@@ -194,7 +194,7 @@ fn review() -> Review {
 fn review_summary() -> ReviewSummary {
     ReviewSummary {
         id: review_id(),
-        root: root_path(),
+        scope: ReviewSummaryScope::Workspace,
         status: ReviewStatus::Submitted {
             submitted_at_ms: 300,
         },
@@ -205,6 +205,7 @@ fn review_summary() -> ReviewSummary {
         user_comment_count: 2,
         pending_suggestion_count: 1,
         file_comment_counts: vec![ReviewFileCommentCount {
+            root: root_path(),
             relative_path: "src/lib.rs".to_owned(),
             user_comment_count: 1,
             ai_comment_count: 1,
@@ -235,6 +236,9 @@ fn review_data_model_round_trips() {
 
     round_trip(&vec![
         ReviewDiffSelection::AllUncommitted,
+        ReviewDiffSelection::Workspace {
+            scope: ProjectDiffScope::Unstaged,
+        },
         ReviewDiffSelection::Root {
             root: root_path(),
             scope: ProjectDiffScope::Uncommitted,
@@ -277,6 +281,7 @@ fn review_data_model_round_trips() {
     ]);
     round_trip(&review());
     round_trip(&review_summary());
+    round_trip(&ReviewSummaryScope::Root { root: root_path() });
 }
 
 #[test]
@@ -386,7 +391,7 @@ fn project_git_diff_file_binary_flag_defaults_for_legacy_json() {
 }
 
 #[test]
-fn review_summary_root_defaults_for_legacy_json() {
+fn review_summary_scope_defaults_for_legacy_json() {
     let summary: ReviewSummary = serde_json::from_value(json!({
         "id": "review-1",
         "status": { "state": "draft" },
@@ -397,15 +402,16 @@ fn review_summary_root_defaults_for_legacy_json() {
         "user_comment_count": 0,
         "pending_suggestion_count": 0
     }))
-    .expect("legacy summary without root should deserialize");
+    .expect("legacy summary without scope should deserialize");
 
-    assert_eq!(summary.root, ProjectRootPath(String::new()));
+    assert_eq!(summary.scope, ReviewSummaryScope::Workspace);
     assert!(summary.file_comment_counts.is_empty());
 }
 
 #[test]
 fn review_file_comment_count_round_trips_and_totals() {
     let count = ReviewFileCommentCount {
+        root: root_path(),
         relative_path: "src/lib.rs".to_owned(),
         user_comment_count: 2,
         ai_comment_count: 3,
@@ -419,6 +425,7 @@ fn review_file_comment_count_round_trips_and_totals() {
         "relative_path": "src/main.rs"
     }))
     .expect("missing per-file count fields should default");
+    assert_eq!(decoded.root, ProjectRootPath(String::new()));
     assert_eq!(decoded.total_count(), 0);
 }
 

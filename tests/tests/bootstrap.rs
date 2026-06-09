@@ -3,9 +3,9 @@ use std::time::Duration;
 use client::ClientConfig;
 use protocol::{
     BackendAccessMode, BackendKind, FrameKind, HostBootstrapPayload, HostBrowseStartPayload,
-    HostSettingValue, NewAgentPayload, ProjectBootstrapPayload, SessionId, SessionSchemasPayload,
-    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, TerminalCreatePayload,
-    TerminalLaunchTarget,
+    HostSettingValue, NewAgentPayload, ProjectBootstrapPayload, ReviewSummaryScope, SessionId,
+    SessionSchemasPayload, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload,
+    TerminalCreatePayload, TerminalLaunchTarget,
 };
 use server::backend::BackendSession;
 use server::store::project::ProjectStore;
@@ -317,8 +317,8 @@ async fn project_subscription_starts_with_project_bootstrap() {
     assert_eq!(bootstrap.project.id, project.id);
     assert_eq!(bootstrap.review_summaries.len(), 1);
     assert_eq!(
-        bootstrap.review_summaries[0].root.0,
-        root.path().to_string_lossy().to_string()
+        bootstrap.review_summaries[0].scope,
+        ReviewSummaryScope::Workspace
     );
     assert!(matches!(
         bootstrap.review_summaries[0].status,

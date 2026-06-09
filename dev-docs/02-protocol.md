@@ -370,9 +370,12 @@ pub enum RejectCode {
 - `WelcomePayload` has no bootstrap field. Initial state is sent as typed
   stream bootstrap frames after the handshake.
 - `ProjectBootstrapPayload.review_summaries` and
-  `ProjectEventPayload::ReviewListChanged` carry `ReviewSummary.root` so
-  clients can bind the implicit active review to the exact project root diff.
-  Summaries also carry per-file review comment counts for git file-list badges.
+  `ProjectEventPayload::ReviewListChanged` carry one active
+  `ReviewSummary` per project with `ReviewSummary.scope =
+  ReviewSummaryScope::Workspace`. Legacy/direct root-scoped reviews may use
+  `ReviewSummaryScope::Root { root }`, but they are not emitted as active
+  summaries. Per-file review comment counts include both `root` and
+  `relative_path` so git file-list badges stay unambiguous across roots.
 - `ReviewSubscribePayload.include_diffs` defaults to `true`; clients can set it
   to `false` for lightweight review/comment surfaces that do not need full diff
   payloads in `ReviewBootstrap`.

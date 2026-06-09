@@ -2,11 +2,13 @@
 
 Spec for Tyde's inline Review feature.
 
-Reviews are an **always-on, root-scoped inline layer** over each project root's
-current unstaged git diff. The primary UX is the project diff view: comments,
-AI suggestions, stale-anchor badges, and submit controls render inline with the
-changed files for that root. There is no standalone Review tab and no
-start/open/cancel/close lifecycle in the new UX.
+Reviews are an **always-on, workspace-scoped inline layer** over a project's
+current unstaged git diffs. In this document, **workspace** means the
+`Project`, keyed by `ProjectId`, spanning every path in `Project.roots`.
+There is exactly one active draft review per project, even when the project has
+one root. The primary UX is still the project diff surface: comments, AI
+suggestions, stale-anchor badges, and submit controls render inline with the
+changed files from any root in the project.
 
 Audience: implementation agents and future maintainers.
 
@@ -14,30 +16,34 @@ Audience: implementation agents and future maintainers.
 
 ## 1. Current model
 
-- Exactly one active draft review exists for each `(project_id, root)` pair.
-  `root` is a `ProjectRootPath` from `Project { roots: Vec<String> }`.
+- Exactly one active draft review exists for each `ProjectId`.
+- The active review scope is `ReviewDiffSelection::Workspace { scope:
+  ProjectDiffScope::Unstaged }`.
 - Active reviews are implicit. Project bootstrap and review summary updates
-  surface them; clients should not send `ReviewCreate` just to make a review
-  appear in the UI.
-- Active reviews always track `ProjectDiffScope::Unstaged` for their root.
-  Staged-only changes are not part of the active inline review.
+  surface the active id; clients should not send `ReviewCreate` just to make a
+  review appear in the UI.
+- `Review.diffs` contains one `ProjectGitDiffPayload` per project root that can
+  be read as a git repository. Each payload is normalized to
+  `ProjectDiffScope::Unstaged` and `DiffContextMode::FullFile`.
 - Submitting feedback does not move the active review into a durable
   submitted/consumed queue. After successful delivery the server clears
   comments, suggestions, and AI reviewer state and keeps the same draft review
-  ready for the next unstaged diff.
+  ready for the next unstaged workspace diff.
 - Diff refreshes never silently re-anchor comments. If a stored anchor no
-  longer matches the current unstaged diff, the server marks it stale and
-  leaves the original location unchanged.
-- When a root's unstaged diff becomes clean, that root's active review resets:
-  comments, suggestions, AI state, and diff payloads are cleared.
+  longer matches the current unstaged diff for its root, the server marks it
+  stale and leaves the original `ReviewLocation` unchanged.
+- Clean reset is workspace-wide: the active review clears only when **all**
+  project roots have clean unstaged state. If one root becomes clean while
+  another root is still dirty, comments in the clean root become stale through
+  normal anchor-status refresh.
 - Feedback can be submitted either to an existing open same-project agent or to
   a newly spawned same-project agent.
 
-Legacy `Submitted`, `Consumed`, `Cancelled`, project-only draft, and
-origin-session records may still be present in persisted stores. They must
-safely deserialize and remain subscribable by id where possible, but they are
-not the active inline review surface. Project-only legacy drafts are hidden from
-active summaries so they cannot create multiple active reviews for a root.
+Legacy root-scoped draft records may still exist in persisted stores and may
+remain subscribable by id. They are not emitted as active summaries and are not
+merged into the workspace review. This is a start-fresh model: there is no
+migration or comment-merging path from old per-root drafts into the active
+workspace draft.
 
 ---
 
@@ -46,7 +52,8 @@ active summaries so they cannot create multiple active reviews for a root.
 ### Streams
 
 ```text
-/project/<project_id>   ReviewCreate (legacy/get-or-create), ProjectBootstrap,
+/project/<project_id>   ReviewCreate (legacy/direct get-or-create),
+                       ProjectBootstrap,
                        ProjectEvent::ReviewListChanged
 /review/<review_id>     ReviewSubscribe, ReviewAction, ReviewEvent
 ```
@@ -55,20 +62,28 @@ active summaries so they cannot create multiple active reviews for a root.
 
 `ProjectBootstrapPayload.review_summaries` and
 `ProjectEventPayload::ReviewListChanged` are the source of active review ids.
-Each active summary includes the root it belongs to:
+For each project they contain exactly one active draft summary with workspace
+scope:
 
 ```rust
 pub struct ReviewSummary {
     pub id: ReviewId,
-    pub root: ProjectRootPath,
-    pub status: ReviewStatus, // Draft for active reviews
+    pub scope: ReviewSummaryScope, // Workspace for active summaries
+    pub status: ReviewStatus,     // Draft for active summaries
     pub user_comment_count: u32,
     pub pending_suggestion_count: u32,
     pub file_comment_counts: Vec<ReviewFileCommentCount>,
     // legacy origin fields...
 }
 
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewSummaryScope {
+    Workspace,
+    Root { root: ProjectRootPath }, // legacy/direct reviews only
+}
+
 pub struct ReviewFileCommentCount {
+    pub root: ProjectRootPath,
     pub relative_path: String,
     pub user_comment_count: u32,
     pub ai_comment_count: u32,
@@ -76,18 +91,19 @@ pub struct ReviewFileCommentCount {
 }
 ```
 
-For a project with multiple roots, the summary list contains one active draft
-summary per root. Clients bind inline review state by `(project_id, root)`, not
-by project alone.
+For a project with multiple roots, the summary list still contains one active
+summary, not one summary per root. Clients bind active inline review state by
+`(project_id, ReviewSummaryScope::Workspace)`.
 
 `file_comment_counts` lets the normal git file list show comment badges without
-subscribing to the full review diff. Per-file totals are
+subscribing to the full review diff. The `root` field is required because the
+same relative path can exist in multiple project roots. Per-file totals are
 `user_comment_count + ai_comment_count + pending_suggestion_count`. Human
 comments, accepted AI comments, and pending AI suggestions count even when
-their anchors are stale; rejected suggestions do not count.
-The legacy aggregate `ReviewSummary.user_comment_count` remains the total
-accepted comment-record count for summary hubs, including human comments and
-accepted AI comments.
+their anchors are stale; rejected suggestions do not count. The legacy
+aggregate `ReviewSummary.user_comment_count` remains the total accepted
+comment-record count for summary hubs, including human comments and accepted AI
+comments.
 
 ### Subscribe
 
@@ -102,11 +118,11 @@ Clients that only need comment/suggestion state for a lightweight Comments
 surface may send `{ "include_diffs": false }`; the server then clears `diffs`
 from `ReviewBootstrap` and any later `Snapshot`/`Cleared` review payload sent
 to that subscriber. Other review events are unchanged. Lightweight subscribe
-does not refresh the root's full-file diff; mutation, submit, AI review, and
-full subscribe paths still refresh diffs before they need them.
-If the same connection has already subscribed to that review with
-`include_diffs = true`, the full mode is sticky for that connection/review so a
-later lightweight subscribe cannot downgrade full diff payloads.
+does not refresh the full workspace diff; mutation, submit, AI review, and full
+subscribe paths still refresh diffs before they need them. If the same
+connection has already subscribed to that review with `include_diffs = true`,
+the full mode is sticky for that connection/review so a later lightweight
+subscribe cannot downgrade full diff payloads.
 
 ### Create
 
@@ -114,26 +130,32 @@ later lightweight subscribe cannot downgrade full diff payloads.
 pub struct ReviewCreatePayload {
     pub selection: ReviewDiffSelection,
 }
-```
 
-`ReviewCreate` remains for older clients and direct get-or-create flows. New UI
-paths should prefer the active id from project bootstrap/summaries. When create
-is used, the server resolves it to the selected root, normalizes the active
-selection to:
-
-```rust
-ReviewDiffSelection::Root {
-    root,
-    scope: ProjectDiffScope::Unstaged,
-    path: None,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewDiffSelection {
+    AllUncommitted, // legacy; active create normalizes to Workspace/Unstaged
+    Workspace { scope: ProjectDiffScope },
+    Root { root: ProjectRootPath, scope: ProjectDiffScope, path: Option<String> },
 }
 ```
 
-If a draft already exists for `(project_id, root)`, the caller is subscribed to
-that review and receives `ReviewBootstrap`. Otherwise the server creates the
-root-scoped draft and subscribes the caller. Legacy `AllUncommitted` create is
-accepted only when the project has a single root; multi-root callers must send a
-root selection.
+New UI paths should prefer the active id from project bootstrap/summaries.
+When `ReviewCreate` is used with `Workspace` or legacy `AllUncommitted`, the
+server normalizes it to:
+
+```rust
+ReviewDiffSelection::Workspace {
+    scope: ProjectDiffScope::Unstaged,
+}
+```
+
+and returns the one active workspace draft for the project, creating it if
+needed.
+
+`ReviewCreate::Root` remains a legacy/direct path for callers that already know
+a review id or need a root-scoped draft. Root-scoped drafts are normalized to
+unstaged full-root selection, remain subscribable by id, and are not emitted as
+active project summaries.
 
 Older clients may still include `origin_agent_id`; serde ignores that field.
 The server no longer requires an origin agent to create or use a review.
@@ -157,7 +179,7 @@ pub enum ReviewSubmitTarget {
 
 `ExistingAgent` is valid only when the agent is live and bound to the same
 project as the review. `NewAgent` spawns an unrestricted same-project agent
-using the project's roots and sends the review bundle as the initial user input
+using `project.roots` and sends the review bundle as the initial user input
 with `MessageOrigin::Review { review_id }`.
 
 ### Actions
@@ -177,10 +199,11 @@ pub enum ReviewActionPayload {
 }
 ```
 
-`Submit` validates comments and target, delivers the bundle, then resets the
-review on success. `ClearComments` explicitly resets comments/suggestions/AI
-state without delivering anything. `Cancel` remains deserializable for
-backcompat but new server/UI paths should not depend on it for lifecycle.
+`Submit` validates comments and target, delivers one feedback bundle for all
+accepted comments across roots, then resets the review on success.
+`ClearComments` explicitly resets comments/suggestions/AI state without
+delivering anything. `Cancel` remains deserializable for backcompat but new
+server/UI paths should not depend on it for lifecycle.
 `StartAiReview.backend_kind = None` asks the host to use
 `HostSettings.default_backend`, or the first enabled backend if no default is
 configured; `Some(kind)` remains an explicit override.
@@ -197,11 +220,13 @@ pub enum ReviewAnchorStatus {
 }
 
 pub struct ReviewComment {
+    pub location: ReviewLocation, // includes root
     pub anchor_status: ReviewAnchorStatus,
     // ...
 }
 
 pub struct ReviewSuggestedComment {
+    pub location: ReviewLocation, // includes root
     pub anchor_status: ReviewAnchorStatus,
     // ...
 }
@@ -226,16 +251,17 @@ pub enum ReviewEventPayload {
 ```
 
 `Cleared` is emitted after successful submit, explicit clear, and clean
-unstaged-root reset. Clients should replace their local review projection with
-the included review.
+workspace reset. Clients should replace their local review projection with the
+included review.
 
 ### Diff files
 
 Review diffs use the normal project diff payload with
 `ProjectDiffScope::Unstaged` and `DiffContextMode::FullFile`.
-`ProjectGitDiffFile.is_binary` marks binary additions/modifications. Binary
-files carry no hunks, so line and hunk anchors are impossible, but file-level
-`ReviewAnchor::File` comments are valid.
+`Review.diffs` may contain multiple `ProjectGitDiffPayload` values, one for
+each git root in the project. `ProjectGitDiffFile.is_binary` marks binary
+additions/modifications. Binary files carry no hunks, so line and hunk anchors
+are impossible, but file-level `ReviewAnchor::File` comments are valid.
 
 ---
 
@@ -243,25 +269,29 @@ files carry no hunks, so line and hunk anchors are impossible, but file-level
 
 ### Registry
 
-`ReviewRegistry` owns review actors and enforces get-or-create singleton
-semantics per `(project_id, root)`. Project summaries first ensure an implicit
-active draft exists for every current project root, then return exactly one
-active draft summary per root.
+`ReviewRegistry` owns review actors and enforces active singleton semantics per
+`ProjectId`. Project summaries first ensure the implicit active workspace draft
+exists for the project, then return exactly one workspace summary.
 
 When legacy records are loaded:
 
-- draft root records are normalized to unstaged, full-root active selections;
-- multiple drafts for the same root are hidden behind the latest active one;
-- project-only `AllUncommitted` drafts remain safe/subscribable by id but are
-  not exposed as active summaries;
+- draft workspace records are normalized to unstaged workspace selection;
+- draft root records remain safe/subscribable by id but are hidden from active
+  summaries;
+- legacy `AllUncommitted` drafts remain safe/subscribable by id but are not
+  treated as active workspace summaries;
 - submitted/consumed/cancelled records deserialize safely and are not
   redelivered by the inline flow.
 
+There is intentionally no migration or merge logic that moves comments from old
+per-root drafts into the active workspace review.
+
 ### Diff refresh and stale anchors
 
-Review actors refresh `diffs` from the root's unstaged diff on subscribe and
-before mutating/submitting. After each refresh the actor checks every comment and
-suggestion location against the refreshed diff:
+Review actors refresh `diffs` from every project root's unstaged diff on full
+subscribe and before mutating/submitting/starting AI review. After each refresh
+the actor checks every comment and suggestion location against the refreshed
+workspace diff:
 
 - valid location => `anchor_status = Current`
 - invalid location => `anchor_status = Stale { reason }`
@@ -272,16 +302,35 @@ any stale/invalid accepted comment fails with `InvalidLocation`.
 Untracked binary files are included in refreshed unstaged diffs as
 `is_binary = true` with empty hunks instead of failing review creation or
 refresh. Because binary and metadata-only changes can have no hunks, clean-reset
-logic treats the unstaged diff as clean only when refreshed diffs contain no
-files.
+logic treats the workspace diff as clean only when every refreshed diff contains
+no files.
 
 ### Clean reset
 
-A refresh that observes no changed files for the review root clears that root's
-active review. Project-stream git status refreshes also notify the registry for
-roots whose unstaged state is clean (`unstaged == None` and not untracked), so
-subscribed clients reset even if no review action is in flight. Staged-only
-changes therefore leave the active unstaged review clear.
+A refresh that observes no changed files in any root clears the active workspace
+review. Project-stream git status refreshes also notify the registry only when
+all project roots have clean unstaged state (`unstaged == None` and not
+untracked). Staged-only changes therefore leave the active unstaged review
+clear.
+
+If one root becomes clean while another root remains dirty, the review is not
+cleared. Comments in the clean root remain in the review and are marked stale by
+anchor-status refresh because their diff file is no longer present.
+
+### AI review
+
+`StartAiReview` spawns one agent named `AI Review` for the workspace review.
+The spawn request uses:
+
+- `project_id = Some(review.project_id)`
+- `workspace_roots = project.roots`
+- read-only access mode
+- one reviewer prompt containing all refreshed review diffs
+- the review-feedback MCP server so the reviewer can call
+  `propose_review_comment`
+
+The reviewer proposes typed `ReviewLocation` values. The `root` in each
+location must be one of the project root paths present in the review diff.
 
 ### Submit
 
@@ -289,12 +338,14 @@ changes therefore leave the active unstaged review clear.
 
 1. Require draft review, at least one accepted comment, and no running AI
    reviewer.
-2. Refresh the root's unstaged diff and mark stale anchors.
+2. Refresh all roots' unstaged diffs and mark stale anchors.
 3. Reject if any accepted comment is stale/invalid.
-4. Build `ReviewFeedbackBundle` and render the deterministic markdown message.
+4. Build one `ReviewFeedbackBundle` containing comments across all roots and
+   render the deterministic markdown message.
 5. Deliver to the chosen target:
    - existing agent: live, same project, receives `AgentInput::SendMessage`
-   - new agent: spawned in the same project with the bundle as initial input
+   - new agent: spawned in the same project with `project.roots` and the bundle
+     as initial input
 6. On success, clear comments, suggestions, and AI state; keep `status = Draft`;
    emit `Cleared` and update project review summaries.
 
@@ -305,7 +356,11 @@ target or retry.
 
 ## 4. Migration notes
 
-- `ReviewSummary.root` is required on new summary payloads and defaults to an
+- `ReviewSummary.root` is replaced by `ReviewSummary.scope`.
+- Active summaries use `ReviewSummaryScope::Workspace`.
+- `ReviewSummaryScope::Root { root }` exists only for legacy/direct summaries,
+  not for the active project surface.
+- `ReviewFileCommentCount.root` is required on new payloads and defaults to an
   empty `ProjectRootPath` only for legacy JSON deserialization.
 - `ReviewSummary.file_comment_counts` defaults to an empty list for legacy
   summary JSON.
@@ -316,35 +371,18 @@ target or retry.
 - `ReviewActionPayload::StartAiReview.backend_kind` is optional. Missing values
   use the host default backend, then the first enabled backend.
 - `ReviewActionPayload::Submit` requires an explicit `target`.
-- Active reviews normalize to `ReviewDiffSelection::Root { scope: Unstaged,
-  path: None }`.
-- `ReviewComment.anchor_status` and `ReviewSuggestedComment.anchor_status`
-  default to `Current` when absent.
-- Persisted legacy `Submitted`/`Consumed`/`Cancelled` reviews deserialize safely
-  but are not redelivered by the new review flow.
-- `MessageOrigin::Review` remains unchanged and is required on all delivered
-  feedback bundle messages.
+- Active reviews normalize to `ReviewDiffSelection::Workspace { scope:
+  Unstaged }`.
+- Old per-root drafts are start-fresh legacy data: they may be subscribed by id,
+  but they are not emitted as active summaries and are not merged.
 
 ---
 
-## 5. UI contract
+## 5. Implementation checklist
 
-Frontend/mobile should:
-
-- Treat `ProjectBootstrap.review_summaries` and
-  `ProjectEventPayload::ReviewListChanged` as the source of active review ids.
-- Bind active review state by `(project_id, summary.root)`.
-- Render per-file comment badges in the normal git diff/file list from
-  `ReviewSummary.file_comment_counts` when available.
-- Subscribe to `/review/<summary.id>` when the diff surface for that root needs
-  full review state; do not create a review just to make one exist.
-- For a lightweight Comments surface, subscribe with `include_diffs = false`
-  and render small snippets around comments/suggestions from already-loaded
-  project diff data instead of treating the all-root full diff as the primary
-  entrypoint.
-- Render `anchor_status = Stale` distinctly and avoid silently changing the
-  anchor location.
-- Use `ClearComments` for an explicit user reset.
-- Use `Submit { target: ExistingAgent { agent_id } }` or
-  `Submit { target: NewAgent { backend_kind, cost_hint, name } }`.
-- Replace local review state with the review included in `Cleared`.
+- Bind active review state by `(project_id, ReviewSummaryScope::Workspace)`.
+- Read `ReviewFileCommentCount.root` and `relative_path` together for per-file
+  badges.
+- Do not create per-root active reviews from bootstrap or summary handling.
+- Do not clear the workspace review just because one root became clean.
+- Do not add migration or comment-merging logic for old per-root drafts.

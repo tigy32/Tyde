@@ -1778,6 +1778,62 @@ mod tests {
     }
 
     #[test]
+    fn accepts_workspace_review_summary_scope_payloads() {
+        let mut validator = ProtocolValidator::new();
+        let stream = StreamPath("/project/project-1".to_owned());
+        let summary = crate::ReviewSummary {
+            id: crate::ReviewId("review-1".to_owned()),
+            scope: crate::ReviewSummaryScope::Workspace,
+            status: crate::ReviewStatus::Draft,
+            origin_session_id: crate::SessionId("session-1".to_owned()),
+            origin_agent_id: crate::AgentId("agent-1".to_owned()),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            user_comment_count: 1,
+            pending_suggestion_count: 0,
+            file_comment_counts: vec![crate::ReviewFileCommentCount {
+                root: crate::ProjectRootPath("/repo-a".to_owned()),
+                relative_path: "src/lib.rs".to_owned(),
+                user_comment_count: 1,
+                ai_comment_count: 0,
+                pending_suggestion_count: 0,
+            }],
+        };
+        let bootstrap = Envelope::from_payload(
+            stream.clone(),
+            FrameKind::ProjectBootstrap,
+            0,
+            &crate::ProjectBootstrapPayload {
+                project: crate::Project {
+                    id: crate::ProjectId("project-1".to_owned()),
+                    name: "Project".to_owned(),
+                    roots: vec!["/repo-a".to_owned(), "/repo-b".to_owned()],
+                    sort_order: 0,
+                },
+                file_list: crate::ProjectFileListPayload {
+                    incremental: false,
+                    roots: vec![],
+                },
+                git_status: crate::ProjectGitStatusPayload { roots: vec![] },
+                review_summaries: vec![summary.clone()],
+            },
+        )
+        .expect("serialize ProjectBootstrap");
+        validator.validate_envelope(&bootstrap).unwrap();
+
+        let event = Envelope::from_payload(
+            stream,
+            FrameKind::ProjectEvent,
+            1,
+            &crate::ProjectEventPayload::ReviewListChanged {
+                reviews: vec![summary],
+            },
+        )
+        .expect("serialize ProjectEvent");
+        validator.validate_envelope(&event).unwrap();
+    }
+
+    #[test]
     fn accepts_team_member_origin_with_team_fields() {
         let mut validator = ProtocolValidator::new();
         validator

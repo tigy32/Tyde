@@ -93,7 +93,6 @@ pub fn DiffViewer(
     // (matching the desktop integrated diff surface). Reactive over
     // `review_summaries`.
     let project_for_review = project.clone();
-    let root_for_review = root.clone();
     let active_review_id = Memo::new(move |_| {
         if !review_enabled {
             return None;
@@ -102,11 +101,16 @@ pub fn DiffViewer(
             project_for_review.local_host_id.clone(),
             project_for_review.project_id.clone(),
         );
+        // One active review per project spans all roots; bind to the single
+        // workspace draft (this diff tab renders its own root's slice — its
+        // comment decorations filter by `ReviewLocation.root`). Legacy
+        // root-scoped summaries are never active and are ignored.
         let id = state.review_summaries.with(|map| {
             map.get(&key)?
                 .iter()
                 .filter(|s| {
-                    matches!(s.status, protocol::ReviewStatus::Draft) && s.root == root_for_review
+                    matches!(s.status, protocol::ReviewStatus::Draft)
+                        && matches!(s.scope, protocol::ReviewSummaryScope::Workspace)
                 })
                 .max_by_key(|s| s.updated_at_ms)
                 .map(|s| s.id.clone())
@@ -1528,7 +1532,7 @@ mod wasm_tests {
     fn fixture_summary(review_id: &ReviewId) -> ReviewSummary {
         ReviewSummary {
             id: review_id.clone(),
-            root: ProjectRootPath("/x".to_owned()),
+            scope: protocol::ReviewSummaryScope::Workspace,
             status: ReviewStatus::Draft,
             origin_session_id: SessionId("s1".to_owned()),
             origin_agent_id: AgentId("a1".to_owned()),

@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use client::{AgentEndpoint, AgentEvent, HostEndpoint, HostEvent, ProjectEvent};
 use protocol::{
-    AgentBootstrapEvent, BackendKind, ChatEvent, SendMessagePayload, SpawnAgentParams,
-    SpawnAgentPayload,
+    AgentBootstrapEvent, BackendKind, ChatEvent, ReviewSummaryScope, SendMessagePayload,
+    SpawnAgentParams, SpawnAgentPayload,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -274,7 +274,10 @@ async fn runtime_preserves_project_bootstrap_until_project_endpoint_is_opened() 
             assert_eq!(payload.project.id, project.id);
             assert_eq!(payload.project.name, project.name);
             assert_eq!(payload.review_summaries.len(), 1);
-            assert_eq!(payload.review_summaries[0].root.0, project.roots[0]);
+            assert_eq!(
+                payload.review_summaries[0].scope,
+                ReviewSummaryScope::Workspace
+            );
         }
         _ => panic!("expected ProjectBootstrap"),
     }

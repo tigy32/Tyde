@@ -8,7 +8,7 @@ use protocol::{
     ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectListDirPayload,
     ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload,
     ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload,
-    ProjectStageHunkPayload, ReviewStatus,
+    ProjectStageHunkPayload, ReviewStatus, ReviewSummaryScope,
 };
 use std::fs;
 use std::path::Path;
@@ -572,7 +572,7 @@ async fn create_project_pushes_file_list_and_git_status() {
     assert!(git_status.roots[0].clean);
 
     assert_eq!(review_summaries.len(), 1);
-    assert_eq!(review_summaries[0].root.0, project.roots[0]);
+    assert_eq!(review_summaries[0].scope, ReviewSummaryScope::Workspace);
     assert!(matches!(review_summaries[0].status, ReviewStatus::Draft));
 }
 
@@ -618,18 +618,9 @@ async fn project_create_pushes_file_list_and_git_status_for_all_roots() {
     assert!(git_status.roots.iter().all(|root| root.clean));
     assert!(git_status.roots.iter().all(|root| root.files.is_empty()));
 
-    assert_eq!(review_summaries.len(), 2);
-    let summary_roots = review_summaries
-        .iter()
-        .map(|summary| summary.root.0.as_str())
-        .collect::<Vec<_>>();
-    assert!(summary_roots.contains(&project.roots[0].as_str()));
-    assert!(summary_roots.contains(&project.roots[1].as_str()));
-    assert!(
-        review_summaries
-            .iter()
-            .all(|summary| matches!(summary.status, ReviewStatus::Draft))
-    );
+    assert_eq!(review_summaries.len(), 1);
+    assert_eq!(review_summaries[0].scope, ReviewSummaryScope::Workspace);
+    assert!(matches!(review_summaries[0].status, ReviewStatus::Draft));
 }
 
 #[tokio::test]

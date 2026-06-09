@@ -132,7 +132,6 @@ pub(crate) struct ReviewRegistryHandle {
 pub(crate) struct ReviewCreateRequest {
     pub review_id: ReviewId,
     pub project_id: ProjectId,
-    pub root: ProjectRootPath,
     pub selection: ReviewDiffSelection,
     pub diffs: Vec<ProjectGitDiffPayload>,
 }
@@ -201,7 +200,7 @@ impl ReviewRegistry {
         let mut rehydrated = Vec::new();
         for mut review in store.list()? {
             let mut changed = reset_running_ai_reviewer(&mut review);
-            changed |= normalize_rehydrated_active_review(&mut review);
+            changed |= normalize_rehydrated_workspace_review(&mut review);
             if changed {
                 store.upsert(review.clone())?;
             }
@@ -507,11 +506,23 @@ impl ReviewRegistryActor {
     }
 
     async fn create(&mut self, request: ReviewCreateRequest) -> Result<ReviewId, String> {
-        if let Some(review_id) = self
-            .draft_review_for_project_root(&request.project_id, &request.root)
-            .await?
-        {
-            let _ = self.project_update_tx.send(request.project_id);
+        let is_active_workspace = active_review_selection(&request.selection);
+        let existing = if is_active_workspace {
+            self.draft_workspace_review_for_project(&request.project_id)
+                .await?
+        } else {
+            match &request.selection {
+                ReviewDiffSelection::Root { root, .. } => {
+                    self.draft_review_for_project_root(&request.project_id, root)
+                        .await?
+                }
+                ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => None,
+            }
+        };
+        if let Some(review_id) = existing {
+            if is_active_workspace {
+                let _ = self.project_update_tx.send(request.project_id);
+            }
             return Ok(review_id);
         }
 
@@ -523,7 +534,7 @@ impl ReviewRegistryActor {
             project_id: request.project_id.clone(),
             origin_agent_id,
             origin_session_id,
-            selection: normalize_root_selection(request.root.clone(), request.selection),
+            selection: normalize_create_selection(request.selection),
             status: ReviewStatus::Draft,
             diffs: request.diffs,
             comments: Vec::new(),
@@ -546,8 +557,29 @@ impl ReviewRegistryActor {
             self.project_update_tx.clone(),
         );
         self.handles.insert(review_id.clone(), handle);
-        let _ = self.project_update_tx.send(request.project_id);
+        if is_active_workspace {
+            let _ = self.project_update_tx.send(request.project_id);
+        }
         Ok(review_id)
+    }
+
+    async fn draft_workspace_review_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<ReviewId>, String> {
+        let handles = self.handles.values().cloned().collect::<Vec<_>>();
+        let mut drafts = Vec::new();
+        for handle in handles {
+            let snapshot = handle.snapshot().await?;
+            if snapshot.project_id == *project_id
+                && matches!(snapshot.status, ReviewStatus::Draft)
+                && active_review_selection(&snapshot.selection)
+            {
+                drafts.push(snapshot);
+            }
+        }
+        drafts.sort_by(active_review_sort);
+        Ok(drafts.into_iter().next().map(|review| review.id))
     }
 
     async fn draft_review_for_project_root(
@@ -601,35 +633,25 @@ impl ReviewRegistryActor {
 
     async fn summaries(&mut self, project_id: ProjectId) -> Result<Vec<ReviewSummary>, String> {
         let project = self.load_project(&project_id).await?;
-        self.ensure_active_reviews_for_project(&project).await?;
-
-        let mut roots = project
-            .roots
-            .iter()
-            .map(|root| ProjectRootPath(root.clone()))
-            .collect::<Vec<_>>();
-        roots.sort();
+        self.ensure_active_review_for_project(&project).await?;
 
         let handles = self.handles.values().cloned().collect::<Vec<_>>();
-        let mut summaries = Vec::new();
-        for root in roots {
-            let mut drafts = Vec::new();
-            for handle in &handles {
-                let snapshot = handle.snapshot().await?;
-                if snapshot.project_id == project_id
-                    && matches!(snapshot.status, ReviewStatus::Draft)
-                    && active_review_root(&snapshot).as_ref() == Some(&root)
-                {
-                    drafts.push(snapshot);
-                }
-            }
-            drafts.sort_by(active_review_sort);
-            if let Some(review) = drafts.into_iter().next() {
-                summaries.push(actor::summary_for_review(&review));
+        let mut drafts = Vec::new();
+        for handle in &handles {
+            let snapshot = handle.snapshot().await?;
+            if snapshot.project_id == project_id
+                && matches!(snapshot.status, ReviewStatus::Draft)
+                && active_review_selection(&snapshot.selection)
+            {
+                drafts.push(snapshot);
             }
         }
-        summaries.sort_by(|left, right| left.root.cmp(&right.root));
-        Ok(summaries)
+        drafts.sort_by(active_review_sort);
+        Ok(drafts
+            .into_iter()
+            .next()
+            .map(|review| vec![actor::summary_for_review(&review)])
+            .unwrap_or_default())
     }
 
     async fn reset_project_roots_for_clean_unstaged(
@@ -637,14 +659,21 @@ impl ReviewRegistryActor {
         project_id: ProjectId,
         roots: Vec<ProjectRootPath>,
     ) -> Result<(), String> {
+        let project = self.load_project(&project_id).await?;
+        let all_roots_clean = project
+            .roots
+            .iter()
+            .map(|root| ProjectRootPath(root.clone()))
+            .all(|root| roots.contains(&root));
+        if !all_roots_clean {
+            return Ok(());
+        }
         let handles = self.handles.values().cloned().collect::<Vec<_>>();
         for handle in handles {
             let snapshot = handle.snapshot().await?;
             if snapshot.project_id == project_id
                 && matches!(snapshot.status, ReviewStatus::Draft)
-                && active_review_root(&snapshot)
-                    .as_ref()
-                    .is_some_and(|root| roots.contains(root))
+                && active_review_selection(&snapshot.selection)
             {
                 handle.reset_for_clean_working_tree().await?;
             }
@@ -652,26 +681,22 @@ impl ReviewRegistryActor {
         Ok(())
     }
 
-    async fn ensure_active_reviews_for_project(&mut self, project: &Project) -> Result<(), String> {
-        for root in &project.roots {
-            let root = ProjectRootPath(root.clone());
-            if self
-                .draft_review_for_project_root(&project.id, &root)
-                .await?
-                .is_some()
-            {
-                continue;
-            }
-            let review_id = ReviewId(Uuid::new_v4().to_string());
-            let request = ReviewCreateRequest {
-                review_id,
-                project_id: project.id.clone(),
-                root: root.clone(),
-                selection: active_root_selection(root),
-                diffs: Vec::new(),
-            };
-            self.create(request).await?;
+    async fn ensure_active_review_for_project(&mut self, project: &Project) -> Result<(), String> {
+        if self
+            .draft_workspace_review_for_project(&project.id)
+            .await?
+            .is_some()
+        {
+            return Ok(());
         }
+        let review_id = ReviewId(Uuid::new_v4().to_string());
+        let request = ReviewCreateRequest {
+            review_id,
+            project_id: project.id.clone(),
+            selection: active_workspace_selection(),
+            diffs: Vec::new(),
+        };
+        self.create(request).await?;
         Ok(())
     }
 
@@ -694,14 +719,14 @@ fn reset_running_ai_reviewer(review: &mut Review) -> bool {
     false
 }
 
-fn normalize_rehydrated_active_review(review: &mut Review) -> bool {
+fn normalize_rehydrated_workspace_review(review: &mut Review) -> bool {
     if !matches!(review.status, ReviewStatus::Draft) {
         return false;
     }
-    let ReviewDiffSelection::Root { root, .. } = review.selection.clone() else {
+    if !matches!(review.selection, ReviewDiffSelection::Workspace { .. }) {
         return false;
-    };
-    let normalized = active_root_selection(root);
+    }
+    let normalized = active_workspace_selection();
     if review.selection == normalized {
         return false;
     }
@@ -717,15 +742,13 @@ pub(crate) fn review_stream_path(review_id: &ReviewId) -> StreamPath {
 pub(crate) fn build_create_request(
     review_id: ReviewId,
     project_id: ProjectId,
-    root: ProjectRootPath,
     payload: ReviewCreatePayload,
     diffs: Vec<ProjectGitDiffPayload>,
 ) -> ReviewCreateRequest {
     ReviewCreateRequest {
         review_id,
         project_id,
-        root: root.clone(),
-        selection: normalize_root_selection(root, payload.selection),
+        selection: normalize_create_selection(payload.selection),
         diffs: normalize_diff_payloads(diffs),
     }
 }
@@ -735,14 +758,18 @@ fn synthetic_review_origin(project_id: &ProjectId) -> (AgentId, SessionId) {
     (AgentId(id.clone()), SessionId(id))
 }
 
-pub(crate) fn review_create_root(
+pub(crate) fn review_create_selection(
     project: &Project,
     selection: &ReviewDiffSelection,
-) -> Result<ProjectRootPath, String> {
+) -> Result<ReviewDiffSelection, String> {
     match selection {
         ReviewDiffSelection::Root { root, .. } => {
             if project.roots.iter().any(|candidate| candidate == &root.0) {
-                Ok(root.clone())
+                Ok(ReviewDiffSelection::Root {
+                    root: root.clone(),
+                    scope: ProjectDiffScope::Unstaged,
+                    path: None,
+                })
             } else {
                 Err(format!(
                     "project {} does not contain review root {}",
@@ -750,37 +777,41 @@ pub(crate) fn review_create_root(
                 ))
             }
         }
-        ReviewDiffSelection::AllUncommitted => match project.roots.as_slice() {
-            [root] => Ok(ProjectRootPath(root.clone())),
-            [] => Err(format!("project {} has no review roots", project.id)),
-            _ => Err(format!(
-                "ReviewCreate AllUncommitted is ambiguous for multi-root project {}; use Root",
-                project.id
-            )),
-        },
+        ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => {
+            match project.roots.as_slice() {
+                [] => Err(format!("project {} has no review roots", project.id)),
+                _ => Ok(active_workspace_selection()),
+            }
+        }
     }
 }
 
-fn normalize_root_selection(
-    root: ProjectRootPath,
-    selection: ReviewDiffSelection,
-) -> ReviewDiffSelection {
+fn normalize_create_selection(selection: ReviewDiffSelection) -> ReviewDiffSelection {
     match selection {
-        ReviewDiffSelection::Root { .. } => ReviewDiffSelection::Root {
+        ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => {
+            active_workspace_selection()
+        }
+        ReviewDiffSelection::Root { root, .. } => ReviewDiffSelection::Root {
             root,
             scope: ProjectDiffScope::Unstaged,
             path: None,
         },
-        ReviewDiffSelection::AllUncommitted => active_root_selection(root),
     }
 }
 
-fn active_root_selection(root: ProjectRootPath) -> ReviewDiffSelection {
-    ReviewDiffSelection::Root {
-        root,
+fn active_workspace_selection() -> ReviewDiffSelection {
+    ReviewDiffSelection::Workspace {
         scope: ProjectDiffScope::Unstaged,
-        path: None,
     }
+}
+
+fn active_review_selection(selection: &ReviewDiffSelection) -> bool {
+    matches!(
+        selection,
+        ReviewDiffSelection::Workspace {
+            scope: ProjectDiffScope::Unstaged
+        }
+    )
 }
 
 fn active_review_root(review: &Review) -> Option<ProjectRootPath> {
@@ -789,7 +820,7 @@ fn active_review_root(review: &Review) -> Option<ProjectRootPath> {
             root, path: None, ..
         } => Some(root.clone()),
         ReviewDiffSelection::Root { .. } => None,
-        ReviewDiffSelection::AllUncommitted => None,
+        ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => None,
     }
 }
 
@@ -1000,11 +1031,19 @@ mod tests {
         assert_eq!(summary.user_comment_count, 3);
         assert_eq!(summary.pending_suggestion_count, 1);
         assert_eq!(summary.file_comment_counts.len(), 2);
+        assert_eq!(
+            summary.file_comment_counts[0].root,
+            ProjectRootPath("/repo".to_owned())
+        );
         assert_eq!(summary.file_comment_counts[0].relative_path, "src/lib.rs");
         assert_eq!(summary.file_comment_counts[0].user_comment_count, 1);
         assert_eq!(summary.file_comment_counts[0].ai_comment_count, 1);
         assert_eq!(summary.file_comment_counts[0].pending_suggestion_count, 1);
         assert_eq!(summary.file_comment_counts[0].total_count(), 3);
+        assert_eq!(
+            summary.file_comment_counts[1].root,
+            ProjectRootPath("/repo".to_owned())
+        );
         assert_eq!(summary.file_comment_counts[1].relative_path, "src/other.rs");
         assert_eq!(summary.file_comment_counts[1].user_comment_count, 1);
         assert_eq!(summary.file_comment_counts[1].ai_comment_count, 0);

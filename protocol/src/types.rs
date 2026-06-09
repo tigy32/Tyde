@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -2288,9 +2288,11 @@ impl ReviewStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReviewDiffSelection {
-    /// Legacy v1 default. New inline reviews are root-scoped and normalize to
-    /// `Root { scope: Unstaged }`.
+    /// Legacy v1 default. New inline reviews are workspace-scoped and normalize to
+    /// `Workspace { scope: Unstaged }`.
     AllUncommitted,
+    /// All roots in the project workspace.
+    Workspace { scope: ProjectDiffScope },
     /// One project root, optionally narrowed to a path.
     Root {
         root: ProjectRootPath,
@@ -2303,6 +2305,7 @@ impl ReviewDiffSelection {
     pub const fn kind_name(&self) -> &'static str {
         match self {
             Self::AllUncommitted => "all_uncommitted",
+            Self::Workspace { .. } => "workspace",
             Self::Root { .. } => "root",
         }
     }
@@ -2680,7 +2683,7 @@ impl ReviewErrorContext {
 pub struct ReviewSummary {
     pub id: ReviewId,
     #[serde(default)]
-    pub root: ProjectRootPath,
+    pub scope: ReviewSummaryScope,
     pub status: ReviewStatus,
     pub origin_session_id: SessionId,
     pub origin_agent_id: AgentId,
@@ -2693,7 +2696,19 @@ pub struct ReviewSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewSummaryScope {
+    #[default]
+    Workspace,
+    Root {
+        root: ProjectRootPath,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewFileCommentCount {
+    #[serde(default)]
+    pub root: ProjectRootPath,
     pub relative_path: String,
     #[serde(default)]
     pub user_comment_count: u32,

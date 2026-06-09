@@ -1,11 +1,13 @@
 //! Shared review controls and helpers for the always-on inline review flow.
 //!
 //! The standalone three-pane workbench has been retired: reviews are now an
-//! always-on, root-scoped layer over the normal git diff surfaces
-//! (`ReviewableDiffView` in `diff_view.rs`). What remains here is the shared
-//! action sidebar (`ReviewSidebar` — live counts, AI-reviewer form,
-//! submit-target picker, Clear) that the git-panel per-root hub mounts, plus
-//! the subscribe/diff-open/feedback helpers used across the integrated flow.
+//! always-on, workspace-scoped layer over the normal git diff surfaces
+//! (`ReviewableDiffView` in `diff_view.rs`). There is one active review per
+//! project spanning every root; each per-root diff tab renders its own slice.
+//! What remains here is the shared action sidebar (`ReviewSidebar` — live
+//! counts, AI-reviewer form, submit-target picker, Clear) that the single
+//! git-panel workspace hub mounts, plus the subscribe/diff-open/feedback
+//! helpers used across the integrated flow.
 //!
 //! Reactivity rules (`dev-docs/01-philosophy.md`):
 //! * No optimistic UI: action buttons disable on click and re-enable when
@@ -36,7 +38,7 @@ use protocol::{
     BackendKind, DiffContextMode, FrameKind, ProjectDiffScope, ProjectGitDiffLineKind, ProjectId,
     ProjectReadDiffPayload, ProjectRootPath, Review, ReviewActionPayload, ReviewAiReviewerStatus,
     ReviewAnchor, ReviewCommentSource, ReviewDiffSide, ReviewId, ReviewLocation, ReviewStatus,
-    ReviewSuggestionState, StreamPath,
+    ReviewSuggestionState, ReviewSummary, ReviewSummaryScope, StreamPath,
 };
 
 type ReviewAiIntervalSlot = StoredValue<Option<(i32, Closure<dyn Fn()>)>, LocalStorage>;
@@ -102,12 +104,18 @@ fn format_elapsed(start_ms: u64) -> String {
 /// crate so the git-panel review hub can mount the exact same controls
 /// without re-implementing submit-target gating. Reviews are always-on, so
 /// there is no Cancel/discard-review affordance here.
+///
+/// `can_run_ai` is an optional extra gate on the AI reviewer: when supplied
+/// and `false`, "Run AI reviewer" is disabled (e.g. the workspace has no
+/// reviewable changes, so the reviewer would see an empty diff). Omitted
+/// (`None`) ⇒ no extra gate, the historical behavior.
 #[component]
 pub(crate) fn ReviewSidebar(
     review: Review,
     host_id: String,
     review_id: protocol::ReviewId,
     is_draft: Memo<bool>,
+    #[prop(optional)] can_run_ai: Option<Memo<bool>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
@@ -456,6 +464,11 @@ pub(crate) fn ReviewSidebar(
             if !is_draft.get() {
                 return "Review is no longer Draft";
             }
+            // Extra gate (e.g. workspace has no reviewable changes): an empty
+            // diff would spawn a reviewer with nothing to review.
+            if !can_run_ai.map(|m| m.get()).unwrap_or(true) {
+                return "No reviewable changes";
+            }
             if effective_backend.get().is_none() {
                 return "No AI backend available";
             }
@@ -479,6 +492,12 @@ pub(crate) fn ReviewSidebar(
     let live_for_run_ai = live_for_ai;
     let on_run_ai = move |_| {
         let rid = review_for_ai.clone();
+        // Mirror the disabled gate: never spawn a reviewer when the extra
+        // gate forbids it (e.g. no reviewable changes — empty diff).
+        if !can_run_ai.map(|m| m.get_untracked()).unwrap_or(true) {
+            log::info!("review.start_ai.skipped review={rid} reason=no_reviewable_changes");
+            return;
+        }
         // Gate on there being *some* runnable backend (else nothing to do),
         // but resolve the default server-side: send the explicit picker
         // override when chosen, else `None` so the host applies its
@@ -1214,51 +1233,50 @@ pub(crate) fn try_claim_review_action(
     claimed
 }
 
-/// The most-recently-updated Draft review id for `(project_id, root)`, if
-/// any. Submitted/Consumed/Cancelled are filtered out — only an actively
-/// editable Draft is a review surface. Active reviews are per
-/// `(project, root)`, so a Draft on a *different* root of the same project
-/// must not be returned here (it would wrongly suppress creating one for
-/// this root).
-fn existing_draft_for_root(
+/// The single active workspace Draft summary for a project, if present.
+/// The server emits exactly one active summary per project with
+/// `ReviewSummaryScope::Workspace`, spanning every root. Legacy root-scoped
+/// summaries are never active and are ignored. Submitted/Consumed/Cancelled
+/// records are filtered out — only an actively editable Draft is a review
+/// surface.
+pub(crate) fn pick_workspace_draft(summaries: &[ReviewSummary]) -> Option<&ReviewSummary> {
+    summaries
+        .iter()
+        .filter(|s| {
+            matches!(s.scope, ReviewSummaryScope::Workspace)
+                && matches!(s.status, ReviewStatus::Draft)
+        })
+        .max_by_key(|s| s.updated_at_ms)
+}
+
+/// The single active workspace Draft review id for `project_id`, if any.
+/// One review spans all of the project's roots, so this is keyed by project
+/// alone (no root).
+fn workspace_draft_for_project(
     state: &AppState,
     project_id: &protocol::ProjectId,
-    root: &protocol::ProjectRootPath,
 ) -> Option<protocol::ReviewId> {
     state.review_summaries.with_untracked(|map| {
-        map.get(project_id).and_then(|summaries| {
-            summaries
-                .iter()
-                .filter(|s| s.root == *root && matches!(s.status, ReviewStatus::Draft))
-                .max_by_key(|s| s.updated_at_ms)
-                .map(|s| s.id.clone())
-        })
+        map.get(project_id)
+            .and_then(|summaries| pick_workspace_draft(summaries).map(|s| s.id.clone()))
     })
 }
 
-/// Send a root-scoped `ReviewCreate` with create-pending gating, with
-/// no tab navigation — callers decide which surface to show. At most one
-/// Draft per `(project, root)`: callers must check `existing_draft_for_root`
-/// first.
+/// Send a workspace-scoped `ReviewCreate` with create-pending gating, with
+/// no tab navigation — callers decide which surface to show. There is at
+/// most one active Draft per project: callers must check
+/// [`workspace_draft_for_project`] first.
 ///
-/// The selection is root-scoped `Unstaged` to match the active-review
-/// model: a project-wide `AllUncommitted` create is ambiguous on multi-root
-/// projects and the server now normalizes every active review to
-/// `Root { scope: Unstaged }`.
+/// The selection is `Workspace { Unstaged }` to match the active-review
+/// model: there is exactly one active review per project spanning all of its
+/// roots, and the server normalizes every active review to
+/// `Workspace { scope: Unstaged }`.
 ///
-/// The create-pending gate is keyed by `(host, project)`, not the root: the
-/// only create path ([`create_review_for_active_agent`]) resolves a single
-/// root per project (the first unstaged one), and the `CommandError` clear
-/// path in dispatch only recovers `(host, project)` from the `/project/{id}`
-/// stream — it has no root — so a per-root key could not be released on
-/// error. The gate is a transient debounce, not lifecycle state, so
-/// project-keying is sufficient.
-fn send_review_create(
-    state: &AppState,
-    host_id: &str,
-    project_id: &protocol::ProjectId,
-    root: &protocol::ProjectRootPath,
-) {
+/// The create-pending gate is keyed by `(host, project)`: a project has one
+/// active review, and the `CommandError` clear path in dispatch recovers
+/// `(host, project)` from the `/project/{id}` stream. The gate is a transient
+/// debounce, not lifecycle state.
+fn send_review_create(state: &AppState, host_id: &str, project_id: &protocol::ProjectId) {
     let mut claimed = false;
     let key = (host_id.to_owned(), project_id.clone());
     state.review_create_pending.update(|map| {
@@ -1274,10 +1292,8 @@ fn send_review_create(
 
     let stream = StreamPath(format!("/project/{}", project_id.0));
     let payload = protocol::ReviewCreatePayload {
-        selection: protocol::ReviewDiffSelection::Root {
-            root: root.clone(),
+        selection: protocol::ReviewDiffSelection::Workspace {
             scope: ProjectDiffScope::Unstaged,
-            path: None,
         },
     };
     let state_for_failure = state.clone();
@@ -1390,25 +1406,22 @@ pub fn open_changed_diff_for_root(
     });
 }
 
-/// Open (or focus) the compact review-comments surface for `(project_id,
-/// root)`: snippets around each human comment, accepted AI comment, and
-/// pending AI suggestion — not the full root diff. The full diff stays one
-/// click away via the surface's "Open full diff" button (which routes
-/// through [`open_changed_diff_for_root`]).
-pub fn open_comments_for_root(
+/// Open (or focus) the compact review-comments surface for the project's
+/// single workspace draft review: snippets around each human comment,
+/// accepted AI comment, and pending AI suggestion — not the full diff —
+/// grouped by root. The full diff stays one click away via the surface's
+/// per-root "Open full diff" buttons.
+pub fn open_comments_for_project(
     state: &AppState,
     host_id: &str,
     project_id: &protocol::ProjectId,
-    root: &protocol::ProjectRootPath,
 ) {
-    let label = format!("Comments: {}", root_display_name(root));
     state.open_tab(
         TabContent::Comments {
             host_id: host_id.to_owned(),
             project_id: project_id.clone(),
-            root: root.clone(),
         },
-        label,
+        "Review comments".to_owned(),
         true,
     );
 }
@@ -1638,23 +1651,21 @@ fn file_diff_cached(
     diffs.contains_key(&per_file) || diffs.contains_key(&whole_root)
 }
 
-/// Compact, comments-first review surface for one root's draft review.
+/// Compact, comments-first surface for the project's single workspace draft
+/// review, grouped by root.
 ///
 /// Shows only the regions that carry feedback — each human comment, accepted
 /// AI comment, and pending AI suggestion — as a small snippet plus its
-/// thread, instead of the whole root diff. Rejected suggestions are excluded
-/// from the entry list (they stay reachable under each thread's existing
-/// "N rejected" toggle). An empty state covers the no-feedback case, and an
-/// "Open full diff" button is the escape hatch to the full reviewable diff.
+/// thread, instead of the whole diff. One review spans every root, so entries
+/// are grouped under per-root headers; each group has its own "Open full diff"
+/// escape hatch. Rejected suggestions are excluded from the entry list (they
+/// stay reachable under each thread's existing "N rejected" toggle). An empty
+/// state covers the no-feedback case.
 #[component]
-pub fn ReviewCommentsSurface(
-    host_id: String,
-    project_id: ProjectId,
-    root: ProjectRootPath,
-) -> impl IntoView {
+pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    // Resolve the draft review id for this (project_id, root). Start from the
+    // Resolve the project's single workspace draft review id. Start from the
     // Draft summary (cheap, arrives first), but if we hold the full record
     // require *its* live status to still be Draft: a live `StatusChanged`
     // updates `state.reviews` before `review_summaries` refreshes, so trusting
@@ -1662,16 +1673,11 @@ pub fn ReviewCommentsSurface(
     // already-submitted review. Mirrors `ReviewableDiffView`'s guard.
     let draft_state = state.clone();
     let draft_host = host_id.clone();
-    let draft_root = root.clone();
     let draft_project = project_id.clone();
     let draft: Memo<Option<(String, ReviewId)>> = Memo::new(move |_| {
         let id = draft_state.review_summaries.with(|m| {
-            m.get(&draft_project).and_then(|sums| {
-                sums.iter()
-                    .filter(|s| s.root == draft_root && matches!(s.status, ReviewStatus::Draft))
-                    .max_by_key(|s| s.updated_at_ms)
-                    .map(|s| s.id.clone())
-            })
+            m.get(&draft_project)
+                .and_then(|sums| pick_workspace_draft(sums).map(|s| s.id.clone()))
         })?;
         let live_non_draft = draft_state.reviews.with(|r| {
             r.get(&id)
@@ -1693,11 +1699,10 @@ pub fn ReviewCommentsSurface(
     // surface has no drag-to-comment gutter, so it never opens.
     let composer: RwSignal<Option<ComposerState>> = RwSignal::new(None);
 
-    // Distinct files that carry feedback (comments or pending suggestions).
-    // Drives the per-file diff fetch below.
+    // Distinct (root, file) pairs that carry feedback (comments or pending
+    // suggestions) across all roots. Drives the per-file diff fetch below.
     let files_state = state.clone();
-    let files_root = root.clone();
-    let commented_files: Memo<Vec<String>> = Memo::new(move |_| {
+    let commented_files: Memo<Vec<(ProjectRootPath, String)>> = Memo::new(move |_| {
         let Some((_, rid)) = draft.get() else {
             return Vec::new();
         };
@@ -1705,57 +1710,54 @@ pub fn ReviewCommentsSurface(
             let Some(review) = map.get(&rid) else {
                 return Vec::new();
             };
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<(ProjectRootPath, String)> =
+                std::collections::HashSet::new();
             let mut files = Vec::new();
-            let comment_files = review
-                .comments
-                .iter()
-                .filter(|c| c.location.root == files_root)
-                .map(|c| &c.location.relative_path);
+            let comment_files = review.comments.iter().map(|c| &c.location);
             let suggestion_files = review
                 .suggestions
                 .iter()
-                .filter(|s| {
-                    matches!(s.state, ReviewSuggestionState::Pending)
-                        && s.location.root == files_root
-                })
-                .map(|s| &s.location.relative_path);
-            for path in comment_files.chain(suggestion_files) {
-                if seen.insert(path.clone()) {
-                    files.push(path.clone());
+                .filter(|s| matches!(s.state, ReviewSuggestionState::Pending))
+                .map(|s| &s.location);
+            for loc in comment_files.chain(suggestion_files) {
+                let pair = (loc.root.clone(), loc.relative_path.clone());
+                if seen.insert(pair.clone()) {
+                    files.push(pair);
                 }
             }
             files
         })
     });
 
-    // Fetch the unstaged diff for each commented file not already in the
-    // project diff cache (per-file or shared whole-root). Lightweight: only
-    // commented files, Hunks context. Snippets render reactively from
+    // Fetch the unstaged diff for each commented (root, file) not already in
+    // the project diff cache (per-file or shared whole-root). Lightweight:
+    // only commented files, Hunks context. Snippets render reactively from
     // `state.diff_contents` once these responses land. `requested` dedupes so
     // a file is fetched at most once per surface mount.
     {
         let fetch_state = state.clone();
         let fetch_host = host_id.clone();
         let fetch_pid = project_id.clone();
-        let fetch_root = root.clone();
-        let requested: StoredValue<std::collections::HashSet<String>, LocalStorage> =
-            StoredValue::new_local(std::collections::HashSet::new());
+        let requested: StoredValue<
+            std::collections::HashSet<(ProjectRootPath, String)>,
+            LocalStorage,
+        > = StoredValue::new_local(std::collections::HashSet::new());
         Effect::new(move |_| {
-            for path in commented_files.get() {
+            for (root, path) in commented_files.get() {
                 let cached = fetch_state.diff_contents.with_untracked(|diffs| {
-                    file_diff_cached(diffs, &fetch_host, &fetch_pid, &fetch_root, &path)
+                    file_diff_cached(diffs, &fetch_host, &fetch_pid, &root, &path)
                 });
-                if cached || requested.with_value(|set| set.contains(&path)) {
+                let pair = (root.clone(), path.clone());
+                if cached || requested.with_value(|set| set.contains(&pair)) {
                     continue;
                 }
                 requested.update_value(|set| {
-                    set.insert(path.clone());
+                    set.insert(pair.clone());
                 });
                 let key = DiffKey::new(
                     fetch_host.clone(),
                     fetch_pid.clone(),
-                    fetch_root.clone(),
+                    root.clone(),
                     ProjectDiffScope::Unstaged,
                     path.clone(),
                 );
@@ -1763,7 +1765,7 @@ pub fn ReviewCommentsSurface(
                     let previous = diffs.get(&key);
                     let next = DiffViewState::for_request(
                         previous,
-                        fetch_root.clone(),
+                        root.clone(),
                         ProjectDiffScope::Unstaged,
                         Some(path.clone()),
                         DiffContextMode::Hunks,
@@ -1773,7 +1775,7 @@ pub fn ReviewCommentsSurface(
                 let stream = StreamPath(format!("/project/{}", fetch_pid.0));
                 let host = fetch_host.clone();
                 let payload = ProjectReadDiffPayload {
-                    root: fetch_root.clone(),
+                    root: root.clone(),
                     scope: ProjectDiffScope::Unstaged,
                     path: Some(path.clone()),
                     context_mode: DiffContextMode::Hunks,
@@ -1789,16 +1791,16 @@ pub fn ReviewCommentsSurface(
         });
     }
 
-    // Distinct anchored locations carrying feedback. Depends only on
-    // `state.reviews` + the draft id: the entry *set* changes when comments or
-    // pending suggestions are added/removed, not when diffs arrive. Each row
-    // then computes its snippet reactively from `state.diff_contents`, so the
-    // async path-scoped diff fetch fills the snippet in without changing the
-    // entry set or the `<For>` key. Comments (human + accepted-AI) and pending
-    // suggestions define the set; rejected suggestions are excluded.
+    // Distinct anchored locations carrying feedback, grouped by root. Depends
+    // only on `state.reviews` + the draft id: the entry *set* changes when
+    // comments or pending suggestions are added/removed, not when diffs
+    // arrive. Each row then computes its snippet reactively from
+    // `state.diff_contents`, so the async path-scoped diff fetch fills the
+    // snippet in without changing the entry set or the `<For>` key. Comments
+    // (human + accepted-AI) and pending suggestions define the set; rejected
+    // suggestions are excluded.
     let entries_state = state.clone();
-    let entries_root = root.clone();
-    let entries: Memo<Vec<CommentSurfaceEntry>> = Memo::new(move |_| {
+    let groups: Memo<Vec<(ProjectRootPath, Vec<CommentSurfaceEntry>)>> = Memo::new(move |_| {
         let Some((_, rid)) = draft.get() else {
             return Vec::new();
         };
@@ -1808,24 +1810,20 @@ pub fn ReviewCommentsSurface(
             };
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut entries = Vec::new();
-            let comment_locs = review
-                .comments
-                .iter()
-                .filter(|c| c.location.root == entries_root)
-                .map(|c| &c.location);
+            let comment_locs = review.comments.iter().map(|c| &c.location);
             let suggestion_locs = review
                 .suggestions
                 .iter()
-                .filter(|s| {
-                    matches!(s.state, ReviewSuggestionState::Pending)
-                        && s.location.root == entries_root
-                })
+                .filter(|s| matches!(s.state, ReviewSuggestionState::Pending))
                 .map(|s| &s.location);
             for loc in comment_locs.chain(suggestion_locs) {
-                // Key includes the review id so a different draft for the same
-                // path/anchor forces a fresh row rather than reusing one bound
-                // to the old review.
-                let key = format!("{}|{}|{:?}", rid.0, loc.relative_path, loc.anchor);
+                // Key includes the review id and root so a different draft, or
+                // the same path/anchor in another root, forces a fresh row
+                // rather than reusing one bound to the old review/root.
+                let key = format!(
+                    "{}|{}|{}|{:?}",
+                    rid.0, loc.root.0, loc.relative_path, loc.anchor
+                );
                 if seen.insert(key.clone()) {
                     entries.push(CommentSurfaceEntry {
                         label: anchor_label(&loc.relative_path, &loc.anchor),
@@ -1836,25 +1834,35 @@ pub fn ReviewCommentsSurface(
             }
             entries
         });
-        entries.sort_by(|a, b| anchor_sort_key(&a.location).cmp(&anchor_sort_key(&b.location)));
-        entries
+        // Stable order: by root, then by file/anchor within the root.
+        entries.sort_by(|a, b| {
+            a.location
+                .root
+                .0
+                .cmp(&b.location.root.0)
+                .then_with(|| anchor_sort_key(&a.location).cmp(&anchor_sort_key(&b.location)))
+        });
+        let mut groups: Vec<(ProjectRootPath, Vec<CommentSurfaceEntry>)> = Vec::new();
+        for entry in entries {
+            let root = entry.location.root.clone();
+            match groups.last_mut() {
+                Some((r, items)) if *r == root => items.push(entry),
+                _ => groups.push((root, vec![entry])),
+            }
+        }
+        groups
     });
 
-    let has_entries = Memo::new(move |_| !entries.get().is_empty());
+    let has_entries = Memo::new(move |_| !groups.get().is_empty());
 
-    let open_state = state.clone();
-    let open_host = host_id.clone();
-    let open_pid = project_id.clone();
-    let open_root = root.clone();
+    // Toolbar escape hatch: always available, opens the project's first
+    // reviewable root's full diff (per-root groups offer their own opener).
+    let toolbar_state = state.clone();
+    let toolbar_host = host_id.clone();
+    let toolbar_pid = project_id.clone();
     let open_full_diff = move |_| {
-        open_changed_diff_for_root(&open_state, &open_host, &open_pid, &open_root);
+        open_changed_diff_for_project(&toolbar_state, &toolbar_host, &toolbar_pid);
     };
-
-    let region_host = host_id.clone();
-    let region_root = root.clone();
-    // Captured for the per-row reactive snippet computation.
-    let snippet_state = state.clone();
-    let snippet_pid = project_id.clone();
 
     view! {
         <div class="review-comments-surface" data-test="review-comments-surface">
@@ -1863,7 +1871,7 @@ pub fn ReviewCommentsSurface(
                 <button
                     class="review-btn review-comments-open-full"
                     data-test="review-comments-open-full"
-                    title="Open the full root diff"
+                    title="Open the full diff for the first changed root"
                     on:click=open_full_diff
                 >
                     "Open full diff"
@@ -1880,88 +1888,64 @@ pub fn ReviewCommentsSurface(
             >
                 <div class="review-comments-list">
                     <For
-                        each=move || entries.get()
-                        key=|e| e.key.clone()
+                        each=move || groups.get()
+                        key=|(root, entries)| {
+                            // Re-key the group when its root or its entry set
+                            // changes so added/removed rows re-render.
+                            let ids: String = entries.iter().map(|e| e.key.as_str()).collect::<Vec<_>>().join(",");
+                            format!("{}::{ids}", root.0)
+                        }
                         children={
-                            let region_host = region_host.clone();
-                            let region_root = region_root.clone();
-                            let snippet_state = snippet_state.clone();
-                            let snippet_pid = snippet_pid.clone();
-                            move |entry: CommentSurfaceEntry| {
-                                let Some((_, rid)) = draft.get_untracked() else {
-                                    return view! { <div></div> }.into_any();
+                            let host_id = host_id.clone();
+                            let project_id = project_id.clone();
+                            let state = state.clone();
+                            move |(root, entries): (ProjectRootPath, Vec<CommentSurfaceEntry>)| {
+                                let open_state = state.clone();
+                                let open_host = host_id.clone();
+                                let open_pid = project_id.clone();
+                                let open_root = root.clone();
+                                let open_full_diff = move |_| {
+                                    open_changed_diff_for_root(
+                                        &open_state,
+                                        &open_host,
+                                        &open_pid,
+                                        &open_root,
+                                    );
                                 };
-                                let anchor = entry.location.anchor.clone();
-                                let matcher: std::sync::Arc<
-                                    dyn Fn(&ReviewAnchor) -> bool + Send + Sync,
-                                > = std::sync::Arc::new(move |a: &ReviewAnchor| *a == anchor);
-                                // Reactive snippet: recomputed from the live
-                                // project diff cache, so the async path-scoped
-                                // fetch fills it in without remounting the row.
-                                let snip_state = snippet_state.clone();
-                                let snip_pid = snippet_pid.clone();
-                                let snip_host = region_host.clone();
-                                let snip_root = region_root.clone();
-                                let snip_path = entry.location.relative_path.clone();
-                                let snip_anchor = entry.location.anchor.clone();
-                                let snippet = move || {
-                                    snip_state.diff_contents.with(|diffs| {
-                                        let files = resolve_diff_files(
-                                            diffs,
-                                            &snip_host,
-                                            &snip_pid,
-                                            &snip_root,
-                                            &snip_path,
-                                        );
-                                        snippet_for_anchor(&files, &snip_path, &snip_anchor)
-                                    })
-                                };
+                                let row_host = host_id.clone();
+                                let row_pid = project_id.clone();
+                                let row_state = state.clone();
+                                let rows = entries.into_iter().map(|entry| {
+                                    review_comment_entry_row(
+                                        &row_state,
+                                        &row_host,
+                                        &row_pid,
+                                        draft,
+                                        composer,
+                                        is_draft,
+                                        entry,
+                                    )
+                                }).collect::<Vec<_>>();
                                 view! {
                                     <div
-                                        class="review-comments-entry"
-                                        data-test="review-comments-entry"
+                                        class="review-comments-root-group"
+                                        data-test="review-comments-root-group"
+                                        data-root=root.0.clone()
                                     >
-                                        <div class="review-comments-entry-label">
-                                            {entry.label.clone()}
+                                        <div class="review-comments-root-header">
+                                            <span class="review-comments-root-name">
+                                                {root_display_name(&root)}
+                                            </span>
+                                            <button
+                                                class="review-btn review-comments-open-root"
+                                                data-test="review-comments-open-root"
+                                                title="Open this root's full diff"
+                                                on:click=open_full_diff
+                                            >
+                                                "Open diff"
+                                            </button>
                                         </div>
-                                        {move || {
-                                            let lines = snippet();
-                                            (!lines.is_empty()).then(|| view! {
-                                            <pre class="review-comments-snippet">
-                                                {lines.into_iter().map(|line| {
-                                                    let cls = match line.marker {
-                                                        '+' => "review-snippet-line added",
-                                                        '-' => "review-snippet-line removed",
-                                                        _ => "review-snippet-line context",
-                                                    };
-                                                    let num = line
-                                                        .number
-                                                        .map(|n| n.to_string())
-                                                        .unwrap_or_default();
-                                                    view! {
-                                                        <div class=cls>
-                                                            <span class="review-snippet-num">{num}</span>
-                                                            <span class="review-snippet-marker">
-                                                                {line.marker.to_string()}
-                                                            </span>
-                                                            <span class="review-snippet-text">
-                                                                {line.text}
-                                                            </span>
-                                                        </div>
-                                                    }
-                                                }).collect::<Vec<_>>()}
-                                            </pre>
-                                            })
-                                        }}
-                                        <ThreadRegionFiltered
-                                            review_id=rid
-                                            root=region_root.clone()
-                                            relative_path=entry.location.relative_path.clone()
-                                            host_id=region_host.clone()
-                                            composer=composer
-                                            matcher=matcher
-                                            is_draft=is_draft
-                                        />
+                                        {rows}
                                     </div>
                                 }.into_any()
                             }
@@ -1971,6 +1955,82 @@ pub fn ReviewCommentsSurface(
             </Show>
         </div>
     }
+}
+
+/// Render one comment-surface entry row: its label, a reactive diff snippet
+/// pulled from the project diff cache, and the anchored comment thread. The
+/// snippet is computed reactively (not captured) so the async path-scoped
+/// diff fetch fills it in without remounting the row.
+fn review_comment_entry_row(
+    state: &AppState,
+    host_id: &str,
+    project_id: &ProjectId,
+    draft: Memo<Option<(String, ReviewId)>>,
+    composer: RwSignal<Option<ComposerState>>,
+    is_draft: Memo<bool>,
+    entry: CommentSurfaceEntry,
+) -> impl IntoView {
+    let Some((_, rid)) = draft.get_untracked() else {
+        return view! { <div></div> }.into_any();
+    };
+    let anchor = entry.location.anchor.clone();
+    let matcher: std::sync::Arc<dyn Fn(&ReviewAnchor) -> bool + Send + Sync> =
+        std::sync::Arc::new(move |a: &ReviewAnchor| *a == anchor);
+
+    let snip_state = state.clone();
+    let snip_pid = project_id.clone();
+    let snip_host = host_id.to_owned();
+    let snip_root = entry.location.root.clone();
+    let snip_path = entry.location.relative_path.clone();
+    let snip_anchor = entry.location.anchor.clone();
+    let snippet = move || {
+        snip_state.diff_contents.with(|diffs| {
+            let files = resolve_diff_files(diffs, &snip_host, &snip_pid, &snip_root, &snip_path);
+            snippet_for_anchor(&files, &snip_path, &snip_anchor)
+        })
+    };
+
+    let region_root = entry.location.root.clone();
+    let region_host = host_id.to_owned();
+    view! {
+        <div class="review-comments-entry" data-test="review-comments-entry">
+            <div class="review-comments-entry-label">{entry.label.clone()}</div>
+            {move || {
+                let lines = snippet();
+                (!lines.is_empty()).then(|| view! {
+                    <pre class="review-comments-snippet">
+                        {lines.into_iter().map(|line| {
+                            let cls = match line.marker {
+                                '+' => "review-snippet-line added",
+                                '-' => "review-snippet-line removed",
+                                _ => "review-snippet-line context",
+                            };
+                            let num = line.number.map(|n| n.to_string()).unwrap_or_default();
+                            view! {
+                                <div class=cls>
+                                    <span class="review-snippet-num">{num}</span>
+                                    <span class="review-snippet-marker">
+                                        {line.marker.to_string()}
+                                    </span>
+                                    <span class="review-snippet-text">{line.text}</span>
+                                </div>
+                            }
+                        }).collect::<Vec<_>>()}
+                    </pre>
+                })
+            }}
+            <ThreadRegionFiltered
+                review_id=rid
+                root=region_root
+                relative_path=entry.location.relative_path.clone()
+                host_id=region_host
+                composer=composer
+                matcher=matcher
+                is_draft=is_draft
+            />
+        </div>
+    }
+    .into_any()
 }
 
 /// Open (or focus) the whole-root unstaged diff surface for `project_id`'s
@@ -2164,11 +2224,11 @@ fn subscribe_backoff_ms(failures: u32) -> i32 {
 
 /// Public entry — used by the agent chat header's "Review changes" button.
 ///
-/// Reviews are always-on and root-scoped server-side, so this is primarily
-/// navigation: it opens/focuses the project's normal changed-file diff tab
-/// (the canonical inline review surface). The active root review's
-/// decorations resolve on that diff tab from the bootstrap/summary stream.
-/// If no Draft summary has arrived yet, it also fires a legacy
+/// Reviews are always-on and workspace-scoped server-side, so this is
+/// primarily navigation: it opens/focuses the project's normal changed-file
+/// diff tab (the canonical inline review surface). The active workspace
+/// review's decorations resolve on that diff tab from the bootstrap/summary
+/// stream. If no Draft summary has arrived yet, it also fires a legacy
 /// get-or-create `ReviewCreate` as a fallback so the surface is never blank
 /// against an older server. We never open a standalone `TabContent::Review`
 /// workbench — that surface has been retired.
@@ -2193,14 +2253,13 @@ pub fn create_review_for_active_agent(state: &AppState) {
     // Always land the user on the changed-file diff surface.
     open_changed_diff_for_project(state, &host_id, &project_id);
 
-    // Create only when there's an unstaged root to anchor the review to, and
-    // only when *that root* has no Draft yet. Active reviews are per
-    // `(project, root)`, so a Draft on a different root must not suppress
-    // creating one for the root we just opened.
-    if let Some(root) = review_root_for_project(state, &project_id)
-        && existing_draft_for_root(state, &project_id, &root).is_none()
+    // Create only when the project has reviewable changes and no active
+    // workspace Draft yet. One review spans all roots, so the check and the
+    // create are both project-scoped.
+    if review_root_for_project(state, &project_id).is_some()
+        && workspace_draft_for_project(state, &project_id).is_none()
     {
-        send_review_create(state, &host_id, &project_id, &root);
+        send_review_create(state, &host_id, &project_id);
     }
 }
 
@@ -2488,7 +2547,7 @@ mod wasm_tests {
     /// the given review pre-seeded. Returns the captured `AppState` so the
     /// test can drive signal updates that mirror dispatch events. `is_draft`
     /// derives reactively from the live review status, exactly as the
-    /// git-panel per-root hub wires it. The mount handle is leaked so the
+    /// git-panel workspace hub wires it. The mount handle is leaked so the
     /// view stays alive for the duration of the test.
     fn mount_sidebar(
         container: HtmlElement,
@@ -2882,51 +2941,43 @@ mod wasm_tests {
         );
     }
 
-    /// Fix 3: `existing_draft_for_root` is per `(project, root)`. A Draft on
-    /// root A must NOT be reported for root B — otherwise the fallback create
-    /// would wrongly skip creating a review for B.
+    /// Workspace model (replaces the old per-root `existing_draft_for_root`
+    /// test): `pick_workspace_draft` returns the single active Workspace draft
+    /// spanning all roots, and ignores legacy `Root`-scoped summaries (which
+    /// the server never emits as active).
     #[wasm_bindgen_test]
-    async fn existing_draft_lookup_is_root_scoped() {
-        let container = make_container();
-        let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(None));
-        let holder_for_mount = holder.clone();
-        let handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            // A single Draft summary anchored to root A only.
-            let summary = protocol::ReviewSummary {
-                id: ReviewId("rev-a".to_owned()),
-                root: ProjectRootPath("/repo-a".to_owned()),
-                status: ReviewStatus::Draft,
-                origin_session_id: SessionId("s".to_owned()),
-                origin_agent_id: AgentId("project-review:rev-a".to_owned()),
-                created_at_ms: 0,
-                updated_at_ms: 1,
-                user_comment_count: 0,
-                pending_suggestion_count: 0,
-                file_comment_counts: vec![],
-            };
-            state.review_summaries.update(|m| {
-                m.insert(ProjectId("proj-1".to_owned()), vec![summary]);
-            });
-            *holder_for_mount.borrow_mut() = Some(state.clone());
-            provide_context(state);
-            view! { <div></div> }
-        });
-        std::mem::forget(handle);
-        next_tick().await;
-
-        let state = holder.borrow().clone().unwrap();
-        let pid = ProjectId("proj-1".to_owned());
+    fn pick_workspace_draft_ignores_legacy_root_summaries() {
+        // A workspace draft is the active summary — found regardless of root.
+        let workspace = protocol::ReviewSummary {
+            id: ReviewId("rev-ws".to_owned()),
+            scope: protocol::ReviewSummaryScope::Workspace,
+            status: ReviewStatus::Draft,
+            origin_session_id: SessionId("s".to_owned()),
+            origin_agent_id: AgentId("project-review:rev-ws".to_owned()),
+            created_at_ms: 0,
+            updated_at_ms: 1,
+            user_comment_count: 0,
+            pending_suggestion_count: 0,
+            file_comment_counts: vec![],
+        };
         assert_eq!(
-            existing_draft_for_root(&state, &pid, &ProjectRootPath("/repo-a".to_owned())),
-            Some(ReviewId("rev-a".to_owned())),
-            "root A's own draft must be found"
+            pick_workspace_draft(std::slice::from_ref(&workspace)).map(|s| s.id.clone()),
+            Some(ReviewId("rev-ws".to_owned())),
+            "the active workspace draft must be found"
         );
+
+        // A legacy root-scoped summary is never an active workspace draft.
+        let legacy_root = protocol::ReviewSummary {
+            id: ReviewId("rev-root".to_owned()),
+            scope: protocol::ReviewSummaryScope::Root {
+                root: ProjectRootPath("/repo-a".to_owned()),
+            },
+            ..workspace.clone()
+        };
         assert_eq!(
-            existing_draft_for_root(&state, &pid, &ProjectRootPath("/repo-b".to_owned())),
+            pick_workspace_draft(std::slice::from_ref(&legacy_root)),
             None,
-            "root A's draft must NOT satisfy a lookup for root B"
+            "a legacy root-scoped summary must not be treated as the active draft"
         );
     }
 
@@ -2978,7 +3029,7 @@ mod wasm_tests {
                     pid.clone(),
                     vec![protocol::ReviewSummary {
                         id: rid.clone(),
-                        root: root.clone(),
+                        scope: protocol::ReviewSummaryScope::Workspace,
                         status: ReviewStatus::Draft,
                         origin_session_id: SessionId("s".to_owned()),
                         origin_agent_id: AgentId("a".to_owned()),
@@ -2996,7 +3047,6 @@ mod wasm_tests {
                 <ReviewCommentsSurface
                     host_id="h1".to_owned()
                     project_id=pid.clone()
-                    root=root.clone()
                 />
             }
         });
@@ -3087,6 +3137,49 @@ mod wasm_tests {
         );
     }
 
+    /// NEW: the workspace comments surface groups entries by root — a review
+    /// with comments in two roots renders one group per root, each tagged with
+    /// its `data-root`, and the entries land under their own root's group.
+    #[wasm_bindgen_test]
+    async fn comments_surface_groups_by_root() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let mut review = make_review();
+        // One comment in the default root (/repo)...
+        review.comments.push(comment_at_line(2, "in repo"));
+        // ...and one in a second root.
+        let mut other = comment_at_line(3, "in other");
+        other.id = ReviewCommentId("c-other".to_owned());
+        other.location.root = ProjectRootPath("/other".to_owned());
+        other.location.relative_path = "src/other.rs".to_owned();
+        review.comments.push(other);
+        let _ = mount_comments_surface(container.clone(), review, true);
+
+        next_tick().await;
+        next_tick().await;
+
+        let groups = container
+            .query_selector_all("[data-test=\"review-comments-root-group\"]")
+            .unwrap();
+        assert_eq!(
+            groups.length(),
+            2,
+            "a review spanning two roots must render one group per root"
+        );
+        let roots: Vec<String> = (0..groups.length())
+            .filter_map(|i| groups.item(i))
+            .filter_map(|el| {
+                el.dyn_into::<Element>()
+                    .ok()
+                    .and_then(|e| e.get_attribute("data-root"))
+            })
+            .collect();
+        assert!(
+            roots.iter().any(|r| r == "/repo") && roots.iter().any(|r| r == "/other"),
+            "both roots must have a group; got: {roots:?}"
+        );
+    }
+
     /// Recording bridge: captures the serialized envelope `line` of every
     /// `send_host_line` invoke into `window.__sent_lines` so a test can assert
     /// on the exact frame payloads that went out.
@@ -3157,7 +3250,7 @@ mod wasm_tests {
                     ProjectId("proj-1".to_owned()),
                     vec![protocol::ReviewSummary {
                         id: ReviewId("rev-1".to_owned()),
-                        root: root_path(),
+                        scope: protocol::ReviewSummaryScope::Workspace,
                         status: ReviewStatus::Draft,
                         origin_session_id: SessionId("s".to_owned()),
                         origin_agent_id: AgentId("a".to_owned()),
@@ -3174,7 +3267,6 @@ mod wasm_tests {
                 <ReviewCommentsSurface
                     host_id="h1".to_owned()
                     project_id=ProjectId("proj-1".to_owned())
-                    root=root_path()
                 />
             }
         });

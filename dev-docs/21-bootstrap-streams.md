@@ -42,7 +42,9 @@ Sent as seq `0` on `/project/<project_id>`. It contains:
 - the `Project`
 - initial file list
 - initial git status
-- review summaries for that project
+- review summaries for that project. Review is workspace-scoped, so this is
+  one active `ReviewSummary` with `scope = ReviewSummaryScope::Workspace` per
+  project, not one summary per root.
 
 Implementation note: the previous initial review-summary replay was emitted on
 project streams (`ProjectEventPayload::ReviewListChanged` from the host's

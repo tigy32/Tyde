@@ -532,18 +532,13 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                                     TabContent::Comments {
                                         host_id,
                                         project_id,
-                                        root,
-                                    } => Some((
-                                        host_id.clone(),
-                                        project_id.clone(),
-                                        root.clone(),
-                                    )),
+                                    } => Some((host_id.clone(), project_id.clone())),
                                     _ => None,
                                 })
                         });
                         match resolved {
-                            Some((host_id, project_id, root)) => {
-                                view! { <ReviewCommentsSurface host_id=host_id project_id=project_id root=root /> }.into_any()
+                            Some((host_id, project_id)) => {
+                                view! { <ReviewCommentsSurface host_id=host_id project_id=project_id /> }.into_any()
                             }
                             None => view! { <div></div> }.into_any(),
                         }

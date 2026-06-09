@@ -402,7 +402,21 @@ Important:
   metadata-only changes such as mode changes, or for empty untracked text files;
   an empty hunk list does not mean the file is clean
 
-### 6.5 `project_error`
+
+### 6.5 `project_event` review summaries
+
+`ProjectBootstrapPayload.review_summaries` and later
+`ProjectEventPayload::ReviewListChanged` payloads carry the active inline
+review ids for the project. Review is workspace-scoped: the active surface emits
+one `ReviewSummary` per project with `scope = ReviewSummaryScope::Workspace`,
+not one summary per root. Root-scoped summaries are legacy/direct only and must
+not be treated as the active project review surface.
+
+`ReviewSummary.file_comment_counts` entries carry both `root` and
+`relative_path`; consumers must use the pair because multiple roots can contain
+the same relative path.
+
+### 6.6 `project_error`
 
 Reports project-stream user-intent failures and subscription failures that occur
 after the stream is valid and established.
@@ -615,4 +629,6 @@ for browse, read, status, diff, and staging.
 
 ---
 
-Protocol v4 note: every project stream starts with `project_bootstrap` seq 0 containing the project, initial file list, initial git status, and review summaries. Granular project events are live deltas after that bootstrap.
+Protocol v4 note: every project stream starts with `project_bootstrap` seq 0
+containing the project, initial file list, initial git status, and review
+summaries. Granular project events are live deltas after that bootstrap.

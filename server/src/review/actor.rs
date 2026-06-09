@@ -10,8 +10,8 @@ use protocol::{
     ReviewComment, ReviewCommentId, ReviewCommentSource, ReviewDiffSelection, ReviewDiffSide,
     ReviewErrorCode, ReviewErrorContext, ReviewErrorPayload, ReviewEventPayload,
     ReviewFileCommentCount, ReviewId, ReviewLocation, ReviewStatus, ReviewSubmitTarget,
-    ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState, SendMessagePayload,
-    StreamPath,
+    ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState, ReviewSummaryScope,
+    SendMessagePayload, StreamPath,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -658,6 +658,22 @@ impl ReviewActor {
             .refresh_diffs_or_error(Some(&conn), context.clone())
             .await
         {
+            return;
+        }
+        if diff_is_clean(&self.review.diffs) {
+            tracing::info!(
+                review_id = %self.review.id,
+                conn = %conn,
+                "AI review skipped because workspace has no changed files"
+            );
+            self.send_error(
+                Some(&conn),
+                ReviewErrorCode::InvalidStatus,
+                "nothing to review: workspace has no unstaged changes".to_owned(),
+                false,
+                context,
+            )
+            .await;
             return;
         }
 
@@ -1561,7 +1577,7 @@ fn read_review_diffs(
     selection: &ReviewDiffSelection,
 ) -> Result<Vec<ProjectGitDiffPayload>, String> {
     match selection {
-        ReviewDiffSelection::AllUncommitted => {
+        ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => {
             let mut diffs = Vec::new();
             for root in &project.roots {
                 let payload = ProjectReadDiffPayload {
@@ -1730,7 +1746,7 @@ pub(crate) fn summary_for_review(review: &Review) -> protocol::ReviewSummary {
     let file_comment_counts = review_file_comment_counts(review);
     protocol::ReviewSummary {
         id: review.id.clone(),
-        root: review_summary_root(review).unwrap_or_default(),
+        scope: review_summary_scope(review),
         status: review.status.clone(),
         origin_session_id: review.origin_session_id.clone(),
         origin_agent_id: review.origin_agent_id.clone(),
@@ -1743,11 +1759,15 @@ pub(crate) fn summary_for_review(review: &Review) -> protocol::ReviewSummary {
 }
 
 pub(crate) fn review_file_comment_counts(review: &Review) -> Vec<ReviewFileCommentCount> {
-    let mut counts = BTreeMap::<String, ReviewFileCommentCount>::new();
+    let mut counts = BTreeMap::<(ProjectRootPath, String), ReviewFileCommentCount>::new();
     for comment in &review.comments {
         let count = counts
-            .entry(comment.location.relative_path.clone())
+            .entry((
+                comment.location.root.clone(),
+                comment.location.relative_path.clone(),
+            ))
             .or_insert_with(|| ReviewFileCommentCount {
+                root: comment.location.root.clone(),
                 relative_path: comment.location.relative_path.clone(),
                 ..ReviewFileCommentCount::default()
             });
@@ -1765,8 +1785,12 @@ pub(crate) fn review_file_comment_counts(review: &Review) -> Vec<ReviewFileComme
             continue;
         }
         let count = counts
-            .entry(suggestion.location.relative_path.clone())
+            .entry((
+                suggestion.location.root.clone(),
+                suggestion.location.relative_path.clone(),
+            ))
             .or_insert_with(|| ReviewFileCommentCount {
+                root: suggestion.location.root.clone(),
                 relative_path: suggestion.location.relative_path.clone(),
                 ..ReviewFileCommentCount::default()
             });
@@ -1775,13 +1799,11 @@ pub(crate) fn review_file_comment_counts(review: &Review) -> Vec<ReviewFileComme
     counts.into_values().collect()
 }
 
-pub(crate) fn review_summary_root(review: &Review) -> Option<ProjectRootPath> {
+pub(crate) fn review_summary_scope(review: &Review) -> ReviewSummaryScope {
     match &review.selection {
-        ReviewDiffSelection::Root { root, .. } => Some(root.clone()),
-        ReviewDiffSelection::AllUncommitted => match review.diffs.as_slice() {
-            [diff] => Some(diff.root.clone()),
-            _ => None,
-        },
+        ReviewDiffSelection::Workspace { .. } => ReviewSummaryScope::Workspace,
+        ReviewDiffSelection::Root { root, .. } => ReviewSummaryScope::Root { root: root.clone() },
+        ReviewDiffSelection::AllUncommitted => ReviewSummaryScope::Workspace,
     }
 }
 

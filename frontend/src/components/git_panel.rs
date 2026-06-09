@@ -9,9 +9,9 @@ use crate::state::{AppState, DiffViewState, root_display_name};
 
 use protocol::{
     FrameKind, ProjectDiffScope, ProjectDiscardFilePayload, ProjectGitChangeKind,
-    ProjectGitCommitPayload, ProjectGitFileStatus, ProjectId, ProjectPath, ProjectReadDiffPayload,
+    ProjectGitCommitPayload, ProjectGitFileStatus, ProjectPath, ProjectReadDiffPayload,
     ProjectRootGitStatus, ProjectRootPath, ProjectStageFilePayload, ProjectUnstageFilePayload,
-    ReviewId, ReviewStatus, StreamPath,
+    ReviewActionPayload, ReviewId, StreamPath,
 };
 
 #[component]
@@ -46,6 +46,10 @@ pub fn GitPanel() -> impl IntoView {
                 </span>
             </div>
             <div class="gp-content">
+                // One workspace-level review hub for the whole project,
+                // rendered once (not per root). Renders nothing when there is
+                // no active workspace draft for the project.
+                <WorkspaceReviewHub />
                 {move || {
                     match git_roots.get() {
                         Some(roots) => {
@@ -71,84 +75,49 @@ pub fn GitPanel() -> impl IntoView {
     }
 }
 
-/// Per-root always-on review controls. Finds the Draft review for
-/// `(project_id, root)` in `review_summaries`, subscribes to it, and
-/// surfaces compact hub controls (AI Review button, live counts, Submit).
-/// No "Start review" or "Cancel" buttons — reviews are always-on and
-/// managed by the server.
+/// The single workspace-level review hub for the active project. One review
+/// spans every root, so this renders exactly once (not per root). It finds
+/// the project's one active workspace Draft review, subscribes to it, shows
+/// workspace-wide counts, a primary "Review all changes across the
+/// workspace" action (AI review across every root), a "Comments" button, and
+/// the shared `ReviewSidebar` (configurable AI reviewer / Submit / Clear).
+/// Renders nothing when the project has no active workspace draft. A draft can
+/// exist with no reviewable changes (e.g. staged-only edits), so the AI-review
+/// actions are independently gated on there being a dirty file in some root.
 #[component]
-fn RootReviewControls(
-    host_id: String,
-    project_id: ProjectId,
-    root: ProjectRootPath,
-) -> impl IntoView {
+fn WorkspaceReviewHub() -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    // Find the Draft review for this (project_id, root).
-    let find_state = state.clone();
-    let find_root = root.clone();
-    let find_pid = project_id.clone();
-    let draft: Memo<Option<(String, ReviewId)>> = {
-        let host = host_id.clone();
-        Memo::new(move |_| {
-            find_state.review_summaries.with(|map| {
-                map.get(&find_pid).and_then(|summaries| {
-                    summaries
-                        .iter()
-                        .filter(|s| s.root == find_root && matches!(s.status, ReviewStatus::Draft))
-                        .max_by_key(|s| s.updated_at_ms)
-                        .map(|s| (host.clone(), s.id.clone()))
-                })
+    // Resolve the project's single workspace Draft review id, reactively.
+    let target_state = state.clone();
+    let target: Memo<Option<(String, ReviewId)>> = Memo::new(move |_| {
+        let ap = target_state.active_project.get()?;
+        target_state.review_summaries.with(|map| {
+            map.get(&ap.project_id).and_then(|sums| {
+                crate::components::review_view::pick_workspace_draft(sums)
+                    .map(|s| (ap.host_id.clone(), s.id.clone()))
             })
         })
-    };
+    });
 
-    let hub_pid = project_id.clone();
-    let hub_root = root.clone();
+    // Keep the review subscribed so `ReviewSidebar` can mount with the full
+    // record. The shared helper retries on send failure / record loss /
+    // reconnect, and resubscribes when the draft id changes.
+    crate::components::review_view::subscribe_review_reactive(&state, target);
+
     view! {
-        {move || draft.get().map(|(h, rid)| view! {
-            <RootReviewHub
-                host_id=h
-                project_id=hub_pid.clone()
-                root=hub_root.clone()
-                review_id=rid
-            />
+        {move || target.get().map(|(host, rid)| view! {
+            <WorkspaceReviewHubInner host_id=host review_id=rid />
         })}
     }
 }
 
-/// Draft-review hub for a single root inside the git panel. Subscribes to
-/// the review, shows live counts, an "Open changes" button, and the shared
-/// `ReviewSidebar` (AI reviewer / Submit) once the record arrives.
+/// Hub body, mounted once a workspace draft id is resolved.
 #[component]
-fn RootReviewHub(
-    host_id: String,
-    project_id: ProjectId,
-    root: ProjectRootPath,
-    review_id: ReviewId,
-) -> impl IntoView {
+fn WorkspaceReviewHubInner(host_id: String, review_id: ReviewId) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    // The "Open changes" button opens *this* root's unstaged diff, not the
-    // project's first dirty root — multi-root projects must land on the root
-    // whose hub was clicked.
-    let open_state = state.clone();
-    let open_host = host_id.clone();
-    let open_pid = project_id.clone();
-    let open_root = root.clone();
-
-    // Keep the review subscribed so `ReviewSidebar` can mount with the
-    // full record. The shared helper retries on send failure / record
-    // loss / reconnect.
-    {
-        let host = host_id.clone();
-        let rid = review_id.clone();
-        let target: Memo<Option<(String, ReviewId)>> =
-            Memo::new(move |_| Some((host.clone(), rid.clone())));
-        crate::components::review_view::subscribe_review_reactive(&state, target);
-    }
-
-    // Live counts: prefer the full record, fall back to the summary list.
+    // Live workspace counts: prefer the full record, fall back to the summary.
     let counts_state = state.clone();
     let counts_rid = review_id.clone();
     let counts: Memo<(u32, u32)> = Memo::new(move |_| {
@@ -192,15 +161,137 @@ fn RootReviewHub(
         })
     });
 
+    // Whether the workspace has any reviewable (unstaged or untracked) change
+    // in any root, read straight from the git status the panel already
+    // renders. Reviews track unstaged state, so staged-only files don't count
+    // — they'd give the AI reviewer an empty diff. Reactive: enables/disables
+    // as git status changes. No cache; pure projection of `git_status`.
+    let changes_state = state.clone();
+    let has_reviewable_changes: Memo<bool> = Memo::new(move |_| {
+        let Some(ap) = changes_state.active_project.get() else {
+            return false;
+        };
+        changes_state.git_status.with(|m| {
+            m.get(&ap.project_id)
+                .map(|roots| {
+                    roots
+                        .iter()
+                        .any(|r| r.files.iter().any(|f| f.unstaged.is_some() || f.untracked))
+                })
+                .unwrap_or(false)
+        })
+    });
+
+    // "Review all changes across the workspace": the primary one-click AI
+    // review over every root. The server spawns the single workspace AI
+    // reviewer with `project.roots` as context. Backend defaults to the
+    // host's `default_backend` (None on the wire). Gated through the shared
+    // `start_ai` action gate so it and the sidebar's configurable Run AI
+    // can't double-spawn.
+    let review_all_state = state.clone();
+    let review_all_host = host_id.clone();
+    let review_all_rid = review_id.clone();
+    let ai_running: Memo<bool> = {
+        let s = state.clone();
+        let rid = review_id.clone();
+        Memo::new(move |_| {
+            s.reviews.with(|m| {
+                m.get(&rid)
+                    .map(|r| {
+                        matches!(
+                            r.ai_reviewer.status,
+                            protocol::ReviewAiReviewerStatus::Running
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+        })
+    };
+    let backend_available: Memo<bool> = {
+        let s = state.clone();
+        let host = host_id.clone();
+        Memo::new(move |_| {
+            s.host_settings_by_host.with(|m| {
+                m.get(&host)
+                    .map(|hs| hs.default_backend.is_some() || !hs.enabled_backends.is_empty())
+                    .unwrap_or(false)
+            })
+        })
+    };
+    let start_pending: Memo<bool> = {
+        let s = state.clone();
+        let rid = review_id.clone();
+        Memo::new(move |_| {
+            s.review_action_pending
+                .with(|m| m.get(&rid).map(|g| g.start_ai).unwrap_or(false))
+        })
+    };
+    let review_all_disabled = move || {
+        !is_draft.get()
+            || !has_reviewable_changes.get()
+            || ai_running.get()
+            || !backend_available.get()
+            || start_pending.get()
+    };
+    let on_review_all = move |_| {
+        let rid = review_all_rid.clone();
+        let host = review_all_host.clone();
+        let mut claimed = false;
+        review_all_state.review_action_pending.update(|map| {
+            let gate = map.entry(rid.clone()).or_default();
+            if !gate.start_ai {
+                gate.start_ai = true;
+                claimed = true;
+            }
+        });
+        if !claimed {
+            return;
+        }
+        let fail_state = review_all_state.clone();
+        let fail_rid = rid.clone();
+        spawn_local(async move {
+            let stream = StreamPath(format!("/review/{}", rid.0));
+            let payload = ReviewActionPayload::StartAiReview {
+                backend_kind: None,
+                cost_hint: None,
+                instructions: None,
+            };
+            if let Err(e) = send_frame(&host, stream, FrameKind::ReviewAction, &payload).await {
+                log::error!("review.review_all.send_err review={fail_rid} error={e}");
+                fail_state.review_action_pending.update(|map| {
+                    if let Some(gate) = map.get_mut(&fail_rid) {
+                        gate.start_ai = false;
+                        if gate.is_idle() {
+                            map.remove(&fail_rid);
+                        }
+                    }
+                });
+            }
+        });
+    };
+
+    let comments_state = state.clone();
+    let comments_host = host_id.clone();
+    let on_comments = move |_| {
+        let Some(ap) = comments_state.active_project.get_untracked() else {
+            return;
+        };
+        crate::components::review_view::open_comments_for_project(
+            &comments_state,
+            &comments_host,
+            &ap.project_id,
+        );
+    };
+
     let sidebar_state = state.clone();
     let sidebar_host = host_id.clone();
     let sidebar_rid = review_id.clone();
 
     view! {
-        <div class="gp-review-hub" data-test="gp-root-review-hub">
+        <div class="gp-review-hub" data-test="gp-workspace-review-hub">
             <div class="gp-review-hub-header">
-                <span class="gp-review-hub-title">"Review"</span>
-                <span class="gp-review-counts" data-test="gp-root-review-counts">
+                <span class="gp-review-hub-title">"Workspace review"</span>
+                <span class="gp-review-counts" data-test="gp-workspace-review-counts">
                     {move || {
                         let (c, s) = counts.get();
                         format!(
@@ -211,17 +302,19 @@ fn RootReviewHub(
                 </span>
             </div>
             <button
+                class="gp-review-all-btn primary"
+                data-test="gp-workspace-review-all"
+                title="Run an AI review over every changed file across the workspace"
+                disabled=review_all_disabled
+                on:click=on_review_all
+            >
+                "Review all changes across the workspace"
+            </button>
+            <button
                 class="gp-review-open-btn"
-                data-test="gp-root-review-open"
-                title="Open the review comments for this root"
-                on:click=move |_| {
-                    crate::components::review_view::open_comments_for_root(
-                        &open_state,
-                        &open_host,
-                        &open_pid,
-                        &open_root,
-                    )
-                }
+                data-test="gp-workspace-review-comments"
+                title="Open the workspace review comments"
+                on:click=on_comments
             >
                 "Comments"
             </button>
@@ -239,6 +332,7 @@ fn RootReviewHub(
                             host_id=sidebar_host.clone()
                             review_id=sidebar_rid.clone()
                             is_draft=is_draft
+                            can_run_ai=has_reviewable_changes
                         />
                     }.into_any(),
                     None => view! { <div></div> }.into_any(),
@@ -300,25 +394,14 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
 
     let commit_message = RwSignal::new(String::new());
 
-    // Per-root review controls: binds to (project_id, root) from the active project.
     let state = expect_context::<AppState>();
-    let review_root = root_path.clone();
-    let review_project_signal: Memo<Option<(String, ProjectId, ProjectRootPath)>> =
-        Memo::new(move |_| {
-            state.active_project.get().map(|ap| {
-                (
-                    ap.host_id.clone(),
-                    ap.project_id.clone(),
-                    review_root.clone(),
-                )
-            })
-        });
 
-    // Per-file review-comment counts for this root's draft review. Drives the
-    // "(N)" badges on the file rows. Prefers the server-computed per-file
-    // counts on the draft `ReviewSummary` (available without a full review
-    // subscribe); falls back to computing from the loaded `Review` when no
-    // summary is present yet.
+    // Per-file review-comment badges for this root, sourced from the project's
+    // single workspace draft review. Prefers the server-computed per-file
+    // counts on the workspace `ReviewSummary` (available without a full review
+    // subscribe), narrowed to this root via `ReviewFileCommentCount.root`;
+    // falls back to computing from the loaded `Review` (also root-filtered)
+    // when the summary carries no per-file counts yet.
     let counts_state = state.clone();
     let counts_root = root_path.clone();
     let file_counts: Memo<HashMap<String, u32>> = Memo::new(move |_| {
@@ -327,27 +410,31 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
         };
         let summary = counts_state.review_summaries.with(|map| {
             map.get(&ap.project_id).and_then(|summaries| {
-                summaries
-                    .iter()
-                    .filter(|s| s.root == counts_root && matches!(s.status, ReviewStatus::Draft))
-                    .max_by_key(|s| s.updated_at_ms)
+                crate::components::review_view::pick_workspace_draft(summaries)
                     .map(|s| (s.id.clone(), s.file_comment_counts.clone()))
             })
         });
         let Some((rid, file_comment_counts)) = summary else {
             return HashMap::new();
         };
-        if !file_comment_counts.is_empty() {
-            return file_comment_counts
+        let this_root: Vec<_> = file_comment_counts
+            .iter()
+            .filter(|f| f.root == counts_root)
+            .collect();
+        if !this_root.is_empty() {
+            return this_root
                 .iter()
                 .map(|f| (f.relative_path.clone(), f.total_count()))
                 .collect();
         }
-        // Summary carries no per-file counts (older server, or counts not yet
-        // populated) — fall back to the loaded review record if present.
-        counts_state
-            .reviews
-            .with(|m| m.get(&rid).map(per_file_comment_counts).unwrap_or_default())
+        // Summary carries no per-file counts for this root (older server, or
+        // counts not yet populated) — fall back to the loaded review record,
+        // filtered to this root.
+        counts_state.reviews.with(|m| {
+            m.get(&rid)
+                .map(|r| per_file_comment_counts(r, &counts_root))
+                .unwrap_or_default()
+        })
     });
 
     view! {
@@ -359,9 +446,6 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
                     <span class="gp-root-ahead-behind">{ab}</span>
                 })}
             </div>
-            {move || review_project_signal.get().map(|(host_id, project_id, root)| view! {
-                <RootReviewControls host_id=host_id project_id=project_id root=root />
-            })}
             <Show when=move || has_staged>
                 <div class="gp-commit-area">
                     <textarea
@@ -610,22 +694,28 @@ fn GitFileSection(
     }
 }
 
-/// Per-file review-comment counts keyed by `relative_path`. Counts every
-/// comment (human comments and accepted AI suggestions, which the server
-/// promotes into `comments`) plus pending AI suggestions. Rejected
-/// suggestions are excluded — they are neither `Pending` nor promoted to a
-/// comment.
+/// Per-file review-comment counts for one root, keyed by `relative_path`.
+/// Counts every comment (human comments and accepted AI suggestions, which
+/// the server promotes into `comments`) plus pending AI suggestions whose
+/// location is in `root`. Rejected suggestions are excluded — they are
+/// neither `Pending` nor promoted to a comment.
 ///
-/// Computed from the loaded `Review` as a fallback until `ReviewSummary`
-/// carries per-file counts directly; swapping to the summary field is a
-/// single change at the call site in `GitRootSection`.
-fn per_file_comment_counts(review: &protocol::Review) -> HashMap<String, u32> {
+/// The workspace review spans every root, so locations are filtered by
+/// `ReviewLocation.root` to keep each root's badges separate. Computed from
+/// the loaded `Review` as a fallback until `ReviewSummary` carries per-file
+/// counts directly.
+fn per_file_comment_counts(
+    review: &protocol::Review,
+    root: &ProjectRootPath,
+) -> HashMap<String, u32> {
     let mut counts: HashMap<String, u32> = HashMap::new();
     for c in &review.comments {
-        *counts.entry(c.location.relative_path.clone()).or_insert(0) += 1;
+        if c.location.root == *root {
+            *counts.entry(c.location.relative_path.clone()).or_insert(0) += 1;
+        }
     }
     for s in &review.suggestions {
-        if matches!(s.state, protocol::ReviewSuggestionState::Pending) {
+        if matches!(s.state, protocol::ReviewSuggestionState::Pending) && s.location.root == *root {
             *counts.entry(s.location.relative_path.clone()).or_insert(0) += 1;
         }
     }
@@ -849,7 +939,7 @@ mod wasm_tests {
         AgentId, Envelope, FrameKind, Project, ProjectBootstrapPayload, ProjectEventPayload,
         ProjectFileListPayload, ProjectGitChangeKind, ProjectGitFileStatus,
         ProjectGitStatusPayload, ProjectId, ProjectRootGitStatus, ReviewId, ReviewStatus,
-        ReviewSummary, SessionId,
+        ReviewSummary, ReviewSummaryScope, SessionId,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -877,19 +967,7 @@ mod wasm_tests {
     }
 
     fn changed_root() -> ProjectRootGitStatus {
-        ProjectRootGitStatus {
-            root: ProjectRootPath("/repo".to_owned()),
-            branch: Some("main".to_owned()),
-            ahead: 0,
-            behind: 0,
-            clean: false,
-            files: vec![ProjectGitFileStatus {
-                relative_path: "src/foo.rs".to_owned(),
-                staged: None,
-                unstaged: Some(ProjectGitChangeKind::Modified),
-                untracked: false,
-            }],
-        }
+        root_with_unstaged("/repo")
     }
 
     fn root_with_unstaged(path: &str) -> ProjectRootGitStatus {
@@ -908,10 +986,11 @@ mod wasm_tests {
         }
     }
 
+    /// The single active workspace draft summary the server emits per project.
     fn draft_summary() -> ReviewSummary {
         ReviewSummary {
             id: ReviewId("rev-1".to_owned()),
-            root: ProjectRootPath("/repo".to_owned()),
+            scope: ReviewSummaryScope::Workspace,
             status: ReviewStatus::Draft,
             origin_session_id: SessionId("s".to_owned()),
             origin_agent_id: AgentId("project-review:rev-1".to_owned()),
@@ -930,7 +1009,9 @@ mod wasm_tests {
             project_id: ProjectId("proj-1".to_owned()),
             origin_agent_id: AgentId("project-review:rev-1".to_owned()),
             origin_session_id: SessionId("s".to_owned()),
-            selection: ReviewDiffSelection::AllUncommitted,
+            selection: ReviewDiffSelection::Workspace {
+                scope: ProjectDiffScope::Unstaged,
+            },
             status: ReviewStatus::Draft,
             diffs: vec![],
             comments: vec![ReviewComment {
@@ -987,8 +1068,8 @@ mod wasm_tests {
         holder
     }
 
-    /// No draft review + uncommitted changes ⇒ the git panel does NOT show a
-    /// per-root review hub (there is no draft to bind to).
+    /// No draft review + uncommitted changes ⇒ the git panel does NOT show the
+    /// workspace review hub (there is no active workspace draft to bind to).
     #[wasm_bindgen_test]
     async fn no_draft_shows_review_changes_control() {
         let container = make_container();
@@ -997,42 +1078,54 @@ mod wasm_tests {
 
         assert!(
             container
-                .query_selector("[data-test=\"gp-root-review-hub\"]")
+                .query_selector("[data-test=\"gp-workspace-review-hub\"]")
                 .unwrap()
                 .is_none(),
-            "per-root review hub must not show without a draft review"
+            "workspace review hub must not show without an active draft review"
         );
     }
 
-    /// A Draft review ⇒ the git panel shows a per-root review hub with live counts.
+    /// REWRITTEN for the workspace model (behavior change approved): a Draft
+    /// review ⇒ the git panel shows exactly ONE workspace review hub (not one
+    /// per root) with the workspace-wide comment count.
     #[wasm_bindgen_test]
     async fn draft_shows_review_hub_with_counts() {
         let container = make_container();
         let _ = mount_git_panel(container.clone(), true);
         next_tick().await;
 
-        assert!(
-            container
-                .query_selector("[data-test=\"gp-root-review-hub\"]")
-                .unwrap()
-                .is_some(),
-            "expected the per-root review hub with a draft review present"
+        // Exactly one workspace hub for the project.
+        let hubs = container
+            .query_selector_all("[data-test=\"gp-workspace-review-hub\"]")
+            .unwrap();
+        assert_eq!(
+            hubs.length(),
+            1,
+            "exactly one workspace review hub must render for the project"
         );
         let counts = container
-            .query_selector("[data-test=\"gp-root-review-counts\"]")
+            .query_selector("[data-test=\"gp-workspace-review-counts\"]")
             .unwrap()
-            .expect("counts element present");
+            .expect("workspace counts element present");
         let text = counts.text_content().unwrap_or_default();
         assert!(
             text.contains("1 comment"),
-            "expected the summary comment count in the hub; got: {text}"
+            "expected the workspace comment count in the hub; got: {text}"
+        );
+        // The primary "Review all changes across the workspace" action exists.
+        assert!(
+            container
+                .query_selector("[data-test=\"gp-workspace-review-all\"]")
+                .unwrap()
+                .is_some(),
+            "the workspace hub must offer the Review-all primary action"
         );
     }
 
     /// A file with review comments shows a per-file "(N)" badge in the file
-    /// list. `mount_git_panel` seeds one User comment on `src/foo.rs`; with
-    /// the draft summary carrying no per-file counts, the badge derives from
-    /// the loaded review record (the fallback path).
+    /// list. `mount_git_panel` seeds one User comment on `src/foo.rs` in
+    /// `/repo`; with the workspace summary carrying no per-file counts, the
+    /// badge derives from the loaded review record, filtered to this root.
     #[wasm_bindgen_test]
     async fn file_row_shows_comment_count_badge() {
         let container = make_container();
@@ -1068,14 +1161,12 @@ mod wasm_tests {
         );
     }
 
-    /// Multi-root: clicking root B's "Comments" opens root B's comments
-    /// surface, not the project's first dirty root (A). Regression for the hub
-    /// dropping the root and falling back to a project-first-root opener.
+    /// REWRITTEN for the workspace model (behavior change approved): a
+    /// multi-root project renders exactly ONE workspace review hub (not one
+    /// per root), and clicking its "Comments" button opens the project-level
+    /// (workspace) comments surface — there is no longer a per-root opener.
     #[wasm_bindgen_test]
-    async fn root_hub_comments_opens_clicked_root() {
-        // Opening the comments surface only pushes a tab (no diff fetch), but
-        // keep the recording bridge so any incidental invoke resolves cleanly
-        // in headless Chrome.
+    async fn workspace_hub_comments_opens_project_comments() {
         stub_recording_bridge();
         let container = make_container();
         let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
@@ -1086,30 +1177,19 @@ mod wasm_tests {
                 host_id: "h1".to_owned(),
                 project_id: ProjectId("proj-1".to_owned()),
             }));
-            // Two dirty roots; A is first, so a first-root opener would pick A.
+            // Two dirty roots in the project.
             state.git_status.update(|m| {
                 m.insert(
                     ProjectId("proj-1".to_owned()),
                     vec![root_with_unstaged("/repo-a"), root_with_unstaged("/repo-b")],
                 );
             });
-            // A Draft review only for root B ⇒ only B's hub (and button) render.
-            let mut summary = draft_summary();
-            summary.id = ReviewId("rev-b".to_owned());
-            summary.root = ProjectRootPath("/repo-b".to_owned());
+            // One active workspace draft spanning both roots.
             state.review_summaries.update(|m| {
-                m.insert(ProjectId("proj-1".to_owned()), vec![summary]);
+                m.insert(ProjectId("proj-1".to_owned()), vec![draft_summary()]);
             });
-            // Seed the full record so the hub doesn't network-subscribe.
-            let mut review = full_review();
-            review.id = ReviewId("rev-b".to_owned());
-            review.selection = protocol::ReviewDiffSelection::Root {
-                root: ProjectRootPath("/repo-b".to_owned()),
-                scope: protocol::ProjectDiffScope::Unstaged,
-                path: None,
-            };
             state.reviews.update(|m| {
-                m.insert(ReviewId("rev-b".to_owned()), review);
+                m.insert(ReviewId("rev-1".to_owned()), full_review());
             });
             *holder_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
@@ -1118,34 +1198,216 @@ mod wasm_tests {
         std::mem::forget(handle);
         next_tick().await;
 
-        // Only root B has a draft, so there is exactly one Comments button.
+        // Exactly one workspace hub even with two roots.
+        let hubs = container
+            .query_selector_all("[data-test=\"gp-workspace-review-hub\"]")
+            .unwrap();
+        assert_eq!(
+            hubs.length(),
+            1,
+            "a multi-root project must render exactly one workspace review hub"
+        );
+
         let open_btn = container
-            .query_selector("[data-test=\"gp-root-review-open\"]")
+            .query_selector("[data-test=\"gp-workspace-review-comments\"]")
             .unwrap()
-            .expect("root B's Comments button must render");
+            .expect("the workspace hub's Comments button must render");
         open_btn.dyn_ref::<HtmlElement>().unwrap().click();
         next_tick().await;
 
         let state = holder.borrow().clone().unwrap();
         let opened = state.center_zone.with_untracked(|cz| {
             cz.tabs.iter().find_map(|t| match &t.content {
-                TabContent::Comments { root, .. } => Some(root.clone()),
+                TabContent::Comments { project_id, .. } => Some(project_id.clone()),
                 _ => None,
             })
         });
-        let root = opened.expect("a comments tab must open on Comments");
+        let pid = opened.expect("a workspace comments tab must open on Comments");
         assert_eq!(
-            root,
-            ProjectRootPath("/repo-b".to_owned()),
-            "Comments must open the clicked root (B), not the first dirty root (A)"
+            pid,
+            ProjectId("proj-1".to_owned()),
+            "Comments must open the project's workspace comments surface"
+        );
+    }
+
+    /// NEW: the workspace hub's primary "Review all changes across the
+    /// workspace" action targets the single workspace review id (sends
+    /// `StartAiReview` on `/review/<workspace_id>`), regardless of how many
+    /// roots the project has.
+    #[wasm_bindgen_test]
+    async fn review_all_targets_workspace_review() {
+        record_bridge();
+        let container = make_container();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "h1".to_owned(),
+                project_id: ProjectId("proj-1".to_owned()),
+            }));
+            state.connection_statuses.update(|m| {
+                m.insert("h1".to_owned(), crate::state::ConnectionStatus::Connected);
+            });
+            // Multi-root project, one workspace draft, a backend available so
+            // the Review-all action is enabled.
+            state.git_status.update(|m| {
+                m.insert(
+                    ProjectId("proj-1".to_owned()),
+                    vec![root_with_unstaged("/repo-a"), root_with_unstaged("/repo-b")],
+                );
+            });
+            state.review_summaries.update(|m| {
+                m.insert(ProjectId("proj-1".to_owned()), vec![draft_summary()]);
+            });
+            state.reviews.update(|m| {
+                m.insert(ReviewId("rev-1".to_owned()), full_review());
+            });
+            state.host_settings_by_host.update(|m| {
+                m.insert(
+                    "h1".to_owned(),
+                    protocol::HostSettings {
+                        enabled_backends: vec![protocol::BackendKind::Codex],
+                        default_backend: Some(protocol::BackendKind::Codex),
+                        enable_mobile_connections: false,
+                        mobile_broker_url: None,
+                        tyde_debug_mcp_enabled: false,
+                        tyde_agent_control_mcp_enabled: false,
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <GitPanel /> }
+        });
+        std::mem::forget(handle);
+        next_tick().await;
+        next_tick().await;
+
+        let btn = container
+            .query_selector("[data-test=\"gp-workspace-review-all\"]")
+            .unwrap()
+            .expect("Review-all button must render");
+        let btn: HtmlElement = btn.dyn_into().unwrap();
+        assert!(
+            !btn.has_attribute("disabled"),
+            "Review-all must enable with a draft review and an available backend"
+        );
+        btn.click();
+        next_tick().await;
+
+        let sent = sent_lines_joined();
+        assert!(
+            sent.contains("start_ai_review"),
+            "Review-all must send a StartAiReview action; sent: {sent}"
+        );
+        assert!(
+            sent.contains("/review/rev-1"),
+            "StartAiReview must target the workspace review stream; sent: {sent}"
+        );
+    }
+
+    fn clean_root(path: &str) -> ProjectRootGitStatus {
+        ProjectRootGitStatus {
+            root: ProjectRootPath(path.to_owned()),
+            branch: Some("main".to_owned()),
+            ahead: 0,
+            behind: 0,
+            clean: true,
+            files: vec![],
+        }
+    }
+
+    /// NEW (blocker): with an active workspace draft but NO reviewable changes
+    /// (clean tree), the "Review all" action is DISABLED and cannot dispatch
+    /// `StartAiReview` — an empty-diff reviewer must not be spawnable. It then
+    /// enables reactively once a root gains a changed file (pure projection of
+    /// git status).
+    #[wasm_bindgen_test]
+    async fn review_all_disabled_without_reviewable_changes() {
+        record_bridge();
+        let container = make_container();
+        let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "h1".to_owned(),
+                project_id: ProjectId("proj-1".to_owned()),
+            }));
+            state.connection_statuses.update(|m| {
+                m.insert("h1".to_owned(), crate::state::ConnectionStatus::Connected);
+            });
+            // A draft exists, but the tree is clean (no reviewable changes).
+            state.git_status.update(|m| {
+                m.insert(ProjectId("proj-1".to_owned()), vec![clean_root("/repo")]);
+            });
+            state.review_summaries.update(|m| {
+                m.insert(ProjectId("proj-1".to_owned()), vec![draft_summary()]);
+            });
+            state.reviews.update(|m| {
+                m.insert(ReviewId("rev-1".to_owned()), full_review());
+            });
+            state.host_settings_by_host.update(|m| {
+                m.insert(
+                    "h1".to_owned(),
+                    protocol::HostSettings {
+                        enabled_backends: vec![protocol::BackendKind::Codex],
+                        default_backend: Some(protocol::BackendKind::Codex),
+                        enable_mobile_connections: false,
+                        mobile_broker_url: None,
+                        tyde_debug_mcp_enabled: false,
+                        tyde_agent_control_mcp_enabled: false,
+                    },
+                );
+            });
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <GitPanel /> }
+        });
+        std::mem::forget(handle);
+        next_tick().await;
+        next_tick().await;
+
+        // The hub still renders (a draft exists), but Review-all is disabled.
+        let btn = container
+            .query_selector("[data-test=\"gp-workspace-review-all\"]")
+            .unwrap()
+            .expect("Review-all button must render while a draft exists");
+        let btn: HtmlElement = btn.dyn_into().unwrap();
+        assert!(
+            btn.has_attribute("disabled"),
+            "Review-all must be disabled with no reviewable changes"
+        );
+        // Clicking the disabled action must not dispatch StartAiReview.
+        btn.click();
+        next_tick().await;
+        assert!(
+            !sent_lines_joined().contains("start_ai_review"),
+            "a clean workspace must not be able to dispatch StartAiReview"
+        );
+
+        // A root gains a changed file ⇒ Review-all enables reactively.
+        let state = holder.borrow().clone().unwrap();
+        state.git_status.update(|m| {
+            m.insert(
+                ProjectId("proj-1".to_owned()),
+                vec![root_with_unstaged("/repo")],
+            );
+        });
+        next_tick().await;
+        let btn = container
+            .query_selector("[data-test=\"gp-workspace-review-all\"]")
+            .unwrap()
+            .expect("Review-all button still present");
+        let btn: HtmlElement = btn.dyn_into().unwrap();
+        assert!(
+            !btn.has_attribute("disabled"),
+            "Review-all must enable once a root has a reviewable change"
         );
     }
 
     /// The create flow (server echoes `ReviewListChanged` for a pending
     /// create) must NOT auto-open any review surface tab — it only releases
-    /// the pending token. Reviews live on the normal diff surfaces now, and
-    /// the standalone review-workbench tab has been removed entirely. Driven
-    /// through `dispatch_envelope` so no network is touched.
+    /// the pending token. Driven through `dispatch_envelope` so no network is
+    /// touched.
     #[wasm_bindgen_test]
     async fn create_flow_does_not_open_review_tab() {
         let container = make_container();
@@ -1161,8 +1423,6 @@ mod wasm_tests {
         next_tick().await;
 
         let state = holder.borrow().clone().unwrap();
-        // Prime the host validators, then bootstrap the project stream so a
-        // follow-up `ProjectEvent` passes the bootstrap-first protocol check.
         crate::dispatch::prime_host_for_tests(&state, "h1");
         let project_stream = StreamPath("/project/proj-1".to_owned());
         let bootstrap_env = Envelope::from_payload(
@@ -1203,14 +1463,10 @@ mod wasm_tests {
         .expect("synthetic ReviewListChanged");
         crate::dispatch::dispatch_envelope(&state, "h1", env);
 
-        // The pending token is released …
         let pending = state
             .review_create_pending
             .with_untracked(|m| m.get(&key).copied().unwrap_or(0));
         assert_eq!(pending, 0, "create-pending token must be released");
-        // … and dispatch did not auto-open any diff surface tab (only an
-        // explicit click handler opens the changed-file diff; the standalone
-        // review-workbench tab no longer exists at all).
         let opened_surface = state.center_zone.with_untracked(|cz| {
             cz.tabs
                 .iter()
@@ -1220,7 +1476,6 @@ mod wasm_tests {
             !opened_surface,
             "ReviewListChanged must not auto-open a diff surface tab"
         );
-        // The summary list was still folded in.
         let known = state
             .review_summaries
             .with_untracked(|m| m.get(&ProjectId("proj-1".to_owned())).map(|v| v.len()))
@@ -1232,8 +1487,7 @@ mod wasm_tests {
     /// and a `ProjectBootstrap` (reconnect / re-subscribe) folds that draft
     /// summary into `review_summaries` before the server's `ReviewListChanged`
     /// echo is handled. The echo then carries no *new* id, but the pending
-    /// create token must still be released — otherwise the "Review changes"
-    /// button wedges forever (a successful create emits no `CommandError`).
+    /// create token must still be released.
     #[wasm_bindgen_test]
     async fn create_flow_releases_pending_without_new_id() {
         let container = make_container();
@@ -1251,8 +1505,6 @@ mod wasm_tests {
         let state = holder.borrow().clone().unwrap();
         crate::dispatch::prime_host_for_tests(&state, "h1");
         let project_stream = StreamPath("/project/proj-1".to_owned());
-        // Bootstrap already carries the existing draft summary — this models
-        // the race where the draft is folded into state before the echo lands.
         let bootstrap_env = Envelope::from_payload(
             project_stream.clone(),
             FrameKind::ProjectBootstrap,
@@ -1275,14 +1527,11 @@ mod wasm_tests {
         .expect("synthetic ProjectBootstrap");
         crate::dispatch::dispatch_envelope(&state, "h1", bootstrap_env);
 
-        // The user fired a fallback create (state lacked the draft at click
-        // time); its token is in flight.
         let key = ("h1".to_owned(), ProjectId("proj-1".to_owned()));
         state.review_create_pending.update(|m| {
             m.insert(key.clone(), 1);
         });
 
-        // The echo confirms the same already-known draft — `new_ids` is empty.
         let env = Envelope::from_payload(
             project_stream,
             FrameKind::ProjectEvent,
@@ -1301,7 +1550,6 @@ mod wasm_tests {
             pending, 0,
             "create-pending token must release even with no new id"
         );
-        // Still no auto-opened diff surface tab — behavior is unchanged.
         let opened_surface = state.center_zone.with_untracked(|cz| {
             cz.tabs
                 .iter()
@@ -1335,10 +1583,41 @@ mod wasm_tests {
             .unwrap_or(0.0) as i32
     }
 
+    /// Recording bridge that captures the serialized envelope `line` of every
+    /// `send_host_line` invoke into `window.__sent_lines`.
+    fn record_bridge() {
+        let _ = js_sys::eval(
+            "(function(){ \
+               window.__sent_lines = []; \
+               window.__TAURI__ = window.__TAURI__ || {}; \
+               window.__TAURI__.core = window.__TAURI__.core || {}; \
+               window.__TAURI__.core.invoke = function(cmd, args){ \
+                 try { \
+                   if (cmd === 'send_host_line' && args) { \
+                     var line = (args.line !== undefined) ? args.line \
+                       : (args.get ? args.get('line') : undefined); \
+                     if (line !== undefined) { window.__sent_lines.push(line); } \
+                   } \
+                 } catch (e) {} \
+                 return Promise.resolve(); }; \
+               window.__TAURI__.event = window.__TAURI__.event || {}; \
+               window.__TAURI__.event.listen = function(){ return Promise.resolve(function(){}); }; \
+             })();",
+        );
+    }
+
+    fn sent_lines_joined() -> String {
+        js_sys::eval("(window.__sent_lines||[]).join('\\n')")
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default()
+    }
+
     /// `subscribe_review_reactive` must retry reactively: it subscribes when
     /// the record is absent, stays quiet while it's present, and
-    /// **resubscribes when the record is later lost** (the bug fix — a
-    /// `StoredValue` guard would have stayed latched and never resubscribed).
+    /// **resubscribes when the record is later lost**. (Previously driven via
+    /// the per-root review hub; now exercised directly since the hub is
+    /// workspace-scoped and resolves its id from summaries.)
     #[wasm_bindgen_test]
     async fn hub_resubscribes_when_record_lost() {
         stub_recording_bridge();
@@ -1346,36 +1625,28 @@ mod wasm_tests {
         let container = make_container();
         let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
         let holder_for_mount = holder.clone();
-        let review_for_mount = review_id.clone();
         let handle = mount_to(container, move || {
             let state = AppState::new();
-            // The hub only subscribes at a connected host.
             state.connection_statuses.update(|m| {
                 m.insert("h1".to_owned(), crate::state::ConnectionStatus::Connected);
             });
+            let target: Memo<Option<(String, ReviewId)>> =
+                Memo::new(move |_| Some(("h1".to_owned(), ReviewId("rev-1".to_owned()))));
+            crate::components::review_view::subscribe_review_reactive(&state, target);
             *holder_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! {
-                <RootReviewHub
-                    host_id="h1".to_owned()
-                    project_id=ProjectId("proj-1".to_owned())
-                    root=ProjectRootPath("/repo".to_owned())
-                    review_id=review_for_mount.clone()
-                />
-            }
+            view! { <div></div> }
         });
         std::mem::forget(handle);
         next_tick().await;
 
-        // Record absent ⇒ one subscribe.
         assert_eq!(
             invoke_count(),
             1,
-            "the hub must subscribe while the record is absent"
+            "the helper must subscribe while the record is absent"
         );
 
         let state = holder.borrow().clone().unwrap();
-        // Record arrives ⇒ no further subscribe.
         state.reviews.update(|m| {
             m.insert(review_id.clone(), full_review());
         });
@@ -1386,7 +1657,6 @@ mod wasm_tests {
             "no resubscribe should fire while the record is present"
         );
 
-        // Record is lost (e.g. cleared) ⇒ resubscribe.
         state.reviews.update(|m| {
             m.remove(&review_id);
         });
@@ -1394,7 +1664,7 @@ mod wasm_tests {
         assert_eq!(
             invoke_count(),
             2,
-            "the hub must resubscribe after the record is lost"
+            "the helper must resubscribe after the record is lost"
         );
     }
 
@@ -1408,14 +1678,10 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
-    /// A persistently-failing subscribe must NOT tight-loop: the first
-    /// attempt fires, then retries are deferred behind a backoff timer, so a
-    /// burst of microtasks does not spin out hundreds of sends. The backoff
-    /// retry does eventually fire.
+    /// A persistently-failing subscribe must NOT tight-loop: the first attempt
+    /// fires, then retries are deferred behind a backoff timer.
     #[wasm_bindgen_test]
     async fn hub_subscribe_failure_backs_off_no_tight_loop() {
-        // Every invoke rejects — a tight loop would be observable as a large
-        // count after the synchronous/microtask burst.
         let _ = js_sys::eval(
             "(function(){ \
                window.__invoke_count = 0; \
@@ -1433,21 +1699,14 @@ mod wasm_tests {
             state.connection_statuses.update(|m| {
                 m.insert("h1".to_owned(), crate::state::ConnectionStatus::Connected);
             });
+            let target: Memo<Option<(String, ReviewId)>> =
+                Memo::new(move |_| Some(("h1".to_owned(), ReviewId("rev-1".to_owned()))));
+            crate::components::review_view::subscribe_review_reactive(&state, target);
             provide_context(state);
-            view! {
-                <RootReviewHub
-                    host_id="h1".to_owned()
-                    project_id=ProjectId("proj-1".to_owned())
-                    root=ProjectRootPath("/repo".to_owned())
-                    review_id=ReviewId("rev-1".to_owned())
-                />
-            }
+            view! { <div></div> }
         });
         std::mem::forget(handle);
 
-        // Burst of microtasks: only the first attempt should have fired (the
-        // retry is parked behind the ~250ms backoff timer, not re-issued
-        // immediately).
         next_tick().await;
         next_tick().await;
         next_tick().await;
@@ -1457,8 +1716,6 @@ mod wasm_tests {
             "a failed subscribe must not re-issue immediately (tight loop)"
         );
 
-        // After the first backoff window, the retry fires — and still does
-        // not spin (the next retry sits behind a longer backoff).
         sleep_ms(400).await;
         let after = invoke_count();
         assert!(
@@ -1481,24 +1738,18 @@ mod wasm_tests {
             state.connection_statuses.update(|m| {
                 m.insert("h1".to_owned(), crate::state::ConnectionStatus::Connected);
             });
+            let target: Memo<Option<(String, ReviewId)>> =
+                Memo::new(move |_| Some(("h1".to_owned(), ReviewId("rev-1".to_owned()))));
+            crate::components::review_view::subscribe_review_reactive(&state, target);
             *holder_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! {
-                <RootReviewHub
-                    host_id="h1".to_owned()
-                    project_id=ProjectId("proj-1".to_owned())
-                    root=ProjectRootPath("/repo".to_owned())
-                    review_id=ReviewId("rev-1".to_owned())
-                />
-            }
+            view! { <div></div> }
         });
         std::mem::forget(handle);
         next_tick().await;
-        // First subscribe (sent OK, but no bootstrap record arrives).
         assert_eq!(invoke_count(), 1, "initial subscribe");
 
         let state = holder.borrow().clone().unwrap();
-        // Disconnect: the in-flight latch is dropped.
         state.connection_statuses.update(|m| {
             m.insert(
                 "h1".to_owned(),
@@ -1512,7 +1763,6 @@ mod wasm_tests {
             "no subscribe should be sent while disconnected"
         );
 
-        // Reconnect: resubscribe.
         state.connection_statuses.update(|m| {
             m.insert("h1".to_owned(), crate::state::ConnectionStatus::Connected);
         });
@@ -1520,15 +1770,13 @@ mod wasm_tests {
         assert_eq!(
             invoke_count(),
             2,
-            "the hub must resubscribe after reconnecting"
+            "the helper must resubscribe after reconnecting"
         );
     }
 
-    /// If the subscribe target temporarily becomes `None` (e.g. the owning
-    /// project's draft resolves away, or `state.projects` is cleared on
-    /// disconnect) after a subscribe that never received a bootstrap, the
-    /// in-flight latch must be dropped so the same target reappearing
-    /// resubscribes — it must not stay wedged.
+    /// If the subscribe target temporarily becomes `None` after a subscribe
+    /// that never received a bootstrap, the in-flight latch must be dropped so
+    /// the same target reappearing resubscribes.
     #[wasm_bindgen_test]
     async fn subscribe_resubscribes_when_target_disappears_and_returns() {
         stub_recording_bridge();
@@ -1554,12 +1802,10 @@ mod wasm_tests {
         assert_eq!(invoke_count(), 1, "initial subscribe");
 
         let target_sig = holder.borrow().clone().unwrap();
-        // Target disappears (no bootstrap had arrived).
         target_sig.set(None);
         next_tick().await;
         assert_eq!(invoke_count(), 1, "no subscribe while the target is None");
 
-        // Same target returns ⇒ must resubscribe (not stay latched).
         target_sig.set(Some(("h1".to_owned(), ReviewId("rev-1".to_owned()))));
         next_tick().await;
         assert_eq!(

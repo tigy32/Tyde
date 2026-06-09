@@ -16,7 +16,8 @@ use protocol::{
     ReviewCommentId, ReviewCommentSource, ReviewCreatePayload, ReviewDiffSelection, ReviewDiffSide,
     ReviewErrorCode, ReviewEventPayload, ReviewId, ReviewLocation, ReviewSeverity, ReviewStatus,
     ReviewSubmitTarget, ReviewSubscribePayload, ReviewSuggestedComment, ReviewSuggestionState,
-    SessionId, SessionListPayload, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload,
+    ReviewSummaryScope, SessionId, SessionListPayload, SetSettingPayload, SpawnAgentParams,
+    SpawnAgentPayload,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -97,6 +98,26 @@ async fn expect_existing_review_create_echo(
     }
 }
 
+async fn expect_review_summary_update(
+    client: &mut client::Connection,
+    project: &Project,
+    review_id: &ReviewId,
+    context: &str,
+) -> protocol::ReviewSummary {
+    loop {
+        let env = next_env(client, context).await;
+        if env.kind == FrameKind::ProjectEvent
+            && env.stream.0 == format!("/project/{}", project.id.0)
+        {
+            let ProjectEventPayload::ReviewListChanged { reviews } =
+                env.parse_payload().expect("project event payload");
+            if let Some(summary) = reviews.into_iter().find(|summary| summary.id == *review_id) {
+                return summary;
+            }
+        }
+    }
+}
+
 async fn expect_new_agent(client: &mut client::Connection, context: &str) -> NewAgentPayload {
     loop {
         let env = next_env(client, context).await;
@@ -157,6 +178,57 @@ async fn assert_no_trailing_review_snapshot(client: &mut client::Connection, con
                         "review mutation emitted trailing Snapshot for review {} after {}",
                         review.id.0, context
                     );
+                }
+                quiet_deadline = tokio::time::Instant::now() + QUIET_FOR;
+            }
+            Ok(Ok(None)) => panic!("connection closed while checking {context}"),
+            Ok(Err(err)) => panic!("next_event failed while checking {context}: {err:?}"),
+        }
+    }
+}
+
+async fn assert_no_ai_review_spawned(client: &mut client::Connection, context: &str) {
+    const QUIET_FOR: Duration = Duration::from_millis(100);
+    const MAX_WAIT: Duration = Duration::from_millis(300);
+
+    let start = tokio::time::Instant::now();
+    let max_deadline = start + MAX_WAIT;
+    let mut quiet_deadline = start + QUIET_FOR;
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= quiet_deadline || now >= max_deadline {
+            return;
+        }
+        let deadline = if quiet_deadline <= max_deadline {
+            quiet_deadline
+        } else {
+            max_deadline
+        };
+        let wait_for = deadline.saturating_duration_since(now);
+
+        match tokio::time::timeout(wait_for, client.next_event()).await {
+            Err(_) => return,
+            Ok(Ok(Some(env))) => {
+                match env.kind {
+                    FrameKind::NewAgent => {
+                        let payload: NewAgentPayload =
+                            env.parse_payload().expect("new agent payload");
+                        assert_ne!(
+                            payload.name, "AI Review",
+                            "clean StartAiReview spawned an AI Review agent during {context}"
+                        );
+                    }
+                    FrameKind::ReviewEvent => {
+                        let event: ReviewEventPayload =
+                            env.parse_payload().expect("review event payload");
+                        if let ReviewEventPayload::AiReviewerChanged { state } = event
+                            && state.status == ReviewAiReviewerStatus::Running
+                        {
+                            panic!("clean StartAiReview entered Running state during {context}");
+                        }
+                    }
+                    _ => {}
                 }
                 quiet_deadline = tokio::time::Instant::now() + QUIET_FOR;
             }
@@ -393,6 +465,34 @@ fn new_line_location(review: &Review) -> ReviewLocation {
     }
 }
 
+fn new_line_location_for_root(review: &Review, root: &str) -> ReviewLocation {
+    let diff = review
+        .diffs
+        .iter()
+        .find(|diff| diff.root.0 == root)
+        .unwrap_or_else(|| panic!("review diff for root {root}"));
+    let file = diff
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/lib.rs")
+        .unwrap_or_else(|| panic!("src/lib.rs diff for root {root}"));
+    let added_line = file
+        .hunks
+        .iter()
+        .flat_map(|hunk| hunk.lines.iter())
+        .find(|line| line.kind == ProjectGitDiffLineKind::Added)
+        .unwrap_or_else(|| panic!("added line for root {root}"));
+    ReviewLocation {
+        root: diff.root.clone(),
+        relative_path: file.relative_path.clone(),
+        anchor: ReviewAnchor::LineRange {
+            side: ReviewDiffSide::New,
+            start_line: added_line.new_line_number.expect("new line number"),
+            end_line: added_line.new_line_number.expect("new line number"),
+        },
+    }
+}
+
 fn out_of_range_location(review: &Review) -> ReviewLocation {
     let mut location = new_line_location(review);
     location.anchor = ReviewAnchor::LineRange {
@@ -464,7 +564,25 @@ async fn create_review(
     project: &Project,
     _origin: &NewAgentPayload,
 ) -> Review {
-    create_review_for_root(client, project, &project.roots[0]).await
+    client
+        .review_create(
+            &project.id,
+            ReviewCreatePayload {
+                selection: ReviewDiffSelection::Workspace {
+                    scope: ProjectDiffScope::Unstaged,
+                },
+            },
+        )
+        .await
+        .expect("review create");
+    loop {
+        let env = next_env(client, "review bootstrap").await;
+        if env.kind == FrameKind::ReviewBootstrap {
+            let bootstrap: ReviewBootstrapPayload =
+                env.parse_payload().expect("review bootstrap payload");
+            return bootstrap.review;
+        }
+    }
 }
 
 async fn create_review_for_root(
@@ -592,9 +710,10 @@ fn tyde_review_json(markdown: &str) -> &str {
 }
 
 #[tokio::test]
-async fn project_bootstrap_exposes_one_active_review_per_root() {
+async fn project_bootstrap_exposes_one_active_workspace_review() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;
+    set_default_backend(&mut client, BackendKind::Claude).await;
     let root = tempfile::tempdir().expect("temp root");
     let repo_a = root.path().join("review-root-a");
     let repo_b = root.path().join("review-root-b");
@@ -613,35 +732,174 @@ async fn project_bootstrap_exposes_one_active_review_per_root() {
     .await;
     let bootstrap = expect_project_bootstrap(&mut client, &project).await;
 
-    assert_eq!(bootstrap.review_summaries.len(), 2);
-    let roots = bootstrap
-        .review_summaries
-        .iter()
-        .map(|summary| summary.root.0.as_str())
-        .collect::<Vec<_>>();
-    assert!(roots.contains(&project.roots[0].as_str()));
-    assert!(roots.contains(&project.roots[1].as_str()));
-    assert!(
-        bootstrap
-            .review_summaries
-            .iter()
-            .all(|summary| matches!(summary.status, ReviewStatus::Draft))
-    );
+    assert_eq!(bootstrap.review_summaries.len(), 1);
+    let summary = &bootstrap.review_summaries[0];
+    assert_eq!(summary.scope, ReviewSummaryScope::Workspace);
+    assert!(matches!(summary.status, ReviewStatus::Draft));
 
-    let first = &bootstrap.review_summaries[0];
-    let review = subscribe_review(&mut client, &first.id).await;
+    let review = subscribe_review(&mut client, &summary.id).await;
     assert_eq!(review.project_id, project.id);
     assert_eq!(
         review.selection,
-        ReviewDiffSelection::Root {
-            root: first.root.clone(),
+        ReviewDiffSelection::Workspace {
             scope: ProjectDiffScope::Unstaged,
-            path: None,
         }
     );
-    assert_eq!(review.diffs.len(), 1);
-    assert_eq!(review.diffs[0].root, first.root);
-    assert_eq!(review.diffs[0].scope, ProjectDiffScope::Unstaged);
+    assert_eq!(review.diffs.len(), 2);
+    let diff_roots = review
+        .diffs
+        .iter()
+        .map(|diff| diff.root.0.as_str())
+        .collect::<Vec<_>>();
+    assert!(diff_roots.contains(&project.roots[0].as_str()));
+    assert!(diff_roots.contains(&project.roots[1].as_str()));
+    assert!(
+        review
+            .diffs
+            .iter()
+            .all(|diff| diff.scope == ProjectDiffScope::Unstaged)
+    );
+
+    client
+        .review_action(
+            &summary.id,
+            ReviewActionPayload::StartAiReview {
+                backend_kind: None,
+                cost_hint: None,
+                instructions: Some("__mock_slow__ Check both roots.".to_owned()),
+            },
+        )
+        .await
+        .expect("start workspace AI review");
+
+    let mut new_agent = None;
+    let mut running = None;
+    while new_agent.is_none() || running.is_none() {
+        let env = next_env(&mut client, "workspace AI reviewer start").await;
+        match env.kind {
+            FrameKind::NewAgent => {
+                let payload: NewAgentPayload = env.parse_payload().expect("new agent payload");
+                assert_eq!(payload.name, "AI Review");
+                assert_eq!(payload.project_id, Some(project.id.clone()));
+                assert_eq!(payload.workspace_roots, project.roots);
+                assert!(
+                    new_agent.replace(payload).is_none(),
+                    "expected one NewAgent"
+                );
+            }
+            FrameKind::ReviewEvent => match env.parse_payload().expect("review event payload") {
+                ReviewEventPayload::AiReviewerChanged { state }
+                    if state.status == ReviewAiReviewerStatus::Running =>
+                {
+                    assert!(
+                        running.replace(state).is_none(),
+                        "expected one running AI reviewer event"
+                    );
+                }
+                ReviewEventPayload::Snapshot { review } => {
+                    panic!(
+                        "unexpected Snapshot for review {} while waiting for workspace AI reviewer",
+                        review.id.0
+                    );
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    let new_agent = new_agent.expect("new AI Review agent");
+    let running = running.expect("running AI reviewer state");
+    assert_eq!(running.agent_id, Some(new_agent.agent_id.clone()));
+    close_agent_and_wait(&mut client, &new_agent.instance_stream).await;
+}
+
+#[tokio::test]
+async fn start_ai_review_on_clean_workspace_errors_without_spawning_agent() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.client;
+    set_default_backend(&mut client, BackendKind::Claude).await;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo_a = root.path().join("clean-review-root-a");
+    let repo_b = root.path().join("clean-review-root-b");
+    fs::create_dir_all(&repo_a).expect("create repo a");
+    fs::create_dir_all(&repo_b).expect("create repo b");
+    seed_repo(&repo_a);
+    seed_repo(&repo_b);
+    git(&repo_a, &["add", "."]);
+    git(&repo_a, &["commit", "-m", "Apply changes"]);
+    git(&repo_b, &["add", "."]);
+    git(&repo_b, &["commit", "-m", "Apply changes"]);
+
+    let project = create_project_with_roots(
+        &mut client,
+        vec![
+            repo_a.to_string_lossy().to_string(),
+            repo_b.to_string_lossy().to_string(),
+        ],
+    )
+    .await;
+    let bootstrap = expect_project_bootstrap(&mut client, &project).await;
+    assert_eq!(bootstrap.review_summaries.len(), 1);
+    let review_id = bootstrap.review_summaries[0].id.clone();
+    let review = subscribe_review(&mut client, &review_id).await;
+    assert!(review.diffs.is_empty());
+    assert_eq!(review.ai_reviewer.status, ReviewAiReviewerStatus::Idle);
+
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::StartAiReview {
+                backend_kind: None,
+                cost_hint: None,
+                instructions: Some("There should be nothing to review.".to_owned()),
+            },
+        )
+        .await
+        .expect("start AI review on clean workspace");
+
+    let mut saw_error = false;
+    while !saw_error {
+        let env = next_env(&mut client, "clean workspace StartAiReview").await;
+        match env.kind {
+            FrameKind::NewAgent => {
+                let payload: NewAgentPayload = env.parse_payload().expect("new agent payload");
+                assert_ne!(
+                    payload.name, "AI Review",
+                    "clean StartAiReview must not spawn an AI Review agent"
+                );
+            }
+            FrameKind::ReviewEvent => match env.parse_payload().expect("review event payload") {
+                ReviewEventPayload::Error { error } => {
+                    assert_eq!(error.code, ReviewErrorCode::InvalidStatus);
+                    assert!(matches!(
+                        error.context,
+                        protocol::ReviewErrorContext::StartAiReview
+                    ));
+                    assert!(
+                        error.message.contains("nothing to review"),
+                        "unexpected clean StartAiReview error: {}",
+                        error.message
+                    );
+                    saw_error = true;
+                }
+                ReviewEventPayload::AiReviewerChanged { state }
+                    if state.status == ReviewAiReviewerStatus::Running =>
+                {
+                    panic!("clean StartAiReview must not enter Running state");
+                }
+                ReviewEventPayload::Cleared { review: cleared } => {
+                    assert_ne!(cleared.ai_reviewer.status, ReviewAiReviewerStatus::Running);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    assert_no_ai_review_spawned(&mut client, "clean StartAiReview").await;
+
+    let snapshot = subscribe_review(&mut client, &review.id).await;
+    assert_ne!(snapshot.ai_reviewer.status, ReviewAiReviewerStatus::Running);
+    assert_eq!(snapshot.ai_reviewer.agent_id, None);
 }
 
 #[tokio::test]
@@ -711,6 +969,187 @@ async fn create_review_add_update_delete_and_submit_live() {
         }
         other => panic!("expected cleared review after submit, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn workspace_review_counts_submit_and_clean_reset_across_roots() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.client;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo_a = root.path().join("review-root-a");
+    let repo_b = root.path().join("review-root-b");
+    fs::create_dir_all(&repo_a).expect("create repo a");
+    fs::create_dir_all(&repo_b).expect("create repo b");
+    seed_repo(&repo_a);
+    seed_repo(&repo_b);
+
+    let project = create_project_with_roots(
+        &mut client,
+        vec![
+            repo_a.to_string_lossy().to_string(),
+            repo_b.to_string_lossy().to_string(),
+        ],
+    )
+    .await;
+    let bootstrap = expect_project_bootstrap(&mut client, &project).await;
+    assert_eq!(bootstrap.review_summaries.len(), 1);
+    let review_id = bootstrap.review_summaries[0].id.clone();
+    let review = subscribe_review(&mut client, &review_id).await;
+    let location_a = new_line_location_for_root(&review, &project.roots[0]);
+    let location_b = new_line_location_for_root(&review, &project.roots[1]);
+    let (agent, _session_id) = spawn_project_agent_with_prompt(
+        &mut client,
+        &project,
+        "start review target __mock_slow__",
+        false,
+    )
+    .await;
+
+    for (location, body) in [
+        (location_a.clone(), "Root A review comment."),
+        (location_b.clone(), "Root B review comment."),
+    ] {
+        client
+            .review_action(
+                &review.id,
+                ReviewActionPayload::AddComment {
+                    location,
+                    body: body.to_owned(),
+                },
+            )
+            .await
+            .expect("add workspace comment");
+        match expect_review_delta(&mut client, "workspace comment upsert").await {
+            ReviewEventPayload::CommentUpsert { comment } => assert_eq!(comment.body, body),
+            other => panic!("expected workspace comment upsert, got {other:?}"),
+        }
+    }
+
+    let summary = loop {
+        let summary =
+            expect_review_summary_update(&mut client, &project, &review.id, "workspace counts")
+                .await;
+        if summary.file_comment_counts.len() == 2 {
+            break summary;
+        }
+    };
+    assert_eq!(summary.scope, ReviewSummaryScope::Workspace);
+    for root in &project.roots {
+        let count = summary
+            .file_comment_counts
+            .iter()
+            .find(|count| count.root.0 == *root && count.relative_path == "src/lib.rs")
+            .unwrap_or_else(|| panic!("missing comment count for root {root}"));
+        assert_eq!(count.user_comment_count, 1);
+        assert_eq!(count.ai_comment_count, 0);
+        assert_eq!(count.pending_suggestion_count, 0);
+        assert_eq!(count.total_count(), 1);
+    }
+
+    client
+        .review_action(&review.id, submit_to(&agent))
+        .await
+        .expect("submit workspace review");
+
+    let mut cleared_count = 0;
+    let mut queued_review_message = None;
+    while cleared_count == 0 || queued_review_message.is_none() {
+        let env = next_env(&mut client, "workspace review submit").await;
+        match env.kind {
+            FrameKind::ReviewEvent => match env.parse_payload().expect("review event") {
+                ReviewEventPayload::Cleared { review: cleared } => {
+                    assert_eq!(cleared.id, review.id);
+                    assert!(cleared.comments.is_empty());
+                    cleared_count += 1;
+                }
+                other => panic!("unexpected review event during workspace submit: {other:?}"),
+            },
+            FrameKind::QueuedMessages if env.stream == agent.instance_stream => {
+                let payload: QueuedMessagesPayload =
+                    env.parse_payload().expect("queued messages payload");
+                let review_messages = payload
+                    .messages
+                    .iter()
+                    .filter(|entry| {
+                        entry.origin
+                            == Some(MessageOrigin::Review {
+                                review_id: review.id.clone(),
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                if !review_messages.is_empty() {
+                    assert_eq!(review_messages.len(), 1);
+                    queued_review_message = Some(review_messages[0].message.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(cleared_count, 1);
+    let queued_review_message = queued_review_message.expect("queued review message");
+    let bundle: serde_json::Value = serde_json::from_str(tyde_review_json(&queued_review_message))
+        .expect("workspace feedback bundle JSON");
+    assert_eq!(bundle["review_id"], review.id.0);
+    let comments = bundle["comments"].as_array().expect("comments array");
+    assert_eq!(comments.len(), 2);
+    let bundle_roots = comments
+        .iter()
+        .map(|comment| comment["location"]["root"].as_str().expect("root"))
+        .collect::<Vec<_>>();
+    assert!(bundle_roots.contains(&project.roots[0].as_str()));
+    assert!(bundle_roots.contains(&project.roots[1].as_str()));
+
+    for (location, body) in [
+        (location_a.clone(), "Root A reset comment."),
+        (location_b.clone(), "Root B reset comment."),
+    ] {
+        client
+            .review_action(
+                &review.id,
+                ReviewActionPayload::AddComment {
+                    location,
+                    body: body.to_owned(),
+                },
+            )
+            .await
+            .expect("add reset comment");
+        match expect_review_delta(&mut client, "reset comment upsert").await {
+            ReviewEventPayload::CommentUpsert { comment } => assert_eq!(comment.body, body),
+            other => panic!("expected reset comment upsert, got {other:?}"),
+        }
+    }
+
+    git(&repo_a, &["add", "."]);
+    git(&repo_a, &["commit", "-m", "Apply root A"]);
+    let partial_clean = subscribe_review(&mut client, &review.id).await;
+    assert_eq!(
+        partial_clean.comments.len(),
+        2,
+        "one clean root must not clear the workspace review while another root is dirty"
+    );
+    let root_a_comment = partial_clean
+        .comments
+        .iter()
+        .find(|comment| comment.location.root.0 == project.roots[0])
+        .expect("root A comment");
+    assert!(matches!(
+        root_a_comment.anchor_status,
+        protocol::ReviewAnchorStatus::Stale { .. }
+    ));
+    assert!(
+        partial_clean
+            .diffs
+            .iter()
+            .any(|diff| diff.root.0 == project.roots[1] && !diff.files.is_empty())
+    );
+
+    git(&repo_b, &["add", "."]);
+    git(&repo_b, &["commit", "-m", "Apply root B"]);
+    let all_clean = subscribe_review(&mut client, &review.id).await;
+    assert!(all_clean.comments.is_empty());
+    assert!(all_clean.suggestions.is_empty());
+    assert_eq!(all_clean.ai_reviewer.status, ReviewAiReviewerStatus::Idle);
+    assert!(all_clean.diffs.is_empty());
 }
 
 #[tokio::test]
@@ -947,10 +1386,8 @@ async fn create_review_does_not_require_origin_agent() {
         .review_create(
             &project.id,
             ReviewCreatePayload {
-                selection: ReviewDiffSelection::Root {
-                    root: ProjectRootPath(project.roots[0].clone()),
+                selection: ReviewDiffSelection::Workspace {
                     scope: ProjectDiffScope::Unstaged,
-                    path: None,
                 },
             },
         )
@@ -991,10 +1428,8 @@ async fn create_review_with_untracked_binary_file_allows_file_comment() {
         .review_create(
             &project.id,
             ReviewCreatePayload {
-                selection: ReviewDiffSelection::Root {
-                    root: ProjectRootPath(project.roots[0].clone()),
+                selection: ReviewDiffSelection::Workspace {
                     scope: ProjectDiffScope::Unstaged,
-                    path: None,
                 },
             },
         )
@@ -1570,10 +2005,8 @@ async fn second_review_create_attaches_to_existing_singleton() {
         .review_create(
             &project.id,
             ReviewCreatePayload {
-                selection: ReviewDiffSelection::Root {
-                    root: ProjectRootPath(project.roots[0].clone()),
+                selection: ReviewDiffSelection::Workspace {
                     scope: ProjectDiffScope::Unstaged,
-                    path: None,
                 },
             },
         )
@@ -1625,10 +2058,8 @@ async fn fallback_review_create_for_existing_draft_echoes_review_list() {
         .review_create(
             &project.id,
             ReviewCreatePayload {
-                selection: ReviewDiffSelection::Root {
-                    root: ProjectRootPath(project.roots[0].clone()),
+                selection: ReviewDiffSelection::Workspace {
                     scope: ProjectDiffScope::Unstaged,
-                    path: None,
                 },
             },
         )
@@ -1639,8 +2070,8 @@ async fn fallback_review_create_for_existing_draft_echoes_review_list() {
     let summary = bootstrap
         .review_summaries
         .iter()
-        .find(|summary| summary.root.0 == project.roots[0])
-        .expect("active draft summary for project root");
+        .find(|summary| summary.scope == ReviewSummaryScope::Workspace)
+        .expect("active draft workspace summary");
 
     expect_existing_review_create_echo(&mut client, &project, &summary.id).await;
 }
@@ -1850,7 +2281,7 @@ async fn legacy_project_only_drafts_do_not_surface_as_active_summaries() {
     let bootstrap = expect_project_bootstrap(&mut client, &project).await;
     assert_eq!(bootstrap.review_summaries.len(), 1);
     let summary = &bootstrap.review_summaries[0];
-    assert_eq!(summary.root.0, repo.to_string_lossy().to_string());
+    assert_eq!(summary.scope, ReviewSummaryScope::Workspace);
     assert_ne!(summary.id, first.id);
     assert_ne!(summary.id, second.id);
     assert!(matches!(summary.status, ReviewStatus::Draft));

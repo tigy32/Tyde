@@ -462,10 +462,13 @@ pub fn ReviewableDiffView(
     let drag_selection = RwSignal::new(None);
     install_drag_listeners(drag_selection, composer);
 
-    // Reactively resolve this project's Draft review. `(host, id)` when one
-    // exists, `None` otherwise. Only changes when the draft id changes
-    // (create / submit / cancel) — adding a comment does not flip it, so the
-    // diff below does not remount on every comment.
+    // Reactively resolve this project's single workspace Draft review.
+    // `(host, id)` when one exists, `None` otherwise. One review spans all of
+    // the project's roots, so the lookup is keyed by project alone; this diff
+    // tab renders only its own root's slice of that review (its decorations
+    // filter comments by `ReviewLocation.root`). Only changes when the draft
+    // id changes (create / submit / cancel) — adding a comment does not flip
+    // it, so the diff below does not remount on every comment.
     //
     // We start from the Draft summary (cheap, arrives first), but if we hold
     // the full record we require *its* live status to still be Draft: a live
@@ -477,16 +480,10 @@ pub fn ReviewableDiffView(
     let draft_state = state.clone();
     let draft_host = host_id.clone();
     let draft_project = project_id.clone();
-    let draft_root = root.clone();
     let draft: Memo<Option<(String, protocol::ReviewId)>> = Memo::new(move |_| {
         let id = draft_state.review_summaries.with(|m| {
             m.get(&draft_project).and_then(|sums| {
-                sums.iter()
-                    .filter(|s| {
-                        matches!(s.status, protocol::ReviewStatus::Draft) && s.root == draft_root
-                    })
-                    .max_by_key(|s| s.updated_at_ms)
-                    .map(|s| s.id.clone())
+                crate::components::review_view::pick_workspace_draft(sums).map(|s| s.id.clone())
             })
         })?;
         let live_non_draft = draft_state.reviews.with(|r| {
@@ -4226,7 +4223,7 @@ mod wasm_tests {
     fn summary_for(review: &protocol::Review) -> protocol::ReviewSummary {
         protocol::ReviewSummary {
             id: review.id.clone(),
-            root: review_root(),
+            scope: protocol::ReviewSummaryScope::Workspace,
             status: review.status.clone(),
             origin_session_id: review.origin_session_id.clone(),
             origin_agent_id: review.origin_agent_id.clone(),
@@ -4284,7 +4281,7 @@ mod wasm_tests {
                         protocol::ProjectId("proj-1".to_owned()),
                         vec![protocol::ReviewSummary {
                             id: review.id.clone(),
-                            root: review_root(),
+                            scope: protocol::ReviewSummaryScope::Workspace,
                             status: review.status.clone(),
                             origin_session_id: review.origin_session_id.clone(),
                             origin_agent_id: review.origin_agent_id.clone(),

@@ -76,7 +76,7 @@ use crate::review::reviewer::{
     reviewer_tool_policy,
 };
 use crate::review::{
-    ReviewRegistry, ReviewRegistryHandle, build_create_request, review_create_root,
+    ReviewRegistry, ReviewRegistryHandle, build_create_request, review_create_selection,
     review_stream_path,
 };
 use crate::review_mcp::{REVIEW_FEEDBACK_MCP_SERVER_NAME, ReviewMcpHandle};
@@ -4506,26 +4506,18 @@ impl HostHandle {
         };
 
         let project = load_project(&project_store, &project_id, OPERATION).await?;
-        let root = review_create_root(&project, &payload.selection)
+        let normalized_selection = review_create_selection(&project, &payload.selection)
             .map_err(|error| AppError::invalid(OPERATION, error))?;
-        let normalized_selection = match &payload.selection {
-            ReviewDiffSelection::Root { .. } => ReviewDiffSelection::Root {
-                root: root.clone(),
-                scope: protocol::ProjectDiffScope::Unstaged,
-                path: None,
-            },
-            ReviewDiffSelection::AllUncommitted => ReviewDiffSelection::Root {
-                root: root.clone(),
-                scope: protocol::ProjectDiffScope::Unstaged,
-                path: None,
-            },
+        let selection_root = match &normalized_selection {
+            ReviewDiffSelection::Root { root, .. } => Some(root),
+            ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => None,
         };
 
         let diff_started = Instant::now();
         tracing::debug!(
             project_id = %project_id,
             selection_kind = payload.selection.kind_name(),
-            root = %root,
+            root = selection_root.map(|root| root.0.as_str()).unwrap_or("<workspace>"),
             "reading initial review diffs"
         );
         let diffs = match read_review_diffs(&project, &normalized_selection) {
@@ -4534,7 +4526,7 @@ impl HostHandle {
                 tracing::info!(
                     project_id = %project_id,
                     selection_kind = payload.selection.kind_name(),
-                    root = %root,
+                    root = selection_root.map(|root| root.0.as_str()).unwrap_or("<workspace>"),
                     diff_count = stats.diff_count,
                     file_count = stats.file_count,
                     hunk_count = stats.hunk_count,
@@ -4548,7 +4540,7 @@ impl HostHandle {
                 tracing::warn!(
                     project_id = %project_id,
                     selection_kind = payload.selection.kind_name(),
-                    root = %root,
+                    root = selection_root.map(|root| root.0.as_str()).unwrap_or("<workspace>"),
                     elapsed_ms = diff_started.elapsed().as_millis() as u64,
                     error_len = error.len(),
                     "failed to read initial review diffs"
@@ -4564,11 +4556,17 @@ impl HostHandle {
         tracing::debug!(
             project_id = %project_id,
             review_id = %review_id,
-            root = %root,
+            root = selection_root.map(|root| root.0.as_str()).unwrap_or("<workspace>"),
             "creating or getting review actor"
         );
-        let request =
-            build_create_request(review_id.clone(), project_id.clone(), root, payload, diffs);
+        let request = build_create_request(
+            review_id.clone(),
+            project_id.clone(),
+            ReviewCreatePayload {
+                selection: normalized_selection,
+            },
+            diffs,
+        );
         let review_id = review_registry.create(request).await.map_err(|error| {
             AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
         })?;
@@ -4993,12 +4991,27 @@ impl HostHandle {
             Err(message) => return (reply, Err(message)),
         };
         let instructions_len = request.instructions.as_ref().map_or(0, String::len);
-        let roots = request
-            .review
-            .diffs
-            .iter()
-            .map(|diff| diff.root.0.clone())
-            .collect::<Vec<_>>();
+        let roots = {
+            let state = self.state.lock().await;
+            let project = match state
+                .project_store
+                .lock()
+                .await
+                .get(&request.review.project_id)
+            {
+                Some(project) => project,
+                None => {
+                    return (
+                        reply,
+                        Err(format!(
+                            "cannot spawn AI reviewer for missing project {}",
+                            request.review.project_id
+                        )),
+                    );
+                }
+            };
+            project.roots
+        };
         let roots_count = roots.len();
         let stats = host_diff_stats(&request.review.diffs);
         tracing::info!(
@@ -5020,6 +5033,18 @@ impl HostHandle {
                 "AI reviewer spawn rejected without diff roots"
             );
             return (reply, Err("review has no frozen diff roots".to_owned()));
+        }
+        if stats.file_count == 0 {
+            tracing::warn!(
+                review_id = %request.review_id,
+                backend_kind = ?backend_kind,
+                roots_count,
+                "AI reviewer spawn rejected without changed files"
+            );
+            return (
+                reply,
+                Err("review has no changed files to review".to_owned()),
+            );
         }
         let review_mcp_url = {
             let state = self.state.lock().await;
@@ -5158,7 +5183,7 @@ fn read_review_diffs(
     selection: &ReviewDiffSelection,
 ) -> Result<Vec<protocol::ProjectGitDiffPayload>, String> {
     match selection {
-        ReviewDiffSelection::AllUncommitted => {
+        ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => {
             let mut diffs = Vec::new();
             for root in &project.roots {
                 let payload = ProjectReadDiffPayload {
@@ -7008,8 +7033,9 @@ mod tests {
     use crate::store::agent_teams::AgentTeamsStoreFile;
     use protocol::{
         AgentErrorPayload, BackendKind, CustomAgentId, DiffContextMode, HostSettingValue,
-        ProjectDiffScope, ProjectGitDiffPayload, ProtocolValidator, Review, ReviewAiReviewerState,
-        ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec, ToolPolicy,
+        ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload, ProtocolValidator, Review,
+        ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec,
+        ToolPolicy,
     };
 
     #[test]
@@ -8875,9 +8901,21 @@ mod tests {
 
         let (review_tx, _review_rx) = mpsc::channel(1);
         let (reply, _response) = oneshot::channel();
+        let project_store = {
+            let state = host.state.lock().await;
+            Arc::clone(&state.project_store)
+        };
+        let project = project_store
+            .lock()
+            .await
+            .create(
+                "Review Project".to_owned(),
+                vec!["/tmp/review-root".to_owned()],
+            )
+            .expect("create review project");
         let review = Review {
             id: ReviewId("review-test".to_string()),
-            project_id: ProjectId("project-test".to_string()),
+            project_id: project.id,
             origin_agent_id: AgentId("agent-test".to_string()),
             origin_session_id: SessionId("session-test".to_string()),
             selection: ReviewDiffSelection::AllUncommitted,
@@ -8887,7 +8925,11 @@ mod tests {
                 scope: ProjectDiffScope::Uncommitted,
                 path: None,
                 context_mode: DiffContextMode::Hunks,
-                files: Vec::new(),
+                files: vec![ProjectGitDiffFile {
+                    relative_path: "src/lib.rs".to_owned(),
+                    is_binary: false,
+                    hunks: Vec::new(),
+                }],
             }],
             comments: Vec::new(),
             suggestions: Vec::new(),
