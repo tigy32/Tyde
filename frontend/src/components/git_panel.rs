@@ -11,7 +11,7 @@ use protocol::{
     FrameKind, ProjectDiffScope, ProjectDiscardFilePayload, ProjectGitChangeKind,
     ProjectGitCommitPayload, ProjectGitFileStatus, ProjectPath, ProjectReadDiffPayload,
     ProjectRootGitStatus, ProjectRootPath, ProjectStageFilePayload, ProjectUnstageFilePayload,
-    ReviewActionPayload, ReviewId, StreamPath,
+    ReviewId, StreamPath,
 };
 
 #[component]
@@ -77,13 +77,11 @@ pub fn GitPanel() -> impl IntoView {
 
 /// The single workspace-level review hub for the active project. One review
 /// spans every root, so this renders exactly once (not per root). It finds
-/// the project's one active workspace Draft review, subscribes to it, shows
-/// workspace-wide counts, a primary "Review all changes across the
-/// workspace" action (AI review across every root), a "Comments" button, and
-/// the shared `ReviewSidebar` (configurable AI reviewer / Submit / Clear).
+/// the project's one active workspace Draft review, subscribes to it, and
+/// renders the compact review summary plus the shared `ReviewSidebar`.
 /// Renders nothing when the project has no active workspace draft. A draft can
-/// exist with no reviewable changes (e.g. staged-only edits), so the AI-review
-/// actions are independently gated on there being a dirty file in some root.
+/// exist with no reviewable changes (e.g. staged-only edits), so AI review is
+/// independently gated on there being a dirty file in some root.
 #[component]
 fn WorkspaceReviewHub() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -182,94 +180,6 @@ fn WorkspaceReviewHubInner(host_id: String, review_id: ReviewId) -> impl IntoVie
         })
     });
 
-    // "Review all changes across the workspace": the primary one-click AI
-    // review over every root. The server spawns the single workspace AI
-    // reviewer with `project.roots` as context. Backend defaults to the
-    // host's `default_backend` (None on the wire). Gated through the shared
-    // `start_ai` action gate so it and the sidebar's configurable Run AI
-    // can't double-spawn.
-    let review_all_state = state.clone();
-    let review_all_host = host_id.clone();
-    let review_all_rid = review_id.clone();
-    let ai_running: Memo<bool> = {
-        let s = state.clone();
-        let rid = review_id.clone();
-        Memo::new(move |_| {
-            s.reviews.with(|m| {
-                m.get(&rid)
-                    .map(|r| {
-                        matches!(
-                            r.ai_reviewer.status,
-                            protocol::ReviewAiReviewerStatus::Running
-                        )
-                    })
-                    .unwrap_or(false)
-            })
-        })
-    };
-    let backend_available: Memo<bool> = {
-        let s = state.clone();
-        let host = host_id.clone();
-        Memo::new(move |_| {
-            s.host_settings_by_host.with(|m| {
-                m.get(&host)
-                    .map(|hs| hs.default_backend.is_some() || !hs.enabled_backends.is_empty())
-                    .unwrap_or(false)
-            })
-        })
-    };
-    let start_pending: Memo<bool> = {
-        let s = state.clone();
-        let rid = review_id.clone();
-        Memo::new(move |_| {
-            s.review_action_pending
-                .with(|m| m.get(&rid).map(|g| g.start_ai).unwrap_or(false))
-        })
-    };
-    let review_all_disabled = move || {
-        !is_draft.get()
-            || !has_reviewable_changes.get()
-            || ai_running.get()
-            || !backend_available.get()
-            || start_pending.get()
-    };
-    let on_review_all = move |_| {
-        let rid = review_all_rid.clone();
-        let host = review_all_host.clone();
-        let mut claimed = false;
-        review_all_state.review_action_pending.update(|map| {
-            let gate = map.entry(rid.clone()).or_default();
-            if !gate.start_ai {
-                gate.start_ai = true;
-                claimed = true;
-            }
-        });
-        if !claimed {
-            return;
-        }
-        let fail_state = review_all_state.clone();
-        let fail_rid = rid.clone();
-        spawn_local(async move {
-            let stream = StreamPath(format!("/review/{}", rid.0));
-            let payload = ReviewActionPayload::StartAiReview {
-                backend_kind: None,
-                cost_hint: None,
-                instructions: None,
-            };
-            if let Err(e) = send_frame(&host, stream, FrameKind::ReviewAction, &payload).await {
-                log::error!("review.review_all.send_err review={fail_rid} error={e}");
-                fail_state.review_action_pending.update(|map| {
-                    if let Some(gate) = map.get_mut(&fail_rid) {
-                        gate.start_ai = false;
-                        if gate.is_idle() {
-                            map.remove(&fail_rid);
-                        }
-                    }
-                });
-            }
-        });
-    };
-
     let comments_state = state.clone();
     let comments_host = host_id.clone();
     let on_comments = move |_| {
@@ -290,7 +200,6 @@ fn WorkspaceReviewHubInner(host_id: String, review_id: ReviewId) -> impl IntoVie
     view! {
         <div class="gp-review-hub" data-test="gp-workspace-review-hub">
             <div class="gp-review-hub-header">
-                <span class="gp-review-hub-title">"Workspace review"</span>
                 <span class="gp-review-counts" data-test="gp-workspace-review-counts">
                     {move || {
                         let (c, s) = counts.get();
@@ -300,24 +209,15 @@ fn WorkspaceReviewHubInner(host_id: String, review_id: ReviewId) -> impl IntoVie
                         )
                     }}
                 </span>
+                <button
+                    class="gp-review-open-btn"
+                    data-test="gp-workspace-review-comments"
+                    title="Open the workspace review comments"
+                    on:click=on_comments
+                >
+                    "Comments"
+                </button>
             </div>
-            <button
-                class="gp-review-all-btn primary"
-                data-test="gp-workspace-review-all"
-                title="Run an AI review over every changed file across the workspace"
-                disabled=review_all_disabled
-                on:click=on_review_all
-            >
-                "Review all changes across the workspace"
-            </button>
-            <button
-                class="gp-review-open-btn"
-                data-test="gp-workspace-review-comments"
-                title="Open the workspace review comments"
-                on:click=on_comments
-            >
-                "Comments"
-            </button>
             {move || {
                 if !loaded.get() {
                     return view! {

@@ -773,33 +773,23 @@ pub(crate) fn ReviewSidebar(
             .unwrap_or(false);
         user_open || running
     };
+    // Disclosure arrow matching the app's collapsible pattern (the git
+    // panel's CHANGES sections use the same ▾/▸ `fe-chevron`).
+    let ai_chevron = move || {
+        if ai_open_attr() {
+            "\u{25be}"
+        } else {
+            "\u{25b8}"
+        }
+    };
     let _ = status; // silence unused if banner moved out of sidebar
 
     view! {
         <div class="review-sidebar">
             <div class="review-sidebar-section">
-                <h4 class="review-sidebar-title">"Counts"</h4>
-                <div class="review-counts" data-test="review-counts">
-                    <span class="review-count-line"
-                          data-count-comments=move || user_comment_count.get().to_string()>
-                        {move || {
-                            let n = user_comment_count.get();
-                            format!("{n} comment{}", if n == 1 { "" } else { "s" })
-                        }}
-                    </span>
-                    <span class="review-count-line"
-                          data-count-pending=move || pending_suggestion_count.get().to_string()>
-                        {move || {
-                            let n = pending_suggestion_count.get();
-                            format!("{n} pending AI suggestion{}", if n == 1 { "" } else { "s" })
-                        }}
-                    </span>
-                </div>
-            </div>
-
-            <div class="review-sidebar-section">
                 <button
                     class="review-btn primary review-run-ai-btn"
+                    data-test="gp-workspace-review-all"
                     disabled=ai_disabled
                     title=ai_reason
                     on:click=move |ev| {
@@ -823,6 +813,7 @@ pub(crate) fn ReviewSidebar(
                     }
                 >
                     <summary class="review-ai-disclosure-summary">
+                        <span class="fe-chevron">{ai_chevron}</span>
                         "Configure AI reviewer"
                     </summary>
                     <div class="review-ai-disclosure-body">
@@ -1001,23 +992,25 @@ pub(crate) fn ReviewSidebar(
                         }
                     })
                 }}
-                <button
-                    class="review-btn primary review-submit-btn"
-                    disabled=submit_disabled
-                    title=submit_reason
-                    on:click=on_submit
-                >
-                    "Submit review"
-                </button>
-                <button
-                    class="review-btn review-clear-btn"
-                    data-test="review-clear-btn"
-                    disabled=clear_disabled
-                    title=clear_reason
-                    on:click=on_clear
-                >
-                    "Clear comments"
-                </button>
+                <div class="review-action-row">
+                    <button
+                        class="review-btn primary review-submit-btn"
+                        disabled=submit_disabled
+                        title=submit_reason
+                        on:click=on_submit
+                    >
+                        "Submit review"
+                    </button>
+                    <button
+                        class="review-btn review-clear-btn"
+                        data-test="review-clear-btn"
+                        disabled=clear_disabled
+                        title=clear_reason
+                        on:click=on_clear
+                    >
+                        "Clear comments"
+                    </button>
+                </div>
             </div>
         </div>
     }
@@ -2736,34 +2729,96 @@ mod wasm_tests {
         );
     }
 
-    /// Sidebar count derives reactively from the comments/suggestions
-    /// signal — the visible text reflects the live counts.
+    /// Live review counts derive reactively from the comments/suggestions
+    /// signal. UPDATED (panel density redesign, flagged): the sidebar's
+    /// two-line COUNTS block was removed; the surviving compact indicator is
+    /// the workspace hub's top-right `gp-workspace-review-counts`
+    /// ("{c} comments · {s} AI"). This mounts the real hub (`GitPanel`) and
+    /// asserts that single indicator reflects live counts — same reactive
+    /// guarantee, repointed at the compact element.
     #[wasm_bindgen_test]
     async fn sidebar_counts_derive_reactively() {
         ensure_styles_loaded();
         let container = make_container();
         let review = make_review();
         let review_id = review.id.clone();
-        let state_holder = mount_sidebar(container.clone(), review);
+
+        let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let review_for_mount = review.clone();
+        let summary_id = review_id.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state
+                .active_project
+                .set(Some(crate::state::ActiveProjectRef {
+                    host_id: "h1".to_owned(),
+                    project_id: ProjectId("proj-1".to_owned()),
+                }));
+            state.git_status.update(|m| {
+                m.insert(
+                    ProjectId("proj-1".to_owned()),
+                    vec![protocol::ProjectRootGitStatus {
+                        root: root_path(),
+                        branch: Some("main".to_owned()),
+                        ahead: 0,
+                        behind: 0,
+                        clean: false,
+                        files: vec![protocol::ProjectGitFileStatus {
+                            relative_path: "src/foo.rs".to_owned(),
+                            staged: None,
+                            unstaged: Some(protocol::ProjectGitChangeKind::Modified),
+                            untracked: false,
+                        }],
+                    }],
+                );
+            });
+            state.review_summaries.update(|m| {
+                m.insert(
+                    ProjectId("proj-1".to_owned()),
+                    vec![protocol::ReviewSummary {
+                        id: summary_id.clone(),
+                        scope: protocol::ReviewSummaryScope::Workspace,
+                        status: ReviewStatus::Draft,
+                        origin_session_id: SessionId("s".to_owned()),
+                        origin_agent_id: AgentId("a".to_owned()),
+                        created_at_ms: 0,
+                        updated_at_ms: 1,
+                        user_comment_count: 0,
+                        pending_suggestion_count: 0,
+                        file_comment_counts: vec![],
+                    }],
+                );
+            });
+            // Seed the full record so the hub doesn't fire a network subscribe.
+            state.reviews.update(|m| {
+                m.insert(review_for_mount.id.clone(), review_for_mount.clone());
+            });
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <crate::components::git_panel::GitPanel /> }
+        });
+        std::mem::forget(handle);
 
         next_tick().await;
         next_tick().await;
 
         let counts = container
-            .query_selector("[data-test=\"review-counts\"]")
+            .query_selector("[data-test=\"gp-workspace-review-counts\"]")
             .unwrap()
-            .expect("counts panel mounted");
+            .expect("workspace counts indicator mounted");
         let counts_el: HtmlElement = counts.dyn_into().unwrap();
         assert!(
             counts_el
                 .text_content()
                 .unwrap_or_default()
-                .contains("0 comments"),
-            "expected initial '0 comments', got: {}",
+                .contains("0 comment"),
+            "expected initial '0 comment', got: {}",
             counts_el.text_content().unwrap_or_default()
         );
 
-        let state = state_holder.borrow().clone().unwrap();
+        let state = holder.borrow().clone().unwrap();
         state.reviews.update(|map| {
             if let Some(r) = map.get_mut(&review_id) {
                 r.comments.push(comment_at_line(2, "first"));
@@ -2774,19 +2829,16 @@ mod wasm_tests {
         next_tick().await;
 
         let counts = container
-            .query_selector("[data-test=\"review-counts\"]")
+            .query_selector("[data-test=\"gp-workspace-review-counts\"]")
             .unwrap()
-            .expect("counts panel mounted");
+            .expect("workspace counts indicator mounted");
         let counts_el: HtmlElement = counts.dyn_into().unwrap();
         let txt = counts_el.text_content().unwrap_or_default();
         assert!(
             txt.contains("2 comments"),
             "expected '2 comments' in: {txt}"
         );
-        assert!(
-            txt.contains("1 pending AI"),
-            "expected '1 pending AI' in: {txt}"
-        );
+        assert!(txt.contains("1 AI"), "expected '1 AI' in: {txt}");
     }
 
     /// AI review uses the host's default backend automatically — the user no

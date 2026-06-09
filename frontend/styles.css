@@ -7711,26 +7711,6 @@ pre.tool-error-pre {
     gap: var(--space-2);
 }
 
-.review-sidebar-title {
-    font-size: 0.769rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-tertiary);
-    margin: 0;
-}
-
-.review-counts {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-1);
-}
-
-.review-count-line {
-    font-size: 0.846rem;
-    color: var(--text-secondary);
-}
-
 .review-instructions,
 .review-textarea {
     width: 100%;
@@ -7855,11 +7835,20 @@ pre.tool-error-pre {
 
 .review-ai-disclosure-summary {
     cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
     padding: var(--space-1) var(--space-2);
     font-size: 0.846rem;
     color: var(--text-secondary);
     user-select: none;
-    list-style: revert;
+    list-style: none;
+}
+
+/* Use the app's own ▾/▸ `fe-chevron` glyph instead of the native disclosure
+   triangle, matching the git panel's collapsible CHANGES sections. */
+.review-ai-disclosure-summary::-webkit-details-marker {
+    display: none;
 }
 
 .review-ai-disclosure-summary:hover {
@@ -7926,6 +7915,25 @@ pre.tool-error-pre {
     font-size: 0.846rem;
     cursor: pointer;
     transition: background 0.1s ease;
+}
+
+/* Density: action buttons and the AI status row are sized to content and
+   sit at the start of the column rather than stretching the full panel
+   width. Related actions (Submit + Clear) group in a wrapping row. */
+.review-run-ai-btn,
+.review-ai-agent-link,
+.review-ai-status {
+    align-self: flex-start;
+}
+
+.review-action-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.review-action-row .review-btn {
+    flex: 0 0 auto;
 }
 
 .review-btn:hover:not(:disabled) {
@@ -8088,17 +8096,9 @@ pre.tool-error-pre {
 
 .gp-review-hub-header {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     justify-content: space-between;
     gap: var(--space-2);
-}
-
-.gp-review-hub-title {
-    font-size: 0.769rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-tertiary);
 }
 
 .gp-review-counts {
