@@ -12,6 +12,16 @@ const CANONICAL_BACKENDS: [BackendKind; 5] = [
     BackendKind::Gemini,
 ];
 
+/// Preference order for choosing the initial default backend when seeding a
+/// brand-new install. Most capable / most widely used first.
+const DEFAULT_BACKEND_PREFERENCE: [BackendKind; 5] = [
+    BackendKind::Claude,
+    BackendKind::Codex,
+    BackendKind::Gemini,
+    BackendKind::Kiro,
+    BackendKind::Tycode,
+];
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StoreFile {
     settings: HostSettings,
@@ -43,6 +53,36 @@ impl HostSettingsStore {
 
     pub fn get(&self) -> Result<HostSettings, String> {
         Self::read_from_disk(&self.path)
+    }
+
+    /// First-run convenience: when no settings file exists yet, enable every
+    /// backend that is already installed on this host and pick a sensible
+    /// default, so a brand-new user can start chatting immediately instead of
+    /// landing on an empty backend list and a silently broken "New Chat".
+    ///
+    /// Deliberately a no-op once a settings file exists (a user who turns every
+    /// backend off is respected) and when nothing is installed (the install is
+    /// left fresh so a later launch can seed once a CLI is installed). Returns
+    /// `true` only when it actually seeded.
+    pub fn seed_installed_backends_if_fresh(
+        &self,
+        installed: &[BackendKind],
+    ) -> Result<bool, String> {
+        if self.path.exists() {
+            return Ok(false);
+        }
+        let enabled = normalize_backend_list(installed.to_vec());
+        if enabled.is_empty() {
+            return Ok(false);
+        }
+        let default_backend = DEFAULT_BACKEND_PREFERENCE
+            .into_iter()
+            .find(|kind| enabled.contains(kind));
+        let mut settings = empty_settings();
+        settings.enabled_backends = enabled;
+        settings.default_backend = default_backend;
+        Self::save(&self.path, &settings)?;
+        Ok(true)
     }
 
     pub fn apply(&self, setting: HostSettingValue) -> Result<HostSettings, String> {
@@ -214,6 +254,61 @@ mod tests {
     use protocol::SessionSettingValue;
 
     use super::*;
+
+    #[test]
+    fn seeds_installed_backends_on_fresh_install_with_preferred_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        let store = HostSettingsStore::load(path.clone()).expect("load empty store");
+
+        // Codex + Claude installed; Claude is preferred as the default.
+        let seeded = store
+            .seed_installed_backends_if_fresh(&[BackendKind::Codex, BackendKind::Claude])
+            .expect("seed");
+        assert!(seeded);
+        assert!(path.exists(), "seeding persists a settings file");
+
+        let settings = store.get().expect("get settings");
+        // Normalized to canonical order.
+        assert_eq!(
+            settings.enabled_backends,
+            vec![BackendKind::Claude, BackendKind::Codex]
+        );
+        assert_eq!(settings.default_backend, Some(BackendKind::Claude));
+    }
+
+    #[test]
+    fn seeding_is_noop_once_a_settings_file_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        // A user who deliberately turned every backend off.
+        let store = HostSettingsStore::load(path).expect("load empty store");
+        store
+            .apply(HostSettingValue::EnabledBackends {
+                enabled_backends: vec![],
+            })
+            .expect("disable all backends");
+
+        let seeded = store
+            .seed_installed_backends_if_fresh(&[BackendKind::Claude])
+            .expect("seed");
+        assert!(!seeded, "must not re-enable backends once configured");
+        assert!(store.get().expect("get").enabled_backends.is_empty());
+    }
+
+    #[test]
+    fn seeding_is_noop_when_nothing_is_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        let store = HostSettingsStore::load(path.clone()).expect("load empty store");
+
+        let seeded = store.seed_installed_backends_if_fresh(&[]).expect("seed");
+        assert!(!seeded);
+        assert!(
+            !path.exists(),
+            "no file is written so a later launch can seed once a CLI is installed"
+        );
+    }
 
     #[test]
     fn old_store_files_without_tier_fields_load_with_tiers_off() {

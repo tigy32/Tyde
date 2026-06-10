@@ -421,7 +421,11 @@ pub fn ProjectRail() -> impl IntoView {
             <div class="rail-bottom">
                 <button
                     class="rail-item rail-add"
-                    title="New Project on Selected Host"
+                    title=move || if connected.get() {
+                        "New project on the selected host"
+                    } else {
+                        "Connect to a host first to create a project"
+                    }
                     on:click=on_add_click
                     disabled=move || !connected.get()
                 >

@@ -2570,6 +2570,8 @@ mod wasm_tests {
                     mobile_broker_url: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
                 },
             );
         });
@@ -4075,6 +4077,12 @@ mod wasm_tests {
         let host_id = "host-draft-commit";
         let project_id = "p-1";
         let state = install_state(host_id, vec![], vec![]);
+        state.host_settings_by_host.update(|settings_by_host| {
+            settings_by_host
+                .get_mut(host_id)
+                .expect("test host settings")
+                .complexity_tiers_enabled = true;
+        });
         install_host_stream(&state, host_id);
         install_catalog(&state, host_id);
         install_project(&state, host_id, project_id, "Test Project");
@@ -4114,7 +4122,7 @@ mod wasm_tests {
         next_tick().await;
         set_select_by_label(&container, "Backend", "codex");
         next_tick().await;
-        set_select_by_label(&container, "Cost effort", "low");
+        set_select_by_label(&container, "Task complexity", "low");
         next_tick().await;
         // The wizard's upfront Project picker self-seeds from the installed
         // project list and propagates to each member via the autofill

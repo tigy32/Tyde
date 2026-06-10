@@ -392,6 +392,33 @@ impl HostHandle {
             host_path
         );
 
+        // First-run: enable whichever backends are already installed so a fresh
+        // install lands on a usable picker instead of an empty one. No-op once a
+        // settings file exists.
+        {
+            let installed: Vec<protocol::BackendKind> = backend_setup
+                .backends
+                .iter()
+                .filter(|info| info.status == protocol::BackendSetupStatus::Installed)
+                .map(|info| info.backend_kind)
+                .collect();
+            match state
+                .settings_store
+                .lock()
+                .await
+                .seed_installed_backends_if_fresh(&installed)
+            {
+                Ok(true) => tracing::info!(
+                    ?installed,
+                    "seeded enabled backends from installed CLIs on first run"
+                ),
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(%err, "failed to seed installed backends on first run")
+                }
+            }
+        }
+
         let settings = state
             .settings_store
             .lock()

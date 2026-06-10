@@ -9,6 +9,7 @@ use crate::bridge;
 use crate::components::command_palette::CommandPalette;
 use crate::components::feedback_modal::FeedbackModal;
 use crate::components::header::Header;
+use crate::components::help_tour::HelpTour;
 use crate::components::host_browser::HostBrowser;
 use crate::components::project_rail::ProjectRail;
 use crate::components::settings_panel::restore_appearance;
@@ -597,6 +598,7 @@ pub fn App() -> impl IntoView {
             <CommandPalette />
             <FeedbackModal />
             <HostBrowser />
+            <HelpTour />
         </div>
     }
 }

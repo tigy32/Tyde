@@ -18,7 +18,9 @@ use rmcp::{
         CallToolRequestParams, CallToolResult, Content, ListToolsResult, PaginatedRequestParams,
         ServerCapabilities, ServerInfo,
     },
-    schemars, service::RequestContext, tool, tool_router,
+    schemars,
+    service::RequestContext,
+    tool, tool_router,
     transport::{
         StreamableHttpServerConfig,
         streamable_http_server::{

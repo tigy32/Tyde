@@ -707,6 +707,20 @@ pub fn SettingsPanel() -> impl IntoView {
     let active_tab = RwSignal::new(SettingsTab::Appearance);
     let search_query = RwSignal::new(String::new());
 
+    // Honor deep-link requests (e.g. the onboarding "Set up an AI engine" CTA
+    // asking to open straight to the Backends tab).
+    {
+        let state = state.clone();
+        Effect::new(move |_| {
+            if let Some(label) = state.settings_tab_request.get() {
+                if let Some(tab) = ALL_TABS.into_iter().find(|tab| tab.label() == label) {
+                    active_tab.set(tab);
+                }
+                state.settings_tab_request.set(None);
+            }
+        });
+    }
+
     let on_close = move |_| {
         state.settings_open.set(false);
     };
@@ -4332,6 +4346,8 @@ mod wasm_tests {
                         .map(|s| protocol::BrokerUrl::new(s.to_owned()).expect("broker url")),
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
                 },
             );
         });

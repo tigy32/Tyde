@@ -152,6 +152,14 @@ pub fn FileExplorer() -> impl IntoView {
 
     let state_for_add_root = state.clone();
     let on_add_root = move |_| open_add_root_browser(&state_for_add_root);
+    let state_for_add_title = state.clone();
+    let add_root_title = move || {
+        if state_for_add_title.active_project.get().is_none() {
+            "Open or select a project first to add a workspace folder"
+        } else {
+            "Add a workspace folder (root) to this project"
+        }
+    };
     let add_root_disabled = move || state.active_project.get().is_none();
 
     view! {
@@ -166,7 +174,7 @@ pub fn FileExplorer() -> impl IntoView {
                 </span>
                 <button
                     class="fe-add-root"
-                    title="Add workspace root"
+                    title=add_root_title
                     on:click=on_add_root
                     disabled=add_root_disabled
                 >

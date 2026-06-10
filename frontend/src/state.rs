@@ -764,6 +764,13 @@ pub struct AppState {
     pub project_view_memory: RwSignal<HashMap<ActiveProjectRef, ProjectViewMemory>>,
     pub command_palette_open: RwSignal<bool>,
     pub settings_open: RwSignal<bool>,
+    /// When set, the settings panel jumps to the tab with this label (e.g.
+    /// "Backends") the next time it renders. Used to deep-link from onboarding
+    /// CTAs. Cleared by the panel once consumed.
+    pub settings_tab_request: RwSignal<Option<&'static str>>,
+    /// Current step of the guided help tour overlay, `None` when the tour is
+    /// closed. The Help button on the home screen starts it at step 0.
+    pub help_tour_step: RwSignal<Option<usize>>,
     pub feedback_open: RwSignal<bool>,
     pub find_bar_open: RwSignal<bool>,
     pub host_settings_by_host: RwSignal<HashMap<String, HostSettings>>,
@@ -1009,6 +1016,8 @@ impl AppState {
             project_view_memory: RwSignal::new(HashMap::new()),
             command_palette_open: RwSignal::new(false),
             settings_open: RwSignal::new(false),
+            settings_tab_request: RwSignal::new(None),
+            help_tour_step: RwSignal::new(None),
             feedback_open: RwSignal::new(false),
             find_bar_open: RwSignal::new(false),
             host_settings_by_host: RwSignal::new(HashMap::new()),

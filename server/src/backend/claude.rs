@@ -7296,7 +7296,9 @@ fn claude_backend_defaults(
     }
 }
 
-pub(crate) fn claude_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
+pub(crate) fn claude_cost_hint_defaults(
+    cost_hint: SpawnCostHint,
+) -> protocol::SessionSettingsValues {
     let (model, effort) = claude_backend_defaults(Some(cost_hint));
     let mut values = protocol::SessionSettingsValues::default();
     if let Some(model) = model {

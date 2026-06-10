@@ -1011,6 +1011,13 @@ async fn team_member_create_rejects_unknown_custom_agent() {
 async fn team_create_allows_default_agent_with_backend_and_cost() {
     let mut fixture = Fixture::new().await;
     let project = create_project(&mut fixture.client, "default-agent-project").await;
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::ComplexityTiersEnabled { enabled: true },
+        })
+        .await
+        .expect("set complexity tiers failed");
     let mut manager_spec = member_spec_with_profile(
         "manager",
         None,

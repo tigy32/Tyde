@@ -1600,7 +1600,9 @@ fn gemini_backend_model(cost_hint: Option<SpawnCostHint>) -> Option<&'static str
     }
 }
 
-pub(crate) fn gemini_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
+pub(crate) fn gemini_cost_hint_defaults(
+    cost_hint: SpawnCostHint,
+) -> protocol::SessionSettingsValues {
     let mut values = protocol::SessionSettingsValues::default();
     if let Some(model) = gemini_backend_model(Some(cost_hint)) {
         values.0.insert(

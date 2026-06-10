@@ -1,17 +1,10 @@
 use leptos::prelude::*;
-use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::spawn_local;
 
-use crate::actions::{begin_new_chat, begin_new_chat_with, delete_project_root, rename_project};
-use crate::state::{AgentInfo, AppState, ConnectionStatus};
+use crate::actions::{begin_new_chat, begin_new_chat_with};
+use crate::components::host_browser::open_project_browser;
+use crate::state::{AppState, ConnectionStatus};
 
 use protocol::{BackendKind, CustomAgent};
-
-#[derive(Clone, Copy, PartialEq)]
-enum HomeTab {
-    Projects,
-    Agents,
-}
 
 fn backend_label_for(kind: BackendKind) -> &'static str {
     match kind {
@@ -23,10 +16,21 @@ fn backend_label_for(kind: BackendKind) -> &'static str {
     }
 }
 
+/// One-line orientation shown under each engine name in the New Chat picker so
+/// the bare backend names aren't a wall of unfamiliar words to a new user.
+fn backend_tagline(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Tycode => "Tycode subprocess",
+        BackendKind::Kiro => "Kiro ACP",
+        BackendKind::Claude => "Anthropic — deep reasoning & coding",
+        BackendKind::Codex => "OpenAI — fast code generation",
+        BackendKind::Gemini => "Google — multimodal assistant",
+    }
+}
+
 #[component]
 pub fn HomeView() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let active_tab = RwSignal::new(HomeTab::Projects);
 
     let connected_state = state.clone();
     let connected = Memo::new(move |_| {
@@ -35,17 +39,42 @@ pub fn HomeView() -> impl IntoView {
             ConnectionStatus::Connected
         )
     });
-    let state_for_hosts = state.clone();
 
-    let tab_class = move |target: HomeTab| {
-        move || {
-            if active_tab.get() == target {
-                "tab active"
-            } else {
-                "tab"
-            }
-        }
+    // Setup progress for the getting-started guide. The guide is always on
+    // screen — it doubles as orientation for returning users — and only the
+    // step markers and CTAs react to progress.
+    let backend_state = state.clone();
+    let has_backend = Memo::new(move |_| {
+        backend_state
+            .host_settings_by_host
+            .get()
+            .values()
+            .any(|settings| !settings.enabled_backends.is_empty())
+    });
+    let project_state = state.clone();
+    let has_project = Memo::new(move |_| !project_state.projects.get().is_empty());
+    let agents_state = state.clone();
+    let has_agent = Memo::new(move |_| !agents_state.agents.get().is_empty());
+
+    let open_backends_state = state.clone();
+    let open_backend_settings = move |_| {
+        open_backends_state
+            .settings_tab_request
+            .set(Some("Backends"));
+        open_backends_state.settings_open.set(true);
     };
+
+    let create_project_state = state.clone();
+    let on_create_project = move |_| open_project_browser(&create_project_state);
+
+    let manage_hosts_state = state.clone();
+    let on_manage_hosts = move |_| {
+        manage_hosts_state.settings_tab_request.set(Some("Hosts"));
+        manage_hosts_state.settings_open.set(true);
+    };
+
+    let help_state = state.clone();
+    let on_help = move |_| help_state.help_tour_step.set(Some(0));
 
     view! {
         <div class="home-view">
@@ -55,334 +84,83 @@ pub fn HomeView() -> impl IntoView {
                 <p class="home-tagline">"Coding Agent Studio"</p>
             </div>
 
-            <div class="home-hints">
-                <span class="kbd-hint"><kbd>"⌘ K"</kbd>" Palette"</span>
-                <span class="kbd-hint"><kbd>"⌘ N"</kbd>" New Chat"</span>
-                <span class="kbd-hint"><kbd>"⌘ ,"</kbd>" Settings"</span>
+            <div class="home-getstarted">
+                <h2 class="home-getstarted-title">"Getting started"</h2>
+                <p class="home-getstarted-lede">
+                    "Tyde is a control center for AI coding agents. It runs the agent backends you already know — Claude, Codex, Gemini and more — and keeps every session organized, so you can run many agents across many projects at once."
+                </p>
+                <ol class="home-getstarted-steps">
+                    <li class="home-getstarted-step" class:done=move || has_backend.get()>
+                        <span class="home-getstarted-marker">
+                            {move || if has_backend.get() { "✓" } else { "1" }}
+                        </span>
+                        <div class="home-getstarted-body">
+                            <div class="home-getstarted-step-title">"Connect an agent backend"</div>
+                            <p class="home-getstarted-step-desc">
+                                "Tyde brings no AI of its own — it runs external agent backends like Claude, Codex, and Gemini. Pick one, install it, and sign in; backends already on your machine are enabled automatically."
+                            </p>
+                            <Show when=move || !has_backend.get()>
+                                <button
+                                    class="action-btn primary home-getstarted-cta"
+                                    on:click=open_backend_settings
+                                >
+                                    "Connect an agent backend →"
+                                </button>
+                            </Show>
+                        </div>
+                    </li>
+                    <li class="home-getstarted-step" class:done=move || has_project.get()>
+                        <span class="home-getstarted-marker">
+                            {move || if has_project.get() { "✓" } else { "2" }}
+                        </span>
+                        <div class="home-getstarted-body">
+                            <div class="home-getstarted-step-title">"Create a project"</div>
+                            <p class="home-getstarted-step-desc">
+                                "A project is one or more folders an agent can read and edit — usually a codebase. Your projects live in the left sidebar; switch between them anytime."
+                            </p>
+                            <Show when=move || !has_project.get()>
+                                <button
+                                    class="action-btn primary home-getstarted-cta"
+                                    on:click=on_create_project.clone()
+                                    disabled=move || !connected.get()
+                                    title=move || if connected.get() {
+                                        "Pick a folder to create your first project"
+                                    } else {
+                                        "Connect to a host first to create a project"
+                                    }
+                                >
+                                    "Choose a folder →"
+                                </button>
+                            </Show>
+                        </div>
+                    </li>
+                    <li class="home-getstarted-step" class:done=move || has_agent.get()>
+                        <span class="home-getstarted-marker">
+                            {move || if has_agent.get() { "✓" } else { "3" }}
+                        </span>
+                        <div class="home-getstarted-body">
+                            <div class="home-getstarted-step-title">"Run agents in it"</div>
+                            <p class="home-getstarted-step-desc">
+                                "Open a chat inside a project (New Chat, or ⌘N), describe a task, and an agent gets to work in that folder. Each project can run several agents at once — Tyde keeps every session organized so you can jump between them."
+                            </p>
+                        </div>
+                    </li>
+                </ol>
             </div>
 
             <div class="home-actions">
                 <NewChatButton connected_sig=connected />
-                <button
-                    class="action-btn"
-                    on:click=move |_| state.settings_open.set(true)
-                >
+                <button class="action-btn" on:click=on_manage_hosts>
                     "Manage Hosts"
                 </button>
-            </div>
-
-            <div class="tab-bar home-tab-bar">
-                <button class={tab_class(HomeTab::Projects)} on:click=move |_| active_tab.set(HomeTab::Projects)>"Projects"</button>
-                <button class={tab_class(HomeTab::Agents)} on:click=move |_| active_tab.set(HomeTab::Agents)>"Agents"</button>
-            </div>
-
-            {move || match active_tab.get() {
-                HomeTab::Projects => {
-                    let state_for_arm = state.clone();
-                    let state_for_hosts = state_for_hosts.clone();
-                    view! {
-                    <section class="home-section">
-                        <For
-                            each=move || state_for_hosts.configured_hosts.get()
-                            key=|host| host.id.clone()
-                            let:host
-                        >
-                            {
-                                let state = state_for_arm.clone();
-                                let host_id = host.id.clone();
-                                let host_label = host.label.clone();
-
-                                let state_for_status = state.clone();
-                                let host_id_for_status = host_id.clone();
-                                let status = move || {
-                                    state_for_status.connection_statuses
-                                        .get()
-                                        .get(&host_id_for_status)
-                                        .cloned()
-                                        .unwrap_or(crate::state::ConnectionStatus::Disconnected)
-                                };
-
-                                let state_for_projects = state.clone();
-                                let host_id_for_projects = host_id.clone();
-                                let projects_view = move || {
-                                    let state = state_for_projects.clone();
-                                    let host_id_filter = host_id_for_projects.clone();
-                                    let projects: Vec<_> = state.projects.get()
-                                        .into_iter()
-                                        .filter(|project| project.host_id == host_id_filter)
-                                        .collect();
-                                    if projects.is_empty() {
-                                        view! { <div class="panel-empty">"No projects"</div> }.into_any()
-                                    } else {
-                                        let agents = state.agents.get();
-                                        view! {
-                                            <div class="project-grid">
-                                                {projects.into_iter().map(|project| {
-                                                    view! { <ProjectCard project=project.project agents=agents.clone() host_id=project.host_id.clone() /> }
-                                                }).collect_view()}
-                                            </div>
-                                        }.into_any()
-                                    }
-                                };
-
-                                view! {
-                                    <div class="home-host-section">
-                                        <div class="home-host-header">
-                                            <h2 class="section-title">{host_label.clone()}</h2>
-                                            <span class="home-host-status">
-                                                {move || match status() {
-                                                    crate::state::ConnectionStatus::Connected => "Connected",
-                                                    crate::state::ConnectionStatus::Connecting => "Connecting",
-                                                    crate::state::ConnectionStatus::Disconnected => "Disconnected",
-                                                    crate::state::ConnectionStatus::Error(_) => "Error",
-                                                }}
-                                            </span>
-                                        </div>
-                                        {projects_view}
-                                    </div>
-                                }
-                            }
-                        </For>
-                    </section>
-                    }.into_any()
-                },
-                HomeTab::Agents => {
-                    let state_for_agents = state.clone();
-                    view! {
-                    <section class="home-section">
-                        <div class="agent-list">
-                            <For
-                                each=move || state_for_agents.agents.get()
-                                key=|agent| format!("{}:{}", agent.host_id, agent.agent_id.0)
-                                let:agent
-                            >
-                                <AgentRow host_id=agent.host_id agent_id=agent.agent_id />
-                            </For>
-                        </div>
-                    </section>
-                    }.into_any()
-                },
-            }}
-        </div>
-    }
-}
-
-#[component]
-fn ProjectCard(
-    project: protocol::Project,
-    agents: Vec<AgentInfo>,
-    host_id: String,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let project_id = project.id.clone();
-    let agent_count = agents
-        .iter()
-        .filter(|agent| agent.host_id == host_id && agent.project_id.as_ref() == Some(&project_id))
-        .count();
-
-    let editing = RwSignal::new(false);
-    let draft_name = RwSignal::new(project.name.clone());
-
-    let project_name = project.name.clone();
-    let begin_edit = {
-        let project_name = project_name.clone();
-        move |_| {
-            draft_name.set(project_name.clone());
-            editing.set(true);
-        }
-    };
-
-    let commit_rename = {
-        let state = state.clone();
-        let host_id = host_id.clone();
-        let project_id = project_id.clone();
-        let project_name = project_name.clone();
-        move || {
-            let new_name = draft_name.get_untracked();
-            let trimmed = new_name.trim();
-            editing.set(false);
-            if trimmed.is_empty() || trimmed == project_name {
-                return;
-            }
-            rename_project(
-                &state,
-                host_id.clone(),
-                project_id.clone(),
-                trimmed.to_owned(),
-            );
-        }
-    };
-
-    let on_input = move |ev: web_sys::Event| {
-        if let Some(target) = ev.target()
-            && let Some(input) = target.dyn_ref::<web_sys::HtmlInputElement>()
-        {
-            draft_name.set(input.value());
-        }
-    };
-
-    let commit_for_blur = commit_rename.clone();
-    let on_blur = move |_| commit_for_blur();
-
-    let commit_for_keydown = commit_rename.clone();
-    let on_keydown = move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
-        "Enter" => {
-            ev.prevent_default();
-            commit_for_keydown();
-        }
-        "Escape" => {
-            ev.prevent_default();
-            editing.set(false);
-        }
-        _ => {}
-    };
-
-    let project_name_view = project_name.clone();
-    let name_view = move || {
-        if editing.get() {
-            view! {
-                <input
-                    class="project-card-name-input"
-                    type="text"
-                    prop:value=move || draft_name.get()
-                    on:input=on_input
-                    on:blur=on_blur.clone()
-                    on:keydown=on_keydown.clone()
-                    autofocus="true"
-                />
-            }
-            .into_any()
-        } else {
-            view! {
                 <button
-                    class="project-card-name"
-                    title="Click to rename"
-                    on:click=begin_edit.clone()
+                    class="action-btn"
+                    title="Take a quick tour of the interface"
+                    on:click=on_help
                 >
-                    {project_name_view.clone()}
+                    "Help"
                 </button>
-            }
-            .into_any()
-        }
-    };
-
-    let roots = project.roots.clone();
-    let roots_view = if roots.is_empty() {
-        view! { <div class="project-card-roots-empty">"No workspace roots"</div> }.into_any()
-    } else {
-        let host_id = host_id.clone();
-        let project_id = project_id.clone();
-        let project_name = project.name.clone();
-        roots
-            .into_iter()
-            .map(|root| {
-                let state = state.clone();
-                let host_id = host_id.clone();
-                let project_id = project_id.clone();
-                let project_name = project_name.clone();
-                let root_for_label = root.clone();
-                let root_for_title = root.clone();
-                let on_remove = move |ev: web_sys::MouseEvent| {
-                    ev.stop_propagation();
-                    let state = state.clone();
-                    let host_id = host_id.clone();
-                    let project_id = project_id.clone();
-                    let project_name = project_name.clone();
-                    let root = root.clone();
-                    spawn_local(async move {
-                        let message = format!(
-                            "Remove root \"{}\" from project \"{}\"?",
-                            root, project_name
-                        );
-                        if !crate::bridge::confirm_dialog("Remove root", &message).await {
-                            return;
-                        }
-                        delete_project_root(&state, host_id, project_id, root);
-                    });
-                };
-                view! {
-                    <div class="project-card-root-row">
-                        <span class="project-card-root-path" title=root_for_title>
-                            {root_for_label}
-                        </span>
-                        <button
-                            class="project-card-root-remove"
-                            title="Remove root"
-                            on:click=on_remove
-                        >
-                            "×"
-                        </button>
-                    </div>
-                }
-            })
-            .collect_view()
-            .into_any()
-    };
-
-    view! {
-        <div class="project-card">
-            {name_view}
-            <div class="project-card-roots">{roots_view}</div>
-            <div class="project-card-agents">
-                {match agent_count {
-                    0 => "No active agents".to_string(),
-                    1 => "1 active agent".to_string(),
-                    n => format!("{n} active agents"),
-                }}
             </div>
-        </div>
-    }
-}
-
-#[component]
-fn AgentRow(host_id: String, agent_id: protocol::AgentId) -> impl IntoView {
-    let state = expect_context::<AppState>();
-
-    // Look up the agent reactively so state changes (fatal_error, name, etc.)
-    // flow through without relying on the keyed `<For>` to recreate this row.
-    let agent = move || {
-        state
-            .agents
-            .get()
-            .into_iter()
-            .find(|a| a.host_id == host_id && a.agent_id == agent_id)
-    };
-
-    let agent_for_name = agent.clone();
-    let name = move || agent_for_name().map(|a| a.name).unwrap_or_default();
-
-    let agent_for_backend = agent.clone();
-    let backend_class = move || match agent_for_backend().map(|a| a.backend_kind) {
-        Some(BackendKind::Tycode) => "backend-badge tycode",
-        Some(BackendKind::Kiro) => "backend-badge kiro",
-        Some(BackendKind::Claude) => "backend-badge claude",
-        Some(BackendKind::Codex) => "backend-badge codex",
-        Some(BackendKind::Gemini) => "backend-badge gemini",
-        None => "backend-badge",
-    };
-
-    let agent_for_label = agent.clone();
-    let backend_label = move || match agent_for_label().map(|a| a.backend_kind) {
-        Some(BackendKind::Tycode) => "Tycode",
-        Some(BackendKind::Kiro) => "Kiro",
-        Some(BackendKind::Claude) => "Claude",
-        Some(BackendKind::Codex) => "Codex",
-        Some(BackendKind::Gemini) => "Gemini",
-        None => "",
-    };
-
-    let status_text = move || match agent() {
-        Some(a) if a.fatal_error.is_some() => "Terminated",
-        Some(a) if !a.started => "Initializing",
-        Some(_) => "Idle",
-        None => "",
-    };
-
-    view! {
-        <div class="agent-row">
-            <span class="agent-name">{name}</span>
-            <span class=backend_class>{backend_label}</span>
-            <span class="agent-status">{status_text}</span>
         </div>
     }
 }
@@ -489,8 +267,9 @@ fn FlyoutBody(
                             style="display:flex;align-items:center;gap:0.5rem;width:100%;text-align:left;padding:0.4rem 0.6rem;background:transparent;border:none;color:inherit;cursor:pointer;border-radius:4px;white-space:nowrap;"
                             on:click=on_row_click
                         >
-                            <span>
-                                {backend_label_for(backend)}
+                            <span style="display:flex;flex-direction:column;gap:0.1rem;">
+                                <span>{backend_label_for(backend)}</span>
+                                <span style="opacity:0.55;font-size:0.7rem;">{backend_tagline(backend)}</span>
                             </span>
                             <span style="flex:1;"></span>
                             <span style="opacity:0.5;font-size:0.7rem;">"▶"</span>
@@ -593,5 +372,228 @@ fn NewChatButton(connected_sig: Memo<bool>) -> impl IntoView {
                 </Show>
             </div>
         </>
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use crate::state::{AgentInfo, ProjectInfo};
+    use leptos::mount::mount_to;
+    use protocol::{AgentId, AgentOrigin, Project, ProjectId, StreamPath};
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    /// Yield to the browser event loop so reactive effects flush and the DOM
+    /// reflects the rendered view before we assert on it.
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn visible_text(container: &HtmlElement) -> String {
+        container.text_content().unwrap_or_default()
+    }
+
+    /// Find a rendered `<button>` by its visible label, ignoring markup
+    /// structure so the test survives styling refactors.
+    fn find_button_by_text(container: &HtmlElement, text: &str) -> Option<HtmlElement> {
+        let nodes = container.query_selector_all("button").unwrap();
+        (0..nodes.length())
+            .filter_map(|i| nodes.item(i)?.dyn_into::<HtmlElement>().ok())
+            .find(|btn| btn.text_content().unwrap_or_default().contains(text))
+    }
+
+    fn enable_backend(state: &AppState, host_id: &str) {
+        state.host_settings_by_host.update(|map| {
+            map.insert(
+                host_id.to_owned(),
+                protocol::HostSettings {
+                    enabled_backends: vec![BackendKind::Claude],
+                    default_backend: Some(BackendKind::Claude),
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: false,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
+                },
+            );
+        });
+    }
+
+    fn add_project(state: &AppState, host_id: &str) {
+        state.projects.update(|projects| {
+            projects.push(ProjectInfo {
+                host_id: host_id.to_owned(),
+                project: Project {
+                    id: ProjectId("p-1".to_owned()),
+                    name: "demo".to_owned(),
+                    roots: vec!["/tmp/demo".to_owned()],
+                    sort_order: 0,
+                },
+            });
+        });
+    }
+
+    fn add_agent(state: &AppState, host_id: &str) {
+        state.agents.update(|agents| {
+            agents.push(AgentInfo {
+                host_id: host_id.to_owned(),
+                agent_id: AgentId("a-1".to_owned()),
+                name: "agent".to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: Some(ProjectId("p-1".to_owned())),
+                parent_agent_id: None,
+                session_id: None,
+                custom_agent_id: None,
+                created_at_ms: 1,
+                instance_stream: StreamPath("/agent/a-1/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+            });
+        });
+    }
+
+    fn checkmark_count(container: &HtmlElement) -> usize {
+        visible_text(container).matches('✓').count()
+    }
+
+    /// A brand-new user (no backend enabled anywhere, no projects) must see the
+    /// getting-started guide explaining what Tyde is, with all three setup
+    /// steps pending and working calls-to-action: backend setup deep-links to
+    /// Settings → Backends, and project creation offers a folder picker.
+    #[wasm_bindgen_test]
+    async fn fresh_install_shows_getting_started_with_ctas() {
+        let container = make_container();
+        let state = AppState::new();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <HomeView /> }
+        });
+        next_tick().await;
+
+        let text = visible_text(&container);
+        assert!(
+            text.contains("Getting started"),
+            "fresh install must show the getting-started guide, got: {text}"
+        );
+        for step in [
+            "Connect an agent backend",
+            "Create a project",
+            "Run agents in it",
+        ] {
+            assert!(text.contains(step), "missing setup step {step:?}: {text}");
+        }
+        assert_eq!(
+            checkmark_count(&container),
+            0,
+            "no step is complete yet, so no checkmarks expected: {text}"
+        );
+
+        let folder_cta = find_button_by_text(&container, "Choose a folder →")
+            .expect("step 2 must offer a folder picker button");
+        assert!(
+            folder_cta
+                .dyn_ref::<web_sys::HtmlButtonElement>()
+                .expect("button element")
+                .disabled(),
+            "folder CTA must be disabled while no host is connected"
+        );
+
+        let cta = find_button_by_text(&container, "Connect an agent backend →")
+            .expect("step 1 must offer a backend-setup button");
+        cta.click();
+        next_tick().await;
+        assert!(
+            state.settings_open.get_untracked(),
+            "backend CTA must open settings"
+        );
+        assert_eq!(
+            state.settings_tab_request.get_untracked(),
+            Some("Backends"),
+            "backend CTA must deep-link to the Backends tab"
+        );
+    }
+
+    /// The guide stays on screen permanently as orientation: each completed
+    /// step flips to a checkmark and drops its CTA, and the guide is still
+    /// visible once everything is set up.
+    #[wasm_bindgen_test]
+    async fn getting_started_tracks_progress_and_stays_visible() {
+        let container = make_container();
+        let state = AppState::new();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <HomeView /> }
+        });
+        next_tick().await;
+
+        enable_backend(&state, "local");
+        next_tick().await;
+        assert_eq!(
+            checkmark_count(&container),
+            1,
+            "backend step must show as completed"
+        );
+        assert!(
+            find_button_by_text(&container, "Connect an agent backend →").is_none(),
+            "backend CTA must disappear once a backend is enabled"
+        );
+
+        add_project(&state, "local");
+        next_tick().await;
+        assert_eq!(
+            checkmark_count(&container),
+            2,
+            "project step must show as completed"
+        );
+        assert!(
+            find_button_by_text(&container, "Choose a folder →").is_none(),
+            "folder CTA must disappear once a project exists"
+        );
+
+        add_agent(&state, "local");
+        next_tick().await;
+        assert_eq!(
+            checkmark_count(&container),
+            3,
+            "running an agent completes the last step"
+        );
+
+        let text = visible_text(&container);
+        assert!(
+            text.contains("Getting started"),
+            "guide must stay visible after setup is complete: {text}"
+        );
+
+        let help =
+            find_button_by_text(&container, "Help").expect("home screen must offer a Help button");
+        help.click();
+        next_tick().await;
+        assert_eq!(
+            state.help_tour_step.get_untracked(),
+            Some(0),
+            "Help button must start the guided tour at step 1"
+        );
     }
 }

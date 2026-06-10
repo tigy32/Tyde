@@ -12,8 +12,8 @@ use crate::send::send_frame;
 use crate::state::{AppState, ConnectionStatus};
 
 use protocol::{
-    AgentOrigin, BackendKind, CancelQueuedMessagePayload, FrameKind, ImageData, InterruptPayload,
-    QueuedMessageId, SendMessagePayload, SendQueuedMessageNowPayload, StreamPath,
+    AgentOrigin, BackendKind, BackendSetupStatus, CancelQueuedMessagePayload, FrameKind, ImageData,
+    InterruptPayload, QueuedMessageId, SendMessagePayload, SendQueuedMessageNowPayload, StreamPath,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,12 +249,98 @@ fn pending_images_to_payload(images: &[PendingImage]) -> Option<Vec<ImageData>> 
     }
 }
 
+/// Why a fresh "New Chat" draft can't be started yet, limited to things the
+/// user can fix from Settings → Backends. Drives the inline notice above the
+/// composer so a misconfigured first run guides the user instead of silently
+/// eating their message.
+#[derive(Clone, Copy, PartialEq)]
+enum DraftBackendNotice {
+    NoBackend,
+    NotInstalled(BackendKind),
+}
+
+fn draft_backend_label(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Tycode => "Tycode",
+        BackendKind::Kiro => "Kiro",
+        BackendKind::Claude => "Claude",
+        BackendKind::Codex => "Codex",
+        BackendKind::Gemini => "Gemini",
+    }
+}
+
+impl DraftBackendNotice {
+    fn message(self) -> String {
+        match self {
+            DraftBackendNotice::NoBackend => {
+                "No agent backend is set up yet — connect one to start chatting.".to_string()
+            }
+            DraftBackendNotice::NotInstalled(kind) => format!(
+                "{} isn't installed on this host yet — finish setup to start chatting.",
+                draft_backend_label(kind)
+            ),
+        }
+    }
+
+    fn cta(self) -> &'static str {
+        match self {
+            DraftBackendNotice::NoBackend => "Connect an agent backend →",
+            DraftBackendNotice::NotInstalled(_) => "Finish setup →",
+        }
+    }
+}
+
+/// Readiness of the backend a fresh draft would spawn. `None` means "go ahead":
+/// either a live agent is active (not a draft), we're mid team-member
+/// activation, we're not connected (handled elsewhere), or the resolved backend
+/// looks usable. We can detect a missing or not-installed backend up front;
+/// "installed but not signed in" only surfaces as a runtime spawn error, so it
+/// is intentionally not covered here.
+fn draft_backend_notice(state: &AppState) -> Option<DraftBackendNotice> {
+    if state.active_agent.get().is_some() {
+        return None;
+    }
+    if state.active_pending_team_member_untracked().is_some() {
+        return None;
+    }
+    if !matches!(
+        state.chat_context_connection_status(),
+        ConnectionStatus::Connected
+    ) {
+        return None;
+    }
+    let host_id = state.chat_context_host_id()?;
+    let settings = state.chat_context_host_settings()?;
+    let backend = state
+        .draft_backend_override
+        .get()
+        .or(settings.default_backend)
+        .or_else(|| settings.enabled_backends.first().copied());
+    let Some(backend) = backend else {
+        return Some(DraftBackendNotice::NoBackend);
+    };
+    let not_installed = state.backend_setup_by_host.with(|map| {
+        map.get(&host_id)
+            .and_then(|infos| infos.iter().find(|info| info.backend_kind == backend))
+            .map(|info| info.status == BackendSetupStatus::NotInstalled)
+            .unwrap_or(false)
+    });
+    not_installed.then_some(DraftBackendNotice::NotInstalled(backend))
+}
+
 fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage>>) {
     let text = state.chat_input.get_untracked();
     let text = text.trim().to_owned();
     let images = pending_images.get_untracked();
     let payload_images = pending_images_to_payload(&images);
     if text.is_empty() && payload_images.is_none() {
+        return;
+    }
+
+    // A draft with no usable backend: keep the text and let the inline notice
+    // above the composer guide the user to setup, instead of clearing the input
+    // and silently failing to spawn.
+    if draft_backend_notice(state).is_some() {
         return;
     }
 
@@ -893,6 +979,11 @@ pub fn ChatInput() -> impl IntoView {
         }
     });
 
+    // Draft "New Chat" with no usable backend → inline guidance toward setup.
+    let notice_compute_state = state.clone();
+    let backend_notice = Memo::new(move |_| draft_backend_notice(&notice_compute_state));
+    let notice_state = state.clone();
+
     let queue_state = state.clone();
     let queue_ids = Memo::new(move |_| -> Vec<QueuedMessageId> {
         let Some(active) = queue_state.active_agent.get() else {
@@ -988,6 +1079,26 @@ pub fn ChatInput() -> impl IntoView {
 
             <Show when=move || is_readonly.get()>
                 <div class="chat-readonly-notice">"Read-only: native sub-agent"</div>
+            </Show>
+
+            <Show when=move || backend_notice.get().is_some()>
+                <div class="chat-backend-notice">
+                    <span class="chat-backend-notice-text">
+                        {move || backend_notice.get().map(|n| n.message()).unwrap_or_default()}
+                    </span>
+                    <button
+                        class="chat-backend-notice-cta"
+                        on:click={
+                            let notice_state = notice_state.clone();
+                            move |_| {
+                                notice_state.settings_tab_request.set(Some("Backends"));
+                                notice_state.settings_open.set(true);
+                            }
+                        }
+                    >
+                        {move || backend_notice.get().map(|n| n.cta()).unwrap_or_default()}
+                    </button>
+                </div>
             </Show>
 
             <div class="chat-input-row">
