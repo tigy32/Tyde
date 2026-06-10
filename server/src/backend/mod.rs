@@ -12,9 +12,9 @@ pub mod tycode;
 use std::collections::HashMap;
 
 use protocol::{
-    AgentErrorCode, AgentInput, BackendAccessMode, BackendKind, ChatEvent, CustomAgentId,
-    ImageData, SendMessagePayload, SessionId, SessionSettingFieldType, SessionSettingValue,
-    SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
+    AgentErrorCode, AgentInput, BackendAccessMode, BackendKind, BackendTierConfig, ChatEvent,
+    CustomAgentId, ImageData, SendMessagePayload, SessionId, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -330,6 +330,23 @@ pub(crate) fn apply_session_settings_update(
                 values.0.insert(key.clone(), value.clone());
             }
         }
+    }
+}
+
+/// The built-in Low/High tier mapping for a backend, used to seed the
+/// user-editable per-backend tier config when complexity tiers are first
+/// enabled (and as the spawn-time fallback for backends with no config).
+pub(crate) fn builtin_tier_config(kind: BackendKind) -> BackendTierConfig {
+    let defaults: fn(SpawnCostHint) -> SessionSettingsValues = match kind {
+        BackendKind::Claude => claude::claude_cost_hint_defaults,
+        BackendKind::Codex => codex::codex_cost_hint_defaults,
+        BackendKind::Gemini => gemini::gemini_cost_hint_defaults,
+        BackendKind::Kiro => kiro::kiro_cost_hint_defaults,
+        BackendKind::Tycode => |_| SessionSettingsValues::default(),
+    };
+    BackendTierConfig {
+        low: defaults(SpawnCostHint::Low),
+        high: defaults(SpawnCostHint::High),
     }
 }
 

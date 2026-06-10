@@ -168,6 +168,8 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
             mobile_broker_url: None,
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
+            complexity_tiers_enabled: false,
+            backend_tier_configs: std::collections::HashMap::new(),
         },
         mobile_access: BootstrapMobileAccess {
             broker_status: BootstrapBrokerStatus::Disabled,
@@ -3457,6 +3459,8 @@ mod tests {
                     mobile_broker_url: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: protocol::MobileBrokerStatus::Disabled,

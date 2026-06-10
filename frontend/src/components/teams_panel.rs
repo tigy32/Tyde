@@ -1405,6 +1405,7 @@ fn DraftMemberRow(
     member_id: TeamDraftMemberId,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let state_for_tiers = state.clone();
 
     let host_for_member = host_id.clone();
     let draft_for_member = draft_id.clone();
@@ -1742,34 +1743,41 @@ fn DraftMemberRow(
                         }).collect_view()}
                     </select>
                 </label>
-                <label class="settings-form-label">
-                    <span>"Cost effort"</span>
-                    <select
-                        class="settings-text-input"
-                        on:change=move |ev| {
-                            let parsed = parse_cost_hint(&event_target_value(&ev));
-                            if let Some(mut current) = member.get_untracked() {
-                                current.cost_hint = parsed;
-                                send_replace.run(current);
-                            }
-                        }
-                    >
-                        <option value="" prop:selected=move || member.get().and_then(|member| member.cost_hint).is_none()>"Backend default"</option>
-                        {[SpawnCostHint::Low, SpawnCostHint::Medium, SpawnCostHint::High]
-                            .into_iter()
-                            .map(|hint| {
-                                let value = cost_hint_value(hint);
-                                let label = cost_hint_label(hint);
-                                view! {
-                                    <option
-                                        value=value
-                                        prop:selected=move || member.get().and_then(|member| member.cost_hint) == Some(hint)
-                                    >{label}</option>
+                {move || {
+                    let tiers_enabled = state_for_tiers
+                        .selected_host_settings()
+                        .is_some_and(|settings| settings.complexity_tiers_enabled);
+                    tiers_enabled.then(|| view! {
+                        <label class="settings-form-label">
+                            <span>"Task complexity"</span>
+                            <select
+                                class="settings-text-input"
+                                on:change=move |ev| {
+                                    let parsed = parse_cost_hint(&event_target_value(&ev));
+                                    if let Some(mut current) = member.get_untracked() {
+                                        current.cost_hint = parsed;
+                                        send_replace.run(current);
+                                    }
                                 }
-                            })
-                            .collect_view()}
-                    </select>
-                </label>
+                            >
+                                <option value="" prop:selected=move || member.get().and_then(|member| member.cost_hint).is_none()>"Backend default"</option>
+                                {[SpawnCostHint::Low, SpawnCostHint::High]
+                                    .into_iter()
+                                    .map(|hint| {
+                                        let value = cost_hint_value(hint);
+                                        let label = cost_hint_label(hint);
+                                        view! {
+                                            <option
+                                                value=value
+                                                prop:selected=move || member.get().and_then(|member| member.cost_hint) == Some(hint)
+                                            >{label}</option>
+                                        }
+                                    })
+                                    .collect_view()}
+                            </select>
+                        </label>
+                    })
+                }}
             </div>
         </div>
     }
@@ -1947,6 +1955,7 @@ fn request_member_shuffle(state: &AppState, team_id: &TeamId, error_sig: RwSigna
 #[component]
 fn MemberFormFields(form: MemberFormState) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let state_for_tiers = state.clone();
     let name_sig = form.name;
     let description_sig = form.description;
     let custom_agent_sig = form.custom_agent_id;
@@ -2098,41 +2107,48 @@ fn MemberFormFields(form: MemberFormState) -> impl IntoView {
                 <span class="settings-form-hint">"The backend is fixed once a member exists."</span>
             })}
         </label>
-        <label class="settings-form-label">
-            <span>"Cost effort"</span>
-            <select
-                class="settings-text-input"
-                disabled=is_editing
-                on:change=move |ev| {
-                    cost_sig.set(parse_cost_hint(&event_target_value(&ev)));
-                }
-            >
-                <option
-                    value=""
-                    prop:selected=move || cost_sig.get().is_none()
-                >
-                    "Backend default"
-                </option>
-                {[SpawnCostHint::Low, SpawnCostHint::Medium, SpawnCostHint::High]
-                    .into_iter()
-                    .map(|hint| {
-                        let value = cost_hint_value(hint);
-                        let label = cost_hint_label(hint);
-                        view! {
-                            <option
-                                value=value
-                                prop:selected=move || cost_sig.get() == Some(hint)
-                            >
-                                {label}
-                            </option>
+        {move || {
+            let tiers_enabled = state_for_tiers
+                .selected_host_settings()
+                .is_some_and(|settings| settings.complexity_tiers_enabled);
+            tiers_enabled.then(|| view! {
+                <label class="settings-form-label">
+                    <span>"Task complexity"</span>
+                    <select
+                        class="settings-text-input"
+                        disabled=is_editing
+                        on:change=move |ev| {
+                            cost_sig.set(parse_cost_hint(&event_target_value(&ev)));
                         }
-                    })
-                    .collect_view()}
-            </select>
-            {move || is_editing.then(|| view! {
-                <span class="settings-form-hint">"The cost effort is fixed once a member exists."</span>
-            })}
-        </label>
+                    >
+                        <option
+                            value=""
+                            prop:selected=move || cost_sig.get().is_none()
+                        >
+                            "Backend default"
+                        </option>
+                        {[SpawnCostHint::Low, SpawnCostHint::High]
+                            .into_iter()
+                            .map(|hint| {
+                                let value = cost_hint_value(hint);
+                                let label = cost_hint_label(hint);
+                                view! {
+                                    <option
+                                        value=value
+                                        prop:selected=move || cost_sig.get() == Some(hint)
+                                    >
+                                        {label}
+                                    </option>
+                                }
+                            })
+                            .collect_view()}
+                    </select>
+                    {move || is_editing.then(|| view! {
+                        <span class="settings-form-hint">"The task complexity is fixed once a member exists."</span>
+                    })}
+                </label>
+            })
+        }}
         <div class="settings-form-label team-member-projects">
             <span>"Projects"<span class="settings-form-hint">" (pick one or more — workspace roots are derived)"</span></span>
             <div class="team-member-project-list">

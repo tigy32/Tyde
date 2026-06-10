@@ -6300,6 +6300,57 @@ kbd {
     background: linear-gradient(180deg, var(--surface-2), var(--surface-1));
 }
 
+.settings-tier-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    margin-top: var(--space-3);
+}
+
+.settings-tier-backend {
+    padding: var(--space-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.settings-tier-backend-name {
+    font-weight: 600;
+}
+
+.settings-tier-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+}
+
+.settings-tier-name {
+    width: 3.5em;
+    flex-shrink: 0;
+    color: var(--text-secondary);
+}
+
+.settings-tier-select {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex: 1;
+    min-width: 0;
+}
+
+.settings-tier-select-label {
+    color: var(--text-secondary);
+    font-size: 0.85em;
+}
+
+.settings-tier-select .settings-select {
+    flex: 1;
+    min-width: 0;
+}
+
 .settings-panel-header {
     display: flex;
     align-items: center;

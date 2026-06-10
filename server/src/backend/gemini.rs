@@ -1593,13 +1593,14 @@ pub struct GeminiBackend {
 fn gemini_backend_model(cost_hint: Option<SpawnCostHint>) -> Option<&'static str> {
     match cost_hint {
         Some(SpawnCostHint::Low) => Some("gemini-2.5-flash-lite"),
-        Some(SpawnCostHint::Medium) => Some("gemini-2.5-flash"),
+        // Medium is a legacy no-op: spawn on the backend's own defaults.
+        Some(SpawnCostHint::Medium) => None,
         Some(SpawnCostHint::High) => Some("gemini-2.5-pro"),
         None => None,
     }
 }
 
-fn gemini_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
+pub(crate) fn gemini_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
     let mut values = protocol::SessionSettingsValues::default();
     if let Some(model) = gemini_backend_model(Some(cost_hint)) {
         values.0.insert(

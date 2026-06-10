@@ -12,8 +12,9 @@ use protocol::{
     CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL, DiffContextMode, FrameKind, HostSettingValue,
     McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus,
     MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState,
-    ProjectId, RunBackendSetupPayload, SetSettingPayload, Skill, SkillId, Steering, SteeringId,
-    SteeringScope, ToolPolicy,
+    ProjectId, RunBackendSetupPayload, SelectOption, SessionSchemaEntry, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsValues, SetSettingPayload, Skill, SkillId, Steering,
+    SteeringId, SteeringScope, ToolPolicy,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -1578,7 +1579,203 @@ fn BackendsTab() -> impl IntoView {
                     .collect::<Vec<_>>()}
             </div>
         </div>
+
+        <ComplexityTiersSection />
     }
+}
+
+/// "Task complexity tiers" — master toggle plus, when enabled, the
+/// per-backend Low/High tier mappings. The rows are generated from each
+/// backend's session settings schema, so they show exactly the fields
+/// (model, effort, ...) that backend supports.
+#[component]
+fn ComplexityTiersSection() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let state_for_checked = state.clone();
+    let state_for_disabled = state.clone();
+    let state_for_toggle = state.clone();
+    let state_for_rows = state.clone();
+
+    let checked = move || {
+        state_for_checked
+            .selected_host_settings()
+            .is_some_and(|settings| settings.complexity_tiers_enabled)
+    };
+    let disabled = move || state_for_disabled.selected_host_settings().is_none();
+    let on_toggle = move |ev: web_sys::Event| {
+        let target = ev.target().unwrap();
+        let input: web_sys::HtmlInputElement = target.unchecked_into();
+        send_host_setting(
+            &state_for_toggle,
+            HostSettingValue::ComplexityTiersEnabled {
+                enabled: input.checked(),
+            },
+        );
+    };
+
+    view! {
+        <div class="settings-field">
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label">"Task complexity tiers"</label>
+                    <p class="settings-description">
+                        "Let agents and spawn dialogs request a cheaper, faster setup for trivial tasks (low) or the most capable one for extremely complex tasks (high). When disabled, every spawn uses the backend's own defaults and agents are never offered the choice."
+                    </p>
+                </div>
+                <label class="settings-toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=checked
+                        disabled=disabled
+                        on:change=on_toggle
+                    />
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            </div>
+            {move || complexity_tier_rows(&state_for_rows)}
+        </div>
+    }
+}
+
+fn complexity_tier_rows(state: &AppState) -> Option<AnyView> {
+    let settings = state.selected_host_settings()?;
+    if !settings.complexity_tiers_enabled {
+        return None;
+    }
+    let host_id = state.selected_host_id.get()?;
+    let schemas = state.session_schemas.get();
+    let host_schemas = schemas.get(&host_id)?;
+    let rows = settings
+        .enabled_backends
+        .iter()
+        .copied()
+        .filter_map(|kind| {
+            let SessionSchemaEntry::Ready { schema } = host_schemas.get(&kind)? else {
+                return None;
+            };
+            let select_fields = schema
+                .fields
+                .iter()
+                .filter_map(|field| match &field.field_type {
+                    SessionSettingFieldType::Select { options, .. } => {
+                        Some((field.key.clone(), field.label.clone(), options.clone()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if select_fields.is_empty() {
+                return None;
+            }
+            let config = settings
+                .backend_tier_configs
+                .get(&kind)
+                .cloned()
+                .unwrap_or_default();
+            Some(view! {
+                <div class="settings-tier-backend">
+                    <div class="settings-tier-backend-name">{backend_label(kind)}</div>
+                    {tier_row(state, kind, false, &config.low, &select_fields)}
+                    {tier_row(state, kind, true, &config.high, &select_fields)}
+                </div>
+            })
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return Some(
+            view! {
+                <p class="settings-description">
+                    "No enabled backends with configurable session settings on this host."
+                </p>
+            }
+            .into_any(),
+        );
+    }
+    Some(view! { <div class="settings-tier-list">{rows}</div> }.into_any())
+}
+
+fn tier_row(
+    state: &AppState,
+    kind: BackendKind,
+    is_high: bool,
+    values: &SessionSettingsValues,
+    fields: &[(String, String, Vec<SelectOption>)],
+) -> AnyView {
+    let selects = fields
+        .iter()
+        .map(|(key, label, options)| {
+            let current = match values.0.get(key) {
+                Some(SessionSettingValue::String(value)) => value.clone(),
+                _ => String::new(),
+            };
+            let option_views = options
+                .iter()
+                .map(|option| {
+                    view! { <option value=option.value.clone()>{option.label.clone()}</option> }
+                })
+                .collect::<Vec<_>>();
+            let state = state.clone();
+            let key = key.clone();
+            view! {
+                <label class="settings-tier-select">
+                    <span class="settings-tier-select-label">{label.clone()}</span>
+                    <select
+                        class="settings-select"
+                        prop:value=current
+                        on:change=move |ev: web_sys::Event| {
+                            let target = ev.target().unwrap();
+                            let el: web_sys::HtmlSelectElement = target.unchecked_into();
+                            update_tier_setting(&state, kind, is_high, &key, el.value());
+                        }
+                    >
+                        <option value="">"Backend default"</option>
+                        {option_views}
+                    </select>
+                </label>
+            }
+        })
+        .collect::<Vec<_>>();
+    view! {
+        <div class="settings-tier-row">
+            <span class="settings-tier-name">{if is_high { "High" } else { "Low" }}</span>
+            {selects}
+        </div>
+    }
+    .into_any()
+}
+
+fn update_tier_setting(
+    state: &AppState,
+    kind: BackendKind,
+    is_high: bool,
+    key: &str,
+    value: String,
+) {
+    let Some(mut settings) = state.selected_host_settings_untracked() else {
+        return;
+    };
+    let mut config = settings
+        .backend_tier_configs
+        .remove(&kind)
+        .unwrap_or_default();
+    let tier_values = if is_high {
+        &mut config.high
+    } else {
+        &mut config.low
+    };
+    if value.is_empty() {
+        tier_values.0.remove(key);
+    } else {
+        tier_values
+            .0
+            .insert(key.to_owned(), SessionSettingValue::String(value));
+    }
+    send_host_setting(
+        state,
+        HostSettingValue::BackendTiers {
+            backend: kind,
+            config,
+        },
+    );
 }
 
 #[component]

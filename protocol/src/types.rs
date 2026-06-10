@@ -827,6 +827,26 @@ pub struct HostSettings {
     pub tyde_debug_mcp_enabled: bool,
     #[serde(default = "default_agent_control_mcp_enabled")]
     pub tyde_agent_control_mcp_enabled: bool,
+    /// When false (default), spawn cost hints are ignored: every spawn uses
+    /// the backend's own default model/effort and the hint is hidden from
+    /// spawn UIs and the agent-control MCP tool schema.
+    #[serde(default)]
+    pub complexity_tiers_enabled: bool,
+    /// Per-backend overrides for what the Low/High complexity tiers mean.
+    /// Backends without an entry fall back to built-in defaults.
+    #[serde(default)]
+    pub backend_tier_configs: HashMap<BackendKind, BackendTierConfig>,
+}
+
+/// Per-backend mapping from spawn complexity tiers to session-settings
+/// overrides (e.g. `model`, `effort`). An empty map means "no override" —
+/// the spawn runs on the backend's own defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendTierConfig {
+    #[serde(default)]
+    pub low: SessionSettingsValues,
+    #[serde(default)]
+    pub high: SessionSettingsValues,
 }
 
 fn default_agent_control_mcp_enabled() -> bool {
@@ -858,6 +878,13 @@ pub enum HostSettingValue {
     },
     TydeAgentControlMcpEnabled {
         enabled: bool,
+    },
+    ComplexityTiersEnabled {
+        enabled: bool,
+    },
+    BackendTiers {
+        backend: BackendKind,
+        config: BackendTierConfig,
     },
 }
 

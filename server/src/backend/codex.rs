@@ -4934,13 +4934,14 @@ impl CodexBackend {
 fn codex_backend_defaults(cost_hint: Option<SpawnCostHint>) -> (Option<String>, Option<String>) {
     match cost_hint {
         Some(SpawnCostHint::Low) => (None, Some("low".to_string())),
-        Some(SpawnCostHint::Medium) => (None, Some("medium".to_string())),
+        // Medium is a legacy no-op: spawn on the backend's own defaults.
+        Some(SpawnCostHint::Medium) => (None, None),
         Some(SpawnCostHint::High) => (None, Some("xhigh".to_string())),
         None => (None, None),
     }
 }
 
-fn codex_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
+pub(crate) fn codex_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
     let (model, effort) = codex_backend_defaults(Some(cost_hint));
     let mut values = protocol::SessionSettingsValues::default();
     if let Some(model) = model {
@@ -7727,6 +7728,8 @@ for line in sys.stdin:
                     mobile_broker_url: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: MobileBrokerStatus::Disabled,

@@ -86,6 +86,8 @@ fn expected_empty_settings() -> HostSettings {
         mobile_broker_url: None,
         tyde_debug_mcp_enabled: false,
         tyde_agent_control_mcp_enabled: true,
+        complexity_tiers_enabled: false,
+        backend_tier_configs: std::collections::HashMap::new(),
     }
 }
 
@@ -178,6 +180,8 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             mobile_broker_url: None,
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
+            complexity_tiers_enabled: false,
+            backend_tier_configs: std::collections::HashMap::new(),
         }
     );
 }

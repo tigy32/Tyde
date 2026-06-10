@@ -7289,13 +7289,14 @@ fn claude_backend_defaults(
 ) -> (Option<&'static str>, Option<&'static str>) {
     match cost_hint {
         Some(SpawnCostHint::Low) => (Some("haiku"), Some("low")),
-        Some(SpawnCostHint::Medium) => (Some("sonnet"), Some("medium")),
-        Some(SpawnCostHint::High) => (Some("opus"), Some("high")),
+        // Medium is a legacy no-op: spawn on the backend's own defaults.
+        Some(SpawnCostHint::Medium) => (None, None),
+        Some(SpawnCostHint::High) => (Some("opus"), Some("max")),
         None => (None, None),
     }
 }
 
-fn claude_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
+pub(crate) fn claude_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
     let (model, effort) = claude_backend_defaults(Some(cost_hint));
     let mut values = protocol::SessionSettingsValues::default();
     if let Some(model) = model {
@@ -7487,6 +7488,10 @@ impl Backend for ClaudeBackend {
                             SelectOption {
                                 value: "opus".to_string(),
                                 label: "Opus".to_string(),
+                            },
+                            SelectOption {
+                                value: "fable".to_string(),
+                                label: "Fable".to_string(),
                             },
                         ],
                         default: None,
@@ -8049,18 +8054,43 @@ mod tests {
     #[test]
     fn claude_cost_hint_still_sets_explicit_session_settings() {
         let resolved = resolve_session_settings(&BackendSpawnConfig {
-            cost_hint: Some(SpawnCostHint::Medium),
+            cost_hint: Some(SpawnCostHint::Low),
             ..BackendSpawnConfig::default()
         });
 
         assert_eq!(
             resolved.0.get("model"),
-            Some(&SessionSettingValue::String("sonnet".to_string()))
+            Some(&SessionSettingValue::String("haiku".to_string()))
         );
         assert_eq!(
             resolved.0.get("effort"),
-            Some(&SessionSettingValue::String("medium".to_string()))
+            Some(&SessionSettingValue::String("low".to_string()))
         );
+
+        let resolved = resolve_session_settings(&BackendSpawnConfig {
+            cost_hint: Some(SpawnCostHint::High),
+            ..BackendSpawnConfig::default()
+        });
+
+        assert_eq!(
+            resolved.0.get("model"),
+            Some(&SessionSettingValue::String("opus".to_string()))
+        );
+        assert_eq!(
+            resolved.0.get("effort"),
+            Some(&SessionSettingValue::String("max".to_string()))
+        );
+    }
+
+    #[test]
+    fn claude_medium_cost_hint_is_a_no_op() {
+        let resolved = resolve_session_settings(&BackendSpawnConfig {
+            cost_hint: Some(SpawnCostHint::Medium),
+            ..BackendSpawnConfig::default()
+        });
+
+        assert_eq!(resolved.0.get("model"), None);
+        assert_eq!(resolved.0.get("effort"), None);
     }
 
     #[test]

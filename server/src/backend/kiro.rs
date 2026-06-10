@@ -3096,13 +3096,14 @@ pub struct KiroBackend {
 fn kiro_backend_model(cost_hint: Option<SpawnCostHint>) -> Option<&'static str> {
     match cost_hint {
         Some(SpawnCostHint::Low) => Some("claude-haiku-4.5"),
-        Some(SpawnCostHint::Medium) => Some("claude-sonnet-4"),
+        // Medium is a legacy no-op: spawn on the backend's own defaults.
+        Some(SpawnCostHint::Medium) => None,
         Some(SpawnCostHint::High) => Some("claude-sonnet-4.5"),
         None => None,
     }
 }
 
-fn kiro_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
+pub(crate) fn kiro_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
     let mut values = protocol::SessionSettingsValues::default();
     if let Some(model) = kiro_backend_model(Some(cost_hint)) {
         values.0.insert(
@@ -3990,6 +3991,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                     mobile_broker_url: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
                 },
                 mobile_access: protocol::MobileAccessStatePayload {
                     broker_status: protocol::MobileBrokerStatus::Disabled,

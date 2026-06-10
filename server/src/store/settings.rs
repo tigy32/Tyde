@@ -136,6 +136,22 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
         HostSettingValue::TydeAgentControlMcpEnabled { enabled } => {
             settings.tyde_agent_control_mcp_enabled = enabled;
         }
+        HostSettingValue::ComplexityTiersEnabled { enabled } => {
+            settings.complexity_tiers_enabled = enabled;
+            // Seed editable per-backend configs from the built-in defaults so
+            // the settings UI always shows the actual Low/High behavior.
+            if enabled {
+                for kind in CANONICAL_BACKENDS {
+                    settings
+                        .backend_tier_configs
+                        .entry(kind)
+                        .or_insert_with(|| crate::backend::builtin_tier_config(kind));
+                }
+            }
+        }
+        HostSettingValue::BackendTiers { backend, config } => {
+            settings.backend_tier_configs.insert(backend, config);
+        }
     }
 
     Ok(())
@@ -149,6 +165,8 @@ fn empty_settings() -> HostSettings {
         mobile_broker_url: None,
         tyde_debug_mcp_enabled: false,
         tyde_agent_control_mcp_enabled: true,
+        complexity_tiers_enabled: false,
+        backend_tier_configs: std::collections::HashMap::new(),
     }
 }
 
@@ -179,6 +197,8 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         mobile_broker_url: settings.mobile_broker_url,
         tyde_debug_mcp_enabled: settings.tyde_debug_mcp_enabled,
         tyde_agent_control_mcp_enabled: settings.tyde_agent_control_mcp_enabled,
+        complexity_tiers_enabled: settings.complexity_tiers_enabled,
+        backend_tier_configs: settings.backend_tier_configs,
     })
 }
 
@@ -187,4 +207,78 @@ fn normalize_backend_list(backends: Vec<BackendKind>) -> Vec<BackendKind> {
         .into_iter()
         .filter(|kind| backends.contains(kind))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use protocol::SessionSettingValue;
+
+    use super::*;
+
+    #[test]
+    fn old_store_files_without_tier_fields_load_with_tiers_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"settings":{"enabled_backends":["claude"],"default_backend":"claude","enable_mobile_connections":false,"mobile_broker_url":null,"tyde_debug_mcp_enabled":false,"tyde_agent_control_mcp_enabled":true}}"#,
+        )
+        .expect("write legacy store file");
+
+        let store = HostSettingsStore::load(path).expect("load legacy store");
+        let settings = store.get().expect("get settings");
+        assert!(!settings.complexity_tiers_enabled);
+        assert!(settings.backend_tier_configs.is_empty());
+    }
+
+    #[test]
+    fn enabling_complexity_tiers_seeds_builtin_configs_and_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            HostSettingsStore::load(dir.path().join("settings.json")).expect("load empty store");
+
+        let settings = store
+            .apply(HostSettingValue::ComplexityTiersEnabled { enabled: true })
+            .expect("enable tiers");
+        assert!(settings.complexity_tiers_enabled);
+        let claude = settings
+            .backend_tier_configs
+            .get(&BackendKind::Claude)
+            .expect("claude config seeded");
+        assert_eq!(
+            claude.low.0.get("model"),
+            Some(&SessionSettingValue::String("haiku".to_string()))
+        );
+        assert_eq!(
+            claude.high.0.get("model"),
+            Some(&SessionSettingValue::String("opus".to_string()))
+        );
+        assert_eq!(
+            claude.high.0.get("effort"),
+            Some(&SessionSettingValue::String("max".to_string()))
+        );
+
+        // User edits survive a disable/enable cycle (no re-seeding over them).
+        let mut edited = claude.clone();
+        edited.high.0.insert(
+            "model".to_string(),
+            SessionSettingValue::String("fable".to_string()),
+        );
+        store
+            .apply(HostSettingValue::BackendTiers {
+                backend: BackendKind::Claude,
+                config: edited.clone(),
+            })
+            .expect("store edited config");
+        store
+            .apply(HostSettingValue::ComplexityTiersEnabled { enabled: false })
+            .expect("disable tiers");
+        let settings = store
+            .apply(HostSettingValue::ComplexityTiersEnabled { enabled: true })
+            .expect("re-enable tiers");
+        assert_eq!(
+            settings.backend_tier_configs.get(&BackendKind::Claude),
+            Some(&edited)
+        );
+    }
 }

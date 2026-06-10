@@ -56,8 +56,9 @@ use crate::agent::{
 use crate::agent_control_mcp::AgentControlMcpHandle;
 use crate::backend::setup;
 use crate::backend::{
-    BackendSession, StartupMcpServer, StartupMcpTransport, sanitize_session_settings_values,
-    session_settings_schema_for_backend, validate_session_settings_values,
+    BackendSession, StartupMcpServer, StartupMcpTransport, apply_session_settings_update,
+    sanitize_session_settings_values, session_settings_schema_for_backend,
+    validate_session_settings_values,
 };
 use crate::browse_stream;
 use crate::debug_mcp::DebugMcpHandle;
@@ -2181,6 +2182,7 @@ impl HostHandle {
             }
         };
 
+        let request = self.apply_complexity_tier_settings(request).await;
         tracing::info!(
             backend_kind = ?request.backend_kind,
             workspace_roots = ?request.workspace_roots,
@@ -2245,7 +2247,64 @@ impl HostHandle {
         agent_id
     }
 
+    /// Applies the host-level "task complexity tiers" setting to a spawn request.
+    ///
+    /// When tiers are disabled (the default), the cost hint is dropped so every
+    /// spawn uses the backend's own defaults. When enabled, a Low/High hint
+    /// resolves through the user's per-backend tier config when one exists
+    /// (explicit session settings still win); backends without a config fall
+    /// back to their built-in mapping. Medium is a legacy no-op.
+    async fn apply_complexity_tier_settings(
+        &self,
+        mut request: ResolvedSpawnRequest,
+    ) -> ResolvedSpawnRequest {
+        let Some(hint) = request.cost_hint else {
+            return request;
+        };
+        let settings_store = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.settings_store)
+        };
+        let settings = match settings_store.lock().await.get() {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(%error, "failed to read host settings; ignoring spawn cost hint");
+                request.cost_hint = None;
+                return request;
+            }
+        };
+        if !settings.complexity_tiers_enabled {
+            request.cost_hint = None;
+            return request;
+        }
+        let tier_values = match (
+            hint,
+            settings.backend_tier_configs.get(&request.backend_kind),
+        ) {
+            (protocol::SpawnCostHint::Medium, _) => {
+                request.cost_hint = None;
+                return request;
+            }
+            // No user config for this backend: the backend's built-in
+            // tier mapping applies via the cost hint as before.
+            (_, None) => return request,
+            (protocol::SpawnCostHint::Low, Some(config)) => config.low.clone(),
+            (protocol::SpawnCostHint::High, Some(config)) => config.high.clone(),
+        };
+        let mut merged = match request.session_settings_schema.as_ref() {
+            Some(schema) => sanitize_session_settings_values(schema, &tier_values),
+            None => tier_values,
+        };
+        if let Some(explicit) = request.session_settings.take() {
+            apply_session_settings_update(&mut merged, &explicit);
+        }
+        request.session_settings = (!merged.0.is_empty()).then_some(merged);
+        request.cost_hint = None;
+        request
+    }
+
     async fn spawn_resolved_agent(&self, request: ResolvedSpawnRequest) -> AgentId {
+        let request = self.apply_complexity_tier_settings(request).await;
         tracing::info!(
             backend_kind = ?request.backend_kind,
             workspace_roots = ?request.workspace_roots,

@@ -8,10 +8,17 @@ use protocol::{
     SpawnAgentPayload, SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload, TeamMemberId,
 };
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
-    handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    ErrorData as McpError, RoleServer, ServerHandler,
+    handler::server::{
+        router::tool::ToolRouter,
+        tool::{Extension, ToolCallContext},
+        wrapper::Parameters,
+    },
+    model::{
+        CallToolRequestParams, CallToolResult, Content, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, ServerInfo,
+    },
+    schemars, service::RequestContext, tool, tool_router,
     transport::{
         StreamableHttpServerConfig,
         streamable_http_server::{
@@ -120,6 +127,9 @@ struct SpawnAgentToolInput {
     parent_agent_id: Option<String>,
     project_id: Option<String>,
     name: Option<String>,
+    /// Task complexity. `low`: trivial task that needs no real reasoning —
+    /// runs on a cheaper/faster configuration. `high`: extremely complex
+    /// task — runs on the most capable configuration. Omit for normal tasks.
     cost_hint: Option<CostHintInput>,
     access_mode: Option<BackendAccessModeInput>,
 }
@@ -451,7 +461,6 @@ impl TydeAgentControlMcpServer {
     }
 }
 
-#[tool_handler]
 impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
@@ -462,6 +471,52 @@ impl ServerHandler for TydeAgentControlMcpServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
+    }
+
+    // Hand-written (instead of #[tool_handler]) so the tool list can be
+    // filtered against host settings: when task complexity tiers are
+    // disabled, the cost_hint field is hidden from the spawn tool schema so
+    // agents never pick a tier. The host spawn path independently ignores
+    // hints while tiers are disabled, so a stale schema can't re-enable them.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let mut tools = self.tool_router.list_all();
+        let tiers_enabled = self
+            .host
+            .read_settings()
+            .await
+            .map(|settings| settings.complexity_tiers_enabled)
+            .unwrap_or(false);
+        if !tiers_enabled {
+            for tool in &mut tools {
+                if tool.name == "tyde_spawn_agent" {
+                    let schema = std::sync::Arc::make_mut(&mut tool.input_schema);
+                    if let Some(properties) = schema
+                        .get_mut("properties")
+                        .and_then(|value| value.as_object_mut())
+                    {
+                        properties.remove("cost_hint");
+                    }
+                }
+            }
+        }
+        Ok(ListToolsResult {
+            tools,
+            next_cursor: None,
+            meta: None,
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let context = ToolCallContext::new(self, request, context);
+        self.tool_router.call(context).await
     }
 }
 

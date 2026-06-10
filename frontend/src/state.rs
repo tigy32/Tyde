@@ -2696,6 +2696,8 @@ mod tests {
                         mobile_broker_url: None,
                         tyde_debug_mcp_enabled: false,
                         tyde_agent_control_mcp_enabled: true,
+                        complexity_tiers_enabled: false,
+                        backend_tier_configs: std::collections::HashMap::new(),
                     },
                 );
                 settings.insert(
@@ -2707,6 +2709,8 @@ mod tests {
                         mobile_broker_url: None,
                         tyde_debug_mcp_enabled: false,
                         tyde_agent_control_mcp_enabled: true,
+                        complexity_tiers_enabled: false,
+                        backend_tier_configs: std::collections::HashMap::new(),
                     },
                 );
             });

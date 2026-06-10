@@ -236,10 +236,10 @@ gemini -y -p 'Reply exactly with ok' --model gemini-2.5-flash-lite --output-form
 }
 
 fn cost_hint_for(backend_kind: BackendKind) -> Option<SpawnCostHint> {
-    match backend_kind {
-        BackendKind::Codex => Some(SpawnCostHint::Medium),
-        _ => Some(SpawnCostHint::Low),
-    }
+    // Low keeps real-backend runs fast and cheap. Medium is a no-op (backend
+    // default), which for Codex means xhigh reasoning — too slow for tests.
+    let _ = backend_kind;
+    Some(SpawnCostHint::Low)
 }
 
 fn backend_label(backend_kind: BackendKind) -> &'static str {
@@ -714,6 +714,14 @@ impl RealBackendFixture {
         let session_path = session_store_dir.path().join("sessions.json");
         let project_path = session_store_dir.path().join("projects.json");
         let settings_path = session_store_dir.path().join("settings.json");
+        // These tests spawn with low cost hints to keep real backend runs
+        // fast and cheap. Hints are ignored unless complexity tiers are
+        // enabled, so seed the settings store with the feature on.
+        std::fs::write(
+            &settings_path,
+            r#"{"settings":{"complexity_tiers_enabled":true}}"#,
+        )
+        .expect("seed settings store with complexity tiers enabled");
         // Real backends — NOT mock
         let host = server::spawn_host_with_store_paths(session_path, project_path, settings_path)
             .expect("initialize host with real backends");
