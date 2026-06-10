@@ -942,7 +942,7 @@ mod wasm_tests {
                 project: protocol::Project {
                     id: protocol::ProjectId("proj-1".to_owned()),
                     name: "Persist Me".to_owned(),
-                    roots: Vec::new(),
+                    source: protocol::ProjectSource::Standalone { roots: Vec::new() },
                     sort_order: 0,
                 },
             });
@@ -998,7 +998,7 @@ mod wasm_tests {
                 project: protocol::Project {
                     id: protocol::ProjectId("proj-x".to_owned()),
                     name: "Keep Me".to_owned(),
-                    roots: Vec::new(),
+                    source: protocol::ProjectSource::Standalone { roots: Vec::new() },
                     sort_order: 0,
                 },
             });
@@ -1062,7 +1062,7 @@ mod wasm_tests {
                 project: protocol::Project {
                     id: protocol::ProjectId("proj-stale".to_owned()),
                     name: "Stale But Visible".to_owned(),
-                    roots: Vec::new(),
+                    source: protocol::ProjectSource::Standalone { roots: Vec::new() },
                     sort_order: 0,
                 },
             });
@@ -1126,7 +1126,7 @@ mod wasm_tests {
                     project: protocol::Project {
                         id: protocol::ProjectId("p".to_owned()),
                         name: "Gone".to_owned(),
-                        roots: Vec::new(),
+                        source: protocol::ProjectSource::Standalone { roots: Vec::new() },
                         sort_order: 0,
                     },
                 });
@@ -1177,7 +1177,7 @@ mod wasm_tests {
                     project: protocol::Project {
                         id: protocol::ProjectId("q".to_owned()),
                         name: "Also Gone".to_owned(),
-                        roots: Vec::new(),
+                        source: protocol::ProjectSource::Standalone { roots: Vec::new() },
                         sort_order: 0,
                     },
                 });

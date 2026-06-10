@@ -8,8 +8,8 @@ use protocol::{
     FrameError, FrameKind, HostBootstrapPayload, HostSettingsPayload, InterruptPayload,
     ListSessionsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
     MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, ProjectAddRootPayload,
-    ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectEventPayload,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
     ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload, SessionListPayload,
@@ -19,7 +19,8 @@ use protocol::{
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
     TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
-    TerminalStartPayload, read_envelope, write_envelope,
+    TerminalStartPayload, WorkbenchCreatePayload, WorkbenchRemovePayload, read_envelope,
+    write_envelope,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -257,8 +258,29 @@ impl HostCommands {
         self.send(FrameKind::ProjectAddRoot, &payload).await
     }
 
+    pub async fn project_delete_root(
+        &self,
+        payload: ProjectDeleteRootPayload,
+    ) -> Result<(), ClientError> {
+        self.send(FrameKind::ProjectDeleteRoot, &payload).await
+    }
+
     pub async fn project_delete(&self, payload: ProjectDeletePayload) -> Result<(), ClientError> {
         self.send(FrameKind::ProjectDelete, &payload).await
+    }
+
+    pub async fn workbench_create(
+        &self,
+        payload: WorkbenchCreatePayload,
+    ) -> Result<(), ClientError> {
+        self.send(FrameKind::WorkbenchCreate, &payload).await
+    }
+
+    pub async fn workbench_remove(
+        &self,
+        payload: WorkbenchRemovePayload,
+    ) -> Result<(), ClientError> {
+        self.send(FrameKind::WorkbenchRemove, &payload).await
     }
 
     pub async fn terminal_create(&self, payload: TerminalCreatePayload) -> Result<(), ClientError> {

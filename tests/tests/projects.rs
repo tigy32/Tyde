@@ -7,8 +7,8 @@ use protocol::{
     ProjectDeletePayload, ProjectDiffScope, ProjectFileContentsPayload, ProjectFileListPayload,
     ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectListDirPayload,
     ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload,
-    ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath, ProjectStageFilePayload,
-    ProjectStageHunkPayload, ReviewStatus, ReviewSummaryScope,
+    ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope, ProjectRootPath,
+    ProjectStageFilePayload, ProjectStageHunkPayload, ReviewStatus, ReviewSummaryScope,
 };
 use std::fs;
 use std::path::Path;
@@ -164,7 +164,7 @@ async fn create_project(
     client
         .project_create(ProjectCreatePayload {
             name: name.to_owned(),
-            roots,
+            roots: roots.into_iter().map(ProjectRootPath).collect(),
         })
         .await
         .expect("project_create failed");
@@ -173,6 +173,18 @@ async fn create_project(
         ProjectNotifyPayload::Upsert { project } => project,
         other => panic!("expected upsert project notification, got {other:?}"),
     }
+}
+
+fn project_roots(project: &Project) -> Vec<String> {
+    project
+        .root_paths()
+        .into_iter()
+        .map(|root| root.0)
+        .collect()
+}
+
+fn project_root(project: &Project, index: usize) -> String {
+    project.root_paths()[index].0.clone()
 }
 
 /// Create a project with real filesystem roots.
@@ -234,7 +246,7 @@ async fn create_project_emits_upsert() {
         .client
         .project_create(ProjectCreatePayload {
             name: "Tyde".to_owned(),
-            roots: vec!["/tmp/tyde".to_owned()],
+            roots: vec![ProjectRootPath("/tmp/tyde".to_owned())],
         })
         .await
         .expect("project_create failed");
@@ -243,7 +255,7 @@ async fn create_project_emits_upsert() {
         ProjectNotifyPayload::Upsert { project } => {
             assert!(!project.id.0.is_empty());
             assert_eq!(project.name, "Tyde");
-            assert_eq!(project.roots, vec!["/tmp/tyde".to_owned()]);
+            assert_eq!(project_roots(&project), vec!["/tmp/tyde".to_owned()]);
         }
         other => panic!("expected upsert project notification, got {other:?}"),
     }
@@ -259,7 +271,7 @@ async fn create_project_notifies_all_connected_clients() {
         .client
         .project_create(ProjectCreatePayload {
             name: "Shared".to_owned(),
-            roots: vec!["/tmp/shared".to_owned()],
+            roots: vec![ProjectRootPath("/tmp/shared".to_owned())],
         })
         .await
         .expect("project_create failed");
@@ -316,7 +328,7 @@ async fn rename_project_emits_updated_upsert() {
         ProjectNotifyPayload::Upsert { project: renamed } => {
             assert_eq!(renamed.id, project.id);
             assert_eq!(renamed.name, "Renamed");
-            assert_eq!(renamed.roots, vec!["/tmp/original".to_owned()]);
+            assert_eq!(project_roots(&renamed), vec!["/tmp/original".to_owned()]);
         }
         other => panic!("expected upsert project notification, got {other:?}"),
     }
@@ -334,6 +346,7 @@ async fn reorder_projects_persists_and_replays_in_custom_order() {
     fixture
         .client
         .project_reorder(ProjectReorderPayload {
+            scope: ProjectReorderScope::TopLevel,
             project_ids: vec![
                 project_c.id.clone(),
                 project_a.id.clone(),
@@ -387,7 +400,7 @@ async fn add_root_emits_updated_upsert() {
         .client
         .project_add_root(ProjectAddRootPayload {
             id: project.id.clone(),
-            root: "/tmp/root-b".to_owned(),
+            root: ProjectRootPath("/tmp/root-b".to_owned()),
         })
         .await
         .expect("project_add_root failed");
@@ -396,7 +409,7 @@ async fn add_root_emits_updated_upsert() {
         ProjectNotifyPayload::Upsert { project: updated } => {
             assert_eq!(updated.id, project.id);
             assert_eq!(
-                updated.roots,
+                project_roots(&updated),
                 vec!["/tmp/root-a".to_owned(), "/tmp/root-b".to_owned()]
             );
         }
@@ -474,7 +487,10 @@ async fn invalid_project_create_surfaces_command_error_and_keeps_connection_aliv
         .client
         .project_create(ProjectCreatePayload {
             name: "Invalid".to_owned(),
-            roots: vec!["/tmp/dup".to_owned(), "/tmp/dup".to_owned()],
+            roots: vec![
+                ProjectRootPath("/tmp/dup".to_owned()),
+                ProjectRootPath("/tmp/dup".to_owned()),
+            ],
         })
         .await
         .expect("project_create write failed");
@@ -560,7 +576,7 @@ async fn create_project_pushes_file_list_and_git_status() {
     )
     .await;
     assert_eq!(file_list.roots.len(), 1);
-    assert_eq!(file_list.roots[0].root.0, project.roots[0]);
+    assert_eq!(file_list.roots[0].root.0, project_root(&project, 0));
     assert!(
         file_list.roots[0]
             .entries
@@ -599,8 +615,8 @@ async fn project_create_pushes_file_list_and_git_status_for_all_roots() {
         ..
     } = expect_project_bootstrap(&mut fixture.client, "server-pushed project bootstrap").await;
     assert_eq!(file_list.roots.len(), 2);
-    assert_eq!(file_list.roots[0].root.0, project.roots[0]);
-    assert_eq!(file_list.roots[1].root.0, project.roots[1]);
+    assert_eq!(file_list.roots[0].root.0, project_root(&project, 0));
+    assert_eq!(file_list.roots[1].root.0, project_root(&project, 1));
     assert!(
         file_list.roots[0]
             .entries
@@ -643,7 +659,7 @@ async fn project_read_file_returns_file_contents() {
             &project.id,
             ProjectReadFilePayload {
                 path: ProjectPath {
-                    root: protocol::ProjectRootPath(project.roots[0].clone()),
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
                     relative_path: "src/main.rs".to_owned(),
                 },
             },
@@ -681,8 +697,8 @@ async fn project_read_file_accepts_absolute_path_with_line_suffix() {
             &project.id,
             ProjectReadFilePayload {
                 path: ProjectPath {
-                    root: protocol::ProjectRootPath(project.roots[0].clone()),
-                    relative_path: format!("{}/src/main.rs:366", project.roots[0]),
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
+                    relative_path: format!("{}/src/main.rs:366", project_root(&project, 0)),
                 },
             },
         )
@@ -722,7 +738,7 @@ async fn project_read_file_outside_project_does_not_crash_host() {
             &project.id,
             ProjectReadFilePayload {
                 path: ProjectPath {
-                    root: protocol::ProjectRootPath(project.roots[0].clone()),
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
                     relative_path: "/tmp/not-in-project.rs:12".to_owned(),
                 },
             },
@@ -745,7 +761,7 @@ async fn project_read_file_outside_project_does_not_crash_host() {
             &project.id,
             ProjectReadFilePayload {
                 path: ProjectPath {
-                    root: protocol::ProjectRootPath(project.roots[0].clone()),
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
                     relative_path: "src/main.rs".to_owned(),
                 },
             },
@@ -785,7 +801,7 @@ async fn project_read_diff_returns_unstaged_diff() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
@@ -823,7 +839,7 @@ async fn project_read_diff_untracked_file_appears_as_all_added() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
             path: Some("src/new.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
@@ -877,7 +893,7 @@ async fn project_read_diff_unstaged_includes_both_modified_and_untracked() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
             path: None,
             context_mode: DiffContextMode::Hunks,
@@ -945,7 +961,7 @@ async fn project_read_diff_unstaged_includes_both_modified_and_untracked() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
             path: Some("src/new.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
@@ -989,7 +1005,7 @@ async fn project_read_diff_staged_scope_excludes_untracked() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Staged,
             path: None,
             context_mode: DiffContextMode::Hunks,
@@ -1028,7 +1044,7 @@ async fn project_read_diff_hunks_mode_returns_typed_line_numbers() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
@@ -1121,7 +1137,7 @@ async fn project_read_diff_full_file_mode_returns_single_hunk_spanning_file() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::FullFile,
@@ -1168,7 +1184,7 @@ async fn project_read_diff_payload_echoes_context_mode() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
@@ -1206,7 +1222,7 @@ async fn project_read_diff_payload_echoes_context_mode() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::FullFile,
@@ -1260,7 +1276,7 @@ async fn project_stage_file_updates_git_status_and_diffs() {
             &project.id,
             ProjectStageFilePayload {
                 path: ProjectPath {
-                    root: protocol::ProjectRootPath(project.roots[0].clone()),
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
                     relative_path: "src/main.rs".to_owned(),
                 },
             },
@@ -1280,7 +1296,7 @@ async fn project_stage_file_updates_git_status_and_diffs() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Staged,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
@@ -1295,7 +1311,7 @@ async fn project_stage_file_updates_git_status_and_diffs() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
@@ -1333,7 +1349,7 @@ async fn project_stage_hunk_stages_only_one_hunk() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
@@ -1348,7 +1364,7 @@ async fn project_stage_hunk_stages_only_one_hunk() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
-            root: protocol::ProjectRootPath(project.roots[0].clone()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Staged,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
@@ -1364,7 +1380,7 @@ async fn project_stage_hunk_stages_only_one_hunk() {
             &project.id,
             ProjectStageHunkPayload {
                 path: ProjectPath {
-                    root: protocol::ProjectRootPath(project.roots[0].clone()),
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
                     relative_path: "src/main.rs".to_owned(),
                 },
                 hunk_id: first_hunk,
@@ -1480,7 +1496,7 @@ async fn project_list_dir_returns_deeper_entries() {
         .project_list_dir(
             &project.id,
             ProjectListDirPayload {
-                root: ProjectRootPath(project.roots[0].clone()),
+                root: ProjectRootPath(project_root(&project, 0)),
                 path: "a/b/c".to_owned(),
             },
         )

@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use client::{AgentEndpoint, AgentEvent, HostEndpoint, HostEvent, ProjectEvent};
 use protocol::{
-    AgentBootstrapEvent, BackendKind, ChatEvent, ReviewSummaryScope, SendMessagePayload,
-    SpawnAgentParams, SpawnAgentPayload,
+    AgentBootstrapEvent, BackendKind, ChatEvent, ProjectRootPath, ReviewSummaryScope,
+    SendMessagePayload, SpawnAgentParams, SpawnAgentPayload,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -236,7 +236,9 @@ async fn runtime_preserves_project_bootstrap_until_project_endpoint_is_opened() 
         .expect("load project store")
         .create(
             "runtime-bootstrap-project".to_owned(),
-            vec![project_root.path().to_string_lossy().to_string()],
+            vec![ProjectRootPath(
+                project_root.path().to_string_lossy().to_string(),
+            )],
         )
         .expect("create project");
     let host = server::spawn_host_with_mock_backend(

@@ -30,7 +30,8 @@ use crate::{
     TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload,
     TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
-    ToolExecutionCompletedData, ToolRequest, WelcomePayload,
+    ToolExecutionCompletedData, ToolRequest, WelcomePayload, WorkbenchCreatePayload,
+    WorkbenchRemovePayload,
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 32;
@@ -364,6 +365,12 @@ impl ProtocolValidator {
             }
             FrameKind::ProjectDelete => {
                 parse_host_payload::<ProjectDeletePayload>(self, envelope, "ProjectDelete")
+            }
+            FrameKind::WorkbenchCreate => {
+                parse_host_payload::<WorkbenchCreatePayload>(self, envelope, "WorkbenchCreate")
+            }
+            FrameKind::WorkbenchRemove => {
+                parse_host_payload::<WorkbenchRemovePayload>(self, envelope, "WorkbenchRemove")
             }
             FrameKind::CustomAgentUpsert => {
                 parse_host_payload::<CustomAgentUpsertPayload>(self, envelope, "CustomAgentUpsert")
@@ -1811,8 +1818,13 @@ mod tests {
                 project: crate::Project {
                     id: crate::ProjectId("project-1".to_owned()),
                     name: "Project".to_owned(),
-                    roots: vec!["/repo-a".to_owned(), "/repo-b".to_owned()],
                     sort_order: 0,
+                    source: crate::ProjectSource::Standalone {
+                        roots: vec![
+                            crate::ProjectRootPath("/repo-a".to_owned()),
+                            crate::ProjectRootPath("/repo-b".to_owned()),
+                        ],
+                    },
                 },
                 file_list: crate::ProjectFileListPayload {
                     incremental: false,

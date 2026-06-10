@@ -54,6 +54,18 @@ pub fn open_add_root_browser(state: &AppState) {
         log::error!("cannot add a root without an active project");
         return;
     };
+    // §6.5: ProjectAddRoot is invalid on a workbench and on a parent that
+    // already has workbench children. The button that opens this browser
+    // is gated, but guard here too so a stale click (or a key shortcut
+    // that bypasses the disabled state) can't fire a request the server
+    // will reject.
+    if !state.can_manage_project_roots(&active_project.host_id, &active_project.project_id) {
+        log::warn!(
+            "cannot add a root for project {}: workbench or parent-of-workbench",
+            active_project.project_id
+        );
+        return;
+    }
     let Some(host_stream) = state.host_stream_untracked(&active_project.host_id) else {
         log::error!(
             "cannot add a root: host {} has no active stream",
@@ -439,7 +451,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                         FrameKind::ProjectCreate,
                         &ProjectCreatePayload {
                             name,
-                            roots: vec![path.0],
+                            roots: vec![protocol::ProjectRootPath(path.0)],
                         },
                     )
                     .await
@@ -462,7 +474,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                         FrameKind::ProjectAddRoot,
                         &ProjectAddRootPayload {
                             id: project_id,
-                            root: path.0,
+                            root: protocol::ProjectRootPath(path.0),
                         },
                     )
                     .await

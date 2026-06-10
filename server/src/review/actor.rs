@@ -1579,9 +1579,9 @@ fn read_review_diffs(
     match selection {
         ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => {
             let mut diffs = Vec::new();
-            for root in &project.roots {
+            for root in project.root_paths() {
                 let payload = ProjectReadDiffPayload {
-                    root: ProjectRootPath(root.clone()),
+                    root,
                     scope: ProjectDiffScope::Unstaged,
                     path: None,
                     context_mode: DiffContextMode::FullFile,

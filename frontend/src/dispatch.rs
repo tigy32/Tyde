@@ -450,6 +450,19 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 // `ReviewEvent::Snapshot`, neither of which fires for
                 // a rejected request.
                 clear_review_pending_on_error(state, host_id, &payload);
+                // CommandError carries no parent/branch correlation, but
+                // per-parent serialization on the server (§5.5) means we
+                // can drop the oldest pending entry for this host and stay
+                // correct in practice. Otherwise the entry would linger
+                // until the same parent succeeded again or the host
+                // disconnected.
+                if matches!(payload.request_kind, FrameKind::WorkbenchCreate) {
+                    state.pending_workbench_creates.update(|pending| {
+                        if let Some(idx) = pending.iter().position(|p| p.host_id == host_id) {
+                            pending.remove(idx);
+                        }
+                    });
+                }
             }
             Err(error) => {
                 report_dispatch_error(
@@ -1034,6 +1047,33 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         }
         FrameKind::ProjectNotify => match envelope.parse_payload::<ProjectNotifyPayload>() {
             Ok(ProjectNotifyPayload::Upsert { project }) => {
+                // Correlate with any in-flight WorkbenchCreate before mutating
+                // state. §3.3 says the matching upsert is the one to switch
+                // to; identify it by (parent_project_id, branch) and then
+                // drop the pending entry so a future failure doesn't try to
+                // clear it.
+                let workbench_match = match &project.source {
+                    protocol::ProjectSource::GitWorkbench {
+                        parent_project_id,
+                        branch,
+                        ..
+                    } => {
+                        let mut matched = None;
+                        state.pending_workbench_creates.update(|pending| {
+                            if let Some(idx) = pending.iter().position(|p| {
+                                p.host_id == host_id
+                                    && &p.parent_project_id == parent_project_id
+                                    && &p.branch == branch
+                            }) {
+                                pending.remove(idx);
+                                matched = Some(project.id.clone());
+                            }
+                        });
+                        matched
+                    }
+                    protocol::ProjectSource::Standalone { .. } => None,
+                };
+
                 state.projects.update(|projects| {
                     if let Some(existing) = projects
                         .iter_mut()
@@ -1048,26 +1088,16 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     }
                     sort_project_infos(projects);
                 });
+
+                if let Some(new_id) = workbench_match {
+                    state.switch_active_project(Some(crate::state::ActiveProjectRef {
+                        host_id: host_id.to_string(),
+                        project_id: new_id,
+                    }));
+                }
             }
             Ok(ProjectNotifyPayload::Delete { project }) => {
-                state.projects.update(|projects| {
-                    projects.retain(|entry| {
-                        !(entry.host_id == host_id && entry.project.id == project.id)
-                    });
-                });
-                let deleted_ref = crate::state::ActiveProjectRef {
-                    host_id: host_id.to_string(),
-                    project_id: project.id.clone(),
-                };
-                state.forget_project_view_memory(&deleted_ref);
-                if state
-                    .active_project
-                    .get_untracked()
-                    .as_ref()
-                    .is_some_and(|active| active == &deleted_ref)
-                {
-                    state.switch_active_project(None);
-                }
+                handle_project_delete(state, host_id, &project);
             }
             Err(error) => report_dispatch_error(
                 state,
@@ -1228,7 +1258,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         .to_string();
                     let multi_root = state
                         .active_project_info_untracked()
-                        .is_some_and(|project| project.project.roots.len() > 1);
+                        .is_some_and(|project| project.project.root_paths().len() > 1);
                     let label = if multi_root {
                         format!("{base_label} · {}", root_display_name(&path.root))
                     } else {
@@ -2100,6 +2130,45 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
             );
         }
     }
+}
+
+/// Apply a `ProjectNotify::Delete` to state. Removes the record, falls back
+/// the active project if it was the deleted one (workbench → parent if
+/// present, else home; standalone → home), and forgets the deleted project's
+/// view-memory entry. Forget runs **after** the active switch so
+/// `switch_active_project`'s outgoing-project snapshot can't reinsert it.
+pub(crate) fn handle_project_delete(state: &AppState, host_id: &str, project: &protocol::Project) {
+    state.projects.update(|projects| {
+        projects.retain(|entry| !(entry.host_id == host_id && entry.project.id == project.id));
+    });
+    let deleted_ref = crate::state::ActiveProjectRef {
+        host_id: host_id.to_string(),
+        project_id: project.id.clone(),
+    };
+    if state
+        .active_project
+        .get_untracked()
+        .as_ref()
+        .is_some_and(|active| active == &deleted_ref)
+    {
+        // §7.4: when the active project is removed, fall back to its parent
+        // (if a workbench whose parent is still present); otherwise fall
+        // back to home.
+        let fallback = project.parent_project_id().and_then(|parent_id| {
+            let parent_id = parent_id.clone();
+            let parent_present = state
+                .projects
+                .get_untracked()
+                .into_iter()
+                .any(|info| info.host_id == host_id && info.project.id == parent_id);
+            parent_present.then(|| crate::state::ActiveProjectRef {
+                host_id: host_id.to_string(),
+                project_id: parent_id,
+            })
+        });
+        state.switch_active_project(fallback);
+    }
+    state.forget_project_view_memory(&deleted_ref);
 }
 
 fn apply_project_file_list(
@@ -3502,8 +3571,10 @@ mod tests {
                 project: protocol::Project {
                     id: project_id.clone(),
                     name: name.to_owned(),
-                    roots: vec!["/tmp/tyde-project".to_owned()],
                     sort_order: 0,
+                    source: protocol::ProjectSource::Standalone {
+                        roots: vec![protocol::ProjectRootPath("/tmp/tyde-project".to_owned())],
+                    },
                 },
                 file_list: ProjectFileListPayload {
                     incremental: false,

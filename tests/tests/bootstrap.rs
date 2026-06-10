@@ -3,9 +3,9 @@ use std::time::Duration;
 use client::ClientConfig;
 use protocol::{
     BackendAccessMode, BackendKind, FrameKind, HostBootstrapPayload, HostBrowseStartPayload,
-    HostSettingValue, NewAgentPayload, ProjectBootstrapPayload, ReviewSummaryScope, SessionId,
-    SessionSchemasPayload, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload,
-    TerminalCreatePayload, TerminalLaunchTarget,
+    HostSettingValue, NewAgentPayload, ProjectBootstrapPayload, ProjectRootPath,
+    ReviewSummaryScope, SessionId, SessionSchemasPayload, SetSettingPayload, SpawnAgentParams,
+    SpawnAgentPayload, TerminalCreatePayload, TerminalLaunchTarget,
 };
 use server::backend::BackendSession;
 use server::store::project::ProjectStore;
@@ -293,7 +293,7 @@ async fn project_subscription_starts_with_project_bootstrap() {
         .expect("load project store")
         .create(
             "Existing project".to_owned(),
-            vec![root.path().to_string_lossy().to_string()],
+            vec![ProjectRootPath(root.path().to_string_lossy().to_string())],
         )
         .expect("create project");
 

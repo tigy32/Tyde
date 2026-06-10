@@ -12,17 +12,18 @@ use protocol::{
     ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
-    ReviewActionPayload, ReviewCreatePayload, ReviewId, ReviewSubscribePayload,
-    RunBackendSetupPayload, SendMessagePayload, SendQueuedMessageNowPayload, SetAgentNamePayload,
-    SetSessionSettingsPayload, SetSettingPayload, SkillRefreshPayload, SpawnAgentParams,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringUpsertPayload, StreamPath,
-    TeamCompactPayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberShufflePayload,
-    TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload, TerminalClosePayload,
-    TerminalCreatePayload, TerminalId, TerminalResizePayload, TerminalSendPayload,
+    ProjectReorderScope, ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewId,
+    ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
+    SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringUpsertPayload, StreamPath, TeamCompactPayload, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload,
+    TerminalClosePayload, TerminalCreatePayload, TerminalId, TerminalResizePayload,
+    TerminalSendPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -123,20 +124,36 @@ pub(crate) async fn route_client_envelope(
             FrameKind::ProjectAddRoot => {
                 let payload: ProjectAddRootPayload = parse_payload(&envelope, "project_add_root")?;
                 ensure_non_empty("project_add_root", "id", payload.id.0.as_str())?;
-                ensure_non_empty("project_add_root", "root", payload.root.as_str())?;
+                ensure_non_empty("project_add_root", "root", payload.root.0.as_str())?;
                 host.add_project_root(payload).await?;
             }
             FrameKind::ProjectDeleteRoot => {
                 let payload: ProjectDeleteRootPayload =
                     parse_payload(&envelope, "project_delete_root")?;
                 ensure_non_empty("project_delete_root", "id", payload.id.0.as_str())?;
-                ensure_non_empty("project_delete_root", "root", payload.root.as_str())?;
+                ensure_non_empty("project_delete_root", "root", payload.root.0.as_str())?;
                 host.delete_project_root(payload).await?;
             }
             FrameKind::ProjectDelete => {
                 let payload: ProjectDeletePayload = parse_payload(&envelope, "project_delete")?;
                 ensure_non_empty("project_delete", "id", payload.id.0.as_str())?;
                 host.delete_project(payload).await?;
+            }
+            FrameKind::WorkbenchCreate => {
+                let payload: WorkbenchCreatePayload = parse_payload(&envelope, "workbench_create")?;
+                ensure_non_empty(
+                    "workbench_create",
+                    "parent_project_id",
+                    payload.parent_project_id.0.as_str(),
+                )?;
+                ensure_non_empty("workbench_create", "branch", payload.branch.0.as_str())?;
+                ensure_non_empty("workbench_create", "name", payload.name.as_str())?;
+                host.create_workbench(payload).await?;
+            }
+            FrameKind::WorkbenchRemove => {
+                let payload: WorkbenchRemovePayload = parse_payload(&envelope, "workbench_remove")?;
+                ensure_non_empty("workbench_remove", "id", payload.id.0.as_str())?;
+                host.remove_workbench(payload).await?;
             }
             FrameKind::CustomAgentUpsert => {
                 let payload: CustomAgentUpsertPayload =
@@ -976,6 +993,15 @@ fn validate_optional_team_project_ids(
 }
 
 fn validate_project_reorder(payload: &ProjectReorderPayload) -> AppResult<()> {
+    match &payload.scope {
+        ProjectReorderScope::TopLevel => {}
+        ProjectReorderScope::WorkbenchChildren { parent_project_id } => ensure_non_empty(
+            "project_reorder",
+            "parent_project_id",
+            parent_project_id.0.as_str(),
+        )?,
+    }
+
     let mut seen_ids = HashSet::new();
     for project_id in &payload.project_ids {
         ensure_non_empty("project_reorder", "project_id", project_id.0.as_str())?;
@@ -1196,7 +1222,7 @@ async fn send_agent_not_running_error(stream: Stream, agent_id: AgentId) {
     }
 }
 
-fn validate_project_roots(roots: &[String]) -> AppResult<()> {
+fn validate_project_roots(roots: &[ProjectRootPath]) -> AppResult<()> {
     if roots.is_empty() {
         return Err(AppError::invalid(
             "project_create",
@@ -1206,11 +1232,11 @@ fn validate_project_roots(roots: &[String]) -> AppResult<()> {
 
     let mut seen = HashSet::new();
     for root in roots {
-        ensure_non_empty("project_create", "root", root)?;
-        if !seen.insert(root.as_str()) {
+        ensure_non_empty("project_create", "root", root.0.as_str())?;
+        if !seen.insert(root.0.as_str()) {
             return Err(AppError::invalid(
                 "project_create",
-                format!("roots must be unique: {}", root),
+                format!("roots must be unique: {}", root.0),
             ));
         }
     }

@@ -85,7 +85,7 @@ async fn create_project(
     client
         .project_create(ProjectCreatePayload {
             name: name.to_owned(),
-            roots,
+            roots: roots.into_iter().map(ProjectRootPath).collect(),
         })
         .await
         .expect("project_create failed");

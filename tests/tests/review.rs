@@ -323,11 +323,19 @@ async fn create_project_with_roots(client: &mut client::Connection, roots: Vec<S
     client
         .project_create(ProjectCreatePayload {
             name: "Review Project".to_owned(),
-            roots,
+            roots: roots.into_iter().map(ProjectRootPath).collect(),
         })
         .await
         .expect("project_create");
     expect_project(client, "project create").await
+}
+
+fn project_roots(project: &Project) -> Vec<String> {
+    project
+        .root_paths()
+        .into_iter()
+        .map(|root| root.0)
+        .collect()
 }
 
 async fn spawn_project_agent(
@@ -350,7 +358,7 @@ async fn spawn_project_agent_with_prompt(
             parent_agent_id: None,
             project_id: Some(project.id.clone()),
             params: SpawnAgentParams::New {
-                workspace_roots: project.roots.clone(),
+                workspace_roots: project_roots(project),
                 prompt: prompt.to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
@@ -751,8 +759,8 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
         .iter()
         .map(|diff| diff.root.0.as_str())
         .collect::<Vec<_>>();
-    assert!(diff_roots.contains(&project.roots[0].as_str()));
-    assert!(diff_roots.contains(&project.roots[1].as_str()));
+    assert!(diff_roots.contains(&project_roots(&project)[0].as_str()));
+    assert!(diff_roots.contains(&project_roots(&project)[1].as_str()));
     assert!(
         review
             .diffs
@@ -781,7 +789,7 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
                 let payload: NewAgentPayload = env.parse_payload().expect("new agent payload");
                 assert_eq!(payload.name, "AI Review");
                 assert_eq!(payload.project_id, Some(project.id.clone()));
-                assert_eq!(payload.workspace_roots, project.roots);
+                assert_eq!(payload.workspace_roots, project_roots(&project));
                 assert!(
                     new_agent.replace(payload).is_none(),
                     "expected one NewAgent"
@@ -995,8 +1003,8 @@ async fn workspace_review_counts_submit_and_clean_reset_across_roots() {
     assert_eq!(bootstrap.review_summaries.len(), 1);
     let review_id = bootstrap.review_summaries[0].id.clone();
     let review = subscribe_review(&mut client, &review_id).await;
-    let location_a = new_line_location_for_root(&review, &project.roots[0]);
-    let location_b = new_line_location_for_root(&review, &project.roots[1]);
+    let location_a = new_line_location_for_root(&review, &project_roots(&project)[0]);
+    let location_b = new_line_location_for_root(&review, &project_roots(&project)[1]);
     let (agent, _session_id) = spawn_project_agent_with_prompt(
         &mut client,
         &project,
@@ -1034,7 +1042,7 @@ async fn workspace_review_counts_submit_and_clean_reset_across_roots() {
         }
     };
     assert_eq!(summary.scope, ReviewSummaryScope::Workspace);
-    for root in &project.roots {
+    for root in &project_roots(&project) {
         let count = summary
             .file_comment_counts
             .iter()
@@ -1096,8 +1104,8 @@ async fn workspace_review_counts_submit_and_clean_reset_across_roots() {
         .iter()
         .map(|comment| comment["location"]["root"].as_str().expect("root"))
         .collect::<Vec<_>>();
-    assert!(bundle_roots.contains(&project.roots[0].as_str()));
-    assert!(bundle_roots.contains(&project.roots[1].as_str()));
+    assert!(bundle_roots.contains(&project_roots(&project)[0].as_str()));
+    assert!(bundle_roots.contains(&project_roots(&project)[1].as_str()));
 
     for (location, body) in [
         (location_a.clone(), "Root A reset comment."),
@@ -1130,7 +1138,7 @@ async fn workspace_review_counts_submit_and_clean_reset_across_roots() {
     let root_a_comment = partial_clean
         .comments
         .iter()
-        .find(|comment| comment.location.root.0 == project.roots[0])
+        .find(|comment| comment.location.root.0 == project_roots(&project)[0])
         .expect("root A comment");
     assert!(matches!(
         root_a_comment.anchor_status,
@@ -1140,7 +1148,7 @@ async fn workspace_review_counts_submit_and_clean_reset_across_roots() {
         partial_clean
             .diffs
             .iter()
-            .any(|diff| diff.root.0 == project.roots[1] && !diff.files.is_empty())
+            .any(|diff| diff.root.0 == project_roots(&project)[1] && !diff.files.is_empty())
     );
 
     git(&repo_b, &["add", "."]);

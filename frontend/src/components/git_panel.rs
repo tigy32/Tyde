@@ -838,8 +838,8 @@ mod wasm_tests {
     use protocol::{
         AgentId, Envelope, FrameKind, Project, ProjectBootstrapPayload, ProjectEventPayload,
         ProjectFileListPayload, ProjectGitChangeKind, ProjectGitFileStatus,
-        ProjectGitStatusPayload, ProjectId, ProjectRootGitStatus, ReviewId, ReviewStatus,
-        ReviewSummary, ReviewSummaryScope, SessionId,
+        ProjectGitStatusPayload, ProjectId, ProjectRootGitStatus, ProjectRootPath, ProjectSource,
+        ReviewId, ReviewStatus, ReviewSummary, ReviewSummaryScope, SessionId,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1337,7 +1337,9 @@ mod wasm_tests {
                 project: Project {
                     id: ProjectId("proj-1".to_owned()),
                     name: "proj".to_owned(),
-                    roots: vec!["/repo".to_owned()],
+                    source: ProjectSource::Standalone {
+                        roots: vec![ProjectRootPath("/repo".to_owned())],
+                    },
                     sort_order: 0,
                 },
                 file_list: ProjectFileListPayload {
@@ -1417,7 +1419,9 @@ mod wasm_tests {
                 project: Project {
                     id: ProjectId("proj-1".to_owned()),
                     name: "proj".to_owned(),
-                    roots: vec!["/repo".to_owned()],
+                    source: ProjectSource::Standalone {
+                        roots: vec![ProjectRootPath("/repo".to_owned())],
+                    },
                     sort_order: 0,
                 },
                 file_list: ProjectFileListPayload {

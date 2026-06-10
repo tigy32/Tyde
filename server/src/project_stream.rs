@@ -186,7 +186,7 @@ pub(crate) async fn spawn_project_subscription(
     let project = load_subscription_project(&project_store, &project_id).await?;
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
     let watcher = create_project_watcher(&project, watch_tx.clone())?;
-    let watched_roots = project.roots.clone();
+    let watched_roots = project.root_paths();
     let snapshot = initialize_snapshot(&project)?;
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let handle = ProjectStreamHandle { tx: command_tx };
@@ -214,7 +214,11 @@ async fn load_subscription_project(
     project_store: &Arc<Mutex<ProjectStore>>,
     project_id: &ProjectId,
 ) -> Result<Project, String> {
-    let projects = project_store.lock().await.list()?;
+    let projects = project_store
+        .lock()
+        .await
+        .list()
+        .map_err(|error| error.to_string())?;
     projects
         .into_iter()
         .find(|project| &project.id == project_id)
@@ -233,9 +237,9 @@ fn create_project_watcher(
     )
     .map_err(|error| format!("failed to create project filesystem watcher: {error}"))?;
 
-    for root in &project.roots {
+    for root in project.root_paths() {
         watcher
-            .watch(Path::new(root), RecursiveMode::Recursive)
+            .watch(Path::new(&root.0), RecursiveMode::Recursive)
             .map_err(|error| format!("failed to watch project root '{}': {error}", root))?;
     }
 
@@ -259,7 +263,7 @@ async fn run_project_subscription(
     mut project: Project,
     mut snapshot: ProjectSnapshotState,
     mut watcher: RecommendedWatcher,
-    mut watched_roots: Vec<String>,
+    mut watched_roots: Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     mut watch_rx: mpsc::UnboundedReceiver<notify::Result<Event>>,
     mut command_rx: mpsc::UnboundedReceiver<ProjectStreamCommand>,
@@ -407,7 +411,7 @@ async fn refresh_full(
     project: &mut Project,
     snapshot: &mut ProjectSnapshotState,
     watcher: &mut RecommendedWatcher,
-    watched_roots: &mut Vec<String>,
+    watched_roots: &mut Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     subscribers: &mut HashMap<StreamPath, Stream>,
     review_registry: &ReviewRegistryHandle,
@@ -438,7 +442,7 @@ async fn refresh_incremental(
     project: &mut Project,
     snapshot: &mut ProjectSnapshotState,
     watcher: &mut RecommendedWatcher,
-    watched_roots: &mut Vec<String>,
+    watched_roots: &mut Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     subscribers: &mut HashMap<StreamPath, Stream>,
     review_registry: &ReviewRegistryHandle,
@@ -479,15 +483,16 @@ async fn refresh_incremental(
 fn ensure_watched_roots(
     project: &Project,
     watcher: &mut RecommendedWatcher,
-    watched_roots: &mut Vec<String>,
+    watched_roots: &mut Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
 ) -> Result<(), String> {
-    if *watched_roots == project.roots {
+    let roots = project.root_paths();
+    if *watched_roots == roots {
         return Ok(());
     }
 
     *watcher = create_project_watcher(project, watch_tx)?;
-    *watched_roots = project.roots.clone();
+    *watched_roots = roots;
     Ok(())
 }
 
@@ -529,10 +534,9 @@ fn full_file_list_from_raw(
     raw_entries: &BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
 ) -> ProjectFileListPayload {
     let roots = project
-        .roots
-        .iter()
+        .root_paths()
+        .into_iter()
         .map(|root| {
-            let root = ProjectRootPath(root.clone());
             let entries = raw_entries
                 .get(&root)
                 .into_iter()
@@ -788,8 +792,8 @@ fn scan_raw_entries_with_depth(
     max_depth: usize,
 ) -> Result<BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>, String> {
     let mut result = BTreeMap::new();
-    for root in &project.roots {
-        let root_path = Path::new(root);
+    for root in project.root_paths() {
+        let root_path = Path::new(&root.0);
         let metadata = fs::metadata(root_path)
             .map_err(|err| format!("Failed to stat project root '{}': {err}", root))?;
         if !metadata.is_dir() {
@@ -797,7 +801,7 @@ fn scan_raw_entries_with_depth(
         }
         let mut raw = Vec::new();
         collect_raw_entries(root_path, root_path, &mut raw, 0, max_depth)?;
-        result.insert(ProjectRootPath(root.clone()), raw.into_iter().collect());
+        result.insert(root, raw.into_iter().collect());
     }
     Ok(result)
 }
@@ -862,18 +866,19 @@ fn build_git_status_with_runner<F>(
 where
     F: FnMut(&str, &[&str], GitAccessMode) -> Result<String, String>,
 {
-    let mut roots = Vec::with_capacity(project.roots.len());
+    let project_roots = project.root_paths();
+    let mut roots = Vec::with_capacity(project_roots.len());
 
-    for root in &project.roots {
+    for root in project_roots {
         let output = match run_git(
-            root,
+            &root.0,
             &["status", "--porcelain=v2", "--branch"],
             GitAccessMode::ReadOnly,
         ) {
             Ok(output) => output,
             Err(err) if is_not_git_repository_error(&err) => {
                 roots.push(ProjectRootGitStatus {
-                    root: ProjectRootPath(root.clone()),
+                    root,
                     branch: None,
                     ahead: 0,
                     behind: 0,
@@ -950,7 +955,7 @@ where
         }
 
         roots.push(ProjectRootGitStatus {
-            root: ProjectRootPath(root.clone()),
+            root,
             branch,
             ahead,
             behind,
@@ -1313,7 +1318,11 @@ fn collect_raw_entries(
 }
 
 fn validate_root(project: &Project, root: &ProjectRootPath) -> Result<(), String> {
-    if project.roots.iter().any(|candidate| candidate == &root.0) {
+    if project
+        .root_paths()
+        .into_iter()
+        .any(|candidate| candidate == *root)
+    {
         return Ok(());
     }
     Err(format!(
@@ -1384,8 +1393,8 @@ fn project_path_from_absolute(project: &Project, absolute_path: &str) -> Option<
         return None;
     }
 
-    for root in &project.roots {
-        let Ok(relative) = absolute.strip_prefix(root) else {
+    for root in project.root_paths() {
+        let Ok(relative) = absolute.strip_prefix(&root.0) else {
             continue;
         };
         let relative_path = relative.to_string_lossy().replace('\\', "/");
@@ -1393,7 +1402,7 @@ fn project_path_from_absolute(project: &Project, absolute_path: &str) -> Option<
             return None;
         }
         return Some(ProjectPath {
-            root: ProjectRootPath(root.clone()),
+            root,
             relative_path,
         });
     }
@@ -1815,7 +1824,7 @@ fn is_git_no_newline_marker(line: &str) -> bool {
 mod tests {
     use super::*;
 
-    use protocol::{DiffContextMode, ProjectDiffScope, ProjectId};
+    use protocol::{DiffContextMode, ProjectDiffScope, ProjectId, ProjectSource};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1826,8 +1835,10 @@ mod tests {
         Project {
             id: ProjectId("project-1".to_owned()),
             name: "Project".to_owned(),
-            roots: vec![root.to_owned()],
             sort_order: 0,
+            source: ProjectSource::Standalone {
+                roots: vec![ProjectRootPath(root.to_owned())],
+            },
         }
     }
 

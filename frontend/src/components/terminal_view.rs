@@ -60,14 +60,7 @@ fn TerminalTabBar() -> impl IntoView {
                 project.host_id == active_project.host_id
                     && project.project.id == active_project.project_id
             })?;
-        Some(
-            project
-                .project
-                .roots
-                .into_iter()
-                .map(ProjectRootPath)
-                .collect::<Vec<_>>(),
-        )
+        Some(project.project.root_paths())
     });
 
     let can_create_terminal = move || {

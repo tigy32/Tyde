@@ -3565,14 +3565,14 @@ mod wasm_tests {
 
     fn install_project(state: &AppState, host_id: &str, project_id: &str, name: &str) {
         use crate::state::ProjectInfo;
-        use protocol::{Project, ProjectId};
+        use protocol::{Project, ProjectId, ProjectSource};
         state.projects.update(|projects| {
             projects.push(ProjectInfo {
                 host_id: host_id.to_owned(),
                 project: Project {
                     id: ProjectId(project_id.to_owned()),
                     name: name.to_owned(),
-                    roots: Vec::new(),
+                    source: ProjectSource::Standalone { roots: Vec::new() },
                     sort_order: 0,
                 },
             });

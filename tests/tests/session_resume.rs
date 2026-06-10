@@ -4,8 +4,8 @@ use fixture::Fixture;
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentStartPayload, BackendKind, ChatEvent,
     DeleteSessionPayload, Envelope, FrameKind, ListSessionsPayload, NewAgentPayload, Project,
-    ProjectCreatePayload, ProjectNotifyPayload, SessionId, SessionListPayload, SpawnAgentParams,
-    SpawnAgentPayload,
+    ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath, SessionId, SessionListPayload,
+    SpawnAgentParams, SpawnAgentPayload,
 };
 use std::time::Duration;
 
@@ -440,7 +440,7 @@ async fn session_project_id_persists_and_resume_can_override_it() {
             parent_agent_id: None,
             project_id: Some(project_a.id.clone()),
             params: SpawnAgentParams::New {
-                workspace_roots: project_a.roots.clone(),
+                workspace_roots: project_roots(&project_a),
                 prompt: "session project".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
@@ -555,7 +555,7 @@ async fn create_project(
     client
         .project_create(ProjectCreatePayload {
             name: name.to_owned(),
-            roots,
+            roots: roots.into_iter().map(ProjectRootPath).collect(),
         })
         .await
         .expect("project_create failed");
@@ -564,6 +564,14 @@ async fn create_project(
         ProjectNotifyPayload::Upsert { project } => project,
         other => panic!("expected upsert project notification, got {other:?}"),
     }
+}
+
+fn project_roots(project: &Project) -> Vec<String> {
+    project
+        .root_paths()
+        .into_iter()
+        .map(|root| root.0)
+        .collect()
 }
 
 // Bug 6: Delete Session

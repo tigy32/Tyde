@@ -8,8 +8,8 @@ use protocol::{
     ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope, FrameKind,
     HostBootstrapPayload, ListSessionsPayload, NewAgentPayload, Project, ProjectAddRootPayload,
     ProjectCreatePayload, ProjectDeletePayload, ProjectId, ProjectNotifyPayload,
-    ProjectRenamePayload, SessionListPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
-    write_envelope,
+    ProjectRenamePayload, ProjectRootPath, SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
+    StreamPath, write_envelope,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -2321,7 +2321,7 @@ async fn project_mutations_fan_out_and_delete() {
         .client
         .project_create(ProjectCreatePayload {
             name: "Tyde".to_owned(),
-            roots: vec!["/tmp/tyde".to_owned()],
+            roots: vec![ProjectRootPath("/tmp/tyde".to_owned())],
         })
         .await
         .expect("project_create failed");
@@ -2331,7 +2331,7 @@ async fn project_mutations_fan_out_and_delete() {
         other => panic!("expected upsert project notification, got {other:?}"),
     };
     assert_eq!(created.name, "Tyde");
-    assert_eq!(created.roots, vec!["/tmp/tyde".to_owned()]);
+    assert_eq!(project_roots(&created), vec!["/tmp/tyde".to_owned()]);
 
     let (mut client2, bootstrap) = fixture.connect_with_bootstrap().await;
     let replayed = bootstrap
@@ -2355,7 +2355,7 @@ async fn project_mutations_fan_out_and_delete() {
             ProjectNotifyPayload::Upsert { project } => {
                 assert_eq!(project.id, created.id);
                 assert_eq!(project.name, "Tyde Renamed");
-                assert_eq!(project.roots, vec!["/tmp/tyde".to_owned()]);
+                assert_eq!(project_roots(&project), vec!["/tmp/tyde".to_owned()]);
             }
             other => panic!("expected renamed project notification, got {other:?}"),
         }
@@ -2365,7 +2365,7 @@ async fn project_mutations_fan_out_and_delete() {
         .client
         .project_add_root(ProjectAddRootPayload {
             id: created.id.clone(),
-            root: "/tmp/tyde-extra".to_owned(),
+            root: ProjectRootPath("/tmp/tyde-extra".to_owned()),
         })
         .await
         .expect("project_add_root failed");
@@ -2375,7 +2375,7 @@ async fn project_mutations_fan_out_and_delete() {
             ProjectNotifyPayload::Upsert { project } => {
                 assert_eq!(project.id, created.id);
                 assert_eq!(
-                    project.roots,
+                    project_roots(&project),
                     vec!["/tmp/tyde".to_owned(), "/tmp/tyde-extra".to_owned()]
                 );
             }
@@ -2397,7 +2397,7 @@ async fn project_mutations_fan_out_and_delete() {
                 assert_eq!(project.id, created.id);
                 assert_eq!(project.name, "Tyde Renamed");
                 assert_eq!(
-                    project.roots,
+                    project_roots(&project),
                     vec!["/tmp/tyde".to_owned(), "/tmp/tyde-extra".to_owned()]
                 );
             }
@@ -2443,7 +2443,7 @@ async fn project_replay_happens_before_agent_replay() {
             parent_agent_id: None,
             project_id: Some(project.id.clone()),
             params: SpawnAgentParams::New {
-                workspace_roots: project.roots.clone(),
+                workspace_roots: project_roots(&project),
                 prompt: "hello from project".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
@@ -2534,7 +2534,7 @@ async fn project_delete_is_rejected_when_a_session_still_references_it() {
             parent_agent_id: None,
             project_id: Some(project.id.clone()),
             params: SpawnAgentParams::New {
-                workspace_roots: project.roots.clone(),
+                workspace_roots: project_roots(&project),
                 prompt: "hold project".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
@@ -2591,7 +2591,10 @@ async fn invalid_project_input_surfaces_command_error_and_keeps_connection_alive
         .client
         .project_create(ProjectCreatePayload {
             name: "Invalid".to_owned(),
-            roots: vec!["/tmp/dup".to_owned(), "/tmp/dup".to_owned()],
+            roots: vec![
+                ProjectRootPath("/tmp/dup".to_owned()),
+                ProjectRootPath("/tmp/dup".to_owned()),
+            ],
         })
         .await
         .expect("project_create write failed");
@@ -2709,7 +2712,7 @@ async fn create_project(
     client
         .project_create(ProjectCreatePayload {
             name: name.to_owned(),
-            roots,
+            roots: roots.into_iter().map(ProjectRootPath).collect(),
         })
         .await
         .expect("project_create failed");
@@ -2718,4 +2721,12 @@ async fn create_project(
         ProjectNotifyPayload::Upsert { project } => project,
         other => panic!("expected upsert project notification, got {other:?}"),
     }
+}
+
+fn project_roots(project: &Project) -> Vec<String> {
+    project
+        .root_paths()
+        .into_iter()
+        .map(|root| root.0)
+        .collect()
 }

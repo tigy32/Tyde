@@ -8,16 +8,16 @@ use protocol::{
     CommandErrorCode, CommandErrorPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, Envelope, FrameKind, HostSettingValue,
     NewAgentPayload, Project, ProjectCreatePayload, ProjectDeletePayload, ProjectNotifyPayload,
-    SessionSettingValue, SessionSettingsPayload, SetSettingPayload, SpawnCostHint, StreamPath,
-    Team, TeamCreatePayload, TeamDeletePayload, TeamDraft, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftId, TeamDraftMember,
-    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload,
-    TeamId, TeamMember, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
-    TeamMemberBindingPayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
-    TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload, TeamMemberPresetProfile,
-    TeamMemberRole, TeamMemberState, TeamNotifyPayload, TeamPersonalityPresetId,
-    TeamPersonalityTrait, TeamRenamePayload, TeamRolePresetId, TeamSetManagerPayload,
-    TeamTemplateId, ToolPolicy, write_envelope,
+    ProjectRootPath, SessionSettingValue, SessionSettingsPayload, SetSettingPayload, SpawnCostHint,
+    StreamPath, Team, TeamCreatePayload, TeamDeletePayload, TeamDraft,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftId,
+    TeamDraftMember, TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftShuffleScope,
+    TeamDraftUpdatePayload, TeamId, TeamMember, TeamMemberActivatePayload,
+    TeamMemberBindingNotifyPayload, TeamMemberBindingPayload, TeamMemberCreatePayload,
+    TeamMemberCreateSpec, TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload,
+    TeamMemberPresetProfile, TeamMemberRole, TeamMemberState, TeamNotifyPayload,
+    TeamPersonalityPresetId, TeamPersonalityTrait, TeamRenamePayload, TeamRolePresetId,
+    TeamSetManagerPayload, TeamTemplateId, ToolPolicy, write_envelope,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -377,7 +377,7 @@ async fn create_project(client: &mut client::Connection, name: &str) -> Project 
     client
         .project_create(ProjectCreatePayload {
             name: name.to_owned(),
-            roots: vec![format!("/tmp/tyde-team-project-{name}")],
+            roots: vec![ProjectRootPath(format!("/tmp/tyde-team-project-{name}"))],
         })
         .await
         .expect("project_create failed");

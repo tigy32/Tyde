@@ -5,16 +5,16 @@ use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
 use protocol::{
     AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, ChatMessageId, CustomAgent,
-    CustomAgentId, DiffContextMode, HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload,
-    HostPlatform, HostSettings, McpServerConfig, McpServerId, MessageMetadataUpdateData,
-    MobileAccessStatePayload, MobilePairingOfferPayload, Project, ProjectDiffScope,
-    ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus,
-    ProjectRootListing, ProjectRootPath, QueuedMessageEntry, Review, ReviewCommentId, ReviewId,
-    ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry, SessionSettingsValues,
-    SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, Team, TeamDraft,
-    TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId,
-    TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog,
-    TerminalId, ToolExecutionCompletedData, ToolRequest,
+    CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry,
+    HostBrowseErrorPayload, HostPlatform, HostSettings, McpServerConfig, McpServerId,
+    MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload, Project,
+    ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath,
+    ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, QueuedMessageEntry, Review,
+    ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry,
+    SessionSettingsValues, SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath,
+    TaskList, Team, TeamDraft, TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload,
+    TeamMemberId, TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload,
+    TeamPresetCatalog, TerminalId, ToolExecutionCompletedData, ToolRequest,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -706,6 +706,18 @@ pub struct ActiveTerminalRef {
     pub terminal_id: TerminalId,
 }
 
+/// In-flight `WorkbenchCreate` request awaiting the matching `ProjectNotify::
+/// Upsert`. The dispatcher correlates by `(host_id, parent_project_id, branch)`
+/// — see §3.3 of `dev-docs/18-workbenches.md` — and on a match switches the
+/// active project to the new workbench id, then removes the entry. A
+/// `CommandError` for `WorkbenchCreate` clears the oldest entry for the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingWorkbenchCreate {
+    pub host_id: String,
+    pub parent_project_id: ProjectId,
+    pub branch: GitBranchName,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub configured_hosts: RwSignal<Vec<ConfiguredHost>>,
@@ -906,6 +918,10 @@ pub struct AppState {
     /// disable the Start button so the user can't double-fire while
     /// the server is preparing the offer.
     pub mobile_pairing_start_pending: RwSignal<HashSet<String>>,
+    /// In-flight `WorkbenchCreate` requests. The dispatcher uses these to
+    /// correlate the resulting `ProjectNotify::Upsert` and switch the active
+    /// project to the freshly-created workbench. See `PendingWorkbenchCreate`.
+    pub pending_workbench_creates: RwSignal<Vec<PendingWorkbenchCreate>>,
 }
 
 /// Snapshot of identifying fields captured for an agent at the moment
@@ -1062,6 +1078,7 @@ impl AppState {
             mobile_access_state: RwSignal::new(HashMap::new()),
             mobile_pairing_offer: RwSignal::new(HashMap::new()),
             mobile_pairing_start_pending: RwSignal::new(HashSet::new()),
+            pending_workbench_creates: RwSignal::new(Vec::new()),
         }
     }
 
@@ -1615,6 +1632,36 @@ impl AppState {
         self.active_project.get_untracked()
     }
 
+    /// Whether the project at `(host_id, project_id)` accepts ProjectAddRoot /
+    /// ProjectDeleteRoot. Per §6.5/§6.6 of the workbenches design doc:
+    ///
+    /// - A workbench's roots are managed only by WorkbenchCreate /
+    ///   WorkbenchRemove — root edits are rejected with `InvalidInput`.
+    /// - A standalone parent that has at least one workbench child is
+    ///   rejected with `Conflict` because root edits would break the
+    ///   parent_root linkage in every child workbench.
+    /// - Otherwise (standalone with no children), root edits are allowed.
+    ///
+    /// The UI mirrors this: hide / disable add-root and per-root remove
+    /// affordances when the answer is `false`. The server is still the
+    /// enforcement boundary; this is just a projection of state.
+    pub fn can_manage_project_roots(&self, host_id: &str, project_id: &ProjectId) -> bool {
+        let projects = self.projects.get();
+        let Some(project) = projects
+            .iter()
+            .find(|info| info.host_id == host_id && &info.project.id == project_id)
+        else {
+            return false;
+        };
+        if project.project.is_workbench() {
+            return false;
+        }
+        let has_workbench_children = projects.iter().any(|info| {
+            info.host_id == host_id && info.project.parent_project_id() == Some(project_id)
+        });
+        !has_workbench_children
+    }
+
     /// Change which project the center zone is viewing. Snapshots the outgoing
     /// project's center-zone state into `project_view_memory` and restores the
     /// incoming project's last snapshot (or a fresh empty Chat view for a
@@ -1824,6 +1871,8 @@ impl AppState {
             .update(|terminals| terminals.retain(|terminal| terminal.host_id != host_id));
         self.project_view_memory
             .update(|map| map.retain(|key, _| key.host_id != host_id));
+        self.pending_workbench_creates
+            .update(|pending| pending.retain(|entry| entry.host_id != host_id));
 
         if self
             .active_project

@@ -16,26 +16,26 @@ use protocol::{
     McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
     MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
     PROTOCOL_VERSION, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload,
-    ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId, ProjectListDirPayload,
-    ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
-    RejectPayload, ReviewActionPayload, ReviewBootstrapPayload, ReviewCreatePayload,
-    ReviewEventPayload, ReviewId, ReviewSubscribePayload, SendMessagePayload,
-    SendQueuedMessageNowPayload, SeqValidator, SessionListPayload, SessionSchemasPayload,
-    SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
-    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringNotifyPayload, SteeringUpsertPayload, StreamPath, TYDE_VERSION, TeamCreatePayload,
-    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
-    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
-    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
-    TeamMemberNotifyPayload, TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
-    TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
-    TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
-    TerminalSendPayload, TerminalStartPayload, Version, WelcomePayload, read_envelope,
-    write_envelope,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload, RejectPayload,
+    ReviewActionPayload, ReviewBootstrapPayload, ReviewCreatePayload, ReviewEventPayload, ReviewId,
+    ReviewSubscribePayload, SendMessagePayload, SendQueuedMessageNowPayload, SeqValidator,
+    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
+    SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
+    StreamPath, TYDE_VERSION, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
+    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
+    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
+    TeamMemberUpdatePayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload,
+    TeamSetManagerPayload, TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload,
+    TerminalErrorPayload, TerminalExitPayload, TerminalId, TerminalOutputPayload,
+    TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, Version, WelcomePayload,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, read_envelope, write_envelope,
 };
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
 #[cfg(unix)]
@@ -254,11 +254,35 @@ impl Connection {
             .await
     }
 
+    pub async fn project_delete_root(
+        &mut self,
+        payload: ProjectDeleteRootPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::ProjectDeleteRoot, &payload)
+            .await
+    }
+
     pub async fn project_delete(
         &mut self,
         payload: ProjectDeletePayload,
     ) -> Result<(), FrameError> {
         self.send_host_payload(FrameKind::ProjectDelete, &payload)
+            .await
+    }
+
+    pub async fn workbench_create(
+        &mut self,
+        payload: WorkbenchCreatePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::WorkbenchCreate, &payload)
+            .await
+    }
+
+    pub async fn workbench_remove(
+        &mut self,
+        payload: WorkbenchRemovePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::WorkbenchRemove, &payload)
             .await
     }
 

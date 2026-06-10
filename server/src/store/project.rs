@@ -2,128 +2,28 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use protocol::{Project, ProjectId};
+use protocol::{
+    GitBranchName, Project, ProjectId, ProjectReorderScope, ProjectRootPath, ProjectSource,
+    WorkbenchRoot,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+const STORE_VERSION: u32 = 2;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StoreFile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    version: Option<u64>,
-    records: HashMap<String, StoredProject>,
+    version: u32,
+    records: HashMap<String, Project>,
 }
 
-impl StoreFile {
-    fn empty() -> Self {
-        Self {
-            version: None,
-            records: HashMap::new(),
-        }
-    }
-
-    fn projects(&self) -> HashMap<String, Project> {
-        self.records
-            .iter()
-            .map(|(id, record)| (id.clone(), record.to_project()))
-            .collect()
-    }
-
-    fn uses_source_shape(&self) -> bool {
-        self.version == Some(2)
-            || self
-                .records
-                .values()
-                .any(|record| matches!(record, StoredProject::Source(_)))
-    }
-
-    fn normalize_version_for_save(&mut self) {
-        if self.uses_source_shape() {
-            self.version = Some(2);
-            for record in self.records.values_mut() {
-                if let StoredProject::Legacy(project) = record {
-                    *record = StoredProject::Source(SourceProject {
-                        id: project.id.clone(),
-                        name: project.name.clone(),
-                        sort_order: project.sort_order,
-                        source: ProjectSource::Standalone {
-                            roots: project.roots.clone(),
-                        },
-                    });
-                }
-            }
-        }
-    }
+#[derive(Debug, Serialize, Deserialize)]
+struct StoreFileV1 {
+    records: HashMap<String, ProjectRecordV1>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum StoredProject {
-    Legacy(LegacyProject),
-    Source(SourceProject),
-}
-
-impl StoredProject {
-    fn from_project(project: Project, use_source_shape: bool) -> Self {
-        if use_source_shape {
-            StoredProject::Source(SourceProject {
-                id: project.id,
-                name: project.name,
-                sort_order: project.sort_order,
-                source: ProjectSource::Standalone {
-                    roots: project.roots,
-                },
-            })
-        } else {
-            StoredProject::Legacy(LegacyProject {
-                id: project.id,
-                name: project.name,
-                roots: project.roots,
-                sort_order: project.sort_order,
-            })
-        }
-    }
-
-    fn to_project(&self) -> Project {
-        match self {
-            StoredProject::Legacy(project) => Project {
-                id: project.id.clone(),
-                name: project.name.clone(),
-                roots: project.roots.clone(),
-                sort_order: project.sort_order,
-            },
-            StoredProject::Source(project) => Project {
-                id: project.id.clone(),
-                name: project.name.clone(),
-                roots: project.source.root_paths(),
-                sort_order: project.sort_order,
-            },
-        }
-    }
-
-    fn set_name(&mut self, name: String) {
-        match self {
-            StoredProject::Legacy(project) => project.name = name,
-            StoredProject::Source(project) => project.name = name,
-        }
-    }
-
-    fn set_sort_order(&mut self, sort_order: u64) {
-        match self {
-            StoredProject::Legacy(project) => project.sort_order = sort_order,
-            StoredProject::Source(project) => project.sort_order = sort_order,
-        }
-    }
-
-    fn standalone_roots_mut(&mut self) -> Option<&mut Vec<String>> {
-        match self {
-            StoredProject::Legacy(project) => Some(&mut project.roots),
-            StoredProject::Source(project) => project.source.standalone_roots_mut(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyProject {
+#[derive(Debug, Serialize, Deserialize)]
+struct ProjectRecordV1 {
     id: ProjectId,
     name: String,
     roots: Vec<String>,
@@ -131,65 +31,86 @@ struct LegacyProject {
     sort_order: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SourceProject {
-    id: ProjectId,
-    name: String,
-    #[serde(default)]
-    sort_order: u64,
-    source: ProjectSource,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectStoreError {
+    NotFound(String),
+    InvalidInput(String),
+    Conflict(String),
+    InvalidStore(String),
+    Internal(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ProjectSource {
-    Standalone {
-        roots: Vec<String>,
-    },
-    GitWorkbench {
-        parent_project_id: ProjectId,
-        branch: String,
-        roots: Vec<WorkbenchRoot>,
-    },
-}
-
-impl ProjectSource {
-    fn root_paths(&self) -> Vec<String> {
-        match self {
-            ProjectSource::Standalone { roots } => roots.clone(),
-            ProjectSource::GitWorkbench { roots, .. } => roots
-                .iter()
-                .map(|root| root.worktree_root.clone())
-                .collect(),
-        }
+impl ProjectStoreError {
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFound(message.into())
     }
 
-    fn standalone_roots_mut(&mut self) -> Option<&mut Vec<String>> {
+    fn invalid_input(message: impl Into<String>) -> Self {
+        Self::InvalidInput(message.into())
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict(message.into())
+    }
+
+    fn invalid_store(message: impl Into<String>) -> Self {
+        Self::InvalidStore(message.into())
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(message.into())
+    }
+
+    pub fn with_message(self, message: impl Into<String>) -> Self {
+        let message = message.into();
         match self {
-            ProjectSource::Standalone { roots } => Some(roots),
-            ProjectSource::GitWorkbench { .. } => None,
+            Self::NotFound(_) => Self::NotFound(message),
+            Self::InvalidInput(_) => Self::InvalidInput(message),
+            Self::Conflict(_) => Self::Conflict(message),
+            Self::InvalidStore(_) => Self::InvalidStore(message),
+            Self::Internal(_) => Self::Internal(message),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkbenchRoot {
-    parent_root: String,
-    worktree_root: String,
+impl std::fmt::Display for ProjectStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(message)
+            | Self::InvalidInput(message)
+            | Self::Conflict(message)
+            | Self::InvalidStore(message)
+            | Self::Internal(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ProjectStoreError {}
+
+impl From<ProjectStoreError> for String {
+    fn from(error: ProjectStoreError) -> Self {
+        error.to_string()
+    }
 }
 
 #[derive(Debug)]
 pub struct ProjectStore {
     path: PathBuf,
+    records: HashMap<String, Project>,
 }
 
 impl ProjectStore {
-    pub fn load(path: PathBuf) -> Result<Self, String> {
-        let _ = Self::read_from_disk(&path)?;
-        Ok(Self { path })
+    pub fn load(path: PathBuf) -> Result<Self, ProjectStoreError> {
+        let (records, migrated) = Self::read_from_disk(&path)?;
+        validate_records(&records).map_err(ProjectStoreError::invalid_store)?;
+        let store = Self { path, records };
+        if migrated {
+            store.save_current()?;
+        }
+        Ok(store)
     }
 
-    pub fn default_path() -> Result<PathBuf, String> {
+    pub fn default_path() -> Result<PathBuf, ProjectStoreError> {
         if let Ok(path) = std::env::var("TYDE_PROJECT_STORE_PATH") {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
@@ -197,327 +118,941 @@ impl ProjectStore {
             }
         }
 
-        Ok(crate::paths::home_dir()?
+        Ok(crate::paths::home_dir()
+            .map_err(ProjectStoreError::internal)?
             .join(".tyde")
             .join("projects.json"))
     }
 
-    pub fn list(&self) -> Result<Vec<Project>, String> {
-        let records = Self::read_from_disk(&self.path)?;
-        Ok(Self::ordered_projects(&records))
+    pub fn list(&self) -> Result<Vec<Project>, ProjectStoreError> {
+        Ok(Self::ordered_projects(&self.records))
     }
 
     pub fn get(&self, id: &ProjectId) -> Option<Project> {
-        Self::read_from_disk(&self.path)
-            .ok()
-            .and_then(|records| records.get(&id.0).cloned())
+        self.records.get(&id.0).cloned()
     }
 
-    pub fn create(&self, name: String, roots: Vec<String>) -> Result<Project, String> {
-        let id = ProjectId(Uuid::new_v4().to_string());
-        let mut store = Self::read_store_from_disk(&self.path)?;
-        let records = store.projects();
+    pub fn create(
+        &mut self,
+        name: String,
+        roots: Vec<ProjectRootPath>,
+    ) -> Result<Project, ProjectStoreError> {
+        validate_project_name(&name).map_err(ProjectStoreError::invalid_input)?;
+        validate_standalone_roots_for_input(&roots).map_err(ProjectStoreError::invalid_input)?;
+        for root in &roots {
+            if let Some(owner) = root_path_owner(&self.records, root, None) {
+                return Err(ProjectStoreError::conflict(format!(
+                    "project root {} is already registered by project {}",
+                    root, owner
+                )));
+            }
+        }
+
+        let id = self.generate_project_id();
         let project = Project {
             id: id.clone(),
             name,
-            roots,
-            sort_order: Self::next_sort_order(&records),
+            sort_order: Self::next_top_level_sort_order(&self.records),
+            source: ProjectSource::Standalone { roots },
         };
-        let previous = store.records.insert(
-            id.0.clone(),
-            StoredProject::from_project(project.clone(), store.uses_source_shape()),
-        );
-        assert!(
-            previous.is_none(),
-            "project store generated duplicate project id {}",
-            id
-        );
-        self.save_store(&mut store)?;
+        let mut records = self.records.clone();
+        records.insert(id.0.clone(), project.clone());
+        self.persist_candidate(records)?;
         Ok(project)
     }
 
-    pub fn rename(&self, id: &ProjectId, name: String) -> Result<Project, String> {
-        let mut store = Self::read_store_from_disk(&self.path)?;
-        let Some(record) = store.records.get_mut(&id.0) else {
-            return Err(format!("cannot rename missing project {}", id));
+    pub fn rename(&mut self, id: &ProjectId, name: String) -> Result<Project, ProjectStoreError> {
+        validate_project_name(&name).map_err(ProjectStoreError::invalid_input)?;
+        let mut records = self.records.clone();
+        let Some(project) = records.get_mut(&id.0) else {
+            return Err(ProjectStoreError::not_found(format!(
+                "cannot rename missing project {}",
+                id
+            )));
         };
-        record.set_name(name);
-        let updated = record.to_project();
-        self.save_store(&mut store)?;
+        project.name = name;
+        let updated = project.clone();
+        self.persist_candidate(records)?;
         Ok(updated)
     }
 
-    pub fn reorder(&self, project_ids: Vec<ProjectId>) -> Result<Vec<Project>, String> {
-        let mut store = Self::read_store_from_disk(&self.path)?;
-        let records = store.projects();
-        let current_projects = Self::ordered_projects(&records);
+    pub fn reorder(
+        &mut self,
+        scope: ProjectReorderScope,
+        project_ids: Vec<ProjectId>,
+    ) -> Result<Vec<Project>, ProjectStoreError> {
+        let scope_projects = self.projects_in_scope(&scope)?;
+        let scope_ids = scope_projects
+            .iter()
+            .map(|project| project.id.clone())
+            .collect::<HashSet<_>>();
+
         let mut seen_ids = HashSet::new();
         for project_id in &project_ids {
-            if !store.records.contains_key(&project_id.0) {
-                return Err(format!("cannot reorder missing project {}", project_id));
+            if !self.records.contains_key(&project_id.0) {
+                return Err(ProjectStoreError::not_found(format!(
+                    "cannot reorder missing project {}",
+                    project_id
+                )));
             }
-            if !seen_ids.insert(project_id.0.clone()) {
-                return Err(format!(
+            if !scope_ids.contains(project_id) {
+                return Err(ProjectStoreError::invalid_input(format!(
+                    "project {} is not in the requested reorder scope",
+                    project_id
+                )));
+            }
+            if !seen_ids.insert(project_id.clone()) {
+                return Err(ProjectStoreError::conflict(format!(
                     "project reorder contains duplicate id {}",
                     project_id
-                ));
+                )));
             }
         }
 
         let mut ordered_ids = project_ids;
         ordered_ids.extend(
-            current_projects
+            scope_projects
                 .iter()
-                .filter(|project| !seen_ids.contains(&project.id.0))
+                .filter(|project| !seen_ids.contains(&project.id))
                 .map(|project| project.id.clone()),
         );
 
+        let mut records = self.records.clone();
         for (index, project_id) in ordered_ids.into_iter().enumerate() {
-            let Some(project) = store.records.get_mut(&project_id.0) else {
-                return Err(format!("cannot reorder missing project {}", project_id));
+            let Some(project) = records.get_mut(&project_id.0) else {
+                return Err(ProjectStoreError::not_found(format!(
+                    "cannot reorder missing project {}",
+                    project_id
+                )));
             };
-            project.set_sort_order(index as u64);
+            project.sort_order = index as u64;
         }
 
-        self.save_store(&mut store)?;
-        Ok(Self::ordered_projects(&store.projects()))
+        self.persist_candidate(records)?;
+        self.projects_in_scope(&scope)
     }
 
-    pub fn add_root(&self, id: &ProjectId, root: String) -> Result<Project, String> {
-        let mut store = Self::read_store_from_disk(&self.path)?;
-        let Some(project) = store.records.get_mut(&id.0) else {
-            return Err(format!("cannot add root to missing project {}", id));
-        };
-        let Some(roots) = project.standalone_roots_mut() else {
-            return Err(format!("cannot add root to workbench project {}", id));
-        };
-        if roots.iter().any(|existing| existing == &root) {
-            return Err(format!("project {} already contains root {}", id, root));
+    pub fn add_root(
+        &mut self,
+        id: &ProjectId,
+        root: ProjectRootPath,
+    ) -> Result<Project, ProjectStoreError> {
+        validate_project_root(&root).map_err(ProjectStoreError::invalid_input)?;
+        let children = self.list_children(id);
+        if let Some(child) = children.first() {
+            return Err(ProjectStoreError::conflict(format!(
+                "cannot add root to project {} while referenced by workbench {}",
+                id, child
+            )));
         }
-        roots.push(root);
-        let updated = project.to_project();
-        self.save_store(&mut store)?;
+        if let Some(owner) = root_path_owner(&self.records, &root, Some(id)) {
+            return Err(ProjectStoreError::conflict(format!(
+                "project root {} is already registered by project {}",
+                root, owner
+            )));
+        }
+
+        let mut records = self.records.clone();
+        let Some(project) = records.get_mut(&id.0) else {
+            return Err(ProjectStoreError::not_found(format!(
+                "cannot add root to missing project {}",
+                id
+            )));
+        };
+        match &mut project.source {
+            ProjectSource::Standalone { roots } => {
+                if roots.iter().any(|existing| existing == &root) {
+                    return Err(ProjectStoreError::conflict(format!(
+                        "project {} already contains root {}",
+                        id, root
+                    )));
+                }
+                roots.push(root);
+            }
+            ProjectSource::GitWorkbench { .. } => {
+                return Err(ProjectStoreError::invalid_input(format!(
+                    "cannot add root to workbench project {}",
+                    id
+                )));
+            }
+        }
+        let updated = project.clone();
+        self.persist_candidate(records)?;
         Ok(updated)
     }
 
-    pub fn delete_root(&self, id: &ProjectId, root: &str) -> Result<Project, String> {
-        let mut store = Self::read_store_from_disk(&self.path)?;
-        let Some(project) = store.records.get_mut(&id.0) else {
-            return Err(format!("cannot delete root from missing project {}", id));
-        };
-        let Some(roots) = project.standalone_roots_mut() else {
-            return Err(format!("cannot delete root from workbench project {}", id));
-        };
-        let original_len = roots.len();
-        roots.retain(|existing| existing != root);
-        if roots.len() == original_len {
-            return Err(format!("project {} does not contain root {}", id, root));
+    pub fn delete_root(
+        &mut self,
+        id: &ProjectId,
+        root: &ProjectRootPath,
+    ) -> Result<Project, ProjectStoreError> {
+        let children = self.list_children(id);
+        if let Some(child) = children.first() {
+            return Err(ProjectStoreError::conflict(format!(
+                "cannot delete root from project {} while referenced by workbench {}",
+                id, child
+            )));
         }
-        let updated = project.to_project();
-        self.save_store(&mut store)?;
+
+        let mut records = self.records.clone();
+        let Some(project) = records.get_mut(&id.0) else {
+            return Err(ProjectStoreError::not_found(format!(
+                "cannot delete root from missing project {}",
+                id
+            )));
+        };
+        match &mut project.source {
+            ProjectSource::Standalone { roots } => {
+                let original_len = roots.len();
+                roots.retain(|existing| existing != root);
+                if roots.len() == original_len {
+                    return Err(ProjectStoreError::not_found(format!(
+                        "project {} does not contain root {}",
+                        id, root
+                    )));
+                }
+                if roots.is_empty() {
+                    return Err(ProjectStoreError::invalid_input(format!(
+                        "cannot delete root {} from project {} because standalone projects require at least one root",
+                        root, id
+                    )));
+                }
+            }
+            ProjectSource::GitWorkbench { .. } => {
+                return Err(ProjectStoreError::invalid_input(format!(
+                    "cannot delete root from workbench project {}",
+                    id
+                )));
+            }
+        }
+        let updated = project.clone();
+        self.persist_candidate(records)?;
         Ok(updated)
     }
 
-    pub fn delete(&self, id: &ProjectId) -> Result<Project, String> {
-        let mut store = Self::read_store_from_disk(&self.path)?;
-        let Some(project) = store.records.remove(&id.0) else {
-            return Err(format!("cannot delete missing project {}", id));
+    pub fn delete(&mut self, id: &ProjectId) -> Result<Project, ProjectStoreError> {
+        let Some(existing) = self.records.get(&id.0) else {
+            return Err(ProjectStoreError::not_found(format!(
+                "cannot delete missing project {}",
+                id
+            )));
         };
-        let project = project.to_project();
-        self.save_store(&mut store)?;
+        if existing.is_workbench() {
+            return Err(ProjectStoreError::invalid_input(format!(
+                "cannot delete workbench project {} with ProjectDelete; use WorkbenchRemove",
+                id
+            )));
+        }
+        let children = self.list_children(id);
+        if let Some(child) = children.first() {
+            return Err(ProjectStoreError::conflict(format!(
+                "cannot delete project {} while referenced by workbench {}",
+                id, child
+            )));
+        }
+
+        let mut records = self.records.clone();
+        let Some(project) = records.remove(&id.0) else {
+            return Err(ProjectStoreError::not_found(format!(
+                "cannot delete missing project {}",
+                id
+            )));
+        };
+        self.persist_candidate(records)?;
         Ok(project)
     }
 
-    fn read_from_disk(path: &Path) -> Result<HashMap<String, Project>, String> {
-        Ok(Self::read_store_from_disk(path)?.projects())
+    pub fn create_workbench(
+        &mut self,
+        parent_project_id: ProjectId,
+        name: String,
+        branch: GitBranchName,
+        roots: Vec<WorkbenchRoot>,
+    ) -> Result<Project, ProjectStoreError> {
+        validate_project_name(&name).map_err(ProjectStoreError::invalid_input)?;
+        if branch.0.trim().is_empty() {
+            return Err(ProjectStoreError::invalid_input(
+                "workbench branch must not be empty",
+            ));
+        }
+        let Some(parent) = self.records.get(&parent_project_id.0) else {
+            return Err(ProjectStoreError::not_found(format!(
+                "cannot create workbench for missing parent project {}",
+                parent_project_id
+            )));
+        };
+        let ProjectSource::Standalone {
+            roots: parent_roots,
+        } = &parent.source
+        else {
+            return Err(ProjectStoreError::invalid_input(format!(
+                "cannot create workbench for non-standalone parent project {}",
+                parent_project_id
+            )));
+        };
+        validate_workbench_roots_for_parent(&roots, parent_roots, "new workbench")
+            .map_err(ProjectStoreError::invalid_input)?;
+        for root in &roots {
+            if let Some(owner) = root_path_owner(&self.records, &root.worktree_root, None) {
+                return Err(ProjectStoreError::conflict(format!(
+                    "worktree root {} is already registered by project {}",
+                    root.worktree_root, owner
+                )));
+            }
+        }
+
+        let id = self.generate_project_id();
+        let project = Project {
+            id: id.clone(),
+            name,
+            sort_order: Self::next_child_sort_order(&self.records, &parent_project_id),
+            source: ProjectSource::GitWorkbench {
+                parent_project_id,
+                branch,
+                roots,
+            },
+        };
+        let mut records = self.records.clone();
+        records.insert(id.0.clone(), project.clone());
+        self.persist_candidate(records)?;
+        Ok(project)
     }
 
-    fn read_store_from_disk(path: &Path) -> Result<StoreFile, String> {
+    pub fn delete_workbench(&mut self, id: &ProjectId) -> Result<Project, ProjectStoreError> {
+        let Some(existing) = self.records.get(&id.0) else {
+            return Err(ProjectStoreError::not_found(format!(
+                "cannot delete missing workbench project {}",
+                id
+            )));
+        };
+        if !existing.is_workbench() {
+            return Err(ProjectStoreError::invalid_input(format!(
+                "cannot delete non-workbench project {} as workbench",
+                id
+            )));
+        }
+
+        let mut records = self.records.clone();
+        let Some(project) = records.remove(&id.0) else {
+            return Err(ProjectStoreError::not_found(format!(
+                "cannot delete missing workbench project {}",
+                id
+            )));
+        };
+        self.persist_candidate(records)?;
+        Ok(project)
+    }
+
+    pub fn list_children(&self, parent: &ProjectId) -> Vec<ProjectId> {
+        let mut children = self
+            .records
+            .values()
+            .filter(|project| project.parent_project_id() == Some(parent))
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_projects_by_sort_order(&mut children);
+        children.into_iter().map(|project| project.id).collect()
+    }
+
+    fn read_from_disk(path: &Path) -> Result<(HashMap<String, Project>, bool), ProjectStoreError> {
         match std::fs::read_to_string(path) {
-            Ok(contents) => serde_json::from_str::<StoreFile>(&contents)
-                .map_err(|err| format!("Failed to parse project store {}: {err}", path.display()))
-                .and_then(|store| {
-                    Self::validate_store_version(&store, path)?;
-                    Ok(store)
-                }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(StoreFile::empty()),
-            Err(err) => Err(format!(
+            Ok(contents) => Self::parse_store_file(path, &contents),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok((HashMap::new(), false)),
+            Err(err) => Err(ProjectStoreError::internal(format!(
                 "Failed to read project store {}: {err}",
                 path.display()
-            )),
+            ))),
         }
     }
 
-    fn validate_store_version(store: &StoreFile, path: &Path) -> Result<(), String> {
-        match store.version {
-            None | Some(2) => Ok(()),
-            Some(version) => Err(format!(
-                "Failed to parse project store {}: unsupported version {}",
-                path.display(),
-                version
-            )),
+    fn parse_store_file(
+        path: &Path,
+        contents: &str,
+    ) -> Result<(HashMap<String, Project>, bool), ProjectStoreError> {
+        let value = serde_json::from_str::<serde_json::Value>(contents).map_err(|err| {
+            ProjectStoreError::internal(format!(
+                "Failed to parse project store {}: {err}",
+                path.display()
+            ))
+        })?;
+        let version = value.get("version").and_then(serde_json::Value::as_u64);
+        match version {
+            Some(version) if version == STORE_VERSION as u64 => {
+                let store = serde_json::from_value::<StoreFile>(value).map_err(|err| {
+                    ProjectStoreError::internal(format!(
+                        "Failed to parse project store {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                Ok((store.records, false))
+            }
+            Some(version) => Err(ProjectStoreError::internal(format!(
+                "Unsupported project store version {} in {}",
+                version,
+                path.display()
+            ))),
+            None => {
+                let store = serde_json::from_value::<StoreFileV1>(value).map_err(|err| {
+                    ProjectStoreError::internal(format!(
+                        "Failed to parse v1 project store {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                let records = store
+                    .records
+                    .into_iter()
+                    .map(|(key, record)| {
+                        (
+                            key,
+                            Project {
+                                id: record.id,
+                                name: record.name,
+                                sort_order: record.sort_order,
+                                source: ProjectSource::Standalone {
+                                    roots: record.roots.into_iter().map(ProjectRootPath).collect(),
+                                },
+                            },
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                Ok((records, true))
+            }
         }
     }
 
-    fn save_store(&self, store: &mut StoreFile) -> Result<(), String> {
-        store.normalize_version_for_save();
-        let json = serde_json::to_string_pretty(store)
-            .map_err(|err| format!("Failed to serialize project store: {err}"))?;
-
-        self.write_json(&json)
+    fn persist_candidate(
+        &mut self,
+        records: HashMap<String, Project>,
+    ) -> Result<(), ProjectStoreError> {
+        validate_records(&records).map_err(ProjectStoreError::invalid_store)?;
+        Self::save_to_path(&self.path, &records)?;
+        self.records = records;
+        Ok(())
     }
 
-    fn write_json(&self, json: &str) -> Result<(), String> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| format!("Project store path has no parent: {}", self.path.display()))?;
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create project store directory: {err}"))?;
+    fn save_current(&self) -> Result<(), ProjectStoreError> {
+        Self::save_to_path(&self.path, &self.records)
+    }
 
-        let tmp_path = self.path.with_extension("json.tmp");
-        let mut file = std::fs::File::create(&tmp_path)
-            .map_err(|err| format!("Failed to create temp project store file: {err}"))?;
-        file.write_all(json.as_bytes())
-            .map_err(|err| format!("Failed to write temp project store file: {err}"))?;
-        file.sync_all()
-            .map_err(|err| format!("Failed to sync temp project store file: {err}"))?;
-        std::fs::rename(&tmp_path, &self.path).map_err(|err| {
-            format!(
+    fn save_to_path(
+        path: &Path,
+        records: &HashMap<String, Project>,
+    ) -> Result<(), ProjectStoreError> {
+        let json = serde_json::to_string_pretty(&StoreFile {
+            version: STORE_VERSION,
+            records: records.clone(),
+        })
+        .map_err(|err| {
+            ProjectStoreError::internal(format!("Failed to serialize project store: {err}"))
+        })?;
+
+        let parent = path.parent().ok_or_else(|| {
+            ProjectStoreError::internal(format!(
+                "Project store path has no parent: {}",
+                path.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent).map_err(|err| {
+            ProjectStoreError::internal(format!("Failed to create project store directory: {err}"))
+        })?;
+
+        let tmp_path = path.with_extension("json.tmp");
+        let mut file = std::fs::File::create(&tmp_path).map_err(|err| {
+            ProjectStoreError::internal(format!("Failed to create temp project store file: {err}"))
+        })?;
+        file.write_all(json.as_bytes()).map_err(|err| {
+            ProjectStoreError::internal(format!("Failed to write temp project store file: {err}"))
+        })?;
+        file.sync_all().map_err(|err| {
+            ProjectStoreError::internal(format!("Failed to sync temp project store file: {err}"))
+        })?;
+        std::fs::rename(&tmp_path, path).map_err(|err| {
+            ProjectStoreError::internal(format!(
                 "Failed to atomically replace project store {}: {err}",
-                self.path.display()
-            )
+                path.display()
+            ))
         })?;
         Ok(())
     }
 
     fn ordered_projects(records: &HashMap<String, Project>) -> Vec<Project> {
-        let mut projects: Vec<_> = records.values().cloned().collect();
-        projects.sort_by(|left, right| {
-            left.sort_order
-                .cmp(&right.sort_order)
-                .then(left.name.cmp(&right.name))
-                .then(left.id.0.cmp(&right.id.0))
-        });
+        let mut top_level = records
+            .values()
+            .filter(|project| !project.is_workbench())
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_projects_by_sort_order(&mut top_level);
+
+        let mut projects = top_level.clone();
+        for parent in top_level {
+            let mut children = records
+                .values()
+                .filter(|project| project.parent_project_id() == Some(&parent.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            sort_projects_by_sort_order(&mut children);
+            projects.extend(children);
+        }
         projects
     }
 
-    fn next_sort_order(records: &HashMap<String, Project>) -> u64 {
+    fn projects_in_scope(
+        &self,
+        scope: &ProjectReorderScope,
+    ) -> Result<Vec<Project>, ProjectStoreError> {
+        let mut projects = match scope {
+            ProjectReorderScope::TopLevel => self
+                .records
+                .values()
+                .filter(|project| !project.is_workbench())
+                .cloned()
+                .collect::<Vec<_>>(),
+            ProjectReorderScope::WorkbenchChildren { parent_project_id } => {
+                let Some(parent) = self.records.get(&parent_project_id.0) else {
+                    return Err(ProjectStoreError::not_found(format!(
+                        "cannot reorder workbenches for missing parent project {}",
+                        parent_project_id
+                    )));
+                };
+                if parent.is_workbench() {
+                    return Err(ProjectStoreError::invalid_input(format!(
+                        "cannot reorder workbenches for non-standalone parent project {}",
+                        parent_project_id
+                    )));
+                }
+                self.records
+                    .values()
+                    .filter(|project| project.parent_project_id() == Some(parent_project_id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+        };
+        sort_projects_by_sort_order(&mut projects);
+        Ok(projects)
+    }
+
+    fn next_top_level_sort_order(records: &HashMap<String, Project>) -> u64 {
         records
             .values()
+            .filter(|project| !project.is_workbench())
             .map(|project| project.sort_order)
             .max()
             .map(|max_order| max_order.saturating_add(1))
             .unwrap_or(0)
     }
+
+    fn next_child_sort_order(records: &HashMap<String, Project>, parent: &ProjectId) -> u64 {
+        records
+            .values()
+            .filter(|project| project.parent_project_id() == Some(parent))
+            .map(|project| project.sort_order)
+            .max()
+            .map(|max_order| max_order.saturating_add(1))
+            .unwrap_or(0)
+    }
+
+    fn generate_project_id(&self) -> ProjectId {
+        loop {
+            let id = ProjectId(Uuid::new_v4().to_string());
+            if !self.records.contains_key(&id.0) {
+                return id;
+            }
+        }
+    }
+}
+
+fn validate_records(records: &HashMap<String, Project>) -> Result<(), String> {
+    let mut actual_root_owners = HashMap::<ProjectRootPath, ProjectId>::new();
+    let mut standalone_roots = HashMap::<ProjectId, Vec<ProjectRootPath>>::new();
+
+    for (key, project) in records {
+        if key.trim().is_empty() {
+            return Err("Invalid project store: record key must not be empty".to_owned());
+        }
+        if project.id.0.trim().is_empty() {
+            return Err("Invalid project store: project id must not be empty".to_owned());
+        }
+        if key != &project.id.0 {
+            return Err(format!(
+                "Invalid project store: record key {} does not match project id {}",
+                key, project.id
+            ));
+        }
+        validate_project_name(&project.name)
+            .map_err(|error| format!("Invalid project store: project {} {error}", project.id))?;
+
+        match &project.source {
+            ProjectSource::Standalone { roots } => {
+                validate_standalone_roots_for_input(roots).map_err(|error| {
+                    format!("Invalid project store: project {} {error}", project.id)
+                })?;
+                standalone_roots.insert(project.id.clone(), roots.clone());
+                for root in roots {
+                    insert_actual_root_owner(&mut actual_root_owners, root, &project.id)?;
+                }
+            }
+            ProjectSource::GitWorkbench { branch, roots, .. } => {
+                if branch.0.trim().is_empty() {
+                    return Err(format!(
+                        "Invalid project store: workbench {} branch must not be empty",
+                        project.id
+                    ));
+                }
+                if roots.is_empty() {
+                    return Err(format!(
+                        "Invalid project store: workbench {} roots must not be empty",
+                        project.id
+                    ));
+                }
+                validate_workbench_root_uniqueness(roots).map_err(|error| {
+                    format!("Invalid project store: workbench {} {error}", project.id)
+                })?;
+                for root in roots {
+                    insert_actual_root_owner(
+                        &mut actual_root_owners,
+                        &root.worktree_root,
+                        &project.id,
+                    )?;
+                }
+            }
+        }
+    }
+
+    for project in records.values() {
+        let ProjectSource::GitWorkbench {
+            parent_project_id,
+            roots,
+            ..
+        } = &project.source
+        else {
+            continue;
+        };
+        let Some(parent) = records.get(&parent_project_id.0) else {
+            return Err(format!(
+                "Invalid project store: workbench {} references missing parent project {}",
+                project.id, parent_project_id
+            ));
+        };
+        if parent.is_workbench() {
+            return Err(format!(
+                "Invalid project store: workbench {} parent project {} is not standalone",
+                project.id, parent_project_id
+            ));
+        }
+        let Some(parent_roots) = standalone_roots.get(parent_project_id) else {
+            return Err(format!(
+                "Invalid project store: workbench {} parent project {} has no standalone roots",
+                project.id, parent_project_id
+            ));
+        };
+        validate_workbench_roots_for_parent(
+            roots,
+            parent_roots,
+            &format!("workbench {}", project.id),
+        )
+        .map_err(|error| format!("Invalid project store: {error}"))?;
+    }
+
+    Ok(())
+}
+
+fn validate_project_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("name must not be empty".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_project_root(root: &ProjectRootPath) -> Result<(), String> {
+    if root.0.trim().is_empty() {
+        return Err("project root must not be empty".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_standalone_roots_for_input(roots: &[ProjectRootPath]) -> Result<(), String> {
+    if roots.is_empty() {
+        return Err("roots must not be empty".to_owned());
+    }
+    let mut seen = HashSet::new();
+    for root in roots {
+        validate_project_root(root)?;
+        if !seen.insert(root.clone()) {
+            return Err("roots must be unique".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_workbench_root_uniqueness(roots: &[WorkbenchRoot]) -> Result<(), String> {
+    let mut parent_roots = HashSet::new();
+    let mut worktree_roots = HashSet::new();
+    for root in roots {
+        validate_project_root(&root.parent_root)?;
+        validate_project_root(&root.worktree_root)?;
+        if !parent_roots.insert(root.parent_root.clone()) {
+            return Err(format!(
+                "parent_root {} appears more than once",
+                root.parent_root
+            ));
+        }
+        if !worktree_roots.insert(root.worktree_root.clone()) {
+            return Err(format!(
+                "worktree_root {} appears more than once",
+                root.worktree_root
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_workbench_roots_for_parent(
+    roots: &[WorkbenchRoot],
+    parent_roots: &[ProjectRootPath],
+    label: &str,
+) -> Result<(), String> {
+    if roots.is_empty() {
+        return Err(format!("{label} roots must not be empty"));
+    }
+    validate_workbench_root_uniqueness(roots)?;
+
+    let parent_root_set = parent_roots.iter().cloned().collect::<HashSet<_>>();
+    if roots.len() != parent_root_set.len() {
+        return Err(format!(
+            "{label} must have one worktree root per parent root"
+        ));
+    }
+    for root in roots {
+        if !parent_root_set.contains(&root.parent_root) {
+            return Err(format!(
+                "{label} parent_root {} does not match a parent project root",
+                root.parent_root
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn insert_actual_root_owner(
+    owners: &mut HashMap<ProjectRootPath, ProjectId>,
+    root: &ProjectRootPath,
+    project_id: &ProjectId,
+) -> Result<(), String> {
+    if let Some(existing_owner) = owners.insert(root.clone(), project_id.clone()) {
+        return Err(format!(
+            "Invalid project store: root {} is shared by projects {} and {}",
+            root, existing_owner, project_id
+        ));
+    }
+    Ok(())
+}
+
+fn root_path_owner(
+    records: &HashMap<String, Project>,
+    root: &ProjectRootPath,
+    except_id: Option<&ProjectId>,
+) -> Option<ProjectId> {
+    records.values().find_map(|project| {
+        if except_id == Some(&project.id) {
+            return None;
+        }
+        project
+            .root_paths()
+            .into_iter()
+            .any(|candidate| candidate == *root)
+            .then(|| project.id.clone())
+    })
+}
+
+fn sort_projects_by_sort_order(projects: &mut [Project]) {
+    projects.sort_by(|left, right| {
+        left.sort_order
+            .cmp(&right.sort_order)
+            .then(left.name.cmp(&right.name))
+            .then(left.id.0.cmp(&right.id.0))
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
 
-    fn write_v2_store(path: &Path) {
+    fn project_id(id: &str) -> ProjectId {
+        ProjectId(id.to_owned())
+    }
+
+    fn root(path: &str) -> ProjectRootPath {
+        ProjectRootPath(path.to_owned())
+    }
+
+    fn standalone(id: &str, roots: Vec<ProjectRootPath>) -> Project {
+        Project {
+            id: project_id(id),
+            name: id.to_owned(),
+            sort_order: 0,
+            source: ProjectSource::Standalone { roots },
+        }
+    }
+
+    fn workbench(id: &str, parent: &str, branch: &str, roots: Vec<WorkbenchRoot>) -> Project {
+        Project {
+            id: project_id(id),
+            name: id.to_owned(),
+            sort_order: 0,
+            source: ProjectSource::GitWorkbench {
+                parent_project_id: project_id(parent),
+                branch: GitBranchName(branch.to_owned()),
+                roots,
+            },
+        }
+    }
+
+    #[test]
+    fn migrates_v1_records_to_version_2_standalone_records() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let path = dir.path().join("projects.json");
         std::fs::write(
-            path,
+            &path,
             r#"{
-  "version": 2,
-  "records": {
-    "standalone": {
-      "id": "standalone",
-      "name": "Standalone",
-      "sort_order": 0,
-      "source": {
-        "kind": "standalone",
-        "roots": ["/repo"]
-      }
-    },
-    "workbench": {
-      "id": "workbench",
-      "name": "Feature",
-      "sort_order": 1,
-      "source": {
-        "kind": "git_workbench",
-        "parent_project_id": "standalone",
-        "branch": "feature",
-        "roots": [
-          {
-            "parent_root": "/repo",
-            "worktree_root": "/repo--feature"
-          }
-        ]
-      }
-    }
-  }
-}"#,
+              "records": {
+                "project-a": {
+                  "id": "project-a",
+                  "name": "Project A",
+                  "roots": ["/tmp/a"],
+                  "sort_order": 7
+                }
+              }
+            }"#,
         )
-        .expect("write v2 project store");
-    }
+        .expect("write v1 store");
 
-    #[test]
-    fn loads_v2_source_records_as_projects() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("projects.json");
-        write_v2_store(&path);
-
-        let store = ProjectStore::load(path).expect("load v2 project store");
+        let store = ProjectStore::load(path.clone()).expect("load migrated store");
         let projects = store.list().expect("list projects");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, project_id("project-a"));
+        assert_eq!(projects[0].root_paths(), vec![root("/tmp/a")]);
+        assert!(matches!(
+            projects[0].source,
+            ProjectSource::Standalone { .. }
+        ));
 
-        assert_eq!(projects.len(), 2);
-        assert_eq!(projects[0].id.0, "standalone");
-        assert_eq!(projects[0].roots, vec!["/repo".to_owned()]);
-        assert_eq!(projects[1].id.0, "workbench");
-        assert_eq!(projects[1].roots, vec!["/repo--feature".to_owned()]);
-    }
-
-    #[test]
-    fn rename_preserves_v2_source_metadata() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("projects.json");
-        write_v2_store(&path);
-
-        let store = ProjectStore::load(path.clone()).expect("load v2 project store");
-        let renamed = store
-            .rename(&ProjectId("workbench".to_owned()), "Renamed".to_owned())
-            .expect("rename workbench");
-
-        assert_eq!(renamed.name, "Renamed");
-        assert_eq!(renamed.roots, vec!["/repo--feature".to_owned()]);
-
-        let contents = std::fs::read_to_string(path).expect("read saved project store");
-        let value: Value = serde_json::from_str(&contents).expect("parse saved project store");
-        let record = &value["records"]["workbench"];
-
-        assert_eq!(value["version"], 2);
-        assert_eq!(record["name"], "Renamed");
-        assert!(record.get("roots").is_none());
-        assert_eq!(record["source"]["kind"], "git_workbench");
+        let contents = std::fs::read_to_string(path).expect("read migrated store");
+        let saved =
+            serde_json::from_str::<serde_json::Value>(&contents).expect("parse saved store");
         assert_eq!(
-            record["source"]["roots"][0]["worktree_root"],
-            "/repo--feature"
+            saved.get("version").and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert!(saved["records"]["project-a"].get("roots").is_none());
+        assert_eq!(
+            saved["records"]["project-a"]["source"]["kind"].as_str(),
+            Some("standalone")
         );
     }
 
     #[test]
-    fn add_root_preserves_v2_standalone_source_shape() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("projects.json");
-        write_v2_store(&path);
+    fn validation_rejects_invalid_standalone_roots() {
+        let mut records = HashMap::new();
+        records.insert(
+            "project-a".to_owned(),
+            standalone("project-a", vec![root("/tmp/a"), root("/tmp/a")]),
+        );
 
-        let store = ProjectStore::load(path.clone()).expect("load v2 project store");
-        let updated = store
-            .add_root(&ProjectId("standalone".to_owned()), "/repo2".to_owned())
-            .expect("add root");
+        let error = validate_records(&records).expect_err("duplicate roots should fail");
+        assert!(error.contains("roots must be unique"));
+    }
 
-        assert_eq!(updated.roots, vec!["/repo".to_owned(), "/repo2".to_owned()]);
+    #[test]
+    fn validation_rejects_workbench_with_missing_parent() {
+        let mut records = HashMap::new();
+        records.insert(
+            "workbench-a".to_owned(),
+            workbench(
+                "workbench-a",
+                "missing-parent",
+                "feature/a",
+                vec![WorkbenchRoot {
+                    parent_root: root("/tmp/a"),
+                    worktree_root: root("/tmp/a--feature%2Fa"),
+                }],
+            ),
+        );
 
-        let contents = std::fs::read_to_string(path).expect("read saved project store");
-        let value: Value = serde_json::from_str(&contents).expect("parse saved project store");
-        let record = &value["records"]["standalone"];
+        let error = validate_records(&records).expect_err("missing parent should fail");
+        assert!(error.contains("references missing parent project missing-parent"));
+    }
 
-        assert!(record.get("roots").is_none());
-        assert_eq!(record["source"]["kind"], "standalone");
-        assert_eq!(record["source"]["roots"][0], "/repo");
-        assert_eq!(record["source"]["roots"][1], "/repo2");
+    #[test]
+    fn validation_rejects_workbench_parent_root_not_in_parent() {
+        let mut records = HashMap::new();
+        records.insert(
+            "parent".to_owned(),
+            standalone("parent", vec![root("/tmp/parent")]),
+        );
+        records.insert(
+            "workbench".to_owned(),
+            workbench(
+                "workbench",
+                "parent",
+                "feature/a",
+                vec![WorkbenchRoot {
+                    parent_root: root("/tmp/other"),
+                    worktree_root: root("/tmp/parent--feature%2Fa"),
+                }],
+            ),
+        );
+
+        let error = validate_records(&records).expect_err("wrong parent root should fail");
+        assert!(error.contains("does not match a parent project root"));
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_actual_roots_across_records() {
+        let mut records = HashMap::new();
+        records.insert("a".to_owned(), standalone("a", vec![root("/tmp/shared")]));
+        records.insert("b".to_owned(), standalone("b", vec![root("/tmp/shared")]));
+
+        let error = validate_records(&records).expect_err("shared roots should fail");
+        assert!(error.contains("root /tmp/shared is shared by projects"));
+    }
+
+    #[test]
+    fn replay_order_lists_standalone_projects_before_grouped_workbenches() {
+        let mut records = HashMap::new();
+        let mut parent_b = standalone("parent-b", vec![root("/tmp/b")]);
+        parent_b.sort_order = 0;
+        let mut parent_a = standalone("parent-a", vec![root("/tmp/a")]);
+        parent_a.sort_order = 1;
+        let mut child_a = workbench(
+            "child-a",
+            "parent-a",
+            "feature/a",
+            vec![WorkbenchRoot {
+                parent_root: root("/tmp/a"),
+                worktree_root: root("/tmp/a--feature%2Fa"),
+            }],
+        );
+        child_a.sort_order = 0;
+        let mut child_b = workbench(
+            "child-b",
+            "parent-b",
+            "feature/b",
+            vec![WorkbenchRoot {
+                parent_root: root("/tmp/b"),
+                worktree_root: root("/tmp/b--feature%2Fb"),
+            }],
+        );
+        child_b.sort_order = 0;
+        records.insert(parent_a.id.0.clone(), parent_a);
+        records.insert(parent_b.id.0.clone(), parent_b);
+        records.insert(child_a.id.0.clone(), child_a);
+        records.insert(child_b.id.0.clone(), child_b);
+
+        let ordered = ProjectStore::ordered_projects(&records)
+            .into_iter()
+            .map(|project| project.id.0)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ordered, vec!["parent-b", "parent-a", "child-b", "child-a"]);
     }
 }

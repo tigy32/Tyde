@@ -661,9 +661,8 @@ impl ReviewRegistryActor {
     ) -> Result<(), String> {
         let project = self.load_project(&project_id).await?;
         let all_roots_clean = project
-            .roots
-            .iter()
-            .map(|root| ProjectRootPath(root.clone()))
+            .root_paths()
+            .into_iter()
             .all(|root| roots.contains(&root));
         if !all_roots_clean {
             return Ok(());
@@ -764,7 +763,11 @@ pub(crate) fn review_create_selection(
 ) -> Result<ReviewDiffSelection, String> {
     match selection {
         ReviewDiffSelection::Root { root, .. } => {
-            if project.roots.iter().any(|candidate| candidate == &root.0) {
+            if project
+                .root_paths()
+                .iter()
+                .any(|candidate| candidate == root)
+            {
                 Ok(ReviewDiffSelection::Root {
                     root: root.clone(),
                     scope: ProjectDiffScope::Unstaged,
@@ -778,9 +781,10 @@ pub(crate) fn review_create_selection(
             }
         }
         ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => {
-            match project.roots.as_slice() {
-                [] => Err(format!("project {} has no review roots", project.id)),
-                _ => Ok(active_workspace_selection()),
+            if project.root_paths().is_empty() {
+                Err(format!("project {} has no review roots", project.id))
+            } else {
+                Ok(active_workspace_selection())
             }
         }
     }

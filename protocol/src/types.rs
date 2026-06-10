@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -464,6 +464,8 @@ pub enum FrameKind {
     ProjectAddRoot,
     ProjectDeleteRoot,
     ProjectDelete,
+    WorkbenchCreate,
+    WorkbenchRemove,
     CustomAgentUpsert,
     CustomAgentDelete,
     SteeringUpsert,
@@ -590,6 +592,8 @@ impl fmt::Display for FrameKind {
             Self::ProjectAddRoot => f.write_str("project_add_root"),
             Self::ProjectDeleteRoot => f.write_str("project_delete_root"),
             Self::ProjectDelete => f.write_str("project_delete"),
+            Self::WorkbenchCreate => f.write_str("workbench_create"),
+            Self::WorkbenchRemove => f.write_str("workbench_remove"),
             Self::CustomAgentUpsert => f.write_str("custom_agent_upsert"),
             Self::CustomAgentDelete => f.write_str("custom_agent_delete"),
             Self::SteeringUpsert => f.write_str("steering_upsert"),
@@ -2021,15 +2025,59 @@ pub struct TeamMemberShuffleSuggestionNotifyPayload {
 pub struct Project {
     pub id: ProjectId,
     pub name: String,
-    pub roots: Vec<String>,
     #[serde(default)]
     pub sort_order: u64,
+    pub source: ProjectSource,
+}
+
+impl Project {
+    pub fn root_paths(&self) -> Vec<ProjectRootPath> {
+        match &self.source {
+            ProjectSource::Standalone { roots } => roots.clone(),
+            ProjectSource::GitWorkbench { roots, .. } => roots
+                .iter()
+                .map(|root| root.worktree_root.clone())
+                .collect(),
+        }
+    }
+
+    pub fn parent_project_id(&self) -> Option<&ProjectId> {
+        match &self.source {
+            ProjectSource::Standalone { .. } => None,
+            ProjectSource::GitWorkbench {
+                parent_project_id, ..
+            } => Some(parent_project_id),
+        }
+    }
+
+    pub fn is_workbench(&self) -> bool {
+        matches!(self.source, ProjectSource::GitWorkbench { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectSource {
+    Standalone {
+        roots: Vec<ProjectRootPath>,
+    },
+    GitWorkbench {
+        parent_project_id: ProjectId,
+        branch: GitBranchName,
+        roots: Vec<WorkbenchRoot>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkbenchRoot {
+    pub parent_root: ProjectRootPath,
+    pub worktree_root: ProjectRootPath,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectCreatePayload {
     pub name: String,
-    pub roots: Vec<String>,
+    pub roots: Vec<ProjectRootPath>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2039,20 +2087,28 @@ pub struct ProjectRenamePayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectReorderScope {
+    TopLevel,
+    WorkbenchChildren { parent_project_id: ProjectId },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectReorderPayload {
+    pub scope: ProjectReorderScope,
     pub project_ids: Vec<ProjectId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectAddRootPayload {
     pub id: ProjectId,
-    pub root: String,
+    pub root: ProjectRootPath,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDeleteRootPayload {
     pub id: ProjectId,
-    pub root: String,
+    pub root: ProjectRootPath,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2065,6 +2121,18 @@ pub struct ProjectDeletePayload {
 pub enum ProjectNotifyPayload {
     Upsert { project: Project },
     Delete { project: Project },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkbenchCreatePayload {
+    pub parent_project_id: ProjectId,
+    pub branch: GitBranchName,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkbenchRemovePayload {
+    pub id: ProjectId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2080,6 +2148,16 @@ pub enum ProjectEventPayload {
 pub struct ProjectRootPath(pub String);
 
 impl fmt::Display for ProjectRootPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GitBranchName(pub String);
+
+impl fmt::Display for GitBranchName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }

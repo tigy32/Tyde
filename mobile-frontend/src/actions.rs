@@ -43,7 +43,13 @@ pub async fn spawn_new_chat(
                     .find(|p| {
                         p.local_host_id == active.local_host_id && p.project.id == active.project_id
                     })
-                    .map(|p| p.project.roots.clone())
+                    .map(|p| {
+                        p.project
+                            .root_paths()
+                            .into_iter()
+                            .map(|root| root.0)
+                            .collect()
+                    })
             })
             .ok_or("active project not found")?
     } else {

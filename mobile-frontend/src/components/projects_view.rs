@@ -81,10 +81,11 @@ pub fn ProjectsView() -> impl IntoView {
                                 let project_id = project.project.id.clone();
                                 let host_id = project.local_host_id.clone();
                                 let name = project.project.name.clone();
-                                let root_count = project.project.roots.len();
-                                let roots: Vec<String> = project.project.roots.iter()
+                                let project_roots = project.project.root_paths();
+                                let root_count = project_roots.len();
+                                let roots: Vec<String> = project_roots.iter()
                                     .map(|r| {
-                                        r.rsplit('/').find(|s| !s.is_empty()).unwrap_or(r).to_string()
+                                        r.0.rsplit('/').find(|s| !s.is_empty()).unwrap_or(&r.0).to_string()
                                     })
                                     .collect();
                                 let is_active = active_project
@@ -335,7 +336,7 @@ mod wasm_tests {
     use leptos::mount::mount_to;
     use protocol::{
         FileEntryOp, Project, ProjectFileEntry, ProjectFileKind, ProjectGitFileStatus, ProjectId,
-        ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
+        ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, ProjectSource,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -366,7 +367,12 @@ mod wasm_tests {
             project: Project {
                 id: ProjectId(id.to_owned()),
                 name: name.to_owned(),
-                roots: roots.into_iter().map(str::to_owned).collect(),
+                source: ProjectSource::Standalone {
+                    roots: roots
+                        .into_iter()
+                        .map(|root| ProjectRootPath(root.to_owned()))
+                        .collect(),
+                },
                 sort_order: 0,
             },
         }

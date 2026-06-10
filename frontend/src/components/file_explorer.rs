@@ -126,14 +126,17 @@ pub fn FileExplorer() -> impl IntoView {
                 project.host_id == active.host_id && project.project.id == active.project_id
             })
             .map(|project| {
-                let root_count = project.project.roots.len();
-                let title = project.project.roots.join("\n");
+                let root_paths = project.project.root_paths();
+                let root_count = root_paths.len();
+                let title = root_paths
+                    .iter()
+                    .map(|root| root.0.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let label = if root_count == 1 {
-                    project
-                        .project
-                        .roots
+                    root_paths
                         .first()
-                        .map(|root| display_path_name(root))
+                        .map(|root| display_path_name(&root.0))
                         .unwrap_or_else(|| project.project.name.clone())
                 } else {
                     format!("{} · {root_count} roots", project.project.name)
@@ -152,15 +155,29 @@ pub fn FileExplorer() -> impl IntoView {
 
     let state_for_add_root = state.clone();
     let on_add_root = move |_| open_add_root_browser(&state_for_add_root);
+    let state_for_can_manage = state.clone();
+    let can_manage_roots = move || {
+        state_for_can_manage
+            .active_project
+            .get()
+            .is_some_and(|active| {
+                state_for_can_manage.can_manage_project_roots(&active.host_id, &active.project_id)
+            })
+    };
+    let can_manage_for_button = can_manage_roots.clone();
+    let add_root_disabled = move || !can_manage_for_button();
     let state_for_add_title = state.clone();
+    let can_manage_for_title = can_manage_roots.clone();
     let add_root_title = move || {
-        if state_for_add_title.active_project.get().is_none() {
-            "Open or select a project first to add a workspace folder"
+        if can_manage_for_title() {
+            "Add workspace root"
+        } else if state_for_add_title.active_project.get().is_none() {
+            "Open a project to add a workspace root"
         } else {
-            "Add a workspace folder (root) to this project"
+            "Workbench roots are managed via Create/Remove Workbench; \
+             remove all child workbenches before editing the parent's roots"
         }
     };
-    let add_root_disabled = move || state.active_project.get().is_none();
 
     view! {
         <div class="file-explorer">
@@ -208,6 +225,18 @@ pub fn FileExplorer() -> impl IntoView {
                             let filter_val = filter.get().to_lowercase();
                             let hidden = show_hidden.get();
                             let active = state.active_project.get();
+                            // Only thread an (host_id, project_id) into
+                            // render_root_section when root edits are valid
+                            // for this project — that tuple is what gates the
+                            // per-root remove button. The check tracks the
+                            // projects signal so adding a workbench child
+                            // immediately removes the affordance from the
+                            // parent's roots.
+                            let project_ref = active.as_ref().and_then(|a| {
+                                state
+                                    .can_manage_project_roots(&a.host_id, &a.project_id)
+                                    .then(|| (a.host_id.clone(), a.project_id.clone()))
+                            });
                             root_trees
                                 .into_iter()
                                 .flat_map(|(root, nodes)| {
@@ -217,7 +246,7 @@ pub fn FileExplorer() -> impl IntoView {
                                         &filter_val,
                                         hidden,
                                         expanded_dirs,
-                                        active.as_ref().map(|a| (a.host_id.clone(), a.project_id.clone())),
+                                        project_ref.clone(),
                                     )
                                 })
                                 .collect::<Vec<_>>()
@@ -271,19 +300,19 @@ fn render_root_section(
     let root_label = root_display_name(&root);
     let root_title = root.0.clone();
     let remove_button = project_ref.map(|(host_id, project_id)| {
-        let root_path = root.0.clone();
+        let root_for_remove = root.clone();
         let on_remove = move |ev: web_sys::MouseEvent| {
             ev.stop_propagation();
             let state = expect_context::<AppState>();
             let host_id = host_id.clone();
             let project_id = project_id.clone();
-            let root_path = root_path.clone();
+            let root_for_remove = root_for_remove.clone();
             spawn_local(async move {
-                let message = format!("Remove root \"{root_path}\" from this project?");
+                let message = format!("Remove root \"{}\" from this project?", root_for_remove.0);
                 if !crate::bridge::confirm_dialog("Remove root", &message).await {
                     return;
                 }
-                delete_project_root(&state, host_id, project_id, root_path);
+                delete_project_root(&state, host_id, project_id, root_for_remove);
             });
         };
         view! {

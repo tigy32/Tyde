@@ -380,7 +380,9 @@ mod wasm_tests {
     use super::*;
     use crate::state::{AgentInfo, ProjectInfo};
     use leptos::mount::mount_to;
-    use protocol::{AgentId, AgentOrigin, Project, ProjectId, StreamPath};
+    use protocol::{
+        AgentId, AgentOrigin, Project, ProjectId, ProjectRootPath, ProjectSource, StreamPath,
+    };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
@@ -444,7 +446,9 @@ mod wasm_tests {
                 project: Project {
                     id: ProjectId("p-1".to_owned()),
                     name: "demo".to_owned(),
-                    roots: vec!["/tmp/demo".to_owned()],
+                    source: ProjectSource::Standalone {
+                        roots: vec![ProjectRootPath("/tmp/demo".to_owned())],
+                    },
                     sort_order: 0,
                 },
             });

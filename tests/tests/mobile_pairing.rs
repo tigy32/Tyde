@@ -11,8 +11,8 @@ use protocol::{
     HostBootstrapPayload, HostSettingValue, ListSessionsPayload, MobileAccessErrorCode,
     MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState, MobilePairingOfferPayload,
     MobilePairingStartPayload, MobilePairingState, NewAgentPayload, ProjectCreatePayload,
-    SendMessagePayload, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
-    TerminalCreatePayload, TerminalLaunchTarget, write_envelope,
+    ProjectRootPath, SendMessagePayload, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload,
+    StreamPath, TerminalCreatePayload, TerminalLaunchTarget, write_envelope,
 };
 use tokio::time::timeout;
 
@@ -313,7 +313,9 @@ async fn mqtt_pairing_accepts_mobile_tyde_hello_over_encrypted_stream() {
     desktop
         .project_create(ProjectCreatePayload {
             name: "Mobile Project".to_owned(),
-            roots: vec![project_root.path().to_string_lossy().into_owned()],
+            roots: vec![ProjectRootPath(
+                project_root.path().to_string_lossy().into_owned(),
+            )],
         })
         .await
         .expect("create project for mobile replay");
@@ -440,7 +442,9 @@ async fn mqtt_mobile_receives_agent_replay_sessions_and_chat_events() {
         desktop
             .project_create(ProjectCreatePayload {
                 name: format!("Mobile Project {index}"),
-                roots: vec![project_root.path().to_string_lossy().into_owned()],
+                roots: vec![ProjectRootPath(
+                    project_root.path().to_string_lossy().into_owned(),
+                )],
             })
             .await
             .expect("create project for mobile replay");
@@ -585,7 +589,9 @@ async fn mqtt_mobile_reconnect_replays_bootstrap_state_again() {
     desktop
         .project_create(ProjectCreatePayload {
             name: "Mobile Reconnect Project".to_owned(),
-            roots: vec![project_root.path().to_string_lossy().into_owned()],
+            roots: vec![ProjectRootPath(
+                project_root.path().to_string_lossy().into_owned(),
+            )],
         })
         .await
         .expect("create project for mobile replay");

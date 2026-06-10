@@ -680,8 +680,10 @@ fn bootstrap_payloads_round_trip() {
         projects: vec![Project {
             id: project_id(),
             name: "Repo".to_owned(),
-            roots: vec!["/repo".to_owned()],
             sort_order: 0,
+            source: ProjectSource::Standalone {
+                roots: vec![ProjectRootPath("/repo".to_owned())],
+            },
         }],
         mcp_servers: vec![],
         skills: vec![],
@@ -723,8 +725,10 @@ fn bootstrap_payloads_round_trip() {
         project: Project {
             id: project_id(),
             name: "Repo".to_owned(),
-            roots: vec!["/repo".to_owned()],
             sort_order: 0,
+            source: ProjectSource::Standalone {
+                roots: vec![ProjectRootPath("/repo".to_owned())],
+            },
         },
         file_list: ProjectFileListPayload {
             incremental: false,

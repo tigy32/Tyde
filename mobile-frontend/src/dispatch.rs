@@ -1916,7 +1916,9 @@ mod wasm_tests {
                     project: protocol::Project {
                         id: project_id.clone(),
                         name: "project-a".to_owned(),
-                        roots: vec![root.0.clone()],
+                        source: protocol::ProjectSource::Standalone {
+                            roots: vec![root.clone()],
+                        },
                         sort_order: 0,
                     },
                     file_list: ProjectFileListPayload {
@@ -2334,7 +2336,9 @@ mod wasm_tests {
         let project = protocol::Project {
             id: ProjectId("p-1".to_owned()),
             name: "Project One".to_owned(),
-            roots: vec!["/repo".to_owned()],
+            source: protocol::ProjectSource::Standalone {
+                roots: vec![ProjectRootPath("/repo".to_owned())],
+            },
             sort_order: 0,
         };
         let agent_payload = protocol::NewAgentPayload {

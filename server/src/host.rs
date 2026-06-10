@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
@@ -13,16 +13,16 @@ use protocol::types::{
 use protocol::{
     AgentControlStatus, AgentId, AgentInput, AgentOrigin, AgentStartPayload, BackendSetupPayload,
     BrowseBootstrapListing, BrowseBootstrapPayload, CustomAgent, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, HostBootstrapPayload,
-    HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload, ImageData, McpServerConfig,
-    McpServerDeletePayload, McpServerId, McpServerNotifyPayload, McpServerUpsertPayload,
-    McpTransportConfig, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
-    MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, GitBranchName,
+    HostBootstrapPayload, HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload,
+    ImageData, McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
+    McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
     ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
-    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
+    ProjectSource, ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
     ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection, ReviewId, ReviewSubmitTarget,
     RunBackendSetupPayload, SendMessagePayload, SessionId, SessionListPayload, SessionSchemaEntry,
     SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload, SkillNotifyPayload,
@@ -35,7 +35,8 @@ use protocol::{
     TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
     TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
-    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload,
+    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, WorkbenchCreatePayload,
+    WorkbenchRemovePayload, WorkbenchRoot,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -85,7 +86,7 @@ use crate::store::agent_teams::{AgentTeamValidationRefs, AgentTeamsStore};
 use crate::store::custom_agents::CustomAgentStore;
 use crate::store::mcp_servers::McpServerStore;
 use crate::store::mobile_pairings::MobilePairingsStore;
-use crate::store::project::ProjectStore;
+use crate::store::project::{ProjectStore, ProjectStoreError};
 use crate::store::review::ReviewStore;
 use crate::store::session::{SessionRecord, SessionStore};
 use crate::store::settings::HostSettingsStore;
@@ -199,6 +200,7 @@ pub(crate) struct HostState {
     project_streams: HashMap<ProjectId, ProjectStreamSubscription>,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
     browse_streams: HashMap<(StreamPath, StreamPath), Stream>,
+    workbench_parent_locks: HashMap<ProjectId, Weak<Mutex<()>>>,
 }
 
 impl Drop for HostState {
@@ -675,6 +677,26 @@ impl HostHandle {
         for terminal in terminals {
             terminal.close().await;
         }
+    }
+
+    async fn workbench_parent_lock(&self, parent_project_id: &ProjectId) -> Arc<Mutex<()>> {
+        let mut state = self.state.lock().await;
+        state
+            .workbench_parent_locks
+            .retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = state
+            .workbench_parent_locks
+            .get(parent_project_id)
+            .and_then(Weak::upgrade)
+        {
+            return lock;
+        }
+
+        let lock = Arc::new(Mutex::new(()));
+        state
+            .workbench_parent_locks
+            .insert(parent_project_id.clone(), Arc::downgrade(&lock));
+        lock
     }
 
     pub(crate) async fn spawn_agent(&self, payload: SpawnAgentPayload) -> AgentId {
@@ -2396,12 +2418,12 @@ impl HostHandle {
     pub(crate) async fn create_project(&self, payload: ProjectCreatePayload) -> AppResult<()> {
         const OPERATION: &str = "project_create";
         let mut state = self.state.lock().await;
-        let project = state
-            .project_store
-            .lock()
-            .await
-            .create(payload.name, payload.roots)
-            .map_err(|error| project_store_error(OPERATION, error))?;
+        let project = {
+            let mut project_store = state.project_store.lock().await;
+            project_store
+                .create(payload.name, payload.roots)
+                .map_err(|error| project_store_error(OPERATION, error))?
+        };
         let project_id = project.id.clone();
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
         if let Err(error) = ensure_project_actor(&mut state, project_id.clone()).await {
@@ -2440,12 +2462,12 @@ impl HostHandle {
     pub(crate) async fn rename_project(&self, payload: ProjectRenamePayload) -> AppResult<()> {
         const OPERATION: &str = "project_rename";
         let mut state = self.state.lock().await;
-        let project = state
-            .project_store
-            .lock()
-            .await
-            .rename(&payload.id, payload.name)
-            .map_err(|error| project_store_error(OPERATION, error))?;
+        let project = {
+            let mut project_store = state.project_store.lock().await;
+            project_store
+                .rename(&payload.id, payload.name)
+                .map_err(|error| project_store_error(OPERATION, error))?
+        };
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
         Ok(())
     }
@@ -2453,12 +2475,12 @@ impl HostHandle {
     pub(crate) async fn reorder_projects(&self, payload: ProjectReorderPayload) -> AppResult<()> {
         const OPERATION: &str = "project_reorder";
         let mut state = self.state.lock().await;
-        let projects = state
-            .project_store
-            .lock()
-            .await
-            .reorder(payload.project_ids)
-            .map_err(|error| project_store_error(OPERATION, error))?;
+        let projects = {
+            let mut project_store = state.project_store.lock().await;
+            project_store
+                .reorder(payload.scope, payload.project_ids)
+                .map_err(|error| project_store_error(OPERATION, error))?
+        };
         for project in projects {
             fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
         }
@@ -2467,13 +2489,15 @@ impl HostHandle {
 
     pub(crate) async fn add_project_root(&self, payload: ProjectAddRootPayload) -> AppResult<()> {
         const OPERATION: &str = "project_add_root";
+        let parent_lock = self.workbench_parent_lock(&payload.id).await;
+        let _parent_guard = parent_lock.lock().await;
         let mut state = self.state.lock().await;
-        let project = state
-            .project_store
-            .lock()
-            .await
-            .add_root(&payload.id, payload.root)
-            .map_err(|error| project_store_error(OPERATION, error))?;
+        let project = {
+            let mut project_store = state.project_store.lock().await;
+            project_store
+                .add_root(&payload.id, payload.root)
+                .map_err(|error| project_store_error(OPERATION, error))?
+        };
         let project_id = project.id.clone();
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
         let handle = match ensure_project_actor(&mut state, project_id.clone()).await {
@@ -2505,13 +2529,15 @@ impl HostHandle {
         payload: ProjectDeleteRootPayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "project_delete_root";
+        let parent_lock = self.workbench_parent_lock(&payload.id).await;
+        let _parent_guard = parent_lock.lock().await;
         let mut state = self.state.lock().await;
-        let project = state
-            .project_store
-            .lock()
-            .await
-            .delete_root(&payload.id, &payload.root)
-            .map_err(|error| project_store_error(OPERATION, error))?;
+        let project = {
+            let mut project_store = state.project_store.lock().await;
+            project_store
+                .delete_root(&payload.id, &payload.root)
+                .map_err(|error| project_store_error(OPERATION, error))?
+        };
         let project_id = project.id.clone();
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
         let handle = match ensure_project_actor(&mut state, project_id.clone()).await {
@@ -2540,6 +2566,8 @@ impl HostHandle {
 
     pub(crate) async fn delete_project(&self, payload: ProjectDeletePayload) -> AppResult<()> {
         const OPERATION: &str = "project_delete";
+        let parent_lock = self.workbench_parent_lock(&payload.id).await;
+        let _parent_guard = parent_lock.lock().await;
         let mut state = self.state.lock().await;
         let referenced_steering = state
             .steering_store
@@ -2604,16 +2632,360 @@ impl HostHandle {
                 ),
             ));
         }
-        let project = state
-            .project_store
-            .lock()
-            .await
-            .delete(&payload.id)
-            .map_err(|error| project_store_error(OPERATION, error))?;
+        let project = {
+            let mut project_store = state.project_store.lock().await;
+            project_store
+                .delete(&payload.id)
+                .map_err(|error| project_store_error(OPERATION, error))?
+        };
         if let Some(subscription) = state.project_streams.remove(&payload.id) {
             subscription.task.abort();
         }
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Delete { project }).await;
+        Ok(())
+    }
+
+    pub(crate) async fn create_workbench(&self, payload: WorkbenchCreatePayload) -> AppResult<()> {
+        const OPERATION: &str = "workbench_create";
+        let parent_lock = self.workbench_parent_lock(&payload.parent_project_id).await;
+        let _parent_guard = parent_lock.lock().await;
+
+        let project_store = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.project_store)
+        };
+
+        let parent = {
+            let project_store = project_store.lock().await;
+            project_store
+                .get(&payload.parent_project_id)
+                .ok_or_else(|| {
+                    AppError::not_found(
+                        OPERATION,
+                        format!("project {} not found", payload.parent_project_id),
+                    )
+                })?
+        };
+
+        let ProjectSource::Standalone {
+            roots: parent_roots,
+        } = &parent.source
+        else {
+            return Err(AppError::invalid(
+                OPERATION,
+                format!(
+                    "cannot create workbench for non-standalone parent project {}",
+                    parent.id
+                ),
+            ));
+        };
+
+        if parent_roots.is_empty() {
+            return Err(AppError::internal_message(
+                OPERATION,
+                format!("standalone parent project {} has no roots", parent.id),
+                anyhow!("standalone parent project has no roots"),
+            ));
+        }
+
+        let roots = compute_workbench_roots(parent_roots, &payload.branch)?;
+        preflight_workbench_create(&project_store, &parent, &payload.branch, &roots).await?;
+
+        let mut created = Vec::<WorkbenchRoot>::new();
+        for root in &roots {
+            if let Err(error) =
+                git_worktree_add(&root.parent_root, &root.worktree_root, &payload.branch).await
+            {
+                let rollback_message = rollback_created_worktrees(&created).await;
+                let message = append_rollback_message(error, rollback_message);
+                return Err(AppError::internal_message(
+                    OPERATION,
+                    message.clone(),
+                    anyhow!(message),
+                ));
+            }
+            created.push(root.clone());
+        }
+
+        let project = {
+            let mut project_store = project_store.lock().await;
+            match project_store.create_workbench(
+                payload.parent_project_id.clone(),
+                payload.name,
+                payload.branch,
+                roots,
+            ) {
+                Ok(project) => project,
+                Err(error) => {
+                    let rollback_message = rollback_created_worktrees(&created).await;
+                    let message = append_rollback_message(error.to_string(), rollback_message);
+                    return Err(project_store_error(OPERATION, error.with_message(message)));
+                }
+            }
+        };
+
+        let project_id = project.id.clone();
+        let mut state = self.state.lock().await;
+        fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
+        if let Err(error) = ensure_project_actor(&mut state, project_id.clone()).await {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %error,
+                "failed to start project actor after workbench creation"
+            );
+            return Err(AppError::internal_message(
+                OPERATION,
+                error.clone(),
+                anyhow!(error),
+            ));
+        }
+        let host_paths = state.host_streams.keys().cloned().collect::<Vec<_>>();
+        for host_path in host_paths {
+            if let Err(error) =
+                subscribe_host_to_project(&mut state, &host_path, project_id.clone()).await
+            {
+                tracing::warn!(
+                    host_stream = %host_path,
+                    project_id = %project_id,
+                    error = %error,
+                    "failed to subscribe host to workbench project stream after creation"
+                );
+            }
+            if let Err(error) =
+                emit_review_list_changed_for_project(&mut state, project_id.clone()).await
+            {
+                tracing::warn!(
+                    host_stream = %host_path,
+                    project_id = %project_id,
+                    error = %error,
+                    "failed to emit initial review list after workbench creation"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn remove_workbench(&self, payload: WorkbenchRemovePayload) -> AppResult<()> {
+        const OPERATION: &str = "workbench_remove";
+        let project_store = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.project_store)
+        };
+
+        let project = load_project(&project_store, &payload.id, OPERATION).await?;
+        let ProjectSource::GitWorkbench {
+            parent_project_id,
+            roots,
+            ..
+        } = &project.source
+        else {
+            return Err(AppError::invalid(
+                OPERATION,
+                format!(
+                    "cannot remove non-workbench project {} as workbench",
+                    payload.id
+                ),
+            ));
+        };
+        let parent_lock = self.workbench_parent_lock(parent_project_id).await;
+        let _parent_guard = parent_lock.lock().await;
+
+        self.validate_workbench_remove_blockers(&project).await?;
+
+        for root in roots {
+            git_worktree_remove(&root.parent_root, &root.worktree_root)
+                .await
+                .map_err(|error| {
+                    AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+                })?;
+        }
+
+        let deleted = {
+            let mut project_store = project_store.lock().await;
+            project_store
+                .delete_workbench(&payload.id)
+                .map_err(|error| project_store_error(OPERATION, error))?
+        };
+
+        let mut state = self.state.lock().await;
+        if let Some(subscription) = state.project_streams.remove(&payload.id) {
+            subscription.task.abort();
+        }
+        fan_out_project_notify(
+            &mut state,
+            ProjectNotifyPayload::Delete { project: deleted },
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn validate_workbench_remove_blockers(&self, project: &Project) -> AppResult<()> {
+        const OPERATION: &str = "workbench_remove";
+        let ProjectSource::GitWorkbench {
+            parent_project_id,
+            roots,
+            ..
+        } = &project.source
+        else {
+            return Err(AppError::invalid(
+                OPERATION,
+                format!(
+                    "cannot remove non-workbench project {} as workbench",
+                    project.id
+                ),
+            ));
+        };
+
+        let (agent_handles, terminal_handles, session_store, steering_store, project_store) = {
+            let state = self.state.lock().await;
+            let agent_handles = state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .filter_map(|agent_id| state.registry.agent_handle(&agent_id))
+                .collect::<Vec<_>>();
+            let terminal_handles = state.terminal_streams.values().cloned().collect::<Vec<_>>();
+            (
+                agent_handles,
+                terminal_handles,
+                Arc::clone(&state.session_store),
+                Arc::clone(&state.steering_store),
+                Arc::clone(&state.project_store),
+            )
+        };
+
+        for agent in agent_handles {
+            let start = agent.snapshot();
+            if start.project_id.as_ref() == Some(&project.id) {
+                return Err(AppError::conflict(
+                    OPERATION,
+                    format!(
+                        "cannot remove workbench {} while agent {} is live",
+                        project.id, start.agent_id
+                    ),
+                ));
+            }
+        }
+
+        for terminal in terminal_handles {
+            if terminal.project_id() == Some(&project.id) && terminal.is_running() {
+                return Err(AppError::conflict(
+                    OPERATION,
+                    format!(
+                        "cannot remove workbench {} while a terminal is live",
+                        project.id
+                    ),
+                ));
+            }
+        }
+
+        let referenced_session = session_store
+            .lock()
+            .await
+            .list()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+            .into_iter()
+            .find(|session| session.project_id.as_ref() == Some(&project.id));
+        if let Some(session) = referenced_session {
+            return Err(AppError::conflict(
+                OPERATION,
+                format!(
+                    "cannot remove workbench {} while referenced by session {}",
+                    project.id, session.id
+                ),
+            ));
+        }
+
+        let referenced_steering = steering_store
+            .lock()
+            .await
+            .list()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+            .into_iter()
+            .find(|steering| matches!(&steering.scope, SteeringScope::Project(project_id) if project_id == &project.id));
+        if let Some(steering) = referenced_steering {
+            return Err(AppError::conflict(
+                OPERATION,
+                format!(
+                    "cannot remove workbench {} while referenced by steering {}",
+                    project.id, steering.id
+                ),
+            ));
+        }
+
+        let parent = {
+            let project_store = project_store.lock().await;
+            project_store.get(parent_project_id).ok_or_else(|| {
+                AppError::internal_message(
+                    OPERATION,
+                    format!(
+                        "workbench {} references missing parent project {}",
+                        project.id, parent_project_id
+                    ),
+                    anyhow!("workbench parent record is missing"),
+                )
+            })?
+        };
+        let ProjectSource::Standalone {
+            roots: parent_roots,
+        } = &parent.source
+        else {
+            return Err(AppError::internal_message(
+                OPERATION,
+                format!(
+                    "workbench {} parent project {} is not standalone",
+                    project.id, parent_project_id
+                ),
+                anyhow!("workbench parent record is not standalone"),
+            ));
+        };
+        let parent_root_set = parent_roots.iter().cloned().collect::<HashSet<_>>();
+
+        for root in roots {
+            if !parent_root_set.contains(&root.parent_root) {
+                return Err(AppError::internal_message(
+                    OPERATION,
+                    format!(
+                        "workbench {} parent root {} is missing from parent project {}",
+                        project.id, root.parent_root, parent_project_id
+                    ),
+                    anyhow!("workbench parent root is missing"),
+                ));
+            }
+            let exists = tokio::fs::try_exists(&root.worktree_root.0)
+                .await
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+            if !exists {
+                return Err(AppError::not_found(
+                    OPERATION,
+                    format!("worktree root {} is missing", root.worktree_root),
+                ));
+            }
+        }
+
+        let mut dirty_roots = Vec::new();
+        for root in roots {
+            let status = git_status_porcelain(&root.worktree_root)
+                .await
+                .map_err(|error| {
+                    AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+                })?;
+            if !status.trim().is_empty() {
+                dirty_roots.push(root.worktree_root.0.clone());
+            }
+        }
+        if !dirty_roots.is_empty() {
+            return Err(AppError::conflict(
+                OPERATION,
+                format!(
+                    "cannot remove workbench {} because worktree roots are dirty: {}",
+                    project.id,
+                    dirty_roots.join(", ")
+                ),
+            ));
+        }
+
         Ok(())
     }
 
@@ -3251,7 +3623,8 @@ impl HostHandle {
                     member.id, project_id
                 )
             })?;
-            for root in project.roots {
+            for root in project.root_paths() {
+                let root = root.0;
                 if seen.insert(root.clone()) {
                     roots.push(root);
                 }
@@ -4912,7 +5285,12 @@ impl HostHandle {
                 state.agent_control_mcp.clone(),
             )
         };
-        if project.roots.is_empty() {
+        let project_roots = project
+            .root_paths()
+            .into_iter()
+            .map(|root| root.0)
+            .collect::<Vec<_>>();
+        if project_roots.is_empty() {
             return Err(format!(
                 "project {} has no roots for review target",
                 project_id
@@ -4925,7 +5303,7 @@ impl HostHandle {
             })?;
         let startup_mcp_servers = startup_mcp_servers_for_settings(
             &host_settings,
-            &project.roots,
+            &project_roots,
             &debug_mcp,
             &agent_control_mcp,
         );
@@ -4983,7 +5361,7 @@ impl HostHandle {
             parent_session_id: None,
             project_id: Some(project_id.clone()),
             backend_kind,
-            workspace_roots: project.roots,
+            workspace_roots: project_roots,
             initial_input: Some(payload),
             cost_hint,
             session_settings: None,
@@ -5096,7 +5474,11 @@ impl HostHandle {
                     );
                 }
             };
-            project.roots
+            project
+                .root_paths()
+                .into_iter()
+                .map(|root| root.0)
+                .collect::<Vec<_>>()
         };
         let roots_count = roots.len();
         let stats = host_diff_stats(&request.review.diffs);
@@ -5257,7 +5639,7 @@ async fn load_project(
         .lock()
         .await
         .list()
-        .map_err(|error| AppError::internal(operation, anyhow!(error)))?;
+        .map_err(|error| project_store_error(operation, error))?;
     projects
         .into_iter()
         .find(|project| &project.id == project_id)
@@ -5271,9 +5653,9 @@ fn read_review_diffs(
     match selection {
         ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => {
             let mut diffs = Vec::new();
-            for root in &project.roots {
+            for root in project.root_paths() {
                 let payload = ProjectReadDiffPayload {
-                    root: ProjectRootPath(root.clone()),
+                    root,
                     scope: protocol::ProjectDiffScope::Unstaged,
                     path: None,
                     context_mode: protocol::DiffContextMode::FullFile,
@@ -5331,6 +5713,346 @@ fn host_diff_stats(diffs: &[protocol::ProjectGitDiffPayload]) -> HostDiffStats {
     }
 }
 
+fn compute_workbench_roots(
+    parent_roots: &[ProjectRootPath],
+    branch: &GitBranchName,
+) -> AppResult<Vec<WorkbenchRoot>> {
+    parent_roots
+        .iter()
+        .map(|parent_root| {
+            Ok(WorkbenchRoot {
+                parent_root: parent_root.clone(),
+                worktree_root: compute_worktree_path(parent_root, branch)
+                    .map_err(|error| AppError::invalid("workbench_create", error))?,
+            })
+        })
+        .collect()
+}
+
+fn compute_worktree_path(
+    parent_root: &ProjectRootPath,
+    branch: &GitBranchName,
+) -> Result<ProjectRootPath, String> {
+    let parent_path = Path::new(&parent_root.0);
+    let basename = parent_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("parent root {} has no UTF-8 basename", parent_root))?;
+    let sibling_name = format!("{}--{}", basename, percent_encode_branch(&branch.0));
+    let worktree_path = match parent_path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => PathBuf::from(sibling_name),
+        Some(parent) => parent.join(sibling_name),
+        None => PathBuf::from(sibling_name),
+    };
+    let worktree_path = worktree_path.to_str().ok_or_else(|| {
+        format!(
+            "computed worktree path for parent root {} is not UTF-8",
+            parent_root
+        )
+    })?;
+    Ok(ProjectRootPath(worktree_path.to_owned()))
+}
+
+fn percent_encode_branch(branch: &str) -> String {
+    let mut encoded = String::with_capacity(branch.len());
+    for byte in branch.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
+                encoded.push(*byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(hex_digit(byte >> 4));
+                encoded.push(hex_digit(byte & 0x0f));
+            }
+        }
+    }
+    encoded
+}
+
+fn hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'A' + (value - 10)) as char,
+        _ => unreachable!("hex_digit value must be in 0..=15"),
+    }
+}
+
+async fn preflight_workbench_create(
+    project_store: &Arc<Mutex<ProjectStore>>,
+    parent: &Project,
+    branch: &GitBranchName,
+    roots: &[WorkbenchRoot],
+) -> AppResult<()> {
+    const OPERATION: &str = "workbench_create";
+    if !matches!(parent.source, ProjectSource::Standalone { .. }) {
+        return Err(AppError::invalid(
+            OPERATION,
+            format!(
+                "cannot create workbench for non-standalone parent project {}",
+                parent.id
+            ),
+        ));
+    }
+
+    for root in roots {
+        ensure_git_top_level(&root.parent_root).await?;
+    }
+    for root in roots {
+        let output = run_git(
+            &root.parent_root,
+            &["check-ref-format", "--branch", &branch.0],
+        )
+        .await
+        .map_err(|error| AppError::internal_message(OPERATION, error.clone(), anyhow!(error)))?;
+        if !output.status.success() {
+            return Err(AppError::invalid(
+                OPERATION,
+                format!(
+                    "invalid git branch {} for parent root {}: {}",
+                    branch,
+                    root.parent_root,
+                    git_output_message(&output)
+                ),
+            ));
+        }
+    }
+    for root in roots {
+        if git_branch_exists(&root.parent_root, branch).await? {
+            return Err(AppError::conflict(
+                OPERATION,
+                format!(
+                    "branch {} already exists in parent root {}",
+                    branch, root.parent_root
+                ),
+            ));
+        }
+    }
+    for root in roots {
+        let exists = tokio::fs::try_exists(&root.worktree_root.0)
+            .await
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        if exists {
+            return Err(AppError::conflict(
+                OPERATION,
+                format!("worktree path {} already exists", root.worktree_root),
+            ));
+        }
+    }
+
+    let records = project_store
+        .lock()
+        .await
+        .list()
+        .map_err(|error| project_store_error(OPERATION, error))?;
+    for root in roots {
+        if let Some(owner) = records.iter().find(|project| {
+            project
+                .root_paths()
+                .into_iter()
+                .any(|candidate| candidate == root.worktree_root)
+        }) {
+            return Err(AppError::conflict(
+                OPERATION,
+                format!(
+                    "worktree path {} is already registered as project root for project {}",
+                    root.worktree_root, owner.id
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+async fn ensure_git_top_level(parent_root: &ProjectRootPath) -> AppResult<()> {
+    const OPERATION: &str = "workbench_create";
+    let output = run_git(parent_root, &["rev-parse", "--show-toplevel"])
+        .await
+        .map_err(|error| AppError::internal_message(OPERATION, error.clone(), anyhow!(error)))?;
+    if !output.status.success() {
+        return Err(AppError::invalid(
+            OPERATION,
+            format!(
+                "parent root {} is not a git top-level: {}",
+                parent_root,
+                git_output_message(&output)
+            ),
+        ));
+    }
+    let top_level = String::from_utf8(output.stdout).map_err(|error| {
+        AppError::internal_message(
+            OPERATION,
+            format!(
+                "git rev-parse --show-toplevel for {} returned non-UTF-8 output",
+                parent_root
+            ),
+            error,
+        )
+    })?;
+    let top_level = top_level.trim();
+    let root_canonical = tokio::fs::canonicalize(&parent_root.0)
+        .await
+        .map_err(|error| {
+            AppError::invalid(
+                OPERATION,
+                format!("parent root {} is invalid: {}", parent_root, error),
+            )
+        })?;
+    let top_level_canonical = tokio::fs::canonicalize(top_level)
+        .await
+        .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+    if root_canonical != top_level_canonical {
+        return Err(AppError::invalid(
+            OPERATION,
+            format!(
+                "parent root {} is not a git top-level; git top-level is {}",
+                parent_root, top_level
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn git_branch_exists(
+    parent_root: &ProjectRootPath,
+    branch: &GitBranchName,
+) -> AppResult<bool> {
+    let ref_name = format!("refs/heads/{}", branch.0);
+    let output = run_git(
+        parent_root,
+        &["rev-parse", "--verify", "--quiet", &ref_name],
+    )
+    .await
+    .map_err(|error| {
+        AppError::internal_message("workbench_create", error.clone(), anyhow!(error))
+    })?;
+    Ok(output.status.success())
+}
+
+async fn git_worktree_add(
+    parent_root: &ProjectRootPath,
+    worktree_root: &ProjectRootPath,
+    branch: &GitBranchName,
+) -> Result<(), String> {
+    let output = run_git(
+        parent_root,
+        &["worktree", "add", "-b", &branch.0, &worktree_root.0],
+    )
+    .await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "git worktree add failed for parent root {} branch {} worktree {}: {}",
+        parent_root,
+        branch,
+        worktree_root,
+        git_output_message(&output)
+    ))
+}
+
+async fn git_worktree_remove(
+    parent_root: &ProjectRootPath,
+    worktree_root: &ProjectRootPath,
+) -> Result<(), String> {
+    let output = run_git(parent_root, &["worktree", "remove", &worktree_root.0]).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "git worktree remove failed for parent root {} worktree {}: {}",
+        parent_root,
+        worktree_root,
+        git_output_message(&output)
+    ))
+}
+
+async fn git_status_porcelain(worktree_root: &ProjectRootPath) -> Result<String, String> {
+    let output = run_git(
+        worktree_root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed for worktree root {}: {}",
+            worktree_root,
+            git_output_message(&output)
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("git status output was not valid UTF-8: {error}"))
+}
+
+async fn rollback_created_worktrees(created: &[WorkbenchRoot]) -> Option<String> {
+    let mut failures = Vec::new();
+    for root in created.iter().rev() {
+        match run_git(
+            &root.parent_root,
+            &["worktree", "remove", "--force", &root.worktree_root.0],
+        )
+        .await
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => failures.push(format!(
+                "rollback git worktree remove --force failed for {}: {}",
+                root.worktree_root,
+                git_output_message(&output)
+            )),
+            Err(error) => failures.push(format!(
+                "rollback git worktree remove --force failed for {}: {}",
+                root.worktree_root, error
+            )),
+        }
+    }
+    if failures.is_empty() {
+        None
+    } else {
+        Some(failures.join("; "))
+    }
+}
+
+fn append_rollback_message(error: String, rollback_message: Option<String>) -> String {
+    match rollback_message {
+        Some(rollback_message) => format!("{error}; rollback failures: {rollback_message}"),
+        None => error,
+    }
+}
+
+async fn run_git(root: &ProjectRootPath, args: &[&str]) -> Result<std::process::Output, String> {
+    tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&root.0)
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to run git -C {} {}: {}",
+                root,
+                args.join(" "),
+                error
+            )
+        })
+}
+
+fn git_output_message(output: &std::process::Output) -> String {
+    let code = output
+        .status
+        .code()
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_owned());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    format!(
+        "exit code {}; stdout: {}; stderr: {}",
+        code,
+        stdout.trim(),
+        stderr.trim()
+    )
+}
+
 async fn project_exists(
     project_store: &Arc<Mutex<ProjectStore>>,
     project_id: &ProjectId,
@@ -5340,19 +6062,20 @@ async fn project_exists(
         .lock()
         .await
         .list()
-        .map_err(|error| AppError::internal(operation, anyhow!(error)))?;
+        .map_err(|error| project_store_error(operation, error))?;
     Ok(projects
         .into_iter()
         .any(|project| project.id == *project_id))
 }
 
-fn project_store_error(operation: &'static str, error: String) -> AppError {
-    if error.contains("missing project") || error.contains("does not contain root") {
-        AppError::not_found(operation, error)
-    } else if error.contains("already contains root") || error.contains("duplicate id") {
-        AppError::conflict(operation, error)
-    } else {
-        AppError::internal_message(operation, error.clone(), anyhow!(error))
+fn project_store_error(operation: &'static str, error: ProjectStoreError) -> AppError {
+    match error {
+        ProjectStoreError::NotFound(message) => AppError::not_found(operation, message),
+        ProjectStoreError::InvalidInput(message) => AppError::invalid(operation, message),
+        ProjectStoreError::Conflict(message) => AppError::conflict(operation, message),
+        ProjectStoreError::InvalidStore(message) | ProjectStoreError::Internal(message) => {
+            AppError::internal_message(operation, message.clone(), anyhow!(message))
+        }
     }
 }
 
@@ -5738,6 +6461,7 @@ fn spawn_host_inner(
             project_streams: HashMap::new(),
             terminal_streams: HashMap::new(),
             browse_streams: HashMap::new(),
+            workbench_parent_locks: HashMap::new(),
         })),
     };
 
@@ -7023,8 +7747,8 @@ async fn resolve_terminal_launch(
             relative_cwd,
         } => {
             let project = load_project(project_store, &project_id, OPERATION).await?;
-            let roots = project.roots.iter().cloned().collect::<HashSet<_>>();
-            if !roots.contains(&root.0) {
+            let roots = project.root_paths().into_iter().collect::<HashSet<_>>();
+            if !roots.contains(&root) {
                 return Err(AppError::invalid(
                     OPERATION,
                     format!(
@@ -7141,6 +7865,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn worktree_path_percent_encodes_branch_bytes() {
+        let parent = ProjectRootPath("/Users/mike/Tyde2".to_owned());
+
+        let simple = compute_worktree_path(&parent, &GitBranchName("feature-login".to_owned()))
+            .expect("compute simple worktree path");
+        assert_eq!(simple.0, "/Users/mike/Tyde2--feature-login");
+
+        let slash = compute_worktree_path(&parent, &GitBranchName("feature/login".to_owned()))
+            .expect("compute slash worktree path");
+        assert_eq!(slash.0, "/Users/mike/Tyde2--feature%2Flogin");
+
+        let unicode = compute_worktree_path(&parent, &GitBranchName("café%".to_owned()))
+            .expect("compute unicode worktree path");
+        assert_eq!(unicode.0, "/Users/mike/Tyde2--caf%C3%A9%25");
+    }
+
+    #[tokio::test]
+    async fn workbench_remove_reports_internal_when_parent_record_is_missing() {
+        let dir = std::env::temp_dir().join(format!("tyde-host-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp host dir");
+        let host = spawn_host_with_mock_backend(
+            dir.join("sessions.json"),
+            dir.join("projects.json"),
+            dir.join("settings.json"),
+        )
+        .expect("spawn host");
+
+        let workbench = Project {
+            id: ProjectId("workbench-test".to_owned()),
+            name: "feature".to_owned(),
+            sort_order: 0,
+            source: ProjectSource::GitWorkbench {
+                parent_project_id: ProjectId("missing-parent".to_owned()),
+                branch: GitBranchName("feature".to_owned()),
+                roots: vec![WorkbenchRoot {
+                    parent_root: ProjectRootPath("/tmp/parent".to_owned()),
+                    worktree_root: ProjectRootPath("/tmp/parent--feature".to_owned()),
+                }],
+            },
+        };
+
+        let error = host
+            .validate_workbench_remove_blockers(&workbench)
+            .await
+            .expect_err("missing parent should block removal");
+        assert_eq!(error.code(), protocol::CommandErrorCode::Internal);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     struct TeamFixture {
         _dir: tempfile::TempDir,
         host: HostHandle,
@@ -7210,7 +7985,7 @@ mod tests {
 
         host.create_project(ProjectCreatePayload {
             name: "Team Project".to_owned(),
-            roots: vec![project_root.to_string_lossy().to_string()],
+            roots: vec![ProjectRootPath(project_root.to_string_lossy().to_string())],
         })
         .await
         .expect("create project");
@@ -7354,7 +8129,7 @@ mod tests {
 
         host.create_project(ProjectCreatePayload {
             name: "Race Manager Project".to_owned(),
-            roots: vec![manager_project_root],
+            roots: vec![ProjectRootPath(manager_project_root)],
         })
         .await
         .expect("create manager project");
@@ -7374,7 +8149,7 @@ mod tests {
 
         host.create_project(ProjectCreatePayload {
             name: "Race Project".to_owned(),
-            roots: vec![project_root.clone()],
+            roots: vec![ProjectRootPath(project_root.clone())],
         })
         .await
         .expect("create project");
@@ -8435,7 +9210,7 @@ mod tests {
             .host
             .create_project(ProjectCreatePayload {
                 name: "Second Team Project".to_owned(),
-                roots: vec![fixture.project_root.clone(), second_root.clone()],
+                roots: vec![ProjectRootPath(second_root.clone())],
             })
             .await
             .expect("create second project");
@@ -8996,7 +9771,7 @@ mod tests {
             .await
             .create(
                 "Review Project".to_owned(),
-                vec!["/tmp/review-root".to_owned()],
+                vec![ProjectRootPath("/tmp/review-root".to_owned())],
             )
             .expect("create review project");
         let review = Review {

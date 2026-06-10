@@ -4241,7 +4241,9 @@ mod wasm_tests {
             project: protocol::Project {
                 id: protocol::ProjectId(project.to_owned()),
                 name: project.to_owned(),
-                roots: vec![root.to_owned()],
+                source: protocol::ProjectSource::Standalone {
+                    roots: vec![protocol::ProjectRootPath(root.to_owned())],
+                },
                 sort_order: 0,
             },
         }

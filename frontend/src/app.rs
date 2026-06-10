@@ -225,7 +225,7 @@ fn install_click_listener(state: AppState) {
         } else {
             let roots = state
                 .active_project_info_untracked()
-                .map(|project| project.project.roots)
+                .map(|project| project.project.root_paths())
                 .unwrap_or_default();
             if let Some(path) = resolve_chat_file_href(&href, &roots) {
                 crate::actions::open_project_path(&state, path);
@@ -301,7 +301,7 @@ fn install_file_drop_navigation_guard() {
     });
 }
 
-fn resolve_chat_file_href(href: &str, project_roots: &[String]) -> Option<ProjectPath> {
+fn resolve_chat_file_href(href: &str, project_roots: &[ProjectRootPath]) -> Option<ProjectPath> {
     let decoded = percent_decode_path(href).unwrap_or_else(|| href.to_owned());
     let normalized = normalize_file_reference(&decoded)?;
 
@@ -318,7 +318,7 @@ fn resolve_chat_file_href(href: &str, project_roots: &[String]) -> Option<Projec
     }
     let root = project_roots.first()?.clone();
     Some(ProjectPath {
-        root: ProjectRootPath(root),
+        root,
         relative_path: normalized,
     })
 }
@@ -362,9 +362,12 @@ fn strip_trailing_line_suffix(path: &str) -> &str {
     candidate
 }
 
-fn project_path_from_absolute(path: &str, project_roots: &[String]) -> Option<ProjectPath> {
+fn project_path_from_absolute(
+    path: &str,
+    project_roots: &[ProjectRootPath],
+) -> Option<ProjectPath> {
     for root in project_roots {
-        let normalized_root = root.replace('\\', "/");
+        let normalized_root = root.0.replace('\\', "/");
         if path == normalized_root {
             return None;
         }
@@ -378,7 +381,7 @@ fn project_path_from_absolute(path: &str, project_roots: &[String]) -> Option<Pr
                 return None;
             }
             return Some(ProjectPath {
-                root: ProjectRootPath(root.clone()),
+                root: root.clone(),
                 relative_path: relative_path.to_owned(),
             });
         }
@@ -434,7 +437,7 @@ mod tests {
 
     #[test]
     fn resolves_absolute_file_links_with_line_numbers() {
-        let roots = vec!["/Users/mike/Tyde2".to_owned()];
+        let roots = vec![ProjectRootPath("/Users/mike/Tyde2".to_owned())];
         let resolved =
             resolve_chat_file_href("/Users/mike/Tyde2/server/src/agent/mod.rs:366", &roots);
 
@@ -449,7 +452,7 @@ mod tests {
 
     #[test]
     fn resolves_relative_file_links_with_line_and_column_numbers() {
-        let roots = vec!["/Users/mike/Tyde2".to_owned()];
+        let roots = vec![ProjectRootPath("/Users/mike/Tyde2".to_owned())];
         let resolved = resolve_chat_file_href("./server/src/agent/mod.rs:366:8", &roots);
 
         assert_eq!(
@@ -463,7 +466,7 @@ mod tests {
 
     #[test]
     fn resolves_percent_encoded_file_urls() {
-        let roots = vec!["/Users/mike/Tyde2".to_owned()];
+        let roots = vec![ProjectRootPath("/Users/mike/Tyde2".to_owned())];
         let resolved =
             resolve_chat_file_href("file:///Users/mike/Tyde2/docs/My%20File.md#L12", &roots);
 
@@ -478,7 +481,7 @@ mod tests {
 
     #[test]
     fn rejects_absolute_paths_outside_the_active_project() {
-        let roots = vec!["/Users/mike/Tyde2".to_owned()];
+        let roots = vec![ProjectRootPath("/Users/mike/Tyde2".to_owned())];
         let resolved = resolve_chat_file_href("/tmp/outside.rs:12", &roots);
 
         assert_eq!(resolved, None);

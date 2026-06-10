@@ -11,10 +11,10 @@ use protocol::{
     CommandErrorCode, CommandErrorPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, Envelope, FrameKind, McpServerConfig,
     McpServerDeletePayload, McpServerId, McpServerNotifyPayload, McpServerUpsertPayload,
-    McpTransportConfig, NewAgentPayload, ProjectCreatePayload, ProjectNotifyPayload, Skill,
-    SkillId, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
-    Steering, SteeringDeletePayload, SteeringId, SteeringNotifyPayload, SteeringScope,
-    SteeringUpsertPayload, ToolPolicy,
+    McpTransportConfig, NewAgentPayload, ProjectCreatePayload, ProjectNotifyPayload,
+    ProjectRootPath, Skill, SkillId, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams,
+    SpawnAgentPayload, Steering, SteeringDeletePayload, SteeringId, SteeringNotifyPayload,
+    SteeringScope, SteeringUpsertPayload, ToolPolicy,
 };
 use serde_json::to_string_pretty;
 use std::collections::VecDeque;
@@ -712,7 +712,7 @@ async fn replay_order_replays_customization_before_agents() {
         .client
         .project_create(ProjectCreatePayload {
             name: "Custom Project".to_string(),
-            roots: vec!["/tmp/custom-project".to_string()],
+            roots: vec![ProjectRootPath("/tmp/custom-project".to_string())],
         })
         .await
         .expect("project_create failed");
@@ -811,7 +811,7 @@ async fn spawn_with_custom_agent_resolves_expected_configuration() {
         .client
         .project_create(ProjectCreatePayload {
             name: "Spawn Project".to_string(),
-            roots: vec!["/tmp/spawn-project".to_string()],
+            roots: vec![ProjectRootPath("/tmp/spawn-project".to_string())],
         })
         .await
         .expect("project_create failed");
@@ -1183,7 +1183,7 @@ async fn steering_ordering_combines_host_and_project_by_title() {
         .client
         .project_create(ProjectCreatePayload {
             name: "Ordering Project".to_string(),
-            roots: vec!["/tmp/ordering-project".to_string()],
+            roots: vec![ProjectRootPath("/tmp/ordering-project".to_string())],
         })
         .await
         .expect("project_create failed");

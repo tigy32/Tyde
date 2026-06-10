@@ -2,13 +2,16 @@ use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
-use crate::state::{ActiveProjectRef, AppState, TabContent, sort_project_infos};
+use crate::state::{
+    ActiveProjectRef, AppState, PendingWorkbenchCreate, TabContent, sort_project_infos,
+};
 
 use protocol::{
-    AgentId, BackendKind, CustomAgentId, FrameKind, ImageData, ProjectDeletePayload,
+    AgentId, BackendKind, CustomAgentId, FrameKind, GitBranchName, ImageData, ProjectDeletePayload,
     ProjectDeleteRootPayload, ProjectId, ProjectPath, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, SessionId, SessionSettingsValues, SetSessionSettingsPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, SessionId, SessionSettingsValues,
+    SetSessionSettingsPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    WorkbenchCreatePayload, WorkbenchRemovePayload,
 };
 
 /// Resume a session on the given host. Synchronously switches the active
@@ -116,8 +119,13 @@ pub fn spawn_new_chat(
             (
                 active_project.host_id,
                 host_stream,
-                Some(project.project.id),
-                project.project.roots,
+                Some(project.project.id.clone()),
+                project
+                    .project
+                    .root_paths()
+                    .into_iter()
+                    .map(|root| root.0)
+                    .collect::<Vec<String>>(),
             )
         }
         None => match state.selected_host_stream_untracked() {
@@ -319,7 +327,12 @@ pub fn rename_project(state: &AppState, host_id: String, project_id: ProjectId, 
     });
 }
 
-pub fn delete_project_root(state: &AppState, host_id: String, project_id: ProjectId, root: String) {
+pub fn delete_project_root(
+    state: &AppState,
+    host_id: String,
+    project_id: ProjectId,
+    root: ProjectRootPath,
+) {
     let Some(host_stream) = state.host_stream_untracked(&host_id) else {
         log::error!("delete_project_root: host stream missing for {host_id}");
         return;
@@ -369,24 +382,54 @@ pub fn reorder_projects(
         return;
     };
 
-    let current_ids: Vec<_> = state
+    let host_projects: Vec<_> = state
         .projects
         .get_untracked()
         .into_iter()
         .filter(|project| project.host_id == host_id.as_str())
-        .map(|project| project.project.id)
         .collect();
 
-    let Some(dragged_index) = current_ids.iter().position(|id| *id == dragged_project_id) else {
+    let Some(dragged) = host_projects
+        .iter()
+        .find(|project| project.project.id == dragged_project_id)
+    else {
         log::error!(
             "reorder_projects: dragged project {} not found",
             dragged_project_id
         );
         return;
     };
+
+    // Reorder is scoped: dragging a top-level project reorders top-level only;
+    // dragging a workbench reorders that parent's children only. Cross-scope
+    // drags are rejected — the protocol does not represent moving a workbench
+    // out from under its parent.
+    let scope = match dragged.project.parent_project_id().cloned() {
+        Some(parent_project_id) => ProjectReorderScope::WorkbenchChildren { parent_project_id },
+        None => ProjectReorderScope::TopLevel,
+    };
+
+    let current_ids: Vec<ProjectId> = host_projects
+        .iter()
+        .filter(|project| match &scope {
+            ProjectReorderScope::TopLevel => !project.project.is_workbench(),
+            ProjectReorderScope::WorkbenchChildren { parent_project_id } => {
+                project.project.parent_project_id() == Some(parent_project_id)
+            }
+        })
+        .map(|project| project.project.id.clone())
+        .collect();
+
+    let Some(dragged_index) = current_ids.iter().position(|id| *id == dragged_project_id) else {
+        log::error!(
+            "reorder_projects: dragged project {} not found in scope",
+            dragged_project_id
+        );
+        return;
+    };
     let Some(target_index) = current_ids.iter().position(|id| *id == target_project_id) else {
         log::error!(
-            "reorder_projects: target project {} not found",
+            "reorder_projects: target project {} not found in scope",
             target_project_id
         );
         return;
@@ -411,30 +454,33 @@ pub fn reorder_projects(
     }
     reordered_ids.insert(insert_index, dragged_id);
 
+    let scope_for_update = scope.clone();
     state.projects.update(|projects| {
-        let mut ordered_projects = Vec::new();
-        for project_id in &reordered_ids {
-            if let Some(project) = projects
+        for project in projects.iter_mut() {
+            if project.host_id != host_id.as_str() {
+                continue;
+            }
+            let in_scope = match &scope_for_update {
+                ProjectReorderScope::TopLevel => !project.project.is_workbench(),
+                ProjectReorderScope::WorkbenchChildren { parent_project_id } => {
+                    project.project.parent_project_id() == Some(parent_project_id)
+                }
+            };
+            if !in_scope {
+                continue;
+            }
+            if let Some(index) = reordered_ids
                 .iter()
-                .find(|project| {
-                    project.host_id == host_id.as_str() && project.project.id == *project_id
-                })
-                .cloned()
+                .position(|id| *id == project.project.id)
             {
-                ordered_projects.push(project);
+                project.project.sort_order = index as u64;
             }
         }
-
-        for (index, project) in ordered_projects.iter_mut().enumerate() {
-            project.project.sort_order = index as u64;
-        }
-
-        projects.retain(|project| project.host_id != host_id.as_str());
-        projects.extend(ordered_projects);
         sort_project_infos(projects);
     });
 
     let payload = ProjectReorderPayload {
+        scope,
         project_ids: reordered_ids,
     };
     spawn_local(async move {
@@ -442,6 +488,61 @@ pub fn reorder_projects(
             send_frame(&host_id, host_stream, FrameKind::ProjectReorder, &payload).await
         {
             log::error!("failed to send ProjectReorder: {error}");
+        }
+    });
+}
+
+pub fn create_workbench(
+    state: &AppState,
+    host_id: String,
+    parent_project_id: ProjectId,
+    branch: String,
+) {
+    let trimmed = branch.trim().to_owned();
+    if trimmed.is_empty() {
+        log::error!("create_workbench: branch must not be empty");
+        return;
+    }
+    let Some(host_stream) = state.host_stream_untracked(&host_id) else {
+        log::error!("create_workbench: host stream missing for {host_id}");
+        return;
+    };
+    let branch_name = GitBranchName(trimmed.clone());
+    // Record the pending create so dispatch can correlate the resulting
+    // `ProjectNotify::Upsert` (per §3.3) and switch active to the new
+    // workbench.
+    state.pending_workbench_creates.update(|pending| {
+        pending.push(PendingWorkbenchCreate {
+            host_id: host_id.clone(),
+            parent_project_id: parent_project_id.clone(),
+            branch: branch_name.clone(),
+        });
+    });
+    let payload = WorkbenchCreatePayload {
+        parent_project_id,
+        branch: branch_name,
+        name: trimmed,
+    };
+    spawn_local(async move {
+        if let Err(error) =
+            send_frame(&host_id, host_stream, FrameKind::WorkbenchCreate, &payload).await
+        {
+            log::error!("failed to send WorkbenchCreate: {error}");
+        }
+    });
+}
+
+pub fn remove_workbench(state: &AppState, host_id: String, workbench_id: ProjectId) {
+    let Some(host_stream) = state.host_stream_untracked(&host_id) else {
+        log::error!("remove_workbench: host stream missing for {host_id}");
+        return;
+    };
+    let payload = WorkbenchRemovePayload { id: workbench_id };
+    spawn_local(async move {
+        if let Err(error) =
+            send_frame(&host_id, host_stream, FrameKind::WorkbenchRemove, &payload).await
+        {
+            log::error!("failed to send WorkbenchRemove: {error}");
         }
     });
 }
