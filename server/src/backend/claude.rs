@@ -6735,6 +6735,10 @@ fn claude_estimated_context_window_for_model(model_hint: Option<&str>) -> u64 {
     if normalized.ends_with("[1m]") {
         return CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M;
     }
+    // Fable ships a 1M context window by default (no explicit [1m] suffix).
+    if normalized.contains("fable") {
+        return CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M;
+    }
     if normalized.contains("haiku") {
         return CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT;
     }
@@ -13282,6 +13286,28 @@ for raw_line in sys.stdin:
             bd.get("context_window").and_then(Value::as_u64),
             Some(CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M)
         );
+    }
+
+    #[test]
+    fn estimate_context_breakdown_treats_fable_as_1m_window() {
+        // Fable defaults to a 1M context window even without an explicit [1m]
+        // suffix, so the estimated fallback must not collapse it to 200k.
+        let usage = json!({
+            "input_tokens": 20,
+            "output_tokens": 10,
+            "total_tokens": 30,
+            "cached_prompt_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "reasoning_tokens": 0
+        });
+        for model in ["fable", "claude-fable-5", "Claude Fable 5"] {
+            let bd = estimate_context_breakdown(Some(&usage), 0, 0, 0, None, Some(model));
+            assert_eq!(
+                bd.get("context_window").and_then(Value::as_u64),
+                Some(CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M),
+                "{model} should estimate a 1M context window"
+            );
+        }
     }
 
     #[test]
