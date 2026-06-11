@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use protocol::{
     FrameKind, HostAbsPath, HostBrowseEntriesPayload, HostBrowseEntry, HostBrowseEntryError,
     HostBrowseErrorCode, HostBrowseErrorPayload, HostBrowseOpenedPayload, HostPlatform,
-    ProjectFileKind,
+    ProjectFileKind, ProjectRootPath,
 };
 use tokio::fs;
 
@@ -37,13 +37,37 @@ pub(crate) fn home_dir() -> HostAbsPath {
     HostAbsPath(path)
 }
 
-pub(crate) fn opened_payload(initial: &HostAbsPath) -> HostBrowseOpenedPayload {
+pub(crate) fn opened_payload(home: &HostAbsPath) -> HostBrowseOpenedPayload {
     HostBrowseOpenedPayload {
-        home: initial.clone(),
+        home: home.clone(),
         root: HostAbsPath("/".to_owned()),
         separator: '/',
         platform: host_platform(),
     }
+}
+
+pub(crate) fn project_roots_initial_path(roots: &[ProjectRootPath]) -> Option<HostAbsPath> {
+    match roots {
+        [] => None,
+        [root] => Some(HostAbsPath(root.0.clone())),
+        [first, rest @ ..] => common_ancestor(first, rest),
+    }
+}
+
+fn common_ancestor(first: &ProjectRootPath, rest: &[ProjectRootPath]) -> Option<HostAbsPath> {
+    let paths = rest
+        .iter()
+        .map(|root| Path::new(&root.0))
+        .collect::<Vec<_>>();
+    Path::new(&first.0)
+        .ancestors()
+        .find(|candidate| {
+            candidate
+                .components()
+                .any(|component| matches!(component, std::path::Component::Normal(_)))
+                && paths.iter().all(|path| path.starts_with(candidate))
+        })
+        .map(|path| HostAbsPath(path.to_string_lossy().to_string()))
 }
 
 pub(crate) async fn emit_entries(stream: &Stream, payload: &HostBrowseEntriesPayload) {
@@ -271,5 +295,39 @@ mod tests {
                 .iter()
                 .any(|entry| entry.name == "project.txt")
         );
+    }
+
+    #[test]
+    fn project_roots_initial_path_uses_single_root_directly() {
+        let roots = vec![ProjectRootPath("/repo/app".to_owned())];
+
+        assert_eq!(
+            project_roots_initial_path(&roots),
+            Some(HostAbsPath("/repo/app".to_owned()))
+        );
+    }
+
+    #[test]
+    fn project_roots_initial_path_uses_deepest_common_parent() {
+        let roots = vec![
+            ProjectRootPath("/repo/app".to_owned()),
+            ProjectRootPath("/repo/tools".to_owned()),
+        ];
+
+        assert_eq!(
+            project_roots_initial_path(&roots),
+            Some(HostAbsPath("/repo".to_owned()))
+        );
+    }
+
+    #[test]
+    fn project_roots_initial_path_returns_none_without_useful_parent() {
+        let roots = vec![
+            ProjectRootPath("/repo-a".to_owned()),
+            ProjectRootPath("/repo-b".to_owned()),
+        ];
+
+        assert_eq!(project_roots_initial_path(&[]), None);
+        assert_eq!(project_roots_initial_path(&roots), None);
     }
 }

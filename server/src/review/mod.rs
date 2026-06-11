@@ -184,6 +184,10 @@ enum RegistryCommand {
         roots: Vec<ProjectRootPath>,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    DeleteForProject {
+        project_id: ProjectId,
+        reply: oneshot::Sender<Result<Vec<ReviewId>, String>>,
+    },
 }
 
 pub(crate) struct ReviewRegistry;
@@ -407,6 +411,22 @@ impl ReviewRegistryHandle {
             .await
             .map_err(|_| "review registry dropped clean reset response".to_owned())?
     }
+
+    /// Deletes every persisted review referencing `project_id` (used when a
+    /// project or workbench is deleted) and returns the removed review ids.
+    pub(crate) async fn delete_for_project(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<ReviewId>, String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(RegistryCommand::DeleteForProject { project_id, reply })
+            .await
+            .map_err(|_| "review registry stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "review registry dropped delete-for-project response".to_owned())?
+    }
 }
 
 struct ReviewRegistryActor {
@@ -499,6 +519,10 @@ impl ReviewRegistryActor {
                     let result = self
                         .reset_project_roots_for_clean_unstaged(project_id, roots)
                         .await;
+                    let _ = reply.send(result);
+                }
+                RegistryCommand::DeleteForProject { project_id, reply } => {
+                    let result = self.delete_for_project(&project_id);
                     let _ = reply.send(result);
                 }
             }
@@ -678,6 +702,14 @@ impl ReviewRegistryActor {
             }
         }
         Ok(())
+    }
+
+    fn delete_for_project(&mut self, project_id: &ProjectId) -> Result<Vec<ReviewId>, String> {
+        let removed = self.store.delete_for_project(project_id)?;
+        for review_id in &removed {
+            self.handles.remove(review_id);
+        }
+        Ok(removed)
     }
 
     async fn ensure_active_review_for_project(&mut self, project: &Project) -> Result<(), String> {

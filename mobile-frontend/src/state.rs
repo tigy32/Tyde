@@ -273,14 +273,77 @@ pub struct ProjectInfo {
     pub project: Project,
 }
 
+/// Orders the project list the way the server's `ordered_projects` emits
+/// it: hosts first, then each host's top-level projects by `sort_order`,
+/// with every parent's git-workbench children listed directly beneath it
+/// (children ordered by their own per-parent `sort_order`). Workbench
+/// children carry an independent `sort_order` sequence starting at 0, so
+/// a flat sort by raw `sort_order` would interleave them among top-level
+/// projects. Updates arrive as single-project upserts
+/// (`ProjectNotify::Upsert`, project bootstraps) as well as full
+/// snapshots, so the grouped order is re-derived locally instead of
+/// trusting arrival order. A workbench whose parent hasn't arrived yet
+/// sorts after every known top-level project (grouped with any orphan
+/// siblings of the same parent) until the parent's upsert lands and the
+/// next re-sort slots it into place.
 pub fn sort_project_infos(projects: &mut [ProjectInfo]) {
-    projects.sort_by(|left, right| {
-        left.local_host_id
-            .0
-            .cmp(&right.local_host_id.0)
-            .then(left.project.sort_order.cmp(&right.project.sort_order))
-            .then(left.project.name.cmp(&right.project.name))
-            .then(left.project.id.0.cmp(&right.project.id.0))
+    // (top-level sort_order, top-level name, top-level id) for parent
+    // lookup, keyed per host so colliding ids across hosts stay isolated.
+    let top_level: HashMap<(LocalHostId, ProjectId), (u64, String)> = projects
+        .iter()
+        .filter(|info| !info.project.is_workbench())
+        .map(|info| {
+            (
+                (info.local_host_id.clone(), info.project.id.clone()),
+                (info.project.sort_order, info.project.name.clone()),
+            )
+        })
+        .collect();
+
+    projects.sort_by_cached_key(|info| {
+        let host = info.local_host_id.0.clone();
+        let own = (
+            info.project.sort_order,
+            info.project.name.clone(),
+            info.project.id.0.clone(),
+        );
+        match info.project.parent_project_id() {
+            None => {
+                let (order, name, id) = own;
+                // Top-level rows sort by their own key and come before
+                // their children (`is_child = 0`).
+                (
+                    host,
+                    order,
+                    name,
+                    id,
+                    0u8,
+                    0u64,
+                    String::new(),
+                    String::new(),
+                )
+            }
+            Some(parent_id) => {
+                let key = (info.local_host_id.clone(), parent_id.clone());
+                let (parent_order, parent_name) = top_level
+                    .get(&key)
+                    .cloned()
+                    // Orphan workbench: parent not (yet) in the list.
+                    // Push it after all known top-level groups.
+                    .unwrap_or((u64::MAX, String::new()));
+                let (order, name, id) = own;
+                (
+                    host,
+                    parent_order,
+                    parent_name,
+                    parent_id.0.clone(),
+                    1u8,
+                    order,
+                    name,
+                    id,
+                )
+            }
+        }
     });
 }
 
@@ -777,6 +840,113 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::{GitBranchName, ProjectSource, WorkbenchRoot};
+
+    fn top_level_project(host: &str, id: &str, name: &str, sort_order: u64) -> ProjectInfo {
+        ProjectInfo {
+            local_host_id: LocalHostId(host.to_owned()),
+            project: Project {
+                id: ProjectId(id.to_owned()),
+                name: name.to_owned(),
+                sort_order,
+                source: ProjectSource::Standalone {
+                    roots: vec![ProjectRootPath(format!("/x/{id}"))],
+                },
+            },
+        }
+    }
+
+    fn workbench_project(
+        host: &str,
+        id: &str,
+        name: &str,
+        sort_order: u64,
+        parent_id: &str,
+    ) -> ProjectInfo {
+        ProjectInfo {
+            local_host_id: LocalHostId(host.to_owned()),
+            project: Project {
+                id: ProjectId(id.to_owned()),
+                name: name.to_owned(),
+                sort_order,
+                source: ProjectSource::GitWorkbench {
+                    parent_project_id: ProjectId(parent_id.to_owned()),
+                    branch: GitBranchName(format!("branch-{id}")),
+                    roots: vec![WorkbenchRoot {
+                        parent_root: ProjectRootPath(format!("/x/{parent_id}")),
+                        worktree_root: ProjectRootPath(format!("/x/wb/{id}")),
+                    }],
+                },
+            },
+        }
+    }
+
+    fn sorted_ids(projects: &[ProjectInfo]) -> Vec<&str> {
+        projects.iter().map(|p| p.project.id.0.as_str()).collect()
+    }
+
+    /// Workbench children carry an independent per-parent sort_order
+    /// sequence starting at 0, so a flat sort by raw sort_order would
+    /// interleave them among top-level projects (A(0), wb(0), B(1)).
+    /// The grouped sort must keep each workbench directly beneath its
+    /// parent instead.
+    #[test]
+    fn sort_project_infos_groups_workbenches_under_parent() {
+        let mut projects = vec![
+            workbench_project("h-1", "wb-b", "Bench B", 0, "p-b"),
+            top_level_project("h-1", "p-b", "B", 1),
+            top_level_project("h-1", "p-a", "A", 0),
+        ];
+        sort_project_infos(&mut projects);
+        assert_eq!(sorted_ids(&projects), vec!["p-a", "p-b", "wb-b"]);
+    }
+
+    /// Multiple children of one parent order by their own sort_order,
+    /// and siblings of different parents never interleave.
+    #[test]
+    fn sort_project_infos_orders_children_per_parent() {
+        let mut projects = vec![
+            workbench_project("h-1", "wb-a2", "Bench A2", 1, "p-a"),
+            top_level_project("h-1", "p-b", "B", 1),
+            workbench_project("h-1", "wb-b1", "Bench B1", 0, "p-b"),
+            workbench_project("h-1", "wb-a1", "Bench A1", 0, "p-a"),
+            top_level_project("h-1", "p-a", "A", 0),
+        ];
+        sort_project_infos(&mut projects);
+        assert_eq!(
+            sorted_ids(&projects),
+            vec!["p-a", "wb-a1", "wb-a2", "p-b", "wb-b1"]
+        );
+    }
+
+    /// A workbench whose parent hasn't arrived yet (out-of-order
+    /// upserts) sorts after all known top-level groups rather than
+    /// panicking or landing somewhere arbitrary in the middle.
+    #[test]
+    fn sort_project_infos_pushes_orphan_workbenches_to_end() {
+        let mut projects = vec![
+            workbench_project("h-1", "wb-orphan", "Bench Orphan", 0, "p-missing"),
+            top_level_project("h-1", "p-b", "B", 1),
+            top_level_project("h-1", "p-a", "A", 0),
+        ];
+        sort_project_infos(&mut projects);
+        assert_eq!(sorted_ids(&projects), vec!["p-a", "p-b", "wb-orphan"]);
+    }
+
+    /// Hosts stay segregated: grouping happens within a host, never
+    /// across two paired hosts that reuse project ids.
+    #[test]
+    fn sort_project_infos_keeps_hosts_separate() {
+        let mut projects = vec![
+            workbench_project("h-2", "wb-2", "Bench", 0, "p-1"),
+            top_level_project("h-2", "p-1", "Same Id Other Host", 0),
+            top_level_project("h-1", "p-1", "First Host", 0),
+        ];
+        sort_project_infos(&mut projects);
+        assert_eq!(projects[0].local_host_id.0, "h-1");
+        assert_eq!(projects[1].local_host_id.0, "h-2");
+        assert_eq!(sorted_ids(&projects), vec!["p-1", "p-1", "wb-2"]);
+    }
 
     #[test]
     fn local_host_id_serializes_transparent() {

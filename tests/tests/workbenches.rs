@@ -7,11 +7,13 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    BackendKind, CommandErrorCode, CommandErrorPayload, Envelope, FrameKind, GitBranchName,
+    BackendKind, CommandErrorCode, CommandErrorPayload, CustomAgent, CustomAgentId,
+    CustomAgentUpsertPayload, Envelope, FrameKind, GitBranchName, HostSettingValue,
     NewAgentPayload, NewTerminalPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
     ProjectDeletePayload, ProjectDeleteRootPayload, ProjectNotifyPayload, ProjectRootPath,
-    ProjectSource, SpawnAgentParams, SpawnAgentPayload, Steering, SteeringId, SteeringScope,
-    SteeringUpsertPayload, TerminalCreatePayload, TerminalLaunchTarget, WorkbenchCreatePayload,
+    ProjectSource, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, Steering, SteeringId,
+    SteeringScope, SteeringUpsertPayload, TeamCreatePayload, TeamMemberCreateSpec,
+    TerminalCreatePayload, TerminalLaunchTarget, ToolPolicy, WorkbenchCreatePayload,
     WorkbenchRemovePayload,
 };
 
@@ -504,10 +506,41 @@ async fn workbench_create_rolls_back_previously_created_roots_on_late_git_failur
     assert_eq!(error.operation, "workbench_create");
     assert_eq!(error.code, CommandErrorCode::Internal);
     assert!(!worktree_a.exists(), "first worktree should be rolled back");
+
+    // Rollback must also delete the branch that `git worktree add -b`
+    // created in repo A, otherwise retrying the identical create fails
+    // the branch-exists preflight forever.
+    let branch_check = Command::new("git")
+        .arg("-C")
+        .arg(repo_a.path())
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/rollback-test",
+        ])
+        .output()
+        .expect("run git rev-parse for rolled-back branch");
+    assert!(
+        !branch_check.status.success(),
+        "rollback should delete the branch created in repo A"
+    );
+
+    // With the branch gone, retrying the same create succeeds.
+    let workbench = create_workbench(&mut fixture.client, &parent, "rollback-test").await;
+    assert!(worktree_a.is_dir(), "retried create should make worktree A");
+    assert!(
+        expected_worktree_path(repo_b.path(), "rollback-test").is_dir(),
+        "retried create should make worktree B"
+    );
+    match &workbench.source {
+        ProjectSource::GitWorkbench { branch, .. } => assert_eq!(branch.0, "rollback-test"),
+        other => panic!("expected GitWorkbench source, got {other:?}"),
+    }
 }
 
 #[tokio::test]
-async fn workbench_remove_rejects_missing_worktree_path() {
+async fn workbench_remove_succeeds_when_worktree_dir_was_deleted_out_of_band() {
     let mut fixture = Fixture::new().await;
     let repo = init_git_repo("missing-worktree");
     let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
@@ -515,6 +548,9 @@ async fn workbench_remove_rejects_missing_worktree_path() {
     let worktree_root = PathBuf::from(project_roots(&workbench)[0].clone());
     fs::remove_dir_all(&worktree_root).expect("remove worktree dir out of band");
 
+    // A worktree dir deleted out of band (manual `rm -rf`, or a half-failed
+    // earlier removal) must not brick the record: removal succeeds, prunes
+    // git's worktree bookkeeping, and deletes the store record.
     fixture
         .client
         .workbench_remove(WorkbenchRemovePayload {
@@ -522,9 +558,98 @@ async fn workbench_remove_rejects_missing_worktree_path() {
         })
         .await
         .expect("workbench_remove write failed");
-    let error = expect_command_error(&mut fixture.client, "missing worktree remove").await;
+    match expect_project_notify(&mut fixture.client, "missing worktree remove").await {
+        ProjectNotifyPayload::Delete { project } => assert_eq!(project.id, workbench.id),
+        other => panic!("expected workbench delete, got {other:?}"),
+    }
+
+    let worktrees = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .expect("run git worktree list");
+    assert!(worktrees.status.success());
+    assert!(
+        !String::from_utf8_lossy(&worktrees.stdout)
+            .contains(worktree_root.to_string_lossy().as_ref()),
+        "git worktree bookkeeping should be pruned for the missing worktree"
+    );
+}
+
+#[tokio::test]
+async fn workbench_remove_rejects_team_member_reference() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo("team-blocker");
+    let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
+    let workbench = create_workbench(&mut fixture.client, &parent, "team-blocker").await;
+
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Claude],
+            },
+        })
+        .await
+        .expect("set enabled backends failed");
+    let custom_agent = CustomAgent {
+        id: CustomAgentId("workbench-team-agent".to_owned()),
+        name: "Workbench team agent".to_owned(),
+        description: "workbench team agent".to_owned(),
+        instructions: None,
+        skill_ids: Vec::new(),
+        mcp_server_ids: Vec::new(),
+        tool_policy: ToolPolicy::Unrestricted,
+    };
+    fixture
+        .client
+        .custom_agent_upsert(CustomAgentUpsertPayload {
+            custom_agent: custom_agent.clone(),
+        })
+        .await
+        .expect("custom_agent_upsert failed");
+    fixture
+        .client
+        .team_create(TeamCreatePayload {
+            name: "Workbench team".to_owned(),
+            manager: TeamMemberCreateSpec {
+                name: "manager".to_owned(),
+                description: "manager description".to_owned(),
+                profile: None,
+                custom_agent_id: Some(custom_agent.id.clone()),
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                project_ids: vec![workbench.id.clone()],
+            },
+        })
+        .await
+        .expect("team_create failed");
+
+    // Removing a workbench referenced by a team member would persist a
+    // dangling ProjectId in agent_teams.json and brick the next boot.
+    fixture
+        .client
+        .workbench_remove(WorkbenchRemovePayload {
+            id: workbench.id.clone(),
+        })
+        .await
+        .expect("workbench_remove write failed");
+    let error: CommandErrorPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::CommandError,
+        "team member blocker",
+    )
+    .await
+    .parse_payload()
+    .expect("parse CommandError");
     assert_eq!(error.operation, "workbench_remove");
-    assert_eq!(error.code, CommandErrorCode::NotFound);
+    assert_eq!(error.code, CommandErrorCode::Conflict);
+    assert!(
+        error.message.contains("team member"),
+        "unexpected error message: {}",
+        error.message
+    );
 }
 
 #[tokio::test]
@@ -554,6 +679,10 @@ async fn workbench_remove_rejects_live_agent_live_terminal_session_and_steering_
         })
         .await
         .expect("spawn live workbench agent");
+    // No AgentStart wait is needed before attempting removal: the agent is
+    // inserted into the host registry (with its project_id) synchronously
+    // under the host state lock before the NewAgent frame is emitted, so
+    // receiving NewAgent guarantees the live-agent blocker sees it.
     let _ = expect_kind(
         &mut fixture.client,
         FrameKind::NewAgent,
@@ -630,6 +759,10 @@ async fn workbench_remove_rejects_live_agent_live_terminal_session_and_steering_
         })
         .await
         .expect("spawn session agent");
+    // No AgentStart wait is needed here either (registration is synchronous
+    // before the NewAgent echo); the session blocker additionally relies on
+    // the ChatEvent + AgentClosed waits below, which guarantee the session
+    // record is persisted before removal is attempted.
     let new_agent: NewAgentPayload = expect_kind(
         &mut fixture.client,
         FrameKind::NewAgent,

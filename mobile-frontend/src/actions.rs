@@ -663,7 +663,7 @@ pub async fn discard_team_draft(
 pub async fn start_host_browse(
     state: &AppState,
     host: &LocalHostId,
-    initial: Option<protocol::HostAbsPath>,
+    initial: protocol::HostBrowseInitial,
     include_hidden: bool,
 ) -> Result<protocol::StreamPath, String> {
     let browse_stream = new_browse_stream();

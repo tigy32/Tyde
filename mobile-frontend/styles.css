@@ -230,7 +230,7 @@ input, textarea, select {
     padding: 5px 9px;
     background: var(--accent-error-bg);
     border: 1px solid var(--accent-error);
-    border-radius: var(--radius-full);
+    border-radius: var(--radius-lg);
     box-shadow: var(--shadow-sm);
     color: var(--accent-error);
 }
@@ -239,6 +239,13 @@ input, textarea, select {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+/* Error messages carry diagnostics (e.g. which protocol version the client
+   sent) — wrap instead of ellipsizing so the tail is readable on a phone. */
+.connection-banner-inner.error .status-text {
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 .status-dot {
@@ -1728,6 +1735,15 @@ input, textarea, select {
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
+}
+
+/* Workbench (git worktree) rows nest beneath their parent project:
+   indented with a connector edge so the attachment reads at a glance.
+   Display only — mobile cannot create or remove workbenches. */
+.project-list-item-workbench {
+    margin-left: var(--space-4);
+    padding-left: var(--space-2);
+    border-left: 2px solid var(--border-default);
 }
 
 .project-card {

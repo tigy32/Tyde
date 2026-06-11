@@ -6,8 +6,8 @@ use protocol::{
     AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, CancelQueuedMessagePayload,
     ClientErrorCode, ClientErrorPayload, CustomAgentDeletePayload, CustomAgentUpsertPayload,
     DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FrameKind, HostBrowseClosePayload,
-    HostBrowseListPayload, HostBrowseStartPayload, InterruptPayload, ListSessionsPayload,
-    McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceRenamePayload,
+    HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload, InterruptPayload,
+    ListSessionsPayload, McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceRenamePayload,
     MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingStartPayload,
     ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
@@ -340,8 +340,18 @@ pub(crate) async fn route_client_envelope(
                         ),
                     ));
                 }
-                if let Some(initial) = payload.initial.as_ref() {
-                    ensure_non_empty("host_browse_start", "initial", initial.0.as_str())?;
+                match &payload.initial {
+                    HostBrowseInitial::Home => {}
+                    HostBrowseInitial::Path { path } => {
+                        ensure_non_empty("host_browse_start", "initial.path", path.0.as_str())?;
+                    }
+                    HostBrowseInitial::ProjectRoots { project_id } => {
+                        ensure_non_empty(
+                            "host_browse_start",
+                            "initial.project_id",
+                            project_id.0.as_str(),
+                        )?;
+                    }
                 }
                 host.open_browse_stream(connection_host_stream, host_output_stream, payload)
                     .await?;

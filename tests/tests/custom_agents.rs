@@ -130,16 +130,9 @@ async fn raw_next_event(client: &mut client::Connection, context: &str) -> Envel
 }
 
 fn builtin_team_custom_agent_ids() -> HashSet<&'static str> {
-    [
-        "tyde-team-lead",
-        "tyde-code-reviewer",
-        "tyde-frontend-engineer",
-        "tyde-backend-engineer",
-        "tyde-test-qa-engineer",
-        "tyde-debugger",
-    ]
-    .into_iter()
-    .collect()
+    ["tyde-default", "tyde-team-lead", "tyde-help"]
+        .into_iter()
+        .collect()
 }
 
 fn collect_builtin_team_custom_agents_from_bootstrap(
@@ -383,36 +376,59 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
     let builtins = collect_builtin_team_custom_agents_from_bootstrap(&fixture.bootstrap);
     assert_eq!(
         builtins.len(),
-        6,
-        "expected six built-in team custom agents: {builtins:?}"
+        3,
+        "expected Default, Orchestrator, and Help builtins: {builtins:?}"
     );
-    let reviewer_id = CustomAgentId("tyde-code-reviewer".to_owned());
-    let reviewer = builtins
-        .get(&reviewer_id)
-        .expect("built-in Code Reviewer should be seeded");
-    assert_eq!(reviewer.name, "Code Reviewer");
+    let default = builtins
+        .get(&CustomAgentId("tyde-default".to_owned()))
+        .expect("built-in Default should be seeded");
+    assert_eq!(default.name, "Default");
+    assert_eq!(
+        default.instructions, None,
+        "Default starts uncustomized: {default:?}"
+    );
+    let orchestrator_id = CustomAgentId("tyde-team-lead".to_owned());
+    let orchestrator = builtins
+        .get(&orchestrator_id)
+        .expect("built-in Orchestrator should be seeded");
+    assert_eq!(orchestrator.name, "Orchestrator");
     assert!(
-        reviewer
+        orchestrator
             .instructions
             .as_deref()
-            .is_some_and(|instructions| instructions.contains("Review workflow")),
-        "Code Reviewer should start with review defaults: {reviewer:?}"
+            .is_some_and(|instructions| instructions.contains("Multi-backend orchestration")),
+        "Orchestrator should describe multi-backend workflows: {orchestrator:?}"
     );
-    let debugger = builtins
-        .get(&CustomAgentId("tyde-debugger".to_owned()))
-        .expect("built-in Debugger should be seeded");
-    assert_eq!(debugger.name, "Debugger");
+    let help = builtins
+        .get(&CustomAgentId("tyde-help".to_owned()))
+        .expect("built-in Help should be seeded");
+    assert_eq!(help.name, "Help");
     assert!(
-        debugger
-            .instructions
+        help.instructions
             .as_deref()
-            .is_some_and(|instructions| instructions.contains("Form theories")),
-        "Debugger should start with debugging defaults: {debugger:?}"
+            .is_some_and(|instructions| instructions.contains("tyde-config")),
+        "Help should reference its config tools: {help:?}"
     );
+    for deprecated in [
+        "tyde-code-reviewer",
+        "tyde-frontend-engineer",
+        "tyde-backend-engineer",
+        "tyde-test-qa-engineer",
+        "tyde-debugger",
+    ] {
+        assert!(
+            !fixture
+                .bootstrap
+                .custom_agents
+                .iter()
+                .any(|agent| agent.id.0 == deprecated),
+            "deprecated builtin {deprecated} must not be seeded on a fresh install"
+        );
+    }
 
-    let mut edited = reviewer.clone();
-    edited.description = "Custom review policy".to_owned();
-    edited.instructions = Some("Always check migration tests before approval.".to_owned());
+    let mut edited = orchestrator.clone();
+    edited.description = "Custom orchestration policy".to_owned();
+    edited.instructions = Some("Always plan with two backends before coding.".to_owned());
     fixture
         .client
         .custom_agent_upsert(CustomAgentUpsertPayload {
@@ -420,15 +436,18 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         })
         .await
         .expect("custom_agent_upsert built-in override failed");
-    let notified =
-        expect_custom_agent_upsert_raw(&mut fixture.client, &reviewer_id, "edited built-in upsert")
-            .await;
+    let notified = expect_custom_agent_upsert_raw(
+        &mut fixture.client,
+        &orchestrator_id,
+        "edited built-in upsert",
+    )
+    .await;
     assert_eq!(notified, edited);
 
     let (_fresh, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
     let replayed = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap);
     assert_eq!(
-        replayed.get(&reviewer_id),
+        replayed.get(&orchestrator_id),
         Some(&edited),
         "built-in seeding must not overwrite user edits"
     );

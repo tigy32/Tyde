@@ -13,10 +13,10 @@ use protocol::types::{
 use protocol::{
     AgentControlStatus, AgentId, AgentInput, AgentOrigin, AgentStartPayload, BackendSetupPayload,
     BrowseBootstrapListing, BrowseBootstrapPayload, CustomAgent, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, GitBranchName,
-    HostBootstrapPayload, HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload,
-    ImageData, McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
-    McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, GitBranchName, HostAbsPath,
+    HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
+    HostSettingsPayload, ImageData, McpServerConfig, McpServerDeletePayload, McpServerId,
+    McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
     MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
     ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
@@ -62,6 +62,7 @@ use crate::backend::{
     validate_session_settings_values,
 };
 use crate::browse_stream;
+use crate::config_mcp::ConfigMcpHandle;
 use crate::debug_mcp::DebugMcpHandle;
 use crate::error::{AppError, AppResult};
 use crate::mobile_access::{
@@ -192,6 +193,7 @@ pub(crate) struct HostState {
     pub use_mock_backend: bool,
     pub debug_mcp: DebugMcpHandle,
     pub agent_control_mcp: AgentControlMcpHandle,
+    pub config_mcp: ConfigMcpHandle,
     pub review_mcp: ReviewMcpHandle,
     pub mobile_access: MobileAccessHandle,
     kiro_session_schema: KiroSessionSchemaState,
@@ -201,6 +203,11 @@ pub(crate) struct HostState {
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
     browse_streams: HashMap<(StreamPath, StreamPath), Stream>,
     workbench_parent_locks: HashMap<ProjectId, Weak<Mutex<()>>>,
+    /// Workbench projects currently being removed. Removal validates
+    /// blockers against a snapshot and then runs slow git subprocesses
+    /// outside the state lock; agent spawns and terminal creation check
+    /// this set so they cannot race into a half-removed workbench.
+    removing_projects: HashSet<ProjectId>,
 }
 
 impl Drop for HostState {
@@ -417,6 +424,46 @@ impl HostHandle {
                 Ok(false) => {}
                 Err(err) => {
                     tracing::warn!(%err, "failed to seed installed backends on first run")
+                }
+            }
+        }
+
+        // Pare-back: drop deprecated builtin custom agents (the old specialist
+        // set) when the stored copy is an unedited published version and no
+        // team member references it. User-edited copies and agents in use by
+        // teams are preserved. Idempotent, so re-running per registration is
+        // harmless.
+        {
+            let referenced: std::collections::HashSet<String> =
+                match state.team_registry.snapshot().await {
+                    Ok(snapshot) => snapshot
+                        .members
+                        .iter()
+                        .filter_map(|member| member.custom_agent_id.as_ref())
+                        .map(|id| id.0.clone())
+                        .collect(),
+                    Err(err) => {
+                        tracing::warn!(%err, "skipping builtin agent pare-back: no team snapshot");
+                        std::collections::HashSet::new()
+                    }
+                };
+            let custom_agents = state.custom_agent_store.lock().await;
+            for id in crate::store::custom_agents::deprecated_builtin_custom_agent_ids() {
+                if referenced.contains(id) {
+                    continue;
+                }
+                let agent_id = protocol::CustomAgentId(id.to_owned());
+                let Some(record) = custom_agents.get(&agent_id) else {
+                    continue;
+                };
+                if !crate::store::custom_agents::is_superseded_builtin(&record) {
+                    continue;
+                }
+                match custom_agents.delete(&agent_id) {
+                    Ok(_) => tracing::info!(%agent_id, "removed deprecated builtin custom agent"),
+                    Err(err) => {
+                        tracing::warn!(%agent_id, %err, "failed to remove deprecated builtin")
+                    }
                 }
             }
         }
@@ -1498,6 +1545,8 @@ impl HostHandle {
             use_mock_backend,
             debug_mcp,
             agent_control_mcp,
+            config_mcp,
+            removing_projects,
             parent_session_id,
         ) = {
             let state = self.state.lock().await;
@@ -1512,6 +1561,8 @@ impl HostHandle {
                 state.use_mock_backend,
                 state.debug_mcp.clone(),
                 state.agent_control_mcp.clone(),
+                state.config_mcp.clone(),
+                state.removing_projects.clone(),
                 payload.parent_agent_id.as_ref().map(|agent_id| {
                     if let Some(session_id) = state.agent_sessions.get(agent_id).cloned() {
                         Ok(session_id)
@@ -1555,7 +1606,15 @@ impl HostHandle {
             } => {
                 let (project_id, missing_project_failure) = match payload.project_id.clone() {
                     Some(project_id) => {
-                        if project_store.lock().await.get(&project_id).is_some() {
+                        if removing_projects.contains(&project_id) {
+                            (
+                                None,
+                                Some(format!(
+                                    "cannot spawn agent in workbench {} because it is being removed",
+                                    project_id
+                                )),
+                            )
+                        } else if project_store.lock().await.get(&project_id).is_some() {
                             (Some(project_id), None)
                         } else {
                             (
@@ -1574,6 +1633,8 @@ impl HostHandle {
                     &workspace_roots,
                     &debug_mcp,
                     &agent_control_mcp,
+                    &config_mcp,
+                    payload.custom_agent_id.as_ref(),
                 );
                 let requested_custom_agent_id = payload.custom_agent_id.clone();
                 let (
@@ -1732,7 +1793,13 @@ impl HostHandle {
                 let requested_project_id = payload.project_id.or(record.project_id.clone());
                 let (project_id, missing_project_warning) = match requested_project_id {
                     Some(project_id) => {
-                        if project_store.lock().await.get(&project_id).is_some() {
+                        if removing_projects.contains(&project_id) {
+                            let warning = format!(
+                                "workbench {} is being removed; resuming without a project",
+                                project_id
+                            );
+                            (None, Some(warning))
+                        } else if project_store.lock().await.get(&project_id).is_some() {
                             (Some(project_id), None)
                         } else {
                             let warning = format!(
@@ -1749,6 +1816,8 @@ impl HostHandle {
                     &record.workspace_roots,
                     &debug_mcp,
                     &agent_control_mcp,
+                    &config_mcp,
+                    record.custom_agent_id.as_ref(),
                 );
                 let (
                     effective_custom_agent_id,
@@ -2003,7 +2072,13 @@ impl HostHandle {
                 let requested_project_id = record.project_id.clone();
                 let (project_id, missing_project_warning) = match requested_project_id {
                     Some(project_id) => {
-                        if project_store.lock().await.get(&project_id).is_some() {
+                        if removing_projects.contains(&project_id) {
+                            let warning = format!(
+                                "workbench {} is being removed; forking without a project",
+                                project_id
+                            );
+                            (None, Some(warning))
+                        } else if project_store.lock().await.get(&project_id).is_some() {
                             (Some(project_id), None)
                         } else {
                             let warning = format!(
@@ -2022,6 +2097,8 @@ impl HostHandle {
                     &workspace_roots,
                     &debug_mcp,
                     &agent_control_mcp,
+                    &config_mcp,
+                    record.custom_agent_id.as_ref(),
                 );
                 let (
                     effective_custom_agent_id,
@@ -2638,6 +2715,7 @@ impl HostHandle {
                 .delete(&payload.id)
                 .map_err(|error| project_store_error(OPERATION, error))?
         };
+        cleanup_reviews_for_deleted_project(&state.review_registry, &payload.id).await;
         if let Some(subscription) = state.project_streams.remove(&payload.id) {
             subscription.task.abort();
         }
@@ -2688,15 +2766,16 @@ impl HostHandle {
             ));
         }
 
-        let roots = compute_workbench_roots(parent_roots, &payload.branch)?;
-        preflight_workbench_create(&project_store, &parent, &payload.branch, &roots).await?;
+        let branch = payload.branch.clone();
+        let roots = compute_workbench_roots(parent_roots, &branch)?;
+        preflight_workbench_create(&project_store, &parent, &branch, &roots).await?;
 
         let mut created = Vec::<WorkbenchRoot>::new();
         for root in &roots {
             if let Err(error) =
-                git_worktree_add(&root.parent_root, &root.worktree_root, &payload.branch).await
+                git_worktree_add(&root.parent_root, &root.worktree_root, &branch).await
             {
-                let rollback_message = rollback_created_worktrees(&created).await;
+                let rollback_message = rollback_created_worktrees(&created, &branch).await;
                 let message = append_rollback_message(error, rollback_message);
                 return Err(AppError::internal_message(
                     OPERATION,
@@ -2717,7 +2796,7 @@ impl HostHandle {
             ) {
                 Ok(project) => project,
                 Err(error) => {
-                    let rollback_message = rollback_created_worktrees(&created).await;
+                    let rollback_message = rollback_created_worktrees(&created, &branch).await;
                     let message = append_rollback_message(error.to_string(), rollback_message);
                     return Err(project_store_error(OPERATION, error.with_message(message)));
                 }
@@ -2727,17 +2806,15 @@ impl HostHandle {
         let project_id = project.id.clone();
         let mut state = self.state.lock().await;
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
+        // The workbench record and worktrees already exist and the Upsert
+        // has fanned out, so a project-actor failure here must not fail
+        // the request (mirrors create_project): warn and return success.
         if let Err(error) = ensure_project_actor(&mut state, project_id.clone()).await {
             tracing::warn!(
                 project_id = %project_id,
                 error = %error,
                 "failed to start project actor after workbench creation"
             );
-            return Err(AppError::internal_message(
-                OPERATION,
-                error.clone(),
-                anyhow!(error),
-            ));
         }
         let host_paths = state.host_streams.keys().cloned().collect::<Vec<_>>();
         for host_path in host_paths {
@@ -2791,14 +2868,71 @@ impl HostHandle {
         let parent_lock = self.workbench_parent_lock(parent_project_id).await;
         let _parent_guard = parent_lock.lock().await;
 
-        self.validate_workbench_remove_blockers(&project).await?;
+        // Mark the workbench as being removed before validating blockers
+        // so agent spawns and terminal creation reject it while the slow
+        // git subprocesses below run outside the host state lock. The
+        // marker is cleared on every exit path (success or failure) by
+        // the wrapper below.
+        {
+            let mut state = self.state.lock().await;
+            if !state.removing_projects.insert(payload.id.clone()) {
+                return Err(AppError::conflict(
+                    OPERATION,
+                    format!("workbench {} is already being removed", payload.id),
+                ));
+            }
+        }
+        let result = self
+            .remove_workbench_marked(&payload, &project, roots, &project_store)
+            .await;
+        self.state
+            .lock()
+            .await
+            .removing_projects
+            .remove(&payload.id);
+        result
+    }
+
+    async fn remove_workbench_marked(
+        &self,
+        payload: &WorkbenchRemovePayload,
+        project: &Project,
+        roots: &[WorkbenchRoot],
+        project_store: &Arc<Mutex<ProjectStore>>,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "workbench_remove";
+        self.validate_workbench_remove_blockers(project).await?;
 
         for root in roots {
-            git_worktree_remove(&root.parent_root, &root.worktree_root)
+            let exists = tokio::fs::try_exists(&root.worktree_root.0)
                 .await
-                .map_err(|error| {
-                    AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
-                })?;
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+            if exists {
+                git_worktree_remove(&root.parent_root, &root.worktree_root)
+                    .await
+                    .map_err(|error| {
+                        AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+                    })?;
+            } else {
+                // The worktree dir was deleted out of band (or by an
+                // earlier half-failed removal); prune git's worktree
+                // bookkeeping in the parent repo and keep going so the
+                // record can still be removed. A retry after a partial
+                // failure lands here and succeeds.
+                tracing::warn!(
+                    project_id = %project.id,
+                    worktree_root = %root.worktree_root,
+                    "worktree root missing during workbench removal; pruning git worktree bookkeeping"
+                );
+                if let Err(error) = git_worktree_prune(&root.parent_root).await {
+                    tracing::warn!(
+                        project_id = %project.id,
+                        parent_root = %root.parent_root,
+                        error = %error,
+                        "failed to prune git worktrees for missing worktree root"
+                    );
+                }
+            }
         }
 
         let deleted = {
@@ -2809,6 +2943,7 @@ impl HostHandle {
         };
 
         let mut state = self.state.lock().await;
+        cleanup_reviews_for_deleted_project(&state.review_registry, &payload.id).await;
         if let Some(subscription) = state.project_streams.remove(&payload.id) {
             subscription.task.abort();
         }
@@ -2837,7 +2972,14 @@ impl HostHandle {
             ));
         };
 
-        let (agent_handles, terminal_handles, session_store, steering_store, project_store) = {
+        let (
+            agent_handles,
+            terminal_handles,
+            session_store,
+            steering_store,
+            project_store,
+            team_registry,
+        ) = {
             let state = self.state.lock().await;
             let agent_handles = state
                 .registry
@@ -2852,6 +2994,7 @@ impl HostHandle {
                 Arc::clone(&state.session_store),
                 Arc::clone(&state.steering_store),
                 Arc::clone(&state.project_store),
+                state.team_registry.clone(),
             )
         };
 
@@ -2914,6 +3057,29 @@ impl HostHandle {
             ));
         }
 
+        let snapshot = team_registry
+            .snapshot()
+            .await
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        let referenced_team_members = snapshot
+            .members
+            .iter()
+            .filter(|member| member.project_ids.contains(&project.id))
+            .map(|member| member.id.clone())
+            .collect::<Vec<_>>();
+        if !referenced_team_members.is_empty() {
+            return Err(AppError::conflict(
+                OPERATION,
+                referenced_team_member_delete_message(
+                    "workbench",
+                    &project.id,
+                    Some(project.name.as_str()),
+                    &snapshot,
+                    &referenced_team_members,
+                ),
+            ));
+        }
+
         let parent = {
             let project_store = project_store.lock().await;
             project_store.get(parent_project_id).ok_or_else(|| {
@@ -2953,19 +3119,20 @@ impl HostHandle {
                     anyhow!("workbench parent root is missing"),
                 ));
             }
-            let exists = tokio::fs::try_exists(&root.worktree_root.0)
-                .await
-                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-            if !exists {
-                return Err(AppError::not_found(
-                    OPERATION,
-                    format!("worktree root {} is missing", root.worktree_root),
-                ));
-            }
         }
 
         let mut dirty_roots = Vec::new();
         for root in roots {
+            let exists = tokio::fs::try_exists(&root.worktree_root.0)
+                .await
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+            if !exists {
+                // The worktree dir was deleted out of band (or by an
+                // earlier half-failed removal). Treat it as removable
+                // rather than blocking: removal prunes git bookkeeping
+                // and deletes the record, so retries are the recourse.
+                continue;
+            }
             let status = git_status_porcelain(&root.worktree_root)
                 .await
                 .map_err(|error| {
@@ -3222,6 +3389,24 @@ impl HostHandle {
     ) -> Result<TeamDescribeData, String> {
         let registry = { self.state.lock().await.team_registry.clone() };
         registry.describe_for_agent(agent_id).await
+    }
+
+    pub(crate) async fn list_custom_agents(&self) -> Result<Vec<CustomAgent>, String> {
+        let store = { Arc::clone(&self.state.lock().await.custom_agent_store) };
+        let agents = store.lock().await.list()?;
+        Ok(agents)
+    }
+
+    pub(crate) async fn list_skills(&self) -> Result<Vec<protocol::Skill>, String> {
+        let store = { Arc::clone(&self.state.lock().await.skill_store) };
+        let skills = store.lock().await.list()?;
+        Ok(skills)
+    }
+
+    pub(crate) async fn list_mcp_servers(&self) -> Result<Vec<protocol::McpServerConfig>, String> {
+        let store = { Arc::clone(&self.state.lock().await.mcp_server_store) };
+        let servers = store.lock().await.list()?;
+        Ok(servers)
     }
 
     pub(crate) async fn custom_agent_by_id(
@@ -4099,6 +4284,19 @@ impl HostHandle {
             Arc::clone(&state.project_store)
         };
         let launch = resolve_terminal_launch(&project_store, payload).await?;
+        let launch_project_id = launch.project_id.clone();
+        if let Some(project_id) = launch_project_id.as_ref() {
+            let state = self.state.lock().await;
+            if state.removing_projects.contains(project_id) {
+                return Err(AppError::conflict(
+                    OPERATION,
+                    format!(
+                        "cannot create terminal in workbench {} because it is being removed",
+                        project_id
+                    ),
+                ));
+            }
+        }
         let terminal_id = TerminalId(Uuid::new_v4().to_string());
         let terminal_stream_path = StreamPath(format!("/terminal/{}", terminal_id));
         let terminal_output_stream = host_output_stream.with_path(terminal_stream_path.clone());
@@ -4108,6 +4306,24 @@ impl HostHandle {
 
         {
             let mut state = self.state.lock().await;
+            // Re-check under the same lock that guards `terminal_streams`:
+            // workbench removal inserts into `removing_projects` before it
+            // validates blockers, so either this terminal is registered in
+            // time for the blocker check to see it, or the removal marker
+            // is visible here and the terminal is rejected.
+            if let Some(project_id) = launch_project_id.as_ref()
+                && state.removing_projects.contains(project_id)
+            {
+                drop(state);
+                terminal.close().await;
+                return Err(AppError::conflict(
+                    OPERATION,
+                    format!(
+                        "cannot create terminal in workbench {} because it is being removed",
+                        project_id
+                    ),
+                ));
+            }
             let previous = state.terminal_streams.insert(
                 (connection_host_stream.clone(), terminal_id),
                 terminal.clone(),
@@ -4582,6 +4798,8 @@ impl HostHandle {
                 ),
             ));
         }
+        let home = browse_stream::home_dir();
+        let initial = self.resolve_browse_initial(payload.initial, &home).await;
         let browse_stream = host_output_stream.with_path(browse_stream_path.clone());
 
         {
@@ -4601,8 +4819,7 @@ impl HostHandle {
             }
         }
 
-        let initial = payload.initial.unwrap_or_else(browse_stream::home_dir);
-        let opened = browse_stream::opened_payload(&initial);
+        let opened = browse_stream::opened_payload(&home);
         let listing = match browse_stream::list_dir(&initial, payload.include_hidden).await {
             Ok(entries) => BrowseBootstrapListing::Entries { entries },
             Err(error) => BrowseBootstrapListing::Error { error },
@@ -4617,6 +4834,32 @@ impl HostHandle {
             })?;
         let _ = browse_stream.send_value(FrameKind::BrowseBootstrap, payload);
         Ok(())
+    }
+
+    /// Resolve the client's browse-start intent to a concrete directory.
+    /// `ProjectRoots` falls back to home when the project is unknown or its
+    /// roots have no useful common ancestor — the browser should still open.
+    async fn resolve_browse_initial(
+        &self,
+        initial: HostBrowseInitial,
+        home: &HostAbsPath,
+    ) -> HostAbsPath {
+        match initial {
+            HostBrowseInitial::Home => home.clone(),
+            HostBrowseInitial::Path { path } => path,
+            HostBrowseInitial::ProjectRoots { project_id } => {
+                let project = {
+                    let state = self.state.lock().await;
+                    let project_store = state.project_store.lock().await;
+                    project_store.get(&project_id)
+                };
+                project
+                    .and_then(|project| {
+                        browse_stream::project_roots_initial_path(&project.root_paths())
+                    })
+                    .unwrap_or_else(|| home.clone())
+            }
+        }
     }
 
     pub(crate) async fn list_browse_dir(
@@ -5263,6 +5506,7 @@ impl HostHandle {
             use_mock_backend,
             debug_mcp,
             agent_control_mcp,
+            config_mcp,
         ) = {
             let state = self.state.lock().await;
             let project = state
@@ -5283,6 +5527,7 @@ impl HostHandle {
                 state.use_mock_backend,
                 state.debug_mcp.clone(),
                 state.agent_control_mcp.clone(),
+                state.config_mcp.clone(),
             )
         };
         let project_roots = project
@@ -5306,6 +5551,8 @@ impl HostHandle {
             &project_roots,
             &debug_mcp,
             &agent_control_mcp,
+            &config_mcp,
+            None,
         );
         let mut resolved_spawn_config = {
             let custom_agents = custom_agent_store.lock().await;
@@ -5985,7 +6232,10 @@ async fn git_status_porcelain(worktree_root: &ProjectRootPath) -> Result<String,
         .map_err(|error| format!("git status output was not valid UTF-8: {error}"))
 }
 
-async fn rollback_created_worktrees(created: &[WorkbenchRoot]) -> Option<String> {
+async fn rollback_created_worktrees(
+    created: &[WorkbenchRoot],
+    branch: &GitBranchName,
+) -> Option<String> {
     let mut failures = Vec::new();
     for root in created.iter().rev() {
         match run_git(
@@ -6005,11 +6255,60 @@ async fn rollback_created_worktrees(created: &[WorkbenchRoot]) -> Option<String>
                 root.worktree_root, error
             )),
         }
+        // `git worktree add -b` created this branch in the parent repo;
+        // delete it so retrying the identical create passes the
+        // branch-exists preflight. The branch still points at the parent
+        // HEAD (no work happened), so `-D` cannot lose anything.
+        match run_git(&root.parent_root, &["branch", "-D", &branch.0]).await {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => failures.push(format!(
+                "rollback git branch -D {} failed for {}: {}",
+                branch,
+                root.parent_root,
+                git_output_message(&output)
+            )),
+            Err(error) => failures.push(format!(
+                "rollback git branch -D {} failed for {}: {}",
+                branch, root.parent_root, error
+            )),
+        }
     }
     if failures.is_empty() {
         None
     } else {
         Some(failures.join("; "))
+    }
+}
+
+async fn git_worktree_prune(parent_root: &ProjectRootPath) -> Result<(), String> {
+    let output = run_git(parent_root, &["worktree", "prune"]).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "git worktree prune failed for parent root {}: {}",
+        parent_root,
+        git_output_message(&output)
+    ))
+}
+
+async fn cleanup_reviews_for_deleted_project(
+    review_registry: &ReviewRegistryHandle,
+    project_id: &ProjectId,
+) {
+    match review_registry.delete_for_project(project_id.clone()).await {
+        Ok(removed) if removed.is_empty() => {}
+        Ok(removed) => tracing::info!(
+            project_id = %project_id,
+            review_count = removed.len(),
+            review_ids = ?removed,
+            "deleted persisted reviews referencing removed project"
+        ),
+        Err(error) => tracing::warn!(
+            project_id = %project_id,
+            error = %error,
+            "failed to delete persisted reviews referencing removed project"
+        ),
     }
 }
 
@@ -6435,6 +6734,7 @@ fn spawn_host_inner(
     // server. The MCP server runs on its own thread and accesses the host
     // through the cloned handle.
     let agent_control_mcp_placeholder = AgentControlMcpHandle { url: String::new() };
+    let config_mcp_placeholder = ConfigMcpHandle { url: String::new() };
     let review_mcp_placeholder = ReviewMcpHandle { url: String::new() };
     let host = HostHandle {
         state: Arc::new(Mutex::new(HostState {
@@ -6453,6 +6753,7 @@ fn spawn_host_inner(
             use_mock_backend,
             debug_mcp,
             agent_control_mcp: agent_control_mcp_placeholder,
+            config_mcp: config_mcp_placeholder,
             review_mcp: review_mcp_placeholder,
             mobile_access: mobile_access.clone(),
             kiro_session_schema: KiroSessionSchemaState::Pending,
@@ -6462,6 +6763,7 @@ fn spawn_host_inner(
             terminal_streams: HashMap::new(),
             browse_streams: HashMap::new(),
             workbench_parent_locks: HashMap::new(),
+            removing_projects: HashSet::new(),
         })),
     };
 
@@ -6500,6 +6802,21 @@ fn spawn_host_inner(
         .try_lock()
         .expect("newly created host state must be unlocked")
         .agent_control_mcp = agent_control_mcp;
+
+    let config_mcp = match crate::config_mcp::start_server(None, host.clone()) {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(
+                "config MCP server unavailable; continuing without it: {}",
+                err
+            );
+            ConfigMcpHandle { url: String::new() }
+        }
+    };
+    host.state
+        .try_lock()
+        .expect("newly created host state must be unlocked")
+        .config_mcp = config_mcp;
 
     let review_mcp =
         match crate::review_mcp::start_server(runtime_config.review_mcp_bind_addr, host.clone()) {
@@ -6749,8 +7066,25 @@ pub(crate) fn startup_mcp_servers_for_settings(
     workspace_roots: &[String],
     debug_mcp: &DebugMcpHandle,
     agent_control_mcp: &AgentControlMcpHandle,
+    config_mcp: &ConfigMcpHandle,
+    custom_agent_id: Option<&protocol::CustomAgentId>,
 ) -> Vec<StartupMcpServer> {
     let mut servers = Vec::new();
+
+    // The builtin Help agent gets the host-configuration tools; no other
+    // agent does.
+    if custom_agent_id.is_some_and(|id| id.0 == crate::store::custom_agents::HELP_CUSTOM_AGENT_ID)
+        && !config_mcp.url.is_empty()
+    {
+        servers.push(StartupMcpServer {
+            name: "tyde-config".to_string(),
+            transport: StartupMcpTransport::Http {
+                url: config_mcp.url.clone(),
+                headers: HashMap::new(),
+                bearer_token_env_var: None,
+            },
+        });
+    }
 
     if settings.tyde_debug_mcp_enabled {
         let mut headers = HashMap::new();
@@ -7847,6 +8181,56 @@ mod tests {
         ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec,
         ToolPolicy,
     };
+
+    #[test]
+    fn startup_mcp_servers_attach_config_only_to_help_agent() {
+        let settings = protocol::HostSettings {
+            enabled_backends: vec![BackendKind::Claude],
+            default_backend: Some(BackendKind::Claude),
+            enable_mobile_connections: false,
+            mobile_broker_url: None,
+            tyde_debug_mcp_enabled: false,
+            tyde_agent_control_mcp_enabled: false,
+            complexity_tiers_enabled: false,
+            backend_tier_configs: HashMap::new(),
+        };
+        let debug_mcp = DebugMcpHandle { url: String::new() };
+        let agent_control = AgentControlMcpHandle { url: String::new() };
+        let config_mcp = ConfigMcpHandle {
+            url: "http://127.0.0.1:9/mcp".to_owned(),
+        };
+
+        let help_id = CustomAgentId(crate::store::custom_agents::HELP_CUSTOM_AGENT_ID.to_owned());
+        let servers = startup_mcp_servers_for_settings(
+            &settings,
+            &[],
+            &debug_mcp,
+            &agent_control,
+            &config_mcp,
+            Some(&help_id),
+        );
+        assert_eq!(
+            servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["tyde-config"],
+            "help agent must get the config tools"
+        );
+
+        let other_id = CustomAgentId("ca-user".to_owned());
+        for custom_agent_id in [None, Some(&other_id)] {
+            let servers = startup_mcp_servers_for_settings(
+                &settings,
+                &[],
+                &debug_mcp,
+                &agent_control,
+                &config_mcp,
+                custom_agent_id,
+            );
+            assert!(
+                servers.iter().all(|s| s.name != "tyde-config"),
+                "non-help spawns must not get config tools: {custom_agent_id:?}"
+            );
+        }
+    }
 
     #[test]
     fn spawn_host_with_mock_backend_does_not_require_existing_tokio_runtime() {

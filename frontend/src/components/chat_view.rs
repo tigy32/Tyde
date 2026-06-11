@@ -69,6 +69,43 @@ fn restore_scroll_top_without_animation(el: &web_sys::HtmlElement, scroll_top: i
     );
 }
 
+/// Feature-discovery tips shown on empty chat drafts, keyed by tab id so
+/// each new chat surfaces the next one instead of repeating at random.
+const DID_YOU_KNOW_TIPS: &[(&str, &str)] = &[
+    (
+        "Multi-backend orchestration",
+        "Pick the Orchestrator agent from the New Chat \u{25be} menu: every backend drafts a plan, the plans cross-review to consensus, one agent implements, and the other backends review the result.",
+    ),
+    (
+        "Ask the Help agent",
+        "Pick Help from the New Chat \u{25be} menu to ask how anything in Tyde works \u{2014} it can change settings and create agents for you.",
+    ),
+    (
+        "Customize your default agent",
+        "Edit the Default agent in Settings \u{2192} Custom Agents to shape every chat that doesn't pick a specific agent.",
+    ),
+    (
+        "Task complexity tiers",
+        "Turn on tiers in Settings \u{2192} Backends to run cheap fast agents for small tasks and maximum-power agents for hard ones.",
+    ),
+    (
+        "Agent teams",
+        "The Teams panel builds a manager-plus-specialists roster that plans, implements, and reviews on your behalf.",
+    ),
+    (
+        "Command palette",
+        "\u{2318}K searches everything you can do in Tyde \u{2014} switching projects, opening panels, starting chats.",
+    ),
+    (
+        "Skills and steering",
+        "Settings \u{2192} Skills and Steering inject reusable guidance into every agent you spawn.",
+    ),
+    (
+        "Tyde on your phone",
+        "Pair a phone in Settings \u{2192} Mobile to watch and steer agents away from your desk.",
+    ),
+];
+
 #[component]
 pub fn ChatView(
     tab_id: TabId,
@@ -680,6 +717,15 @@ pub fn ChatView(
                                 <img class="chat-welcome-icon" src="icon.png" alt="Tyde" />
                                 <h2 class="chat-welcome-title">"Tyde"</h2>
                                 <p class="chat-welcome-subtitle">"Send a message to start a conversation"</p>
+                                <div class="chat-didyouknow">
+                                    <span class="chat-didyouknow-label">"Did you know?"</span>
+                                    <div class="chat-didyouknow-title">
+                                        {DID_YOU_KNOW_TIPS[tab_id.0 as usize % DID_YOU_KNOW_TIPS.len()].0}
+                                    </div>
+                                    <p class="chat-didyouknow-body">
+                                        {DID_YOU_KNOW_TIPS[tab_id.0 as usize % DID_YOU_KNOW_TIPS.len()].1}
+                                    </p>
+                                </div>
                                 <div class="chat-welcome-shortcuts">
                                     <span class="chat-welcome-shortcut"><kbd>"Enter"</kbd>" Send Message"</span>
                                     <span class="chat-welcome-shortcut"><kbd>"Ctrl+K"</kbd>" Command Palette"</span>
@@ -1150,6 +1196,46 @@ mod wasm_tests {
             },
             tool_requests: Vec::new(),
         }
+    }
+
+    /// A draft chat (no agent yet) surfaces a "Did you know?" feature tip on
+    /// the welcome screen; once the draft binds to a real agent the welcome
+    /// (and tip) give way to the conversation.
+    #[wasm_bindgen_test]
+    async fn draft_welcome_shows_did_you_know_tip_until_agent_binds() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let agent_ref: RwSignal<Option<ActiveAgentRef>> = RwSignal::new(None);
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            provide_context(state);
+            let is_active_signal: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView tab_id=TabId(10_003) agent_ref=agent_ref.into() is_active=is_active_signal /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Did you know?"),
+            "draft welcome must show a feature tip: {text}"
+        );
+        assert!(
+            DID_YOU_KNOW_TIPS
+                .iter()
+                .any(|(title, body)| text.contains(title) && text.contains(body)),
+            "tip content must come from the curated list: {text}"
+        );
+
+        agent_ref.set(Some(ActiveAgentRef {
+            host_id: "host-a".to_owned(),
+            agent_id: AgentId("agent-tip".to_owned()),
+        }));
+        next_tick().await;
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("Did you know?"),
+            "tip must disappear once the draft binds to an agent: {text}"
+        );
     }
 
     #[wasm_bindgen_test]

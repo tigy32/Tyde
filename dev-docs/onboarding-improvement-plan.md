@@ -48,6 +48,30 @@ Remaining work is tracked in the phases below — primarily backend sign-in
 *status detection*, rail legibility, and hiding the host concept for
 local-only users.
 
+## Round 3 (Mike's three ideas, 2026-06-10)
+
+- **Builtin agents pared to three**: Default / Orchestrator / Help
+  (`store/custom_agents.rs`). The old specialist set (Code Reviewer,
+  Frontend/Backend Engineer, Test/QA, Debugger) is no longer seeded; host
+  startup deletes a stored copy only when it is byte-identical to a
+  previously shipped version AND no team member references it. Team role
+  presets for specialists no longer pin a custom agent (members fall back to
+  the Default agent); the tech-lead preset still pins the Orchestrator.
+- **Orchestrator is now the multi-backend consensus prompt** (adapted from
+  Mike's): per-backend planning fanout → cross-review to consensus → single
+  write-access implementer → multi-backend review → verify; never end turn
+  while agents are pending (tyde_await_agents).
+- **Default agent is customizable**: plain spawns (no agent picked) resolve
+  the editable `tyde-default` record (`agent/customization.rs`); pickers
+  hide it since they already have a "Default agent" row.
+- **Help agent + tyde-config MCP** (`config_mcp.rs`): Help knows Tyde's
+  concepts and gets config tools (get/set settings, custom agent CRUD, list
+  skills / MCP servers, backend setup status) attached only to its spawns.
+  Sign-in/install remain user actions in the dock terminal.
+- **"Did you know?" tips** on empty chat drafts (`chat_view.rs`), rotating
+  by tab id through 8 feature-discovery tips (orchestration, Help agent,
+  tiers, teams, palette, skills, mobile, default-agent editing).
+
 ## TL;DR
 
 A new user must understand and configure **five concepts in the right order**

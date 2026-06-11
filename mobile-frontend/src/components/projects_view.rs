@@ -81,6 +81,17 @@ pub fn ProjectsView() -> impl IntoView {
                                 let project_id = project.project.id.clone();
                                 let host_id = project.local_host_id.clone();
                                 let name = project.project.name.clone();
+                                // Workbenches (git worktrees) render indented
+                                // beneath their parent with a branch badge.
+                                // Display only — mobile cannot create or
+                                // remove workbenches.
+                                let workbench_branch = match &project.project.source {
+                                    protocol::ProjectSource::GitWorkbench { branch, .. } => {
+                                        Some(branch.0.clone())
+                                    }
+                                    protocol::ProjectSource::Standalone { .. } => None,
+                                };
+                                let is_workbench = workbench_branch.is_some();
                                 let project_roots = project.project.root_paths();
                                 let root_count = project_roots.len();
                                 let roots: Vec<String> = project_roots.iter()
@@ -116,10 +127,26 @@ pub fn ProjectsView() -> impl IntoView {
                                     }));
                                 });
 
-                                let test = if is_active { "project-row-active" } else { "project-row" };
-                                let aria_label = format!("Open project {name}");
+                                let test = if is_active {
+                                    "project-row-active"
+                                } else if is_workbench {
+                                    "project-row-workbench"
+                                } else {
+                                    "project-row"
+                                };
+                                let aria_label = if let Some(branch) = &workbench_branch {
+                                    format!("Open workbench {name} on branch {branch}")
+                                } else {
+                                    format!("Open project {name}")
+                                };
+                                let item_class = if is_workbench {
+                                    "project-list-item project-list-item-workbench"
+                                } else {
+                                    "project-list-item"
+                                };
 
                                 view! {
+                                    <div class=item_class>
                                     <Card
                                         data_mobile_test=test
                                         dense=true
@@ -131,6 +158,15 @@ pub fn ProjectsView() -> impl IntoView {
                                             <div class="list-row-primary">
                                                 <div class="list-row-title">
                                                     {name.clone()}
+                                                    {workbench_branch.clone().map(|branch| view! {
+                                                        <span style="margin-left: var(--space-2);">
+                                                            <Pill
+                                                                label=format!("\u{2387} {branch}")
+                                                                tone=PillTone::Neutral
+                                                                data_mobile_test="project-workbench-branch"
+                                                            />
+                                                        </span>
+                                                    })}
                                                     <Show when=move || is_active>
                                                         <span style="margin-left: var(--space-2);">
                                                             <Pill
@@ -178,6 +214,7 @@ pub fn ProjectsView() -> impl IntoView {
                                             }
                                         })}
                                     </Card>
+                                    </div>
                                 }
                             }).collect::<Vec<_>>()}
                         </div>

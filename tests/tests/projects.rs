@@ -2,13 +2,16 @@ mod fixture;
 
 use fixture::Fixture;
 use protocol::{
-    CommandErrorCode, CommandErrorPayload, DiffContextMode, Envelope, FileEntryOp, FrameKind,
+    BrowseBootstrapListing, BrowseBootstrapPayload, CommandErrorCode, CommandErrorPayload,
+    DiffContextMode, Envelope, FileEntryOp, FrameKind, GitBranchName, HostAbsPath,
+    HostBrowseEntriesPayload, HostBrowseInitial, HostBrowseOpenedPayload, HostBrowseStartPayload,
     Project, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
     ProjectDeletePayload, ProjectDiffScope, ProjectFileContentsPayload, ProjectFileListPayload,
-    ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectListDirPayload,
-    ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload,
-    ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope, ProjectRootPath,
-    ProjectStageFilePayload, ProjectStageHunkPayload, ReviewStatus, ReviewSummaryScope,
+    ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope,
+    ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload, ReviewStatus,
+    ReviewSummaryScope, StreamPath, WorkbenchCreatePayload,
 };
 use std::fs;
 use std::path::Path;
@@ -141,6 +144,76 @@ async fn expect_project_git_diff(
     assert_eq!(env.kind, FrameKind::ProjectGitDiff);
     env.parse_payload()
         .expect("failed to parse ProjectGitDiffPayload")
+}
+
+async fn expect_browse_event(
+    client: &mut client::Connection,
+    browse_stream: &StreamPath,
+    kind: FrameKind,
+    context: &str,
+) -> Envelope {
+    loop {
+        let env = expect_next_event(client, context).await;
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env
+                .parse_payload()
+                .expect("failed to parse CommandErrorPayload while waiting for browse event");
+            panic!(
+                "command error while waiting for {context}: {} {}",
+                error.operation, error.message
+            );
+        }
+        if env.stream == *browse_stream && env.kind == kind {
+            return env;
+        }
+    }
+}
+
+async fn open_browse_and_read_initial(
+    client: &mut client::Connection,
+    browse_stream: StreamPath,
+    initial: HostBrowseInitial,
+) -> (HostBrowseOpenedPayload, HostBrowseEntriesPayload) {
+    client
+        .host_browse_start(HostBrowseStartPayload {
+            browse_stream: browse_stream.clone(),
+            initial,
+            include_hidden: false,
+        })
+        .await
+        .expect("host_browse_start failed");
+
+    let env = expect_browse_event(
+        client,
+        &browse_stream,
+        FrameKind::BrowseBootstrap,
+        "browse bootstrap",
+    )
+    .await;
+    assert_eq!(env.seq, 0, "BrowseBootstrap must be seq 0");
+    let bootstrap: BrowseBootstrapPayload = env
+        .parse_payload()
+        .expect("failed to parse BrowseBootstrapPayload");
+    let entries = match bootstrap.listing {
+        BrowseBootstrapListing::Entries { entries } => entries,
+        BrowseBootstrapListing::Error { error } => panic!(
+            "browse bootstrap carried an error listing: {:?} {}",
+            error.code, error.message
+        ),
+    };
+    (bootstrap.opened, entries)
+}
+
+fn browse_stream(name: &str) -> StreamPath {
+    StreamPath(format!("/browse/{name}"))
+}
+
+fn host_home() -> String {
+    std::env::var("HOME").expect("HOME must be set for host browse tests")
+}
+
+fn host_root() -> String {
+    "/".to_owned()
 }
 
 async fn request_project_diff(
@@ -415,6 +488,211 @@ async fn add_root_emits_updated_upsert() {
         }
         other => panic!("expected upsert project notification, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn host_browse_home_opens_home() {
+    let mut fixture = Fixture::new().await;
+    let home = host_home();
+
+    let (opened, entries) = open_browse_and_read_initial(
+        &mut fixture.client,
+        browse_stream("home"),
+        HostBrowseInitial::Home,
+    )
+    .await;
+
+    assert_eq!(opened.home.0, home);
+    assert_eq!(opened.root.0, host_root());
+    assert_eq!(entries.path.0, home);
+}
+
+#[tokio::test]
+async fn host_browse_path_keeps_home_as_actual_home() {
+    let mut fixture = Fixture::new().await;
+    let initial = tempfile::tempdir().expect("create browse initial dir");
+    let initial_path = initial.path().to_string_lossy().to_string();
+    assert_ne!(
+        initial_path,
+        host_home(),
+        "test initial path must differ from HOME"
+    );
+
+    let (opened, entries) = open_browse_and_read_initial(
+        &mut fixture.client,
+        browse_stream("path"),
+        HostBrowseInitial::Path {
+            path: HostAbsPath(initial_path.clone()),
+        },
+    )
+    .await;
+
+    assert_eq!(opened.home.0, host_home());
+    assert_eq!(opened.root.0, host_root());
+    assert_eq!(entries.path.0, initial_path);
+}
+
+#[tokio::test]
+async fn host_browse_project_roots_with_one_root_opens_that_root() {
+    let mut fixture = Fixture::new().await;
+    let root = tempfile::tempdir().expect("create project root");
+    let root_path = root.path().to_string_lossy().to_string();
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Browse One Root",
+        vec![root_path.clone()],
+    )
+    .await;
+
+    let (opened, entries) = open_browse_and_read_initial(
+        &mut fixture.client,
+        browse_stream("project-one-root"),
+        HostBrowseInitial::ProjectRoots {
+            project_id: project.id,
+        },
+    )
+    .await;
+
+    assert_eq!(opened.home.0, host_home());
+    assert_eq!(opened.root.0, host_root());
+    assert_eq!(entries.path.0, root_path);
+}
+
+#[tokio::test]
+async fn host_browse_project_roots_with_siblings_opens_common_parent() {
+    let mut fixture = Fixture::new().await;
+    let parent = tempfile::tempdir().expect("create project roots parent");
+    let root_a = parent.path().join("root-a");
+    let root_b = parent.path().join("root-b");
+    fs::create_dir(&root_a).expect("create root-a");
+    fs::create_dir(&root_b).expect("create root-b");
+    let root_a_path = root_a.to_string_lossy().to_string();
+    let root_b_path = root_b.to_string_lossy().to_string();
+    let parent_path = parent.path().to_string_lossy().to_string();
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Browse Sibling Roots",
+        vec![root_a_path, root_b_path],
+    )
+    .await;
+
+    let (opened, entries) = open_browse_and_read_initial(
+        &mut fixture.client,
+        browse_stream("project-sibling-roots"),
+        HostBrowseInitial::ProjectRoots {
+            project_id: project.id,
+        },
+    )
+    .await;
+
+    assert_eq!(opened.home.0, host_home());
+    assert_eq!(opened.root.0, host_root());
+    assert_eq!(entries.path.0, parent_path);
+    assert!(
+        entries.entries.iter().any(|entry| entry.name == "root-a"),
+        "common parent listing should contain root-a"
+    );
+    assert!(
+        entries.entries.iter().any(|entry| entry.name == "root-b"),
+        "common parent listing should contain root-b"
+    );
+}
+
+#[tokio::test]
+async fn host_browse_project_roots_without_useful_parent_opens_home() {
+    let mut fixture = Fixture::new().await;
+    let home = host_home();
+    let project = create_project(
+        &mut fixture.client,
+        "Browse Root Only Common Ancestor",
+        vec![
+            "/tyde-browse-no-common-a".to_owned(),
+            "/tyde-browse-no-common-b".to_owned(),
+        ],
+    )
+    .await;
+
+    let (opened, entries) = open_browse_and_read_initial(
+        &mut fixture.client,
+        browse_stream("project-no-useful-common-parent"),
+        HostBrowseInitial::ProjectRoots {
+            project_id: project.id,
+        },
+    )
+    .await;
+
+    assert_eq!(opened.home.0, home);
+    assert_eq!(opened.root.0, host_root());
+    assert_eq!(entries.path.0, home);
+}
+
+#[tokio::test]
+async fn host_browse_unknown_project_opens_home() {
+    let mut fixture = Fixture::new().await;
+    let home = host_home();
+
+    let (opened, entries) = open_browse_and_read_initial(
+        &mut fixture.client,
+        browse_stream("unknown-project"),
+        HostBrowseInitial::ProjectRoots {
+            project_id: ProjectId("does-not-exist".to_owned()),
+        },
+    )
+    .await;
+
+    assert_eq!(opened.home.0, home);
+    assert_eq!(opened.root.0, host_root());
+    assert_eq!(entries.path.0, home);
+}
+
+#[tokio::test]
+async fn host_browse_workbench_project_roots_opens_worktree() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo("browse-workbench", &[("src/lib.rs", "pub fn a() {}\n")]);
+    let parent = create_project_with_real_roots(
+        &mut fixture.client,
+        "Browse Workbench Parent",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+
+    fixture
+        .client
+        .workbench_create(WorkbenchCreatePayload {
+            parent_project_id: parent.id.clone(),
+            branch: GitBranchName("feature/browse".to_owned()),
+            name: "feature/browse".to_owned(),
+        })
+        .await
+        .expect("workbench_create failed");
+    let workbench = match expect_project_notify(&mut fixture.client, "workbench create").await {
+        ProjectNotifyPayload::Upsert { project } => project,
+        other => panic!("expected workbench upsert, got {other:?}"),
+    };
+    let _ = expect_project_bootstrap(
+        &mut fixture.client,
+        "workbench server-pushed project bootstrap",
+    )
+    .await;
+    let worktree_path = project_root(&workbench, 0);
+    assert_ne!(
+        worktree_path,
+        project_root(&parent, 0),
+        "workbench worktree must differ from the parent root"
+    );
+
+    let (opened, entries) = open_browse_and_read_initial(
+        &mut fixture.client,
+        browse_stream("workbench-roots"),
+        HostBrowseInitial::ProjectRoots {
+            project_id: workbench.id,
+        },
+    )
+    .await;
+
+    assert_eq!(opened.home.0, host_home());
+    assert_eq!(opened.root.0, host_root());
+    assert_eq!(entries.path.0, worktree_path);
 }
 
 #[tokio::test]

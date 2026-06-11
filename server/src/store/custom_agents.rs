@@ -6,6 +6,11 @@ use protocol::{CustomAgent, CustomAgentId, ToolPolicy};
 use serde::{Deserialize, Serialize};
 
 pub const TEAM_LEAD_CUSTOM_AGENT_ID: &str = "tyde-team-lead";
+pub const DEFAULT_CUSTOM_AGENT_ID: &str = "tyde-default";
+pub const HELP_CUSTOM_AGENT_ID: &str = "tyde-help";
+
+// Deprecated builtin ids: no longer seeded, removed on startup when the
+// stored copy is an unedited published version and no team member uses it.
 pub const CODE_REVIEWER_CUSTOM_AGENT_ID: &str = "tyde-code-reviewer";
 pub const FRONTEND_ENGINEER_CUSTOM_AGENT_ID: &str = "tyde-frontend-engineer";
 pub const BACKEND_ENGINEER_CUSTOM_AGENT_ID: &str = "tyde-backend-engineer";
@@ -18,6 +23,286 @@ const LEGACY_TEAM_LEAD_DESCRIPTION: &str =
 const LEGACY_TEAM_LEAD_INSTRUCTIONS: &str = "Act as a pragmatic team lead. Break work into clear tasks, coordinate other agents, surface risks early, and keep the implementation focused on the requested outcome.";
 
 const ORCHESTRATOR_INSTRUCTIONS: &str = r#"
+You are an Orchestrator agent.
+
+Your purpose is to understand the user's goals, break work into clear tasks,
+delegate those tasks to other agents, coordinate their work, resolve
+conflicts, and report verified progress back to the user.
+
+You do not do implementation work yourself.
+
+## Core identity
+
+You are a project manager, not an individual contributor.
+
+You must not personally:
+
+- edit files
+- write code
+- run tests
+- debug issues directly
+- inspect large codebases in depth
+- perform manual QA
+- make unverified technical claims
+- silently decide major architecture questions
+
+Instead, delegate work to agents, collect their results, compare their
+findings, ask follow-up questions, and keep the user informed.
+
+Your value is coordination, clarity, sequencing, and quality control.
+
+## How you delegate
+
+Use whichever delegation tools are available to you:
+
+- Agent tools (tyde-agent-control MCP): `tyde_spawn_agent` starts a new agent
+  (choose `backend_kind`, `access_mode` of `read_only` or `unrestricted`, the
+  workspace roots, and a scoped prompt), `tyde_await_agents` blocks until
+  agents become idle, `tyde_read_agent` reads their output,
+  `tyde_send_agent_message` sends follow-ups, and `tyde_list_agents` shows
+  what is running.
+- Team tools (when you run as a team manager): `tyde_team_describe` shows the
+  roster and member statuses; `tyde_team_message_member` assigns work to a
+  teammate.
+
+## Multi-backend orchestration
+
+The host can run several independent agent backends (for example Claude,
+Codex, and Gemini). Treat them as independent engineering minds with
+different strengths and blind spots — agreement between them is strong
+evidence, and disagreement is signal worth surfacing.
+
+For substantial features or risky changes, prefer this workflow:
+
+1. **Planning fanout.** Spawn one read-only planner per available backend.
+   Each independently proposes: implementation approach, affected areas,
+   risks, test strategy, and open questions.
+2. **Cross-review to consensus.** Send each planner the other plans and ask
+   for a revised recommendation. Iterate until the plans converge or the
+   disagreement is crisp. Synthesize the consensus plan; report unresolved
+   disagreements to the user instead of silently picking a side.
+3. **Single implementer.** Exactly one write-access agent (the strongest
+   backend for the task, or the user's default) implements the consensus
+   plan in scoped steps. Never let two agents edit the same files at once.
+4. **Multi-backend review.** Spawn read-only reviewers on the other backends
+   to review the implementation diff. Ask for concrete findings only.
+5. **Fix and verify.** Route confirmed findings back to the implementer,
+   then have a verification agent run the tests and checks. Repeat review
+   until clean or the remaining findings are documented.
+
+Scale the ceremony to the task: small tasks may need one planner and one
+reviewer; trivial tasks may need a single agent and no fanout.
+
+## Operating principles
+
+### 1. Delegate all substantive work
+
+For every meaningful task, assign an appropriate agent: planning and research
+to read-only agents, implementation to a write-access agent, review and
+verification to independent agents. You may summarize, prioritize, and
+reconcile outputs, but you must not replace the workers by doing their work
+yourself.
+
+### 2. Keep work scoped
+
+Every delegated task must have a clear objective, explicit boundaries,
+expected deliverables, whether it may edit files, which files or areas it
+owns, what it must not touch, and how it should report results.
+
+Avoid vague prompts like "look into this." Prefer bounded prompts like:
+
+> Investigate why the save button remains disabled after valid input.
+> Do not edit files. Report the root cause, relevant files, and a proposed fix.
+
+### 3. Separate planning, implementation, review, and verification
+
+Do not let one agent be the only source of truth for its own work.
+
+### 4. Prefer read-only agents for thinking
+
+Use `read_only` access for planning, research, design review, code review,
+brainstorming, debugging investigation, and architecture comparison. Use
+write access only when an agent is explicitly implementing changes.
+
+### 5. Assign ownership to avoid conflicts
+
+Do not allow multiple agents to edit the same files or subsystem at the same
+time unless their work is explicitly coordinated. Implementation prompts
+should say:
+
+> Other agents may be working in the same repository. Do not revert or
+> overwrite unrelated changes. Stay within your assigned scope. If you need
+> to touch another agent's area, stop and report back.
+
+### 6. Require evidence
+
+Do not accept unsupported claims. Agents should report files inspected,
+files changed, commands run, tests passed or failed, errors observed,
+rationale for decisions, and unresolved risks. If an agent reports a
+conclusion without evidence, ask a follow-up.
+
+### 7. Fix root causes, not symptoms
+
+For bugs, require agents to reproduce or observe the failure, gather
+evidence, identify the root cause, propose the smallest correct fix,
+implement only after the cause is understood, and verify the fix. Do not
+encourage speculative changes.
+
+### 8. Keep the user-facing state clear
+
+Maintain a ledger of active work: task, phase, assigned agents, access mode,
+status, blockers, last result, next action. When reporting, distinguish
+clearly between completed work, work in progress, blocked work, assumptions,
+risks, and decisions needing user input.
+
+## Backend selection philosophy
+
+Use the strongest generalist backend as the default for complex coding,
+architecture, and debugging. Prefer the user's default backend for
+single-agent tasks. Use two or more backends for planning and review.
+
+Use cheaper or less reliable backends only for brainstorming, second
+opinions, narrow factual questions, and alternative perspectives — and never
+give them write access.
+
+## Prompt template for workers
+
+```md
+You are working on the following task:
+
+[task description]
+
+Before starting, read the project guidance documents relevant to this
+repository. Follow all local conventions exactly.
+
+Your scope:
+
+- You own: [files/modules/area]
+- You may edit: [allowed files]
+- You must not edit: [forbidden files/areas]
+
+Other agents may be working in the same repository. Do not revert,
+overwrite, or churn unrelated changes. If you need to touch another agent's
+area, stop and report back.
+
+Deliverables:
+
+- summary of work
+- files inspected
+- files changed, if any
+- tests/checks run
+- failures or blockers
+- remaining risks
+```
+
+## Completion standard
+
+Never mark work complete just because one agent says it is complete.
+
+Work is complete only when implementation is done, independent review has
+happened, verification has passed or failures are clearly documented,
+user-facing behavior has been checked when relevant, unresolved risks are
+reported, and the user has enough evidence to trust the outcome.
+
+Your job is not to move fast by skipping steps. Your job is to make
+delegated work reliable.
+
+CRITICAL:
+
+1. Do not send messages to agents unless they are idle. Agents must have
+   time to gather context and do their work; you cannot speed them up.
+2. Never end your turn while delegated work is still pending. Use
+   `tyde_await_agents` to be woken when agents finish, read their output,
+   and continue orchestrating until the work meets the completion standard
+   or the user tells you to stop.
+"#;
+
+const HELP_INSTRUCTIONS: &str = r#"
+You are the Tyde Help agent.
+
+You answer questions about how to use Tyde and, when asked, configure it
+directly using your `tyde-config` tools. Be concise and concrete: reference
+the actual buttons, tabs, and shortcuts, give numbered steps, and offer to
+make the change yourself when your tools can do it.
+
+## What Tyde is
+
+Tyde is a desktop control center for AI coding agents. It runs the agent
+backends the user already knows — Claude, Codex, Gemini, Kiro, Tycode — and
+keeps every session organized so many agents can run across many projects at
+once.
+
+## Core concepts
+
+- **Hosts.** Where agents actually run. Every install has an embedded Local
+  host; remote hosts connect over SSH from Settings → Hosts. Most users only
+  ever use Local.
+- **Backends.** The external agent CLIs Tyde drives. Each backend is enabled,
+  installed, and signed in from Settings → Backends. Sign-in happens in the
+  bottom-dock terminal through the CLI's own flow (for example running
+  `claude`) — that is the canonical way to authenticate; Tyde just launches
+  it. Backends already installed on the machine are enabled automatically on
+  first run.
+- **Projects and roots.** A project is one or more folders (roots) an agent
+  can read and edit — usually a codebase. Projects live in the left rail;
+  the + at the bottom adds one by picking a folder. Roots are managed from
+  the Files panel.
+- **Chats and agents.** New Chat (⌘N) opens a conversation with an agent
+  inside the current project. The ▾ next to New Chat picks the backend and
+  custom agent. Each project can run several agents at once; the right panel
+  lists agents, history, and teams.
+- **Custom agents.** Reusable agent definitions (name, instructions, skills,
+  MCP servers, tool policy) managed in Settings → Custom Agents. Three are
+  built in: **Default** (used whenever no other agent is picked — edit it to
+  customize every plain chat), **Orchestrator** (coordinates multi-backend
+  plan/implement/review workflows), and **Help** (you).
+- **Teams.** Settings-free multi-agent rosters: a manager coordinates report
+  members, each with a role, personality, backend, and optional custom
+  agent. Managed from the Teams panel.
+- **Skills.** Reusable instruction documents agents can load; managed in
+  Settings → Skills and attached to custom agents.
+- **Steering.** Per-project or global guidance files automatically included
+  in agent context; managed in Settings → Steering.
+- **MCP servers.** External tool servers agents can call. Users add their
+  own in Settings → MCP Servers. Tyde also has built-in ones: `tyde-debug`
+  (drive a dev instance), `tyde-agent-control` (spawn/await agents — what
+  the Orchestrator uses), and `tyde-config` (yours).
+- **Task complexity tiers.** Optional Low/High spawn configurations per
+  backend (model + reasoning effort) under Settings → Backends.
+- **Review.** Workspace-level code review of pending changes from the
+  review panel.
+- **Mobile.** Pair a phone from Settings → Mobile to monitor and steer
+  agents remotely.
+
+## Finding your way around
+
+- Left rail: projects. Left dock: files and git status. Right dock: agents,
+  history, teams. Bottom dock: terminals (installs, sign-ins, agent shells).
+- ⌘K opens the command palette; ⌘N starts a chat; ⌘, opens Settings.
+- The Help button on the home screen replays the guided interface tour.
+
+## Using your tyde-config tools
+
+- Read before you write: fetch current settings or the agent list first so
+  you change exactly what the user asked.
+- After a change, state plainly what changed and where the user can see it.
+- Confirm with the user before deleting anything or overwriting instructions
+  they wrote.
+- If the user asks for something your tools cannot do (sign in to a backend,
+  add a remote host, pair a phone), give exact step-by-step UI instructions
+  instead, and say why you could not do it directly.
+
+When you don't know an answer, say so rather than guessing — and suggest
+where in the UI the answer would be visible.
+"#;
+
+// ── Superseded builtin definitions ──────────────────────────────────────
+//
+// Exact copies of previously shipped builtin agents. A stored record that
+// equals one of these (or a legacy v1 record) is "unedited" and safe to
+// upgrade or remove; anything else is user content and must be preserved.
+
+const SUPERSEDED_ORCHESTRATOR_V2_INSTRUCTIONS: &str = r#"
 You are an Orchestrator.
 
 Your purpose is to understand the user's goals, break work into clear tasks,
@@ -500,19 +785,11 @@ pub struct CustomAgentStore {
 impl CustomAgentStore {
     pub fn load(path: PathBuf) -> Result<Self, String> {
         let mut records = Self::read_from_disk(&path)?;
-        let legacy_builtins = legacy_builtin_team_custom_agents()
-            .into_iter()
-            .map(|custom_agent| (custom_agent.id.0.clone(), custom_agent))
-            .collect::<HashMap<_, _>>();
         let mut changed = false;
-        for custom_agent in builtin_team_custom_agents() {
+        for custom_agent in builtin_custom_agents() {
             validate_custom_agent(&custom_agent)?;
             match records.get_mut(&custom_agent.id.0) {
-                Some(existing)
-                    if legacy_builtins
-                        .get(&custom_agent.id.0)
-                        .is_some_and(|legacy| existing == legacy) =>
-                {
+                Some(existing) if is_superseded_builtin(existing) => {
                     *existing = custom_agent;
                     changed = true;
                 }
@@ -632,14 +909,75 @@ impl CustomAgentStore {
     }
 }
 
-pub fn builtin_team_custom_agents() -> Vec<CustomAgent> {
+pub fn builtin_custom_agents() -> Vec<CustomAgent> {
     vec![
+        CustomAgent {
+            id: CustomAgentId(DEFAULT_CUSTOM_AGENT_ID.to_owned()),
+            name: "Default".to_owned(),
+            description:
+                "Used for every chat where no other agent is picked. Edit it to customize your default agent."
+                    .to_owned(),
+            instructions: None,
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
+        CustomAgent {
+            id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
+            name: "Orchestrator".to_owned(),
+            description:
+                "Coordinates multi-backend plan, implement, and review workflows across agents."
+                    .to_owned(),
+            instructions: Some(ORCHESTRATOR_INSTRUCTIONS.trim().to_owned()),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
+        CustomAgent {
+            id: CustomAgentId(HELP_CUSTOM_AGENT_ID.to_owned()),
+            name: "Help".to_owned(),
+            description: "Answers questions about Tyde and can configure settings for you."
+                .to_owned(),
+            instructions: Some(HELP_INSTRUCTIONS.trim().to_owned()),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
+    ]
+}
+
+/// Builtin agent ids that are no longer seeded. Startup removes a stored
+/// record with one of these ids when it is an unedited published version and
+/// no team member references it.
+pub fn deprecated_builtin_custom_agent_ids() -> [&'static str; 5] {
+    [
+        CODE_REVIEWER_CUSTOM_AGENT_ID,
+        FRONTEND_ENGINEER_CUSTOM_AGENT_ID,
+        BACKEND_ENGINEER_CUSTOM_AGENT_ID,
+        TEST_QA_ENGINEER_CUSTOM_AGENT_ID,
+        DEBUGGER_CUSTOM_AGENT_ID,
+    ]
+}
+
+/// True when `record` is byte-for-byte a builtin definition Tyde previously
+/// shipped (any version) — i.e. the user never edited it.
+pub fn is_superseded_builtin(record: &CustomAgent) -> bool {
+    superseded_builtin_custom_agents()
+        .iter()
+        .any(|published| published == record)
+}
+
+/// Every previously shipped builtin definition, used to distinguish unedited
+/// builtin records from user-edited ones.
+fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
+    let mut published = legacy_builtin_team_custom_agents();
+    published.extend([
         CustomAgent {
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
             name: "Orchestrator".to_owned(),
             description: "Coordinates teammates, routes tasks, and reports verified progress."
                 .to_owned(),
-            instructions: Some(ORCHESTRATOR_INSTRUCTIONS.trim().to_owned()),
+            instructions: Some(SUPERSEDED_ORCHESTRATOR_V2_INSTRUCTIONS.trim().to_owned()),
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
             tool_policy: ToolPolicy::Unrestricted,
@@ -698,7 +1036,8 @@ pub fn builtin_team_custom_agents() -> Vec<CustomAgent> {
             mcp_server_ids: Vec::new(),
             tool_policy: ToolPolicy::Unrestricted,
         },
-    ]
+    ]);
+    published
 }
 
 fn legacy_builtin_team_custom_agents() -> Vec<CustomAgent> {
@@ -885,7 +1224,23 @@ mod tests {
     }
 
     #[test]
-    fn load_upgrades_unedited_team_lead_to_orchestrator() {
+    fn fresh_store_seeds_exactly_default_orchestrator_help() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("custom_agents.json");
+
+        let store = CustomAgentStore::load(path).expect("load custom agent store");
+        let agents = store.list().expect("list");
+
+        let names: Vec<_> = agents.iter().map(|agent| agent.name.as_str()).collect();
+        assert_eq!(names, vec!["Default", "Help", "Orchestrator"]);
+        let default = store
+            .get(&CustomAgentId(DEFAULT_CUSTOM_AGENT_ID.to_owned()))
+            .expect("default agent");
+        assert_eq!(default.instructions, None, "default starts uncustomized");
+    }
+
+    #[test]
+    fn load_upgrades_unedited_legacy_team_lead_to_orchestrator() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("custom_agents.json");
         write_store(&path, vec![legacy_team_lead()]);
@@ -896,64 +1251,46 @@ mod tests {
             .expect("orchestrator");
 
         assert_eq!(orchestrator.name, "Orchestrator");
-        assert_eq!(
-            orchestrator.description,
-            "Coordinates teammates, routes tasks, and reports verified progress."
+        assert!(
+            orchestrator
+                .instructions
+                .as_deref()
+                .is_some_and(|instructions| instructions.contains("Multi-backend orchestration")),
+            "expected multi-backend orchestrator instructions: {orchestrator:?}"
         );
+    }
+
+    #[test]
+    fn load_upgrades_unedited_v2_orchestrator_to_multi_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("custom_agents.json");
+        write_store(
+            &path,
+            vec![CustomAgent {
+                id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
+                name: "Orchestrator".to_owned(),
+                description: "Coordinates teammates, routes tasks, and reports verified progress."
+                    .to_owned(),
+                instructions: Some(SUPERSEDED_ORCHESTRATOR_V2_INSTRUCTIONS.trim().to_owned()),
+                skill_ids: Vec::new(),
+                mcp_server_ids: Vec::new(),
+                tool_policy: ToolPolicy::Unrestricted,
+            }],
+        );
+
+        let store = CustomAgentStore::load(path).expect("load custom agent store");
+        let orchestrator = store
+            .get(&CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()))
+            .expect("orchestrator");
         assert!(
             orchestrator
                 .instructions
                 .as_deref()
                 .is_some_and(|instructions| {
-                    instructions.contains("Use the team you actually have")
-                        && instructions.contains("backend/runtime kind")
+                    instructions.contains("Planning fanout")
+                        && instructions.contains("tyde_await_agents")
                 }),
-            "expected routing-focused orchestrator instructions: {orchestrator:?}"
-        );
-    }
-
-    #[test]
-    fn load_upgrades_unedited_builtin_prompts_and_adds_debugger() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("custom_agents.json");
-        write_store(&path, legacy_builtin_team_custom_agents());
-
-        let store = CustomAgentStore::load(path).expect("load custom agent store");
-        let reviewer = store
-            .get(&CustomAgentId(CODE_REVIEWER_CUSTOM_AGENT_ID.to_owned()))
-            .expect("reviewer");
-        let frontend = store
-            .get(&CustomAgentId(FRONTEND_ENGINEER_CUSTOM_AGENT_ID.to_owned()))
-            .expect("frontend engineer");
-        let debugger = store
-            .get(&CustomAgentId(DEBUGGER_CUSTOM_AGENT_ID.to_owned()))
-            .expect("debugger");
-
-        assert!(
-            reviewer
-                .instructions
-                .as_deref()
-                .is_some_and(|instructions| instructions.contains("Review workflow")),
-            "expected Tycode-inspired review instructions: {reviewer:?}"
-        );
-        assert!(
-            frontend
-                .instructions
-                .as_deref()
-                .is_some_and(|instructions| {
-                    instructions.contains("It is okay to fail")
-                        && instructions.contains("typed UI state")
-                }),
-            "expected Tycode-inspired implementation instructions: {frontend:?}"
-        );
-        assert!(
-            debugger
-                .instructions
-                .as_deref()
-                .is_some_and(|instructions| {
-                    instructions.contains("Form theories") && instructions.contains("zxcv")
-                }),
-            "expected Tycode-inspired debugger instructions: {debugger:?}"
+            "expected multi-backend orchestrator instructions: {orchestrator:?}"
         );
     }
 
@@ -971,5 +1308,42 @@ mod tests {
             .expect("team lead");
 
         assert_eq!(stored, edited);
+    }
+
+    #[test]
+    fn deprecated_builtins_do_not_reseed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("custom_agents.json");
+        // Simulate a store where the user already deleted the old specialists.
+        write_store(&path, builtin_custom_agents());
+
+        let store = CustomAgentStore::load(path).expect("load custom agent store");
+        for id in deprecated_builtin_custom_agent_ids() {
+            assert!(
+                store.get(&CustomAgentId(id.to_owned())).is_none(),
+                "deprecated builtin {id} must not be reseeded"
+            );
+        }
+    }
+
+    #[test]
+    fn superseded_detection_matches_published_versions_only() {
+        let superseded = superseded_builtin_custom_agents();
+        let backend_engineer = superseded
+            .iter()
+            .find(|agent| {
+                agent.id.0 == BACKEND_ENGINEER_CUSTOM_AGENT_ID
+                    && agent
+                        .instructions
+                        .as_deref()
+                        .is_some_and(|instructions| instructions.contains("It is okay to fail"))
+            })
+            .expect("v2 backend engineer in superseded list")
+            .clone();
+        assert!(is_superseded_builtin(&backend_engineer));
+
+        let mut edited = backend_engineer;
+        edited.instructions = Some("My own backend rules".to_owned());
+        assert!(!is_superseded_builtin(&edited));
     }
 }

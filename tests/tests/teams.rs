@@ -732,9 +732,8 @@ async fn team_draft_template_shuffle_and_commit_is_atomic() {
         draft
             .members
             .iter()
-            .any(|member| member.custom_agent_id
-                == Some(CustomAgentId("tyde-debugger".to_owned()))),
-        "template application should choose built-in custom agents: {draft:?}"
+            .all(|member| member.custom_agent_id.is_none()),
+        "template members use the customizable Default agent, not stale builtin ids: {draft:?}"
     );
 
     for member in draft.members.clone() {
@@ -781,9 +780,8 @@ async fn team_draft_template_shuffle_and_commit_is_atomic() {
     assert!(
         members
             .iter()
-            .any(|member| member.custom_agent_id
-                == Some(CustomAgentId("tyde-debugger".to_owned()))),
-        "commit should persist built-in custom agent selections: {members:?}"
+            .all(|member| member.custom_agent_id.is_none()),
+        "committed template members keep the Default-agent fallback: {members:?}"
     );
     for member in &members {
         let binding =
@@ -1774,10 +1772,16 @@ async fn team_member_shuffle_emits_server_owned_suggestion() {
         notify.suggestion.profile.personality_preset_id.is_some(),
         "suggestion must carry a personality preset id from the server catalog"
     );
-    assert!(
-        notify.suggestion.custom_agent_id.is_some(),
-        "suggestion must carry a default custom agent from the server catalog"
-    );
+    // Specialist role presets no longer pin a builtin custom agent; the
+    // tech-lead preset still does. Either way the field must match the
+    // server catalog, so just assert it parses (no stale ids).
+    if let Some(custom_agent_id) = &notify.suggestion.custom_agent_id {
+        assert_eq!(
+            custom_agent_id,
+            &CustomAgentId("tyde-team-lead".to_owned()),
+            "only the orchestrator remains a preset default"
+        );
+    }
 
     // Shuffling against a team that does not exist on the host is an
     // error, not a silent no-op.
@@ -1863,7 +1867,7 @@ async fn custom_agent_delete_rejected_for_builtin_role_preset_default() {
             .role_presets
             .iter()
             .any(|preset| preset.default_custom_agent_id
-                == Some(CustomAgentId("tyde-frontend-engineer".to_owned()))),
+                == Some(CustomAgentId("tyde-team-lead".to_owned()))),
         "HostBootstrap should include role preset defaults before team state"
     );
     assert!(
@@ -1871,14 +1875,14 @@ async fn custom_agent_delete_rejected_for_builtin_role_preset_default() {
             .bootstrap
             .custom_agents
             .iter()
-            .any(|agent| agent.id == CustomAgentId("tyde-frontend-engineer".to_owned())),
+            .any(|agent| agent.id == CustomAgentId("tyde-team-lead".to_owned())),
         "HostBootstrap should include built-in team custom agents"
     );
 
     fixture
         .client
         .custom_agent_delete(CustomAgentDeletePayload {
-            id: CustomAgentId("tyde-frontend-engineer".to_owned()),
+            id: CustomAgentId("tyde-team-lead".to_owned()),
         })
         .await
         .expect("custom_agent_delete send failed");

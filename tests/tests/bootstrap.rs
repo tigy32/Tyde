@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use client::ClientConfig;
 use protocol::{
-    BackendAccessMode, BackendKind, FrameKind, HostBootstrapPayload, HostBrowseStartPayload,
-    HostSettingValue, NewAgentPayload, ProjectBootstrapPayload, ProjectRootPath,
-    ReviewSummaryScope, SessionId, SessionSchemasPayload, SetSettingPayload, SpawnAgentParams,
-    SpawnAgentPayload, TerminalCreatePayload, TerminalLaunchTarget,
+    BackendAccessMode, BackendKind, FrameKind, HostBootstrapPayload, HostBrowseInitial,
+    HostBrowseStartPayload, HostSettingValue, NewAgentPayload, ProjectBootstrapPayload,
+    ProjectRootPath, ReviewSummaryScope, SessionId, SessionSchemasPayload, SetSettingPayload,
+    SpawnAgentParams, SpawnAgentPayload, TerminalCreatePayload, TerminalLaunchTarget,
 };
 use server::backend::BackendSession;
 use server::store::project::ProjectStore;
@@ -410,9 +410,9 @@ async fn browse_and_terminal_streams_start_with_bootstraps() {
     client
         .host_browse_start(HostBrowseStartPayload {
             browse_stream: browse_stream.clone(),
-            initial: Some(protocol::HostAbsPath(
-                dir.path().to_string_lossy().to_string(),
-            )),
+            initial: HostBrowseInitial::Path {
+                path: protocol::HostAbsPath(dir.path().to_string_lossy().to_string()),
+            },
             include_hidden: false,
         })
         .await

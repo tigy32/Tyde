@@ -510,24 +510,45 @@ pub fn create_workbench(
     let branch_name = GitBranchName(trimmed.clone());
     // Record the pending create so dispatch can correlate the resulting
     // `ProjectNotify::Upsert` (per §3.3) and switch active to the new
-    // workbench.
+    // workbench. Purge stale entries while we're here so an old orphaned
+    // create can never trigger a spurious switch.
+    let now = crate::state::now_ms();
     state.pending_workbench_creates.update(|pending| {
+        pending.retain(|entry| !entry.is_stale(now));
         pending.push(PendingWorkbenchCreate {
             host_id: host_id.clone(),
             parent_project_id: parent_project_id.clone(),
             branch: branch_name.clone(),
+            requested_at_ms: now,
+            error: None,
         });
     });
     let payload = WorkbenchCreatePayload {
-        parent_project_id,
-        branch: branch_name,
+        parent_project_id: parent_project_id.clone(),
+        branch: branch_name.clone(),
         name: trimmed,
     };
+    let state = state.clone();
     spawn_local(async move {
         if let Err(error) =
             send_frame(&host_id, host_stream, FrameKind::WorkbenchCreate, &payload).await
         {
             log::error!("failed to send WorkbenchCreate: {error}");
+            // The request never reached the host: drop the pending entry so
+            // it can't match a later Upsert and cause a spurious
+            // active-project switch. The create modal notices the entry
+            // vanishing (without a matching workbench appearing) and shows a
+            // generic failure.
+            state.pending_workbench_creates.update(|pending| {
+                if let Some(idx) = pending.iter().position(|entry| {
+                    entry.host_id == host_id
+                        && entry.parent_project_id == parent_project_id
+                        && entry.branch == branch_name
+                        && entry.error.is_none()
+                }) {
+                    pending.remove(idx);
+                }
+            });
         }
     });
 }

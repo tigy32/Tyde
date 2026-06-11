@@ -74,6 +74,11 @@ pub struct AgentInfo {
 /// so no data is lost, only ephemeral UI state like scroll position.
 pub const TAB_LRU_CAPACITY: usize = 2;
 
+/// Id of the builtin "Default" custom agent. It backs every spawn that picks
+/// no explicit agent, so pickers that already offer a "Default agent" row
+/// hide this record to avoid a duplicate entry.
+pub const DEFAULT_CUSTOM_AGENT_ID: &str = "tyde-default";
+
 thread_local! {
     static NEXT_TAB_ID: Cell<u64> = const { Cell::new(0) };
 }
@@ -710,12 +715,46 @@ pub struct ActiveTerminalRef {
 /// Upsert`. The dispatcher correlates by `(host_id, parent_project_id, branch)`
 /// — see §3.3 of `dev-docs/18-workbenches.md` — and on a match switches the
 /// active project to the new workbench id, then removes the entry. A
-/// `CommandError` for `WorkbenchCreate` clears the oldest entry for the host.
+/// `CommandError` for `WorkbenchCreate` marks the oldest non-failed entry for
+/// the host with the error message (the error carries no parent/branch
+/// correlation); the create modal consumes errored entries to surface the
+/// failure inline. Entries are time-bounded by
+/// [`PENDING_WORKBENCH_CREATE_TTL_MS`] so a mis-correlated or orphaned entry
+/// cannot linger and trigger a spurious active-project switch much later.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingWorkbenchCreate {
     pub host_id: String,
     pub parent_project_id: ProjectId,
     pub branch: GitBranchName,
+    /// Wall-clock ms (`Date.now()`) when the request was sent. See
+    /// [`PendingWorkbenchCreate::is_stale`].
+    pub requested_at_ms: u64,
+    /// Error message from a `CommandError` for `WorkbenchCreate` on this
+    /// host. `None` while the create is still in flight.
+    pub error: Option<String>,
+}
+
+/// How long an in-flight workbench create stays correlatable. Past this the
+/// entry is purged on the next touch of `pending_workbench_creates`.
+pub const PENDING_WORKBENCH_CREATE_TTL_MS: u64 = 5 * 60 * 1000;
+
+impl PendingWorkbenchCreate {
+    pub fn is_stale(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.requested_at_ms) > PENDING_WORKBENCH_CREATE_TTL_MS
+    }
+}
+
+/// Current wall-clock in ms. Zero on non-wasm builds (native logic tests
+/// never exercise the staleness path).
+pub fn now_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        0
+    }
 }
 
 #[derive(Clone)]

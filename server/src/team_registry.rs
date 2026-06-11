@@ -19,10 +19,7 @@ use uuid::Uuid;
 
 use crate::agent::now_ms;
 use crate::store::agent_teams::{AgentTeamValidationRefs, AgentTeamsStore};
-use crate::store::custom_agents::{
-    BACKEND_ENGINEER_CUSTOM_AGENT_ID, CODE_REVIEWER_CUSTOM_AGENT_ID, DEBUGGER_CUSTOM_AGENT_ID,
-    FRONTEND_ENGINEER_CUSTOM_AGENT_ID, TEAM_LEAD_CUSTOM_AGENT_ID, TEST_QA_ENGINEER_CUSTOM_AGENT_ID,
-};
+use crate::store::custom_agents::TEAM_LEAD_CUSTOM_AGENT_ID;
 
 const ACTIVATION_RESERVATION_TIMEOUT_MS: u64 = 35_000;
 
@@ -1553,7 +1550,7 @@ fn role_presets() -> Vec<TeamRolePreset> {
             default_description:
                 "Reviews the plan and code for correctness, design fit, and maintainability."
                     .to_owned(),
-            default_custom_agent_id: Some(CustomAgentId(CODE_REVIEWER_CUSTOM_AGENT_ID.to_owned())),
+            default_custom_agent_id: None,
         },
         TeamRolePreset {
             id: role_id("frontend-specialist"),
@@ -1563,9 +1560,7 @@ fn role_presets() -> Vec<TeamRolePreset> {
             default_description:
                 "Implements UI behavior, typed frontend state projection, and user-facing polish."
                     .to_owned(),
-            default_custom_agent_id: Some(CustomAgentId(
-                FRONTEND_ENGINEER_CUSTOM_AGENT_ID.to_owned(),
-            )),
+            default_custom_agent_id: None,
         },
         TeamRolePreset {
             id: role_id("backend-specialist"),
@@ -1575,9 +1570,7 @@ fn role_presets() -> Vec<TeamRolePreset> {
             default_description:
                 "Implements server-owned behavior, persistence, validation, and protocol flow."
                     .to_owned(),
-            default_custom_agent_id: Some(CustomAgentId(
-                BACKEND_ENGINEER_CUSTOM_AGENT_ID.to_owned(),
-            )),
+            default_custom_agent_id: None,
         },
         TeamRolePreset {
             id: role_id("test-author-qa"),
@@ -1587,9 +1580,7 @@ fn role_presets() -> Vec<TeamRolePreset> {
             default_description:
                 "Adds focused tests, exercises edge cases, and verifies observable behavior."
                     .to_owned(),
-            default_custom_agent_id: Some(CustomAgentId(
-                TEST_QA_ENGINEER_CUSTOM_AGENT_ID.to_owned(),
-            )),
+            default_custom_agent_id: None,
         },
         TeamRolePreset {
             id: role_id("bug-hunter-debugger"),
@@ -1599,7 +1590,7 @@ fn role_presets() -> Vec<TeamRolePreset> {
             default_description:
                 "Reproduces failures, gathers evidence, identifies root causes, and fixes the bug."
                     .to_owned(),
-            default_custom_agent_id: Some(CustomAgentId(DEBUGGER_CUSTOM_AGENT_ID.to_owned())),
+            default_custom_agent_id: None,
         },
     ]
 }

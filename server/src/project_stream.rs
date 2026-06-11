@@ -27,6 +27,34 @@ use crate::stream::Stream;
 const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
 const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+struct ProjectWatcher {
+    inner: Option<RecommendedWatcher>,
+}
+
+impl ProjectWatcher {
+    fn new(inner: RecommendedWatcher) -> Self {
+        Self { inner: Some(inner) }
+    }
+}
+
+impl Drop for ProjectWatcher {
+    fn drop(&mut self) {
+        let Some(watcher) = self.inner.take() else {
+            return;
+        };
+        match std::thread::Builder::new()
+            .name("tyde-project-watch-drop".to_owned())
+            .spawn(move || drop(watcher))
+        {
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                %error,
+                "failed to spawn project watcher drop thread; dropping watcher inline"
+            ),
+        }
+    }
+}
+
 /// A (relative_path, kind) pair used for comparing file listings between snapshots.
 pub(crate) type RawFileEntry = (String, ProjectFileKind);
 
@@ -185,9 +213,25 @@ pub(crate) async fn spawn_project_subscription(
 ) -> Result<ProjectStreamSubscription, String> {
     let project = load_subscription_project(&project_store, &project_id).await?;
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
-    let watcher = create_project_watcher(&project, watch_tx.clone())?;
     let watched_roots = project.root_paths();
     let snapshot = initialize_snapshot(&project)?;
+    let (watcher_ready_tx, watcher_ready_rx) = mpsc::unbounded_channel();
+    {
+        let project = project.clone();
+        let watch_tx = watch_tx.clone();
+        let tx = watcher_ready_tx.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("tyde-project-watch-init".to_owned())
+            .spawn(move || {
+                let result = create_project_watcher(&project, watch_tx);
+                let _ = tx.send(result);
+            })
+        {
+            let _ = watcher_ready_tx.send(Err(format!(
+                "failed to spawn project watcher initialization thread: {error}"
+            )));
+        }
+    }
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let handle = ProjectStreamHandle { tx: command_tx };
 
@@ -197,10 +241,11 @@ pub(crate) async fn spawn_project_subscription(
             project_id,
             project,
             snapshot,
-            watcher,
+            None,
             watched_roots,
             watch_tx,
             watch_rx,
+            watcher_ready_rx,
             command_rx,
             review_registry,
         )
@@ -228,7 +273,7 @@ async fn load_subscription_project(
 fn create_project_watcher(
     project: &Project,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
-) -> Result<RecommendedWatcher, String> {
+) -> Result<ProjectWatcher, String> {
     let mut watcher = RecommendedWatcher::new(
         move |result| {
             let _ = watch_tx.send(result);
@@ -243,7 +288,7 @@ fn create_project_watcher(
             .map_err(|error| format!("failed to watch project root '{}': {error}", root))?;
     }
 
-    Ok(watcher)
+    Ok(ProjectWatcher::new(watcher))
 }
 
 fn initialize_snapshot(project: &Project) -> Result<ProjectSnapshotState, String> {
@@ -262,10 +307,11 @@ async fn run_project_subscription(
     project_id: ProjectId,
     mut project: Project,
     mut snapshot: ProjectSnapshotState,
-    mut watcher: RecommendedWatcher,
+    mut watcher: Option<ProjectWatcher>,
     mut watched_roots: Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     mut watch_rx: mpsc::UnboundedReceiver<notify::Result<Event>>,
+    mut watcher_ready_rx: mpsc::UnboundedReceiver<Result<ProjectWatcher, String>>,
     mut command_rx: mpsc::UnboundedReceiver<ProjectStreamCommand>,
     review_registry: ReviewRegistryHandle,
 ) {
@@ -310,17 +356,28 @@ async fn run_project_subscription(
                         snapshot.diff_context_modes.retain(|(subscriber, _), _| subscriber != &host_path);
                     }
                     ProjectStreamCommand::Refresh { reply } => {
-                        let result = refresh_full(
-                            &project_store,
-                            &project_id,
-                            &mut project,
-                            &mut snapshot,
-                            &mut watcher,
-                            &mut watched_roots,
-                            watch_tx.clone(),
-                            &mut subscribers,
-                            &review_registry,
-                        ).await;
+                        let result = if let Some(watcher) = watcher.as_mut() {
+                            refresh_full(
+                                &project_store,
+                                &project_id,
+                                &mut project,
+                                &mut snapshot,
+                                watcher,
+                                &mut watched_roots,
+                                watch_tx.clone(),
+                                &mut subscribers,
+                                &review_registry,
+                            ).await
+                        } else {
+                            refresh_full_unwatched(
+                                &project_store,
+                                &project_id,
+                                &mut project,
+                                &mut snapshot,
+                                &mut subscribers,
+                                &review_registry,
+                            ).await
+                        };
                         let _ = reply.send(result);
                     }
                     ProjectStreamCommand::RememberDiffContext { host_path, key, context_mode, reply } => {
@@ -330,6 +387,44 @@ async fn run_project_subscription(
                     ProjectStreamCommand::EmitProjectEvent { payload, reply } => {
                         let result = broadcast_project_event(&mut subscribers, &payload).await;
                         let _ = reply.send(result);
+                    }
+                }
+            }
+            maybe_watcher = watcher_ready_rx.recv(), if watcher.is_none() => {
+                match maybe_watcher {
+                    Some(Ok(ready_watcher)) => {
+                        watcher = Some(ready_watcher);
+                        if let Some(watcher) = watcher.as_mut()
+                            && let Err(error) = refresh_full(
+                                &project_store,
+                                &project_id,
+                                &mut project,
+                                &mut snapshot,
+                                watcher,
+                                &mut watched_roots,
+                                watch_tx.clone(),
+                                &mut subscribers,
+                                &review_registry,
+                            ).await
+                        {
+                            tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after watcher initialization refresh failure");
+                            emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
+                            return;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after watcher initialization failure");
+                        emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
+                        return;
+                    }
+                    None => {
+                        tracing::warn!(project_id = %project_id, "stopping project subscription after watcher initialization channel closed");
+                        emit_fatal_project_stream_error(
+                            &mut subscribers,
+                            "project_watch",
+                            "project filesystem watcher failed to initialize".to_owned(),
+                        ).await;
+                        return;
                     }
                 }
             }
@@ -363,38 +458,62 @@ async fn run_project_subscription(
             _ = &mut debounce_sleep, if debounce_active => {
                 debounce_active = false;
                 let refresh = pending_update.take();
-                if let Err(error) = refresh_incremental(
-                    &project_store,
-                    &project_id,
-                    &mut project,
-                    &mut snapshot,
-                    &mut watcher,
-                    &mut watched_roots,
-                    watch_tx.clone(),
-                    &mut subscribers,
-                    &review_registry,
-                    refresh.files,
-                    refresh.git,
-                ).await {
+                let result = if let Some(watcher) = watcher.as_mut() {
+                    refresh_incremental(
+                        &project_store,
+                        &project_id,
+                        &mut project,
+                        &mut snapshot,
+                        watcher,
+                        &mut watched_roots,
+                        watch_tx.clone(),
+                        &mut subscribers,
+                        &review_registry,
+                        refresh.files,
+                        refresh.git,
+                    ).await
+                } else {
+                    refresh_full_unwatched(
+                        &project_store,
+                        &project_id,
+                        &mut project,
+                        &mut snapshot,
+                        &mut subscribers,
+                        &review_registry,
+                    ).await
+                };
+                if let Err(error) = result {
                     tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after debounced refresh failure");
                     emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
                     return;
                 }
             }
             _ = git_poll.tick() => {
-                if let Err(error) = refresh_incremental(
-                    &project_store,
-                    &project_id,
-                    &mut project,
-                    &mut snapshot,
-                    &mut watcher,
-                    &mut watched_roots,
-                    watch_tx.clone(),
-                    &mut subscribers,
-                    &review_registry,
-                    false,
-                    true,
-                ).await {
+                let result = if let Some(watcher) = watcher.as_mut() {
+                    refresh_incremental(
+                        &project_store,
+                        &project_id,
+                        &mut project,
+                        &mut snapshot,
+                        watcher,
+                        &mut watched_roots,
+                        watch_tx.clone(),
+                        &mut subscribers,
+                        &review_registry,
+                        false,
+                        true,
+                    ).await
+                } else {
+                    refresh_full_unwatched(
+                        &project_store,
+                        &project_id,
+                        &mut project,
+                        &mut snapshot,
+                        &mut subscribers,
+                        &review_registry,
+                    ).await
+                };
+                if let Err(error) = result {
                     tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after git status refresh failure");
                     emit_fatal_project_stream_error(&mut subscribers, "project_git_status", error).await;
                     return;
@@ -410,7 +529,7 @@ async fn refresh_full(
     project_id: &ProjectId,
     project: &mut Project,
     snapshot: &mut ProjectSnapshotState,
-    watcher: &mut RecommendedWatcher,
+    watcher: &mut ProjectWatcher,
     watched_roots: &mut Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     subscribers: &mut HashMap<StreamPath, Stream>,
@@ -435,13 +554,38 @@ async fn refresh_full(
     Ok(())
 }
 
+async fn refresh_full_unwatched(
+    project_store: &Arc<Mutex<ProjectStore>>,
+    project_id: &ProjectId,
+    project: &mut Project,
+    snapshot: &mut ProjectSnapshotState,
+    subscribers: &mut HashMap<StreamPath, Stream>,
+    review_registry: &ReviewRegistryHandle,
+) -> Result<(), String> {
+    let latest_project = load_subscription_project(project_store, project_id).await?;
+    let raw_entries = scan_raw_entries(&latest_project)?;
+    let file_list = full_file_list_from_raw(&latest_project, &raw_entries);
+    let git_status = build_git_status(&latest_project)?;
+    let git_json = serialize_git_status(&git_status)?;
+
+    *project = latest_project;
+    snapshot.file_entries = raw_entries;
+    snapshot.git_status = Some(git_json);
+
+    fan_out_payload(subscribers, FrameKind::ProjectFileList, &file_list).await?;
+    fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
+    reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &git_status).await;
+    refresh_remembered_diffs(project, snapshot, subscribers).await;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn refresh_incremental(
     project_store: &Arc<Mutex<ProjectStore>>,
     project_id: &ProjectId,
     project: &mut Project,
     snapshot: &mut ProjectSnapshotState,
-    watcher: &mut RecommendedWatcher,
+    watcher: &mut ProjectWatcher,
     watched_roots: &mut Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     subscribers: &mut HashMap<StreamPath, Stream>,
@@ -482,7 +626,7 @@ async fn refresh_incremental(
 
 fn ensure_watched_roots(
     project: &Project,
-    watcher: &mut RecommendedWatcher,
+    watcher: &mut ProjectWatcher,
     watched_roots: &mut Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
 ) -> Result<(), String> {

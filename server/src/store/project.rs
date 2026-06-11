@@ -101,10 +101,25 @@ pub struct ProjectStore {
 
 impl ProjectStore {
     pub fn load(path: PathBuf) -> Result<Self, ProjectStoreError> {
-        let (records, migrated) = Self::read_from_disk(&path)?;
-        validate_records(&records).map_err(ProjectStoreError::invalid_store)?;
+        let (mut records, migrated) = Self::read_from_disk(&path)?;
+        let heal_actions = heal_duplicate_standalone_roots(&mut records);
+        for action in &heal_actions {
+            tracing::warn!("project store heal: {action}");
+        }
+        // Older builds didn't enforce today's invariants at write time, so a
+        // store strict `validate_records` rejects can still be legal legacy
+        // data — refusing to start would brick the app until the user
+        // hand-edits the file. Load leniently; mutations stay strict via
+        // `persist_candidate`, so a kept-but-invalid record fails on the
+        // next mutation instead (deleting it is always a valid repair).
+        let record_count_before = records.len();
+        let load_warnings = validate_records_for_load(&mut records);
+        for warning in &load_warnings {
+            tracing::warn!("project store load: {warning}");
+        }
+        let quarantined_records = records.len() != record_count_before;
         let store = Self { path, records };
-        if migrated {
+        if migrated || !heal_actions.is_empty() || quarantined_records {
             store.save_current()?;
         }
         Ok(store)
@@ -661,6 +676,197 @@ impl ProjectStore {
     }
 }
 
+/// Pre-workbench versions of Tyde let two projects register the same root
+/// (accidental duplicate projects exist in real stores). Workbenches require
+/// unique root ownership, so heal old stores on load instead of refusing to
+/// start: the earliest standalone project (by sort order, then id) keeps a
+/// contested root, later projects lose it, and a project left with no roots
+/// is removed entirely. A root a workbench depends on is never taken from
+/// its parent — workbenches postdate the uniqueness rule, so that conflict
+/// can only come from new data; load keeps both records with a warning and
+/// strict validation rejects it again on the next mutation. Returns a
+/// description of every change for logging; empty means nothing healed.
+fn heal_duplicate_standalone_roots(records: &mut HashMap<String, Project>) -> Vec<String> {
+    let workbench_required: HashSet<(ProjectId, ProjectRootPath)> = records
+        .values()
+        .filter_map(|project| match &project.source {
+            ProjectSource::GitWorkbench {
+                parent_project_id,
+                roots,
+                ..
+            } => Some(
+                roots
+                    .iter()
+                    .map(|root| (parent_project_id.clone(), root.parent_root.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+            ProjectSource::Standalone { .. } => None,
+        })
+        .flatten()
+        .collect();
+    let workbench_parents: HashSet<ProjectId> = workbench_required
+        .iter()
+        .map(|(parent_project_id, _)| parent_project_id.clone())
+        .collect();
+
+    let mut standalone_order: Vec<(u64, String)> = records
+        .values()
+        .filter(|project| matches!(project.source, ProjectSource::Standalone { .. }))
+        .map(|project| (project.sort_order, project.id.0.clone()))
+        .collect();
+    standalone_order.sort();
+
+    let mut actions = Vec::new();
+    let mut owners = HashMap::<ProjectRootPath, ProjectId>::new();
+    let mut emptied = Vec::new();
+    for (_, key) in standalone_order {
+        let Some(project) = records.get_mut(&key) else {
+            continue;
+        };
+        let project_id = project.id.clone();
+        let project_name = project.name.clone();
+        let ProjectSource::Standalone { roots } = &mut project.source else {
+            continue;
+        };
+        // A project that already had zero roots is legacy data, not a heal
+        // casualty; leave it for the load validator to warn about.
+        let started_with_roots = !roots.is_empty();
+        let mut kept = Vec::new();
+        for root in roots.drain(..) {
+            match owners.get(&root) {
+                Some(owner) if *owner != project_id => {
+                    if workbench_required.contains(&(project_id.clone(), root.clone())) {
+                        // A workbench needs this root from this parent;
+                        // leave the conflict for validation to report.
+                        kept.push(root);
+                    } else {
+                        actions.push(format!(
+                            "dropped root {} from project {} ({}): already owned by project {}",
+                            root, project_id, project_name, owner
+                        ));
+                    }
+                }
+                _ => {
+                    owners.insert(root.clone(), project_id.clone());
+                    kept.push(root);
+                }
+            }
+        }
+        let now_empty = kept.is_empty();
+        *roots = kept;
+        if now_empty && started_with_roots && !workbench_parents.contains(&project_id) {
+            emptied.push((key, project_id, project_name));
+        }
+    }
+
+    for (key, project_id, project_name) in emptied {
+        records.remove(&key);
+        actions.push(format!(
+            "removed project {} ({}): every root was a duplicate of an earlier project",
+            project_id, project_name
+        ));
+    }
+
+    actions
+}
+
+/// Lenient validation used only at load time; mutations still run the
+/// strict `validate_records`. Older builds never enforced some of today's
+/// invariants at write time (shared roots across projects, standalone
+/// projects with zero roots), so any projects.json a prior build wrote must
+/// load. Records that can still function are kept with a warning;
+/// quarantined (skipped and dropped on the next save) are only records that
+/// cannot work at all: corrupt key/id pairs and workbench records that no
+/// longer satisfy workbench invariants (e.g. a half-removed parent) — the
+/// worktrees on disk are untouched. Returns the warnings to log.
+fn validate_records_for_load(records: &mut HashMap<String, Project>) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    let broken_keys: Vec<String> = records
+        .iter()
+        .filter(|(key, project)| {
+            key.trim().is_empty() || project.id.0.trim().is_empty() || *key != &project.id.0
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in broken_keys {
+        records.remove(&key);
+        warnings.push(format!(
+            "skipped record with key {key:?}: key does not match a valid project id"
+        ));
+    }
+
+    let snapshot: &HashMap<String, Project> = records;
+    let broken_workbenches: Vec<(String, String)> = snapshot
+        .values()
+        .filter_map(|project| {
+            workbench_load_problem(snapshot, project).map(|problem| (project.id.0.clone(), problem))
+        })
+        .collect();
+    for (key, problem) in broken_workbenches {
+        records.remove(&key);
+        warnings.push(format!("skipped workbench record {key}: {problem}"));
+    }
+
+    // Legacy-legal violations: warn but keep, so the app starts.
+    let mut owners = HashMap::<ProjectRootPath, ProjectId>::new();
+    let mut projects: Vec<&Project> = records.values().collect();
+    projects.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+    for project in projects {
+        if let ProjectSource::Standalone { roots } = &project.source
+            && let Err(error) = validate_standalone_roots_for_input(roots)
+        {
+            warnings.push(format!(
+                "standalone project {} {error}; loading it anyway",
+                project.id
+            ));
+        }
+        for root in project.root_paths() {
+            match owners.get(&root) {
+                Some(owner) if *owner != project.id => warnings.push(format!(
+                    "root {} is shared by projects {} and {}; loading both",
+                    root, owner, project.id
+                )),
+                _ => {
+                    owners.insert(root, project.id.clone());
+                }
+            }
+        }
+    }
+
+    warnings
+}
+
+/// Why a workbench record cannot be loaded at all, or None if it is (or is
+/// not a workbench). Mirrors the workbench checks in `validate_records`.
+fn workbench_load_problem(records: &HashMap<String, Project>, project: &Project) -> Option<String> {
+    let ProjectSource::GitWorkbench {
+        parent_project_id,
+        branch,
+        roots,
+    } = &project.source
+    else {
+        return None;
+    };
+    if branch.0.trim().is_empty() {
+        return Some("branch must not be empty".to_owned());
+    }
+    let Some(parent) = records.get(&parent_project_id.0) else {
+        return Some(format!(
+            "references missing parent project {parent_project_id}"
+        ));
+    };
+    let ProjectSource::Standalone {
+        roots: parent_roots,
+    } = &parent.source
+    else {
+        return Some(format!(
+            "parent project {parent_project_id} is not standalone"
+        ));
+    };
+    validate_workbench_roots_for_parent(roots, parent_roots, "workbench").err()
+}
+
 fn validate_records(records: &HashMap<String, Project>) -> Result<(), String> {
     let mut actual_root_owners = HashMap::<ProjectRootPath, ProjectId>::new();
     let mut standalone_roots = HashMap::<ProjectId, Vec<ProjectRootPath>>::new();
@@ -1004,6 +1210,177 @@ mod tests {
 
         let error = validate_records(&records).expect_err("wrong parent root should fail");
         assert!(error.contains("does not match a parent project root"));
+    }
+
+    fn write_store_file(path: &std::path::Path, records: HashMap<String, Project>) {
+        let json = serde_json::to_string_pretty(&StoreFile {
+            version: STORE_VERSION,
+            records,
+        })
+        .unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    /// Stores written before the root-uniqueness rule (or with accidental
+    /// duplicate projects) must load by healing, not refuse to start: the
+    /// earliest project keeps a contested root and a project left rootless
+    /// is removed.
+    #[test]
+    fn load_heals_duplicate_standalone_roots_instead_of_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("projects.json");
+        let mut earlier = standalone("earlier", vec![root("/tmp/shared")]);
+        earlier.sort_order = 1;
+        let mut duplicate = standalone("duplicate", vec![root("/tmp/shared")]);
+        duplicate.sort_order = 2;
+        let mut partial = standalone("partial", vec![root("/tmp/shared"), root("/tmp/own")]);
+        partial.sort_order = 3;
+        let mut records = HashMap::new();
+        for project in [earlier, duplicate, partial] {
+            records.insert(project.id.0.clone(), project);
+        }
+        write_store_file(&path, records);
+
+        let store = ProjectStore::load(path.clone()).expect("healed store must load");
+        let earlier = store.get(&project_id("earlier")).expect("earlier kept");
+        assert_eq!(
+            earlier.root_paths(),
+            vec![root("/tmp/shared")],
+            "earliest project keeps the contested root"
+        );
+        assert!(
+            store.get(&project_id("duplicate")).is_none(),
+            "fully duplicated project is removed"
+        );
+        let partial = store.get(&project_id("partial")).expect("partial kept");
+        assert_eq!(
+            partial.root_paths(),
+            vec![root("/tmp/own")],
+            "later project loses only the contested root"
+        );
+
+        // The heal persists, so the next load is clean.
+        let reloaded = ProjectStore::load(path).expect("reload healed store");
+        assert!(reloaded.get(&project_id("duplicate")).is_none());
+    }
+
+    /// A root a workbench depends on is never taken away from its parent —
+    /// the heal pass keeps the shared root on both projects and the store
+    /// still loads (with a warning) so startup never requires hand-editing
+    /// the file. Mutations still reject the conflict.
+    #[test]
+    fn load_keeps_shared_roots_a_workbench_depends_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("projects.json");
+        let mut earlier = standalone("earlier", vec![root("/tmp/shared")]);
+        earlier.sort_order = 1;
+        let mut parent = standalone("parent", vec![root("/tmp/shared")]);
+        parent.sort_order = 2;
+        let child = workbench(
+            "child",
+            "parent",
+            "feature/a",
+            vec![WorkbenchRoot {
+                parent_root: root("/tmp/shared"),
+                worktree_root: root("/tmp/shared--feature%2Fa"),
+            }],
+        );
+        let mut records = HashMap::new();
+        for project in [earlier, parent, child] {
+            records.insert(project.id.0.clone(), project);
+        }
+        write_store_file(&path, records);
+
+        let mut store = ProjectStore::load(path).expect("conflicted store must still load");
+        assert_eq!(
+            store
+                .get(&project_id("earlier"))
+                .expect("earlier kept")
+                .root_paths(),
+            vec![root("/tmp/shared")]
+        );
+        assert_eq!(
+            store
+                .get(&project_id("parent"))
+                .expect("parent kept")
+                .root_paths(),
+            vec![root("/tmp/shared")]
+        );
+        assert!(store.get(&project_id("child")).is_some(), "workbench kept");
+
+        // Mutations still run strict validation against the conflict.
+        let error = store
+            .rename(&project_id("earlier"), "renamed".to_owned())
+            .expect_err("mutation must reject the shared root");
+        assert!(matches!(error, ProjectStoreError::InvalidStore(_)));
+    }
+
+    /// Older builds allowed a standalone project to end up with zero roots;
+    /// such a store must still load. Mutations stay strict until the record
+    /// is repaired (adding a root) or deleted.
+    #[test]
+    fn load_tolerates_legacy_standalone_project_with_no_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("projects.json");
+        let mut records = HashMap::new();
+        for project in [
+            standalone("empty", vec![]),
+            standalone("ok", vec![root("/tmp/ok")]),
+        ] {
+            records.insert(project.id.0.clone(), project);
+        }
+        write_store_file(&path, records);
+
+        let mut store = ProjectStore::load(path).expect("legacy store must load");
+        let empty = store.get(&project_id("empty")).expect("empty project kept");
+        assert!(empty.root_paths().is_empty());
+        assert!(store.get(&project_id("ok")).is_some());
+
+        // Mutations still reject the invariant while the record is broken...
+        let error = store
+            .rename(&project_id("empty"), "renamed".to_owned())
+            .expect_err("mutation must reject empty roots");
+        assert!(matches!(error, ProjectStoreError::InvalidStore(_)));
+
+        // ...and adding a root repairs it.
+        let repaired = store
+            .add_root(&project_id("empty"), root("/tmp/empty"))
+            .expect("add_root repairs the legacy record");
+        assert_eq!(repaired.root_paths(), vec![root("/tmp/empty")]);
+        store
+            .rename(&project_id("empty"), "renamed".to_owned())
+            .expect("mutations work once repaired");
+    }
+
+    /// A half-removed workbench record (parent gone) must not brick startup;
+    /// just that record is quarantined and the rest of the store loads.
+    #[test]
+    fn load_quarantines_workbench_with_missing_parent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("projects.json");
+        let orphan = workbench(
+            "orphan",
+            "gone",
+            "feature/a",
+            vec![WorkbenchRoot {
+                parent_root: root("/tmp/gone"),
+                worktree_root: root("/tmp/gone--feature%2Fa"),
+            }],
+        );
+        let mut records = HashMap::new();
+        for project in [standalone("ok", vec![root("/tmp/ok")]), orphan] {
+            records.insert(project.id.0.clone(), project);
+        }
+        write_store_file(&path, records);
+
+        let store = ProjectStore::load(path.clone()).expect("store must load");
+        assert!(store.get(&project_id("orphan")).is_none(), "orphan skipped");
+        assert!(store.get(&project_id("ok")).is_some(), "rest of store kept");
+
+        // The quarantine is persisted, so the next load is clean.
+        let reloaded = ProjectStore::load(path).expect("reload store");
+        assert!(reloaded.get(&project_id("orphan")).is_none());
+        assert!(reloaded.get(&project_id("ok")).is_some());
     }
 
     #[test]

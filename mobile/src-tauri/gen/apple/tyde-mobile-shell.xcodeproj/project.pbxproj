@@ -179,7 +179,7 @@
 			path = "tyde-mobile-shell";
 			sourceTree = "<group>";
 		};
-		"TEMP_F63CE2EA-C2E1-4B26-A6DB-8822188EFC83" /* x86_64 */ = {
+		"TEMP_8BEAB368-D096-4629-85DA-D2E776607C99" /* x86_64 */ = {
 			isa = PBXGroup;
 			children = (
 			);

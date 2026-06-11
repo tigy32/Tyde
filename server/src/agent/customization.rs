@@ -68,11 +68,25 @@ pub(crate) fn resolve_spawn_config(
     let mut skills = Vec::new();
     let mut tool_policy = ToolPolicy::Unrestricted;
 
-    if let Some(custom_agent_id) = request.custom_agent_id {
-        let custom_agent = request
-            .custom_agent_store
-            .get(custom_agent_id)
-            .ok_or_else(|| format!("cannot resolve missing custom agent {}", custom_agent_id))?;
+    // A spawn with no explicit custom agent uses the editable "Default"
+    // builtin, so users can customize every plain chat from Settings →
+    // Custom Agents. An explicit selection must exist; the implicit default
+    // is best-effort (a deleted Default agent means no customization).
+    let custom_agent = match request.custom_agent_id {
+        Some(custom_agent_id) => Some(
+            request
+                .custom_agent_store
+                .get(custom_agent_id)
+                .ok_or_else(|| {
+                    format!("cannot resolve missing custom agent {}", custom_agent_id)
+                })?,
+        ),
+        None => request.custom_agent_store.get(&CustomAgentId(
+            crate::store::custom_agents::DEFAULT_CUSTOM_AGENT_ID.to_owned(),
+        )),
+    };
+
+    if let Some(custom_agent) = custom_agent {
         instructions = custom_agent.instructions.clone();
         tool_policy = custom_agent.tool_policy.clone();
 

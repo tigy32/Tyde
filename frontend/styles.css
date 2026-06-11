@@ -2047,13 +2047,47 @@ kbd {
 
 .chat-empty-hint {
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
+    gap: var(--space-4);
     padding: 48px 32px;
     color: var(--text-tertiary);
     font-size: 1rem;
     font-style: italic;
     opacity: 0.8;
+}
+
+.chat-didyouknow {
+    max-width: 460px;
+    padding: var(--space-3) var(--space-4);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 10px;
+    text-align: left;
+    font-style: normal;
+}
+
+.chat-didyouknow-label {
+    display: block;
+    font-size: 0.769rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--accent-primary);
+    margin-bottom: var(--space-1);
+}
+
+.chat-didyouknow-title {
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+}
+
+.chat-didyouknow-body {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    line-height: 1.45;
 }
 
 /* ===== Initializing Agent Overlay ===== */
@@ -8578,4 +8612,149 @@ pre.tool-error-pre {
     text-align: center;
     color: var(--text-tertiary);
     font-size: 0.923rem;
+}
+
+/* ============================================================
+   Workbench create modal (project rail) + rail context-menu
+   disabled states. Appended section — keep self-contained.
+   ============================================================ */
+
+/* Backdrop behind the New Workbench modal. Position/inset/z-index come
+   from inline styles on the element; this only softens the dim layer. */
+.modal-backdrop {
+    background: rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(1px);
+}
+
+.workbench-create-modal {
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    padding: var(--space-4);
+    min-width: 360px;
+    max-width: 480px;
+    font-family: var(--font-sans);
+    animation: modal-scale-in 0.15s ease-out;
+}
+
+.workbench-create-modal .modal-title {
+    color: var(--text-bright);
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: var(--space-3);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.workbench-create-modal .modal-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin-bottom: var(--space-4);
+}
+
+.workbench-create-modal .modal-label {
+    color: var(--text-secondary);
+    font-size: 0.846rem;
+}
+
+.workbench-create-modal .modal-input {
+    font-size: 0.923rem;
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    padding: 6px 8px;
+    outline: none;
+    width: 100%;
+}
+
+.workbench-create-modal .modal-input:focus {
+    border-color: var(--accent-primary);
+}
+
+.workbench-create-modal .modal-input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Inline failure from a rejected WorkbenchCreate (or a send failure). */
+.workbench-create-modal .modal-error {
+    color: var(--error);
+    font-size: 0.846rem;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
+/* "Creating workbench…" indicator while the request is in flight. */
+.workbench-create-modal .modal-status {
+    color: var(--text-secondary);
+    font-size: 0.846rem;
+    animation: workbench-create-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes workbench-create-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+}
+
+.workbench-create-modal .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+}
+
+.workbench-create-modal .modal-button {
+    border: 1px solid var(--border-primary);
+    background: var(--surface-3);
+    color: var(--text-primary);
+    font-size: 0.846rem;
+    line-height: 1.4;
+    padding: 5px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.08s, border-color 0.08s;
+}
+
+.workbench-create-modal .modal-button:hover:not(:disabled) {
+    background: var(--surface-hover);
+    border-color: var(--border-secondary);
+}
+
+.workbench-create-modal .modal-button.primary {
+    background: var(--accent-primary);
+    border-color: var(--accent-primary);
+    color: #ffffff;
+}
+
+.workbench-create-modal .modal-button.primary:hover:not(:disabled) {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+}
+
+.workbench-create-modal .modal-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Rail context menu: disabled item (e.g. Delete Project on a parent that
+   still has workbenches) plus the explanatory hint line under it. */
+.context-menu-item:disabled {
+    color: var(--text-tertiary);
+    cursor: not-allowed;
+}
+
+.context-menu-item:disabled:hover {
+    background: transparent;
+    color: var(--text-tertiary);
+}
+
+.context-menu-hint {
+    color: var(--text-tertiary);
+    font-size: 0.769rem;
+    line-height: 1.3;
+    padding: 0 10px 6px;
 }

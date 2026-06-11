@@ -580,7 +580,14 @@ fn HostToolsSection() -> impl IntoView {
         };
         let state = state_for_open_browser.clone();
         spawn_local(async move {
-            match crate::actions::start_host_browse(&state, &host, None, false).await {
+            match crate::actions::start_host_browse(
+                &state,
+                &host,
+                protocol::HostBrowseInitial::Home,
+                false,
+            )
+            .await
+            {
                 Ok(stream) => browse_stream.set(Some(stream)),
                 Err(e) => log::error!("start_host_browse failed: {e}"),
             }

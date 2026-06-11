@@ -450,16 +450,25 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 // `ReviewEvent::Snapshot`, neither of which fires for
                 // a rejected request.
                 clear_review_pending_on_error(state, host_id, &payload);
-                // CommandError carries no parent/branch correlation, but
-                // per-parent serialization on the server (§5.5) means we
-                // can drop the oldest pending entry for this host and stay
-                // correct in practice. Otherwise the entry would linger
-                // until the same parent succeeded again or the host
-                // disconnected.
+                // CommandError carries no parent/branch correlation — its
+                // `stream` is the host stream the request was sent on — so
+                // when creates under *different* parents run concurrently
+                // (the server lock is only per parent) we cannot tell which
+                // one failed. Best effort: mark the oldest in-flight entry
+                // for this host with the message so the create modal can
+                // surface it inline. Entries are additionally time-bounded
+                // (PENDING_WORKBENCH_CREATE_TTL_MS) so a mis-correlated or
+                // unconsumed entry cannot linger and cause a spurious
+                // active-project switch later.
                 if matches!(payload.request_kind, FrameKind::WorkbenchCreate) {
+                    let now = crate::state::now_ms();
                     state.pending_workbench_creates.update(|pending| {
-                        if let Some(idx) = pending.iter().position(|p| p.host_id == host_id) {
-                            pending.remove(idx);
+                        pending.retain(|p| !p.is_stale(now));
+                        if let Some(entry) = pending
+                            .iter_mut()
+                            .find(|p| p.host_id == host_id && p.error.is_none())
+                        {
+                            entry.error = Some(payload.message.clone());
                         }
                     });
                 }
@@ -1059,11 +1068,17 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         ..
                     } => {
                         let mut matched = None;
+                        let now = crate::state::now_ms();
                         state.pending_workbench_creates.update(|pending| {
+                            // Stale or already-failed entries must not steal
+                            // this upsert: only a live in-flight create gets
+                            // the auto-switch.
+                            pending.retain(|p| !p.is_stale(now));
                             if let Some(idx) = pending.iter().position(|p| {
                                 p.host_id == host_id
                                     && &p.parent_project_id == parent_project_id
                                     && &p.branch == branch
+                                    && p.error.is_none()
                             }) {
                                 pending.remove(idx);
                                 matched = Some(project.id.clone());
@@ -2169,6 +2184,24 @@ pub(crate) fn handle_project_delete(state: &AppState, host_id: &str, project: &p
         state.switch_active_project(fallback);
     }
     state.forget_project_view_memory(&deleted_ref);
+    // Drop per-project caches keyed by the deleted ProjectId so they can't
+    // leak or be misread if the id ever reappears. Mirrors the mobile
+    // dispatcher's delete handling. Workbench removals arrive as the same
+    // Delete notification, so this covers both standalone project deletes
+    // and workbench removals.
+    let deleted_id = &project.id;
+    state.file_tree.update(|map| {
+        map.remove(deleted_id);
+    });
+    state.git_status.update(|map| {
+        map.remove(deleted_id);
+    });
+    state.review_summaries.update(|map| {
+        map.remove(deleted_id);
+    });
+    state.diff_contents.update(|map| {
+        map.retain(|key, _| !(key.host_id == host_id && &key.project_id == deleted_id));
+    });
 }
 
 fn apply_project_file_list(

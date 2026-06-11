@@ -14,6 +14,13 @@ use crate::state::{ActiveProjectRef, AppState, TabContent};
 struct DraggedProject {
     host_id: String,
     project_id: protocol::ProjectId,
+    /// `Some` when the dragged row is a workbench (its parent project id),
+    /// `None` for a top-level standalone project. Captured at drag start so
+    /// drop targets can apply the same scope rule as `reorder_projects`:
+    /// top-level rows reorder among top-level rows, workbenches among
+    /// siblings under the same parent. Cross-scope targets show no drop
+    /// indicator and reject the drop.
+    parent_project_id: Option<protocol::ProjectId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,6 +400,7 @@ fn ProjectRow(
 
     let host_id_for_drag = host_id.clone();
     let project_id_for_drag = project_id.clone();
+    let project_signal_for_drag = project_signal.clone();
     let on_drag_start = move |ev: web_sys::DragEvent| {
         if let Some(data_transfer) = ev.data_transfer() {
             data_transfer.set_effect_allowed("move");
@@ -402,11 +410,14 @@ fn ProjectRow(
         dragged_project.set(Some(DraggedProject {
             host_id: host_id_for_drag.clone(),
             project_id: project_id_for_drag.clone(),
+            parent_project_id: project_signal_for_drag()
+                .and_then(|project| project.parent_project_id().cloned()),
         }));
     };
 
     let host_id_for_dragover = host_id.clone();
     let project_id_for_dragover = project_id.clone();
+    let project_signal_for_dragover = project_signal.clone();
     let on_drag_over = move |ev: web_sys::DragEvent| {
         let Some(active_drag) = dragged_project.get() else {
             return;
@@ -414,6 +425,18 @@ fn ProjectRow(
         if active_drag.host_id != host_id_for_dragover
             || active_drag.project_id == project_id_for_dragover
         {
+            return;
+        }
+        // Reorder is scoped (same parent, or both top-level) — see
+        // `reorder_projects`. Don't advertise a drop the action would
+        // reject: no prevent_default (so the drop never fires here) and no
+        // indicator.
+        let target_parent =
+            project_signal_for_dragover().and_then(|project| project.parent_project_id().cloned());
+        if active_drag.parent_project_id != target_parent {
+            if drop_target.get_untracked().is_some() {
+                drop_target.set(None);
+            }
             return;
         }
         ev.prevent_default();
@@ -430,6 +453,7 @@ fn ProjectRow(
     let state_for_reorder = state.clone();
     let host_id_for_drop = host_id.clone();
     let project_id_for_drop = project_id.clone();
+    let project_signal_for_drop = project_signal.clone();
     let on_drop = move |ev: web_sys::DragEvent| {
         ev.prevent_default();
         let Some(active_drag) = dragged_project.get() else {
@@ -439,6 +463,13 @@ fn ProjectRow(
         dragged_project.set(None);
         if active_drag.host_id != host_id_for_drop || active_drag.project_id == project_id_for_drop
         {
+            return;
+        }
+        // Same scope rule as on_drag_over / reorder_projects; defensive in
+        // case a drop sneaks through without a matching dragover.
+        let target_parent =
+            project_signal_for_drop().and_then(|project| project.parent_project_id().cloned());
+        if active_drag.parent_project_id != target_parent {
             return;
         }
         reorder_projects(
@@ -634,6 +665,22 @@ fn RailContextMenuView(
             .is_some_and(|project| project.is_workbench())
     };
 
+    // The server rejects deleting a standalone project while a workbench
+    // still references it ("cannot delete project … while referenced by
+    // workbench …"), so offering an enabled Delete there is a guaranteed
+    // failure. Derive child presence from the same projects signal the rail
+    // uses for nesting.
+    let has_workbench_children: Memo<bool> = {
+        let state = state.clone();
+        let host_id = menu.host_id.clone();
+        let project_id = menu.project_id.clone();
+        Memo::new(move |_| {
+            state.projects.get().iter().any(|info| {
+                info.host_id == host_id && info.project.parent_project_id() == Some(&project_id)
+            })
+        })
+    };
+
     let host_id_for_rename = menu.host_id.clone();
     let project_id_for_rename = menu.project_id.clone();
     let on_rename = move |_| {
@@ -751,9 +798,21 @@ fn RailContextMenuView(
                     <button class="context-menu-item" on:click=on_new_workbench.clone()>
                         "New Workbench"
                     </button>
-                    <button class="context-menu-item" on:click=on_delete.clone()>
+                    <button
+                        class="context-menu-item"
+                        on:click=on_delete.clone()
+                        disabled=move || has_workbench_children.get()
+                        title=move || if has_workbench_children.get() {
+                            "Remove its workbenches first"
+                        } else {
+                            ""
+                        }
+                    >
                         "Delete Project"
                     </button>
+                    {move || has_workbench_children.get().then(|| view! {
+                        <div class="context-menu-hint">"Remove its workbenches first"</div>
+                    })}
                 })}
                 {move || is_workbench().then(|| view! {
                     <button class="context-menu-item" on:click=on_remove_workbench.clone()>
@@ -765,6 +824,35 @@ fn RailContextMenuView(
     }
 }
 
+/// Submission record the New Workbench modal holds while a create is in
+/// flight. `preexisting_ids` snapshots the workbench ids that already matched
+/// `(host, parent, branch)` at submit time so success is detected only by a
+/// *new* matching workbench appearing — a pre-existing same-branch workbench
+/// must not close the modal as a false success.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SubmittedWorkbenchCreate {
+    branch: protocol::GitBranchName,
+    preexisting_ids: Vec<protocol::ProjectId>,
+}
+
+/// New Workbench modal. State machine:
+///
+/// - **Editing** (`submitted == None`): inputs enabled; `error` (if set)
+///   shows the previous attempt's failure inline so the user can correct the
+///   branch name and retry.
+/// - **Pending** (`submitted == Some`): entered on submit, after
+///   `create_workbench` pushed its `PendingWorkbenchCreate` entry. Inputs and
+///   submit are disabled and a "Creating workbench…" status is shown. A
+///   watcher effect resolves the phase:
+///   - success — a new workbench matching `(host, parent, branch)` lands in
+///     `state.projects` (the dispatcher auto-switches to it) → close;
+///   - reported failure — our pending entry carries the `CommandError`
+///     message → consume the entry, show the message, back to Editing;
+///   - silent failure — the pending entry vanished without a workbench
+///     appearing (send failure, host disconnect cleanup) → generic error,
+///     back to Editing.
+/// - Cancel / Escape / backdrop always close, withdrawing any in-flight
+///   pending entry so a late success can't yank the active project later.
 #[component]
 fn WorkbenchCreateModal(
     prompt: WorkbenchCreatePrompt,
@@ -772,6 +860,9 @@ fn WorkbenchCreateModal(
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let branch = RwSignal::new(String::new());
+    let submitted = RwSignal::new(None::<SubmittedWorkbenchCreate>);
+    let error: RwSignal<Option<String>> = RwSignal::new(None);
+    let pending = move || submitted.get().is_some();
     let input_ref = NodeRef::<leptos::html::Input>::new();
     Effect::new(move |_| {
         if let Some(el) = input_ref.get() {
@@ -779,33 +870,145 @@ fn WorkbenchCreateModal(
         }
     });
 
-    let close = move || workbench_prompt.set(None);
+    let close = {
+        let state = state.clone();
+        let host_id = prompt.host_id.clone();
+        let parent_project_id = prompt.parent_project_id.clone();
+        move || {
+            if let Some(sub) = submitted.get_untracked() {
+                state.pending_workbench_creates.update(|pending| {
+                    pending.retain(|entry| {
+                        !(entry.host_id == host_id
+                            && entry.parent_project_id == parent_project_id
+                            && entry.branch == sub.branch)
+                    });
+                });
+            }
+            workbench_prompt.set(None);
+        }
+    };
 
-    let close_for_backdrop = close;
+    // Watch for the outcome of an in-flight create. Reads nothing while
+    // Editing (early return keeps the tracked sources minimal).
+    {
+        let state = state.clone();
+        let host_id = prompt.host_id.clone();
+        let parent_project_id = prompt.parent_project_id.clone();
+        Effect::new(move |_| {
+            let Some(sub) = submitted.get() else {
+                return;
+            };
+            let success = state.projects.get().iter().any(|info| {
+                info.host_id == host_id
+                    && !sub.preexisting_ids.contains(&info.project.id)
+                    && match &info.project.source {
+                        ProjectSource::GitWorkbench {
+                            parent_project_id: parent,
+                            branch,
+                            ..
+                        } => parent == &parent_project_id && branch == &sub.branch,
+                        ProjectSource::Standalone { .. } => false,
+                    }
+            });
+            if success {
+                workbench_prompt.set(None);
+                return;
+            }
+            let entry = state
+                .pending_workbench_creates
+                .get()
+                .into_iter()
+                .find(|entry| {
+                    entry.host_id == host_id
+                        && entry.parent_project_id == parent_project_id
+                        && entry.branch == sub.branch
+                });
+            let failure = match entry {
+                Some(entry) => {
+                    let Some(message) = entry.error else {
+                        // Still in flight.
+                        return;
+                    };
+                    // Consume the errored entry — it exists solely so this
+                    // modal can surface the failure.
+                    state.pending_workbench_creates.update(|pending| {
+                        pending.retain(|entry| {
+                            !(entry.host_id == host_id
+                                && entry.parent_project_id == parent_project_id
+                                && entry.branch == sub.branch
+                                && entry.error.is_some())
+                        });
+                    });
+                    message
+                }
+                // Entry vanished without a workbench appearing: the send
+                // failed (actions removed it) or the host disconnected.
+                None => {
+                    "The request could not be completed. Check the host connection and try again."
+                        .to_owned()
+                }
+            };
+            error.set(Some(failure));
+            submitted.set(None);
+            if let Some(el) = input_ref.get_untracked() {
+                let _ = el.focus();
+            }
+        });
+    }
+
+    let close_for_backdrop = close.clone();
     let on_backdrop_click = move |_| close_for_backdrop();
 
-    let close_for_cancel = close;
+    let close_for_cancel = close.clone();
     let on_cancel = move |_| close_for_cancel();
 
     let state_for_submit = state.clone();
     let prompt_for_submit = prompt.clone();
-    let close_for_submit = close;
     let submit = move || {
+        if submitted.get_untracked().is_some() {
+            return;
+        }
         let value = branch.get_untracked().trim().to_owned();
         if value.is_empty() {
             return;
         }
+        let branch_name = protocol::GitBranchName(value.clone());
+        let preexisting_ids = state_for_submit
+            .projects
+            .get_untracked()
+            .into_iter()
+            .filter(|info| {
+                info.host_id == prompt_for_submit.host_id
+                    && match &info.project.source {
+                        ProjectSource::GitWorkbench {
+                            parent_project_id,
+                            branch,
+                            ..
+                        } => {
+                            parent_project_id == &prompt_for_submit.parent_project_id
+                                && branch == &branch_name
+                        }
+                        ProjectSource::Standalone { .. } => false,
+                    }
+            })
+            .map(|info| info.project.id)
+            .collect();
+        error.set(None);
         create_workbench(
             &state_for_submit,
             prompt_for_submit.host_id.clone(),
             prompt_for_submit.parent_project_id.clone(),
             value,
         );
-        close_for_submit();
+        submitted.set(Some(SubmittedWorkbenchCreate {
+            branch: branch_name,
+            preexisting_ids,
+        }));
     };
     let submit_for_keydown = submit.clone();
     let submit_for_button = submit;
 
+    let close_for_keydown = close.clone();
     let on_keydown = move |ev: web_sys::KeyboardEvent| {
         ev.stop_propagation();
         match ev.key().as_str() {
@@ -815,7 +1018,7 @@ fn WorkbenchCreateModal(
             }
             "Escape" => {
                 ev.prevent_default();
-                close_for_cancel();
+                close_for_keydown();
             }
             _ => {}
         }
@@ -845,19 +1048,26 @@ fn WorkbenchCreateModal(
                         spellcheck="false"
                         autocapitalize="none"
                         autocomplete="off"
+                        disabled=pending
                         prop:value=move || branch.get()
                         on:input=move |ev| branch.set(event_target_value(&ev))
                         on:keydown=on_keydown
                     />
+                    {move || error.get().map(|message| view! {
+                        <div class="modal-error">{message}</div>
+                    })}
+                    {move || pending().then(|| view! {
+                        <div class="modal-status">"Creating workbench…"</div>
+                    })}
                 </div>
                 <div class="modal-actions">
                     <button class="modal-button" on:click=on_cancel>"Cancel"</button>
                     <button
                         class="modal-button primary"
                         on:click=move |_| submit_for_button()
-                        disabled=move || branch.get().trim().is_empty()
+                        disabled=move || pending() || branch.get().trim().is_empty()
                     >
-                        "Create Workbench"
+                        {move || if pending() { "Creating…" } else { "Create Workbench" }}
                     </button>
                 </div>
             </div>

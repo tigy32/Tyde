@@ -16,18 +16,6 @@ fn backend_label_for(kind: BackendKind) -> &'static str {
     }
 }
 
-/// One-line orientation shown under each engine name in the New Chat picker so
-/// the bare backend names aren't a wall of unfamiliar words to a new user.
-fn backend_tagline(kind: BackendKind) -> &'static str {
-    match kind {
-        BackendKind::Tycode => "Tycode subprocess",
-        BackendKind::Kiro => "Kiro ACP",
-        BackendKind::Claude => "Anthropic — deep reasoning & coding",
-        BackendKind::Codex => "OpenAI — fast code generation",
-        BackendKind::Gemini => "Google — multimodal assistant",
-    }
-}
-
 #[component]
 pub fn HomeView() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -267,10 +255,7 @@ fn FlyoutBody(
                             style="display:flex;align-items:center;gap:0.5rem;width:100%;text-align:left;padding:0.4rem 0.6rem;background:transparent;border:none;color:inherit;cursor:pointer;border-radius:4px;white-space:nowrap;"
                             on:click=on_row_click
                         >
-                            <span style="display:flex;flex-direction:column;gap:0.1rem;">
-                                <span>{backend_label_for(backend)}</span>
-                                <span style="opacity:0.55;font-size:0.7rem;">{backend_tagline(backend)}</span>
-                            </span>
+                            <span>{backend_label_for(backend)}</span>
                             <span style="flex:1;"></span>
                             <span style="opacity:0.5;font-size:0.7rem;">"▶"</span>
                         </button>
@@ -322,6 +307,7 @@ fn NewChatButton(connected_sig: Memo<bool>) -> impl IntoView {
             .cloned()
             .map(|m| m.into_values().collect())
             .unwrap_or_default();
+        agents.retain(|a| a.id.0 != crate::state::DEFAULT_CUSTOM_AGENT_ID);
         agents.sort_by(|a, b| a.name.cmp(&b.name));
         agents
     });

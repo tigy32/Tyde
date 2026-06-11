@@ -3,8 +3,8 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     FrameKind, HostAbsPath, HostBrowseClosePayload, HostBrowseErrorCode, HostBrowseErrorPayload,
-    HostBrowseListPayload, HostBrowseStartPayload, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectFileKind, StreamPath,
+    HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectFileKind, StreamPath,
 };
 
 use crate::send::send_frame;
@@ -90,6 +90,12 @@ fn open_browser_for(
     purpose: BrowsePurpose,
 ) {
     let browse_stream = new_browse_stream();
+    let initial = match &purpose {
+        BrowsePurpose::OpenProject => HostBrowseInitial::Home,
+        BrowsePurpose::AddRoot { project_id } => HostBrowseInitial::ProjectRoots {
+            project_id: project_id.clone(),
+        },
+    };
     let dialog = BrowseDialogState {
         host_id: ArcRwSignal::new(host_id.clone()),
         browse_stream: ArcRwSignal::new(browse_stream.clone()),
@@ -116,7 +122,7 @@ fn open_browser_for(
             FrameKind::HostBrowseStart,
             &HostBrowseStartPayload {
                 browse_stream: browse_stream.clone(),
-                initial: None,
+                initial,
                 include_hidden: false,
             },
         )
@@ -274,7 +280,7 @@ fn switch_host(state: &AppState, dialog: &BrowseDialogState, new_host_id: String
             FrameKind::HostBrowseStart,
             &HostBrowseStartPayload {
                 browse_stream: new_browse_stream_for_task.clone(),
-                initial: None,
+                initial: HostBrowseInitial::Home,
                 include_hidden,
             },
         )

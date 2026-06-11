@@ -177,6 +177,26 @@ impl ReviewStore {
         })
     }
 
+    /// Deletes every persisted review referencing `project_id` and returns
+    /// the ids of the removed reviews. Used when a project or workbench is
+    /// deleted so the store does not accumulate orphaned records.
+    pub fn delete_for_project(&self, project_id: &ProjectId) -> Result<Vec<ReviewId>, String> {
+        let mut records = Self::read_from_disk(&self.path)?;
+        let removed = records
+            .iter()
+            .filter(|(_, review)| &review.project_id == project_id)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            return Ok(removed);
+        }
+        for id in &removed {
+            records.remove(id);
+        }
+        self.save(&records)?;
+        Ok(removed)
+    }
+
     fn read_modify_write<F>(&self, update: F) -> Result<(), String>
     where
         F: FnOnce(&mut HashMap<ReviewId, Review>),

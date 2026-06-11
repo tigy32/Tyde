@@ -2858,9 +2858,17 @@ pub struct HostBrowseStartPayload {
     /// `/browse/<uuid>` — client-allocated stream path on which the server
     /// will emit `HostBrowseOpened` / `HostBrowseEntries` / `HostBrowseError`.
     pub browse_stream: StreamPath,
-    /// Initial directory to list. None = server chooses (its home directory).
-    pub initial: Option<HostAbsPath>,
+    /// Server-owned intent for the initial directory to list.
+    pub initial: HostBrowseInitial,
     pub include_hidden: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostBrowseInitial {
+    Home,
+    Path { path: HostAbsPath },
+    ProjectRoots { project_id: ProjectId },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

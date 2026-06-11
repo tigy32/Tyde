@@ -1441,6 +1441,7 @@ fn DraftMemberRow(
             .cloned()
             .map(|m| m.into_values().collect())
             .unwrap_or_default();
+        agents.retain(|a| a.id.0 != crate::state::DEFAULT_CUSTOM_AGENT_ID);
         agents.sort_by(|a, b| a.name.cmp(&b.name));
         agents
     });
@@ -1976,6 +1977,7 @@ fn MemberFormFields(form: MemberFormState) -> impl IntoView {
             .cloned()
             .map(|m| m.into_values().collect())
             .unwrap_or_default();
+        agents.retain(|a| a.id.0 != crate::state::DEFAULT_CUSTOM_AGENT_ID);
         agents.sort_by(|a, b| a.name.cmp(&b.name));
         agents
     });

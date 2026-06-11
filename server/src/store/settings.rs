@@ -95,7 +95,24 @@ impl HostSettingsStore {
     fn read_from_disk(path: &Path) -> Result<HostSettings, String> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let store = serde_json::from_str::<StoreFile>(&contents).map_err(|err| {
+                let mut value =
+                    serde_json::from_str::<serde_json::Value>(&contents).map_err(|err| {
+                        format!("Failed to parse settings store {}: {err}", path.display())
+                    })?;
+                // Other builds/branches may know backend kinds this build
+                // doesn't (real incident: a sibling branch wrote
+                // "antigravity"). Skip those entries instead of refusing to
+                // load the whole file. A later save rewrites the file
+                // without them — acceptable loss; everything else survives.
+                let skipped = strip_unknown_backend_kinds(&mut value);
+                if !skipped.is_empty() {
+                    tracing::warn!(
+                        "Settings store {} references backend kinds unknown to this build; skipped: {}",
+                        path.display(),
+                        skipped.join(", ")
+                    );
+                }
+                let store = serde_json::from_value::<StoreFile>(value).map_err(|err| {
                     format!("Failed to parse settings store {}: {err}", path.display())
                 })?;
                 validate_settings(store.settings)
@@ -195,6 +212,55 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
     }
 
     Ok(())
+}
+
+/// Removes backend kinds this build doesn't know from everywhere they can
+/// appear in a raw settings file, returning a description of each skipped
+/// entry. Works on the raw JSON rather than `BackendKind` so a fake
+/// "unknown" variant never has to leak into that widely-used enum. An
+/// unknown `default_backend` becomes null; `validate_settings` then
+/// re-normalizes the result as usual.
+fn strip_unknown_backend_kinds(value: &mut serde_json::Value) -> Vec<String> {
+    let mut skipped = Vec::new();
+    let Some(settings) = value.get_mut("settings") else {
+        return skipped;
+    };
+    if let Some(entries) = settings
+        .get_mut("enabled_backends")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        entries.retain(|entry| {
+            let known = is_known_backend_kind(entry);
+            if !known {
+                skipped.push(format!("enabled_backends entry {entry}"));
+            }
+            known
+        });
+    }
+    if let Some(default) = settings.get_mut("default_backend")
+        && !default.is_null()
+        && !is_known_backend_kind(default)
+    {
+        skipped.push(format!("default_backend {default}"));
+        *default = serde_json::Value::Null;
+    }
+    if let Some(configs) = settings
+        .get_mut("backend_tier_configs")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        configs.retain(|key, _| {
+            let known = is_known_backend_kind(&serde_json::Value::String(key.clone()));
+            if !known {
+                skipped.push(format!("backend_tier_configs key \"{key}\""));
+            }
+            known
+        });
+    }
+    skipped
+}
+
+fn is_known_backend_kind(value: &serde_json::Value) -> bool {
+    serde_json::from_value::<BackendKind>(value.clone()).is_ok()
 }
 
 fn empty_settings() -> HostSettings {
@@ -324,6 +390,104 @@ mod tests {
         let settings = store.get().expect("get settings");
         assert!(!settings.complexity_tiers_enabled);
         assert!(settings.backend_tier_configs.is_empty());
+    }
+
+    #[test]
+    fn unknown_backend_in_enabled_backends_is_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"settings":{"enabled_backends":["claude","antigravity","codex"],"default_backend":"claude"}}"#,
+        )
+        .expect("write store file");
+
+        let store = HostSettingsStore::load(path).expect("load store with unknown backend");
+        let settings = store.get().expect("get settings");
+        assert_eq!(
+            settings.enabled_backends,
+            vec![BackendKind::Claude, BackendKind::Codex]
+        );
+        assert_eq!(settings.default_backend, Some(BackendKind::Claude));
+    }
+
+    #[test]
+    fn unknown_backend_tier_config_key_is_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"settings":{"enabled_backends":["claude"],"complexity_tiers_enabled":true,"backend_tier_configs":{"claude":{"low":{"model":{"string":"haiku"}},"high":{}},"antigravity":{"low":{"model":{"string":"Gemini 3.5 Flash (Low)"}},"high":{}}}}}"#,
+        )
+        .expect("write store file");
+
+        let store = HostSettingsStore::load(path).expect("load store with unknown tier key");
+        let settings = store.get().expect("get settings");
+        assert!(settings.complexity_tiers_enabled);
+        assert_eq!(settings.backend_tier_configs.len(), 1);
+        let claude = settings
+            .backend_tier_configs
+            .get(&BackendKind::Claude)
+            .expect("claude tier config kept");
+        assert_eq!(
+            claude.low.0.get("model"),
+            Some(&SessionSettingValue::String("haiku".to_string()))
+        );
+    }
+
+    #[test]
+    fn unknown_default_backend_falls_back_to_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"settings":{"enabled_backends":["claude","antigravity"],"default_backend":"antigravity"}}"#,
+        )
+        .expect("write store file");
+
+        let store = HostSettingsStore::load(path).expect("load store with unknown default");
+        let settings = store.get().expect("get settings");
+        assert_eq!(settings.enabled_backends, vec![BackendKind::Claude]);
+        assert_eq!(settings.default_backend, None);
+    }
+
+    #[test]
+    fn fully_known_settings_file_round_trips_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"settings":{"enabled_backends":["claude","codex"],"default_backend":"codex","enable_mobile_connections":true,"mobile_broker_url":null,"tyde_debug_mcp_enabled":true,"tyde_agent_control_mcp_enabled":true,"complexity_tiers_enabled":true,"backend_tier_configs":{"codex":{"low":{"reasoning_effort":{"string":"low"}},"high":{"reasoning_effort":{"string":"xhigh"}}}}}}"#,
+        )
+        .expect("write store file");
+
+        let store = HostSettingsStore::load(path).expect("load fully-known store");
+        let before = store.get().expect("get settings");
+        assert_eq!(
+            before.enabled_backends,
+            vec![BackendKind::Claude, BackendKind::Codex]
+        );
+        assert_eq!(before.default_backend, Some(BackendKind::Codex));
+        assert!(before.enable_mobile_connections);
+        assert!(before.tyde_debug_mcp_enabled);
+        assert!(before.complexity_tiers_enabled);
+        assert_eq!(
+            before
+                .backend_tier_configs
+                .get(&BackendKind::Codex)
+                .expect("codex tier config")
+                .high
+                .0
+                .get("reasoning_effort"),
+            Some(&SessionSettingValue::String("xhigh".to_string()))
+        );
+
+        // A write cycle must not drop any known entries.
+        let after = store
+            .apply(HostSettingValue::TydeDebugMcpEnabled { enabled: true })
+            .expect("apply no-op setting");
+        assert_eq!(after, before);
+        assert_eq!(store.get().expect("re-read settings"), before);
     }
 
     #[test]
