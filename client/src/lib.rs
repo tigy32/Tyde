@@ -1015,6 +1015,10 @@ impl Connection {
                     let _: ProjectEventPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::CommandError => {
+                    let _: CommandErrorPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 other => {
                     panic!(
                         "unexpected server frame kind {} on project stream {}",

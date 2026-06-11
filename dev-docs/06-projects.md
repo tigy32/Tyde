@@ -173,19 +173,16 @@ This keeps project ownership explicit while avoiding the forbidden fallback of
 
 ## 6. Deletion Rule
 
-Deleting a project that is still referenced by a stored session would create a
-dangling `project_id`. That violates the philosophy rule that invalid states
-should be unrepresentable.
+Deleting a project detaches dependent metadata before removing the project
+record:
 
-So `project_delete` is rejected if any persisted session still references the
-project.
+- persisted sessions keep their history, but their `project_id` is cleared
+- project-scoped steering is deleted
+- team members drop the deleted project id from `project_ids`
 
-The consequence is intentional:
-
-- either the session must be migrated to another project first
-- or the session must be removed before the project can be deleted
-
-We do not compensate for dangling references later in the UI.
+If a team member loses its last project, it remains in the team with an empty
+`project_ids` list and cannot spawn a fresh project-bound agent until a project
+is assigned again.
 
 ---
 

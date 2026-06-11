@@ -2184,7 +2184,7 @@ impl CodexInner {
                 }
 
                 self.track_tool_requests(call_ids.clone()).await;
-                for (change, call_id) in file_changes.into_iter().zip(call_ids.into_iter()) {
+                for (change, call_id) in file_changes.into_iter().zip(call_ids) {
                     self.emit_modify_file_request(
                         &call_id,
                         &change.path,

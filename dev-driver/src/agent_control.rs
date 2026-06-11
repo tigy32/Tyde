@@ -284,7 +284,7 @@ impl AgentControlHandle {
             .values()
             .map(agent_overview_from_state)
             .collect::<Vec<_>>();
-        agents.sort_by(|left, right| left.created_at_ms.cmp(&right.created_at_ms));
+        agents.sort_by_key(|agent| agent.created_at_ms);
         agents
     }
 

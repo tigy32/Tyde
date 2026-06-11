@@ -1245,7 +1245,7 @@ async fn team_member_create_rejects_missing_project() {
 }
 
 #[tokio::test]
-async fn team_member_create_rejects_empty_project_ids() {
+async fn team_member_create_allows_unassigned_project_ids() {
     let mut fixture = Fixture::new().await;
     let custom_agent = upsert_custom_agent(&mut fixture.client, "empty-projects-agent").await;
     let (team, _) = create_team(
@@ -1264,14 +1264,30 @@ async fn team_member_create_rejects_empty_project_ids() {
             session_id: None,
         })
         .await
-        .expect("team_member_create write failed");
+        .expect("team_member_create failed");
 
-    let error = expect_command_error(&mut fixture.client, "empty project_ids error").await;
-    assert_eq!(error.operation, "team_member_create");
+    let member = expect_team_member_notify(&mut fixture.client, "empty project_ids member").await;
+    assert!(member.project_ids.is_empty());
+    let _ =
+        expect_team_member_binding_notify(&mut fixture.client, "empty project_ids member binding")
+            .await;
+
+    fixture
+        .client
+        .team_member_activate(TeamMemberActivatePayload {
+            member_id: member.id,
+            prompt: Some("hello".to_owned()),
+            images: None,
+        })
+        .await
+        .expect("team_member_activate write failed");
+    let error =
+        expect_command_error(&mut fixture.client, "empty project_ids activation error").await;
+    assert_eq!(error.operation, "team_member_activate");
     assert_eq!(error.code, CommandErrorCode::InvalidInput);
     assert!(!error.fatal);
     assert!(
-        error.message.contains("project_ids must not be empty"),
+        error.message.contains("has no project_ids"),
         "unexpected error: {}",
         error.message
     );
@@ -1550,79 +1566,104 @@ async fn custom_agent_delete_succeeds_after_team_member_delete() {
 }
 
 #[tokio::test]
-async fn project_delete_rejects_active_team_member_reference() {
+async fn project_delete_unassigns_team_members_that_only_reference_it() {
     let mut fixture = Fixture::new().await;
-    let (_, project, _, _, _) = create_team_with_report(&mut fixture, "project-delete").await;
-
-    fixture
-        .client
-        .project_delete(ProjectDeletePayload { id: project.id })
-        .await
-        .expect("project_delete write failed");
-
-    let error = expect_command_error(&mut fixture.client, "referenced project delete").await;
-    assert_eq!(error.operation, "project_delete");
-    assert_eq!(error.code, CommandErrorCode::Conflict);
-    assert!(!error.fatal);
-    assert!(
-        error.message.contains("team member"),
-        "unexpected error: {}",
-        error.message
-    );
-}
-
-#[tokio::test]
-async fn project_delete_succeeds_after_team_member_delete() {
-    let mut fixture = Fixture::new().await;
-    let custom_agent =
-        upsert_custom_agent(&mut fixture.client, "project-delete-after-member-delete").await;
-    let manager_project = create_project(&mut fixture.client, "manager-delete-project").await;
-    let report_project = create_project(&mut fixture.client, "report-delete-project").await;
-    let (team, _) = create_team(
-        &mut fixture.client,
-        "Project Delete After Member Delete",
-        custom_agent.id.clone(),
-        Some(manager_project.id),
-    )
-    .await;
-    let report = create_report(
-        &mut fixture.client,
-        team.id,
-        "report",
-        custom_agent.id,
-        Some(report_project.id.clone()),
-    )
-    .await;
+    let (_, project, _, manager, report) =
+        create_team_with_report(&mut fixture, "project-delete").await;
 
     fixture
         .client
         .project_delete(ProjectDeletePayload {
-            id: report_project.id.clone(),
+            id: project.id.clone(),
         })
         .await
-        .expect("project_delete write failed");
-    let error = expect_command_error(&mut fixture.client, "referenced report project delete").await;
-    assert_eq!(error.operation, "project_delete");
-    assert_eq!(error.code, CommandErrorCode::Conflict);
-    assert!(
-        error.message.contains("team member"),
-        "unexpected error: {}",
-        error.message
-    );
+        .expect("project_delete failed");
 
-    fixture
-        .client
-        .team_member_delete(TeamMemberDeletePayload { id: report.id })
-        .await
-        .expect("team_member_delete failed");
-    let _ =
-        expect_team_member_delete_notify(&mut fixture.client, "TeamMemberNotify deleted report")
+    let updated_a =
+        expect_team_member_notify(&mut fixture.client, "TeamMemberNotify unassigned member 1")
             .await;
-    let _ = expect_team_member_binding_delete_notify(
+    let updated_b =
+        expect_team_member_notify(&mut fixture.client, "TeamMemberNotify unassigned member 2")
+            .await;
+    for member_id in [&manager.id, &report.id] {
+        let updated = [&updated_a, &updated_b]
+            .into_iter()
+            .find(|member| &member.id == member_id)
+            .unwrap_or_else(|| panic!("missing TeamMemberNotify for {member_id}"));
+        assert!(
+            updated.project_ids.is_empty(),
+            "member {} should be unassigned after project delete",
+            updated.id
+        );
+    }
+    let env = expect_kind(
         &mut fixture.client,
-        "TeamMemberBindingNotify deleted report",
+        FrameKind::ProjectNotify,
+        "ProjectNotify delete",
     )
     .await;
+    match env
+        .parse_payload::<ProjectNotifyPayload>()
+        .expect("parse ProjectNotify delete")
+    {
+        ProjectNotifyPayload::Delete { project: deleted } => assert_eq!(deleted.id, project.id),
+        other => panic!("expected ProjectNotify::Delete, got {other:?}"),
+    }
+
+    let (_fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert!(
+        bootstrap.projects.is_empty(),
+        "deleted project should not replay"
+    );
+    for member_id in [&manager.id, &report.id] {
+        let member = bootstrap
+            .team_members
+            .iter()
+            .find(|member| &member.id == member_id)
+            .unwrap_or_else(|| panic!("missing replayed team member {member_id}"));
+        assert!(
+            member.project_ids.is_empty(),
+            "replayed member {} should stay unassigned",
+            member.id
+        );
+    }
+}
+
+#[tokio::test]
+async fn project_delete_prunes_team_member_project_refs() {
+    let mut fixture = Fixture::new().await;
+    let custom_agent = upsert_custom_agent(&mut fixture.client, "project-delete-prune").await;
+    let manager_project = create_project(&mut fixture.client, "manager-delete-project").await;
+    let report_project = create_project(&mut fixture.client, "report-delete-project").await;
+    let kept_project = create_project(&mut fixture.client, "kept-report-project").await;
+    let (team, _) = create_team(
+        &mut fixture.client,
+        "Project Delete Prunes Member",
+        custom_agent.id.clone(),
+        Some(manager_project.id),
+    )
+    .await;
+    fixture
+        .client
+        .team_member_create(TeamMemberCreatePayload {
+            team_id: team.id,
+            member: member_spec(
+                "report",
+                Some(custom_agent.id),
+                vec![report_project.id.clone(), kept_project.id.clone()],
+            ),
+            session_id: None,
+        })
+        .await
+        .expect("team_member_create failed");
+    let report =
+        expect_team_member_notify(&mut fixture.client, "TeamMemberNotify report create").await;
+    let _ = expect_team_member_binding_notify(
+        &mut fixture.client,
+        "TeamMemberBindingNotify report create",
+    )
+    .await;
+
     fixture
         .client
         .project_delete(ProjectDeletePayload {
@@ -1630,6 +1671,10 @@ async fn project_delete_succeeds_after_team_member_delete() {
         })
         .await
         .expect("project_delete failed");
+    let updated_report =
+        expect_team_member_notify(&mut fixture.client, "TeamMemberNotify pruned report").await;
+    assert_eq!(updated_report.id, report.id);
+    assert_eq!(updated_report.project_ids, vec![kept_project.id.clone()]);
     let env = expect_kind(
         &mut fixture.client,
         FrameKind::ProjectNotify,
@@ -1645,7 +1690,21 @@ async fn project_delete_succeeds_after_team_member_delete() {
         }
         other => panic!("expected ProjectNotify::Delete, got {other:?}"),
     }
-    let _fresh = fixture.connect_fresh_host().await;
+
+    let (_fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let replayed = bootstrap
+        .team_members
+        .iter()
+        .find(|member| member.id == report.id)
+        .expect("report should replay");
+    assert_eq!(replayed.project_ids, vec![kept_project.id]);
+    assert!(
+        bootstrap
+            .projects
+            .iter()
+            .all(|project| project.id != report_project.id),
+        "deleted project should not replay"
+    );
 }
 
 #[tokio::test]

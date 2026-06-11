@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use protocol::{Steering, SteeringId};
+use protocol::{ProjectId, Steering, SteeringId, SteeringScope};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -67,6 +67,26 @@ impl SteeringStore {
         }
         self.save(&records)?;
         Ok(id.clone())
+    }
+
+    pub fn delete_for_project(&self, project_id: &ProjectId) -> Result<Vec<SteeringId>, String> {
+        let mut records = Self::read_from_disk(&self.path)?;
+        let mut deleted = records
+            .values()
+            .filter(|steering| {
+                matches!(&steering.scope, SteeringScope::Project(id) if id == project_id)
+            })
+            .map(|steering| steering.id.clone())
+            .collect::<Vec<_>>();
+        if deleted.is_empty() {
+            return Ok(deleted);
+        }
+        deleted.sort_by(|left, right| left.0.cmp(&right.0));
+        for id in &deleted {
+            records.remove(&id.0);
+        }
+        self.save(&records)?;
+        Ok(deleted)
     }
 
     fn read_from_disk(path: &Path) -> Result<HashMap<String, Steering>, String> {

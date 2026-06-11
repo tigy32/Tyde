@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 use protocol::{
-    AgentControlStatus, AgentId, CustomAgentId, SessionId, Team, TeamCreateFromDraftPayload,
-    TeamCreatePayload, TeamDeletePayload, TeamDraft, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftId,
-    TeamDraftMember, TeamDraftMemberEdit, TeamDraftMemberId, TeamDraftNotifyPayload,
-    TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload, TeamMember,
-    TeamMemberBindingNotifyPayload, TeamMemberBindingPayload, TeamMemberCreatePayload,
+    AgentControlStatus, AgentId, CustomAgentId, ProjectId, SessionId, Team,
+    TeamCreateFromDraftPayload, TeamCreatePayload, TeamDeletePayload, TeamDraft,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftId, TeamDraftMember, TeamDraftMemberEdit, TeamDraftMemberId,
+    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload,
+    TeamMember, TeamMemberBindingNotifyPayload, TeamMemberBindingPayload, TeamMemberCreatePayload,
     TeamMemberCreateSpec, TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload,
     TeamMemberPresetProfile, TeamMemberRole, TeamMemberShufflePayload, TeamMemberShuffleSuggestion,
     TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
@@ -156,6 +156,11 @@ enum TeamRegistryCommand {
     },
     DeleteMember {
         payload: TeamMemberDeletePayload,
+        refs: AgentTeamValidationRefs,
+        reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
+    },
+    RemoveProjectRefs {
+        project_id: ProjectId,
         refs: AgentTeamValidationRefs,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
@@ -471,6 +476,19 @@ impl TeamRegistryHandle {
         .await
     }
 
+    pub(crate) async fn remove_project_refs(
+        &self,
+        project_id: ProjectId,
+        refs: AgentTeamValidationRefs,
+    ) -> Result<TeamRegistryEvents, String> {
+        self.mutate(|reply| TeamRegistryCommand::RemoveProjectRefs {
+            project_id,
+            refs,
+            reply,
+        })
+        .await
+    }
+
     pub(crate) async fn create_draft(
         &self,
         payload: TeamDraftCreatePayload,
@@ -688,6 +706,14 @@ impl TeamRegistryActor {
                     reply,
                 } => {
                     let result = self.delete_member(payload, &refs);
+                    let _ = reply.send(result);
+                }
+                TeamRegistryCommand::RemoveProjectRefs {
+                    project_id,
+                    refs,
+                    reply,
+                } => {
+                    let result = self.remove_project_refs(&project_id, &refs);
                     let _ = reply.send(result);
                 }
                 TeamRegistryCommand::CreateDraft { payload, reply } => {
@@ -1164,6 +1190,26 @@ impl TeamRegistryActor {
         Ok(TeamRegistryEvents {
             member_notifies: vec![TeamMemberNotifyPayload::Delete { member }],
             binding_notifies,
+            ..TeamRegistryEvents::default()
+        })
+    }
+
+    fn remove_project_refs(
+        &mut self,
+        project_id: &ProjectId,
+        refs: &AgentTeamValidationRefs,
+    ) -> Result<TeamRegistryEvents, String> {
+        let members = self.store.remove_project_from_members(project_id, refs)?;
+        for member in &members {
+            if member.project_ids.is_empty() {
+                self.pending_activations.remove(&member.id);
+            }
+        }
+        Ok(TeamRegistryEvents {
+            member_notifies: members
+                .into_iter()
+                .map(|member| TeamMemberNotifyPayload::Upsert { member })
+                .collect(),
             ..TeamRegistryEvents::default()
         })
     }

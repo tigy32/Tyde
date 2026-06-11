@@ -859,7 +859,7 @@ fn list_tycode_sessions() -> Result<Vec<BackendSession>, String> {
         });
     }
 
-    sessions.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
     Ok(sessions)
 }
 

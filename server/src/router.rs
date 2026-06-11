@@ -894,7 +894,7 @@ fn validate_team_member_create_spec(
     if let Some(custom_agent_id) = spec.custom_agent_id.as_ref() {
         ensure_non_empty(operation, "custom_agent_id", custom_agent_id.0.as_str())?;
     }
-    validate_team_project_ids(operation, &spec.project_ids)
+    validate_optional_team_project_ids(operation, &spec.project_ids)
 }
 
 fn validate_team_draft_update(payload: &TeamDraftUpdatePayload) -> AppResult<()> {
@@ -973,12 +973,6 @@ fn validate_team_profile(
 }
 
 fn validate_team_project_ids(operation: &'static str, project_ids: &[ProjectId]) -> AppResult<()> {
-    if project_ids.is_empty() {
-        return Err(AppError::invalid(
-            operation,
-            "project_ids must not be empty",
-        ));
-    }
     let mut seen = HashSet::new();
     for project_id in project_ids {
         ensure_non_empty(operation, "project_id", project_id.0.as_str())?;

@@ -438,6 +438,34 @@ impl AgentTeamsStore {
         Ok(updated)
     }
 
+    pub fn remove_project_from_members(
+        &mut self,
+        project_id: &ProjectId,
+        refs: &AgentTeamValidationRefs,
+    ) -> Result<Vec<TeamMember>, String> {
+        let now = now_ms()?;
+        let mut updated = Vec::new();
+        for member in self.file.members.values_mut() {
+            let original_len = member.project_ids.len();
+            member
+                .project_ids
+                .retain(|candidate| candidate != project_id);
+            if member.project_ids.len() != original_len {
+                member.updated_at_ms = now;
+                updated.push(member.clone());
+            }
+        }
+        if !updated.is_empty() {
+            self.validate_and_save(refs)?;
+            updated.sort_by(|left, right| {
+                left.created_at_ms
+                    .cmp(&right.created_at_ms)
+                    .then(left.id.0.cmp(&right.id.0))
+            });
+        }
+        Ok(updated)
+    }
+
     pub fn delete_member(
         &mut self,
         payload: TeamMemberDeletePayload,
@@ -1109,9 +1137,6 @@ fn validate_profile_ids(profile: Option<&TeamMemberPresetProfile>) -> Result<(),
 }
 
 fn validate_project_ids(project_ids: &[ProjectId]) -> Result<(), String> {
-    if project_ids.is_empty() {
-        return Err("team member project_ids must not be empty".to_string());
-    }
     let mut seen = HashSet::new();
     for project_id in project_ids {
         validate_id("team member project_id", &project_id.0)?;
@@ -1551,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn create_member_rejects_empty_project_ids() {
+    fn create_member_allows_empty_project_ids() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("agent_teams.json");
         let refs = refs();
@@ -1566,7 +1591,7 @@ mod tests {
             )
             .expect("create team");
 
-        let err = store
+        let member = store
             .create_member(
                 TeamMemberCreatePayload {
                     team_id: team.id,
@@ -1583,7 +1608,7 @@ mod tests {
                 },
                 &refs,
             )
-            .expect_err("empty project_ids should fail");
-        assert!(err.contains("project_ids must not be empty"));
+            .expect("empty project_ids should be allowed");
+        assert!(member.project_ids.is_empty());
     }
 }

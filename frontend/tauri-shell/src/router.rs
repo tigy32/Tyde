@@ -26,7 +26,7 @@ struct ConnectedHost {
 
 enum RouterCommand {
     ConnectDuplex {
-        app: AppHandle,
+        app: Box<AppHandle>,
         host_id: String,
         transport: HostTransportConfig,
         host: server::HostHandle,
@@ -83,7 +83,7 @@ impl ProxyRouterHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(RouterCommand::ConnectDuplex {
-                app,
+                app: Box::new(app),
                 host_id,
                 transport,
                 host,
@@ -181,7 +181,7 @@ async fn router_actor(
                 hosts.insert(
                     host_id.clone(),
                     ConnectedHost {
-                        app,
+                        app: *app,
                         connection_id,
                         tx: connection_tx,
                     },

@@ -2687,11 +2687,7 @@ pub fn pair_lines_side_by_side_with_tokens(
             }
         };
 
-    for ((line, old_tok), new_tok) in lines
-        .into_iter()
-        .zip(old_tokens.into_iter())
-        .zip(new_tokens.into_iter())
-    {
+    for ((line, old_tok), new_tok) in lines.into_iter().zip(old_tokens).zip(new_tokens) {
         match line.kind {
             ProjectGitDiffLineKind::Removed => removed.push((line, old_tok, new_tok)),
             ProjectGitDiffLineKind::Added => added.push((line, old_tok, new_tok)),

@@ -30,6 +30,7 @@ case "$(uname -s)-$(uname -m)" in
     Darwin-arm64)  cft_platform="mac-arm64" ;;
     Darwin-x86_64) cft_platform="mac-x64" ;;
     Linux-x86_64)  cft_platform="linux64" ;;
+    Linux-aarch64) cft_platform="" ;;
     *) die "unsupported platform: $(uname -s)-$(uname -m)" ;;
 esac
 
@@ -56,10 +57,28 @@ log "detected Chrome $chrome_version_full (major $chrome_major)"
 # ── Find or download a matching chromedriver ──────────────────────────────
 # Cache by major version. Chrome auto-updates within a major; chromedriver is
 # only required to match the major number per Chrome for Testing's policy.
-driver_dir="$cache_dir/chromedriver-$chrome_major-$cft_platform"
-driver_bin="$driver_dir/chromedriver"
+if [[ -z "$cft_platform" ]]; then
+    driver_bin=""
+    for candidate in chromedriver \
+        /snap/chromium/current/usr/lib/chromium-browser/chromedriver \
+        /snap/chromium/*/usr/lib/chromium-browser/chromedriver; do
+        if [[ "$candidate" == "chromedriver" ]]; then
+            if command -v chromedriver >/dev/null 2>&1; then
+                driver_bin="$(command -v chromedriver)"
+                break
+            fi
+        elif [[ -x "$candidate" ]]; then
+            driver_bin="$candidate"
+            break
+        fi
+    done
+    [[ -x "$driver_bin" ]] || die "chromedriver not found for $(uname -s)-$(uname -m)"
+else
+    driver_dir="$cache_dir/chromedriver-$chrome_major-$cft_platform"
+    driver_bin="$driver_dir/chromedriver"
+fi
 
-if [[ ! -x "$driver_bin" ]]; then
+if [[ -n "$cft_platform" && ! -x "$driver_bin" ]]; then
     log "downloading chromedriver for Chrome major $chrome_major ($cft_platform)…"
     mkdir -p "$driver_dir"
     versions_json="$cache_dir/known-good-versions.json"

@@ -36,7 +36,7 @@ pub fn SessionsView() -> impl IntoView {
                 title.contains(&query_trimmed) || backend.contains(&query_trimmed)
             });
         }
-        sessions.sort_by(|a, b| b.summary.updated_at_ms.cmp(&a.summary.updated_at_ms));
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.summary.updated_at_ms));
         sessions
     });
 

@@ -2516,7 +2516,7 @@ async fn projects_persist_to_disk_and_replay_from_fresh_host() {
 }
 
 #[tokio::test]
-async fn project_delete_is_rejected_when_a_session_still_references_it() {
+async fn project_delete_detaches_sessions_that_reference_it() {
     let mut fixture = Fixture::new().await;
 
     let project = create_project(
@@ -2553,6 +2553,24 @@ async fn project_delete_is_rejected_when_a_session_still_references_it() {
         "mock backend response to: hold project",
     )
     .await;
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list_sessions failed");
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::SessionList,
+        "session list after delete guard spawn",
+    )
+    .await;
+    let list: SessionListPayload = env.parse_payload().expect("parse spawn SessionList");
+    let session_id = list
+        .sessions
+        .iter()
+        .find(|session| session.project_id.as_ref() == Some(&project.id))
+        .map(|session| session.id.clone())
+        .expect("spawned session should reference project before delete");
 
     fixture
         .client
@@ -2560,27 +2578,46 @@ async fn project_delete_is_rejected_when_a_session_still_references_it() {
             id: project.id.clone(),
         })
         .await
-        .expect("project_delete write failed");
+        .expect("project_delete failed");
 
-    let error = expect_command_error(&mut fixture.client, "project delete rejection").await;
-    assert_eq!(error.operation, "project_delete");
-    assert_eq!(error.code, CommandErrorCode::Conflict);
-    assert!(!error.fatal);
-    assert!(
-        error.message.contains("referenced by session"),
-        "unexpected project_delete error: {}",
-        error.message
-    );
-
-    expect_no_event(
+    let env = expect_kind(
         &mut fixture.client,
-        Duration::from_millis(150),
-        "connection should stay open after rejected project delete",
+        FrameKind::ProjectNotify,
+        "project delete notify",
     )
     .await;
+    match env
+        .parse_payload::<ProjectNotifyPayload>()
+        .expect("parse project delete notify")
+    {
+        ProjectNotifyPayload::Delete { project: deleted } => assert_eq!(deleted.id, project.id),
+        other => panic!("expected project delete notification, got {other:?}"),
+    }
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::SessionList,
+        "session list after project delete",
+    )
+    .await;
+    let list: SessionListPayload = env.parse_payload().expect("parse SessionList");
+    let session = list
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .expect("detached session should remain in list");
+    assert_eq!(session.project_id, None);
 
     let (_fresh_client, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
-    assert_eq!(bootstrap.projects, vec![project]);
+    assert!(
+        bootstrap.projects.is_empty(),
+        "deleted project should not replay"
+    );
+    let session = bootstrap
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .expect("detached session should replay");
+    assert_eq!(session.project_id, None);
 }
 
 #[tokio::test]

@@ -736,7 +736,7 @@ fn RailContextMenuView(
             .unwrap_or_default();
         spawn_local(async move {
             let message = format!(
-                "Delete project \"{project_name}\"? Sessions and history are preserved on the server."
+                "Delete project \"{project_name}\"? Sessions and history will be preserved without this project."
             );
             if !crate::bridge::confirm_dialog("Delete project", &message).await {
                 return;

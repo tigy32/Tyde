@@ -11,7 +11,8 @@ use protocol::{
     ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope,
     ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload, ReviewStatus,
-    ReviewSummaryScope, StreamPath, WorkbenchCreatePayload,
+    ReviewSummaryScope, Steering, SteeringId, SteeringNotifyPayload, SteeringScope,
+    SteeringUpsertPayload, StreamPath, WorkbenchCreatePayload,
 };
 use std::fs;
 use std::path::Path;
@@ -80,8 +81,7 @@ async fn expect_project_notify(
     client: &mut client::Connection,
     context: &str,
 ) -> ProjectNotifyPayload {
-    let env = expect_next_event(client, context).await;
-    assert_eq!(env.kind, FrameKind::ProjectNotify);
+    let env = expect_project_response(client, FrameKind::ProjectNotify, context).await;
     env.parse_payload()
         .expect("failed to parse ProjectNotifyPayload")
 }
@@ -90,8 +90,7 @@ async fn expect_command_error(
     client: &mut client::Connection,
     context: &str,
 ) -> CommandErrorPayload {
-    let env = expect_next_event(client, context).await;
-    assert_eq!(env.kind, FrameKind::CommandError);
+    let env = expect_project_response(client, FrameKind::CommandError, context).await;
     env.parse_payload()
         .expect("failed to parse CommandErrorPayload")
 }
@@ -100,8 +99,7 @@ async fn expect_project_bootstrap(
     client: &mut client::Connection,
     context: &str,
 ) -> ProjectBootstrapPayload {
-    let env = expect_next_event(client, context).await;
-    assert_eq!(env.kind, FrameKind::ProjectBootstrap);
+    let env = expect_project_response(client, FrameKind::ProjectBootstrap, context).await;
     env.parse_payload()
         .expect("failed to parse ProjectBootstrapPayload")
 }
@@ -116,22 +114,11 @@ async fn expect_project_file_list(
         .expect("failed to parse ProjectFileListPayload")
 }
 
-async fn expect_project_git_status(
-    client: &mut client::Connection,
-    context: &str,
-) -> ProjectGitStatusPayload {
-    let env = expect_next_event(client, context).await;
-    assert_eq!(env.kind, FrameKind::ProjectGitStatus);
-    env.parse_payload()
-        .expect("failed to parse ProjectGitStatusPayload")
-}
-
 async fn expect_project_file_contents(
     client: &mut client::Connection,
     context: &str,
 ) -> ProjectFileContentsPayload {
-    let env = expect_next_event(client, context).await;
-    assert_eq!(env.kind, FrameKind::ProjectFileContents);
+    let env = expect_project_response(client, FrameKind::ProjectFileContents, context).await;
     env.parse_payload()
         .expect("failed to parse ProjectFileContentsPayload")
 }
@@ -140,10 +127,75 @@ async fn expect_project_git_diff(
     client: &mut client::Connection,
     context: &str,
 ) -> ProjectGitDiffPayload {
-    let env = expect_next_event(client, context).await;
-    assert_eq!(env.kind, FrameKind::ProjectGitDiff);
+    let env = expect_project_response(client, FrameKind::ProjectGitDiff, context).await;
     env.parse_payload()
         .expect("failed to parse ProjectGitDiffPayload")
+}
+
+async fn expect_project_response(
+    client: &mut client::Connection,
+    expected: FrameKind,
+    context: &str,
+) -> Envelope {
+    loop {
+        let env = expect_next_event(client, context).await;
+        if env.kind == expected {
+            return env;
+        }
+        if matches!(
+            env.kind,
+            FrameKind::ProjectFileList | FrameKind::ProjectGitStatus
+        ) {
+            continue;
+        }
+        assert_eq!(env.kind, expected);
+    }
+}
+
+async fn expect_project_file_list_matching(
+    client: &mut client::Connection,
+    context: &str,
+    mut matches: impl FnMut(&ProjectFileListPayload) -> bool,
+) -> ProjectFileListPayload {
+    loop {
+        let env = expect_next_event(client, context).await;
+        if env.kind == FrameKind::ProjectFileList {
+            let payload = env
+                .parse_payload()
+                .expect("failed to parse ProjectFileListPayload");
+            if matches(&payload) {
+                return payload;
+            }
+            continue;
+        }
+        if env.kind == FrameKind::ProjectGitStatus {
+            continue;
+        }
+        assert_eq!(env.kind, FrameKind::ProjectFileList);
+    }
+}
+
+async fn expect_project_git_status_matching(
+    client: &mut client::Connection,
+    context: &str,
+    mut matches: impl FnMut(&ProjectGitStatusPayload) -> bool,
+) -> ProjectGitStatusPayload {
+    loop {
+        let env = expect_next_event(client, context).await;
+        if env.kind == FrameKind::ProjectGitStatus {
+            let payload = env
+                .parse_payload()
+                .expect("failed to parse ProjectGitStatusPayload");
+            if matches(&payload) {
+                return payload;
+            }
+            continue;
+        }
+        if env.kind == FrameKind::ProjectFileList {
+            continue;
+        }
+        assert_eq!(env.kind, FrameKind::ProjectGitStatus);
+    }
 }
 
 async fn expect_browse_event(
@@ -269,7 +321,41 @@ async fn create_project_with_real_roots(
 ) -> Project {
     let project = create_project(client, name, roots).await;
     let _ = expect_project_bootstrap(client, "initial server-pushed project bootstrap").await;
+    drain_initial_project_state_pushes(client, "initial project state pushes").await;
     project
+}
+
+async fn drain_initial_project_state_pushes(client: &mut client::Connection, context: &str) {
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), client.next_event()).await {
+            Err(_) => return,
+            Ok(Ok(None)) => return,
+            Ok(Err(err)) => panic!("next_event failed while draining {context}: {err:?}"),
+            Ok(Ok(Some(env)))
+                if fixture::is_builtin_team_custom_agent_notify(&env)
+                    || matches!(
+                        env.kind,
+                        FrameKind::HostSettings
+                            | FrameKind::SessionSchemas
+                            | FrameKind::BackendSetup
+                            | FrameKind::QueuedMessages
+                            | FrameKind::SessionSettings
+                            | FrameKind::TeamPresetCatalogNotify
+                            | FrameKind::SessionList
+                            | FrameKind::ProjectEvent
+                            | FrameKind::ProjectBootstrap
+                            | FrameKind::ProjectFileList
+                            | FrameKind::ProjectGitStatus
+                    ) =>
+            {
+                continue;
+            }
+            Ok(Ok(Some(env))) => panic!(
+                "unexpected event while draining {context}: kind={} stream={}",
+                env.kind, env.stream
+            ),
+        }
+    }
 }
 
 fn git(root: &Path, args: &[&str]) {
@@ -729,6 +815,67 @@ async fn delete_project_emits_delete_and_removes_it_from_replay() {
         "deleted project should not replay",
     )
     .await;
+}
+
+#[tokio::test]
+async fn delete_project_removes_project_scoped_steering() {
+    let mut fixture = Fixture::new().await;
+    let project = create_project(
+        &mut fixture.client,
+        "Delete Steering",
+        vec!["/tmp/delete-steering".to_owned()],
+    )
+    .await;
+    let steering = Steering {
+        id: SteeringId("delete-steering".to_owned()),
+        scope: SteeringScope::Project(project.id.clone()),
+        title: "Project steering".to_owned(),
+        content: "Keep project focused.".to_owned(),
+    };
+
+    fixture
+        .client
+        .steering_upsert(SteeringUpsertPayload {
+            steering: steering.clone(),
+        })
+        .await
+        .expect("steering_upsert failed");
+    let env = expect_next_event(&mut fixture.client, "steering upsert").await;
+    assert_eq!(env.kind, FrameKind::SteeringNotify);
+    assert_eq!(
+        env.parse_payload::<SteeringNotifyPayload>()
+            .expect("parse SteeringNotify upsert"),
+        SteeringNotifyPayload::Upsert {
+            steering: steering.clone()
+        }
+    );
+
+    fixture
+        .client
+        .project_delete(ProjectDeletePayload {
+            id: project.id.clone(),
+        })
+        .await
+        .expect("project_delete failed");
+    let env = expect_next_event(&mut fixture.client, "steering delete").await;
+    assert_eq!(env.kind, FrameKind::SteeringNotify);
+    assert_eq!(
+        env.parse_payload::<SteeringNotifyPayload>()
+            .expect("parse SteeringNotify delete"),
+        SteeringNotifyPayload::Delete {
+            id: steering.id.clone()
+        }
+    );
+    match expect_project_notify(&mut fixture.client, "project delete").await {
+        ProjectNotifyPayload::Delete { project: deleted } => assert_eq!(deleted.id, project.id),
+        other => panic!("expected delete project notification, got {other:?}"),
+    }
+
+    let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        bootstrap.steering.is_empty(),
+        "project-scoped steering should not replay after project delete"
+    );
 }
 
 #[tokio::test]
@@ -1563,8 +1710,18 @@ async fn project_stage_file_updates_git_status_and_diffs() {
         .expect("project_stage_file failed");
 
     let _ = expect_project_file_list(&mut fixture.client, "file list after stage file").await;
-    let git_status =
-        expect_project_git_status(&mut fixture.client, "git status after stage file").await;
+    let git_status = expect_project_git_status_matching(
+        &mut fixture.client,
+        "git status after stage file",
+        |git_status| {
+            git_status.roots[0].files.iter().any(|file| {
+                file.relative_path == "src/main.rs"
+                    && file.staged.is_some()
+                    && file.unstaged.is_none()
+            })
+        },
+    )
+    .await;
     assert_eq!(git_status.roots.len(), 1);
     assert_eq!(git_status.roots[0].files.len(), 1);
     assert!(git_status.roots[0].files[0].staged.is_some());
@@ -1668,8 +1825,18 @@ async fn project_stage_hunk_stages_only_one_hunk() {
         .expect("project_stage_hunk failed");
 
     let _ = expect_project_file_list(&mut fixture.client, "file list after stage hunk").await;
-    let git_status =
-        expect_project_git_status(&mut fixture.client, "git status after stage hunk").await;
+    let git_status = expect_project_git_status_matching(
+        &mut fixture.client,
+        "git status after stage hunk",
+        |git_status| {
+            git_status.roots[0].files.iter().any(|file| {
+                file.relative_path == "src/main.rs"
+                    && file.staged.is_some()
+                    && file.unstaged.is_some()
+            })
+        },
+    )
+    .await;
     assert_eq!(git_status.roots[0].files.len(), 1);
     assert!(git_status.roots[0].files[0].staged.is_some());
     assert!(git_status.roots[0].files[0].unstaged.is_some());
@@ -1699,7 +1866,17 @@ async fn project_stream_emits_live_file_and_git_updates() {
 
     write_file(&repo.path().join("src/new.rs"), "pub fn new_file() {}\n");
 
-    let file_list = expect_project_file_list(&mut fixture.client, "live file list update").await;
+    let file_list = expect_project_file_list_matching(
+        &mut fixture.client,
+        "live file list update",
+        |file_list| {
+            file_list.roots[0]
+                .entries
+                .iter()
+                .any(|entry| entry.relative_path == "src/new.rs")
+        },
+    )
+    .await;
     assert!(
         file_list.roots[0]
             .entries
@@ -1707,7 +1884,17 @@ async fn project_stream_emits_live_file_and_git_updates() {
             .any(|entry| entry.relative_path == "src/new.rs")
     );
 
-    let git_status = expect_project_git_status(&mut fixture.client, "live git status update").await;
+    let git_status = expect_project_git_status_matching(
+        &mut fixture.client,
+        "live git status update",
+        |git_status| {
+            git_status.roots[0]
+                .files
+                .iter()
+                .any(|file| file.relative_path == "src/new.rs" && file.untracked)
+        },
+    )
+    .await;
     assert!(
         git_status.roots[0]
             .files
@@ -1781,7 +1968,14 @@ async fn project_list_dir_returns_deeper_entries() {
         .await
         .expect("project_list_dir failed");
 
-    let listing = expect_project_file_list(&mut fixture.client, "list_dir response").await;
+    let listing =
+        expect_project_file_list_matching(&mut fixture.client, "list_dir response", |listing| {
+            listing.roots[0]
+                .entries
+                .iter()
+                .any(|entry| entry.relative_path == "a/b/c/hidden.rs")
+        })
+        .await;
     assert!(
         listing.roots[0]
             .entries
@@ -1818,7 +2012,17 @@ async fn live_watcher_sends_full_snapshot_after_deleted_files() {
     // Delete a file — the debounced watcher should send a fresh full snapshot without it.
     fs::remove_file(repo.path().join("remove_me.rs")).expect("failed to delete remove_me.rs");
 
-    let file_list = expect_project_file_list(&mut fixture.client, "file list after deletion").await;
+    let file_list = expect_project_file_list_matching(
+        &mut fixture.client,
+        "file list after deletion",
+        |file_list| {
+            file_list.roots[0]
+                .entries
+                .iter()
+                .all(|entry| entry.relative_path != "remove_me.rs")
+        },
+    )
+    .await;
     let entries = &file_list.roots[0].entries;
 
     assert!(

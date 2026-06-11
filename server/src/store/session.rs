@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -81,7 +82,7 @@ impl SessionStore {
     pub fn list(&self) -> Result<Vec<SessionRecord>, String> {
         let records = Self::read_from_disk(&self.path)?;
         let mut out: Vec<_> = records.into_values().collect();
-        out.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        out.sort_by_key(|record| Reverse(record.updated_at_ms));
         Ok(out)
     }
 
@@ -212,6 +213,22 @@ impl SessionStore {
             record.session_settings = Some(settings);
             record.updated_at_ms = now_ms();
         })
+    }
+
+    pub fn detach_project(&self, project_id: &ProjectId) -> Result<Vec<SessionId>, String> {
+        let mut records = Self::read_from_disk(&self.path)?;
+        let mut detached = Vec::new();
+        for record in records.values_mut() {
+            if record.project_id.as_ref() == Some(project_id) {
+                record.project_id = None;
+                detached.push(record.id.clone());
+            }
+        }
+        if !detached.is_empty() {
+            Self::save(&self.path, &records)?;
+            detached.sort_by(|left, right| left.0.cmp(&right.0));
+        }
+        Ok(detached)
     }
 
     pub fn delete(&self, session_id: &SessionId) -> Result<(), String> {

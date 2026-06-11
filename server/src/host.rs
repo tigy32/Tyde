@@ -2646,69 +2646,51 @@ impl HostHandle {
         let parent_lock = self.workbench_parent_lock(&payload.id).await;
         let _parent_guard = parent_lock.lock().await;
         let mut state = self.state.lock().await;
-        let referenced_steering = state
+        {
+            let project_store = state.project_store.lock().await;
+            let Some(project) = project_store.get(&payload.id) else {
+                return Err(AppError::not_found(
+                    OPERATION,
+                    format!("cannot delete missing project {}", payload.id),
+                ));
+            };
+            if project.is_workbench() {
+                return Err(AppError::invalid(
+                    OPERATION,
+                    format!(
+                        "cannot delete workbench project {} with ProjectDelete; use WorkbenchRemove",
+                        payload.id
+                    ),
+                ));
+            }
+            if let Some(child) = project_store.list_children(&payload.id).first() {
+                return Err(AppError::conflict(
+                    OPERATION,
+                    format!(
+                        "cannot delete project {} while referenced by workbench {}",
+                        payload.id, child
+                    ),
+                ));
+            }
+        }
+        let deleted_steering_ids = state
             .steering_store
             .lock()
             .await
-            .list()
-            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
-            .into_iter()
-            .find(|steering| matches!(&steering.scope, SteeringScope::Project(project_id) if project_id == &payload.id));
-        if let Some(steering) = referenced_steering {
-            return Err(AppError::conflict(
-                OPERATION,
-                format!(
-                    "cannot delete project {} while referenced by steering {}",
-                    payload.id, steering.id
-                ),
-            ));
-        }
-        let referenced_session = state
+            .delete_for_project(&payload.id)
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        let detached_session_ids = state
             .session_store
             .lock()
             .await
-            .list()
-            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
-            .into_iter()
-            .find(|session| session.project_id.as_ref() == Some(&payload.id));
-        if let Some(session) = referenced_session {
-            return Err(AppError::conflict(
-                OPERATION,
-                format!(
-                    "cannot delete project {} while referenced by session {}",
-                    payload.id, session.id
-                ),
-            ));
-        }
-        let snapshot = state
-            .team_registry
-            .snapshot()
-            .await
+            .detach_project(&payload.id)
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        let referenced_team_members = snapshot
-            .members
-            .iter()
-            .filter(|member| member.project_ids.contains(&payload.id))
-            .map(|member| member.id.clone())
-            .collect::<Vec<_>>();
-        if !referenced_team_members.is_empty() {
-            let project_name = state
-                .project_store
-                .lock()
-                .await
-                .get(&payload.id)
-                .map(|project| project.name);
-            return Err(AppError::conflict(
-                OPERATION,
-                referenced_team_member_delete_message(
-                    "project",
-                    &payload.id,
-                    project_name.as_deref(),
-                    &snapshot,
-                    &referenced_team_members,
-                ),
-            ));
-        }
+        let team_refs = agent_team_validation_refs(&state, OPERATION).await?;
+        let team_events = state
+            .team_registry
+            .remove_project_refs(payload.id.clone(), team_refs)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
         let project = {
             let mut project_store = state.project_store.lock().await;
             project_store
@@ -2719,7 +2701,14 @@ impl HostHandle {
         if let Some(subscription) = state.project_streams.remove(&payload.id) {
             subscription.task.abort();
         }
+        for id in deleted_steering_ids {
+            fan_out_steering_notify(&mut state, SteeringNotifyPayload::Delete { id }).await;
+        }
+        fan_out_team_registry_events(&mut state, team_events).await;
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Delete { project }).await;
+        if !detached_session_ids.is_empty() {
+            fan_out_session_lists(&mut state).await;
+        }
         Ok(())
     }
 
@@ -3797,6 +3786,9 @@ impl HostHandle {
         &self,
         member: &TeamMember,
     ) -> Result<Vec<String>, String> {
+        if member.project_ids.is_empty() {
+            return Err(format!("team member {} has no project_ids", member.id));
+        }
         let project_store = { Arc::clone(&self.state.lock().await.project_store) };
         let project_store = project_store.lock().await;
         let mut roots = Vec::new();
@@ -8623,6 +8615,20 @@ mod tests {
         serde_json::from_str(&json).expect("parse agent teams store")
     }
 
+    fn assert_no_team_member_references_project(
+        store: &AgentTeamsStoreFile,
+        project_id: &ProjectId,
+    ) {
+        for member in store.members.values() {
+            assert!(
+                !member.project_ids.contains(project_id),
+                "member {} still references deleted project {}",
+                member.id,
+                project_id
+            );
+        }
+    }
+
     async fn assert_agent_team_store_loads_with_current_refs(host: &HostHandle, path: &Path) {
         let refs = {
             let state = host.state.lock().await;
@@ -9913,7 +9919,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn team_references_block_custom_agent_and_project_delete() {
+    async fn team_references_block_custom_agent_but_project_delete_unassigns_members() {
         let fixture = team_fixture().await;
 
         let custom_agent_err = fixture
@@ -9939,22 +9945,27 @@ mod tests {
         assert!(!custom_agent_err.message.contains(&fixture.manager.id.0));
         assert!(!custom_agent_err.message.contains(&fixture.report.id.0));
 
-        let project_err = fixture
+        fixture
             .host
             .delete_project(ProjectDeletePayload {
                 id: fixture.project_id.clone(),
             })
             .await
-            .expect_err("project reference should block delete");
-        assert_eq!(project_err.kind, crate::error::AppErrorKind::Conflict);
-        assert!(project_err.message.contains(r#"project "Team Project""#));
-        assert!(project_err.message.contains(r#"team "Product Team""#));
-        assert!(
-            project_err.message.contains(r#"team member "Manager""#)
-                || project_err.message.contains(r#"team member "Report""#)
-        );
-        assert!(!project_err.message.contains(&fixture.manager.id.0));
-        assert!(!project_err.message.contains(&fixture.report.id.0));
+            .expect("project delete should detach team project refs");
+
+        let snapshot = team_snapshot(&fixture.host).await;
+        let manager = member_from_snapshot(snapshot.clone(), &fixture.manager.id);
+        let report = member_from_snapshot(snapshot, &fixture.report.id);
+        assert!(manager.project_ids.is_empty());
+        assert!(report.project_ids.is_empty());
+
+        let persisted = persisted_team_store(&fixture.agent_team_store_path);
+        assert_no_team_member_references_project(&persisted, &fixture.project_id);
+        assert_agent_team_store_loads_with_current_refs(
+            &fixture.host,
+            &fixture.agent_team_store_path,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10046,9 +10057,7 @@ mod tests {
         let delete_result = delete_task.await.expect("delete task should not panic");
         match (&create_result, &delete_result) {
             (Ok(()), Err(err)) => {
-                assert_eq!(err.kind, crate::error::AppErrorKind::Conflict);
-                assert!(err.message.contains(r#"project "Race Project""#));
-                assert!(err.message.contains(r#"team member "Race Report""#));
+                panic!("delete should detach project refs instead of failing: {err}");
             }
             (Err(err), Ok(())) => {
                 assert_eq!(err.kind, crate::error::AppErrorKind::Conflict);
@@ -10058,12 +10067,25 @@ mod tests {
                     err.message
                 );
             }
-            (Ok(()), Ok(())) => panic!("create and delete both succeeded"),
+            (Ok(()), Ok(())) => {
+                let snapshot = team_snapshot(&fixture.host).await;
+                let created = snapshot
+                    .members
+                    .iter()
+                    .find(|member| member.name == "Race Report")
+                    .expect("created race report");
+                assert!(
+                    !created.project_ids.contains(&fixture.project_id),
+                    "created member retained deleted project ref"
+                );
+            }
             (Err(create_err), Err(delete_err)) => panic!(
                 "create and delete both failed: create={}, delete={}",
                 create_err, delete_err
             ),
         }
+        let persisted = persisted_team_store(&fixture.agent_team_store_path);
+        assert_no_team_member_references_project(&persisted, &fixture.project_id);
         assert_agent_team_store_loads_with_current_refs(
             &fixture.host,
             &fixture.agent_team_store_path,
