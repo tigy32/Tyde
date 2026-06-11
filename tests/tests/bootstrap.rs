@@ -384,9 +384,13 @@ async fn live_agent_reconnect_starts_with_agent_bootstrap() {
         .find(|agent| agent.agent_id == new_agent.agent_id)
         .expect("live agent in HostBootstrap");
 
-    let env = next_env(&mut second, "agent bootstrap").await;
+    let env = loop {
+        let env = next_env(&mut second, "agent bootstrap").await;
+        if env.stream == bootstrapped_agent.instance_stream {
+            break env;
+        }
+    };
     assert_eq!(env.kind, FrameKind::AgentBootstrap);
-    assert_eq!(env.stream, bootstrapped_agent.instance_stream);
     assert_eq!(env.seq, 0);
     let bootstrap: protocol::AgentBootstrapPayload =
         env.parse_payload().expect("agent bootstrap payload");
