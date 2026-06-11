@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use client::ClientConfig;
+use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use devtools_protocol::{UiDebugRequest, UiDebugResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -13,7 +14,7 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
@@ -70,7 +71,7 @@ struct DevInstanceRecord {
     frontend_url: String,
     config_path: PathBuf,
     store_dir: PathBuf,
-    child: Child,
+    child: AsyncGroupChild,
     started_at_ms: u64,
 }
 
@@ -365,7 +366,7 @@ async fn start_instance(
         .kill_on_drop(true);
 
     let child = command
-        .spawn()
+        .group_spawn()
         .map_err(|err| format!("failed to spawn Tyde dev instance: {err}"))?;
 
     let mut record = DevInstanceRecord {
@@ -433,7 +434,8 @@ async fn list_instances(state: &Arc<DebugServerState>) -> Result<Vec<DevInstance
     }
 
     for id in dead_ids {
-        if let Some(record) = instances.remove(&id) {
+        if let Some(mut record) = instances.remove(&id) {
+            let _ = record.child.start_kill();
             let _ = tokio::fs::remove_file(record.config_path).await;
             let _ = tokio::fs::remove_dir_all(record.store_dir).await;
         }

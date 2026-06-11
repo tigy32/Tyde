@@ -4,6 +4,7 @@ edition.workspace = true
 
 [dependencies]
 client = { path = "../client" }
+command-group = { version = "5", features = ["with-tokio"] }
 devtools-protocol = { path = "../devtools-protocol" }
 protocol = { path = "../protocol" }
 serde.workspace = true

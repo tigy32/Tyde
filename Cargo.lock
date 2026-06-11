@@ -7368,6 +7368,7 @@ name = "tyde-dev-driver"
 version = "0.0.0"
 dependencies = [
  "client",
+ "command-group",
  "devtools-protocol",
  "protocol",
  "serde",
