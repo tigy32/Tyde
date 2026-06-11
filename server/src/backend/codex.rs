@@ -30,7 +30,11 @@ const CODEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEX_AGENT_NAME: &str = "codex";
 const CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT: u64 = 200_000;
-const CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_CODEX: u64 = 400_000;
+// The entire GPT-5 family (gpt-5, gpt-5.x, their -codex and -mini variants)
+// ships a 400k context window per OpenAI's model docs. `codex-mini-latest` is
+// the lone exception at 200k. This is only a pre-first-turn fallback — once a
+// turn reports `context_window` in token usage we use that instead.
+const CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_FAMILY: u64 = 400_000;
 const CODEX_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CODEX_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CODEX_FORCED_APPROVAL_POLICY: &str = "never";
@@ -4212,16 +4216,16 @@ fn codex_estimated_context_window_for_model(model_hint: Option<&str>) -> u64 {
         return CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT;
     };
     let normalized = model.trim().to_ascii_lowercase();
-    if normalized == "codex-mini-latest" {
+    // `codex-mini-latest` is the one GPT-5-era model with a 200k window, so it
+    // must be checked before the broader gpt-5 family match below.
+    if normalized.contains("codex-mini") {
         return CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT;
     }
-    if normalized == "gpt-5-codex"
-        || normalized == "gpt-5.1-codex"
-        || normalized == "gpt-5.2-codex"
-        || normalized == "gpt-5.3-codex"
-        || normalized == "gpt-5.4-codex"
-    {
-        return CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_CODEX;
+    // Match the whole gpt-5 family by substring so this stays correct across
+    // version bumps, `-codex`/`-mini` suffixes, and provider prefixes (the CLI
+    // now reports ids like `openai.gpt-5.5`).
+    if normalized.contains("gpt-5") {
+        return CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_FAMILY;
     }
     CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT
 }
@@ -9933,7 +9937,48 @@ Do not describe the tool, and do not skip the tool call."#;
             estimate_context_breakdown(Some(&usage), &turn_context, Some("gpt-5.3-codex"));
         assert_eq!(
             breakdown.get("context_window").and_then(Value::as_u64),
-            Some(CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_CODEX)
+            Some(CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_FAMILY)
+        );
+    }
+
+    #[test]
+    fn codex_estimated_context_window_covers_gpt5_family_and_prefixes() {
+        // Whole gpt-5 family is 400k, regardless of suffix or provider prefix.
+        for model in [
+            "gpt-5",
+            "gpt-5.1",
+            "gpt-5.4",
+            "gpt-5.5",
+            "gpt-5.4-mini",
+            "gpt-5-codex",
+            "gpt-5.3-codex",
+            "gpt-5.3-codex-spark",
+            // The CLI now reports provider-prefixed ids.
+            "openai.gpt-5.5",
+            "openai.gpt-5.3-codex",
+        ] {
+            assert_eq!(
+                codex_estimated_context_window_for_model(Some(model)),
+                CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_FAMILY,
+                "{model} should map to the gpt-5 family window"
+            );
+        }
+
+        // codex-mini-latest is the 200k exception and must not be swept into
+        // the gpt-5 family branch.
+        assert_eq!(
+            codex_estimated_context_window_for_model(Some("codex-mini-latest")),
+            CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT
+        );
+
+        // Unknown / unset models fall back to the conservative default.
+        assert_eq!(
+            codex_estimated_context_window_for_model(None),
+            CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT
+        );
+        assert_eq!(
+            codex_estimated_context_window_for_model(Some("some-future-model")),
+            CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT
         );
     }
 
