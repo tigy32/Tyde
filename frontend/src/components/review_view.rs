@@ -787,21 +787,34 @@ pub(crate) fn ReviewSidebar(
     view! {
         <div class="review-sidebar">
             <div class="review-sidebar-section">
-                <button
-                    class="review-btn primary review-run-ai-btn"
-                    data-test="gp-workspace-review-all"
-                    disabled=ai_disabled
-                    title=ai_reason
-                    on:click=move |ev| {
-                        // Opening the disclosure on Run is a UX nicety —
-                        // the user should always see the reviewer's
-                        // current configuration when they kick it off.
-                        ai_disclosure_open.set(true);
-                        on_run_ai(ev);
-                    }
-                >
-                    "Run AI reviewer"
-                </button>
+                <div class="review-ai-row">
+                    <button
+                        class="review-btn primary review-run-ai-btn"
+                        data-test="gp-workspace-review-all"
+                        disabled=ai_disabled
+                        title=ai_reason
+                        on:click=move |ev| {
+                            // Opening the disclosure on Run is a UX nicety —
+                            // the user should always see the reviewer's
+                            // current configuration when they kick it off.
+                            ai_disclosure_open.set(true);
+                            on_run_ai(ev);
+                        }
+                    >
+                        "Run AI reviewer"
+                    </button>
+                    <div
+                        class=move || format!("review-ai-status status-{}", ai_status_kind())
+                        data-status=ai_status_kind
+                        title="AI reviewer status"
+                    >
+                        <span class="review-ai-status-dot"></span>
+                        <span class="review-ai-status-label">{ai_status_text}</span>
+                        {move || elapsed_label().map(|e| view! {
+                            <span class="review-ai-status-elapsed">{e}</span>
+                        })}
+                    </div>
+                </div>
                 <details
                     class="review-ai-disclosure"
                     prop:open=ai_open_attr
@@ -866,18 +879,6 @@ pub(crate) fn ReviewSidebar(
                         }
                     </div>
                 </details>
-                <div
-                    class=move || format!("review-ai-status status-{}", ai_status_kind())
-                    data-status=ai_status_kind
-                >
-                    <span class="review-ai-status-dot"></span>
-                    <span class="review-ai-status-label">
-                        {move || format!("AI: {}", ai_status_text())}
-                    </span>
-                    {move || elapsed_label().map(|e| view! {
-                        <span class="review-ai-status-elapsed">{e}</span>
-                    })}
-                </div>
                 {
                     let agent_state = state.clone();
                     let host_for_label = host_id.clone();

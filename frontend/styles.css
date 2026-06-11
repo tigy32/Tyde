@@ -23,6 +23,7 @@
     color-scheme: dark;
 
     --surface-base: #121212;
+    --surface-0: #161616;
     --surface-1: #1a1a1a;
     --surface-2: #242424;
     --surface-3: #2d2d2d;
@@ -59,6 +60,7 @@
     color-scheme: light;
 
     --surface-base: #f5f5f5;
+    --surface-0: #fafafa;
     --surface-1: #ffffff;
     --surface-2: #f0f0f0;
     --surface-3: #e5e5e5;
@@ -4809,14 +4811,26 @@ kbd {
 }
 
 .gp-branch {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     font-size: 0.923rem;
     font-weight: 600;
     color: var(--text-primary);
     font-family: var(--font-mono);
+    flex: 1;
+    min-width: 0;
+}
+
+.gp-branch-icon {
+    color: var(--text-secondary);
+    flex-shrink: 0;
+}
+
+.gp-branch-name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    flex: 1;
     min-width: 0;
 }
 
@@ -4896,10 +4910,10 @@ kbd {
     gap: var(--space-1);
     width: 100%;
     padding: var(--space-1) var(--space-3);
-    font-size: 0.846rem;
+    font-size: 0.769rem;
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: 0.06em;
     color: var(--text-secondary);
     text-align: left;
     background: none;
@@ -4909,11 +4923,29 @@ kbd {
 
 .gp-section-header:hover {
     background: var(--surface-hover);
+    color: var(--text-primary);
 }
 
 .gp-section-title {
-    flex: 1;
+    flex: 0 1 auto;
     min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.gp-section-count {
+    flex-shrink: 0;
+    margin-left: 2px;
+    padding: 0 7px;
+    line-height: 16px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    color: var(--text-secondary);
+    font-size: 0.692rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0;
 }
 
 .gp-section-files {
@@ -4925,7 +4957,9 @@ kbd {
     display: flex;
     align-items: center;
     gap: var(--space-1);
-    padding: 0 var(--space-2);
+    margin: 0 var(--space-1);
+    padding: 0 var(--space-1);
+    border-radius: 5px;
     transition: background 0.1s;
 }
 
@@ -4946,7 +4980,7 @@ kbd {
     background: none;
     border: none;
     cursor: pointer;
-    line-height: 22px;
+    line-height: 24px;
 }
 
 .gp-status-icon {
@@ -4965,19 +4999,38 @@ kbd {
 .gp-status-icon.untracked { color: var(--text-tertiary); }
 
 .gp-file-path {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
     min-width: 0;
     font-family: var(--font-mono);
     font-size: 0.923rem;
+}
+
+/* Filename leads and never truncates before the dimmed directory does. */
+.gp-file-name {
+    flex-shrink: 0;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.gp-file-dir {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-tertiary);
+    font-size: 0.769rem;
 }
 
 .gp-file-comment-count {
     flex: 0 0 auto;
     margin-left: 6px;
     font-size: 0.77rem;
-    color: var(--accent);
+    color: var(--accent-link);
     font-variant-numeric: tabular-nums;
 }
 
@@ -5026,11 +5079,20 @@ kbd {
     color: var(--warning);
 }
 
+/* Per-file actions stay out of the way until the row is hovered or
+   focused — the icons-on-every-row look reads as visual noise. */
 .gp-file-actions {
     display: flex;
     align-items: center;
     gap: var(--space-1);
     flex-shrink: 0;
+    opacity: 0;
+    transition: opacity 0.1s;
+}
+
+.gp-file-row:hover .gp-file-actions,
+.gp-file-row:focus-within .gp-file-actions {
+    opacity: 1;
 }
 
 .gp-section-header-row {
@@ -7857,37 +7919,64 @@ pre.tool-error-pre {
     background: var(--surface-0);
     color: var(--text-primary);
     border: 1px solid var(--border-primary);
-    border-radius: 4px;
+    border-radius: 6px;
     padding: var(--space-2);
     font-family: var(--font-sans, inherit);
     font-size: 0.846rem;
     min-height: 60px;
     resize: vertical;
+    transition: border-color 0.12s ease;
+}
+
+.review-instructions:focus,
+.review-textarea:focus,
+.review-submit-instructions:focus {
+    outline: none;
+    border-color: var(--accent-primary);
 }
 
 .review-backend-select,
 .review-cost-select,
 .review-submit-target-select {
+    appearance: none;
+    -webkit-appearance: none;
     width: 100%;
     box-sizing: border-box;
-    background: var(--surface-0);
+    background-color: var(--surface-0);
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%23a0a0a0' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    background-size: 12px 12px;
     color: var(--text-primary);
     border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    padding: var(--space-1) var(--space-2);
+    border-radius: 6px;
+    padding: 6px 28px 6px 10px;
     font-size: 0.846rem;
+    font-family: inherit;
+    cursor: pointer;
+    transition: border-color 0.12s ease, background-color 0.12s ease;
+}
+
+.review-backend-select:hover:not(:disabled),
+.review-cost-select:hover:not(:disabled),
+.review-submit-target-select:hover:not(:disabled) {
+    border-color: var(--border-secondary);
+}
+
+.review-backend-select:focus,
+.review-cost-select:focus,
+.review-submit-target-select:focus {
+    outline: none;
+    border-color: var(--accent-primary);
 }
 
 .review-submit-target-label {
     display: block;
-    font-size: 0.769rem;
-    font-weight: 600;
-    color: var(--text-secondary);
-    margin-bottom: var(--space-1);
-}
-
-.review-submit-target-select {
-    margin-bottom: var(--space-2);
+    font-size: 0.692rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-tertiary);
 }
 
 .review-submit-instructions {
@@ -7898,10 +7987,10 @@ pre.tool-error-pre {
     background: var(--surface-0);
     color: var(--text-primary);
     border: 1px solid var(--border-primary);
-    border-radius: 4px;
+    border-radius: 6px;
     padding: var(--space-1) var(--space-2);
     font-size: 0.846rem;
-    margin-bottom: var(--space-2);
+    transition: border-color 0.12s ease;
 }
 
 /* Clear comments: a neutral (non-destructive) secondary action that sits
@@ -7917,16 +8006,31 @@ pre.tool-error-pre {
     border-color: var(--border-strong, var(--border-primary));
 }
 
-.review-ai-status {
-    font-size: 0.846rem;
-    color: var(--text-secondary);
+/* Run button + status chip on one row: the button takes the space, the
+   pill-shaped status chip hugs its content beside it. */
+.review-ai-row {
     display: flex;
-    align-items: center;
+    align-items: stretch;
     gap: var(--space-2);
-    padding: var(--space-1) var(--space-2);
+}
+
+.review-ai-row .review-run-ai-btn {
+    flex: 1;
+    min-width: 0;
+}
+
+.review-ai-status {
+    font-size: 0.769rem;
+    color: var(--text-secondary);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 10px;
     background: var(--surface-0);
     border: 1px solid var(--border-primary);
-    border-radius: 4px;
+    border-radius: 999px;
+    flex-shrink: 0;
+    white-space: nowrap;
 }
 
 .review-ai-status-dot {
@@ -7956,10 +8060,9 @@ pre.tool-error-pre {
 }
 
 .review-ai-status-elapsed {
-    margin-left: auto;
     font-variant-numeric: tabular-nums;
     color: var(--text-tertiary);
-    font-size: 0.769rem;
+    font-size: 0.692rem;
 }
 
 /* AI reviewer disclosure: collapsed by default so the sidebar isn't
@@ -7968,7 +8071,7 @@ pre.tool-error-pre {
  * picker, cost picker, and instructions textarea. */
 .review-ai-disclosure {
     border: 1px solid var(--border-primary);
-    border-radius: 4px;
+    border-radius: 6px;
     background: var(--surface-0);
 }
 
@@ -7977,11 +8080,16 @@ pre.tool-error-pre {
     display: flex;
     align-items: center;
     gap: var(--space-1);
-    padding: var(--space-1) var(--space-2);
-    font-size: 0.846rem;
+    padding: 6px var(--space-2);
+    font-size: 0.769rem;
     color: var(--text-secondary);
     user-select: none;
     list-style: none;
+    border-radius: 6px;
+}
+
+.review-ai-disclosure-summary:hover {
+    background: var(--surface-hover);
 }
 
 /* Use the app's own ▾/▸ `fe-chevron` glyph instead of the native disclosure
@@ -8046,52 +8154,69 @@ pre.tool-error-pre {
 }
 
 .review-btn {
-    background: var(--surface-2, #2d2d2d);
+    background: var(--surface-3, #2d2d2d);
     color: var(--text-primary);
     border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    padding: var(--space-1) var(--space-3);
+    border-radius: 6px;
+    padding: 6px var(--space-3);
     font-size: 0.846rem;
+    font-weight: 600;
     cursor: pointer;
-    transition: background 0.1s ease;
+    white-space: nowrap;
+    transition:
+        background 0.12s ease,
+        border-color 0.12s ease,
+        box-shadow 0.12s ease,
+        transform 0.04s ease;
 }
 
-/* Density: action buttons and the AI status row are sized to content and
-   sit at the start of the column rather than stretching the full panel
-   width. Related actions (Submit + Clear) group in a wrapping row. */
-.review-run-ai-btn,
-.review-ai-agent-link,
-.review-ai-status {
-    align-self: flex-start;
-}
-
+/* Submit leads the action row at full strength; Clear hugs its content. */
 .review-action-row {
     display: flex;
-    flex-wrap: wrap;
     gap: var(--space-2);
 }
 
-.review-action-row .review-btn {
+.review-action-row .review-submit-btn {
+    flex: 1;
+    min-width: 0;
+}
+
+.review-action-row .review-clear-btn {
     flex: 0 0 auto;
 }
 
 .review-btn:hover:not(:disabled) {
-    background: var(--surface-3, #3a3a3a);
+    background: color-mix(in srgb, var(--surface-3) 88%, var(--text-primary));
+    border-color: var(--border-secondary);
+}
+
+.review-btn:active:not(:disabled) {
+    transform: translateY(1px);
+}
+
+.review-btn:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 1px;
 }
 
 .review-btn:disabled {
-    opacity: 0.5;
+    opacity: 0.45;
     cursor: not-allowed;
 }
 
 .review-btn.primary {
-    background: var(--accent-primary);
-    color: white;
+    background: linear-gradient(180deg, var(--accent-hover), var(--accent-primary));
+    color: #ffffff;
     border-color: var(--accent-primary);
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.08) inset,
+                0 1px 2px rgba(0, 0, 0, 0.25);
 }
 
 .review-btn.primary:hover:not(:disabled) {
-    filter: brightness(1.1);
+    background: linear-gradient(180deg, var(--accent-hover), var(--accent-hover));
+    border-color: var(--accent-hover);
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.10) inset,
+                0 2px 8px rgba(0, 122, 204, 0.30);
 }
 
 .review-btn.destructive {
@@ -8225,8 +8350,12 @@ pre.tool-error-pre {
 .gp-review-hub {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
+    gap: var(--space-3);
+    margin: var(--space-2) var(--space-2) var(--space-3);
+    padding: var(--space-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
 }
 
 .gp-review-hub .gp-review-indicator {
@@ -8236,29 +8365,43 @@ pre.tool-error-pre {
 .gp-review-hub-header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: var(--space-2);
 }
 
-.gp-review-counts {
+.gp-review-hub-title {
     font-size: 0.769rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
     color: var(--text-secondary);
 }
 
+.gp-review-counts {
+    margin-left: auto;
+    font-size: 0.769rem;
+    color: var(--text-tertiary);
+    font-variant-numeric: tabular-nums;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .gp-review-open-btn {
-    align-self: flex-start;
-    padding: 4px 10px;
+    flex-shrink: 0;
+    padding: 3px 10px;
     font-size: 0.769rem;
     font-weight: 600;
-    color: var(--accent-primary);
-    background: rgba(0, 122, 204, 0.10);
+    color: var(--accent-link);
+    background: var(--accent-subtle);
     border: 1px solid rgba(0, 122, 204, 0.42);
-    border-radius: 6px;
+    border-radius: 999px;
     cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
 
 .gp-review-open-btn:hover {
-    background: rgba(0, 122, 204, 0.20);
+    background: rgba(0, 122, 204, 0.24);
+    border-color: rgba(0, 122, 204, 0.62);
     color: #ffffff;
 }
 
@@ -8275,7 +8418,14 @@ pre.tool-error-pre {
     background: transparent;
     padding: 0;
     overflow: visible;
-    gap: var(--space-2);
+    gap: var(--space-3);
+}
+
+/* Hairline between the AI-reviewer block and the submit block so the two
+ * halves of the card read as separate steps. */
+.gp-review-hub .review-sidebar-section + .review-sidebar-section {
+    border-top: 1px solid var(--border-primary);
+    padding-top: var(--space-3);
 }
 
 /* ────────── Inline review affordances on the reused diff renderer ──

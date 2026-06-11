@@ -28,21 +28,32 @@ pub fn GitPanel() -> impl IntoView {
         <div class="git-panel">
             <div class="gp-header">
                 <span class="gp-branch">
-                    {move || {
-                        git_roots.get()
-                            .map(|roots| {
-                                if roots.len() == 1 {
-                                    roots
-                                        .first()
-                                        .and_then(|r| r.branch.clone())
-                                        .map(|b| format!("\u{238b} {b}"))
-                                        .unwrap_or_else(|| "\u{238b} --".to_owned())
-                                } else {
-                                    format!("\u{238b} {} roots", roots.len())
-                                }
-                            })
-                        .unwrap_or_else(|| "\u{238b} --".to_owned())
-                    }}
+                    <svg
+                        class="gp-branch-icon"
+                        width="14"
+                        height="14"
+                        viewBox="0 0 16 16"
+                        fill="currentColor"
+                        aria-hidden="true"
+                    >
+                        <path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25Zm-6 0a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Zm8.25-.75a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z" />
+                    </svg>
+                    <span class="gp-branch-name">
+                        {move || {
+                            git_roots.get()
+                                .map(|roots| {
+                                    if roots.len() == 1 {
+                                        roots
+                                            .first()
+                                            .and_then(|r| r.branch.clone())
+                                            .unwrap_or_else(|| "--".to_owned())
+                                    } else {
+                                        format!("{} roots", roots.len())
+                                    }
+                                })
+                            .unwrap_or_else(|| "--".to_owned())
+                        }}
+                    </span>
                 </span>
             </div>
             <div class="gp-content">
@@ -200,6 +211,7 @@ fn WorkspaceReviewHubInner(host_id: String, review_id: ReviewId) -> impl IntoVie
     view! {
         <div class="gp-review-hub" data-test="gp-workspace-review-hub">
             <div class="gp-review-hub-header">
+                <span class="gp-review-hub-title">"Review"</span>
                 <span class="gp-review-counts" data-test="gp-workspace-review-counts">
                     {move || {
                         let (c, s) = counts.get();
@@ -375,7 +387,8 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
                     </button>
                 </div>
                 <GitFileSection
-                    title=format!("Staged Changes [{staged_count}]")
+                    title="Staged"
+                    count=staged_count
                     files=staged.clone()
                     expanded=staged_expanded
                     scope=ProjectDiffScope::Staged
@@ -388,7 +401,8 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
             </Show>
             <Show when=move || has_unstaged>
                 <GitFileSection
-                    title=format!("Changes [{unstaged_count}]")
+                    title="Changes"
+                    count=unstaged_count
                     files=unstaged.clone()
                     expanded=unstaged_expanded
                     scope=ProjectDiffScope::Unstaged
@@ -401,7 +415,8 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
             </Show>
             <Show when=move || has_untracked>
                 <GitFileSection
-                    title=format!("Untracked [{untracked_count}]")
+                    title="Untracked"
+                    count=untracked_count
                     files=untracked.clone()
                     expanded=untracked_expanded
                     scope=ProjectDiffScope::Unstaged
@@ -418,7 +433,8 @@ fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
 
 #[component]
 fn GitFileSection(
-    title: String,
+    title: &'static str,
+    count: usize,
     files: Vec<ProjectGitFileStatus>,
     expanded: RwSignal<bool>,
     scope: ProjectDiffScope,
@@ -440,6 +456,7 @@ fn GitFileSection(
                 <button class="gp-section-header" on:click=toggle>
                     <span class="fe-chevron">{move || if expanded.get() { "\u{25be}" } else { "\u{25b8}" }}</span>
                     <span class="gp-section-title">{title}</span>
+                    <span class="gp-section-count">{count}</span>
                 </button>
                 <div class="gp-section-actions">
                     {show_stage_btn.then(|| {
@@ -501,9 +518,18 @@ fn GitFileSection(
                             change_kind_class(change_kind)
                         };
 
+                        // Filename leads the row; the parent directory renders
+                        // dimmed after it so long paths truncate from the
+                        // directory, never the filename.
+                        let (dir, name) = match path.rsplit_once('/') {
+                            Some((d, n)) => (Some(d.to_owned()), n.to_owned()),
+                            None => (None, path.clone()),
+                        };
+
                         let root_for_click = root_path.clone();
                         let path_for_click = path.clone();
                         let path_for_badge = path.clone();
+                        let path_for_title = path.clone();
                         let root_for_stage = root_path.clone();
                         let path_for_stage = path.clone();
                         let root_for_unstage = root_path.clone();
@@ -515,12 +541,18 @@ fn GitFileSection(
                             <div class="gp-file-row">
                                 <button
                                     class="gp-file-btn"
+                                    title=path_for_title
                                     on:click=move |_| {
                                         view_diff(root_for_click.clone(), scope, path_for_click.clone());
                                     }
                                 >
                                     <span class=icon_class>{icon}</span>
-                                    <span class="gp-file-path">{path.clone()}</span>
+                                    <span class="gp-file-path">
+                                        <span class="gp-file-name">{name}</span>
+                                        {dir.map(|d| view! {
+                                            <span class="gp-file-dir">{d}</span>
+                                        })}
+                                    </span>
                                     {move || {
                                         let n = file_counts
                                             .get()
