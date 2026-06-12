@@ -25,7 +25,7 @@ use protocol::{
     ProjectSource, ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
     ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection, ReviewId, ReviewSubmitTarget,
     RunBackendSetupPayload, SendMessagePayload, SessionId, SessionListPayload, SessionSchemaEntry,
-    SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload, SkillNotifyPayload,
+    SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload, Skill, SkillNotifyPayload,
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
     SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TeamCreatePayload,
     TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
@@ -85,7 +85,7 @@ use crate::review::{
 use crate::review_mcp::{REVIEW_FEEDBACK_MCP_SERVER_NAME, ReviewMcpHandle};
 use crate::store::agent_teams::{AgentTeamValidationRefs, AgentTeamsStore};
 use crate::store::custom_agents::CustomAgentStore;
-use crate::store::mcp_servers::McpServerStore;
+use crate::store::mcp_servers::{McpServerStore, RESERVED_MCP_SERVER_NAMES};
 use crate::store::mobile_pairings::MobilePairingsStore;
 use crate::store::project::{ProjectStore, ProjectStoreError};
 use crate::store::review::ReviewStore;
@@ -3329,9 +3329,45 @@ impl HostHandle {
         Ok(())
     }
 
+    pub(crate) async fn upsert_skill(&self, skill: Skill, body: String) -> AppResult<()> {
+        const OPERATION: &str = "skill_upsert";
+        let mut state = self.state.lock().await;
+        let skill = state
+            .skill_store
+            .lock()
+            .await
+            .upsert(skill, body)
+            .map_err(|error| skill_store_error(OPERATION, error))?;
+        fan_out_skill_notify(&mut state, SkillNotifyPayload::Upsert { skill }).await;
+        Ok(())
+    }
+
+    pub(crate) async fn delete_skill(&self, id: protocol::SkillId) -> AppResult<()> {
+        const OPERATION: &str = "skill_delete";
+        let mut state = self.state.lock().await;
+        let id = state
+            .skill_store
+            .lock()
+            .await
+            .delete(&id)
+            .map_err(|error| skill_store_error(OPERATION, error))?;
+        fan_out_skill_notify(&mut state, SkillNotifyPayload::Delete { id }).await;
+        Ok(())
+    }
+
     pub(crate) async fn upsert_mcp_server(&self, payload: McpServerUpsertPayload) -> AppResult<()> {
         const OPERATION: &str = "mcp_server_upsert";
         let mut state = self.state.lock().await;
+        let name = payload.mcp_server.name.trim();
+        if RESERVED_MCP_SERVER_NAMES.contains(&name) {
+            return Err(AppError::invalid(
+                OPERATION,
+                format!(
+                    "MCP server {} name '{}' is reserved",
+                    payload.mcp_server.id, name
+                ),
+            ));
+        }
         let mcp_server = state
             .mcp_server_store
             .lock()
@@ -6384,6 +6420,18 @@ fn steering_store_error(operation: &'static str, error: String) -> AppError {
     if error.contains("missing steering") {
         AppError::not_found(operation, error)
     } else if error.starts_with("Failed ") || error.starts_with("Invalid steering store") {
+        AppError::internal_message(operation, error.clone(), anyhow!(error))
+    } else {
+        AppError::invalid(operation, error)
+    }
+}
+
+fn skill_store_error(operation: &'static str, error: String) -> AppError {
+    if error.contains("missing skill") {
+        AppError::not_found(operation, error)
+    } else if error.contains("duplicate directory name") {
+        AppError::conflict(operation, error)
+    } else if error.starts_with("Failed ") || error.starts_with("Invalid skills index") {
         AppError::internal_message(operation, error.clone(), anyhow!(error))
     } else {
         AppError::invalid(operation, error)

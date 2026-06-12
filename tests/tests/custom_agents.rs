@@ -926,6 +926,74 @@ async fn spawn_with_custom_agent_resolves_expected_configuration() {
 }
 
 #[tokio::test]
+async fn default_agent_resolves_all_current_skills_and_mcp_servers() {
+    let mut fixture = Fixture::new().await;
+    let mcp_server = sample_mcp_server("docs", "docs-server");
+    let lint_skill = sample_skill("lint", "lint");
+    let qa_skill = sample_skill("qa", "qa");
+
+    fixture
+        .client
+        .mcp_server_upsert(McpServerUpsertPayload {
+            mcp_server: mcp_server.clone(),
+        })
+        .await
+        .expect("mcp_server_upsert failed");
+    let _ = expect_next_event(&mut fixture.client, "McpServerNotify upsert").await;
+
+    write_skill(
+        fixture.store_dir(),
+        &lint_skill,
+        "Run cargo test -q before reporting completion.",
+    );
+    write_skill(
+        fixture.store_dir(),
+        &qa_skill,
+        "Check the visible UI state before reporting completion.",
+    );
+    fixture
+        .client
+        .skill_refresh(SkillRefreshPayload::default())
+        .await
+        .expect("skill_refresh failed");
+    let _ = expect_next_event(&mut fixture.client, "lint SkillNotify upsert").await;
+    let _ = expect_next_event(&mut fixture.client, "qa SkillNotify upsert").await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("default-customized".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/default-customized".to_string()],
+                prompt: "hello".to_string(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn_agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgentPayload");
+    assert_eq!(new_agent.custom_agent_id, None);
+
+    let env = expect_next_event(&mut fixture.client, "AgentStart").await;
+    let agent_start: AgentStartPayload = env.parse_payload().expect("parse AgentStartPayload");
+    assert_eq!(agent_start.custom_agent_id, None);
+
+    let text = expect_turn_text(&mut fixture.client, "default turn").await;
+    assert!(text.contains("[startup_mcp_servers: tyde-agent-control(http), docs-server(stdio)]"));
+    assert!(text.contains("lint=Run cargo test -q before reporting completion."));
+    assert!(text.contains("qa=Check the visible UI state before reporting completion."));
+}
+
+#[tokio::test]
 async fn tool_policy_rejection_for_non_claude_backends() {
     let mut fixture = Fixture::new().await;
     let cases = vec![
@@ -1121,15 +1189,9 @@ async fn resume_re_resolves_deleted_custom_agent_with_warning() {
 }
 
 #[tokio::test]
-async fn reserved_mcp_name_collision_returns_spawn_error() {
+async fn reserved_mcp_name_returns_upsert_error() {
     let mut fixture = Fixture::new().await;
     let reserved_server = sample_mcp_server("debug-alias", "tyde-debug");
-    let custom_agent = sample_custom_agent(
-        "collision-agent",
-        Vec::new(),
-        vec![reserved_server.id.clone()],
-        ToolPolicy::Unrestricted,
-    );
 
     fixture
         .client
@@ -1137,53 +1199,14 @@ async fn reserved_mcp_name_collision_returns_spawn_error() {
             mcp_server: reserved_server.clone(),
         })
         .await
-        .expect("mcp_server_upsert failed");
-    let _ = expect_next_event(&mut fixture.client, "McpServerNotify upsert").await;
-
-    fixture
-        .client
-        .custom_agent_upsert(CustomAgentUpsertPayload {
-            custom_agent: custom_agent.clone(),
-        })
-        .await
-        .expect("custom_agent_upsert failed");
-    let _ = expect_next_event(&mut fixture.client, "CustomAgentNotify upsert").await;
-
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("collision".to_string()),
-            custom_agent_id: Some(custom_agent.id.clone()),
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/collision".to_string()],
-                prompt: "collision".to_string(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("spawn_agent should enqueue startup failure");
-
-    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
-    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgentPayload");
-    let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
-    let payload = expect_agent_error_containing(
-        &mut fixture.client,
-        &new_agent.instance_stream,
-        "reserved MCP server name 'tyde-debug'",
-        "collision AgentError",
-    )
-    .await;
-    assert!(payload.fatal);
+        .expect("mcp_server_upsert command failed");
+    let error = expect_command_error(&mut fixture.client, "reserved MCP server error").await;
+    assert_eq!(error.operation, "mcp_server_upsert");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
     assert!(
-        payload
+        error
             .message
-            .contains("reserved MCP server name 'tyde-debug'")
+            .contains("MCP server debug-alias name 'tyde-debug' is reserved")
     );
 }
 

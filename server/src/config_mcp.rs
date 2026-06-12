@@ -7,12 +7,14 @@
 //! methods the protocol handlers use, so connected clients see changes
 //! immediately via the usual notify fan-out.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use axum::{Json, Router, response::IntoResponse, routing::get};
 use protocol::{
     BackendKind, CustomAgent, CustomAgentDeletePayload, CustomAgentId, CustomAgentUpsertPayload,
-    HostSettingValue, McpTransportConfig, SetSettingPayload, SkillId, ToolPolicy,
+    HostSettingValue, McpServerConfig, McpServerDeletePayload, McpServerId, McpServerUpsertPayload,
+    McpTransportConfig, SetSettingPayload, Skill, SkillId, SkillRefreshPayload, ToolPolicy,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -153,6 +155,79 @@ struct UpsertCustomAgentToolInput {
     instructions: Option<String>,
     /// Skill ids to attach (see tyde_config_list_skills).
     skill_ids: Option<Vec<String>>,
+    /// MCP server ids to attach (see tyde_config_list_mcp_servers).
+    mcp_server_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct UpsertSkillToolInput {
+    /// Omit to create an id from the skill name.
+    skill_id: Option<String>,
+    /// Directory name under ~/.tyde/skills; keep it slug-like.
+    name: String,
+    title: Option<String>,
+    description: Option<String>,
+    /// Full SKILL.md body.
+    body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SkillIdToolInput {
+    skill_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum McpTransportInput {
+    Http {
+        url: String,
+        headers: Option<HashMap<String, String>>,
+        bearer_token_env_var: Option<String>,
+    },
+    Stdio {
+        command: String,
+        args: Option<Vec<String>>,
+        env: Option<HashMap<String, String>>,
+    },
+}
+
+impl From<McpTransportInput> for McpTransportConfig {
+    fn from(value: McpTransportInput) -> Self {
+        match value {
+            McpTransportInput::Http {
+                url,
+                headers,
+                bearer_token_env_var,
+            } => Self::Http {
+                url,
+                headers: headers.unwrap_or_default(),
+                bearer_token_env_var,
+            },
+            McpTransportInput::Stdio { command, args, env } => Self::Stdio {
+                command,
+                args: args.unwrap_or_default(),
+                env: env.unwrap_or_default(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct UpsertMcpServerToolInput {
+    /// Omit to create a new id.
+    mcp_server_id: Option<String>,
+    /// Unique MCP server name exposed to agents.
+    name: String,
+    transport: McpTransportInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct McpServerIdToolInput {
+    mcp_server_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,9 +377,10 @@ impl TydeConfigMcpServer {
                 .map(|ids| ids.into_iter().map(SkillId).collect())
                 .or_else(|| existing.as_ref().map(|agent| agent.skill_ids.clone()))
                 .unwrap_or_default(),
-            mcp_server_ids: existing
-                .as_ref()
-                .map(|agent| agent.mcp_server_ids.clone())
+            mcp_server_ids: input
+                .mcp_server_ids
+                .map(|ids| ids.into_iter().map(McpServerId).collect())
+                .or_else(|| existing.as_ref().map(|agent| agent.mcp_server_ids.clone()))
                 .unwrap_or_default(),
             tool_policy: existing
                 .as_ref()
@@ -353,6 +429,60 @@ impl TydeConfigMcpServer {
         }
     }
 
+    #[tool(description = "Refresh Tyde's filesystem skill index from ~/.tyde/skills.")]
+    async fn tyde_config_refresh_skills(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .host
+            .refresh_skills(SkillRefreshPayload::default())
+            .await
+        {
+            Ok(()) => match self.host.list_skills().await {
+                Ok(skills) => ok_json(skills),
+                Err(err) => Ok(err_text(err)),
+            },
+            Err(err) => Ok(err_text(err.message)),
+        }
+    }
+
+    #[tool(
+        description = "Install or replace a Tyde skill by writing ~/.tyde/skills/<name>/metadata.json and SKILL.md. Default agents load all Tyde skills automatically."
+    )]
+    async fn tyde_config_upsert_skill(
+        &self,
+        Parameters(input): Parameters<UpsertSkillToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let name = input.name;
+        let id = input.skill_id.unwrap_or_else(|| name.clone());
+        let skill = Skill {
+            id: SkillId(id),
+            name,
+            title: input.title,
+            description: input.description,
+        };
+        match self.host.upsert_skill(skill.clone(), input.body).await {
+            Ok(()) => ok_json(skill),
+            Err(err) => Ok(err_text(err.message)),
+        }
+    }
+
+    #[tool(description = "Delete a Tyde skill from ~/.tyde/skills and notify clients.")]
+    async fn tyde_config_delete_skill(
+        &self,
+        Parameters(input): Parameters<SkillIdToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .host
+            .delete_skill(SkillId(input.skill_id.clone()))
+            .await
+        {
+            Ok(()) => ok_json(json!({ "deleted": input.skill_id })),
+            Err(err) => Ok(err_text(err.message)),
+        }
+    }
+
     #[tool(
         description = "List configured MCP servers (id, name, transport kind — no credentials)."
     )]
@@ -380,13 +510,57 @@ impl TydeConfigMcpServer {
             Err(err) => Ok(err_text(err)),
         }
     }
+
+    #[tool(
+        description = "Install or replace a Tyde MCP server. Default agents load all configured MCP servers automatically."
+    )]
+    async fn tyde_config_upsert_mcp_server(
+        &self,
+        Parameters(input): Parameters<UpsertMcpServerToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = input
+            .mcp_server_id
+            .unwrap_or_else(|| format!("mcp-{}", Uuid::new_v4().simple()));
+        let mcp_server = McpServerConfig {
+            id: McpServerId(id),
+            name: input.name,
+            transport: input.transport.into(),
+        };
+        match self
+            .host
+            .upsert_mcp_server(McpServerUpsertPayload {
+                mcp_server: mcp_server.clone(),
+            })
+            .await
+        {
+            Ok(()) => ok_json(mcp_server),
+            Err(err) => Ok(err_text(err.message)),
+        }
+    }
+
+    #[tool(description = "Delete a configured Tyde MCP server.")]
+    async fn tyde_config_delete_mcp_server(
+        &self,
+        Parameters(input): Parameters<McpServerIdToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .host
+            .delete_mcp_server(McpServerDeletePayload {
+                id: McpServerId(input.mcp_server_id.clone()),
+            })
+            .await
+        {
+            Ok(()) => ok_json(json!({ "deleted": input.mcp_server_id })),
+            Err(err) => Ok(err_text(err.message)),
+        }
+    }
 }
 
 impl ServerHandler for TydeConfigMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Tools for inspecting and configuring this Tyde host: read/change settings, manage custom agents, list skills and MCP servers, and check backend setup status. Read current state before changing it, and tell the user exactly what changed."
+                "Tools for inspecting and configuring this Tyde host: read/change settings, manage custom agents, install/update/delete skills and MCP servers, and check backend setup status. Read current state before changing it, and tell the user exactly what changed."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -477,4 +651,37 @@ pub fn start_server(
     Ok(ConfigMcpHandle {
         url: format!("http://{local_addr}/mcp"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_list_includes_skill_and_mcp_mutations() {
+        let dir = tempfile::tempdir().expect("create temp host dir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("spawn mock host");
+        let server = TydeConfigMcpServer::new(host);
+        let tool_names = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<std::collections::HashSet<_>>();
+
+        for name in [
+            "tyde_config_refresh_skills",
+            "tyde_config_upsert_skill",
+            "tyde_config_delete_skill",
+            "tyde_config_upsert_mcp_server",
+            "tyde_config_delete_mcp_server",
+        ] {
+            assert!(tool_names.contains(name), "missing config MCP tool {name}");
+        }
+    }
 }

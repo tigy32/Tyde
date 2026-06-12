@@ -260,13 +260,15 @@ once.
   members, each with a role, personality, backend, and optional custom
   agent. Managed from the Teams panel.
 - **Skills.** Reusable instruction documents agents can load; managed in
-  Settings → Skills and attached to custom agents.
+  Settings → Skills. The Default agent loads all Tyde skills automatically;
+  custom agents can still attach a specific subset.
 - **Steering.** Per-project or global guidance files automatically included
   in agent context; managed in Settings → Steering.
 - **MCP servers.** External tool servers agents can call. Users add their
-  own in Settings → MCP Servers. Tyde also has built-in ones: `tyde-debug`
-  (drive a dev instance), `tyde-agent-control` (spawn/await agents — what
-  the Orchestrator uses), and `tyde-config` (yours).
+  own in Settings → MCP Servers. The Default agent loads all configured MCP
+  servers automatically. Tyde also has built-in ones: `tyde-debug` (drive a
+  dev instance), `tyde-agent-control` (spawn/await agents — what the
+  Orchestrator uses), and `tyde-config` (yours).
 - **Task complexity tiers.** Optional Low/High spawn configurations per
   backend (model + reasoning effort) under Settings → Backends.
 - **Review.** Workspace-level code review of pending changes from the
@@ -283,8 +285,10 @@ once.
 
 ## Using your tyde-config tools
 
-- Read before you write: fetch current settings or the agent list first so
-  you change exactly what the user asked.
+- Read before you write: fetch current settings, skills, MCP servers, or the
+  agent list first so you change exactly what the user asked.
+- You can install, update, refresh, and delete Tyde skills and MCP servers
+  when the user asks.
 - After a change, state plainly what changed and where the user can see it.
 - Confirm with the user before deleting anything or overwriting instructions
   they wrote.

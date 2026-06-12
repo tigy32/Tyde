@@ -81,6 +81,71 @@ impl SkillStore {
             .map_err(|err| format!("Failed to read skill body {}: {err}", path.display()))
     }
 
+    pub fn upsert(&self, skill: Skill, body: String) -> Result<Skill, String> {
+        validate_skill(&skill)?;
+        if body.trim().is_empty() {
+            return Err(format!("skill {} body must not be empty", skill.id));
+        }
+
+        let mut records = self.read_or_rebuild_index()?;
+        if let Some(existing) = records.get(&skill.id.0)
+            && existing.name != skill.name
+        {
+            return Err(format!(
+                "cannot change skill {} directory name from '{}' to '{}'",
+                skill.id, existing.name, skill.name
+            ));
+        }
+        if let Some(existing) = records
+            .values()
+            .find(|existing| existing.name == skill.name && existing.id != skill.id)
+        {
+            return Err(format!(
+                "cannot upsert skill {} with duplicate directory name '{}' already used by {}",
+                skill.id, skill.name, existing.id
+            ));
+        }
+
+        let skill_dir = self.root_dir.join(&skill.name);
+        std::fs::create_dir_all(&skill_dir).map_err(|err| {
+            format!(
+                "Failed to create skill directory {}: {err}",
+                skill_dir.display()
+            )
+        })?;
+        write_atomic(
+            &skill_dir.join(SKILL_METADATA_FILENAME),
+            serde_json::to_string_pretty(&skill)
+                .map_err(|err| format!("Failed to serialize skill metadata: {err}"))?
+                .as_bytes(),
+        )?;
+        write_atomic(&skill_dir.join(SKILL_BODY_FILENAME), body.as_bytes())?;
+
+        records.insert(skill.id.0.clone(), skill.clone());
+        self.save_index(&records)?;
+        Ok(skill)
+    }
+
+    pub fn delete(&self, id: &SkillId) -> Result<SkillId, String> {
+        let mut records = self.read_or_rebuild_index()?;
+        let skill = records
+            .remove(&id.0)
+            .ok_or_else(|| format!("cannot delete missing skill {}", id))?;
+        let skill_dir = self.root_dir.join(&skill.name);
+        match std::fs::remove_dir_all(&skill_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "Failed to delete skill directory {}: {err}",
+                    skill_dir.display()
+                ));
+            }
+        }
+        self.save_index(&records)?;
+        Ok(id.clone())
+    }
+
     pub fn sync_from_disk(&self) -> Result<SkillSyncResult, String> {
         let previous = self.read_or_rebuild_index()?;
         let next = self.scan_disk()?;
@@ -240,6 +305,28 @@ impl SkillStore {
         })?;
         Ok(())
     }
+}
+
+fn write_atomic(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
+    let tmp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("tmp")
+    ));
+    let mut file = std::fs::File::create(&tmp_path)
+        .map_err(|err| format!("Failed to create temp file {}: {err}", tmp_path.display()))?;
+    file.write_all(contents)
+        .map_err(|err| format!("Failed to write temp file {}: {err}", tmp_path.display()))?;
+    file.sync_all()
+        .map_err(|err| format!("Failed to sync temp file {}: {err}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).map_err(|err| {
+        format!(
+            "Failed to atomically replace {} with {}: {err}",
+            path.display(),
+            tmp_path.display()
+        )
+    })
 }
 
 fn load_skill_from_dir(path: &std::path::Path, dir_name: &str) -> Option<Skill> {

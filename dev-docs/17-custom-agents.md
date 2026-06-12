@@ -88,7 +88,7 @@ Rules:
 
 - custom agents are host-owned only in v1; there is no `scope` field
 - every custom agent is available for every backend
-- `skill_ids` and `mcp_server_ids` must resolve exactly at upsert time
+- explicit `skill_ids` and `mcp_server_ids` must resolve exactly at upsert time
 
 ### 2.3 Steering
 
@@ -364,9 +364,11 @@ At spawn:
    `SteeringScope::Host` plus `SteeringScope::Project(project_id)` when the
    spawn has a `project_id`. Sort by `title` and join with one blank line between
    entries.
-4. Collect the custom agent's referenced skills. Missing `SkillId`,
-   missing `metadata.json`, or missing `SKILL.md` is a spawn error. Materialize
-   the resolved skills per backend.
+4. For the built-in Default custom agent, collect all current Tyde skills and
+   all current user-configured MCP servers at spawn time. For every other
+   custom agent, collect only the agent's referenced skills and MCP servers.
+   Missing `SkillId`, missing `metadata.json`, or missing `SKILL.md` is a spawn
+   error. Materialize the resolved skills per backend.
 
 Important separation:
 

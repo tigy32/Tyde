@@ -3061,6 +3061,7 @@ fn CustomAgentEditor(
     } else {
         "Edit Custom Agent"
     };
+    let is_default_agent = !form.is_new && form.id.0.as_str() == "tyde-default";
 
     let name_sig = form.name;
     let description_sig = form.description;
@@ -3197,93 +3198,112 @@ fn CustomAgentEditor(
                     />
                 </label>
 
-                <label class="settings-form-label">
-                    <span>"Skills"</span>
-                    <div class="settings-backend-list">
-                        {move || {
-                            let list = available_skills.get();
-                            if list.is_empty() {
-                                view! { <div class="settings-description">"No skills on this host."</div> }.into_any()
-                            } else {
-                                view! {
-                                    <>
-                                    {list.into_iter().map(|skill| {
-                                        let id = skill.id.clone();
-                                        let label = skill.name.clone();
-                                        let id_for_check = id.clone();
-                                        let id_for_toggle = id.clone();
-                                        view! {
-                                            <div class="settings-checkbox-row">
-                                                <input
-                                                    type="checkbox"
-                                                    prop:checked=move || skill_ids_sig.get().contains(&id_for_check)
-                                                    on:change=move |ev: web_sys::Event| {
-                                                        let target = ev.target().unwrap();
-                                                        let input: web_sys::HtmlInputElement = target.unchecked_into();
-                                                        let id = id_for_toggle.clone();
-                                                        if input.checked() {
-                                                            skill_ids_sig.update(|v| {
-                                                                if !v.contains(&id) { v.push(id); }
-                                                            });
-                                                        } else {
-                                                            skill_ids_sig.update(|v| v.retain(|s| s != &id));
-                                                        }
+                {if is_default_agent {
+                    view! {
+                        <>
+                            <div class="settings-form-label">
+                                <span>"Skills"</span>
+                                <div class="settings-description">"All host skills"</div>
+                            </div>
+                            <div class="settings-form-label">
+                                <span>"MCP Servers"</span>
+                                <div class="settings-description">"All configured servers"</div>
+                            </div>
+                        </>
+                    }.into_any()
+                } else {
+                    view! {
+                        <>
+                            <label class="settings-form-label">
+                                <span>"Skills"</span>
+                                <div class="settings-backend-list">
+                                    {move || {
+                                        let list = available_skills.get();
+                                        if list.is_empty() {
+                                            view! { <div class="settings-description">"No skills on this host."</div> }.into_any()
+                                        } else {
+                                            view! {
+                                                <>
+                                                {list.into_iter().map(|skill| {
+                                                    let id = skill.id.clone();
+                                                    let label = skill.name.clone();
+                                                    let id_for_check = id.clone();
+                                                    let id_for_toggle = id.clone();
+                                                    view! {
+                                                        <div class="settings-checkbox-row">
+                                                            <input
+                                                                type="checkbox"
+                                                                prop:checked=move || skill_ids_sig.get().contains(&id_for_check)
+                                                                on:change=move |ev: web_sys::Event| {
+                                                                    let target = ev.target().unwrap();
+                                                                    let input: web_sys::HtmlInputElement = target.unchecked_into();
+                                                                    let id = id_for_toggle.clone();
+                                                                    if input.checked() {
+                                                                        skill_ids_sig.update(|v| {
+                                                                            if !v.contains(&id) { v.push(id); }
+                                                                        });
+                                                                    } else {
+                                                                        skill_ids_sig.update(|v| v.retain(|s| s != &id));
+                                                                    }
+                                                                }
+                                                            />
+                                                            <span>{label}</span>
+                                                        </div>
                                                     }
-                                                />
-                                                <span>{label}</span>
-                                            </div>
+                                                }).collect_view()}
+                                                </>
+                                            }.into_any()
                                         }
-                                    }).collect_view()}
-                                    </>
-                                }.into_any()
-                            }
-                        }}
-                    </div>
-                </label>
+                                    }}
+                                </div>
+                            </label>
 
-                <label class="settings-form-label">
-                    <span>"MCP Servers"</span>
-                    <div class="settings-backend-list">
-                        {move || {
-                            let list = available_mcp.get();
-                            if list.is_empty() {
-                                view! { <div class="settings-description">"No MCP servers on this host."</div> }.into_any()
-                            } else {
-                                view! {
-                                    <>
-                                    {list.into_iter().map(|server| {
-                                        let id = server.id.clone();
-                                        let label = server.name.clone();
-                                        let id_for_check = id.clone();
-                                        let id_for_toggle = id.clone();
-                                        view! {
-                                            <div class="settings-checkbox-row">
-                                                <input
-                                                    type="checkbox"
-                                                    prop:checked=move || mcp_server_ids_sig.get().contains(&id_for_check)
-                                                    on:change=move |ev: web_sys::Event| {
-                                                        let target = ev.target().unwrap();
-                                                        let input: web_sys::HtmlInputElement = target.unchecked_into();
-                                                        let id = id_for_toggle.clone();
-                                                        if input.checked() {
-                                                            mcp_server_ids_sig.update(|v| {
-                                                                if !v.contains(&id) { v.push(id); }
-                                                            });
-                                                        } else {
-                                                            mcp_server_ids_sig.update(|v| v.retain(|s| s != &id));
-                                                        }
+                            <label class="settings-form-label">
+                                <span>"MCP Servers"</span>
+                                <div class="settings-backend-list">
+                                    {move || {
+                                        let list = available_mcp.get();
+                                        if list.is_empty() {
+                                            view! { <div class="settings-description">"No MCP servers on this host."</div> }.into_any()
+                                        } else {
+                                            view! {
+                                                <>
+                                                {list.into_iter().map(|server| {
+                                                    let id = server.id.clone();
+                                                    let label = server.name.clone();
+                                                    let id_for_check = id.clone();
+                                                    let id_for_toggle = id.clone();
+                                                    view! {
+                                                        <div class="settings-checkbox-row">
+                                                            <input
+                                                                type="checkbox"
+                                                                prop:checked=move || mcp_server_ids_sig.get().contains(&id_for_check)
+                                                                on:change=move |ev: web_sys::Event| {
+                                                                    let target = ev.target().unwrap();
+                                                                    let input: web_sys::HtmlInputElement = target.unchecked_into();
+                                                                    let id = id_for_toggle.clone();
+                                                                    if input.checked() {
+                                                                        mcp_server_ids_sig.update(|v| {
+                                                                            if !v.contains(&id) { v.push(id); }
+                                                                        });
+                                                                    } else {
+                                                                        mcp_server_ids_sig.update(|v| v.retain(|s| s != &id));
+                                                                    }
+                                                                }
+                                                            />
+                                                            <span>{label}</span>
+                                                        </div>
                                                     }
-                                                />
-                                                <span>{label}</span>
-                                            </div>
+                                                }).collect_view()}
+                                                </>
+                                            }.into_any()
                                         }
-                                    }).collect_view()}
-                                    </>
-                                }.into_any()
-                            }
-                        }}
-                    </div>
-                </label>
+                                    }}
+                                </div>
+                            </label>
+                        </>
+                    }.into_any()
+                }}
 
                 <label class="settings-form-label">
                     <span>"Tool Policy"</span>

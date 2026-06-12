@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use protocol::{
-    BackendAccessMode, BackendKind, CustomAgentId, McpServerConfig, McpServerId,
+    BackendAccessMode, BackendKind, CustomAgent, CustomAgentId, McpServerConfig, McpServerId,
     McpTransportConfig, ProjectId, SkillId, ToolPolicy,
 };
 
@@ -90,32 +90,37 @@ pub(crate) fn resolve_spawn_config(
         instructions = custom_agent.instructions.clone();
         tool_policy = custom_agent.tool_policy.clone();
 
-        for skill_id in &custom_agent.skill_ids {
-            skills.push(resolve_skill(request.skill_store, skill_id)?);
-        }
+        if is_default_custom_agent(&custom_agent) {
+            for skill in request.skill_store.list()? {
+                skills.push(resolve_skill(request.skill_store, &skill.id)?);
+            }
+            for mcp_server in request.mcp_server_store.list()? {
+                push_mcp_server(
+                    &custom_agent.id,
+                    mcp_server,
+                    &mut mcp_names,
+                    &mut mcp_servers,
+                )?;
+            }
+        } else {
+            for skill_id in &custom_agent.skill_ids {
+                skills.push(resolve_skill(request.skill_store, skill_id)?);
+            }
 
-        for mcp_server_id in &custom_agent.mcp_server_ids {
-            let mcp_server = request.mcp_server_store.get(mcp_server_id).ok_or_else(|| {
-                format!(
-                    "custom agent {} references missing MCP server {}",
-                    custom_agent.id, mcp_server_id
-                )
-            })?;
-            let name = mcp_server.name.clone();
-            if RESERVED_MCP_SERVER_NAMES.contains(&name.as_str()) {
-                return Err(format!(
-                    "custom agent {} references reserved MCP server name '{}'",
-                    custom_agent.id, name
-                ));
+            for mcp_server_id in &custom_agent.mcp_server_ids {
+                let mcp_server = request.mcp_server_store.get(mcp_server_id).ok_or_else(|| {
+                    format!(
+                        "custom agent {} references missing MCP server {}",
+                        custom_agent.id, mcp_server_id
+                    )
+                })?;
+                push_mcp_server(
+                    &custom_agent.id,
+                    mcp_server,
+                    &mut mcp_names,
+                    &mut mcp_servers,
+                )?;
             }
-            if let Some(existing_id) = mcp_names.get(&name) {
-                return Err(format!(
-                    "custom agent {} MCP server '{}' collides with existing server {}",
-                    custom_agent.id, name, existing_id
-                ));
-            }
-            mcp_names.insert(name, mcp_server.id.clone());
-            mcp_servers.push(mcp_server);
         }
     }
 
@@ -168,6 +173,34 @@ pub(crate) fn protocol_mcp_servers_to_startup(
             },
         })
         .collect()
+}
+
+fn is_default_custom_agent(custom_agent: &CustomAgent) -> bool {
+    custom_agent.id.0 == crate::store::custom_agents::DEFAULT_CUSTOM_AGENT_ID
+}
+
+fn push_mcp_server(
+    custom_agent_id: &CustomAgentId,
+    mcp_server: McpServerConfig,
+    mcp_names: &mut HashMap<String, McpServerId>,
+    mcp_servers: &mut Vec<McpServerConfig>,
+) -> Result<(), String> {
+    let name = mcp_server.name.clone();
+    if RESERVED_MCP_SERVER_NAMES.contains(&name.as_str()) {
+        return Err(format!(
+            "custom agent {} references reserved MCP server name '{}'",
+            custom_agent_id, name
+        ));
+    }
+    if let Some(existing_id) = mcp_names.get(&name) {
+        return Err(format!(
+            "custom agent {} MCP server '{}' collides with existing server {}",
+            custom_agent_id, name, existing_id
+        ));
+    }
+    mcp_names.insert(name, mcp_server.id.clone());
+    mcp_servers.push(mcp_server);
+    Ok(())
 }
 
 fn startup_mcp_server_to_protocol(server: &StartupMcpServer) -> McpServerConfig {
