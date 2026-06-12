@@ -311,17 +311,42 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
 
     let pre_ref: NodeRef<leptos::html::Pre> = NodeRef::new();
 
+    // ── Open-at-line (from project search) ─────────────────────────────
+    // Resolve a pending goto for THIS file *synchronously*, before the virtual
+    // window is first computed, so a deep target line lands in the very first
+    // rendered window (no top-then-jump flash). Cleared immediately so it
+    // fires once. `pending_line` then drives the measured re-snap below.
+    let goto_path = f.path.clone();
+    let initial_goto: Option<u32> = state.pending_goto_line.with_untracked(|pending| {
+        pending
+            .as_ref()
+            .and_then(|(path, line)| (*path == goto_path).then_some(*line))
+    });
+    if initial_goto.is_some() {
+        state.pending_goto_line.set(None);
+    }
+
     // Virtualization geometry. Pre-seed the line and
     // viewport heights with reasonable estimates so the
     // very first render of a large file already uses a
     // bounded window. The measurement Effect below
-    // refines both values once layout is real.
-    let scroll_top =
-        RwSignal::new(initial_scroll_state.map_or(0.0_f64, |scroll| scroll.scroll_top as f64));
+    // refines both values once layout is real. When a goto is pending we seed
+    // the scroll to the target line (using the estimate) so the first virtual
+    // window already contains it; otherwise we restore any saved scroll.
+    let initial_scroll_top = match initial_goto {
+        Some(line) => (line.saturating_sub(1) as f64) * INITIAL_LINE_HEIGHT_ESTIMATE,
+        None => initial_scroll_state.map_or(0.0_f64, |scroll| scroll.scroll_top as f64),
+    };
+    let scroll_top = RwSignal::new(initial_scroll_top);
     let viewport_height = RwSignal::new(INITIAL_VIEWPORT_HEIGHT_ESTIMATE);
     let line_height = RwSignal::new(INITIAL_LINE_HEIGHT_ESTIMATE);
+    // Set true once the real line height has been measured (drives the
+    // one-shot consumption of a goto request — see below).
+    let geometry_measured = RwSignal::new(false);
 
-    let restored_initial_scroll = std::rc::Rc::new(std::cell::Cell::new(false));
+    // Skip the saved-scroll restore when a goto already seeded the scroll.
+    let restored_initial_scroll =
+        std::rc::Rc::new(std::cell::Cell::new(initial_goto.is_some()));
     let restored_initial_scroll_for_effect = restored_initial_scroll.clone();
     let pre_ref_for_restore = pre_ref;
     let state_for_restore = state.clone();
@@ -362,6 +387,9 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
             }
             if !measure_logged.get() {
                 measure_logged.set(true);
+                // Signal the goto re-snap Effect that the real line height is
+                // now known so it can correct + consume the request.
+                geometry_measured.set(true);
                 crate::perf::log_phase(
                     "file_open",
                     "first_paint_measured",
@@ -372,31 +400,30 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
         }
     });
 
-    // ── Open-at-line (from project search) ─────────────────────────────
-    // `pending_line` holds the 1-based target line for THIS file. It is
-    // seeded from the global `pending_goto_line` request and consumed by the
-    // scroll Effect below, which re-runs when `line_height` is measured so the
-    // scroll seeded from the estimate is corrected to the real geometry.
-    let pending_line: RwSignal<Option<u32>> = RwSignal::new(None);
+    // `pending_line` holds the 1-based target line for THIS file. It is seeded
+    // synchronously above (`initial_goto`) for the freshly-opened case, and by
+    // the bridge Effect below for an already-open tab being re-targeted.
+    let pending_line: RwSignal<Option<u32>> = RwSignal::new(initial_goto);
 
-    // Bridge the global goto request to this file. Runs at mount (reads the
-    // current request) and whenever a new request arrives — covering both a
-    // freshly-opened file and an already-open tab being re-targeted.
-    let goto_path = f.path.clone();
+    // Bridge later global goto requests to this file (already-open tab case).
+    // The freshly-opened case was handled by the synchronous seed above.
+    let goto_path_for_bridge = f.path.clone();
     let state_for_goto = state.clone();
     Effect::new(move |_| {
         if let Some((target_path, line)) = state_for_goto.pending_goto_line.get()
-            && target_path == goto_path
+            && target_path == goto_path_for_bridge
         {
             pending_line.set(Some(line));
             state_for_goto.pending_goto_line.set(None);
         }
     });
 
-    // Apply the scroll. Subscribes to `pending_line`, `line_height`, and the
-    // element ref so it re-snaps once the real line height is known. It does
-    // NOT read `scroll_top`, so the user can freely scroll afterwards without
-    // this Effect fighting them.
+    // Apply / re-snap the scroll. Subscribes to `pending_line`, `line_height`,
+    // `geometry_measured`, and the element ref: it aligns first with the
+    // estimate, then re-snaps once the real line height is measured and
+    // *consumes* the request (clears `pending_line`) so later geometry changes
+    // never yank the user back to an old result. It does NOT read `scroll_top`,
+    // so the user can freely scroll afterwards without this Effect fighting them.
     let pre_ref_for_goto = pre_ref;
     let state_for_goto_scroll = state.clone();
     Effect::new(move |_| {
@@ -404,6 +431,7 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
             return;
         };
         let lh = line_height.get();
+        let measured = geometry_measured.get();
         let Some(el) = pre_ref_for_goto.get() else {
             return;
         };
@@ -412,6 +440,10 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
         scroll_top.set(el.scroll_top() as f64);
         let element: web_sys::Element = el.clone().unchecked_into();
         state_for_goto_scroll.save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
+        if measured {
+            // Real geometry applied — consume the request so it fires once.
+            pending_line.set(None);
+        }
     });
 
     // Write the native scrollTop straight into the signal. Leptos

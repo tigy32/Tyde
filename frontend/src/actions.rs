@@ -368,18 +368,30 @@ pub fn start_project_search(state: &AppState) {
 }
 
 /// Cancel the in-flight project search (if any) for the active project.
+///
+/// Bumps `active_search_id` to a fresh tombstone id *before* sending the
+/// cancel for the old id, so any result frames still in flight from the
+/// cancelled walk no longer match the active id and are dropped by dispatch
+/// instead of being appended after the UI was cleared.
 pub fn cancel_project_search(state: &AppState) {
     let Some(active_project) = state.active_project_ref_untracked() else {
         return;
     };
-    let search_id = state.search_state.with_untracked(|s| s.active_search_id);
-    if search_id == 0 {
+    let cancelled_id = state.search_state.with_untracked(|s| s.active_search_id);
+    if cancelled_id == 0 {
         return;
     }
-    state.search_state.update(|s| s.in_flight = false);
+    state.search_state.update(|s| {
+        // Advance the active id so the cancelled search's late frames are
+        // ignored; the next real search advances it again.
+        s.active_search_id = s.active_search_id.wrapping_add(1).max(1);
+        s.in_flight = false;
+    });
     let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
     let host_id = active_project.host_id.clone();
-    let payload = ProjectSearchCancelPayload { search_id };
+    let payload = ProjectSearchCancelPayload {
+        search_id: cancelled_id,
+    };
     spawn_local(async move {
         if let Err(error) =
             send_frame(&host_id, project_stream, FrameKind::ProjectSearchCancel, &payload).await

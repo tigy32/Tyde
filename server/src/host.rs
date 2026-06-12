@@ -5066,12 +5066,23 @@ impl HostHandle {
                 let active = Arc::clone(&active);
                 move || active.load(Ordering::SeqCst) != search_id
             };
-            let emit = |file: ProjectSearchFileResult| -> bool {
-                match serde_json::to_value(&ProjectSearchResultsPayload { search_id, file }) {
-                    Ok(value) => output
-                        .send_value(FrameKind::ProjectSearchResults, value)
-                        .is_ok(),
-                    Err(_) => false,
+            let emit = {
+                let active = Arc::clone(&active);
+                let output = output.clone();
+                move |file: ProjectSearchFileResult| -> bool {
+                    // Re-check the active id immediately before sending: a long
+                    // single-file scan may have outlived a cancel / supersede
+                    // since the last per-file `cancelled` poll. Don't ship
+                    // results the client will discard (or worse, mis-attribute).
+                    if active.load(Ordering::SeqCst) != search_id {
+                        return false;
+                    }
+                    match serde_json::to_value(&ProjectSearchResultsPayload { search_id, file }) {
+                        Ok(value) => output
+                            .send_value(FrameKind::ProjectSearchResults, value)
+                            .is_ok(),
+                        Err(_) => false,
+                    }
                 }
             };
 

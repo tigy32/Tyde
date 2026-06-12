@@ -386,6 +386,9 @@ fn render_nodes(
                     let root_for_children = root.clone();
                     let root_for_ctx = root.clone();
                     let dir_path_for_ctx = dir_path.clone();
+                    // Resolve the context once, in render scope, rather than on
+                    // every right-click inside the event callback.
+                    let state_for_ctx = expect_context::<AppState>();
 
                     view! {
                         <div class="fe-dir-group">
@@ -396,9 +399,9 @@ fn render_nodes(
                                 on:contextmenu={
                                     let root = root_for_ctx.clone();
                                     let dir_path = dir_path_for_ctx.clone();
+                                    let state = state_for_ctx.clone();
                                     move |ev: web_sys::MouseEvent| {
                                         ev.prevent_default();
-                                        let state = expect_context::<AppState>();
                                         crate::actions::search_in_folder(
                                             &state,
                                             root.clone(),

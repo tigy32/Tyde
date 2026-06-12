@@ -1252,9 +1252,13 @@ where
                 summary.cancelled = true;
                 break 'outer;
             }
-            if summary.total_files as usize >= max_files
-                || summary.total_matches as usize >= MAX_SEARCH_MATCHES
-            {
+            if summary.total_files as usize >= max_files {
+                summary.truncated = true;
+                break 'outer;
+            }
+            let remaining_matches =
+                MAX_SEARCH_MATCHES.saturating_sub(summary.total_matches as usize);
+            if remaining_matches == 0 {
                 summary.truncated = true;
                 break 'outer;
             }
@@ -1283,7 +1287,10 @@ where
                 }
             }
 
-            let mut collector = SearchMatchCollector::new(&matcher);
+            // Cap this file's matches at the smaller of the per-file limit and
+            // the remaining global budget, so the total can never overshoot.
+            let per_file_cap = MAX_MATCHES_PER_FILE.min(remaining_matches);
+            let mut collector = SearchMatchCollector::new(&matcher, per_file_cap);
             if searcher
                 .search_path(&matcher, path, &mut collector)
                 .is_err()
@@ -1308,6 +1315,12 @@ where
                 summary.cancelled = true;
                 break 'outer;
             }
+            // If this file exhausted the global match budget, the run is
+            // truncated — record it now since the loop may end here.
+            if summary.total_matches as usize >= MAX_SEARCH_MATCHES {
+                summary.truncated = true;
+                break 'outer;
+            }
         }
     }
 
@@ -1319,14 +1332,19 @@ where
 struct SearchMatchCollector<'matcher> {
     matcher: &'matcher grep_regex::RegexMatcher,
     matches: Vec<ProjectSearchMatch>,
+    /// Maximum matches this collector will record before stopping. The caller
+    /// sets it to `min(per-file cap, remaining global budget)` so a single file
+    /// can never push the run past the global match cap.
+    max_matches: usize,
     truncated: bool,
 }
 
 impl<'matcher> SearchMatchCollector<'matcher> {
-    fn new(matcher: &'matcher grep_regex::RegexMatcher) -> Self {
+    fn new(matcher: &'matcher grep_regex::RegexMatcher, max_matches: usize) -> Self {
         Self {
             matcher,
             matches: Vec::new(),
+            max_matches,
             truncated: false,
         }
     }
@@ -1342,7 +1360,7 @@ impl grep_searcher::Sink for SearchMatchCollector<'_> {
     ) -> Result<bool, std::io::Error> {
         use grep_matcher::Matcher;
 
-        if self.matches.len() >= MAX_MATCHES_PER_FILE {
+        if self.matches.len() >= self.max_matches {
             self.truncated = true;
             return Ok(false);
         }
@@ -2996,6 +3014,41 @@ new mode 100755\n";
         assert_eq!(files.len(), 3);
         assert_eq!(summary.total_files, 3);
         assert!(summary.truncated, "hitting the file cap marks truncated");
+    }
+
+    #[test]
+    fn search_never_exceeds_global_match_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // 11 files, each with more matching lines than the per-file cap (1000).
+        // 10 full files reach the 10_000 global cap; the run must stop there
+        // and never report more than the cap, with `truncated` set.
+        let line = "needle\n".repeat(1100);
+        for i in 0..11 {
+            write_file(root, &format!("f{i:02}.txt"), line.as_bytes());
+        }
+        let project = test_project(root.to_str().unwrap());
+
+        let (files, summary) = run_search(&project, &search_payload("needle"));
+
+        assert_eq!(
+            summary.total_matches, 10_000,
+            "total matches must be clamped exactly to the global cap"
+        );
+        assert!(
+            (summary.total_matches as usize) <= 10_000,
+            "global match cap must never be exceeded"
+        );
+        assert!(summary.truncated, "hitting the global cap marks truncated");
+        // The emitted per-file totals must sum to the reported total (no file
+        // overshot the budget).
+        let emitted: usize = files.iter().map(|f| f.matches.len()).sum();
+        assert_eq!(emitted, 10_000);
+        // Each emitted file hit the per-file cap, so each is itself truncated.
+        for file in &files {
+            assert!(file.matches.len() <= 1000);
+            assert!(file.truncated, "files over the per-file cap are truncated");
+        }
     }
 
     #[test]
