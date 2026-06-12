@@ -12,7 +12,8 @@ use protocol::{
     MobileAccessStatePayload, MobilePairingOfferPayload, MobilePairingState, NewAgentPayload,
     NewTerminalPayload, ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
     ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectSearchCompletePayload,
+    ProjectSearchResultsPayload, ProtocolValidator,
     QueuedMessagesPayload, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
     ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionId,
     SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload,
@@ -1309,6 +1310,52 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     &envelope.stream,
                     envelope.kind,
                     format!("failed to parse project_file_contents payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::ProjectSearchResults => {
+            match envelope.parse_payload::<ProjectSearchResultsPayload>() {
+                Ok(payload) => {
+                    state.search_state.update(|s| {
+                        // Ignore results from a superseded / cancelled search.
+                        if payload.search_id != s.active_search_id {
+                            return;
+                        }
+                        s.total_matches += payload.file.matches.len() as u32;
+                        s.total_files += 1;
+                        s.results.push(payload.file);
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse project_search_results payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::ProjectSearchComplete => {
+            match envelope.parse_payload::<ProjectSearchCompletePayload>() {
+                Ok(payload) => {
+                    state.search_state.update(|s| {
+                        if payload.search_id != s.active_search_id {
+                            return;
+                        }
+                        s.in_flight = false;
+                        // Trust the server's authoritative totals.
+                        s.total_files = payload.total_files;
+                        s.total_matches = payload.total_matches;
+                        s.truncated = payload.truncated;
+                        s.error = payload.error;
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse project_search_complete payload: {error}"),
                 ),
             }
         }

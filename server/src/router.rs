@@ -12,7 +12,8 @@ use protocol::{
     ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectReorderScope, ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload,
+    ProjectStageFilePayload, ProjectStageHunkPayload,
     ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewId,
     ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
     SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
@@ -604,6 +605,22 @@ pub(crate) async fn route_client_envelope(
                     payload,
                 )
                 .await?;
+            }
+            FrameKind::ProjectSearch => {
+                let payload: ProjectSearchPayload = parse_payload(&envelope, "project_search")?;
+                ensure_non_empty("project_search", "query", payload.query.as_str())?;
+                host.search_project_files(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
+            }
+            FrameKind::ProjectSearchCancel => {
+                let payload: ProjectSearchCancelPayload =
+                    parse_payload(&envelope, "project_search_cancel")?;
+                host.cancel_project_search(project_id, payload).await?;
             }
             FrameKind::ProjectReadDiff => {
                 let payload: ProjectReadDiffPayload =

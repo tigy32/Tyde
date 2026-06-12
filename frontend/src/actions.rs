@@ -3,15 +3,16 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
 use crate::state::{
-    ActiveProjectRef, AppState, PendingWorkbenchCreate, TabContent, sort_project_infos,
+    ActiveProjectRef, AppState, DockVisibility, LeftTab, PendingWorkbenchCreate, TabContent,
+    sort_project_infos,
 };
 
 use protocol::{
     AgentId, BackendKind, CustomAgentId, FrameKind, GitBranchName, ImageData, ProjectDeletePayload,
     ProjectDeleteRootPayload, ProjectId, ProjectPath, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, SessionId, SessionSettingsValues,
-    SetSessionSettingsPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
-    WorkbenchCreatePayload, WorkbenchRemovePayload,
+    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload,
+    ProjectSearchPayload, SessionId, SessionSettingsValues, SetSessionSettingsPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath, WorkbenchCreatePayload, WorkbenchRemovePayload,
 };
 
 /// Resume a session on the given host. Synchronously switches the active
@@ -302,6 +303,115 @@ pub fn open_project_path(state: &AppState, path: ProjectPath) {
             log::error!("failed to send ProjectReadFile: {error}");
         }
     });
+}
+
+/// Issue a project-wide search using the current `search_state` parameters.
+/// Assigns a fresh `search_id`, clears the previous results, and streams the
+/// request to the active project. An empty (whitespace-only) query clears the
+/// results and sends nothing.
+pub fn start_project_search(state: &AppState) {
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        log::error!("start_project_search: no active project");
+        return;
+    };
+    // An empty query clears the results and cancels any still-running walk on
+    // the server (the previous `search_id`), rather than leaving it churning.
+    if state.search_state.with_untracked(|s| s.query.trim().is_empty()) {
+        cancel_project_search(state);
+        state.search_state.update(|s| {
+            s.results.clear();
+            s.total_files = 0;
+            s.total_matches = 0;
+            s.truncated = false;
+            s.error = None;
+        });
+        return;
+    }
+
+    let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
+    let host_id = active_project.host_id.clone();
+
+    let mut payload: Option<ProjectSearchPayload> = None;
+    state.search_state.update(|s| {
+        let new_id = s.active_search_id.wrapping_add(1).max(1);
+        s.active_search_id = new_id;
+        s.results.clear();
+        s.total_files = 0;
+        s.total_matches = 0;
+        s.truncated = false;
+        s.error = None;
+        s.in_flight = true;
+        payload = Some(ProjectSearchPayload {
+            search_id: new_id,
+            query: s.query.clone(),
+            case_sensitive: s.case_sensitive,
+            whole_word: s.whole_word,
+            use_regex: s.use_regex,
+            include_ignored: s.include_ignored,
+            roots: s.roots.clone(),
+            path_prefix: s.path_prefix.clone(),
+            max_results: None,
+        });
+    });
+
+    let Some(payload) = payload else {
+        return;
+    };
+
+    spawn_local(async move {
+        if let Err(error) =
+            send_frame(&host_id, project_stream, FrameKind::ProjectSearch, &payload).await
+        {
+            log::error!("failed to send ProjectSearch: {error}");
+        }
+    });
+}
+
+/// Cancel the in-flight project search (if any) for the active project.
+pub fn cancel_project_search(state: &AppState) {
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        return;
+    };
+    let search_id = state.search_state.with_untracked(|s| s.active_search_id);
+    if search_id == 0 {
+        return;
+    }
+    state.search_state.update(|s| s.in_flight = false);
+    let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
+    let host_id = active_project.host_id.clone();
+    let payload = ProjectSearchCancelPayload { search_id };
+    spawn_local(async move {
+        if let Err(error) =
+            send_frame(&host_id, project_stream, FrameKind::ProjectSearchCancel, &payload).await
+        {
+            log::error!("failed to send ProjectSearchCancel: {error}");
+        }
+    });
+}
+
+/// Reveal and focus the Search panel in the left dock (Cmd/Ctrl+Shift+F).
+pub fn open_search_panel(state: &AppState) {
+    state.left_dock.set(DockVisibility::Visible);
+    state.left_tab.set(LeftTab::Search);
+    state
+        .search_focus_seq
+        .update(|seq| *seq = seq.wrapping_add(1));
+}
+
+/// Scope the Search panel to a folder and reveal it. Prefills the root + path
+/// prefix; re-runs the search immediately if a query is already present.
+pub fn search_in_folder(state: &AppState, root: ProjectRootPath, relative_path: String) {
+    state.search_state.update(|s| {
+        s.path_prefix = Some(relative_path);
+        s.roots = vec![root];
+    });
+    open_search_panel(state);
+    if state
+        .search_state
+        .with_untracked(|s| !s.query.trim().is_empty())
+    {
+        start_project_search(state);
+    }
 }
 
 pub fn rename_project(state: &AppState, host_id: String, project_id: ProjectId, name: String) {

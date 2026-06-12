@@ -3,9 +3,11 @@ use leptos::prelude::*;
 use crate::components::agents_panel::AgentsPanel;
 use crate::components::file_explorer::FileExplorer;
 use crate::components::git_panel::GitPanel;
+use crate::components::search_panel::SearchPanel;
 use crate::components::sessions_panel::SessionsPanel;
 use crate::components::teams_panel::TeamsPanel;
 use crate::components::terminal_view::TerminalView;
+use crate::state::{AppState, LeftTab};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum DockPosition {
@@ -98,15 +100,11 @@ fn RightDock() -> impl IntoView {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum LeftTab {
-    Files,
-    Git,
-}
-
 #[component]
 fn LeftDock() -> impl IntoView {
-    let active_tab = RwSignal::new(LeftTab::Files);
+    // The active left tab lives in AppState so the Cmd/Ctrl+Shift+F shortcut
+    // and the file-explorer "search in folder" action can switch to Search.
+    let active_tab = expect_context::<AppState>().left_tab;
 
     let tab_class = move |target: LeftTab| {
         move || {
@@ -118,18 +116,13 @@ fn LeftDock() -> impl IntoView {
         }
     };
 
-    let files_style = move || {
-        if active_tab.get() == LeftTab::Files {
-            ""
-        } else {
-            "display: none;"
-        }
-    };
-    let git_style = move || {
-        if active_tab.get() == LeftTab::Git {
-            ""
-        } else {
-            "display: none;"
+    let tab_style = move |target: LeftTab| {
+        move || {
+            if active_tab.get() == target {
+                ""
+            } else {
+                "display: none;"
+            }
         }
     };
 
@@ -142,13 +135,19 @@ fn LeftDock() -> impl IntoView {
                 <button class={tab_class(LeftTab::Git)} on:click=move |_| active_tab.set(LeftTab::Git)>
                     "Git"
                 </button>
+                <button class={tab_class(LeftTab::Search)} on:click=move |_| active_tab.set(LeftTab::Search)>
+                    "Search"
+                </button>
             </div>
             <div class="dock-tab-content">
-                <div class="dock-tab-mount" style=files_style>
+                <div class="dock-tab-mount" style=tab_style(LeftTab::Files)>
                     <FileExplorer />
                 </div>
-                <div class="dock-tab-mount" style=git_style>
+                <div class="dock-tab-mount" style=tab_style(LeftTab::Git)>
                     <GitPanel />
+                </div>
+                <div class="dock-tab-mount" style=tab_style(LeftTab::Search)>
+                    <SearchPanel />
                 </div>
             </div>
         </div>

@@ -13,7 +13,7 @@ use protocol::{
     ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
     ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
-    ReviewSummary, StreamPath,
+    ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload, ReviewSummary, StreamPath,
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -1132,6 +1132,259 @@ pub(crate) fn read_file(
             is_binary: true,
         }),
     }
+}
+
+// ── Project global search ─────────────────────────────────────────────────
+
+/// Maximum number of matching files returned by a single search.
+const MAX_SEARCH_FILES: usize = 1000;
+/// Maximum total matches across all files before the walk is truncated.
+const MAX_SEARCH_MATCHES: usize = 10_000;
+/// Maximum matches reported for any single file.
+const MAX_MATCHES_PER_FILE: usize = 1000;
+/// Matching line text longer than this (in bytes) is truncated before being
+/// sent. Match ranges are computed against the truncated text so they always
+/// stay in bounds.
+const MAX_SEARCH_LINE_BYTES: usize = 2000;
+
+/// Final totals for a completed (or aborted) search walk.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SearchSummary {
+    pub total_files: u32,
+    pub total_matches: u32,
+    pub truncated: bool,
+    pub cancelled: bool,
+}
+
+/// Pure search core. Walks `payload.roots` (or every project root when empty),
+/// honouring `.gitignore` unless `include_ignored` is set, and invokes `emit`
+/// once per matching file. `emit` returns `false` to stop early (e.g. the
+/// output stream closed). `cancelled` is polled between files so a superseding
+/// search or an explicit cancel aborts the walk promptly.
+pub(crate) fn search_project<E, C>(
+    project: &Project,
+    payload: &ProjectSearchPayload,
+    mut emit: E,
+    cancelled: C,
+) -> Result<SearchSummary, String>
+where
+    E: FnMut(ProjectSearchFileResult) -> bool,
+    C: Fn() -> bool,
+{
+    use grep_regex::RegexMatcherBuilder;
+    use grep_searcher::{BinaryDetection, SearcherBuilder};
+    use ignore::WalkBuilder;
+
+    if payload.query.is_empty() {
+        return Err("search query must not be empty".to_owned());
+    }
+
+    let pattern = if payload.use_regex {
+        payload.query.clone()
+    } else {
+        regex::escape(&payload.query)
+    };
+    let matcher = RegexMatcherBuilder::new()
+        .case_insensitive(!payload.case_sensitive)
+        .word(payload.whole_word)
+        .build(&pattern)
+        .map_err(|err| format!("invalid search pattern: {err}"))?;
+
+    let all_roots = project.root_paths();
+    let roots: Vec<ProjectRootPath> = if payload.roots.is_empty() {
+        all_roots
+    } else {
+        for requested in &payload.roots {
+            if !all_roots.iter().any(|candidate| candidate == requested) {
+                return Err(format!(
+                    "Root '{}' does not belong to project {}",
+                    requested, project.id
+                ));
+            }
+        }
+        payload.roots.clone()
+    };
+
+    let max_files = payload
+        .max_results
+        .map(|value| value as usize)
+        .unwrap_or(MAX_SEARCH_FILES)
+        .min(MAX_SEARCH_FILES);
+
+    let path_prefix = payload
+        .path_prefix
+        .as_deref()
+        .map(|prefix| {
+            prefix
+                .trim_start_matches("./")
+                .trim_end_matches('/')
+                .to_owned()
+        })
+        .filter(|prefix| !prefix.is_empty());
+
+    let mut searcher = SearcherBuilder::new()
+        .binary_detection(BinaryDetection::quit(0))
+        .line_number(true)
+        .build();
+
+    let mut summary = SearchSummary::default();
+
+    'outer: for root in &roots {
+        let root_path = Path::new(&root.0);
+        let respect_ignore = !payload.include_ignored;
+        let mut builder = WalkBuilder::new(root_path);
+        builder
+            .hidden(respect_ignore)
+            .ignore(respect_ignore)
+            .git_ignore(respect_ignore)
+            .git_global(respect_ignore)
+            .git_exclude(respect_ignore)
+            // Honour .gitignore even when the root is not inside a git repo,
+            // matching editor "search" semantics for standalone folders.
+            .require_git(false)
+            .parents(respect_ignore)
+            .follow_links(false)
+            .filter_entry(|entry| entry.file_name() != ".git");
+        let walk = builder.build();
+
+        for result in walk {
+            if cancelled() {
+                summary.cancelled = true;
+                break 'outer;
+            }
+            if summary.total_files as usize >= max_files
+                || summary.total_matches as usize >= MAX_SEARCH_MATCHES
+            {
+                summary.truncated = true;
+                break 'outer;
+            }
+
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let is_file = entry
+                .file_type()
+                .map(|file_type| file_type.is_file())
+                .unwrap_or(false);
+            if !is_file {
+                continue;
+            }
+            let path = entry.path();
+            let relative_path = match path.strip_prefix(root_path) {
+                Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+                Err(_) => continue,
+            };
+            if let Some(prefix) = &path_prefix {
+                let matches_prefix = relative_path == *prefix
+                    || relative_path.starts_with(&format!("{prefix}/"));
+                if !matches_prefix {
+                    continue;
+                }
+            }
+
+            let mut collector = SearchMatchCollector::new(&matcher);
+            if searcher
+                .search_path(&matcher, path, &mut collector)
+                .is_err()
+            {
+                continue;
+            }
+            if collector.matches.is_empty() {
+                continue;
+            }
+
+            summary.total_files += 1;
+            summary.total_matches += collector.matches.len() as u32;
+            let file_result = ProjectSearchFileResult {
+                path: ProjectPath {
+                    root: root.clone(),
+                    relative_path,
+                },
+                matches: collector.matches,
+                truncated: collector.truncated,
+            };
+            if !emit(file_result) {
+                summary.cancelled = true;
+                break 'outer;
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+/// `grep` sink that records each matching line along with the byte ranges of
+/// the matches *within the exact text we send to the client*.
+struct SearchMatchCollector<'matcher> {
+    matcher: &'matcher grep_regex::RegexMatcher,
+    matches: Vec<ProjectSearchMatch>,
+    truncated: bool,
+}
+
+impl<'matcher> SearchMatchCollector<'matcher> {
+    fn new(matcher: &'matcher grep_regex::RegexMatcher) -> Self {
+        Self {
+            matcher,
+            matches: Vec::new(),
+            truncated: false,
+        }
+    }
+}
+
+impl grep_searcher::Sink for SearchMatchCollector<'_> {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        mat: &grep_searcher::SinkMatch<'_>,
+    ) -> Result<bool, std::io::Error> {
+        use grep_matcher::Matcher;
+
+        if self.matches.len() >= MAX_MATCHES_PER_FILE {
+            self.truncated = true;
+            return Ok(false);
+        }
+
+        let line_number = mat.line_number().unwrap_or(0) as u32;
+        let mut raw = mat.bytes();
+        if let Some(stripped) = raw.strip_suffix(b"\n") {
+            raw = stripped;
+        }
+        if let Some(stripped) = raw.strip_suffix(b"\r") {
+            raw = stripped;
+        }
+        // Send the line as lossy UTF-8, then compute match ranges against the
+        // bytes we actually send so client-side slicing is always consistent.
+        let line_text = truncate_to_bytes(&String::from_utf8_lossy(raw), MAX_SEARCH_LINE_BYTES);
+        let mut ranges = Vec::new();
+        self.matcher
+            .find_iter(line_text.as_bytes(), |found| {
+                ranges.push((found.start() as u32, found.end() as u32));
+                true
+            })
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
+
+        self.matches.push(ProjectSearchMatch {
+            line_number,
+            line_text,
+            ranges,
+        });
+        Ok(true)
+    }
+}
+
+/// Truncate a string to at most `max_bytes` bytes without splitting a `char`.
+fn truncate_to_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 pub(crate) fn read_diff(
@@ -2483,5 +2736,355 @@ new mode 100755\n";
                 "src/lib.rs".to_owned(),
             ]
         );
+    }
+
+    // ── Project global search ─────────────────────────────────────────────
+
+    use protocol::ProjectSearchPayload;
+
+    fn search_payload(query: &str) -> ProjectSearchPayload {
+        ProjectSearchPayload {
+            search_id: 1,
+            query: query.to_owned(),
+            case_sensitive: false,
+            whole_word: false,
+            use_regex: false,
+            include_ignored: false,
+            roots: Vec::new(),
+            path_prefix: None,
+            max_results: None,
+        }
+    }
+
+    fn run_search(
+        project: &Project,
+        payload: &ProjectSearchPayload,
+    ) -> (Vec<ProjectSearchFileResult>, SearchSummary) {
+        let mut files = Vec::new();
+        let summary = search_project(
+            project,
+            payload,
+            |file| {
+                files.push(file);
+                true
+            },
+            || false,
+        )
+        .expect("search should succeed");
+        files.sort_by(|a, b| a.path.relative_path.cmp(&b.path.relative_path));
+        (files, summary)
+    }
+
+    fn write_file(root: &Path, relative: &str, contents: &[u8]) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        fs::write(path, contents).expect("write file");
+    }
+
+    #[test]
+    fn search_finds_literal_matches_across_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_file(root, "a.txt", b"hello needle world\nno match here\n");
+        write_file(root, "nested/b.txt", b"needle at start\nanother needle\n");
+        write_file(root, "c.txt", b"nothing relevant\n");
+        let project = test_project(root.to_str().unwrap());
+
+        let (files, summary) = run_search(&project, &search_payload("needle"));
+
+        assert_eq!(files.len(), 2, "two files should match");
+        assert_eq!(summary.total_files, 2);
+        assert_eq!(summary.total_matches, 3);
+        assert!(!summary.truncated);
+        assert!(!summary.cancelled);
+        let a = files
+            .iter()
+            .find(|f| f.path.relative_path == "a.txt")
+            .unwrap();
+        assert_eq!(a.matches.len(), 1);
+        assert_eq!(a.matches[0].line_number, 1);
+        assert_eq!(a.matches[0].ranges, vec![(6, 12)]);
+        assert_eq!(&a.matches[0].line_text[6..12], "needle");
+    }
+
+    #[test]
+    fn search_respects_gitignore_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_file(root, ".gitignore", b"ignored.txt\nbuild/\n");
+        write_file(root, "ignored.txt", b"needle here\n");
+        write_file(root, "build/out.txt", b"needle here too\n");
+        write_file(root, "kept.txt", b"needle kept\n");
+        let project = test_project(root.to_str().unwrap());
+
+        let (files, summary) = run_search(&project, &search_payload("needle"));
+
+        assert_eq!(summary.total_files, 1);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path.relative_path, "kept.txt");
+    }
+
+    #[test]
+    fn search_include_ignored_overrides_gitignore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_file(root, ".gitignore", b"ignored.txt\n");
+        write_file(root, "ignored.txt", b"needle here\n");
+        write_file(root, "kept.txt", b"needle kept\n");
+        let project = test_project(root.to_str().unwrap());
+
+        let mut payload = search_payload("needle");
+        payload.include_ignored = true;
+        let (files, summary) = run_search(&project, &payload);
+
+        assert_eq!(summary.total_files, 2, "ignored file now included");
+        let names: Vec<_> = files.iter().map(|f| f.path.relative_path.clone()).collect();
+        assert!(names.contains(&"ignored.txt".to_owned()));
+        assert!(names.contains(&"kept.txt".to_owned()));
+    }
+
+    #[test]
+    fn search_skips_git_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // include_ignored would otherwise walk hidden dirs; .git must still skip.
+        write_file(root, ".git/config", b"needle in git internals\n");
+        write_file(root, "real.txt", b"needle in real file\n");
+        let project = test_project(root.to_str().unwrap());
+
+        let mut payload = search_payload("needle");
+        payload.include_ignored = true;
+        let (files, summary) = run_search(&project, &payload);
+
+        assert_eq!(summary.total_files, 1);
+        assert_eq!(files[0].path.relative_path, "real.txt");
+    }
+
+    #[test]
+    fn search_skips_binary_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // NUL byte up front: binary detection quits before any match.
+        write_file(root, "bin.dat", b"\x00needle inside binary\n");
+        write_file(root, "text.txt", b"needle inside text\n");
+        let project = test_project(root.to_str().unwrap());
+
+        let (files, summary) = run_search(&project, &search_payload("needle"));
+
+        assert_eq!(summary.total_files, 1);
+        assert_eq!(files[0].path.relative_path, "text.txt");
+    }
+
+    #[test]
+    fn search_literal_does_not_treat_query_as_regex() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_file(root, "a.txt", b"value a.b matched\nvalue axb not literal\n");
+        let project = test_project(root.to_str().unwrap());
+
+        // "a.b" as a literal must NOT match "axb".
+        let (files, _) = run_search(&project, &search_payload("a.b"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].matches.len(), 1);
+        assert_eq!(files[0].matches[0].line_number, 1);
+    }
+
+    #[test]
+    fn search_regex_mode_matches_pattern() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_file(root, "a.txt", b"foo123bar\nfooXbar\n");
+        let project = test_project(root.to_str().unwrap());
+
+        let mut payload = search_payload(r"foo\d+bar");
+        payload.use_regex = true;
+        let (files, _) = run_search(&project, &payload);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].matches.len(), 1);
+        assert_eq!(files[0].matches[0].line_number, 1);
+        assert_eq!(files[0].matches[0].ranges, vec![(0, 9)]);
+    }
+
+    #[test]
+    fn search_case_sensitive_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_file(root, "a.txt", b"Needle\nneedle\nNEEDLE\n");
+        let project = test_project(root.to_str().unwrap());
+
+        // Default (case-insensitive) matches all three.
+        let (files, _) = run_search(&project, &search_payload("needle"));
+        assert_eq!(files[0].matches.len(), 3);
+
+        // Case-sensitive matches only the exact-case line.
+        let mut payload = search_payload("needle");
+        payload.case_sensitive = true;
+        let (files, _) = run_search(&project, &payload);
+        assert_eq!(files[0].matches.len(), 1);
+        assert_eq!(files[0].matches[0].line_number, 2);
+    }
+
+    #[test]
+    fn search_whole_word_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_file(root, "a.txt", b"cat\ncategory\nscatter\na cat sat\n");
+        let project = test_project(root.to_str().unwrap());
+
+        let mut payload = search_payload("cat");
+        payload.whole_word = true;
+        let (files, _) = run_search(&project, &payload);
+        // Lines 1 ("cat") and 4 ("a cat sat") have the whole word; 2 and 3 do not.
+        let lines: Vec<u32> = files[0].matches.iter().map(|m| m.line_number).collect();
+        assert_eq!(lines, vec![1, 4]);
+    }
+
+    #[test]
+    fn search_invalid_regex_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_file(root, "a.txt", b"anything\n");
+        let project = test_project(root.to_str().unwrap());
+
+        let mut payload = search_payload("(unclosed");
+        payload.use_regex = true;
+        let result = search_project(&project, &payload, |_| true, || false);
+        assert!(result.is_err(), "invalid regex should error");
+    }
+
+    #[test]
+    fn search_empty_query_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = test_project(dir.path().to_str().unwrap());
+        let result = search_project(&project, &search_payload(""), |_| true, || false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn search_ranges_are_byte_offsets_for_multibyte_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // "café — needle here" : the em dash and é are multibyte.
+        write_file(root, "a.txt", "café — needle here\n".as_bytes());
+        let project = test_project(root.to_str().unwrap());
+
+        let (files, _) = run_search(&project, &search_payload("needle"));
+        let m = &files[0].matches[0];
+        let (start, end) = m.ranges[0];
+        // Slicing the SAME bytes the server sent must yield the query.
+        assert_eq!(&m.line_text[start as usize..end as usize], "needle");
+        // "café — " is 4 chars 'c','a','f','é'(2 bytes) + space + em-dash(3 bytes)
+        // + space = 5 + 2 + 1 + 3 + 1 = wait compute: c a f =3, é=2 →5, space=1→6,
+        // em dash=3→9, space=1→10. So needle starts at byte 10.
+        assert_eq!(start, 10);
+    }
+
+    #[test]
+    fn search_enforces_max_results_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for i in 0..10 {
+            write_file(root, &format!("f{i}.txt"), b"needle\n");
+        }
+        let project = test_project(root.to_str().unwrap());
+
+        let mut payload = search_payload("needle");
+        payload.max_results = Some(3);
+        let (files, summary) = run_search(&project, &payload);
+        assert_eq!(files.len(), 3);
+        assert_eq!(summary.total_files, 3);
+        assert!(summary.truncated, "hitting the file cap marks truncated");
+    }
+
+    #[test]
+    fn search_path_prefix_scopes_to_folder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        write_file(root, "src/a.txt", b"needle\n");
+        write_file(root, "src/sub/b.txt", b"needle\n");
+        write_file(root, "docs/c.txt", b"needle\n");
+        let project = test_project(root.to_str().unwrap());
+
+        let mut payload = search_payload("needle");
+        payload.path_prefix = Some("src".to_owned());
+        let (files, summary) = run_search(&project, &payload);
+        assert_eq!(summary.total_files, 2);
+        let names: Vec<_> = files.iter().map(|f| f.path.relative_path.clone()).collect();
+        assert_eq!(names, vec!["src/a.txt".to_owned(), "src/sub/b.txt".to_owned()]);
+    }
+
+    #[test]
+    fn search_multi_root_attributes_paths_to_correct_root() {
+        let dir_a = tempfile::tempdir().expect("tempdir a");
+        let dir_b = tempfile::tempdir().expect("tempdir b");
+        write_file(dir_a.path(), "a.txt", b"needle\n");
+        write_file(dir_b.path(), "b.txt", b"needle\n");
+        let project = Project {
+            id: ProjectId("multi".to_owned()),
+            name: "Multi".to_owned(),
+            sort_order: 0,
+            source: ProjectSource::Standalone {
+                roots: vec![
+                    ProjectRootPath(dir_a.path().to_str().unwrap().to_owned()),
+                    ProjectRootPath(dir_b.path().to_str().unwrap().to_owned()),
+                ],
+            },
+        };
+
+        // No roots filter → both roots searched.
+        let (files, summary) = run_search(&project, &search_payload("needle"));
+        assert_eq!(summary.total_files, 2);
+        for file in &files {
+            let expected_root = if file.path.relative_path == "a.txt" {
+                dir_a.path().to_str().unwrap()
+            } else {
+                dir_b.path().to_str().unwrap()
+            };
+            assert_eq!(file.path.root.0, expected_root);
+        }
+
+        // Restrict to only the second root.
+        let mut payload = search_payload("needle");
+        payload.roots = vec![ProjectRootPath(dir_b.path().to_str().unwrap().to_owned())];
+        let (files, summary) = run_search(&project, &payload);
+        assert_eq!(summary.total_files, 1);
+        assert_eq!(files[0].path.relative_path, "b.txt");
+    }
+
+    #[test]
+    fn search_rejects_root_outside_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = test_project(dir.path().to_str().unwrap());
+        let mut payload = search_payload("needle");
+        payload.roots = vec![ProjectRootPath("/not/in/project".to_owned())];
+        let result = search_project(&project, &payload, |_| true, || false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn search_cancellation_stops_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for i in 0..5 {
+            write_file(root, &format!("f{i}.txt"), b"needle\n");
+        }
+        let project = test_project(root.to_str().unwrap());
+
+        // cancelled() returns true immediately → no files emitted.
+        let mut files = Vec::new();
+        let summary = search_project(
+            &project,
+            &search_payload("needle"),
+            |file| {
+                files.push(file);
+                true
+            },
+            || true,
+        )
+        .expect("search ok");
+        assert!(summary.cancelled);
+        assert_eq!(files.len(), 0);
     }
 }

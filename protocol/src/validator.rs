@@ -19,7 +19,8 @@ use crate::{
     NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
     ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
     ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectNotifyPayload,
-    ProjectRenamePayload, ProjectReorderPayload, ReviewEventPayload, RunBackendSetupPayload,
+    ProjectRenamePayload, ProjectReorderPayload, ProjectSearchCompletePayload,
+    ProjectSearchResultsPayload, ReviewEventPayload, RunBackendSetupPayload,
     SessionListPayload, SessionSchemasPayload, SetSettingPayload, SkillNotifyPayload,
     SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
     SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
@@ -712,6 +713,18 @@ impl ProtocolValidator {
                 envelope,
                 "ProjectGitDiff",
             ),
+            FrameKind::ProjectSearchResults => parse_stream_payload::<ProjectSearchResultsPayload>(
+                &self.recent,
+                envelope,
+                "ProjectSearchResults",
+            ),
+            FrameKind::ProjectSearchComplete => {
+                parse_stream_payload::<ProjectSearchCompletePayload>(
+                    &self.recent,
+                    envelope,
+                    "ProjectSearchComplete",
+                )
+            }
             FrameKind::ProjectEvent => {
                 parse_stream_payload::<ProjectEventPayload>(&self.recent, envelope, "ProjectEvent")
             }

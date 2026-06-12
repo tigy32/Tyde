@@ -334,7 +334,11 @@ pub fn FindBar() -> impl IntoView {
 /// `<span class="find-inline-match">`. Used by diff line rendering; file
 /// view relies on line-level highlighting only (because highlight.js owns
 /// the inline DOM).
-pub fn render_text_with_highlights(text: &str, ranges: &[(usize, usize)]) -> impl IntoView {
+// `use<>` precise-capture: the body fully owns its output (`.into_any()` over
+// `to_owned()` slices), so the returned view borrows nothing from `text` /
+// `ranges`. The annotation lets callers (e.g. the search panel) embed the view
+// in a `'static` context instead of being pinned to the argument lifetimes.
+pub fn render_text_with_highlights(text: &str, ranges: &[(usize, usize)]) -> impl IntoView + use<> {
     if ranges.is_empty() {
         return view! { <span class="diff-text">{text.to_owned()}</span> }.into_any();
     }

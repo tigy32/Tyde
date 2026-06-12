@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,10 @@ use protocol::{
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
     ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
-    ProjectSource, ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
+    ProjectSearchCancelPayload, ProjectSearchCompletePayload, ProjectSearchFileResult,
+    ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
+    ProjectStageHunkPayload,
+    ProjectUnstageFilePayload,
     ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection, ReviewId, ReviewSubmitTarget,
     RunBackendSetupPayload, SendMessagePayload, SessionId, SessionListPayload, SessionSchemaEntry,
     SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload, Skill, SkillNotifyPayload,
@@ -70,8 +74,8 @@ use crate::mobile_access::{
 };
 use crate::project_stream::{
     ProjectDiffRequestKey, ProjectStreamHandle, ProjectStreamSubscription, build_dir_listing,
-    commit, discard_file, is_not_git_repository_error, read_diff, read_file,
-    spawn_project_subscription, stage_file, stage_hunk, unstage_file,
+    SearchSummary, commit, discard_file, is_not_git_repository_error, read_diff, read_file,
+    search_project, spawn_project_subscription, stage_file, stage_hunk, unstage_file,
 };
 use crate::review::actor::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
 use crate::review::reviewer::{
@@ -203,6 +207,11 @@ pub(crate) struct HostState {
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
     browse_streams: HashMap<(StreamPath, StreamPath), Stream>,
     workbench_parent_locks: HashMap<ProjectId, Weak<Mutex<()>>>,
+    /// Per-project "active search id". Each project-wide search stores its
+    /// `search_id` here before spawning its walk; the walk polls this atomic
+    /// and aborts as soon as the value no longer matches (a superseding search
+    /// or an explicit cancel changed it).
+    project_search_ids: HashMap<ProjectId, Arc<AtomicU64>>,
     /// Workbench projects currently being removed. Removal validates
     /// blockers against a snapshot and then runs slow git subprocesses
     /// outside the state lock; agent spawns and terminal creation check
@@ -5012,6 +5021,108 @@ impl HostHandle {
         Ok(())
     }
 
+    /// Run a project-wide text search. The walk is offloaded to a blocking
+    /// task that streams one `ProjectSearchResults` frame per matching file and
+    /// a final `ProjectSearchComplete` frame, so the serial connection loop is
+    /// never blocked. A newer search (or a matching cancel) for the same
+    /// project supersedes any in-flight walk.
+    pub(crate) async fn search_project_files(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+        project_id: ProjectId,
+        payload: ProjectSearchPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_search";
+        self.ensure_host_project_subscription(
+            connection_host_stream,
+            project_output_stream,
+            project_id.clone(),
+            OPERATION,
+        )
+        .await?;
+        let project_store = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.project_store)
+        };
+        let project = load_project(&project_store, &project_id, OPERATION).await?;
+
+        // Register this search as the active one for the project and grab the
+        // shared atomic the walk will poll for cancellation.
+        let search_id = payload.search_id;
+        let active = {
+            let mut state = self.state.lock().await;
+            let slot = state
+                .project_search_ids
+                .entry(project_id.clone())
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+            slot.store(search_id, Ordering::SeqCst);
+            Arc::clone(slot)
+        };
+
+        let output = project_output_stream.clone();
+        tokio::task::spawn_blocking(move || {
+            let cancelled = {
+                let active = Arc::clone(&active);
+                move || active.load(Ordering::SeqCst) != search_id
+            };
+            let emit = |file: ProjectSearchFileResult| -> bool {
+                match serde_json::to_value(&ProjectSearchResultsPayload { search_id, file }) {
+                    Ok(value) => output
+                        .send_value(FrameKind::ProjectSearchResults, value)
+                        .is_ok(),
+                    Err(_) => false,
+                }
+            };
+
+            let (summary, error) = match search_project(&project, &payload, emit, cancelled) {
+                Ok(summary) => (summary, None),
+                Err(message) => (SearchSummary::default(), Some(message)),
+            };
+
+            // Suppress the terminal frame if this search was superseded — the
+            // newer search owns the stream now.
+            if active.load(Ordering::SeqCst) != search_id {
+                return;
+            }
+
+            let complete = ProjectSearchCompletePayload {
+                search_id,
+                total_files: summary.total_files,
+                total_matches: summary.total_matches,
+                truncated: summary.truncated,
+                cancelled: summary.cancelled,
+                error,
+            };
+            if let Ok(value) = serde_json::to_value(&complete) {
+                let _ = output.send_value(FrameKind::ProjectSearchComplete, value);
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Cancel an in-flight project search if `search_id` is still the active
+    /// one for the project. Newer searches are left untouched.
+    pub(crate) async fn cancel_project_search(
+        &self,
+        project_id: ProjectId,
+        payload: ProjectSearchCancelPayload,
+    ) -> AppResult<()> {
+        let state = self.state.lock().await;
+        if let Some(slot) = state.project_search_ids.get(&project_id) {
+            // Only clear if it still points at the search being cancelled, so a
+            // newer search that already replaced it keeps running.
+            let _ = slot.compare_exchange(
+                payload.search_id,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) async fn list_project_dir(
         &self,
         connection_host_stream: &StreamPath,
@@ -6823,6 +6934,7 @@ fn spawn_host_inner(
             terminal_streams: HashMap::new(),
             browse_streams: HashMap::new(),
             workbench_parent_locks: HashMap::new(),
+            project_search_ids: HashMap::new(),
             removing_projects: HashSet::new(),
         })),
     };

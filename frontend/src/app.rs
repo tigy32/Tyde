@@ -129,6 +129,10 @@ fn install_keydown_listener(state: AppState) {
         };
         let ctrl_or_meta = ev.ctrl_key() || ev.meta_key();
         match ev.key().as_str() {
+            key if ctrl_or_meta && ev.shift_key() && key.eq_ignore_ascii_case("f") => {
+                ev.prevent_default();
+                crate::actions::open_search_panel(&state);
+            }
             "k" if ctrl_or_meta => {
                 ev.prevent_default();
                 state.command_palette_open.update(|v| *v = !*v);

@@ -384,12 +384,28 @@ fn render_nodes(
                     };
                     let root_for_click = root.clone();
                     let root_for_children = root.clone();
+                    let root_for_ctx = root.clone();
+                    let dir_path_for_ctx = dir_path.clone();
 
                     view! {
                         <div class="fe-dir-group">
                             <button
                                 class="fe-item fe-dir"
                                 style=format!("padding-left: {}px", indent + 4)
+                                title="Right-click to search in this folder"
+                                on:contextmenu={
+                                    let root = root_for_ctx.clone();
+                                    let dir_path = dir_path_for_ctx.clone();
+                                    move |ev: web_sys::MouseEvent| {
+                                        ev.prevent_default();
+                                        let state = expect_context::<AppState>();
+                                        crate::actions::search_in_folder(
+                                            &state,
+                                            root.clone(),
+                                            dir_path.clone(),
+                                        );
+                                    }
+                                }
                                 on:click={
                                     let dir_path = dir_path.clone();
                                     let root = root_for_click.clone();

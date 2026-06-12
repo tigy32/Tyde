@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -491,6 +491,8 @@ pub enum FrameKind {
     TeamDraftDiscard,
     ProjectReadDiff,
     ProjectReadFile,
+    ProjectSearch,
+    ProjectSearchCancel,
     ProjectStageFile,
     ProjectStageHunk,
     ProjectUnstageFile,
@@ -545,6 +547,8 @@ pub enum FrameKind {
     ProjectFileList,
     ProjectGitStatus,
     ProjectFileContents,
+    ProjectSearchResults,
+    ProjectSearchComplete,
     ProjectGitDiff,
     ProjectGitCommitResult,
     NewTerminal,
@@ -619,6 +623,8 @@ impl fmt::Display for FrameKind {
             Self::TeamDraftDiscard => f.write_str("team_draft_discard"),
             Self::ProjectReadDiff => f.write_str("project_read_diff"),
             Self::ProjectReadFile => f.write_str("project_read_file"),
+            Self::ProjectSearch => f.write_str("project_search"),
+            Self::ProjectSearchCancel => f.write_str("project_search_cancel"),
             Self::ProjectStageFile => f.write_str("project_stage_file"),
             Self::ProjectStageHunk => f.write_str("project_stage_hunk"),
             Self::ProjectUnstageFile => f.write_str("project_unstage_file"),
@@ -671,6 +677,8 @@ impl fmt::Display for FrameKind {
             Self::ProjectFileList => f.write_str("project_file_list"),
             Self::ProjectGitStatus => f.write_str("project_git_status"),
             Self::ProjectFileContents => f.write_str("project_file_contents"),
+            Self::ProjectSearchResults => f.write_str("project_search_results"),
+            Self::ProjectSearchComplete => f.write_str("project_search_complete"),
             Self::ProjectGitDiff => f.write_str("project_git_diff"),
             Self::ProjectGitCommitResult => f.write_str("project_git_commit_result"),
             Self::NewTerminal => f.write_str("new_terminal"),
@@ -2316,6 +2324,83 @@ pub struct ProjectFileContentsPayload {
     pub is_binary: bool,
 }
 
+// ── Project global search ─────────────────────────────────────────────────
+
+/// Client → Server request to run a project-wide text search. Results stream
+/// back as one [`ProjectSearchResultsPayload`] per matching file, terminated
+/// by a single [`ProjectSearchCompletePayload`]. Searches are identified by a
+/// client-chosen, monotonically increasing `search_id`; a newer search (or a
+/// matching [`ProjectSearchCancelPayload`]) supersedes any in-flight walk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSearchPayload {
+    pub search_id: u64,
+    pub query: String,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub whole_word: bool,
+    #[serde(default)]
+    pub use_regex: bool,
+    /// When true, gitignored / hidden files are also searched.
+    #[serde(default)]
+    pub include_ignored: bool,
+    /// Roots to search. Empty means "all of the project's roots".
+    #[serde(default)]
+    pub roots: Vec<ProjectRootPath>,
+    /// Optional relative-path prefix used to scope the search to a folder
+    /// (the "search in folder" action). Matched against the root-relative
+    /// path of each file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    /// Optional override for the maximum number of matching files to return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSearchCancelPayload {
+    pub search_id: u64,
+}
+
+/// A single matching line within a file. `ranges` are byte offsets into
+/// `line_text` (which the server sends verbatim) so the client can slice the
+/// exact same bytes when highlighting — no UTF-8/UTF-16 mismatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSearchMatch {
+    /// 1-based line number.
+    pub line_number: u32,
+    pub line_text: String,
+    pub ranges: Vec<(u32, u32)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSearchFileResult {
+    pub path: ProjectPath,
+    pub matches: Vec<ProjectSearchMatch>,
+    /// True when the per-file match cap was hit and some matches were dropped.
+    pub truncated: bool,
+}
+
+/// Server → Client: one matching file's results. Streamed incrementally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSearchResultsPayload {
+    pub search_id: u64,
+    pub file: ProjectSearchFileResult,
+}
+
+/// Server → Client: terminal frame for a search. Carries the final totals and
+/// whether the walk was truncated (caps hit), cancelled, or errored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSearchCompletePayload {
+    pub search_id: u64,
+    pub total_files: u32,
+    pub total_matches: u32,
+    pub truncated: bool,
+    pub cancelled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectGitDiffPayload {
     pub root: ProjectRootPath,
@@ -3394,5 +3479,121 @@ impl SeqValidator {
         }
         self.expected.insert(stream.clone(), expected + 1);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod search_serde_tests {
+    use super::*;
+
+    fn round_trip<T>(value: &T) -> T
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        let json = serde_json::to_string(value).expect("serialize");
+        serde_json::from_str(&json).expect("deserialize")
+    }
+
+    #[test]
+    fn protocol_version_is_twelve() {
+        assert_eq!(PROTOCOL_VERSION, 12);
+    }
+
+    #[test]
+    fn search_frame_kinds_display_snake_case() {
+        assert_eq!(FrameKind::ProjectSearch.to_string(), "project_search");
+        assert_eq!(
+            FrameKind::ProjectSearchCancel.to_string(),
+            "project_search_cancel"
+        );
+        assert_eq!(
+            FrameKind::ProjectSearchResults.to_string(),
+            "project_search_results"
+        );
+        assert_eq!(
+            FrameKind::ProjectSearchComplete.to_string(),
+            "project_search_complete"
+        );
+    }
+
+    #[test]
+    fn project_search_payload_round_trip() {
+        let payload = ProjectSearchPayload {
+            search_id: 7,
+            query: "needle".to_owned(),
+            case_sensitive: true,
+            whole_word: true,
+            use_regex: false,
+            include_ignored: true,
+            roots: vec![
+                ProjectRootPath("/a".to_owned()),
+                ProjectRootPath("/b".to_owned()),
+            ],
+            path_prefix: Some("src/".to_owned()),
+            max_results: Some(500),
+        };
+        assert_eq!(round_trip(&payload), payload);
+    }
+
+    #[test]
+    fn project_search_payload_defaults_deserialize() {
+        // Minimal payload: only the required fields. Booleans/roots default.
+        let payload: ProjectSearchPayload =
+            serde_json::from_str(r#"{"search_id":1,"query":"x"}"#).expect("deserialize");
+        assert_eq!(payload.search_id, 1);
+        assert_eq!(payload.query, "x");
+        assert!(!payload.case_sensitive);
+        assert!(!payload.whole_word);
+        assert!(!payload.use_regex);
+        assert!(!payload.include_ignored);
+        assert!(payload.roots.is_empty());
+        assert_eq!(payload.path_prefix, None);
+        assert_eq!(payload.max_results, None);
+    }
+
+    #[test]
+    fn project_search_results_payload_round_trip() {
+        let payload = ProjectSearchResultsPayload {
+            search_id: 3,
+            file: ProjectSearchFileResult {
+                path: ProjectPath {
+                    root: ProjectRootPath("/repo".to_owned()),
+                    relative_path: "src/main.rs".to_owned(),
+                },
+                matches: vec![
+                    ProjectSearchMatch {
+                        line_number: 12,
+                        line_text: "let café = needle;".to_owned(),
+                        ranges: vec![(11, 17)],
+                    },
+                    ProjectSearchMatch {
+                        line_number: 40,
+                        line_text: "another needle here".to_owned(),
+                        ranges: vec![(8, 14)],
+                    },
+                ],
+                truncated: true,
+            },
+        };
+        assert_eq!(round_trip(&payload), payload);
+    }
+
+    #[test]
+    fn project_search_complete_round_trip() {
+        let payload = ProjectSearchCompletePayload {
+            search_id: 9,
+            total_files: 4,
+            total_matches: 17,
+            truncated: false,
+            cancelled: true,
+            error: Some("boom".to_owned()),
+        };
+        assert_eq!(round_trip(&payload), payload);
+    }
+
+    #[test]
+    fn project_search_cancel_round_trip() {
+        let payload = ProjectSearchCancelPayload { search_id: 42 };
+        assert_eq!(round_trip(&payload), payload);
     }
 }

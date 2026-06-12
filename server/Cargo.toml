@@ -18,7 +18,12 @@ mqtt-transport = { path = "../mqtt-transport" }
 axum = "0.8"
 base64 = "0.22"
 command-group = { version = "5", features = ["with-tokio"] }
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
 indexmap = "2"
+regex = "1"
 notify = "8"
 portable-pty = "0.8"
 rmcp = { version = "0.15.0", default-features = false, features = ["macros", "schemars", "server", "transport-streamable-http-server"] }

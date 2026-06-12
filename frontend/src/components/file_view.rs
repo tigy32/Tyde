@@ -372,6 +372,48 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
         }
     });
 
+    // ── Open-at-line (from project search) ─────────────────────────────
+    // `pending_line` holds the 1-based target line for THIS file. It is
+    // seeded from the global `pending_goto_line` request and consumed by the
+    // scroll Effect below, which re-runs when `line_height` is measured so the
+    // scroll seeded from the estimate is corrected to the real geometry.
+    let pending_line: RwSignal<Option<u32>> = RwSignal::new(None);
+
+    // Bridge the global goto request to this file. Runs at mount (reads the
+    // current request) and whenever a new request arrives — covering both a
+    // freshly-opened file and an already-open tab being re-targeted.
+    let goto_path = f.path.clone();
+    let state_for_goto = state.clone();
+    Effect::new(move |_| {
+        if let Some((target_path, line)) = state_for_goto.pending_goto_line.get()
+            && target_path == goto_path
+        {
+            pending_line.set(Some(line));
+            state_for_goto.pending_goto_line.set(None);
+        }
+    });
+
+    // Apply the scroll. Subscribes to `pending_line`, `line_height`, and the
+    // element ref so it re-snaps once the real line height is known. It does
+    // NOT read `scroll_top`, so the user can freely scroll afterwards without
+    // this Effect fighting them.
+    let pre_ref_for_goto = pre_ref;
+    let state_for_goto_scroll = state.clone();
+    Effect::new(move |_| {
+        let Some(line) = pending_line.get() else {
+            return;
+        };
+        let lh = line_height.get();
+        let Some(el) = pre_ref_for_goto.get() else {
+            return;
+        };
+        let target = (line.saturating_sub(1) as f64) * lh;
+        el.set_scroll_top(target as i32);
+        scroll_top.set(el.scroll_top() as f64);
+        let element: web_sys::Element = el.clone().unchecked_into();
+        state_for_goto_scroll.save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
+    });
+
     // Write the native scrollTop straight into the signal. Leptos
     // batches reactive updates within the same task, so a burst of
     // native scroll events still only re-renders the visible window
@@ -1052,6 +1094,103 @@ mod wasm_tests {
             "scroll geometry is wrong: scroll_height={scroll_height:.0}px, \
              expected≈{expected_total:.0}px (row_height={row_height:.1}px × \
              {total_lines} lines), ratio={ratio:.3}"
+        );
+    }
+
+    /// The open-at-line path (from project search): a `pending_goto_line`
+    /// request set before the file view mounts must seed the virtualization
+    /// scroll so the target line's window renders on the *first* paint, even
+    /// before the measurement Effect refines the geometry. This is the
+    /// behaviour that makes "click a search result deep in a big file" land on
+    /// the right line instead of the top.
+    #[wasm_bindgen_test]
+    async fn goto_line_seeds_window_to_target_on_first_paint() {
+        ensure_styles_loaded();
+
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "big.txt".to_owned(),
+        };
+        let total_lines = 5000;
+        let content: String = (0..total_lines)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Target the 1-based line 400 → source index 399 → text "line 399",
+        // far below any window that would render if the scroll stayed at 0.
+        let target_line: u32 = 400;
+        let target_text = format!("line {}", target_line - 1);
+
+        let container = make_container();
+        let mount_path = path.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let file_path = mount_path.clone();
+            state.open_files.update(|files| {
+                files.insert(
+                    file_path.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        contents: Some(content.to_owned()),
+                        is_binary: false,
+                    },
+                );
+            });
+            // Request the goto BEFORE mounting the view.
+            state
+                .pending_goto_line
+                .set(Some((file_path.clone(), target_line)));
+            provide_context(state);
+            view! { <FileView tab_id=TabId(20_004) path=mount_path.clone() /> }
+        });
+
+        next_tick().await;
+
+        // The rendered window must contain the target line on first paint.
+        let rows = container
+            .query_selector_all(".file-view-content > .file-line")
+            .unwrap();
+        let mut texts = Vec::new();
+        for i in 0..rows.length() {
+            if let Some(node) = rows.item(i) {
+                texts.push(node.text_content().unwrap_or_default());
+            }
+        }
+        assert!(
+            texts.iter().any(|t| t == &target_text),
+            "target line {target_line:?} (\"{target_text}\") not in the rendered \
+             window on first paint; rendered first={:?} last={:?} count={}",
+            texts.first(),
+            texts.last(),
+            texts.len(),
+        );
+
+        // And virtualization must still be engaged (we did not render the
+        // whole 5000-line file to get there).
+        assert!(
+            (rows.length() as usize) < total_lines / 4,
+            "virtualization regressed: rendered {} of {total_lines} lines",
+            rows.length()
+        );
+
+        // After geometry is measured the target line stays in view.
+        next_tick().await;
+        let rows_after = container
+            .query_selector_all(".file-view-content > .file-line")
+            .unwrap();
+        let mut still_present = false;
+        for i in 0..rows_after.length() {
+            if let Some(node) = rows_after.item(i)
+                && node.text_content().unwrap_or_default() == target_text
+            {
+                still_present = true;
+                break;
+            }
+        }
+        assert!(
+            still_present,
+            "target line dropped out of the window after measurement"
         );
     }
 }

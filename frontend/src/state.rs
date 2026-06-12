@@ -9,7 +9,8 @@ use protocol::{
     HostBrowseErrorPayload, HostPlatform, HostSettings, McpServerConfig, McpServerId,
     MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload, Project,
     ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath,
-    ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, QueuedMessageEntry, Review,
+    ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, ProjectSearchFileResult,
+    QueuedMessageEntry, Review,
     ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry,
     SessionSettingsValues, SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath,
     TaskList, Team, TeamDraft, TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload,
@@ -339,6 +340,45 @@ impl Default for CenterZoneState {
 pub enum DockVisibility {
     Visible,
     Hidden,
+}
+
+/// Which tab of the left dock is currently shown. Stored in `AppState` (rather
+/// than locally in the dock component) so a keyboard shortcut and the
+/// "search in folder" file-explorer action can switch to the Search tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeftTab {
+    Files,
+    Git,
+    Search,
+}
+
+/// All persistent state for the project-wide search panel. Lives in `AppState`
+/// so streamed results survive the panel being display-toggled (or its dock
+/// being hidden) and so `dispatch` can append incoming result frames.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProjectSearchUiState {
+    pub query: String,
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub use_regex: bool,
+    pub include_ignored: bool,
+    /// When set, the search is scoped to this root-relative folder prefix
+    /// (driven by the "search in folder" action).
+    pub path_prefix: Option<String>,
+    /// When non-empty, only these roots are searched (paired with
+    /// `path_prefix` for "search in folder").
+    pub roots: Vec<ProjectRootPath>,
+    /// The `search_id` of the most recently issued search. Incoming result /
+    /// complete frames are ignored unless they carry this id.
+    pub active_search_id: u64,
+    /// True between issuing a search and receiving its `complete` frame.
+    pub in_flight: bool,
+    /// One entry per matching file, in arrival order.
+    pub results: Vec<ProjectSearchFileResult>,
+    pub total_files: u32,
+    pub total_matches: u32,
+    pub truncated: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -824,6 +864,16 @@ pub struct AppState {
     pub help_tour_step: RwSignal<Option<usize>>,
     pub feedback_open: RwSignal<bool>,
     pub find_bar_open: RwSignal<bool>,
+    /// Which left-dock tab is active (Files / Git / Search).
+    pub left_tab: RwSignal<LeftTab>,
+    /// Persistent state for the project-wide Search panel.
+    pub search_state: RwSignal<ProjectSearchUiState>,
+    /// Bumped to request the Search panel focus (and select) its query input —
+    /// e.g. on the Cmd/Ctrl+Shift+F shortcut or the "search in folder" action.
+    pub search_focus_seq: RwSignal<u32>,
+    /// When set, the file view for this `ProjectPath` should scroll so the
+    /// given 1-based line is visible. Consumed (cleared) by the file view.
+    pub pending_goto_line: RwSignal<Option<(ProjectPath, u32)>>,
     pub host_settings_by_host: RwSignal<HashMap<String, HostSettings>>,
     pub backend_setup_by_host: RwSignal<HashMap<String, Vec<BackendSetupInfo>>>,
     pub agent_message_queue: RwSignal<HashMap<AgentId, Vec<QueuedMessageEntry>>>,
@@ -1075,6 +1125,10 @@ impl AppState {
             help_tour_step: RwSignal::new(None),
             feedback_open: RwSignal::new(false),
             find_bar_open: RwSignal::new(false),
+            left_tab: RwSignal::new(LeftTab::Files),
+            search_state: RwSignal::new(ProjectSearchUiState::default()),
+            search_focus_seq: RwSignal::new(0),
+            pending_goto_line: RwSignal::new(None),
             host_settings_by_host: RwSignal::new(HashMap::new()),
             backend_setup_by_host: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),

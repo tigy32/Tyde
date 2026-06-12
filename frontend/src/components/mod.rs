@@ -20,6 +20,7 @@ pub mod inline_review;
 pub mod project_rail;
 pub mod review_layer;
 pub mod review_view;
+pub mod search_panel;
 pub mod session_settings;
 pub mod sessions_panel;
 pub mod settings_panel;
