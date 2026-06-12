@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,6 +130,12 @@ struct ActiveCompaction {
 #[derive(Default)]
 struct AgentReplayState {
     active_stream: Option<ReplayActiveStream>,
+    /// Position in the event_log of the single retained `ToolProgress`
+    /// envelope per tool_call_id. Progress snapshots are coalesced
+    /// latest-wins (replace in place, preserving seq) so long-running
+    /// background tasks don't bloat the replay log. Safe because the
+    /// event_log is append-only.
+    progress_log_index: HashMap<String, usize>,
 }
 
 impl AgentReplayState {
@@ -2908,7 +2914,17 @@ fn record_chat_event_for_replay(
                 );
             }
             for tool_event in tool_events {
-                push_chat_event_to_replay_log(canonical_stream, event_log, &tool_event);
+                if let ChatEvent::ToolProgress(data) = &tool_event {
+                    coalesce_progress_into_replay_log(
+                        canonical_stream,
+                        event_log,
+                        replay_state,
+                        data.tool_call_id.clone(),
+                        &tool_event,
+                    );
+                } else {
+                    push_chat_event_to_replay_log(canonical_stream, event_log, &tool_event);
+                }
             }
         }
         ChatEvent::MessageMetadataUpdated(update) => {
@@ -2923,6 +2939,29 @@ fn record_chat_event_for_replay(
                 active.tool_events.push(event.clone());
             } else {
                 push_chat_event_to_replay_log(canonical_stream, event_log, event);
+            }
+        }
+        ChatEvent::ToolProgress(data) => {
+            if let Some(active) = replay_state.active_stream.as_mut() {
+                let existing = active.tool_events.iter_mut().find(|buffered| {
+                    matches!(
+                        buffered,
+                        ChatEvent::ToolProgress(p) if p.tool_call_id == data.tool_call_id
+                    )
+                });
+                if let Some(existing) = existing {
+                    *existing = event.clone();
+                } else {
+                    active.tool_events.push(event.clone());
+                }
+            } else {
+                coalesce_progress_into_replay_log(
+                    canonical_stream,
+                    event_log,
+                    replay_state,
+                    data.tool_call_id.clone(),
+                    event,
+                );
             }
         }
         ChatEvent::OperationCancelled(_) => {
@@ -2950,6 +2989,28 @@ fn message_has_renderable_content(message: &ChatMessage, has_tool_events: bool) 
             .as_ref()
             .is_some_and(|images| !images.is_empty())
         || has_tool_events
+}
+
+/// Latest-wins coalescing for `ToolProgress`: at most one envelope per
+/// tool_call_id is retained in the event_log, replaced in place so its
+/// seq (and thus replay ordering relative to the tool's request and
+/// completion) is preserved.
+fn coalesce_progress_into_replay_log(
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+    replay_state: &mut AgentReplayState,
+    tool_call_id: String,
+    event: &ChatEvent,
+) {
+    if let Some(&index) = replay_state.progress_log_index.get(&tool_call_id) {
+        let seq = event_log[index].seq;
+        event_log[index] = replay_envelope(canonical_stream, seq, FrameKind::ChatEvent, event);
+    } else {
+        replay_state
+            .progress_log_index
+            .insert(tool_call_id, event_log.len());
+        push_chat_event_to_replay_log(canonical_stream, event_log, event);
+    }
 }
 
 fn push_chat_event_to_replay_log(
@@ -3622,6 +3683,80 @@ mod tests {
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
             "replay should not include granular stream events after compaction"
         );
+    }
+
+    #[tokio::test]
+    async fn replay_coalesces_tool_progress_latest_wins() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        let progress = |tokens: u64| {
+            ChatEvent::ToolProgress(protocol::ToolProgressData {
+                tool_call_id: "toolu_wf".to_owned(),
+                tool_name: "Workflow".to_owned(),
+                update: protocol::ToolProgressUpdate::Workflow(protocol::WorkflowRunState {
+                    workflow_name: "wfprobe".to_owned(),
+                    description: None,
+                    script: None,
+                    status: protocol::WorkflowRunStatus::Running,
+                    summary: None,
+                    total_tokens: tokens,
+                    tool_uses: 0,
+                    duration_ms: 0,
+                    agents: vec![],
+                }),
+            })
+        };
+
+        // Outside any stream (the common case: workflow progress arrives
+        // between turns), then a later one that must replace it in place.
+        for tokens in [100, 200, 300] {
+            append_chat_event(
+                canonical_stream,
+                &mut event_log,
+                &mut subscribers,
+                &mut replay_state,
+                &progress(tokens),
+            )
+            .await;
+        }
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::TypingStatusChanged(false),
+        )
+        .await;
+
+        let progress_envelopes: Vec<&protocol::Envelope> = event_log
+            .iter()
+            .filter(|envelope| {
+                envelope.kind == FrameKind::ChatEvent
+                    && matches!(
+                        envelope.parse_payload::<ChatEvent>(),
+                        Ok(ChatEvent::ToolProgress(_))
+                    )
+            })
+            .collect();
+        assert_eq!(
+            progress_envelopes.len(),
+            1,
+            "N progress events coalesce to one envelope"
+        );
+        let Ok(ChatEvent::ToolProgress(data)) = progress_envelopes[0].parse_payload::<ChatEvent>()
+        else {
+            panic!("expected ToolProgress payload");
+        };
+        let protocol::ToolProgressUpdate::Workflow(state) = data.update else {
+            panic!("expected Workflow update");
+        };
+        assert_eq!(state.total_tokens, 300, "latest snapshot wins");
+        // Replaced in place: progress keeps its original position before
+        // the later TypingStatusChanged.
+        assert!(progress_envelopes[0].seq < event_log.last().unwrap().seq);
     }
 
     #[tokio::test]

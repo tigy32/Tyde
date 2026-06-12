@@ -75,7 +75,7 @@ pub fn SearchPanel() -> impl IntoView {
 
     let toggle = |state: AppState, mutate: fn(&mut crate::state::ProjectSearchUiState)| {
         move |_| {
-            state.search_state.update(|s| mutate(s));
+            state.search_state.update(mutate);
             start_project_search(&state);
         }
     };
@@ -326,7 +326,10 @@ mod wasm_tests {
 
     fn ensure_styles_loaded() {
         let document = web_sys::window().unwrap().document().unwrap();
-        if document.get_element_by_id("test-prod-styles-search").is_none() {
+        if document
+            .get_element_by_id("test-prod-styles-search")
+            .is_none()
+        {
             let style = document.create_element("style").unwrap();
             style.set_id("test-prod-styles-search");
             style.set_text_content(Some(PROD_STYLES));
@@ -358,7 +361,11 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
-    fn file_result(relative: &str, lines: &[(u32, &str, (u32, u32))], truncated: bool) -> ProjectSearchFileResult {
+    fn file_result(
+        relative: &str,
+        lines: &[(u32, &str, (u32, u32))],
+        truncated: bool,
+    ) -> ProjectSearchFileResult {
         ProjectSearchFileResult {
             path: ProjectPath {
                 root: ProjectRootPath("test-root".to_owned()),
@@ -445,7 +452,10 @@ mod wasm_tests {
 
         // No truncation banner when nothing was truncated.
         assert!(
-            container.query_selector(".search-truncated").unwrap().is_none()
+            container
+                .query_selector(".search-truncated")
+                .unwrap()
+                .is_none()
                 || container
                     .query_selector(".search-truncated")
                     .unwrap()
@@ -518,13 +528,11 @@ mod wasm_tests {
         next_tick().await;
 
         let window = web_sys::window().unwrap();
-        let buttons = container.query_selector_all(".search-toggles button").unwrap();
-        assert_eq!(buttons.length(), 4, "expected four toggle buttons");
-        let case_btn = buttons
-            .item(0)
-            .unwrap()
-            .dyn_into::<HtmlElement>()
+        let buttons = container
+            .query_selector_all(".search-toggles button")
             .unwrap();
+        assert_eq!(buttons.length(), 4, "expected four toggle buttons");
+        let case_btn = buttons.item(0).unwrap().dyn_into::<HtmlElement>().unwrap();
 
         let bg_before = window
             .get_computed_style(&case_btn)
@@ -555,7 +563,11 @@ mod wasm_tests {
         let (container, state) = mount_panel(|state| {
             state.search_state.update(|s| {
                 s.query = "needle".to_owned();
-                s.results = vec![file_result("src/a.rs", &[(42, "the needle", (4, 10))], false)];
+                s.results = vec![file_result(
+                    "src/a.rs",
+                    &[(42, "the needle", (4, 10))],
+                    false,
+                )];
                 s.total_files = 1;
                 s.total_matches = 1;
             });

@@ -20,16 +20,16 @@ use crate::{
     ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
     ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectNotifyPayload,
     ProjectRenamePayload, ProjectReorderPayload, ProjectSearchCompletePayload,
-    ProjectSearchResultsPayload, ReviewEventPayload, RunBackendSetupPayload,
-    SessionListPayload, SessionSchemasPayload, SetSettingPayload, SkillNotifyPayload,
-    SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
-    SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
-    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
-    TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload,
-    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    ProjectSearchResultsPayload, ReviewEventPayload, RunBackendSetupPayload, SessionListPayload,
+    SessionSchemasPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
+    StreamPath, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
+    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
+    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     ToolExecutionCompletedData, ToolRequest, WelcomePayload, WorkbenchCreatePayload,
     WorkbenchRemovePayload,
@@ -1188,6 +1188,20 @@ fn validate_chat_event(
         ChatEvent::ToolExecutionCompleted(data) => {
             validate_tool_execution_completed(recent_frames, envelope, state, data)
         }
+        // Progress is legal at any point relative to its tool call —
+        // background tasks emit progress after the tool result and across
+        // turn boundaries — so the only requirement is a non-empty id.
+        ChatEvent::ToolProgress(data) => {
+            if data.tool_call_id.is_empty() {
+                return Err(build_violation(
+                    recent_frames,
+                    envelope,
+                    Some(state.backend_kind),
+                    "received ToolProgress with empty tool_call_id".to_owned(),
+                ));
+            }
+            Ok(())
+        }
         ChatEvent::OperationCancelled(_) => {
             state
                 .cancelled_tool_calls
@@ -1445,6 +1459,10 @@ fn summarize_chat_event(event: &ChatEvent) -> String {
             "event=tool_request tool_call_id={} tool_name={}",
             data.tool_call_id, data.tool_name
         ),
+        ChatEvent::ToolProgress(data) => format!(
+            "event=tool_progress tool_call_id={} tool_name={}",
+            data.tool_call_id, data.tool_name
+        ),
         ChatEvent::ToolExecutionCompleted(data) => format!(
             "event=tool_execution_completed tool_call_id={} tool_name={} success={}",
             data.tool_call_id, data.tool_name, data.success
@@ -1478,6 +1496,7 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
         ChatEvent::StreamReasoningDelta(_) => "StreamReasoningDelta",
         ChatEvent::StreamEnd(_) => "StreamEnd",
         ChatEvent::ToolRequest(_) => "ToolRequest",
+        ChatEvent::ToolProgress(_) => "ToolProgress",
         ChatEvent::ToolExecutionCompleted(_) => "ToolExecutionCompleted",
         ChatEvent::TaskUpdate(_) => "TaskUpdate",
         ChatEvent::OperationCancelled(_) => "OperationCancelled",

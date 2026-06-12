@@ -837,6 +837,7 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 ChatEvent::MessageAdded(_)
                 | ChatEvent::MessageMetadataUpdated(_)
                 | ChatEvent::ToolRequest(_)
+                | ChatEvent::ToolProgress(_)
                 | ChatEvent::ToolExecutionCompleted(_)
                 | ChatEvent::TaskUpdate(_)
                 | ChatEvent::RetryAttempt(_) => {}

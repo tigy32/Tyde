@@ -13,21 +13,20 @@ use protocol::{
     NewTerminalPayload, ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
     ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectSearchCompletePayload,
-    ProjectSearchResultsPayload, ProtocolValidator,
-    QueuedMessagesPayload, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
-    ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionId,
-    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload,
-    SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
-    TeamMemberId, TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload,
-    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload,
-    TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
-    WelcomePayload,
+    ProjectSearchResultsPayload, ProtocolValidator, QueuedMessagesPayload, RejectPayload,
+    ReviewBootstrapPayload, ReviewCommentSource, ReviewErrorContext, ReviewEventPayload, ReviewId,
+    ReviewSuggestionState, SessionId, SessionListPayload, SessionSchemasPayload,
+    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
+    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
+    TerminalBootstrapPayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
+    TerminalStartPayload, WelcomePayload,
 };
 
 use crate::state::{
     ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry, ConnectionStatus,
     OpenFile, ProjectInfo, ReviewActionTarget, SessionInfo, StreamingState, StreamingToolRequest,
-    TabContent, TerminalInfo, ToolRequestEntry, TransientEvent, reduce_diff_response,
+    TabContent, TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent, reduce_diff_response,
     root_display_name, sort_project_infos,
 };
 
@@ -2651,6 +2650,9 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.chat_tool_rows.update(|map| {
         map.remove(&agent_id);
     });
+    state.tool_progress.update(|map| {
+        map.retain(|(id, _), _| *id != agent_id);
+    });
     state.chat_message_rows.update(|map| {
         map.remove(&agent_id);
     });
@@ -3064,6 +3066,32 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                 agent_id
             );
         }
+        ChatEvent::ToolProgress(data) => {
+            log::trace!(
+                "dispatch chat_event host={} agent_id={} type=tool_progress tool_call_id={} tool_name={}",
+                host_id,
+                agent_id,
+                data.tool_call_id,
+                data.tool_name
+            );
+            // Single store: tool cards and the workflow tab read this map
+            // reactively by (agent, tool_call_id). No row mutation — a
+            // snapshot stored on the entry would freeze inside keyed
+            // `<For>` rows, and progress may arrive before its tool
+            // request or after the turn ends; the map is indifferent to
+            // both.
+            let key = (agent_id, ToolCallId(data.tool_call_id.clone()));
+            let existing = state
+                .tool_progress
+                .with_untracked(|map| map.get(&key).cloned());
+            if let Some(signal) = existing {
+                signal.set(data);
+            } else {
+                state.tool_progress.update(|map| {
+                    map.insert(key, leptos::prelude::ArcRwSignal::new(data));
+                });
+            }
+        }
         ChatEvent::TaskUpdate(task_list) => {
             log::trace!(
                 "dispatch chat_event host={} agent_id={} type=task_update items={}",
@@ -3362,6 +3390,9 @@ fn apply_agent_bootstrap(
     });
     state.chat_tool_rows.update(|map| {
         map.remove(&agent_id);
+    });
+    state.tool_progress.update(|map| {
+        map.retain(|(id, _), _| *id != agent_id);
     });
     state.chat_message_rows.update(|map| {
         map.remove(&agent_id);

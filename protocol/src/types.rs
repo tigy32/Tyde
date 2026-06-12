@@ -3183,6 +3183,14 @@ pub enum ChatEvent {
     StreamReasoningDelta(StreamTextDeltaData),
     StreamEnd(StreamEndData),
     ToolRequest(ToolRequest),
+    /// Live progress for a tool call. Zero or more may arrive for a
+    /// `tool_call_id`, both before and *after* its
+    /// `ToolExecutionCompleted` — background tasks (e.g. Claude Code
+    /// workflows) outlive the tool call that started them, so progress
+    /// keeps flowing after the tool result and across turn boundaries.
+    /// Each event carries a full snapshot, never a delta: consumers keep
+    /// only the latest per `tool_call_id`.
+    ToolProgress(ToolProgressData),
     ToolExecutionCompleted(ToolExecutionCompletedData),
     TaskUpdate(TaskList),
     OperationCancelled(OperationCancelledData),
@@ -3350,6 +3358,94 @@ pub struct AskUserQuestionOption {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolProgressData {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub update: ToolProgressUpdate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolProgressUpdate {
+    SubAgent(SubAgentProgress),
+    Workflow(WorkflowRunState),
+    Other { payload: Value },
+}
+
+/// Live status of a sub-agent spawned by a Task-style tool call,
+/// emitted on the parent agent's stream so the Task tool card can show
+/// activity and link to the sub-agent's own view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubAgentProgress {
+    pub agent_id: AgentId,
+    pub agent_name: String,
+    pub last_tool_name: Option<String>,
+    pub tool_calls: u64,
+    pub completed: bool,
+}
+
+/// Full snapshot of a Claude Code workflow run, reduced server-side
+/// from the CLI's `task_progress` delta frames.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowRunState {
+    pub workflow_name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The workflow script source, from the CLI's `task_started` frame.
+    #[serde(default)]
+    pub script: Option<String>,
+    pub status: WorkflowRunStatus,
+    /// Completion summary, from the CLI's `task_notification` frame.
+    #[serde(default)]
+    pub summary: Option<String>,
+    pub total_tokens: u64,
+    pub tool_uses: u64,
+    pub duration_ms: u64,
+    /// Ordered by `index` (the CLI's per-run agent counter).
+    pub agents: Vec<WorkflowAgentState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRunStatus {
+    Running,
+    Completed,
+    Failed,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowAgentState {
+    pub index: u64,
+    pub label: String,
+    #[serde(default)]
+    pub phase_title: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub state: WorkflowAgentStatus,
+    pub tokens: u64,
+    pub tool_calls: u64,
+    pub duration_ms: u64,
+    pub attempt: u64,
+    #[serde(default)]
+    pub prompt_preview: Option<String>,
+    #[serde(default)]
+    pub result_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowAgentStatus {
+    Queued,
+    Running,
+    Done,
+    Error,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

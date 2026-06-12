@@ -8086,8 +8086,7 @@ for line in sys.stdin:
                     agent_type,
                     agent_id: agent_id.clone(),
                 });
-                let _ = agent_id;
-                SubAgentHandle { event_tx }
+                SubAgentHandle { event_tx, agent_id }
             })
         }
     }

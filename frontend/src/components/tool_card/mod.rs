@@ -15,10 +15,17 @@
 use std::sync::Arc;
 
 use leptos::prelude::*;
-use protocol::{ToolExecutionResult, ToolRequestType};
+use protocol::{
+    SubAgentProgress, ToolExecutionResult, ToolProgressData, ToolProgressUpdate, ToolRequestType,
+    WorkflowRunState, WorkflowRunStatus,
+};
 use wasm_bindgen::JsCast;
 
-use crate::state::{AppState, StreamingToolRequest, ToolOutputMode, ToolRequestEntry};
+use crate::components::workflow_view::{WorkflowRunPanel, run_status_label};
+use crate::state::{
+    ActiveAgentRef, AppState, StreamingToolRequest, TabContent, ToolCallId, ToolOutputMode,
+    ToolRequestEntry,
+};
 
 mod ask_user_question;
 mod error_result;
@@ -38,7 +45,10 @@ const TOOL_LIST_TAIL_COUNT: usize = 32;
 pub(crate) mod test_utils;
 
 #[component]
-pub fn ToolCardListView(entries: Vec<ToolRequestEntry>) -> impl IntoView {
+pub fn ToolCardListView(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    entries: Vec<ToolRequestEntry>,
+) -> impl IntoView {
     let entries = Arc::new(entries);
     let expanded = RwSignal::new(false);
     let total = entries.len();
@@ -61,7 +71,7 @@ pub fn ToolCardListView(entries: Vec<ToolRequestEntry>) -> impl IntoView {
                 key=|entry| entry.request.tool_call_id.clone()
                 let:entry
             >
-                <ToolCardView entry=entry />
+                <ToolCardView agent_ref=agent_ref entry=entry />
             </For>
             <ToolListSummary
                 total=move || total
@@ -82,7 +92,10 @@ pub fn ToolCardListView(entries: Vec<ToolRequestEntry>) -> impl IntoView {
 }
 
 #[component]
-pub fn StreamingToolCardListView(entries: ArcRwSignal<Vec<StreamingToolRequest>>) -> impl IntoView {
+pub fn StreamingToolCardListView(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    entries: ArcRwSignal<Vec<StreamingToolRequest>>,
+) -> impl IntoView {
     let expanded = RwSignal::new(false);
 
     view! {
@@ -105,7 +118,7 @@ pub fn StreamingToolCardListView(entries: ArcRwSignal<Vec<StreamingToolRequest>>
                 key=|tool| tool.tool_call_id.clone()
                 let:tool
             >
-                <StreamingToolCardView entry=tool.entry />
+                <StreamingToolCardView agent_ref=agent_ref entry=tool.entry />
             </For>
             <ToolListSummary
                 total={
@@ -131,9 +144,12 @@ pub fn StreamingToolCardListView(entries: ArcRwSignal<Vec<StreamingToolRequest>>
 }
 
 #[component]
-fn StreamingToolCardView(entry: ArcRwSignal<ToolRequestEntry>) -> impl IntoView {
+fn StreamingToolCardView(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    entry: ArcRwSignal<ToolRequestEntry>,
+) -> impl IntoView {
     view! {
-        {move || view! { <ToolCardView entry=entry.get() /> }}
+        {move || view! { <ToolCardView agent_ref=agent_ref entry=entry.get() /> }}
     }
 }
 
@@ -214,7 +230,13 @@ fn is_important_tool(entry: &ToolRequestEntry) -> bool {
 }
 
 #[component]
-pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
+pub fn ToolCardView(
+    /// The chat's agent, plumbed explicitly from the owning view (`None`
+    /// only for draft tabs whose agent hasn't spawned yet — no tool
+    /// cards exist there). Never inferred from the active tab.
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    entry: ToolRequestEntry,
+) -> impl IntoView {
     let state = expect_context::<AppState>();
     let tool_output_mode = state.tool_output_mode;
 
@@ -223,27 +245,78 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
     let tool_type = entry.request.tool_type;
     let result = entry.result;
 
+    // Live progress is read reactively from the central store — never
+    // from the entry — so the card keeps updating inside keyed `<For>`
+    // rows and after the turn ends, without remounting (a remount would
+    // also discard the user's collapse state on every snapshot).
+    let progress: Signal<Option<ToolProgressData>> = Signal::derive({
+        let state = state.clone();
+        let tool_call_id = tool_call_id.clone();
+        move || {
+            let agent_id = agent_ref.get()?.agent_id;
+            let key = (agent_id, ToolCallId(tool_call_id.clone()));
+            state
+                .tool_progress
+                .with(|map| map.get(&key).cloned())
+                .map(|signal| signal.get())
+        }
+    });
+    let workflow_run: Signal<Option<WorkflowRunState>> =
+        Signal::derive(move || match progress.get().map(|data| data.update) {
+            Some(ToolProgressUpdate::Workflow(run)) => Some(run),
+            _ => None,
+        });
+    let subagent_progress: Signal<Option<SubAgentProgress>> =
+        Signal::derive(move || match progress.get().map(|data| data.update) {
+            Some(ToolProgressUpdate::SubAgent(progress)) => Some(progress),
+            _ => None,
+        });
+    // A background task can outlive its tool call: the Workflow tool
+    // result is just the run id, the real work keeps going.
+    let background_running = Signal::derive(move || {
+        workflow_run
+            .get()
+            .is_some_and(|run| run.status == WorkflowRunStatus::Running)
+            || subagent_progress
+                .get()
+                .is_some_and(|progress| !progress.completed)
+    });
+    // The body shape (workflow panel vs regular renderer) flips at most
+    // once, when the first snapshot arrives — memoized so per-snapshot
+    // updates don't recreate the body, only its inner reactive text.
+    let is_workflow = Memo::new(move |_| workflow_run.with(|run| run.is_some()));
+
     let has_result = result.is_some();
     let result_success = result.as_ref().map(|r| r.success).unwrap_or(false);
     let result_failed = has_result && !result_success;
 
-    let status_class = if !has_result {
-        "tool-status-text pending"
-    } else if result_success {
-        "tool-status-text success"
-    } else {
-        "tool-status-text failure"
+    let status_class = move || {
+        if !has_result || (background_running.get() && !result_failed) {
+            "tool-status-text pending"
+        } else if result_success {
+            "tool-status-text success"
+        } else {
+            "tool-status-text failure"
+        }
     };
 
-    let status_label = if !has_result {
-        "Running\u{2026}".to_owned()
-    } else if result_success {
-        "Done".to_owned()
-    } else {
-        "Failed".to_owned()
+    let status_label = move || {
+        if !has_result || (background_running.get() && !result_failed) {
+            "Running\u{2026}".to_owned()
+        } else if result_success {
+            "Done".to_owned()
+        } else {
+            "Failed".to_owned()
+        }
     };
 
     let (icon, header_detail) = tool_icon_and_detail(&tool_name, &tool_type);
+    let header_detail = move || {
+        workflow_run
+            .get()
+            .map(|run| run.workflow_name)
+            .or_else(|| header_detail.clone())
+    };
 
     let completion_summary = result
         .as_ref()
@@ -255,17 +328,24 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
     let body_tool_type_slot = StoredValue::new_local(body_tool_type);
     let body_result_slot = StoredValue::new_local(body_result);
     let tool_call_id_slot = StoredValue::new_local(tool_call_id);
-    let details_open = RwSignal::new(is_ask_user_question || !has_result || !result_success);
+    let details_open = RwSignal::new(
+        is_ask_user_question
+            || !has_result
+            || !result_success
+            || background_running.get_untracked(),
+    );
     let default_open_for_body = move || {
         is_ask_user_question
             || !has_result
             || !result_success
+            || background_running.get()
             || tool_output_mode.get() != ToolOutputMode::Summary
     };
     let default_open_for_prop = move || {
         is_ask_user_question
             || !has_result
             || !result_success
+            || background_running.get()
             || tool_output_mode.get() != ToolOutputMode::Summary
     };
     let render_body_when = move || default_open_for_body() || details_open.get();
@@ -285,7 +365,7 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
             <summary class="tool-card-header">
                 <span class="tool-card-icon">{icon}</span>
                 <span class="tool-card-name">{tool_name}</span>
-                {header_detail.map(|d| view! {
+                {move || header_detail().map(|d| view! {
                     <span class="tool-card-detail">{d}</span>
                 })}
                 {completion_summary.map(|s| view! {
@@ -297,20 +377,39 @@ pub fn ToolCardView(entry: ToolRequestEntry) -> impl IntoView {
             <Show when=render_body_when>
                 <div class="tool-card-body">
                     {move || {
-                        let mode = tool_output_mode.get();
-                        tool_call_id_slot.with_value(|tool_call_id| {
-                            body_tool_type_slot.with_value(|body_tool_type| {
-                                body_result_slot.with_value(|body_result| {
-                                    render_body(
-                                        tool_call_id,
-                                        body_tool_type,
-                                        body_result.as_ref(),
-                                        mode,
-                                        result_failed,
-                                    )
-                                })
-                            })
-                        })
+                        // A workflow card's body IS the live run view —
+                        // the generic args/result JSON adds nothing.
+                        if is_workflow.get() {
+                            let tool_call_id = tool_call_id_slot.with_value(Clone::clone);
+                            return workflow_card_body(agent_ref, workflow_run, tool_call_id)
+                                .into_any();
+                        }
+                        view! {
+                            <div>
+                                {move || {
+                                    subagent_progress.get().map(|progress| {
+                                        subagent_status_line(agent_ref, progress)
+                                    })
+                                }}
+                                {move || {
+                                    let mode = tool_output_mode.get();
+                                    tool_call_id_slot.with_value(|tool_call_id| {
+                                        body_tool_type_slot.with_value(|body_tool_type| {
+                                            body_result_slot.with_value(|body_result| {
+                                                render_body(
+                                                    tool_call_id,
+                                                    body_tool_type,
+                                                    body_result.as_ref(),
+                                                    mode,
+                                                    result_failed,
+                                                )
+                                            })
+                                        })
+                                    })
+                                }}
+                            </div>
+                        }
+                        .into_any()
                     }}
                 </div>
             </Show>
@@ -357,6 +456,105 @@ fn render_body(
             exit_plan_mode::render(tool_call_id, req, result, mode).into_any()
         }
         ToolRequestType::Other { .. } => other::render(req, result, mode).into_any(),
+    }
+}
+
+/// Body for a Workflow tool card: the live run view (phase-grouped agent
+/// rows + aggregate footer) and a link to the dedicated workflow tab.
+fn workflow_card_body(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    run: Signal<Option<WorkflowRunState>>,
+    tool_call_id: String,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let header = move || {
+        run.get().map(|run| {
+            format!(
+                "{} \u{b7} {}",
+                run.workflow_name,
+                run_status_label(run.status)
+            )
+        })
+    };
+
+    let on_open = move |_: web_sys::MouseEvent| {
+        let Some(agent_ref) = agent_ref.get_untracked() else {
+            log::error!("Open workflow clicked on a card with no resolved agent");
+            return;
+        };
+        let Some(run) = run.get_untracked() else {
+            log::error!("Open workflow clicked before any run snapshot");
+            return;
+        };
+        state.open_tab(
+            TabContent::Workflow {
+                agent_ref,
+                tool_call_id: ToolCallId(tool_call_id.clone()),
+            },
+            format!("Workflow: {}", run.workflow_name),
+            true,
+        );
+    };
+
+    view! {
+        <div class="tool-live-workflow">
+            <div class="tool-live-header">
+                <span class="tool-live-title">{header}</span>
+                <button class="tool-live-link" on:click=on_open>"Open workflow"</button>
+            </div>
+            <WorkflowRunPanel run=run />
+        </div>
+    }
+}
+
+/// Live status line on a Task tool card while its sub-agent runs, with a
+/// link that opens the sub-agent's own chat tab.
+fn subagent_status_line(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    progress: SubAgentProgress,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let status_text = if progress.completed {
+        format!(
+            "\u{2713} {} finished \u{b7} {} tool calls",
+            progress.agent_name, progress.tool_calls
+        )
+    } else {
+        let last_tool = progress
+            .last_tool_name
+            .clone()
+            .map(|name| format!(" \u{b7} last tool: {name}"))
+            .unwrap_or_default();
+        format!(
+            "\u{27f3} {} running{last_tool} \u{b7} {} tool calls",
+            progress.agent_name, progress.tool_calls
+        )
+    };
+    let agent_id = progress.agent_id.clone();
+    let agent_name = progress.agent_name.clone();
+
+    let on_open = move |_: web_sys::MouseEvent| {
+        // The sub-agent lives on the same host as the chat that spawned
+        // it; the parent's agent_ref is plumbed in explicitly.
+        let Some(parent) = agent_ref.get_untracked() else {
+            log::error!("Open agent clicked on a card with no resolved agent");
+            return;
+        };
+        state.open_tab(
+            TabContent::chat_with_agent(ActiveAgentRef {
+                host_id: parent.host_id,
+                agent_id: agent_id.clone(),
+            }),
+            agent_name.clone(),
+            true,
+        );
+    };
+
+    view! {
+        <div class="tool-live-subagent">
+            <span class="tool-live-title">{status_text}</span>
+            <button class="tool-live-link" on:click=on_open>"Open agent"</button>
+        </div>
     }
 }
 
@@ -806,5 +1004,208 @@ mod completion_summary_tests {
         assert_eq!(count_summary_lines("a"), 1);
         assert_eq!(count_summary_lines("a\nb"), 2);
         assert_eq!(count_summary_lines("a\nb\n"), 3);
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod live_card_wasm_tests {
+    use super::*;
+    use crate::components::tool_card::test_utils::*;
+    use crate::state::AppState;
+    use leptos::mount::mount_to;
+    use protocol::{
+        AgentId, ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowAgentState,
+        WorkflowAgentStatus,
+    };
+    use serde_json::json;
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn chat_agent_ref() -> ActiveAgentRef {
+        ActiveAgentRef {
+            host_id: "host-1".to_owned(),
+            agent_id: AgentId("agent-1".to_owned()),
+        }
+    }
+
+    /// Mount a card the way the app does: progress lives in
+    /// `AppState::tool_progress`, never on the entry, and the chat's
+    /// agent_ref is plumbed in explicitly. Returns the progress store so
+    /// tests can update it after mount and assert the live re-render.
+    fn mount_card(
+        entry: ToolRequestEntry,
+        progress: Option<ToolProgressData>,
+    ) -> (HtmlElement, AppState) {
+        let state = AppState::new();
+        if let Some(progress) = progress {
+            state.tool_progress.update(|map| {
+                map.insert(
+                    (
+                        chat_agent_ref().agent_id,
+                        ToolCallId(progress.tool_call_id.clone()),
+                    ),
+                    ArcRwSignal::new(progress),
+                );
+            });
+        }
+        let container = make_container();
+        let mount_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state);
+            let agent_ref = Signal::derive(|| Some(chat_agent_ref()));
+            view! { <ToolCardView agent_ref=agent_ref entry=entry /> }
+        });
+        handle.forget();
+        (container, state)
+    }
+
+    fn completed_other_request(tool_call_id: &str, tool_name: &str) -> ToolRequestEntry {
+        ToolRequestEntry {
+            request: ToolRequest {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: tool_name.to_owned(),
+                tool_type: ToolRequestType::Other { args: json!({}) },
+            },
+            result: Some(ToolExecutionCompletedData {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: tool_name.to_owned(),
+                tool_result: ToolExecutionResult::Other {
+                    result: json!({"runId": "wf_123"}),
+                },
+                success: true,
+                error: None,
+            }),
+        }
+    }
+
+    fn workflow_progress(status: WorkflowRunStatus) -> ToolProgressData {
+        ToolProgressData {
+            tool_call_id: "toolu_wf".to_owned(),
+            tool_name: "Workflow".to_owned(),
+            update: ToolProgressUpdate::Workflow(workflow_state(status)),
+        }
+    }
+
+    fn subagent_progress_data(tool_calls: u64, completed: bool) -> ToolProgressData {
+        ToolProgressData {
+            tool_call_id: "toolu_task".to_owned(),
+            tool_name: "Task".to_owned(),
+            update: ToolProgressUpdate::SubAgent(SubAgentProgress {
+                agent_id: AgentId("agent-sub".to_owned()),
+                agent_name: "Explore".to_owned(),
+                last_tool_name: Some("Read".to_owned()),
+                tool_calls,
+                completed,
+            }),
+        }
+    }
+
+    fn workflow_state(status: WorkflowRunStatus) -> WorkflowRunState {
+        WorkflowRunState {
+            workflow_name: "wfprobe".to_owned(),
+            description: None,
+            script: None,
+            status,
+            summary: None,
+            total_tokens: 13078,
+            tool_uses: 0,
+            duration_ms: 3000,
+            agents: vec![WorkflowAgentState {
+                index: 1,
+                label: "probe-1".to_owned(),
+                phase_title: Some("Probe".to_owned()),
+                model: None,
+                state: WorkflowAgentStatus::Running,
+                tokens: 100,
+                tool_calls: 0,
+                duration_ms: 0,
+                attempt: 1,
+                prompt_preview: None,
+                result_preview: None,
+            }],
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn completed_workflow_tool_with_running_run_shows_running_status() {
+        let entry = completed_other_request("toolu_wf", "Workflow");
+        let (container, state) =
+            mount_card(entry, Some(workflow_progress(WorkflowRunStatus::Running)));
+        next_tick().await;
+
+        let body = text(&container);
+        // The tool call itself succeeded, but the run is still going —
+        // the user must see it as running, not done.
+        assert!(
+            body.contains("Running\u{2026}"),
+            "status is running: {body}"
+        );
+        assert!(!body.contains("Done"), "no Done while run active: {body}");
+        assert!(body.contains("probe-1"), "live agent row visible: {body}");
+        assert!(
+            body.contains("Open workflow"),
+            "open-workflow link present: {body}"
+        );
+
+        // A later snapshot in the store must re-render the mounted card
+        // in place — this is the post-turn update path.
+        let key = (chat_agent_ref().agent_id, ToolCallId("toolu_wf".to_owned()));
+        let signal = state
+            .tool_progress
+            .with_untracked(|map| map.get(&key).cloned())
+            .expect("progress signal");
+        signal.set(workflow_progress(WorkflowRunStatus::Completed));
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(body.contains("Done"), "card flips to Done live: {body}");
+        assert!(body.contains("Completed"), "header updates live: {body}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn completed_workflow_run_shows_done_status() {
+        let entry = completed_other_request("toolu_wf", "Workflow");
+        let (container, _state) =
+            mount_card(entry, Some(workflow_progress(WorkflowRunStatus::Completed)));
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(body.contains("Done"), "completed run shows Done: {body}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn task_card_shows_live_subagent_status_and_open_link() {
+        let mut entry = completed_other_request("toolu_task", "Task");
+        entry.result = None; // Task tool is still pending while agent runs.
+        let (container, _state) = mount_card(entry, Some(subagent_progress_data(12, false)));
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("Explore running"),
+            "live status line visible: {body}"
+        );
+        assert!(
+            body.contains("last tool: Read"),
+            "last tool visible: {body}"
+        );
+        assert!(body.contains("12 tool calls"), "tool count visible: {body}");
+        assert!(body.contains("Open agent"), "open-agent link: {body}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn finished_subagent_line_shows_completion() {
+        let entry = completed_other_request("toolu_task", "Task");
+        let (container, _state) = mount_card(entry, Some(subagent_progress_data(30, true)));
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("Explore finished"),
+            "finished line visible: {body}"
+        );
+        assert!(body.contains("Done"), "tool status is Done: {body}");
     }
 }

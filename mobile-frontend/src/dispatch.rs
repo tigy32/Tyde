@@ -1362,6 +1362,8 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                 }
             });
         }
+        // Live tool progress is not rendered on mobile (v1).
+        ChatEvent::ToolProgress(_) => {}
         ChatEvent::ToolExecutionCompleted(data) => {
             let call_id = data.tool_call_id.clone();
             let streaming = state
@@ -1801,6 +1803,7 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
         ChatEvent::StreamReasoningDelta(_) => "StreamReasoningDelta",
         ChatEvent::StreamEnd(_) => "StreamEnd",
         ChatEvent::ToolRequest(_) => "ToolRequest",
+        ChatEvent::ToolProgress(_) => "ToolProgress",
         ChatEvent::ToolExecutionCompleted(_) => "ToolExecutionCompleted",
         ChatEvent::TaskUpdate(_) => "TaskUpdate",
         ChatEvent::OperationCancelled(_) => "OperationCancelled",

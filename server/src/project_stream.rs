@@ -1280,8 +1280,8 @@ where
                 Err(_) => continue,
             };
             if let Some(prefix) = &path_prefix {
-                let matches_prefix = relative_path == *prefix
-                    || relative_path.starts_with(&format!("{prefix}/"));
+                let matches_prefix =
+                    relative_path == *prefix || relative_path.starts_with(&format!("{prefix}/"));
                 if !matches_prefix {
                     continue;
                 }
@@ -1382,7 +1382,7 @@ impl grep_searcher::Sink for SearchMatchCollector<'_> {
                 ranges.push((found.start() as u32, found.end() as u32));
                 true
             })
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
 
         self.matches.push(ProjectSearchMatch {
             line_number,
@@ -3065,7 +3065,10 @@ new mode 100755\n";
         let (files, summary) = run_search(&project, &payload);
         assert_eq!(summary.total_files, 2);
         let names: Vec<_> = files.iter().map(|f| f.path.relative_path.clone()).collect();
-        assert_eq!(names, vec!["src/a.txt".to_owned(), "src/sub/b.txt".to_owned()]);
+        assert_eq!(
+            names,
+            vec!["src/a.txt".to_owned(), "src/sub/b.txt".to_owned()]
+        );
     }
 
     #[test]

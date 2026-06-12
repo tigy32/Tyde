@@ -345,8 +345,7 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
     let geometry_measured = RwSignal::new(false);
 
     // Skip the saved-scroll restore when a goto already seeded the scroll.
-    let restored_initial_scroll =
-        std::rc::Rc::new(std::cell::Cell::new(initial_goto.is_some()));
+    let restored_initial_scroll = std::rc::Rc::new(std::cell::Cell::new(initial_goto.is_some()));
     let restored_initial_scroll_for_effect = restored_initial_scroll.clone();
     let pre_ref_for_restore = pre_ref;
     let state_for_restore = state.clone();
@@ -439,7 +438,8 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath) -> impl IntoView {
         el.set_scroll_top(target as i32);
         scroll_top.set(el.scroll_top() as f64);
         let element: web_sys::Element = el.clone().unchecked_into();
-        state_for_goto_scroll.save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
+        state_for_goto_scroll
+            .save_tab_scroll_state(tab_id, tab_scroll_state_from_element(&element));
         if measured {
             // Real geometry applied — consume the request so it fires once.
             pending_line.set(None);

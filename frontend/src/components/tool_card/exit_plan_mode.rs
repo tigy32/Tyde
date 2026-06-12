@@ -257,6 +257,15 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    fn test_agent_ref() -> Signal<Option<ActiveAgentRef>> {
+        Signal::derive(|| {
+            Some(ActiveAgentRef {
+                host_id: "host-1".to_owned(),
+                agent_id: AgentId("agent-1".to_owned()),
+            })
+        })
+    }
+
     fn exit_plan_req() -> ToolRequestType {
         ToolRequestType::ExitPlanMode {
             plan: Some("Step 1: do the thing\nStep 2: verify it".to_owned()),
@@ -474,7 +483,7 @@ mod wasm_tests {
         let container = {
             let entry_sig = entry_sig.clone();
             mount_with_state(configure_active_agent, move || {
-                view! { {move || view! { <ToolCardView entry=entry_sig.get() /> }} }.into_any()
+                view! { {move || view! { <ToolCardView agent_ref=test_agent_ref() entry=entry_sig.get() /> }} }.into_any()
             })
         };
         next_tick().await;
@@ -515,7 +524,7 @@ mod wasm_tests {
             let entry_sig = entry_sig.clone();
             mount_with_state(configure_active_agent, move || {
                 view! {
-                    {move || view! { <ToolCardView entry=entry_sig.get() /> }}
+                    {move || view! { <ToolCardView agent_ref=test_agent_ref() entry=entry_sig.get() /> }}
                 }
                 .into_any()
             })
@@ -609,7 +618,10 @@ mod wasm_tests {
     async fn completed_drops_active_controls() {
         let container = mount_with_state(
             |_| {},
-            || view! { <ToolCardView entry=completed_entry(true) /> }.into_any(),
+            || {
+                view! { <ToolCardView agent_ref=test_agent_ref() entry=completed_entry(true) /> }
+                    .into_any()
+            },
         );
         next_tick().await;
 

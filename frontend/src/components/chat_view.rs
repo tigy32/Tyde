@@ -806,6 +806,7 @@ pub fn ChatView(
                             let:row
                         >
                             <MeasuredRow
+                                agent_ref=agent_ref
                                 row=row
                                 row_heights=row_heights
                                 heights_version=heights_version
@@ -857,7 +858,7 @@ pub fn ChatView(
                         }}
 
                         {move || {
-                            streaming().map(|ss| view! { <ChatStreamingView streaming=ss /> })
+                            streaming().map(|ss| view! { <ChatStreamingView agent_ref=agent_ref streaming=ss /> })
                         }}
                     </div>
 
@@ -924,6 +925,7 @@ impl VirtualWindow {
 /// are mounted at any time.
 #[component]
 fn MeasuredRow(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
     row: ChatRowHandle,
     row_heights: StoredValue<HashMap<ChatRowId, f64>, LocalStorage>,
     heights_version: RwSignal<u32>,
@@ -1017,7 +1019,7 @@ fn MeasuredRow(
 
     view! {
         <div class="virt-row" node_ref=node_ref>
-            <ChatMessageView row=row />
+            <ChatMessageView agent_ref=agent_ref row=row />
         </div>
     }
 }

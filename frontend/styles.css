@@ -9054,3 +9054,166 @@ pre.tool-error-pre {
     white-space: nowrap;
     color: var(--text-primary);
 }
+
+/* ── Live tool cards (workflow runs, sub-agents) ───────────────────── */
+
+.tool-live-workflow {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.tool-live-header,
+.tool-live-subagent {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.tool-live-subagent {
+    margin-bottom: var(--space-2);
+}
+
+.tool-live-title {
+    font-size: 0.846rem;
+    color: var(--text-secondary);
+}
+
+.tool-live-link {
+    margin-left: auto;
+    flex-shrink: 0;
+    background: none;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    padding: 1px var(--space-2);
+    font-size: 0.769rem;
+    color: var(--accent-link);
+    cursor: pointer;
+}
+
+.tool-live-link:hover {
+    border-color: var(--accent-primary);
+    background: var(--accent-subtle);
+}
+
+.workflow-run-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: 0.846rem;
+}
+
+.workflow-phase {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.workflow-phase-title {
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-top: var(--space-1);
+}
+
+.workflow-agent-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    padding-left: var(--space-2);
+    min-width: 0;
+}
+
+.workflow-agent-glyph {
+    flex-shrink: 0;
+    display: inline-block;
+    width: 1em;
+    text-align: center;
+}
+
+.workflow-agent-glyph.running {
+    animation: task-spin 1.5s linear infinite;
+}
+
+.workflow-agent-glyph.done {
+    color: var(--status-success, #4caf50);
+}
+
+.workflow-agent-glyph.error {
+    color: var(--status-error, #f44336);
+}
+
+.workflow-agent-label {
+    color: var(--text-primary);
+    flex-shrink: 0;
+}
+
+.workflow-agent-model {
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: 0.769rem;
+    flex-shrink: 0;
+}
+
+.workflow-agent-meta {
+    color: var(--text-secondary);
+    flex-shrink: 0;
+}
+
+.workflow-agent-result {
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: 0.769rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+.workflow-run-footer {
+    color: var(--text-secondary);
+    border-top: 1px solid var(--border-primary);
+    padding-top: var(--space-1);
+    margin-top: var(--space-1);
+}
+
+.workflow-run-summary {
+    color: var(--text-primary);
+}
+
+.workflow-script summary {
+    cursor: pointer;
+    color: var(--text-secondary);
+    font-size: 0.846rem;
+}
+
+.workflow-script-source {
+    font-family: var(--font-mono);
+    font-size: 0.769rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: var(--bg-secondary, rgba(128, 128, 128, 0.08));
+    border-radius: 4px;
+    padding: var(--space-2);
+    margin: var(--space-1) 0 0;
+}
+
+.workflow-view {
+    padding: var(--space-3);
+}
+
+.workflow-view-inner {
+    max-width: 900px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.workflow-view-header {
+    font-size: 1.077rem;
+    margin: 0 0 var(--space-2);
+}
+
+.workflow-view-empty {
+    color: var(--text-secondary);
+    padding: var(--space-3);
+}

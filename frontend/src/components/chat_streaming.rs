@@ -5,7 +5,7 @@ use wasm_bindgen::JsCast;
 
 use crate::components::tool_card::StreamingToolCardListView;
 use crate::markdown::render_markdown;
-use crate::state::StreamingState;
+use crate::state::{ActiveAgentRef, StreamingState};
 
 /// Stream-delta cadence at which we re-parse markdown for the in-flight
 /// assistant response. The raw `streaming.text` signal updates on every
@@ -19,7 +19,10 @@ const STREAMING_RENDER_INTERVAL_MS: i32 = 33;
 const REASONING_RENDER_BYTE_CAP: usize = 40_000;
 
 #[component]
-pub fn ChatStreamingView(streaming: StreamingState) -> impl IntoView {
+pub fn ChatStreamingView(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    streaming: StreamingState,
+) -> impl IntoView {
     let text = streaming.text;
     let reasoning = streaming.reasoning;
     let tool_requests = streaming.tool_requests;
@@ -107,7 +110,7 @@ pub fn ChatStreamingView(streaming: StreamingState) -> impl IntoView {
                     None
                 } else {
                     Some(view! {
-                        <StreamingToolCardListView entries=tool_requests.clone() />
+                        <StreamingToolCardListView agent_ref=agent_ref entries=tool_requests.clone() />
                     })
                 }
             }}

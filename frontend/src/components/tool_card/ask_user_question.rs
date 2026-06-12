@@ -421,6 +421,15 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    fn test_agent_ref() -> Signal<Option<ActiveAgentRef>> {
+        Signal::derive(|| {
+            Some(ActiveAgentRef {
+                host_id: "host-1".to_owned(),
+                agent_id: AgentId("agent-1".to_owned()),
+            })
+        })
+    }
+
     fn opt(label: &str, desc: &str) -> AskUserQuestionOption {
         AskUserQuestionOption {
             label: label.to_owned(),
@@ -656,7 +665,9 @@ mod wasm_tests {
                 error: None,
             }),
         };
-        let container = mount_with_state(move || view! { <ToolCardView entry=entry /> }.into_any());
+        let container = mount_with_state(move || {
+            view! { <ToolCardView agent_ref=test_agent_ref() entry=entry /> }.into_any()
+        });
         next_tick().await;
 
         let details = container
@@ -691,7 +702,9 @@ mod wasm_tests {
                 error: Some("question failed".to_owned()),
             }),
         };
-        let container = mount_with_state(move || view! { <ToolCardView entry=entry /> }.into_any());
+        let container = mount_with_state(move || {
+            view! { <ToolCardView agent_ref=test_agent_ref() entry=entry /> }.into_any()
+        });
         next_tick().await;
 
         assert!(

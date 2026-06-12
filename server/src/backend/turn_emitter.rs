@@ -169,6 +169,33 @@ impl TurnEmitter {
         self.lock().tool_completed(data);
     }
 
+    /// Live progress snapshot for a tool call. Deliberately stateless:
+    /// background tasks (workflows, sub-agents) keep emitting progress
+    /// after their tool call completes and across turn boundaries, when
+    /// the per-turn pending/completed maps have already been reset — so
+    /// no pairing is enforced beyond a non-empty id. The frontend
+    /// matches by `tool_call_id` against its persistent index.
+    pub fn tool_progress(&self, data: &protocol::ToolProgressData) {
+        if data.tool_call_id.is_empty() {
+            tracing::debug!(
+                "dropping ToolProgress for tool '{}' with empty tool_call_id",
+                data.tool_name
+            );
+            return;
+        }
+        let payload = match serde_json::to_value(data) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!("failed to serialize ToolProgressData: {err}");
+                return;
+            }
+        };
+        self.lock().send(json!({
+            "kind": "ToolProgress",
+            "data": payload,
+        }));
+    }
+
     // ---------- Cancellation & lifecycle ----------
 
     /// Full cancellation path: close open stream → complete pending
@@ -1186,5 +1213,65 @@ mod tests {
             event_kinds(&events),
             vec!["StreamStart", "ToolRequest", "ToolExecutionCompleted"]
         );
+    }
+
+    fn sample_progress(tool_call_id: &str) -> protocol::ToolProgressData {
+        protocol::ToolProgressData {
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: "Workflow".to_string(),
+            update: protocol::ToolProgressUpdate::Workflow(protocol::WorkflowRunState {
+                workflow_name: "probe".to_string(),
+                description: None,
+                script: None,
+                status: protocol::WorkflowRunStatus::Running,
+                summary: None,
+                total_tokens: 1,
+                tool_uses: 0,
+                duration_ms: 10,
+                agents: vec![],
+            }),
+        }
+    }
+
+    #[test]
+    fn tool_progress_emits_at_any_lifecycle_point() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        // Before any request is known.
+        emitter.tool_progress(&sample_progress("tool-a"));
+        emitter.tool_request("tool-a", "Workflow", json!({"kind": "Other", "args": {}}));
+        // Between request and completion.
+        emitter.tool_progress(&sample_progress("tool-a"));
+        emitter.tool_completed(ToolCompletedPayload {
+            tool_call_id: "tool-a",
+            tool_name: "Workflow",
+            tool_result: json!({"kind": "Other", "result": {}}),
+            success: true,
+            error: None,
+        });
+        // After completion — the background task is still running.
+        emitter.tool_progress(&sample_progress("tool-a"));
+        // After a turn reset, when per-turn tool maps are cleared.
+        emitter.operation_cancelled("bye");
+        emitter.tool_progress(&sample_progress("tool-a"));
+        drop(emitter);
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        assert_eq!(
+            event_kinds(&events)
+                .iter()
+                .filter(|kind| *kind == "ToolProgress")
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn tool_progress_with_empty_id_is_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.tool_progress(&sample_progress(""));
+        drop(emitter);
+        assert_eq!(recv_kinds(&mut rx), Vec::<String>::new());
     }
 }

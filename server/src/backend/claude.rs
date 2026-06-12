@@ -15,6 +15,8 @@ use tokio::task::JoinHandle;
 
 use protocol::{
     BackendAccessMode, ExitPlanModeDecision, SendMessageToolResponse, SessionId, ToolPolicy,
+    ToolProgressData, ToolProgressUpdate, WorkflowAgentState, WorkflowAgentStatus,
+    WorkflowRunState, WorkflowRunStatus,
 };
 
 use crate::backend::turn_emitter::{
@@ -35,6 +37,16 @@ struct SubAgentStream {
     has_explicit_task_prompt: bool,
     /// A local ClaudeInner that routes events to the sub-agent's channel.
     inner: Arc<ClaudeInner>,
+    /// The parent's Task tool_use id — the `tool_call_id` for live
+    /// `ToolProgress` updates on the parent's Task tool card.
+    parent_tool_use_id: String,
+    /// Id of the spawned sub-agent (from `SubAgentHandle`), included in
+    /// progress updates so the frontend can link to the sub-agent view.
+    agent_id: protocol::AgentId,
+    agent_name: String,
+    /// Emitter of the PARENT agent, used for the progress updates above.
+    parent_emitter: Arc<TurnEmitter>,
+    last_progress_emit: std::time::Instant,
 }
 
 #[derive(Default)]
@@ -44,6 +56,7 @@ struct PendingSubAgentPrompt {
 }
 
 const CLAUDE_AGENT_NAME: &str = "claude";
+
 const CLAUDE_ESTIMATED_CONTEXT_WINDOW_DEFAULT: u64 = 200_000;
 const CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M: u64 = 1_000_000;
 const CLAUDE_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
@@ -425,6 +438,62 @@ struct ClaudeSystemFrame {
     task_type: Option<String>,
     #[serde(default)]
     tool_use_id: Option<String>,
+    #[serde(default)]
+    workflow_name: Option<String>,
+    /// Aggregate usage on `task_progress` frames.
+    #[serde(default)]
+    usage: Option<ClaudeTaskUsage>,
+    /// Per-workflow-agent delta events on `task_progress` frames. Each
+    /// entry is parsed individually into `ClaudeWorkflowAgentDelta` so
+    /// one malformed delta is surfaced and skipped without losing the
+    /// rest of the frame.
+    #[serde(default)]
+    workflow_progress: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeTaskUsage {
+    #[serde(default)]
+    total_tokens: Option<u64>,
+    #[serde(default)]
+    tool_uses: Option<u64>,
+    #[serde(default)]
+    duration_ms: Option<u64>,
+}
+
+/// One entry of a `task_progress` frame's `workflow_progress` array.
+/// `kind` stays a string at this boundary: the array carries entry
+/// types beyond `workflow_agent` (e.g. workflow-level records) that
+/// this reducer intentionally ignores, and the set is owned by the CLI,
+/// not by Tyde. Everything consumed from it maps into typed protocol
+/// state.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeWorkflowAgentDelta {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    index: Option<u64>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    phase_title: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    attempt: Option<u64>,
+    #[serde(default)]
+    tokens: Option<u64>,
+    #[serde(default)]
+    tool_calls: Option<u64>,
+    #[serde(default)]
+    duration_ms: Option<u64>,
+    #[serde(default)]
+    prompt_preview: Option<String>,
+    #[serde(default)]
+    result_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2537,6 +2606,9 @@ async fn read_claude_stdout_persistent(
     let mut lines = BufReader::new(stdout).lines();
     let mut subagent_streams: HashMap<String, SubAgentStream> = HashMap::new();
     let mut pending_subagent_prompts: HashMap<u64, PendingSubAgentPrompt> = HashMap::new();
+    // Keyed by task_id; lives at loop scope (not per-turn) because a
+    // workflow's task frames keep arriving after its turn completes.
+    let mut workflow_runs: HashMap<String, WorkflowRunEntry> = HashMap::new();
 
     while let Ok(Some(line)) = lines.next_line().await {
         let trimmed = line.trim();
@@ -2565,14 +2637,23 @@ async fn read_claude_stdout_persistent(
             continue;
         }
 
+        if handle_workflow_task_frame(&value, &mut workflow_runs, &inner.emitter) {
+            continue;
+        }
+
         let subagent_emitter = {
             let state = inner.state.lock().await;
             state.subagent_emitter.clone()
         };
 
         if let Some(ref emitter) = subagent_emitter {
-            detect_subagent_task_system_spawns(&value, emitter.as_ref(), &mut subagent_streams)
-                .await;
+            detect_subagent_task_system_spawns(
+                &value,
+                emitter.as_ref(),
+                &inner.emitter,
+                &mut subagent_streams,
+            )
+            .await;
         }
 
         if let Some(parent_id) = extract_parent_tool_use_id(&value) {
@@ -2586,6 +2667,7 @@ async fn read_claude_stdout_persistent(
             detect_subagent_spawns(
                 &value,
                 emitter.as_ref(),
+                &inner.emitter,
                 &mut subagent_streams,
                 &mut pending_subagent_prompts,
             )
@@ -3388,6 +3470,39 @@ fn consume_subagent_event(stream: &mut SubAgentStream, value: &Value) {
         &mut sa_message_id,
     );
     stream.message_id = sa_message_id;
+    maybe_emit_subagent_progress(stream);
+}
+
+/// Minimum interval between live-status updates on the parent's Task
+/// tool card while routing a sub-agent's events.
+const SUBAGENT_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(250);
+
+fn subagent_progress_data(stream: &SubAgentStream, completed: bool) -> ToolProgressData {
+    ToolProgressData {
+        tool_call_id: stream.parent_tool_use_id.clone(),
+        tool_name: "Task".to_string(),
+        update: ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+            agent_id: stream.agent_id.clone(),
+            agent_name: stream.agent_name.clone(),
+            last_tool_name: stream
+                .summary
+                .tool_calls
+                .last()
+                .map(|tool| tool.name.clone()),
+            tool_calls: stream.summary.tool_calls.len() as u64,
+            completed,
+        }),
+    }
+}
+
+fn maybe_emit_subagent_progress(stream: &mut SubAgentStream) {
+    if stream.last_progress_emit.elapsed() < SUBAGENT_PROGRESS_EMIT_INTERVAL {
+        return;
+    }
+    stream.last_progress_emit = std::time::Instant::now();
+    stream
+        .parent_emitter
+        .tool_progress(&subagent_progress_data(stream, false));
 }
 
 fn emit_subagent_task_prompt_if_needed(stream: &mut SubAgentStream, description: &str) {
@@ -3399,15 +3514,27 @@ fn emit_subagent_task_prompt_if_needed(stream: &mut SubAgentStream, description:
     stream.inner.emitter.user_message(trimmed, Vec::new());
 }
 
-async fn ensure_subagent_stream(
-    emitter: &dyn SubAgentEmitter,
-    streams: &mut HashMap<String, SubAgentStream>,
+struct SubAgentSpawnSpec {
     tool_use_id: String,
     name: String,
     description: String,
     agent_type: String,
     session_id_hint: Option<protocol::SessionId>,
+}
+
+async fn ensure_subagent_stream(
+    emitter: &dyn SubAgentEmitter,
+    parent_emitter: &Arc<TurnEmitter>,
+    streams: &mut HashMap<String, SubAgentStream>,
+    spec: SubAgentSpawnSpec,
 ) {
+    let SubAgentSpawnSpec {
+        tool_use_id,
+        name,
+        description,
+        agent_type,
+        session_id_hint,
+    } = spec;
     if streams.contains_key(&tool_use_id) {
         return;
     }
@@ -3418,7 +3545,7 @@ async fn ensure_subagent_stream(
     let handle = emitter
         .on_subagent_spawned(
             tool_use_id.clone(),
-            name,
+            name.clone(),
             description,
             agent_type,
             session_id_hint,
@@ -3439,24 +3566,276 @@ async fn ensure_subagent_stream(
     });
     let sa_message_id = format!("subagent-{}", tool_use_id);
 
-    streams.insert(
-        tool_use_id,
-        SubAgentStream {
-            summary: ClaudeStdoutSummary::default(),
-            segment: SegmentState {
-                awaiting_stream_start: true,
-                ..SegmentState::default()
-            },
-            message_id: sa_message_id,
-            has_explicit_task_prompt: false,
-            inner: sa_inner,
+    let stream = SubAgentStream {
+        summary: ClaudeStdoutSummary::default(),
+        segment: SegmentState {
+            awaiting_stream_start: true,
+            ..SegmentState::default()
         },
-    );
+        message_id: sa_message_id,
+        has_explicit_task_prompt: false,
+        inner: sa_inner,
+        parent_tool_use_id: tool_use_id.clone(),
+        agent_id: handle.agent_id,
+        agent_name: name,
+        parent_emitter: parent_emitter.clone(),
+        last_progress_emit: std::time::Instant::now(),
+    };
+    // Unthrottled spawn update: the Task card learns the sub-agent's id
+    // (for its "Open agent" link) as soon as the agent exists.
+    parent_emitter.tool_progress(&subagent_progress_data(&stream, false));
+    streams.insert(tool_use_id, stream);
+}
+
+// ============================================================================
+// Workflow task frames → live ToolProgress snapshots.
+//
+// The Claude CLI runs the Workflow tool as a background task: the tool
+// call returns a run id within seconds, then `system` frames
+// (`task_started` / `task_progress` / `task_notification`) keep flowing —
+// mostly *after* the tool result and across turn boundaries. The
+// `workflow_progress` array on `task_progress` frames carries per-agent
+// *delta* events; this reducer folds them into a full `WorkflowRunState`
+// snapshot and emits it as `ToolProgress` on the parent emitter, keyed by
+// the Workflow tool call's `tool_use_id`.
+// ============================================================================
+
+/// Minimum interval between emitted snapshots per run. State transitions
+/// (an agent starting/finishing, the run completing) always flush
+/// immediately so short workflows never render stale.
+const WORKFLOW_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(500);
+
+struct WorkflowRunEntry {
+    tool_use_id: String,
+    state: WorkflowRunState,
+    last_emit: std::time::Instant,
+}
+
+fn map_workflow_agent_status(raw: &str) -> WorkflowAgentStatus {
+    match raw {
+        "queued" => WorkflowAgentStatus::Queued,
+        "start" | "running" | "progress" => WorkflowAgentStatus::Running,
+        "done" => WorkflowAgentStatus::Done,
+        "error" | "failed" => WorkflowAgentStatus::Error,
+        _ => WorkflowAgentStatus::Unknown,
+    }
+}
+
+/// Fold one `workflow_progress` delta into the run state. Returns `true`
+/// when the delta changed an agent's status (a transition worth flushing
+/// immediately). Entry types other than `workflow_agent` (workflow-level
+/// records) are not consumed by this reducer.
+fn apply_workflow_agent_delta(
+    state: &mut WorkflowRunState,
+    delta: &ClaudeWorkflowAgentDelta,
+) -> bool {
+    if delta.kind != "workflow_agent" {
+        return false;
+    }
+    let Some(index) = delta.index else {
+        tracing::warn!("workflow_agent delta without index: {delta:?}");
+        return false;
+    };
+
+    let position = match state
+        .agents
+        .binary_search_by_key(&index, |agent| agent.index)
+    {
+        Ok(position) => position,
+        Err(position) => {
+            state.agents.insert(
+                position,
+                WorkflowAgentState {
+                    index,
+                    label: String::new(),
+                    phase_title: None,
+                    model: None,
+                    state: WorkflowAgentStatus::Queued,
+                    tokens: 0,
+                    tool_calls: 0,
+                    duration_ms: 0,
+                    attempt: 1,
+                    prompt_preview: None,
+                    result_preview: None,
+                },
+            );
+            position
+        }
+    };
+    let agent = &mut state.agents[position];
+
+    if let Some(label) = &delta.label {
+        agent.label = label.clone();
+    }
+    if let Some(phase) = &delta.phase_title {
+        agent.phase_title = Some(phase.clone());
+    }
+    if let Some(model) = &delta.model {
+        agent.model = Some(model.clone());
+    }
+    if let Some(attempt) = delta.attempt {
+        agent.attempt = attempt;
+    }
+    if let Some(tokens) = delta.tokens {
+        agent.tokens = tokens;
+    }
+    if let Some(tool_calls) = delta.tool_calls {
+        agent.tool_calls = tool_calls;
+    }
+    if let Some(duration_ms) = delta.duration_ms {
+        agent.duration_ms = duration_ms;
+    }
+    if let Some(preview) = &delta.prompt_preview {
+        agent.prompt_preview = Some(preview.clone());
+    }
+    if let Some(preview) = &delta.result_preview {
+        agent.result_preview = Some(preview.clone());
+    }
+
+    let mut transitioned = false;
+    if let Some(raw_status) = &delta.state {
+        let status = map_workflow_agent_status(raw_status);
+        if status == WorkflowAgentStatus::Unknown {
+            tracing::warn!("unknown workflow agent state '{raw_status}' (agent {index})");
+        }
+        if agent.state != status {
+            agent.state = status;
+            transitioned = true;
+        }
+    }
+    transitioned
+}
+
+fn apply_workflow_usage(state: &mut WorkflowRunState, usage: &ClaudeTaskUsage) {
+    if let Some(total_tokens) = usage.total_tokens {
+        state.total_tokens = total_tokens;
+    }
+    if let Some(tool_uses) = usage.tool_uses {
+        state.tool_uses = tool_uses;
+    }
+    if let Some(duration_ms) = usage.duration_ms {
+        state.duration_ms = duration_ms;
+    }
+}
+
+fn emit_workflow_snapshot(emitter: &TurnEmitter, entry: &mut WorkflowRunEntry) {
+    entry.last_emit = std::time::Instant::now();
+    emitter.tool_progress(&ToolProgressData {
+        tool_call_id: entry.tool_use_id.clone(),
+        tool_name: "Workflow".to_string(),
+        update: ToolProgressUpdate::Workflow(entry.state.clone()),
+    });
+}
+
+/// Consume a workflow task frame if `value` is one. Returns `true` when
+/// the frame was handled (the caller skips all per-turn processing —
+/// these frames arrive between turns too, where the per-turn path would
+/// drop them).
+fn handle_workflow_task_frame(
+    value: &Value,
+    workflow_runs: &mut HashMap<String, WorkflowRunEntry>,
+    emitter: &TurnEmitter,
+) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("system") {
+        return false;
+    }
+    // Parse failures fall through to `consume_claude_stream_value`, which
+    // warns about any unparseable system frame.
+    let Ok(system) = parse_claude_system_frame(value) else {
+        return false;
+    };
+    let Some(task_id) = system.task_id.as_deref().and_then(normalize_nonempty) else {
+        return false;
+    };
+
+    match system.event() {
+        ClaudeSystemEvent::TaskStarted => {
+            if system.task_type.as_deref() != Some("local_workflow") {
+                return false;
+            }
+            let Some(tool_use_id) = system.tool_use_id.as_deref().and_then(normalize_nonempty)
+            else {
+                tracing::warn!("ignoring workflow task_started without tool_use_id: {value}");
+                return true;
+            };
+            // No fallback name: the CLI sends `workflow_name` on every
+            // workflow task_started. If it ever doesn't, surface that
+            // instead of inventing a label.
+            let Some(workflow_name) = system.workflow_name.as_deref().and_then(normalize_nonempty)
+            else {
+                tracing::warn!("ignoring workflow task_started without workflow_name: {value}");
+                return true;
+            };
+            let mut entry = WorkflowRunEntry {
+                tool_use_id,
+                state: WorkflowRunState {
+                    workflow_name,
+                    description: system.description.as_deref().and_then(normalize_nonempty),
+                    script: system.prompt.as_deref().and_then(normalize_nonempty),
+                    status: WorkflowRunStatus::Running,
+                    summary: None,
+                    total_tokens: 0,
+                    tool_uses: 0,
+                    duration_ms: 0,
+                    agents: Vec::new(),
+                },
+                last_emit: std::time::Instant::now(),
+            };
+            emit_workflow_snapshot(emitter, &mut entry);
+            workflow_runs.insert(task_id, entry);
+            true
+        }
+        ClaudeSystemEvent::TaskProgress => {
+            let Some(entry) = workflow_runs.get_mut(&task_id) else {
+                // Not a workflow task (e.g. a local_agent task) — let the
+                // regular paths see the frame.
+                return false;
+            };
+            let mut transitioned = false;
+            for raw_delta in system.workflow_progress.iter().flatten() {
+                match serde_json::from_value::<ClaudeWorkflowAgentDelta>(raw_delta.clone()) {
+                    Ok(delta) => {
+                        transitioned |= apply_workflow_agent_delta(&mut entry.state, &delta);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "skipping malformed workflow_progress delta: {err}; value={raw_delta}"
+                        );
+                    }
+                }
+            }
+            if let Some(usage) = system.usage.as_ref() {
+                apply_workflow_usage(&mut entry.state, usage);
+            }
+            if transitioned || entry.last_emit.elapsed() >= WORKFLOW_PROGRESS_EMIT_INTERVAL {
+                emit_workflow_snapshot(emitter, entry);
+            }
+            true
+        }
+        ClaudeSystemEvent::TaskNotification => {
+            let Some(mut entry) = workflow_runs.remove(&task_id) else {
+                return false;
+            };
+            entry.state.status = match system.status.as_deref() {
+                Some("completed") => WorkflowRunStatus::Completed,
+                Some("failed") | Some("error") => WorkflowRunStatus::Failed,
+                other => {
+                    tracing::warn!("unknown workflow task_notification status: {other:?}");
+                    WorkflowRunStatus::Unknown
+                }
+            };
+            entry.state.summary = system.summary.as_deref().and_then(normalize_nonempty);
+            emit_workflow_snapshot(emitter, &mut entry);
+            true
+        }
+        _ => false,
+    }
 }
 
 async fn detect_subagent_task_system_spawns(
     value: &Value,
     emitter: &dyn SubAgentEmitter,
+    parent_emitter: &Arc<TurnEmitter>,
     streams: &mut HashMap<String, SubAgentStream>,
 ) {
     if value.get("type").and_then(Value::as_str) != Some("system") {
@@ -3495,12 +3874,15 @@ async fn detect_subagent_task_system_spawns(
 
     ensure_subagent_stream(
         emitter,
+        parent_emitter,
         streams,
-        tool_use_id.clone(),
-        name,
-        description,
-        task_type,
-        None,
+        SubAgentSpawnSpec {
+            tool_use_id: tool_use_id.clone(),
+            name,
+            description,
+            agent_type: task_type,
+            session_id_hint: None,
+        },
     )
     .await;
 
@@ -3626,6 +4008,7 @@ fn track_pending_subagent_prompt_event(
 async fn detect_subagent_spawns(
     value: &Value,
     emitter: &dyn SubAgentEmitter,
+    parent_emitter: &Arc<TurnEmitter>,
     streams: &mut HashMap<String, SubAgentStream>,
     pending_prompts: &mut HashMap<u64, PendingSubAgentPrompt>,
 ) {
@@ -3649,12 +4032,15 @@ async fn detect_subagent_spawns(
         if let Some((tool_use_id, name, description, agent_type)) = extract_spawn_info(&block) {
             ensure_subagent_stream(
                 emitter,
+                parent_emitter,
                 streams,
-                tool_use_id.clone(),
-                name,
-                description.clone(),
-                agent_type,
-                None,
+                SubAgentSpawnSpec {
+                    tool_use_id: tool_use_id.clone(),
+                    name,
+                    description: description.clone(),
+                    agent_type,
+                    session_id_hint: None,
+                },
             )
             .await;
             if let Some(stream) = streams.get_mut(&tool_use_id) {
@@ -3699,6 +4085,10 @@ async fn detect_subagent_completions(value: &Value, streams: &mut HashMap<String
             if phase_has_pending_output(&stream.summary, &stream.segment) {
                 close_current_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
             }
+            // Unthrottled final update with the closing stats.
+            stream
+                .parent_emitter
+                .tool_progress(&subagent_progress_data(&stream, true));
         }
     }
 }
@@ -3784,7 +4174,15 @@ fn consume_claude_stream_value(
             );
         }
         "system" => {
-            let system = parse_claude_system_frame(value).unwrap_or_else(|err| panic!("{err}"));
+            // Never panic on CLI output — the system-frame format is
+            // unversioned and grows new fields/subtypes over time.
+            let system = match parse_claude_system_frame(value) {
+                Ok(system) => system,
+                Err(err) => {
+                    tracing::warn!("Ignoring unparseable Claude system frame: {err}");
+                    return;
+                }
+            };
             if let Some(model) = system.model.as_ref() {
                 summary.model = Some(model.clone());
             }
@@ -3794,6 +4192,11 @@ fn consume_claude_stream_value(
                 ClaudeSystemEvent::CompactBoundary => {
                     summary.control_event = Some(ClaudeControlEvent::ConversationCompacted);
                 }
+                // Workflow task frames are consumed pre-gate in
+                // `read_claude_stdout_persistent` (they keep arriving
+                // between turns, when this per-turn path never runs);
+                // anything reaching here is a non-workflow task event
+                // with nothing to render.
                 ClaudeSystemEvent::TaskStarted
                 | ClaudeSystemEvent::TaskProgress
                 | ClaudeSystemEvent::TaskNotification => {
@@ -7796,6 +8199,14 @@ mod tests {
         make_test_inner_with_workspace("/tmp/test-workspace".to_string())
     }
 
+    fn test_parent_emitter() -> (Arc<TurnEmitter>, mpsc::UnboundedReceiver<Value>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Arc::new(TurnEmitter::new_for_agent(tx, AgentName(CLAUDE_AGENT_NAME))),
+            rx,
+        )
+    }
+
     fn make_test_inner_with_workspace(
         workspace_root: String,
     ) -> (ClaudeInner, mpsc::UnboundedReceiver<Value>) {
@@ -8267,8 +8678,7 @@ mod tests {
                     session_id_hint,
                     agent_id: agent_id.clone(),
                 });
-            let _ = agent_id;
-            Box::pin(async move { SubAgentHandle { event_tx } })
+            Box::pin(async move { SubAgentHandle { event_tx, agent_id } })
         }
     }
 
@@ -12007,6 +12417,201 @@ for raw_line in sys.stdin:
         assert_eq!(summary.streamed_text, "world");
     }
 
+    // ---- Workflow task-frame reducer (fixtures from a live CLI probe) ----
+
+    fn recv_tool_progress(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<WorkflowRunState> {
+        let mut snapshots = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event.get("kind").and_then(Value::as_str) != Some("ToolProgress") {
+                continue;
+            }
+            let data: ToolProgressData =
+                serde_json::from_value(event.get("data").cloned().unwrap_or(Value::Null))
+                    .expect("ToolProgress payload parses");
+            assert_eq!(data.tool_call_id, "toolu_wf");
+            assert_eq!(data.tool_name, "Workflow");
+            let ToolProgressUpdate::Workflow(state) = data.update else {
+                panic!("expected Workflow update");
+            };
+            snapshots.push(state);
+        }
+        snapshots
+    }
+
+    fn workflow_started_frame() -> Value {
+        json!({
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "task-wf",
+            "tool_use_id": "toolu_wf",
+            "description": "Probe: two agents reply hello",
+            "task_type": "local_workflow",
+            "workflow_name": "wfprobe",
+            "prompt": "export const meta = { name: 'wfprobe' }",
+        })
+    }
+
+    fn workflow_progress_frame(deltas: Value, total_tokens: u64) -> Value {
+        json!({
+            "type": "system",
+            "subtype": "task_progress",
+            "task_id": "task-wf",
+            "tool_use_id": "toolu_wf",
+            "summary": "Probe: two agents reply hello",
+            "usage": {"total_tokens": total_tokens, "tool_uses": 0, "duration_ms": 1586},
+            "workflow_progress": deltas,
+        })
+    }
+
+    fn agent_delta(index: u64, label: &str, state: &str) -> Value {
+        json!({
+            "type": "workflow_agent",
+            "index": index,
+            "label": label,
+            "phaseIndex": 1,
+            "phaseTitle": "Probe",
+            "agentId": format!("a{index}"),
+            "model": "claude-opus-4-8[1m]",
+            "state": state,
+            "attempt": 1,
+            "promptPreview": "Reply with exactly the word hello",
+            "tokens": 6539,
+            "toolCalls": 0,
+            "durationMs": 1562,
+            "resultPreview": "hello",
+        })
+    }
+
+    #[test]
+    fn workflow_task_frames_reduce_to_snapshots() {
+        let (inner, mut rx) = make_test_inner();
+        let mut runs: HashMap<String, WorkflowRunEntry> = HashMap::new();
+
+        assert!(handle_workflow_task_frame(
+            &workflow_started_frame(),
+            &mut runs,
+            &inner.emitter,
+        ));
+        assert!(handle_workflow_task_frame(
+            &workflow_progress_frame(
+                json!([
+                    agent_delta(1, "probe-1", "start"),
+                    agent_delta(2, "probe-2", "start")
+                ]),
+                6539,
+            ),
+            &mut runs,
+            &inner.emitter,
+        ));
+        // Progress without a state transition inside the throttle window
+        // must not emit.
+        assert!(handle_workflow_task_frame(
+            &workflow_progress_frame(json!([agent_delta(2, "probe-2", "progress")]), 9000),
+            &mut runs,
+            &inner.emitter,
+        ));
+        assert!(handle_workflow_task_frame(
+            &workflow_progress_frame(json!([agent_delta(2, "probe-2", "done")]), 10000),
+            &mut runs,
+            &inner.emitter,
+        ));
+        assert!(handle_workflow_task_frame(
+            &workflow_progress_frame(json!([agent_delta(1, "probe-1", "done")]), 13078),
+            &mut runs,
+            &inner.emitter,
+        ));
+        assert!(handle_workflow_task_frame(
+            &json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "task_id": "task-wf",
+                "tool_use_id": "toolu_wf",
+                "status": "completed",
+                "summary": "Dynamic workflow completed",
+            }),
+            &mut runs,
+            &inner.emitter,
+        ));
+        assert!(runs.is_empty(), "run is dropped after its notification");
+
+        let snapshots = recv_tool_progress(&mut rx);
+        // started + both-start + probe-2-done + probe-1-done + notification.
+        assert_eq!(snapshots.len(), 5);
+
+        let first = &snapshots[0];
+        assert_eq!(first.workflow_name, "wfprobe");
+        assert_eq!(
+            first.script.as_deref(),
+            Some("export const meta = { name: 'wfprobe' }")
+        );
+        assert_eq!(first.status, WorkflowRunStatus::Running);
+        assert!(first.agents.is_empty());
+
+        let last = snapshots.last().unwrap();
+        assert_eq!(last.status, WorkflowRunStatus::Completed);
+        assert_eq!(last.summary.as_deref(), Some("Dynamic workflow completed"));
+        assert_eq!(last.total_tokens, 13078);
+        assert_eq!(last.agents.len(), 2);
+        assert_eq!(last.agents[0].index, 1);
+        assert_eq!(last.agents[0].label, "probe-1");
+        assert_eq!(last.agents[0].state, WorkflowAgentStatus::Done);
+        assert_eq!(last.agents[0].phase_title.as_deref(), Some("Probe"));
+        assert_eq!(last.agents[0].result_preview.as_deref(), Some("hello"));
+        assert_eq!(last.agents[1].state, WorkflowAgentStatus::Done);
+    }
+
+    #[test]
+    fn workflow_malformed_deltas_and_unknown_states_are_tolerated() {
+        let (inner, mut rx) = make_test_inner();
+        let mut runs: HashMap<String, WorkflowRunEntry> = HashMap::new();
+
+        handle_workflow_task_frame(&workflow_started_frame(), &mut runs, &inner.emitter);
+        assert!(handle_workflow_task_frame(
+            &workflow_progress_frame(
+                json!([
+                    {"type": "workflow_agent"},               // no index
+                    {"type": "something_else", "index": 9},   // not an agent
+                    "not even an object",
+                    agent_delta(1, "probe-1", "some_future_state"),
+                ]),
+                100,
+            ),
+            &mut runs,
+            &inner.emitter,
+        ));
+
+        let snapshots = recv_tool_progress(&mut rx);
+        let last = snapshots.last().unwrap();
+        assert_eq!(last.agents.len(), 1);
+        assert_eq!(last.agents[0].state, WorkflowAgentStatus::Unknown);
+    }
+
+    #[test]
+    fn non_workflow_task_frames_fall_through() {
+        let (inner, mut rx) = make_test_inner();
+        let mut runs: HashMap<String, WorkflowRunEntry> = HashMap::new();
+
+        // A local_agent task_started belongs to the subagent path.
+        assert!(!handle_workflow_task_frame(
+            &json!({
+                "type": "system",
+                "subtype": "task_started",
+                "task_id": "task-agent",
+                "tool_use_id": "toolu_task",
+                "task_type": "local_agent",
+            }),
+            &mut runs,
+            &inner.emitter,
+        ));
+        // Progress for an untracked task is not ours either.
+        assert!(!handle_workflow_task_frame(
+            &workflow_progress_frame(json!([]), 1),
+            &mut runs,
+            &inner.emitter,
+        ));
+        assert!(recv_tool_progress(&mut rx).is_empty());
+    }
+
     #[test]
     fn compact_boundary_system_event_is_recognized() {
         let (inner, _rx) = make_test_inner();
@@ -12070,6 +12675,7 @@ for raw_line in sys.stdin:
     #[tokio::test]
     async fn task_started_local_agent_registers_subagent_and_routes_parent_events() {
         let emitter = TestSubAgentEmitter::default();
+        let (parent_emitter, _parent_rx) = test_parent_emitter();
         let mut streams = HashMap::new();
 
         detect_subagent_task_system_spawns(
@@ -12084,6 +12690,7 @@ for raw_line in sys.stdin:
                 "tool_use_id": "toolu_123"
             }),
             &emitter,
+            &parent_emitter,
             &mut streams,
         )
         .await;
@@ -12176,6 +12783,7 @@ for raw_line in sys.stdin:
     #[tokio::test]
     async fn task_started_local_bash_does_not_register_subagent() {
         let emitter = TestSubAgentEmitter::default();
+        let (parent_emitter, _parent_rx) = test_parent_emitter();
         let mut streams = HashMap::new();
 
         detect_subagent_task_system_spawns(
@@ -12189,6 +12797,7 @@ for raw_line in sys.stdin:
                 "tool_use_id": "toolu_bash"
             }),
             &emitter,
+            &parent_emitter,
             &mut streams,
         )
         .await;
@@ -12200,6 +12809,7 @@ for raw_line in sys.stdin:
     #[tokio::test]
     async fn task_started_dedupes_with_later_tool_use_spawn() {
         let emitter = TestSubAgentEmitter::default();
+        let (parent_emitter, _parent_rx) = test_parent_emitter();
         let mut streams = HashMap::new();
         let mut pending_prompts = HashMap::new();
 
@@ -12214,6 +12824,7 @@ for raw_line in sys.stdin:
                 "tool_use_id": "toolu_123"
             }),
             &emitter,
+            &parent_emitter,
             &mut streams,
         )
         .await;
@@ -12245,6 +12856,7 @@ for raw_line in sys.stdin:
                 }
             }),
             &emitter,
+            &parent_emitter,
             &mut streams,
             &mut pending_prompts,
         )
@@ -12433,6 +13045,79 @@ for raw_line in sys.stdin:
                 panic!("Live Claude integration turn was unexpectedly cancelled");
             }
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Claude CLI auth and network; set TYDE_RUN_CLAUDE_INTEGRATION=1"]
+    async fn live_claude_workflow_emits_tool_progress_snapshots() {
+        if std::env::var("TYDE_RUN_CLAUDE_INTEGRATION").ok().as_deref() != Some("1") {
+            eprintln!("Skipping live Claude integration test; set TYDE_RUN_CLAUDE_INTEGRATION=1");
+            return;
+        }
+
+        let prompt = "Use the Workflow tool (I explicitly request a workflow) with a trivial \
+            script: meta name wfprobe, one phase titled Probe, spawn 2 agents in parallel whose \
+            prompts are \"Reply with exactly the word hello and nothing else; do not use any \
+            tools.\" Wait for the task notification, then reply with the single word done. \
+            ultracode";
+        // Don't stop at the end of the turn: the model typically returns
+        // while the workflow is still running in the background, and the
+        // remaining ToolProgress snapshots arrive BETWEEN turns. That
+        // post-turn flow is exactly what this test exists to prove.
+        let (inner, mut rx) = make_live_test_inner(live_test_workspace_root());
+        inner.clone().start_turn(prompt.to_string(), None).await;
+
+        let mut events = Vec::new();
+        let mut snapshots: Vec<WorkflowRunState> = Vec::new();
+        loop {
+            let event = timeout(Duration::from_secs(300), rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "timed out waiting for completed workflow snapshot; events: {}",
+                        format_live_events(&events)
+                    )
+                })
+                .expect("live Claude event channel closed");
+            events.push(event.clone());
+            if event_kind(&event) != Some("ToolProgress") {
+                continue;
+            }
+            let Ok(data) = serde_json::from_value::<ToolProgressData>(
+                event.get("data").cloned().unwrap_or(Value::Null),
+            ) else {
+                continue;
+            };
+            if let ToolProgressUpdate::Workflow(state) = data.update {
+                let finished = state.status != WorkflowRunStatus::Running;
+                snapshots.push(state);
+                if finished {
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            !snapshots.is_empty(),
+            "expected live workflow ToolProgress snapshots; events: {}",
+            format_live_events(&events)
+        );
+        let last = snapshots.last().unwrap();
+        assert_eq!(
+            last.status,
+            WorkflowRunStatus::Completed,
+            "final snapshot should be completed; events: {}",
+            format_live_events(&events)
+        );
+        assert!(
+            last.agents.len() >= 2
+                && last
+                    .agents
+                    .iter()
+                    .all(|agent| agent.state == WorkflowAgentStatus::Done),
+            "both workflow agents should finish; final snapshot: {last:?}"
+        );
+        assert!(last.total_tokens > 0, "usage folded into final snapshot");
     }
 
     #[tokio::test]
@@ -13406,6 +14091,11 @@ for raw_line in sys.stdin:
                     runtime: Mutex::new(None),
                     turn_event_gate: Mutex::new(()),
                 }),
+                parent_tool_use_id: "toolu_spawn".to_string(),
+                agent_id: protocol::AgentId("test-subagent".to_string()),
+                agent_name: "Agent".to_string(),
+                parent_emitter: test_parent_emitter().0,
+                last_progress_emit: std::time::Instant::now(),
             },
         );
 

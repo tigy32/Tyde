@@ -11,6 +11,7 @@ use crate::components::file_view::FileView;
 use crate::components::home_view::HomeView;
 use crate::components::review_view::ReviewCommentsSurface;
 use crate::components::settings_panel::SettingsPanel;
+use crate::components::workflow_view::WorkflowView;
 use crate::send::send_frame;
 use crate::state::{AppState, ConnectionStatus, TabContent, TabId};
 
@@ -387,6 +388,7 @@ enum TabKind {
     File,
     Diff,
     Comments,
+    Workflow,
     Missing,
 }
 
@@ -419,6 +421,7 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                 Some(TabContent::File { .. }) => TabKind::File,
                 Some(TabContent::Diff { .. }) => TabKind::Diff,
                 Some(TabContent::Comments { .. }) => TabKind::Comments,
+                Some(TabContent::Workflow { .. }) => TabKind::Workflow,
                 None => TabKind::Missing,
             }
         })
@@ -539,6 +542,28 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                         match resolved {
                             Some((host_id, project_id)) => {
                                 view! { <ReviewCommentsSurface host_id=host_id project_id=project_id /> }.into_any()
+                            }
+                            None => view! { <div></div> }.into_any(),
+                        }
+                    }
+                    TabKind::Workflow => {
+                        // Workflow tab content is immutable for a given
+                        // TabId, mirroring File/Diff.
+                        let resolved = state.center_zone.with_untracked(|cz| {
+                            cz.tabs
+                                .iter()
+                                .find(|t| t.id == tab_id)
+                                .and_then(|t| match &t.content {
+                                    TabContent::Workflow {
+                                        agent_ref,
+                                        tool_call_id,
+                                    } => Some((agent_ref.clone(), tool_call_id.clone())),
+                                    _ => None,
+                                })
+                        });
+                        match resolved {
+                            Some((agent_ref, tool_call_id)) => {
+                                view! { <WorkflowView agent_ref=agent_ref tool_call_id=tool_call_id /> }.into_any()
                             }
                             None => view! { <div></div> }.into_any(),
                         }

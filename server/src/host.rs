@@ -25,22 +25,21 @@ use protocol::{
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
     ProjectSearchCancelPayload, ProjectSearchCompletePayload, ProjectSearchFileResult,
     ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
-    ProjectStageHunkPayload,
-    ProjectUnstageFilePayload,
-    ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection, ReviewId, ReviewSubmitTarget,
-    RunBackendSetupPayload, SendMessagePayload, SessionId, SessionListPayload, SessionSchemaEntry,
-    SessionSchemasPayload, SessionSettingsSchema, SetSettingPayload, Skill, SkillNotifyPayload,
-    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TeamCreatePayload,
-    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
-    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
-    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId,
-    TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
-    TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
-    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, WorkbenchCreatePayload,
-    WorkbenchRemovePayload, WorkbenchRoot,
+    ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
+    ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
+    SessionId, SessionListPayload, SessionSchemaEntry, SessionSchemasPayload,
+    SessionSettingsSchema, SetSettingPayload, Skill, SkillNotifyPayload, SkillRefreshPayload,
+    SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
+    SteeringScope, SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
+    TeamDraftUpdatePayload, TeamId, TeamMember, TeamMemberBindingNotifyPayload,
+    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload,
+    TeamMemberRole, TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload,
+    TeamMemberState, TeamMemberUpdatePayload, TeamNotifyPayload, TeamRenamePayload,
+    TeamSetManagerPayload, TerminalCreatePayload, TerminalId, TerminalLaunchTarget,
+    TerminalResizePayload, TerminalSendPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    WorkbenchRoot,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -73,8 +72,8 @@ use crate::mobile_access::{
     MobileAccessCommand, MobileAccessHandle, MobileAccessInit, spawn_mobile_access_actor,
 };
 use crate::project_stream::{
-    ProjectDiffRequestKey, ProjectStreamHandle, ProjectStreamSubscription, build_dir_listing,
-    SearchSummary, commit, discard_file, is_not_git_repository_error, read_diff, read_file,
+    ProjectDiffRequestKey, ProjectStreamHandle, ProjectStreamSubscription, SearchSummary,
+    build_dir_listing, commit, discard_file, is_not_git_repository_error, read_diff, read_file,
     search_project, spawn_project_subscription, stage_file, stage_hunk, unstage_file,
 };
 use crate::review::actor::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
@@ -4834,8 +4833,10 @@ impl HostHandle {
 
         self.fan_out_session_lists().await;
 
-        let _ = start;
-        SubAgentHandle { event_tx }
+        SubAgentHandle {
+            event_tx,
+            agent_id: start.agent_id,
+        }
     }
 
     pub(crate) async fn open_browse_stream(
@@ -5124,12 +5125,7 @@ impl HostHandle {
         if let Some(slot) = state.project_search_ids.get(&project_id) {
             // Only clear if it still points at the search being cancelled, so a
             // newer search that already replaced it keeps running.
-            let _ = slot.compare_exchange(
-                payload.search_id,
-                0,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
+            let _ = slot.compare_exchange(payload.search_id, 0, Ordering::SeqCst, Ordering::SeqCst);
         }
         Ok(())
     }

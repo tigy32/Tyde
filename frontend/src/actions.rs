@@ -12,7 +12,8 @@ use protocol::{
     ProjectDeleteRootPayload, ProjectId, ProjectPath, ProjectReadFilePayload, ProjectRenamePayload,
     ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload,
     ProjectSearchPayload, SessionId, SessionSettingsValues, SetSessionSettingsPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath, WorkbenchCreatePayload,
+    WorkbenchRemovePayload,
 };
 
 /// Resume a session on the given host. Synchronously switches the active
@@ -316,7 +317,10 @@ pub fn start_project_search(state: &AppState) {
     };
     // An empty query clears the results and cancels any still-running walk on
     // the server (the previous `search_id`), rather than leaving it churning.
-    if state.search_state.with_untracked(|s| s.query.trim().is_empty()) {
+    if state
+        .search_state
+        .with_untracked(|s| s.query.trim().is_empty())
+    {
         cancel_project_search(state);
         state.search_state.update(|s| {
             s.results.clear();
@@ -393,8 +397,13 @@ pub fn cancel_project_search(state: &AppState) {
         search_id: cancelled_id,
     };
     spawn_local(async move {
-        if let Err(error) =
-            send_frame(&host_id, project_stream, FrameKind::ProjectSearchCancel, &payload).await
+        if let Err(error) = send_frame(
+            &host_id,
+            project_stream,
+            FrameKind::ProjectSearchCancel,
+            &payload,
+        )
+        .await
         {
             log::error!("failed to send ProjectSearchCancel: {error}");
         }

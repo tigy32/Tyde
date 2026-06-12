@@ -4,7 +4,7 @@ use wasm_bindgen::JsCast;
 
 use crate::components::tool_card::ToolCardListView;
 use crate::markdown::render_markdown;
-use crate::state::ChatRowHandle;
+use crate::state::{ActiveAgentRef, ChatRowHandle};
 
 /// Render a single chat row from its row-local signal.
 ///
@@ -13,7 +13,10 @@ use crate::state::ChatRowHandle;
 /// `ChatMessageView`s only subscribe to their own `ArcRwSignal`, so long
 /// history replay does not wake every already-mounted row.
 #[component]
-pub fn ChatMessageView(row: ChatRowHandle) -> impl IntoView {
+pub fn ChatMessageView(
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    row: ChatRowHandle,
+) -> impl IntoView {
     let entry = row.entry;
 
     // Each Memo reads through `with` to avoid cloning the entire
@@ -225,7 +228,7 @@ pub fn ChatMessageView(row: ChatRowHandle) -> impl IntoView {
                     return None;
                 }
                 Some(view! {
-                    <ToolCardListView entries=tools />
+                    <ToolCardListView agent_ref=agent_ref entries=tools />
                 })
             }}
 
@@ -353,7 +356,7 @@ fn format_relative_time(timestamp_ms: u64) -> String {
     }
 }
 
-fn format_compact(n: u64) -> String {
+pub(crate) fn format_compact(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {

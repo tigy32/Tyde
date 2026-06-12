@@ -10,12 +10,12 @@ use protocol::{
     MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload, Project,
     ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath,
     ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, ProjectSearchFileResult,
-    QueuedMessageEntry, Review,
-    ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry,
-    SessionSettingsValues, SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath,
-    TaskList, Team, TeamDraft, TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload,
-    TeamMemberId, TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload,
-    TeamPresetCatalog, TerminalId, ToolExecutionCompletedData, ToolRequest,
+    QueuedMessageEntry, Review, ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary,
+    SessionId, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId, Steering,
+    SteeringId, StreamPath, TaskList, Team, TeamDraft, TeamDraftId, TeamId, TeamMember,
+    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
+    ToolExecutionCompletedData, ToolProgressData, ToolRequest,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +147,13 @@ pub enum TabContent {
     Comments {
         host_id: String,
         project_id: ProjectId,
+    },
+    /// Detail view for a Claude Code workflow run, opened from its tool
+    /// card. Binds to the owning agent's chat plus the Workflow tool
+    /// call id; live state is read from `AppState::workflow_runs`.
+    Workflow {
+        agent_ref: ActiveAgentRef,
+        tool_call_id: ToolCallId,
     },
 }
 
@@ -826,6 +833,15 @@ pub struct AppState {
     /// (host runtime reset, agent close, agent bootstrap snapshot).
     pub chat_message_rows: RwSignal<HashMap<AgentId, HashMap<ChatMessageId, ChatRowId>>>,
     pub streaming_text: RwSignal<HashMap<AgentId, StreamingState>>,
+    /// Latest `ToolProgress` snapshot per tool call, keyed by the owning
+    /// agent and tool call id. The single source of truth for live tool
+    /// activity (workflow runs, sub-agents): tool cards and the workflow
+    /// tab look snapshots up reactively here — progress is deliberately
+    /// NOT stored on `ToolRequestEntry`, which keyed `<For>` rows would
+    /// render as a frozen snapshot. The inner signal lets an open card
+    /// update without re-rendering the whole map. Cleared anywhere
+    /// `chat_tool_rows` is cleared.
+    pub tool_progress: RwSignal<HashMap<(AgentId, ToolCallId), ArcRwSignal<ToolProgressData>>>,
     pub chat_input: RwSignal<String>,
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
     pub center_zone: RwSignal<CenterZoneState>,
@@ -1101,6 +1117,7 @@ impl AppState {
             chat_tool_rows: RwSignal::new(HashMap::new()),
             chat_message_rows: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
+            tool_progress: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
             task_lists: RwSignal::new(HashMap::new()),
             center_zone,
@@ -1381,6 +1398,9 @@ impl AppState {
         });
         self.chat_tool_rows.update(|map| {
             map.remove(agent_id);
+        });
+        self.tool_progress.update(|map| {
+            map.retain(|(id, _), _| id != agent_id);
         });
         self.chat_message_rows.update(|map| {
             map.remove(agent_id);
@@ -1873,6 +1893,9 @@ impl AppState {
             });
             self.chat_tool_rows.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.tool_progress.update(|map| {
+                map.retain(|(id, _), _| !drop_set.contains(id));
             });
             self.chat_message_rows.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));

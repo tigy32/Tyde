@@ -7,6 +7,10 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Clone)]
 pub(crate) struct SubAgentHandle {
     pub event_tx: mpsc::UnboundedSender<ChatEvent>,
+    /// Id of the spawned sub-agent, included in `ToolProgress` updates
+    /// on the parent's Task tool card so the frontend can link to the
+    /// sub-agent's own view.
+    pub agent_id: AgentId,
 }
 
 pub(crate) trait SubAgentEmitter: Send + Sync {
