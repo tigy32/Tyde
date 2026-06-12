@@ -2403,18 +2403,14 @@ impl CodexInner {
                         .unwrap_or_default()
                 };
                 let file_changes = parse_codex_file_changes(item);
+                let completions =
+                    codex_file_change_completion_plan(&item_id, &known_call_ids, &file_changes);
 
-                if !file_changes.is_empty() {
-                    let total = file_changes.len();
-                    for (idx, change) in file_changes.iter().enumerate() {
-                        let call_id = known_call_ids
-                            .get(idx)
-                            .cloned()
-                            .unwrap_or_else(|| codex_file_change_call_id(&item_id, idx, total));
-
-                        if known_call_ids.get(idx).is_none() {
+                if !completions.is_empty() {
+                    for completion in completions {
+                        if let Some(change) = completion.request.as_ref() {
                             self.emit_modify_file_request(
-                                &call_id,
+                                &completion.call_id,
                                 &change.path,
                                 &change.before,
                                 &change.after,
@@ -2422,54 +2418,13 @@ impl CodexInner {
                         }
 
                         self.emit_tool_execution_completed(
-                            &call_id,
+                            &completion.call_id,
                             "modify_file",
                             success,
                             json!({
                                 "kind": "ModifyFile",
-                                "lines_added": change.lines_added,
-                                "lines_removed": change.lines_removed
-                            }),
-                            if success {
-                                None
-                            } else {
-                                Some("File changes were not applied".to_string())
-                            },
-                        )
-                        .await;
-                    }
-
-                    for call_id in known_call_ids.iter().skip(total) {
-                        self.emit_tool_execution_completed(
-                            call_id,
-                            "modify_file",
-                            success,
-                            json!({
-                                "kind": "ModifyFile",
-                                "lines_added": 0,
-                                "lines_removed": 0
-                            }),
-                            if success {
-                                None
-                            } else {
-                                Some("File changes were not applied".to_string())
-                            },
-                        )
-                        .await;
-                    }
-                    return;
-                }
-
-                if !known_call_ids.is_empty() {
-                    for call_id in known_call_ids {
-                        self.emit_tool_execution_completed(
-                            &call_id,
-                            "modify_file",
-                            success,
-                            json!({
-                                "kind": "ModifyFile",
-                                "lines_added": 0,
-                                "lines_removed": 0
+                                "lines_added": completion.lines_added,
+                                "lines_removed": completion.lines_removed
                             }),
                             if success {
                                 None
@@ -3944,12 +3899,62 @@ struct CodexFileChange {
     lines_removed: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CodexFileChangeCompletion {
+    call_id: String,
+    request: Option<CodexFileChange>,
+    lines_added: u64,
+    lines_removed: u64,
+}
+
 fn codex_file_change_call_id(item_id: &str, index: usize, total: usize) -> String {
     if total <= 1 {
         item_id.to_string()
     } else {
         format!("{item_id}#{}", index + 1)
     }
+}
+
+fn codex_file_change_completion_plan(
+    item_id: &str,
+    known_call_ids: &[String],
+    file_changes: &[CodexFileChange],
+) -> Vec<CodexFileChangeCompletion> {
+    if file_changes.is_empty() {
+        return known_call_ids
+            .iter()
+            .map(|call_id| CodexFileChangeCompletion {
+                call_id: call_id.clone(),
+                request: None,
+                lines_added: 0,
+                lines_removed: 0,
+            })
+            .collect();
+    }
+
+    let total = file_changes.len();
+    let mut completions = Vec::with_capacity(known_call_ids.len().max(total));
+    for (idx, change) in file_changes.iter().enumerate() {
+        let known_call_id = known_call_ids.get(idx).cloned();
+        completions.push(CodexFileChangeCompletion {
+            call_id: known_call_id
+                .unwrap_or_else(|| codex_file_change_call_id(item_id, idx, total)),
+            request: (known_call_ids.get(idx).is_none()).then(|| change.clone()),
+            lines_added: change.lines_added,
+            lines_removed: change.lines_removed,
+        });
+    }
+
+    completions.extend(known_call_ids.iter().skip(total).map(|call_id| {
+        CodexFileChangeCompletion {
+            call_id: call_id.clone(),
+            request: None,
+            lines_added: 0,
+            lines_removed: 0,
+        }
+    }));
+
+    completions
 }
 
 fn parse_codex_file_changes(item: &Value) -> Vec<CodexFileChange> {
@@ -6021,28 +6026,35 @@ impl Backend for CodexBackend {
                                             item.get("status").and_then(Value::as_str) == Some("completed");
                                         let known_call_ids =
                                             file_change_call_ids.remove(&item_id).unwrap_or_default();
-                                        if !file_changes.is_empty() {
-                                            let total = file_changes.len();
-                                            for (idx, change) in file_changes.iter().enumerate() {
-                                                let call_id = known_call_ids
-                                                    .get(idx)
-                                                    .cloned()
-                                                    .unwrap_or_else(|| {
-                                                        codex_file_change_call_id(&item_id, idx, total)
-                                                    });
+                                        let completions = codex_file_change_completion_plan(
+                                            &item_id,
+                                            &known_call_ids,
+                                            &file_changes,
+                                        );
+                                        if !completions.is_empty() {
+                                            for completion in completions {
+                                                if let Some(change) = completion.request.as_ref() {
+                                                    emit_modify_file_request_to(
+                                                        &emitter,
+                                                        &completion.call_id,
+                                                        &change.path,
+                                                        &change.before,
+                                                        &change.after,
+                                                    );
+                                                }
                                                 emitter.tool_completed(ToolCompletedPayload {
-                                                    tool_call_id: &call_id,
+                                                    tool_call_id: &completion.call_id,
                                                     tool_name: "modify_file",
                                                     tool_result: json!({
                                                         "kind": "ModifyFile",
-                                                        "lines_added": change.lines_added,
-                                                        "lines_removed": change.lines_removed,
+                                                        "lines_added": completion.lines_added,
+                                                        "lines_removed": completion.lines_removed,
                                                     }),
                                                     success,
                                                     error: (!success)
                                                         .then_some("File changes were not applied"),
                                                 });
-                                                pending_tool_call_ids.remove(&call_id);
+                                                pending_tool_call_ids.remove(&completion.call_id);
                                             }
                                             maybe_finish_codex_loop_segment(
                                                 &emitter,
@@ -7130,6 +7142,96 @@ for line in sys.stdin:
 
     fn live_test_log(msg: &str) {
         eprintln!("[live-codex-test] {msg}");
+    }
+
+    fn test_file_change(path: &str, lines_added: u64, lines_removed: u64) -> CodexFileChange {
+        CodexFileChange {
+            path: path.to_string(),
+            before: "before".to_string(),
+            after: "after".to_string(),
+            lines_added,
+            lines_removed,
+        }
+    }
+
+    #[test]
+    fn file_change_completion_plan_completes_missing_started_paths() {
+        let known_call_ids = vec![
+            "change-1#1".to_string(),
+            "change-1#2".to_string(),
+            "change-1#3".to_string(),
+            "change-1#4".to_string(),
+        ];
+        let file_changes = vec![
+            test_file_change("src/a.rs", 4, 1),
+            test_file_change("src/b.rs", 2, 0),
+        ];
+
+        let completions =
+            codex_file_change_completion_plan("change-1", &known_call_ids, &file_changes);
+
+        assert_eq!(completions.len(), 4);
+        assert_eq!(
+            completions
+                .iter()
+                .map(|completion| completion.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["change-1#1", "change-1#2", "change-1#3", "change-1#4"]
+        );
+        assert_eq!(
+            completions
+                .iter()
+                .map(|completion| (completion.lines_added, completion.lines_removed))
+                .collect::<Vec<_>>(),
+            vec![(4, 1), (2, 0), (0, 0), (0, 0)]
+        );
+        assert!(
+            completions
+                .iter()
+                .all(|completion| completion.request.is_none()),
+            "known request ids should not emit duplicate requests"
+        );
+    }
+
+    #[test]
+    fn file_change_completion_plan_completes_known_ids_without_changes() {
+        let known_call_ids = vec!["change-2#1".to_string(), "change-2#2".to_string()];
+
+        let completions = codex_file_change_completion_plan("change-2", &known_call_ids, &[]);
+
+        assert_eq!(
+            completions
+                .iter()
+                .map(|completion| (completion.call_id.as_str(), completion.lines_added))
+                .collect::<Vec<_>>(),
+            vec![("change-2#1", 0), ("change-2#2", 0)]
+        );
+    }
+
+    #[test]
+    fn file_change_completion_plan_requests_new_completed_changes() {
+        let file_changes = vec![
+            test_file_change("src/a.rs", 1, 0),
+            test_file_change("src/b.rs", 0, 3),
+        ];
+
+        let completions = codex_file_change_completion_plan("change-3", &[], &file_changes);
+
+        assert_eq!(
+            completions
+                .iter()
+                .map(|completion| completion.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["change-3#1", "change-3#2"]
+        );
+        assert_eq!(
+            completions
+                .iter()
+                .filter_map(|completion| completion.request.as_ref())
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/a.rs", "src/b.rs"]
+        );
     }
 
     #[test]
