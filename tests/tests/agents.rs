@@ -704,6 +704,53 @@ async fn expect_agent_start_on_stream(
     }
 }
 
+async fn spawn_user_child(
+    client: &mut client::Connection,
+    parent_agent_id: &protocol::AgentId,
+    name: &str,
+    prompt: &str,
+    workspace_root: &str,
+) -> NewAgentPayload {
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(parent_agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![workspace_root.to_owned()],
+                prompt: prompt.to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .unwrap_or_else(|error| panic!("spawn {name} failed: {error:?}"));
+
+    let env = expect_next_event(client, &format!("{name} NewAgent")).await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let child_new: NewAgentPayload = env.parse_payload().expect("parse child NewAgent");
+    assert_eq!(child_new.parent_agent_id.as_ref(), Some(parent_agent_id));
+
+    let child_start =
+        expect_agent_start_on_stream(client, &child_new.instance_stream, &format!("{name} start"))
+            .await;
+    assert_eq!(child_start.origin, AgentOrigin::User);
+    assert_eq!(child_start.parent_agent_id.as_ref(), Some(parent_agent_id));
+
+    expect_turn_on_stream(
+        client,
+        &child_new.instance_stream,
+        &format!("mock backend response to: {prompt}"),
+    )
+    .await;
+
+    child_new
+}
+
 async fn spawn_parent_with_native_child(
     client: &mut client::Connection,
 ) -> (
@@ -951,6 +998,108 @@ async fn close_agent_emits_agent_closed_and_removes_agent_from_registry() {
         "closed agent should not replay to new clients",
     )
     .await;
+}
+
+#[tokio::test]
+async fn close_agent_recursively_closes_descendants_first() {
+    let mut fixture = Fixture::new().await;
+
+    let (parent_new, _parent_start, relay_child_new, _relay_child_start) =
+        spawn_parent_with_native_child(&mut fixture.client).await;
+    let user_child_new = spawn_user_child(
+        &mut fixture.client,
+        &parent_new.agent_id,
+        "close-user-child",
+        "user child",
+        "/tmp/close-user-child",
+    )
+    .await;
+    let grandchild_new = spawn_user_child(
+        &mut fixture.client,
+        &user_child_new.agent_id,
+        "close-grandchild",
+        "grandchild",
+        "/tmp/close-grandchild",
+    )
+    .await;
+
+    let ids_before_close = fixture.agent_ids().await;
+    for expected in [
+        &parent_new.agent_id,
+        &relay_child_new.agent_id,
+        &user_child_new.agent_id,
+        &grandchild_new.agent_id,
+    ] {
+        assert!(
+            ids_before_close.contains(expected),
+            "agent {expected} should be registered before close"
+        );
+    }
+
+    fixture
+        .client
+        .close_agent(&parent_new.instance_stream)
+        .await
+        .expect("close parent failed");
+
+    let mut closed_order = Vec::new();
+    loop {
+        let env = expect_next_event(&mut fixture.client, "recursive AgentClosed").await;
+        if env.kind != FrameKind::AgentClosed {
+            continue;
+        }
+        let closed: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
+        let is_parent = closed.agent_id == parent_new.agent_id;
+        closed_order.push(closed.agent_id);
+        if is_parent {
+            break;
+        }
+    }
+
+    let position = |agent_id: &protocol::AgentId| {
+        closed_order
+            .iter()
+            .position(|closed| closed == agent_id)
+            .unwrap_or_else(|| panic!("missing AgentClosed for {agent_id}: {closed_order:?}"))
+    };
+    let parent_position = position(&parent_new.agent_id);
+    assert_eq!(
+        parent_position,
+        closed_order.len() - 1,
+        "parent must be closed after descendants"
+    );
+    assert!(position(&relay_child_new.agent_id) < parent_position);
+    assert!(position(&user_child_new.agent_id) < parent_position);
+    assert!(position(&grandchild_new.agent_id) < position(&user_child_new.agent_id));
+
+    let ids_after_close = fixture.agent_ids().await;
+    for closed in [
+        &parent_new.agent_id,
+        &relay_child_new.agent_id,
+        &user_child_new.agent_id,
+        &grandchild_new.agent_id,
+    ] {
+        assert!(
+            !ids_after_close.contains(closed),
+            "agent {closed} should be removed after recursive close"
+        );
+    }
+
+    let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    for closed in [
+        &parent_new.agent_id,
+        &relay_child_new.agent_id,
+        &user_child_new.agent_id,
+        &grandchild_new.agent_id,
+    ] {
+        assert!(
+            !bootstrap
+                .agents
+                .iter()
+                .any(|agent| &agent.agent_id == closed),
+            "closed descendant {closed} should not replay to late clients"
+        );
+    }
 }
 
 #[tokio::test]

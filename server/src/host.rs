@@ -4463,60 +4463,80 @@ impl HostHandle {
     }
 
     pub(crate) async fn close_agent(&self, agent_id: &AgentId) -> bool {
-        let (agent_handle, host_streams) = {
+        let (close_targets, host_streams) = {
             let state = self.state.lock().await;
-            let Some(agent_handle) = state.registry.agent_handle(agent_id) else {
+            let close_targets = state.registry.agent_subtree_post_order(agent_id);
+            if close_targets.is_empty() {
                 return false;
-            };
+            }
             let host_streams = state
                 .host_streams
                 .iter()
                 .map(|(path, subscriber)| (path.clone(), subscriber.stream.clone()))
                 .collect::<Vec<_>>();
-            (agent_handle, host_streams)
+            (close_targets, host_streams)
         };
 
-        let _ = agent_handle.close().await;
-
-        let payload = AgentClosedPayload {
-            agent_id: agent_id.clone(),
-        };
+        let close_ids = close_targets
+            .iter()
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect::<Vec<_>>();
+        let mut live_streams = host_streams;
         let mut dead_paths = Vec::new();
-        for (path, stream) in host_streams {
-            if emit_agent_closed_for_stream(&payload, &stream)
-                .await
-                .is_err()
-            {
-                dead_paths.push(path);
+
+        for (target_agent_id, agent_handle) in close_targets {
+            let _ = agent_handle.close().await;
+
+            let payload = AgentClosedPayload {
+                agent_id: target_agent_id,
+            };
+            let mut failed_paths = Vec::new();
+            for (path, stream) in &live_streams {
+                if emit_agent_closed_for_stream(&payload, stream)
+                    .await
+                    .is_err()
+                {
+                    failed_paths.push(path.clone());
+                }
+            }
+            if !failed_paths.is_empty() {
+                live_streams.retain(|(path, _)| !failed_paths.contains(path));
+                dead_paths.extend(failed_paths);
             }
         }
-        if !dead_paths.is_empty() {
-            let mut state = self.state.lock().await;
-            for path in dead_paths {
-                state.host_streams.remove(&path);
-            }
-        }
+
+        dead_paths.sort_by(|left, right| left.0.cmp(&right.0));
+        dead_paths.dedup();
 
         let mut state = self.state.lock().await;
-        let removed = state.registry.remove_agent(agent_id);
-        assert!(
-            removed.is_some(),
-            "agent {} disappeared from registry before close completed",
-            agent_id
-        );
-        state.agent_sessions.remove(agent_id);
-        match state
-            .team_registry
-            .clear_binding_by_agent(agent_id.clone())
-            .await
-        {
-            Ok(events) => fan_out_team_registry_events(&mut state, events).await,
-            Err(error) => {
-                tracing::warn!(
-                    agent_id = %agent_id,
-                    error = %error,
-                    "failed to clear team binding while closing agent"
+        for path in dead_paths {
+            state.host_streams.remove(&path);
+        }
+
+        for closed_agent_id in close_ids {
+            let removed = state.registry.remove_agent(&closed_agent_id);
+            if removed.is_none() {
+                tracing::debug!(
+                    agent_id = %closed_agent_id,
+                    "agent was already removed before close cleanup completed"
                 );
+                continue;
+            }
+
+            state.agent_sessions.remove(&closed_agent_id);
+            match state
+                .team_registry
+                .clear_binding_by_agent(closed_agent_id.clone())
+                .await
+            {
+                Ok(events) => fan_out_team_registry_events(&mut state, events).await,
+                Err(error) => {
+                    tracing::warn!(
+                        agent_id = %closed_agent_id,
+                        error = %error,
+                        "failed to clear team binding while closing agent"
+                    );
+                }
             }
         }
 

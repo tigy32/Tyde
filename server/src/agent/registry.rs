@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -192,6 +192,7 @@ struct AgentEntry {
     handle: AgentHandle,
     status_handle: AgentStatusHandle,
     access_mode: BackendAccessMode,
+    parent_agent_id: Option<AgentId>,
 }
 
 impl AgentRegistry {
@@ -255,6 +256,7 @@ impl AgentRegistry {
                 handle: handle.clone(),
                 status_handle,
                 access_mode,
+                parent_agent_id: start.parent_agent_id.clone(),
             },
         );
         assert!(
@@ -308,6 +310,7 @@ impl AgentRegistry {
                 handle: handle.clone(),
                 status_handle,
                 access_mode: BackendAccessMode::Unrestricted,
+                parent_agent_id: start.parent_agent_id.clone(),
             },
         );
         assert!(
@@ -341,6 +344,36 @@ impl AgentRegistry {
         self.agents.keys().cloned().collect()
     }
 
+    pub fn agent_subtree_post_order(&self, agent_id: &AgentId) -> Vec<(AgentId, AgentHandle)> {
+        if !self.agents.contains_key(agent_id) {
+            return Vec::new();
+        }
+
+        let mut children_by_parent: HashMap<AgentId, Vec<AgentId>> = HashMap::new();
+        for (candidate_id, entry) in &self.agents {
+            if let Some(parent_agent_id) = &entry.parent_agent_id {
+                children_by_parent
+                    .entry(parent_agent_id.clone())
+                    .or_default()
+                    .push(candidate_id.clone());
+            }
+        }
+        for children in children_by_parent.values_mut() {
+            children.sort_by(|left, right| left.0.cmp(&right.0));
+        }
+
+        let mut visited = HashSet::new();
+        let mut ordered = Vec::new();
+        collect_agent_subtree_post_order(
+            agent_id,
+            &self.agents,
+            &children_by_parent,
+            &mut visited,
+            &mut ordered,
+        );
+        ordered
+    }
+
     pub fn subscribe_status_changes(&self) -> watch::Receiver<u64> {
         self.status_change_tx.subscribe()
     }
@@ -350,5 +383,33 @@ impl AgentRegistry {
             self.status_change_tx.clone(),
             Arc::clone(&self.status_change_counter),
         )
+    }
+}
+
+fn collect_agent_subtree_post_order(
+    agent_id: &AgentId,
+    agents: &HashMap<AgentId, AgentEntry>,
+    children_by_parent: &HashMap<AgentId, Vec<AgentId>>,
+    visited: &mut HashSet<AgentId>,
+    ordered: &mut Vec<(AgentId, AgentHandle)>,
+) {
+    if !visited.insert(agent_id.clone()) {
+        return;
+    }
+
+    if let Some(children) = children_by_parent.get(agent_id) {
+        for child_id in children {
+            collect_agent_subtree_post_order(
+                child_id,
+                agents,
+                children_by_parent,
+                visited,
+                ordered,
+            );
+        }
+    }
+
+    if let Some(entry) = agents.get(agent_id) {
+        ordered.push((agent_id.clone(), entry.handle.clone()));
     }
 }
