@@ -4250,11 +4250,21 @@ mod wasm_tests {
         diff: DiffViewState,
         review: Option<protocol::Review>,
     ) {
+        mount_reviewable_with_mode(container, diff, review, DiffViewMode::Unified);
+    }
+
+    fn mount_reviewable_with_mode(
+        container: HtmlElement,
+        diff: DiffViewState,
+        review: Option<protocol::Review>,
+        view_mode: DiffViewMode,
+    ) {
         let scope = diff.scope;
         let path = diff.path.clone().unwrap_or_default();
         let root = diff.root.clone();
         let handle = mount_to(container, move || {
             let state = AppState::new();
+            state.diff_view_mode.set(view_mode);
             state
                 .active_project
                 .set(Some(crate::state::ActiveProjectRef {
@@ -4351,6 +4361,80 @@ mod wasm_tests {
                 .unwrap()
                 .is_some(),
             "expected clickable comment gutters on a reviewable diff"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn reviewable_diff_clicking_added_line_opens_composer() {
+        ensure_styles_loaded();
+        let container = make_container();
+        mount_reviewable(
+            container.clone(),
+            small_foo_diff(),
+            Some(draft_review("src/foo.rs", 2, "please fix this")),
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let gutter = container
+            .query_selector(".diff-gutter-new.diff-gutter-clickable[data-line-num=\"2\"]")
+            .unwrap()
+            .expect("new-side added-line gutter");
+        gutter
+            .dispatch_event(&web_sys::PointerEvent::new("pointerdown").unwrap())
+            .unwrap();
+        web_sys::window()
+            .unwrap()
+            .dispatch_event(&web_sys::PointerEvent::new("pointerup").unwrap())
+            .unwrap();
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".review-composer")
+                .unwrap()
+                .is_some(),
+            "clicking an added-line gutter should open an inline composer"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn reviewable_sbs_pure_add_clicking_added_line_opens_composer() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let mut diff = small_foo_diff();
+        diff.files[0].hunks[0].lines = diff.files[0].hunks[0].lines[1..].to_vec();
+        diff.files[0].hunks[0].old_count = 0;
+        mount_reviewable_with_mode(
+            container.clone(),
+            diff,
+            Some(draft_review("src/foo.rs", 2, "please fix this")),
+            DiffViewMode::SideBySide,
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let gutter = container
+            .query_selector(
+                ".diff-pane-right .diff-gutter.diff-gutter-clickable[data-line-num=\"2\"]",
+            )
+            .unwrap()
+            .expect("right-pane added-line gutter");
+        gutter
+            .dispatch_event(&web_sys::PointerEvent::new("pointerdown").unwrap())
+            .unwrap();
+        web_sys::window()
+            .unwrap()
+            .dispatch_event(&web_sys::PointerEvent::new("pointerup").unwrap())
+            .unwrap();
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".review-composer")
+                .unwrap()
+                .is_some(),
+            "clicking a pure-add side-by-side gutter should open an inline composer"
         );
     }
 

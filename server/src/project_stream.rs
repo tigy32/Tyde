@@ -1154,7 +1154,11 @@ where
         validate_relative_path(path)?;
     }
 
-    let mut args = vec!["diff", git_diff_context_arg(payload.context_mode)];
+    let mut args = vec![
+        "diff",
+        "--relative",
+        git_diff_context_arg(payload.context_mode),
+    ];
     match payload.scope {
         ProjectDiffScope::Staged => args.push("--cached"),
         ProjectDiffScope::Unstaged => {}
@@ -1986,6 +1990,21 @@ mod tests {
         }
     }
 
+    fn git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("git {:?} failed to spawn: {err}", args));
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn build_git_status_uses_read_only_git_access() {
         let project = test_project("/repo");
@@ -2049,6 +2068,7 @@ mod tests {
                     "/repo".to_owned(),
                     vec![
                         "diff".to_owned(),
+                        "--relative".to_owned(),
                         "-U3".to_owned(),
                         "--".to_owned(),
                         "src/lib.rs".to_owned(),
@@ -2105,6 +2125,53 @@ mod tests {
                 ],
                 GitAccessMode::ReadOnly,
             )]
+        );
+    }
+
+    #[test]
+    fn read_diff_reports_paths_relative_to_subdirectory_root() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let repo = temp_dir.path().join("repo");
+        let sub_root = repo.join("sub");
+        fs::create_dir_all(&sub_root).expect("create sub root");
+        git(&repo, &["init"]);
+        git(&repo, &["config", "user.email", "review@example.com"]);
+        git(&repo, &["config", "user.name", "Review Test"]);
+        fs::write(sub_root.join("tracked.txt"), "one\n").expect("write tracked");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "Initial"]);
+        fs::write(sub_root.join("tracked.txt"), "one\ntwo\n").expect("modify tracked");
+        fs::write(sub_root.join("new.txt"), "fresh\n").expect("write untracked");
+
+        let root = sub_root.to_str().expect("sub root utf8").to_owned();
+        let project = test_project(&root);
+        let diff = read_diff(
+            &project,
+            ProjectReadDiffPayload {
+                root: ProjectRootPath(root),
+                scope: ProjectDiffScope::Unstaged,
+                path: None,
+                context_mode: DiffContextMode::Hunks,
+            },
+        )
+        .expect("read diff from subdirectory root");
+
+        let paths = diff
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            paths.contains(&"tracked.txt"),
+            "tracked diff path must be relative to the configured root: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"new.txt"),
+            "untracked diff path must remain relative to the configured root: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"sub/tracked.txt"),
+            "tracked diff path must not be repo-root relative: {paths:?}"
         );
     }
 
@@ -2188,7 +2255,7 @@ mod tests {
                 context_mode: DiffContextMode::FullFile,
             },
             |_root, args, _access_mode| match args {
-                ["diff", "-U9999999", "HEAD"] => Ok(String::new()),
+                ["diff", "--relative", "-U9999999", "HEAD"] => Ok(String::new()),
                 ["ls-files", "--others", "--exclude-standard"] => Ok("binary.dat\n".to_owned()),
                 other => panic!("unexpected git args: {other:?}"),
             },
