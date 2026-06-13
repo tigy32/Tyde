@@ -37,6 +37,7 @@ const MOCK_COMPACT_SENTINEL: &str = "/compact";
 /// wall-clock races.  The window also gives replay tests enough time to
 /// connect a second client and verify state.
 pub(crate) const MOCK_SLOW_TURN_SENTINEL: &str = "__mock_slow__";
+const MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL: &str = "__mock_hold_until_interrupt__";
 pub(crate) const MOCK_DUPLICATE_IDLE_SENTINEL: &str = "__mock_duplicate_idle__";
 /// Causes the mock backend task to emit `TypingStatusChanged(true)`, sleep 300 ms,
 /// then exit without completing the turn.  The events channel closes when the
@@ -124,6 +125,10 @@ impl Backend for MockBackend {
             .instructions
             .as_deref()
             .is_some_and(|instructions| instructions.contains(MOCK_SLOW_TURN_SENTINEL));
+        let hold_initial_turn = resolved_spawn_config
+            .instructions
+            .as_deref()
+            .is_some_and(|instructions| instructions.contains(MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL));
 
         {
             let mut store = session_store()
@@ -163,6 +168,7 @@ impl Backend for MockBackend {
             subagent_emitter_rx,
             Some(initial_message),
             slow_initial_turn,
+            hold_initial_turn,
         );
 
         Ok((
@@ -222,6 +228,7 @@ impl Backend for MockBackend {
             events_tx,
             subagent_emitter_rx,
             None,
+            false,
             false,
         );
 
@@ -297,6 +304,7 @@ impl Backend for MockBackend {
             subagent_emitter_rx,
             Some(initial_message),
             false,
+            false,
         );
 
         Ok((
@@ -354,10 +362,12 @@ fn start_mock_command_loop(
     mut subagent_emitter_rx: watch::Receiver<Option<Arc<dyn SubAgentEmitter>>>,
     initial_message: Option<String>,
     slow_initial_turn: bool,
+    hold_initial_turn: bool,
 ) {
     tokio::spawn(async move {
         let mut active_subagents = Vec::new();
         let mut pending_exit_plan_mode = None;
+        let mut holding_until_interrupt = false;
         if let Some(initial_message) = initial_message {
             if initial_message.contains(MOCK_DIE_AFTER_BUSY_SENTINEL) {
                 // Send TypingStatusChanged(true) so the actor sets in_turn=true,
@@ -368,7 +378,12 @@ fn start_mock_command_loop(
                 return;
             }
             record_prompt(&session_id_for_task, &initial_message);
-            if initial_message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL) {
+            if hold_initial_turn || initial_message.contains(MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL) {
+                if !emit_held_turn(&events_tx, &session_id_for_task, &initial_message).await {
+                    return;
+                }
+                holding_until_interrupt = true;
+            } else if initial_message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL) {
                 if emit_exit_plan_mode_request(&events_tx).await.is_none() {
                     return;
                 }
@@ -396,6 +411,13 @@ fn start_mock_command_loop(
         while let Some(command) = command_rx.recv().await {
             match command {
                 MockCommand::Input(AgentInput::SendMessage(payload)) => {
+                    if holding_until_interrupt {
+                        emit_mock_error(
+                            &events_tx,
+                            "mock backend received input while holding until interrupt",
+                        );
+                        continue;
+                    }
                     if let Some(tool_response) = payload.tool_response {
                         handle_exit_plan_mode_tool_response(
                             &events_tx,
@@ -441,12 +463,70 @@ fn start_mock_command_loop(
                         "queued-message inputs must be handled by the agent actor before reaching the backend"
                     );
                 }
-                MockCommand::Interrupt => break,
+                MockCommand::Interrupt => {
+                    if holding_until_interrupt {
+                        let _ =
+                            events_tx.send(ChatEvent::OperationCancelled(OperationCancelledData {
+                                message: "mock backend interrupted held turn".to_owned(),
+                            }));
+                        let _ = events_tx.send(ChatEvent::TypingStatusChanged(false));
+                        holding_until_interrupt = false;
+                        continue;
+                    }
+                    break;
+                }
             }
         }
 
         drop(active_subagents);
     });
+}
+
+async fn emit_held_turn(
+    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    session_id: &SessionId,
+    user_message: &str,
+) -> bool {
+    let message_id = Some(Uuid::new_v4().to_string());
+    let response_text = format!(
+        "{}mock backend held response to: {user_message}",
+        startup_mcp_response_prefix(session_id)
+    );
+
+    events_tx.send(ChatEvent::TypingStatusChanged(true)).is_ok()
+        && events_tx
+            .send(ChatEvent::StreamStart(StreamStartData {
+                message_id: message_id.clone(),
+                agent: "mock".to_owned(),
+                model: Some(MOCK_MODEL.to_owned()),
+            }))
+            .is_ok()
+        && events_tx
+            .send(ChatEvent::StreamDelta(StreamTextDeltaData {
+                message_id: message_id.clone(),
+                text: response_text.clone(),
+            }))
+            .is_ok()
+        && events_tx
+            .send(ChatEvent::StreamEnd(StreamEndData {
+                message: ChatMessage {
+                    message_id: message_id.map(protocol::ChatMessageId),
+                    timestamp: now_ms(),
+                    sender: MessageSender::Assistant {
+                        agent: "mock".to_owned(),
+                    },
+                    content: response_text,
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: Some(ModelInfo {
+                        model: MOCK_MODEL.to_owned(),
+                    }),
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+            }))
+            .is_ok()
 }
 
 fn record_prompt(session_id: &SessionId, prompt: &str) {

@@ -1732,7 +1732,9 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
             ReviewActionPayload::StartAiReview {
                 backend_kind: None,
                 cost_hint: None,
-                instructions: Some("__mock_slow__ Look for changed return values.".to_owned()),
+                instructions: Some(
+                    "__mock_hold_until_interrupt__ Look for changed return values.".to_owned(),
+                ),
             },
         )
         .await
@@ -1740,8 +1742,9 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
 
     let mut reviewer_agent_id = None;
     let mut reviewer_stream = None;
-    while reviewer_agent_id.is_none() || reviewer_stream.is_none() {
-        let env = next_env(&mut client, "AI reviewer spawn").await;
+    let mut suggestion = None;
+    while suggestion.is_none() || reviewer_stream.is_none() {
+        let env = next_env(&mut client, "AI reviewer proposal").await;
         match env.kind {
             FrameKind::NewAgent => {
                 let new_agent: NewAgentPayload = env.parse_payload().expect("new AI reviewer");
@@ -1760,9 +1763,27 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
                     review.id.0
                 ),
                 ReviewEventPayload::AiReviewerChanged { state }
-                    if state.status == ReviewAiReviewerStatus::Running =>
+                    if state.status == ReviewAiReviewerStatus::Running
+                        && reviewer_agent_id.is_none() =>
                 {
-                    reviewer_agent_id = state.agent_id;
+                    let agent_id = state.agent_id.expect("running AI reviewer agent id");
+                    let tool_result = call_propose_review_comment_tool(
+                        &fixture,
+                        &agent_id,
+                        &review.id,
+                        location.clone(),
+                    )
+                    .await;
+                    assert_eq!(
+                        tool_result["status"], "success",
+                        "unexpected tool result: {tool_result}"
+                    );
+                    reviewer_agent_id = Some(agent_id);
+                }
+                ReviewEventPayload::SuggestionUpsert {
+                    suggestion: proposed,
+                } if reviewer_agent_id.is_some() => {
+                    suggestion = Some(proposed);
                 }
                 _ => {}
             },
@@ -1771,20 +1792,7 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
     }
     let reviewer_agent_id = reviewer_agent_id.expect("reviewer agent id");
     let reviewer_stream = reviewer_stream.expect("reviewer stream");
-
-    let tool_result = call_propose_review_comment_tool(
-        &fixture,
-        &reviewer_agent_id,
-        &review.id,
-        location.clone(),
-    )
-    .await;
-    assert_eq!(tool_result["status"], "success");
-
-    let suggestion = match expect_review_delta(&mut client, "AI suggestion upsert delta").await {
-        ReviewEventPayload::SuggestionUpsert { suggestion } => suggestion,
-        other => panic!("expected AI suggestion upsert, got {other:?}"),
-    };
+    let suggestion = suggestion.expect("AI suggestion upsert");
     assert_eq!(suggestion.reviewer_agent_id, reviewer_agent_id);
     assert_eq!(suggestion.body, "AI found a review issue.");
     assert_eq!(suggestion.severity, ReviewSeverity::Bug);
@@ -1829,7 +1837,10 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
 
     let tool_result =
         call_propose_review_comment_tool(&fixture, &reviewer_agent_id, &review.id, location).await;
-    assert_eq!(tool_result["status"], "success");
+    assert_eq!(
+        tool_result["status"], "success",
+        "unexpected tool result: {tool_result}"
+    );
 
     let rejected_suggestion =
         match expect_review_delta(&mut client, "AI rejected-suggestion upsert delta").await {
@@ -1862,7 +1873,10 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
         other => panic!("expected rejected suggestion, got {other:?}"),
     }
 
-    close_agent_and_wait(&mut client, &reviewer_stream).await;
+    client
+        .interrupt(&reviewer_stream)
+        .await
+        .expect("interrupt reviewer");
     match expect_review_delta(&mut client, "AI reviewer completed delta").await {
         ReviewEventPayload::AiReviewerChanged { state }
             if state.status == ReviewAiReviewerStatus::Completed => {}
@@ -1870,6 +1884,7 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
             panic!("unexpected event while waiting for reviewer completion: {other:?}");
         }
     }
+    close_agent_and_wait(&mut client, &reviewer_stream).await;
 }
 
 #[tokio::test]

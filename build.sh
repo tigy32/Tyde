@@ -10,6 +10,9 @@ NOTARY_PROFILE="${NOTARY_PROFILE:-tycode-notary}"
 log() { echo "==> $*"; }
 error() { echo "ERROR: $*" >&2; exit 1; }
 
+DEV_TAURI_PID=""
+DEV_CONFIG_PATH=""
+
 run_tauri_clean() {
     env \
         -u NO_COLOR \
@@ -20,6 +23,25 @@ run_tauri_clean() {
         -u CARGO_MANIFEST_DIR \
         -u CARGO_MANIFEST_PATH \
         "$@"
+}
+
+cleanup_dev() {
+    local status="${1:-$?}"
+
+    trap - EXIT INT TERM
+
+    if [[ -n "${DEV_TAURI_PID:-}" ]]; then
+        kill "$DEV_TAURI_PID" 2>/dev/null || true
+        wait "$DEV_TAURI_PID" 2>/dev/null || true
+        DEV_TAURI_PID=""
+    fi
+
+    if [[ -n "${DEV_CONFIG_PATH:-}" ]]; then
+        rm -f "$DEV_CONFIG_PATH"
+        DEV_CONFIG_PATH=""
+    fi
+
+    return "$status"
 }
 
 usage() {
@@ -371,22 +393,28 @@ cmd_dev() {
     ensure_python3
     ensure_tauri_cli
 
-    local frontend_port config_path
+    local frontend_port
     frontend_port="${TYDE_SNAPSHOT_FRONTEND_PORT:-1420}"
-    config_path="$(write_no_reload_tauri_config "$SCRIPT_DIR" "$frontend_port")"
+    DEV_CONFIG_PATH="$(write_no_reload_tauri_config "$SCRIPT_DIR" "$frontend_port")"
+    DEV_TAURI_PID=""
 
-    cleanup_config() {
-        rm -f "$config_path"
-    }
-    trap cleanup_config EXIT
+    trap 'cleanup_dev $?' EXIT
+    trap 'cleanup_dev 130; exit 130' INT
+    trap 'cleanup_dev 143; exit 143' TERM
 
     log "Starting Tauri with hot reload disabled on http://127.0.0.1:${frontend_port}"
     log "This instance runs from the live workspace, but it will not auto-reload. Restart it to pick up changes."
 
     (
         cd "$SCRIPT_DIR/frontend/tauri-shell"
-        run_tauri_clean "$SCRIPT_DIR/node_modules/.bin/tauri" dev --config "$config_path" --no-watch
-    )
+        run_tauri_clean "$SCRIPT_DIR/node_modules/.bin/tauri" dev --config "$DEV_CONFIG_PATH" --no-watch
+    ) &
+    DEV_TAURI_PID=$!
+
+    local dev_status=0
+    wait "$DEV_TAURI_PID" || dev_status=$?
+    DEV_TAURI_PID=""
+    return "$dev_status"
 }
 
 cmd_tauri() {
