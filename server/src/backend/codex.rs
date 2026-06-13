@@ -4537,11 +4537,20 @@ fn normalize_reasoning_effort(raw: &str) -> Option<String> {
 }
 
 fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
-    workspace_roots
+    if let Some(root) = workspace_roots
         .iter()
-        .find(|root| !root.trim().is_empty() && !root.starts_with("ssh://"))
+        .find(|root| !root.trim().is_empty() && !root.trim_start().starts_with("ssh://"))
         .cloned()
-        .ok_or("Codex backend requires at least one local workspace root".to_string())
+    {
+        return Ok(root);
+    }
+    if workspace_roots
+        .iter()
+        .any(|root| !root.trim().is_empty() && root.trim_start().starts_with("ssh://"))
+    {
+        return Err("Codex backend requires at least one local workspace root".to_string());
+    }
+    crate::backend::tyde_owned_no_root_cwd("codex")
 }
 
 fn codex_runtime_workspace_roots(workspace_roots: &[String], cwd: &str) -> Vec<String> {
@@ -4554,7 +4563,9 @@ fn codex_runtime_workspace_roots(workspace_roots: &[String], cwd: &str) -> Vec<S
         .collect::<Vec<_>>();
 
     if roots.is_empty() {
-        roots.push(cwd.to_string());
+        if workspace_roots.iter().any(|root| !root.trim().is_empty()) {
+            roots.push(cwd.to_string());
+        }
     } else if !roots.iter().any(|root| root == cwd) {
         roots.insert(0, cwd.to_string());
     }
@@ -5347,12 +5358,7 @@ impl Backend for CodexBackend {
     ) -> Result<(Self, EventStream), String> {
         let initial_message = initial_input.message;
         let initial_images = initial_input.images;
-        let roots = if workspace_roots.is_empty() {
-            vec!["/tmp".to_string()]
-        } else {
-            workspace_roots
-        };
-        let cwd = pick_workspace_root(&roots)?;
+        let cwd = pick_workspace_root(&workspace_roots)?;
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
@@ -6482,11 +6488,6 @@ impl Backend for CodexBackend {
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
 
-        let roots = if workspace_roots.is_empty() {
-            vec!["/tmp".to_string()]
-        } else {
-            workspace_roots
-        };
         let session_id = session_id.0;
         let backend_session_id =
             Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
@@ -6495,7 +6496,7 @@ impl Backend for CodexBackend {
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
             let (session, mut raw_events) = match CodexSession::spawn(
-                &roots,
+                &workspace_roots,
                 None,
                 &config.startup_mcp_servers,
                 combined_instructions.as_deref(),
@@ -6651,11 +6652,6 @@ impl Backend for CodexBackend {
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
 
-        let roots = if workspace_roots.is_empty() {
-            vec!["/tmp".to_string()]
-        } else {
-            workspace_roots
-        };
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, BackendStartupError>>();
 
         tokio::spawn(async move {
@@ -6663,7 +6659,7 @@ impl Backend for CodexBackend {
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
             let (session, mut raw_events) = match CodexSession::fork(
-                &roots,
+                &workspace_roots,
                 None,
                 &config.startup_mcp_servers,
                 combined_instructions.as_deref(),
@@ -6933,6 +6929,26 @@ mod tests {
                 .lock()
                 .expect("codex test app-server binary mutex poisoned") = self.previous.take();
         }
+    }
+
+    #[test]
+    fn codex_pick_workspace_root_uses_tyde_no_root_cwd_for_empty_roots() {
+        let root = pick_workspace_root(&[]).expect("empty roots should resolve to no-root cwd");
+
+        assert!(std::path::Path::new(&root).is_dir());
+        assert!(
+            std::path::Path::new(&root)
+                .ends_with(std::path::Path::new(".tyde").join("codex").join("no-root"))
+        );
+        assert!(codex_runtime_workspace_roots(&[], &root).is_empty());
+    }
+
+    #[test]
+    fn codex_pick_workspace_root_keeps_ssh_only_roots_invalid() {
+        let err = pick_workspace_root(&["ssh://devbox.example.com/workspace".to_string()])
+            .expect_err("ssh-only local roots should remain invalid");
+
+        assert!(err.contains("requires at least one local workspace root"));
     }
 
     impl CodexFakeAppServer {

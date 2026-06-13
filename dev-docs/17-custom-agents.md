@@ -390,16 +390,16 @@ native startup surface.
 | Claude | `.claude/agents/{id}.md` + `--agent {id}` | `--append-system-prompt` | `.claude/skills/{name}/SKILL.md` via `--add-dir` | temp JSON via `--mcp-config` |
 | Codex | prepend to `model_instructions_file` | same file | `.agents/skills/tyde-{name}/` symlink | `-c mcp_servers.{name}.command=...` / `url=...` |
 | Kiro | ACP `systemPrompt` | ACP `systemPrompt` append | `.kiro/skills/tyde-{name}/` | ACP `mcpServers` |
-| Gemini | prepended to prompt | same prompt surface | `.gemini/skills/tyde-{name}/` | `.gemini/settings.json` |
+| Antigravity | prepended to prompt | same prompt surface | prompt-embedded skill text | global `~/.gemini/config/mcp_config.json` guarded/restored per turn |
 | Tycode | one temp workspace root containing `.tycode/tyde_steering.md`, appended to `workspace_roots` | same root | same temp workspace root containing `.tycode/skills/` | `--mcp-servers <json>` |
 
 Notes:
 
 - For Claude, keep instructions and steering distinct because Claude has a real
   first-class agent identity surface.
-- For Codex, Kiro, Gemini, and Tycode, the adapter may concatenate custom-agent
-  instructions plus steering in that order, but only after the resolver has
-  kept them separate.
+- For Codex, Kiro, Antigravity, and Tycode, the adapter may concatenate
+  custom-agent instructions plus steering in that order, but only after the
+  resolver has kept them separate.
 - Tycode uses exactly one synthesized extra workspace root per spawn. That root
   contains both the steering file and the materialized skills tree; do not
   append one root for steering and another for skills.
@@ -413,7 +413,7 @@ Notes:
 Tool policy is declared on `CustomAgent.tool_policy`.
 
 - Claude: translate directly to Claude's native allow/deny tool surface.
-- Codex, Kiro, Gemini, Tycode: reject the spawn if the selected custom agent
+- Codex, Kiro, Antigravity, Tycode: reject the spawn if the selected custom agent
   declares `AllowList` or `DenyList`.
 
 This must fail fast. Do not silently drop tool restrictions on backends that do

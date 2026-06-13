@@ -26,7 +26,7 @@ const TYCODE_SUBPROCESS_SHA256_X86_64_UNKNOWN_LINUX_MUSL: &str =
     "a8c77a3ef76d04ce4b99912becdbce5dafba9210ced04cfc959e9f4e808a5e5a";
 const CLAUDE_CLI_CANDIDATES: &[&str] = &["claude"];
 const CODEX_CLI_CANDIDATES: &[&str] = &["codex"];
-const GEMINI_CLI_CANDIDATES: &[&str] = &["gemini"];
+const ANTIGRAVITY_CLI_CANDIDATES: &[&str] = &["agy"];
 const KIRO_CLI_CANDIDATES: &[&str] = &["kiro-cli", "kiro-cli-chat"];
 
 pub(crate) async fn collect_backend_setup() -> BackendSetupPayload {
@@ -37,7 +37,7 @@ pub(crate) async fn collect_backend_setup() -> BackendSetupPayload {
         BackendKind::Kiro,
         BackendKind::Claude,
         BackendKind::Codex,
-        BackendKind::Gemini,
+        BackendKind::Antigravity,
     ] {
         backends.push(probe_backend(kind, platform).await);
     }
@@ -106,7 +106,7 @@ async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetu
         BackendKind::Kiro => probe_candidates(&command_candidates(KIRO_CLI_CANDIDATES)).await,
         BackendKind::Claude => probe_candidates(&command_candidates(CLAUDE_CLI_CANDIDATES)).await,
         BackendKind::Codex => probe_candidates(&command_candidates(CODEX_CLI_CANDIDATES)).await,
-        BackendKind::Gemini => probe_candidates(&command_candidates(GEMINI_CLI_CANDIDATES)).await,
+        BackendKind::Antigravity => probe_candidates(&antigravity_command_candidates()).await,
     };
 
     if kind == BackendKind::Codex && probe.installed {
@@ -227,6 +227,22 @@ async fn run_version_command(command: &str) -> Option<Option<(String, String)>> 
     Some(Some((stdout, stderr)))
 }
 
+fn antigravity_command_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Ok(home) = home_dir() {
+        let local = home.join(".local").join("bin").join("agy");
+        if local.is_file() {
+            candidates.push(local.to_string_lossy().to_string());
+        }
+    }
+    for candidate in command_candidates(ANTIGRAVITY_CLI_CANDIDATES) {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
 fn command_candidates(defaults: &[&str]) -> Vec<String> {
     let mut candidates = Vec::<String>::new();
     for default in defaults {
@@ -322,7 +338,7 @@ fn docs_url(kind: BackendKind) -> String {
             "https://docs.anthropic.com/en/docs/claude-code/getting-started".to_string()
         }
         BackendKind::Codex => "https://help.openai.com/en/articles/11096431".to_string(),
-        BackendKind::Gemini => "https://github.com/google-gemini/gemini-cli".to_string(),
+        BackendKind::Antigravity => "https://antigravity.google/cli".to_string(),
     }
 }
 
@@ -357,12 +373,10 @@ fn install_command(kind: BackendKind, platform: HostPlatform) -> Option<BackendS
             display_command: None,
             runnable: true,
         }),
-        BackendKind::Gemini => Some(BackendSetupCommand {
+        BackendKind::Antigravity => Some(BackendSetupCommand {
             title: "Install CLI".to_string(),
-            description:
-                "Install Gemini CLI with npm. Google documents Node.js 20+ as a prerequisite."
-                    .to_string(),
-            command: "npm install -g @google/gemini-cli".to_string(),
+            description: "Install Antigravity CLI on this host.".to_string(),
+            command: "curl -fsSL https://antigravity.google/cli/install.sh | bash".to_string(),
             display_command: None,
             runnable: true,
         }),
@@ -393,10 +407,11 @@ fn sign_in_command(kind: BackendKind) -> Option<BackendSetupCommand> {
             display_command: None,
             runnable: true,
         }),
-        BackendKind::Gemini => Some(BackendSetupCommand {
+        BackendKind::Antigravity => Some(BackendSetupCommand {
             title: "Sign In".to_string(),
-            description: "Start Gemini CLI so it can prompt for login on this host.".to_string(),
-            command: "gemini".to_string(),
+            description: "Start Antigravity CLI so it can prompt for login on this host."
+                .to_string(),
+            command: "agy".to_string(),
             display_command: None,
             runnable: true,
         }),

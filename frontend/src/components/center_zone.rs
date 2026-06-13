@@ -43,7 +43,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
-        BackendKind::Gemini => "Gemini",
+        BackendKind::Antigravity => "Antigravity",
     }
 }
 

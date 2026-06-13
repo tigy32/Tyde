@@ -15,7 +15,8 @@ host.
 ### Binary and invocation
 
 - Binary: `~/.local/bin/agy`
-- Version: `1.0.6`
+- Original implementation probe version: `1.0.6`
+- Follow-up no-cost probe version: `1.0.7`
 - Headless one-shot invocation works from a normal non-interactive subprocess;
   no PTY is required for `--print` / `-p`.
 - Run with `cwd` set to the primary workspace root.
@@ -44,17 +45,17 @@ Example readiness probe shape:
     -p 'Reply exactly with ok'
 ```
 
-Tyde must **not** use Antigravity native conversation resume for `agy` `1.0.6`.
-The CLI does not emit a structured session/conversation id comparable to
-Gemini's `SessionStarted.session_id`; scraping `~/.gemini` logs or
-`last_conversations.json` would be inference, races under concurrent agents, and
-violates `01-philosophy.md`. See "Spawn contract and session identity" below for
-the Tyde-owned session mapping.
+Current `agy 1.0.8 --help` documents native resume with
+`--conversation <ID>` / `--continue`. Tyde uses exact
+`--conversation=<UUID>` and captures the native conversation UUID from the
+per-turn `--log-file` output (`Created conversation <UUID>` /
+`conversation=<UUID>`). The Tyde `SessionId` for new Antigravity sessions is
+the native conversation UUID.
 
 ### Output contract
 
 `agy -p` writes **plain text** to stdout. It does not emit JSON, NDJSON,
-`stream-json`, or ACP/JSON-RPC events in version `1.0.6`.
+`stream-json`, or ACP/JSON-RPC events in versions `1.0.6` / `1.0.7`.
 
 Observed behavior:
 
@@ -64,7 +65,7 @@ Observed behavior:
 - Process exit is the only reliable stream-end boundary.
 - Stderr was empty in normal probes.
 
-Unsupported / absent in `1.0.6`:
+Unsupported / absent in the validated help surface:
 
 ```text
 --output-format stream-json
@@ -132,7 +133,7 @@ honored.
 Design decision for Antigravity `ReadOnly`:
 
 - Fail closed for `BackendAccessMode::ReadOnly` with a clear backend error.
-- Explain that Antigravity CLI `1.0.6` has no enforceable read-only mode.
+- Explain that Antigravity CLI has no enforceable read-only mode.
 - Keep `--sandbox` available only as an optional terminal restriction in future
   work, not as Tyde's read-only enforcement.
 
@@ -144,25 +145,18 @@ headless turns do not block on interactive approvals.
 
 ### Sessions, resume, and interrupt
 
-Native Antigravity resume is **unsupported** in Tyde for `agy` `1.0.6`.
+Antigravity resume is native in Tyde:
 
-Tyde should use one-shot `agy -p` subprocess turns only:
+- New Antigravity sessions use the captured `agy` conversation UUID as the Tyde
+  `SessionId`.
+- Live follow-up turns and resumed sessions pass `--conversation=<UUID>`.
+- Legacy Tyde-minted `antigravity-<uuid>` session records remain
+  non-resumable because they have no backing `agy` conversation ID.
+- `fork` still fails explicitly as unsupported for Antigravity.
 
-- Mint Tyde-owned `SessionId` values; do not derive them from Antigravity files.
-- Do not read or scrape `~/.gemini/antigravity-cli/conversations`,
-  `~/.gemini/antigravity-cli/cache/last_conversations.json`, or logs.
-- Do not persist stdout prefixes, hashes, cursors, or replay-diff state in
-  `sessions.json`.
-- Mark Antigravity `BackendSession` summaries as `resumable: false`.
-- `resume` and `fork` should fail explicitly as unsupported for Antigravity
-  until `agy` emits a structured native session id and a non-replaying resume
-  contract.
-
-Live follow-up turns, if supported by the backend actor, must be
-Tyde-managed-context turns: the server-owned actor may keep a bounded in-memory
-transcript for the currently live session and include that context in the next
-one-shot prompt. That state is not a native Antigravity session and is not a
-persisted replay cache.
+Live follow-up turns should rely on `agy`'s native conversation state rather
+than Tyde-managed transcript stuffing. Startup instructions may be included in
+the first prompt for a new conversation.
 
 `--print-timeout <duration>` exits print mode and writes a plain-text error such
 as:
@@ -317,12 +311,11 @@ all protected by the compiler.
   `server/src/backend/antigravity.rs` can mirror the actor structure but must
   replace Gemini's NDJSON parser and `.gemini/settings.json` MCP injection.
 - `server/src/backend/gemini.rs:1650-1656` — Gemini receives a structured
-  `SessionStarted.session_id`; Antigravity has no equivalent, so the new backend
-  must mint its own Tyde `SessionId` at spawn time instead of scraping native
-  files.
+  `SessionStarted.session_id`; Antigravity captures its native conversation UUID
+  from the per-turn `--log-file` output.
 - `server/src/backend/gemini.rs:1660` — Gemini resolves `ready_tx` with the
-  native session id; Antigravity must resolve `ready_tx` with the Tyde-minted id
-  after its actor is constructed and before the first `agy -p` process starts.
+  native session id; Antigravity must resolve `ready_tx` with the captured
+  native `agy` conversation UUID before persisting the Tyde session.
 - `server/src/backend/gemini.rs:2083-2108` — in-file Gemini arg/permission tests
   must be replaced by Antigravity arg construction and read-only fail-closed
   unit tests.
@@ -421,16 +414,17 @@ Create `server/src/backend/antigravity.rs`. It should mirror the broad shape of
 `gemini.rs` where that shape still fits Tyde's backend actor model:
 
 - `AntigravityBackend` implementing `Backend`.
-- `spawn`, `resume`, and `fork` entry points, with `resume` and `fork` returning
-  explicit unsupported errors.
+- `spawn`, `resume`, and `fork` entry points. `resume` uses native
+  `--conversation=<UUID>` for exact AGY conversation UUIDs; `fork` returns an
+  explicit unsupported error.
 - An input channel for `AgentInput`.
 - An interrupt channel that terminates the active child process group.
 - A spawn-ready timeout so startup cannot hang indefinitely.
 - Session settings schema and cost-hint defaults in the backend module.
 
-Do not copy Gemini's NDJSON parser, native session-id handling, or old MCP config
-injection. Antigravity uses plain stdout, Tyde-owned session ids, and a global
-MCP config file.
+Do not copy Gemini's NDJSON parser or old MCP config injection. Antigravity uses
+plain stdout, native AGY conversation UUID session ids, and a global MCP config
+file.
 
 Recommended constants:
 
@@ -444,33 +438,38 @@ Arg construction should be unit-tested. For unrestricted turns:
 
 ```text
 agy --print-timeout 5m \
+    --log-file '<per-turn-log>' \
     --dangerously-skip-permissions \
     --model '<exact-model-label>' \
+    [--conversation=<native-agy-uuid>] \
     --add-dir '<extra-root>' \
     -p '<combined prompt>'
 ```
 
-Do not add native conversation flags. There is no supported native resume path
-for `agy` `1.0.6` in Tyde.
+Use exact `--conversation=<UUID>` for live follow-up turns and resumed sessions.
+Do not use `--continue`, because it is cwd-dependent.
 
 ### Spawn contract and session identity
 
 The `Backend::spawn` trait contract needs a `SessionId` at spawn time. Gemini can
-wait for a native `SessionStarted.session_id`; Antigravity cannot. Therefore
-Antigravity uses a Tyde-owned session identity minted at spawn:
+wait for a native `SessionStarted.session_id`; Antigravity captures the native
+`agy` conversation UUID from the first turn's log before completing startup.
+Therefore Antigravity uses the native `agy` conversation UUID as its session
+identity:
 
 1. Validate fail-fast inputs before launching any child:
    - `access_mode` must not be `ReadOnly`.
    - resolved model must be one of the exact known labels.
    - workspace roots must resolve to the primary `cwd` plus `--add-dir` extras.
-2. Mint a Tyde session id, for example
-   `SessionId(format!("antigravity-{}", Uuid::new_v4()))`.
+2. Run the first `agy -p` turn with a per-turn `--log-file`.
 3. Construct the backend actor, event stream, input channel, and interrupt
    channel.
-4. Resolve `ready_tx` with the Tyde-minted `SessionId` once the actor is ready to
-   accept input. This is the Antigravity spawn-ready point; it is not based on an
-   Antigravity event.
-5. Launch the first one-shot `agy -p` turn after the ready handshake.
+4. Capture the active `conversation=<UUID>` marker from the log and use that
+   UUID as the Tyde `SessionId`. If no active marker appears, accept
+   `Created conversation <UUID>` only at process/log finalization.
+5. Resolve `ready_tx` with the captured native `SessionId`. If the CLI exits
+   before any native UUID is captured, fail visibly with the real stdout/stderr
+   error instead of masking it as only a missing-log error.
 
 The user-visible stream is then prose-only:
 
@@ -482,34 +481,29 @@ The user-visible stream is then prose-only:
 
 Session capability rules:
 
-- `Backend::session_id()` returns the Tyde-minted id.
-- `BackendSession.resumable` must be `false`.
+- `Backend::session_id()` returns the native `agy` conversation UUID.
+- `BackendSession.resumable` is true only for native UUID session ids.
 - `list_sessions()` should return `Ok(Vec::new())` for Antigravity because there
-  are no safe native sessions to expose.
-- `resume(session_id, ...)` returns an explicit unsupported error. It must not
-  try to find a native Antigravity conversation with the same or similar id.
+  is no Tyde-owned list/import surface yet.
+- `resume(session_id, ...)` passes exact `--conversation=<UUID>` for native UUID
+  sessions. Legacy `antigravity-<uuid>` records remain non-resumable.
 - `fork(session_id, ...)` returns an explicit unsupported error for the same
   reason.
 
-### Tyde-managed context for live turns
+### Native context for live turns
 
-Because native resume is unsupported, follow-up turns in an already-running
-Antigravity actor must be one-shot Tyde-managed-context turns.
+Follow-up turns in an already-running Antigravity actor use the same native AGY
+conversation as resume:
 
-Concrete behavior:
-
-- The actor keeps a bounded in-memory transcript for the live session: user text
-  submitted through Tyde and assistant text emitted from plain stdout.
-- Each new `AgentInput` builds a combined prompt containing that bounded context
-  plus the new user message.
-- The transcript is server-owned runtime state, not frontend state, and is not a
-  native Antigravity session.
-- The transcript is not written to `sessions.json`; after process/app restart the
-  Antigravity session is non-resumable and must not be offered as resumable.
-
-If the implementation cannot safely build a bounded context prompt within the
-existing backend trait, fail follow-up sends visibly rather than silently sending
-a contextless prompt. Do not add fallback native resume.
+- New sessions capture the native AGY conversation UUID from `--log-file`.
+- The captured UUID is the Tyde `SessionId`.
+- Every live follow-up turn passes exact `--conversation=<UUID>`.
+- Resumed sessions also pass exact `--conversation=<UUID>` after verifying the
+  native conversation database exists.
+- Tyde does not stuff a transcript into follow-up prompts and does not persist a
+  Tyde-managed transcript as session state.
+- Legacy synthetic `antigravity-<uuid>` records remain non-resumable because
+  they have no backing AGY conversation UUID.
 
 ### Chat event mapping
 
@@ -533,9 +527,9 @@ map only what is directly observable:
    semantically cancelled.
 
 `ToolRequest`, `ToolResult`, permission prompts, and typed tool cards are not
-representable from `agy -p` in version `1.0.6`. Do not scrape prose such as
-"I will run..." into fake tool events. That would violate the no-fallback and
-server-owned-behavior rules from `01-philosophy.md`.
+representable from `agy -p` in versions `1.0.6` / `1.0.7`. Do not scrape prose
+such as "I will run..." into fake tool events. That would violate the
+no-fallback and server-owned-behavior rules from `01-philosophy.md`.
 
 ### Access mode mapping
 
@@ -551,7 +545,7 @@ server-owned-behavior rules from `01-philosophy.md`.
 - Emit a clear backend startup/turn error, for example:
 
 ```text
-Antigravity CLI 1.0.6 has no enforceable read-only mode; refusing read_only spawn
+Antigravity CLI has no enforceable read-only mode; refusing read_only spawn
 ```
 
 This is the safest viable way to honor Tyde's read-only contract today. A later
@@ -648,20 +642,18 @@ MCP config conversion:
 Do not write old Gemini workspace `.gemini/settings.json`; Antigravity did not
 use it in the probes.
 
-### Native Antigravity resume is unsupported
+### Native Antigravity resume
 
-There must be no native Antigravity session tracking in Tyde for `agy` `1.0.6`.
-Specifically:
-
-- Do not scrape logs, SQLite files, or `last_conversations.json`.
-- Do not call native resume flags from Tyde.
-- Do not persist emitted stdout prefixes, hashes, cursors, or replay-diff state.
-- Do not try to correlate Tyde session ids with Antigravity native UUIDs.
+Tyde calls native resume with exact `--conversation=<UUID>`. It must not use
+`--continue` because that is cwd-dependent. It must fail visibly if a new
+conversation UUID is required but cannot be captured from the per-turn log.
 
 This removes the growing transcript cache proposed in the earlier design and
-avoids races between concurrent agents. The supported design is Tyde-minted,
-non-resumable session ids plus one-shot `agy -p` turns with optional bounded
-in-memory context while the actor is live.
+avoids cwd-dependent resume races. The supported design is native `agy`
+conversation UUID session ids plus one-shot `agy -p` turns that pass
+`--conversation=<UUID>` whenever the session already has a native UUID. Missing
+native conversation database files fail visibly instead of falling back to a new
+conversation.
 
 ### Session cleanup / migration
 
@@ -799,8 +791,8 @@ Codex implementation should remove every compiled Gemini touchpoint:
 - Update server-side tests in `tests/tests/backend.rs`,
   `tests/tests/custom_agents.rs`, and `tests/tests/settings.rs`.
 - Replace Gemini in-file backend tests with Antigravity arg construction,
-  timeout, model, MCP config, spawn handshake, unsupported resume/fork, and
-  read-only rejection tests.
+  timeout, model, MCP config, spawn handshake, native resume, unsupported fork,
+  and read-only rejection tests.
 - Ignore the `old/` tree unless it is actually compiled.
 
 ### Test plan
@@ -813,10 +805,10 @@ Server/mock protocol tests:
 
 - Spawn an Antigravity mock agent and assert `NewAgent`, `AgentStart`, user echo,
   assistant events, and `SessionList` carry `BackendKind::Antigravity`.
-- Assert Antigravity spawn returns a Tyde-minted `SessionId` at the ready
-  handshake and that the listed session has `resumable: false`.
-- Assert resume/fork requests for Antigravity fail visibly with unsupported
-  backend errors and do not attempt native session lookup.
+- Assert Antigravity spawn with empty roots is accepted and keeps protocol
+  `workspace_roots: []`.
+- Assert Antigravity native UUID sessions are resumable and legacy synthetic
+  `antigravity-<uuid>` sessions are non-resumable.
 - Update host settings to enable/default Antigravity and assert subsequent new
   chat/review/team flows use Antigravity through observable protocol payloads.
 - Assert Antigravity session settings schema is emitted as a ready schema with a
@@ -840,11 +832,14 @@ Store/unit tests:
   clears dangling `session_id`s, rewrites once, and then strict-deserializes.
 - `antigravity.rs`: arg construction includes `--print-timeout`, exact
   `--model`, `--add-dir`, and `--dangerously-skip-permissions` for unrestricted
-  mode; it never includes native resume flags.
-- `antigravity.rs`: spawn mints the Tyde session id before the first child
-  process starts, resolves ready with that id, and reports `resumable: false`.
-- `antigravity.rs`: `list_sessions` returns empty, and `resume` / `fork` return
-  explicit unsupported errors.
+  mode; follow-up/resume arg construction includes exact
+  `--conversation=<UUID>` and never uses `--continue`.
+- `antigravity.rs`: spawn captures the native AGY conversation UUID from
+  `--log-file`, resolves ready with that UUID, and reports native UUID sessions
+  as resumable.
+- `antigravity.rs`: `list_sessions` returns empty, `resume` rejects legacy
+  synthetic `antigravity-<uuid>` ids, native `resume` uses
+  `--conversation=<UUID>`, and `fork` returns an explicit unsupported error.
 - `antigravity.rs`: read-only arg/spawn path rejects before launching `agy`.
 - `antigravity.rs`: plain-text stdout parser emits stream start/deltas/end and
   surfaces `Authentication required` / `Error:` lines as backend errors.

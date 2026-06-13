@@ -15,7 +15,7 @@ fn backend_class(kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "backend-badge kiro",
         BackendKind::Claude => "backend-badge claude",
         BackendKind::Codex => "backend-badge codex",
-        BackendKind::Gemini => "backend-badge gemini",
+        BackendKind::Antigravity => "backend-badge antigravity",
     }
 }
 
@@ -25,7 +25,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
-        BackendKind::Gemini => "Gemini",
+        BackendKind::Antigravity => "Antigravity",
     }
 }
 

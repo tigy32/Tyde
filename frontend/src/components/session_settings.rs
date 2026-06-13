@@ -319,7 +319,7 @@ pub fn SessionSettingsBar() -> impl IntoView {
         match backend_kind {
             BackendKind::Claude => "Session Settings (Claude)",
             BackendKind::Codex => "Session Settings (Codex)",
-            BackendKind::Gemini => "Session Settings (Gemini)",
+            BackendKind::Antigravity => "Session Settings (Antigravity)",
             BackendKind::Kiro => "Session Settings (Kiro)",
             BackendKind::Tycode => "Session Settings",
         }
@@ -330,7 +330,7 @@ pub fn SessionSettingsBar() -> impl IntoView {
             BackendKind::Kiro => "Kiro models unavailable — check installation",
             BackendKind::Claude => "Claude settings unavailable — check installation",
             BackendKind::Codex => "Codex settings unavailable — check installation",
-            BackendKind::Gemini => "Gemini settings unavailable — check installation",
+            BackendKind::Antigravity => "Antigravity settings unavailable — check installation",
             BackendKind::Tycode => "Tycode settings unavailable",
         }
     }
@@ -340,7 +340,7 @@ pub fn SessionSettingsBar() -> impl IntoView {
             BackendKind::Kiro => "Kiro models are loading...",
             BackendKind::Claude => "Claude settings are loading...",
             BackendKind::Codex => "Codex settings are loading...",
-            BackendKind::Gemini => "Gemini settings are loading...",
+            BackendKind::Antigravity => "Antigravity settings are loading...",
             BackendKind::Tycode => "Tycode settings are loading...",
         }
     }

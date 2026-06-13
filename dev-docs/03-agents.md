@@ -380,12 +380,12 @@ pub enum BackendKind {
     Kiro,
     Claude,
     Codex,
-    Gemini,
+    Antigravity,
 }
 ```
 
 These variants match the backends currently exposed by Tyde2: `Tycode`,
-`Kiro`, `Claude`, `Codex`, and `Gemini`.
+`Kiro`, `Claude`, `Codex`, and `Antigravity`.
 
 ### AgentErrorCode
 
@@ -756,8 +756,8 @@ pub struct TaskList {
 
 Agents are backed by a **backend** — the actual coding agent process that does
 the work. The `Backend` trait is the abstraction boundary between the agent actor
-and the underlying implementation. Each `BackendKind` variant (`Claude`, `Codex`,
-`Gemini`) maps to a concrete backend type.
+and the underlying implementation. Each `BackendKind` variant maps to a concrete
+backend type.
 
 ### The Backend trait
 
@@ -852,16 +852,16 @@ The test/development backend. For each input message, it emits a deterministic
 subprocess. Useful for integration tests and UI development without a real
 coding agent.
 
-### Real backends (future)
+### Real backends
 
-`Claude`, `Codex`, and `Gemini` backends will each spawn a subprocess (the
-respective CLI tool), communicate via stdin/stdout, and translate subprocess
-output into `ChatEvent`s. Each implements the same `Backend` trait and may map
-`SpawnCostHint` differently:
+Real backends spawn or connect to the respective CLI/tool process, translate
+backend output into `ChatEvent`s, and implement the same `Backend` trait. Each
+may map `SpawnCostHint` differently:
 
 - `Claude`: lower or higher model family (`haiku` / `sonnet` / `opus`)
 - `Codex`: lower or higher reasoning effort, and eventually model overrides
-- `Gemini`: lower or higher model tier (`flash-lite` / `flash` / `pro`)
+- `Antigravity`: exact `agy models` labels and native `agy --conversation=<UUID>`
+  resume for sessions whose ID is the Antigravity conversation UUID
 - `Kiro` / others: backend-specific model selection where supported
 
 ### Key design decisions

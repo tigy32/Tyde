@@ -23,7 +23,7 @@ pub(crate) mod sub_agent;
 pub(crate) mod team_registry;
 pub(crate) mod terminal_stream;
 
-pub use backend::{acp, claude, codex, gemini, kiro, subprocess};
+pub use backend::{acp, antigravity, claude, codex, kiro, subprocess};
 
 pub use acceptor::{HandshakeError, accept, listen_uds};
 pub use connection::run_connection;

@@ -1023,7 +1023,7 @@ fn backend_kind_label(kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
-        BackendKind::Gemini => "Gemini",
+        BackendKind::Antigravity => "Antigravity",
     }
 }
 
@@ -1120,7 +1120,7 @@ fn parse_backend_kind(s: &str) -> Option<BackendKind> {
         "Kiro" => Some(BackendKind::Kiro),
         "Claude" => Some(BackendKind::Claude),
         "Codex" => Some(BackendKind::Codex),
-        "Gemini" => Some(BackendKind::Gemini),
+        "Antigravity" => Some(BackendKind::Antigravity),
         _ => None,
     }
 }
@@ -3600,11 +3600,11 @@ mod wasm_tests {
         record_bridge();
         let container = make_container();
         let holder = mount_sidebar(container.clone(), make_review());
-        // Host default is Gemini; the user explicitly picks Codex.
+        // Host default is Antigravity; the user explicitly picks Codex.
         seed_host_settings(
             &holder.borrow().clone().unwrap(),
-            Some(BackendKind::Gemini),
-            vec![BackendKind::Codex, BackendKind::Gemini],
+            Some(BackendKind::Antigravity),
+            vec![BackendKind::Codex, BackendKind::Antigravity],
         );
         next_tick().await;
         next_tick().await;

@@ -138,11 +138,6 @@ impl Backend for TycodeBackend {
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
-        let workspace_roots = if workspace_roots.is_empty() {
-            vec!["/tmp".to_string()]
-        } else {
-            workspace_roots
-        };
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
@@ -403,11 +398,6 @@ impl Backend for TycodeBackend {
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
-        let workspace_roots = if workspace_roots.is_empty() {
-            vec!["/tmp".to_string()]
-        } else {
-            workspace_roots
-        };
         let known_session_id = Arc::new(std::sync::Mutex::new(Some(session_id.clone())));
         let mcp_servers_json = build_tycode_mcp_servers_json(&config.startup_mcp_servers);
 

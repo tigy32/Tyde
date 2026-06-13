@@ -174,7 +174,11 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
     assert_eq!(
         store.get().expect("read canonicalized settings"),
         HostSettings {
-            enabled_backends: vec![BackendKind::Kiro, BackendKind::Claude, BackendKind::Gemini,],
+            enabled_backends: vec![
+                BackendKind::Kiro,
+                BackendKind::Claude,
+                BackendKind::Antigravity,
+            ],
             default_backend: Some(BackendKind::Claude),
             enable_mobile_connections: false,
             mobile_broker_url: None,

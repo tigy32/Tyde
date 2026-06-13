@@ -2804,11 +2804,20 @@ fn resolve_kiro_chat_binary() -> String {
 }
 
 fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
-    workspace_roots
+    if let Some(root) = workspace_roots
         .iter()
-        .find(|root| !root.trim().is_empty() && !root.starts_with("ssh://"))
+        .find(|root| !root.trim().is_empty() && !root.trim_start().starts_with("ssh://"))
         .cloned()
-        .ok_or("Kiro backend requires at least one local workspace root".to_string())
+    {
+        return Ok(root);
+    }
+    if workspace_roots
+        .iter()
+        .any(|root| !root.trim().is_empty() && root.trim_start().starts_with("ssh://"))
+    {
+        return Err("Kiro backend requires at least one local workspace root".to_string());
+    }
+    crate::backend::tyde_owned_no_root_cwd("kiro")
 }
 
 fn parse_iso8601_to_unix_ms(s: &str) -> Option<u64> {
@@ -3146,15 +3155,10 @@ impl Backend for KiroBackend {
 
         tokio::spawn(async move {
             let mut ready_tx: Option<oneshot::Sender<Result<(), String>>> = Some(ready_tx);
-            let roots = if workspace_roots.is_empty() {
-                vec!["/tmp".to_string()]
-            } else {
-                workspace_roots
-            };
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
             let (session, mut raw_events) = match KiroSession::spawn(
-                &roots,
+                &workspace_roots,
                 None,
                 None,
                 &config.startup_mcp_servers,
@@ -3327,15 +3331,10 @@ impl Backend for KiroBackend {
 
         tokio::spawn(async move {
             let mut ready_tx: Option<oneshot::Sender<Result<(), String>>> = Some(ready_tx);
-            let roots = if workspace_roots.is_empty() {
-                vec!["/tmp".to_string()]
-            } else {
-                workspace_roots
-            };
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
             let (session, mut raw_events) = match KiroSession::spawn(
-                &roots,
+                &workspace_roots,
                 None,
                 None,
                 &config.startup_mcp_servers,
@@ -3660,6 +3659,25 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn kiro_pick_workspace_root_uses_tyde_no_root_cwd_for_empty_roots() {
+        let root = pick_workspace_root(&[]).expect("empty roots should resolve to no-root cwd");
+
+        assert!(std::path::Path::new(&root).is_dir());
+        assert!(
+            std::path::Path::new(&root)
+                .ends_with(std::path::Path::new(".tyde").join("kiro").join("no-root"))
+        );
+    }
+
+    #[test]
+    fn kiro_pick_workspace_root_keeps_ssh_only_roots_invalid() {
+        let err = pick_workspace_root(&["ssh://devbox.example.com/workspace".to_string()])
+            .expect_err("ssh-only local roots should remain invalid");
+
+        assert!(err.contains("requires at least one local workspace root"));
+    }
 
     #[test]
     fn extract_known_models_dedupes_case_variants() {

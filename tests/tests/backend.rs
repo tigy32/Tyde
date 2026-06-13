@@ -2,21 +2,22 @@ mod fixture;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::ToSocketAddrs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use fixture::Fixture;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentOrigin, AgentStartPayload, BackendKind,
-    ChatEvent, Envelope, FrameKind, HostSettingValue, ImageData, ListSessionsPayload,
-    MessageMetadataUpdateData, MessageSender, NewAgentPayload, ProtocolValidator,
-    SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsValues, SessionSummary, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, ToolExecutionCompletedData,
-    ToolRequest, ToolRequestType,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode, AgentOrigin, AgentStartPayload,
+    BackendKind, ChatEvent, CommandErrorPayload, CustomAgentId, Envelope, FrameKind,
+    HostSettingValue, ImageData, ListSessionsPayload, MessageMetadataUpdateData, MessageSender,
+    NewAgentPayload, ProtocolValidator, SessionId, SessionListPayload, SessionSchemaEntry,
+    SessionSchemasPayload, SessionSettingFieldType, SessionSettingValue, SessionSettingsValues,
+    SessionSummary, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint,
+    StreamPath, ToolExecutionCompletedData, ToolRequest, ToolRequestType,
 };
 use server::backend::Backend;
+use uuid::Uuid;
 
 const REAL_BACKEND_TIMEOUT: Duration = Duration::from_secs(60);
 const REAL_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,7 +42,7 @@ fn backend_binary_available(backend_kind: BackendKind) -> bool {
     match backend_kind {
         BackendKind::Claude => binary_available("claude"),
         BackendKind::Codex => binary_available("codex"),
-        BackendKind::Gemini => binary_available("gemini"),
+        BackendKind::Antigravity => binary_available("agy"),
         BackendKind::Tycode => binary_available("tycode-subprocess"),
         BackendKind::Kiro => binary_available("kiro-cli-chat") || binary_available("kiro-cli"),
     }
@@ -79,7 +80,7 @@ fn backend_runtime_available(backend_kind: BackendKind) -> bool {
 
     match backend_kind {
         BackendKind::Tycode => home_is_writable(),
-        BackendKind::Claude | BackendKind::Gemini | BackendKind::Kiro => {
+        BackendKind::Claude | BackendKind::Antigravity | BackendKind::Kiro => {
             home_is_writable() && remote_network_is_available()
         }
         BackendKind::Codex => remote_network_is_available(),
@@ -139,19 +140,28 @@ printf '{"type":"user","message":{"role":"user","content":[{"type":"text","text"
             }
         }
         BackendKind::Codex => Ok(()),
-        BackendKind::Gemini => {
+        BackendKind::Antigravity => {
             let script = r#"
 tmpdir=$(mktemp -d)
 cd "$tmpdir" || exit 1
-gemini -y -p 'Reply exactly with ok' --model gemini-2.5-flash-lite --output-format stream-json
+agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-permissions -p 'Reply exactly with ok'
 "#;
             let output = run_shell_probe(script, REAL_BACKEND_PROBE_TIMEOUT).await?;
-            if output.contains("\"type\":\"message\"") || output.contains("\"type\": \"message\"") {
-                Ok(())
-            } else {
+            if output.contains("Authentication required") {
                 Err(format!(
-                    "Gemini probe did not emit a message event: {output}"
+                    "Antigravity probe requires authentication: {output}"
                 ))
+            } else if output.contains("Error: timed out waiting for response") {
+                Err(format!("Antigravity probe timed out: {output}"))
+            } else if output
+                .lines()
+                .any(|line| line.trim_start().starts_with("Error:"))
+            {
+                Err(format!("Antigravity probe failed: {output}"))
+            } else if output.trim().is_empty() {
+                Err("Antigravity probe emitted no output".to_string())
+            } else {
+                Ok(())
             }
         }
         BackendKind::Tycode => {
@@ -246,10 +256,102 @@ fn backend_label(backend_kind: BackendKind) -> &'static str {
     match backend_kind {
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
-        BackendKind::Gemini => "gemini",
+        BackendKind::Antigravity => "antigravity",
         BackendKind::Tycode => "tycode",
         BackendKind::Kiro => "kiro",
     }
+}
+
+struct AntigravityConversationDbGuard {
+    path: PathBuf,
+    remove_file: bool,
+    created_dirs: Vec<PathBuf>,
+}
+
+impl AntigravityConversationDbGuard {
+    fn create(session_id: &SessionId) -> Self {
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME must be set"));
+        let dirs = [
+            home.join(".gemini"),
+            home.join(".gemini").join("antigravity-cli"),
+            home.join(".gemini")
+                .join("antigravity-cli")
+                .join("conversations"),
+        ];
+        let mut created_dirs = Vec::new();
+        for dir in dirs {
+            if !dir.exists() {
+                std::fs::create_dir(&dir).unwrap_or_else(|err| {
+                    panic!("failed to create fake Antigravity db dir {dir:?}: {err}")
+                });
+                created_dirs.push(dir);
+            }
+        }
+        let path = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("conversations")
+            .join(format!("{}.db", session_id.0));
+        let remove_file = !path.exists();
+        if remove_file {
+            std::fs::write(&path, b"test conversation db").unwrap_or_else(|err| {
+                panic!("failed to create fake Antigravity conversation db {path:?}: {err}")
+            });
+        }
+        Self {
+            path,
+            remove_file,
+            created_dirs,
+        }
+    }
+}
+
+impl Drop for AntigravityConversationDbGuard {
+    fn drop(&mut self) {
+        if self.remove_file {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        for dir in self.created_dirs.iter().rev() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
+fn set_stored_session_resumable(store_dir: &Path, session_id: &SessionId, resumable: bool) {
+    let path = store_dir.join("sessions.json");
+    let contents = std::fs::read_to_string(&path).expect("read session store");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&contents).expect("parse session store");
+    let record = value
+        .get_mut("records")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|records| records.get_mut(&session_id.0))
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap_or_else(|| panic!("missing stored session record {session_id}"));
+    record.insert("resumable".to_owned(), serde_json::Value::Bool(resumable));
+    let rewritten = serde_json::to_string_pretty(&value).expect("serialize session store");
+    std::fs::write(&path, rewritten).expect("write session store");
+}
+
+fn write_antigravity_session_record_without_alias(store_dir: &Path, session_id: &SessionId) {
+    let path = store_dir.join("sessions.json");
+    let mut records = serde_json::Map::new();
+    records.insert(
+        session_id.0.clone(),
+        serde_json::json!({
+            "id": session_id.0.clone(),
+            "backend_kind": "antigravity",
+            "workspace_roots": [],
+            "created_at_ms": 1,
+            "updated_at_ms": 2,
+            "resumable": true
+        }),
+    );
+    let value = serde_json::json!({
+        "records": records
+    });
+    let json = serde_json::to_string_pretty(&value).expect("serialize antigravity session store");
+    std::fs::write(&path, json).expect("write antigravity session store");
 }
 
 async fn expect_fixture_event(client: &mut client::Connection, context: &str) -> Envelope {
@@ -384,6 +486,719 @@ async fn startup_mcp_servers_follow_debug_host_setting_for_new_agents() {
         final_text.contains("tyde-debug(http)"),
         "expected mock backend turn to reflect injected tyde-debug HTTP startup MCP server, got: {final_text}"
     );
+}
+
+#[tokio::test]
+async fn antigravity_empty_workspace_spawn_is_accepted() {
+    init_tracing();
+
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Antigravity".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: Vec::new(),
+                prompt: "hello antigravity".to_string(),
+                images: None,
+                backend_kind: BackendKind::Antigravity,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("send Antigravity spawn");
+
+    let new_agent = loop {
+        let env = expect_fixture_event(&mut fixture.client, "Antigravity NewAgent").await;
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        match env.kind {
+            FrameKind::NewAgent => {
+                break env
+                    .parse_payload::<NewAgentPayload>()
+                    .expect("parse NewAgent");
+            }
+            FrameKind::HostSettings
+            | FrameKind::SessionSchemas
+            | FrameKind::BackendSetup
+            | FrameKind::TeamPresetCatalogNotify => continue,
+            FrameKind::CommandError => {
+                let error = env
+                    .parse_payload::<CommandErrorPayload>()
+                    .expect("parse unexpected CommandError");
+                panic!("empty-root Antigravity spawn must not be rejected: {error:?}");
+            }
+            other => panic!("unexpected event while waiting for Antigravity NewAgent: {other}"),
+        }
+    };
+    assert_eq!(new_agent.backend_kind, BackendKind::Antigravity);
+
+    let start = expect_fixture_agent_start(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "Antigravity AgentStart",
+    )
+    .await;
+    assert_eq!(start.backend_kind, BackendKind::Antigravity);
+    assert!(
+        start.workspace_roots.is_empty(),
+        "empty-root spawn must keep protocol workspace_roots empty"
+    );
+}
+
+#[tokio::test]
+async fn empty_workspace_spawn_is_accepted_for_all_backends() {
+    init_tracing();
+
+    let mut fixture = Fixture::new().await;
+    let backends = [
+        BackendKind::Claude,
+        BackendKind::Codex,
+        BackendKind::Kiro,
+        BackendKind::Tycode,
+        BackendKind::Antigravity,
+    ];
+    let mut session_ids = Vec::new();
+    for backend_kind in backends {
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                name: Some(format!("{backend_kind:?} empty root")),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::New {
+                    workspace_roots: Vec::new(),
+                    prompt: format!("hello {backend_kind:?}"),
+                    images: None,
+                    backend_kind,
+                    cost_hint: None,
+                    access_mode: Default::default(),
+                    session_settings: None,
+                },
+            })
+            .await
+            .unwrap_or_else(|err| panic!("send {backend_kind:?} empty-root spawn: {err:?}"));
+
+        let new_agent = loop {
+            let env = expect_fixture_event(&mut fixture.client, "empty-root NewAgent").await;
+            if fixture::is_builtin_team_custom_agent_notify(&env) {
+                continue;
+            }
+            match env.kind {
+                FrameKind::NewAgent => {
+                    let payload: NewAgentPayload =
+                        env.parse_payload().expect("parse empty-root NewAgent");
+                    if payload.backend_kind == backend_kind {
+                        break payload;
+                    }
+                }
+                FrameKind::CommandError => {
+                    let error = env
+                        .parse_payload::<CommandErrorPayload>()
+                        .expect("parse unexpected empty-root CommandError");
+                    panic!("{backend_kind:?} empty-root spawn must not be rejected: {error:?}");
+                }
+                _ => {}
+            }
+        };
+
+        let start = expect_fixture_agent_start(
+            &mut fixture.client,
+            &new_agent.instance_stream,
+            "empty-root AgentStart",
+        )
+        .await;
+        assert_eq!(start.backend_kind, backend_kind);
+        assert!(
+            start.workspace_roots.is_empty(),
+            "{backend_kind:?} empty-root spawn must keep AgentStart workspace_roots empty"
+        );
+        let session_id = start
+            .session_id
+            .clone()
+            .unwrap_or_else(|| panic!("{backend_kind:?} empty-root AgentStart missing session_id"));
+        session_ids.push((backend_kind, session_id));
+
+        loop {
+            let env = expect_fixture_event(&mut fixture.client, "empty-root ChatEvent").await;
+            if env.kind != FrameKind::ChatEvent || env.stream != new_agent.instance_stream {
+                continue;
+            }
+            let event: ChatEvent = env.parse_payload().expect("parse empty-root ChatEvent");
+            if matches!(event, ChatEvent::StreamEnd(_)) {
+                break;
+            }
+        }
+    }
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions after all empty-root spawns");
+    let session_list = loop {
+        let env = expect_fixture_event(&mut fixture.client, "empty-root SessionList").await;
+        if env.kind == FrameKind::SessionList {
+            break env
+                .parse_payload::<SessionListPayload>()
+                .expect("parse empty-root SessionList");
+        }
+    };
+    for (backend_kind, session_id) in session_ids {
+        let session = session_list
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .unwrap_or_else(|| panic!("missing {backend_kind:?} empty-root session"));
+        assert_eq!(session.backend_kind, backend_kind);
+        assert!(
+            session.workspace_roots.is_empty(),
+            "{backend_kind:?} empty-root session summary must keep workspace_roots empty"
+        );
+    }
+}
+
+#[tokio::test]
+async fn antigravity_native_uuid_session_remains_resumable_after_close() {
+    init_tracing();
+
+    let mut fixture = Fixture::new().await;
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Antigravity".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![workspace.path().to_string_lossy().to_string()],
+                prompt: "hello antigravity".to_string(),
+                images: None,
+                backend_kind: BackendKind::Antigravity,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn Antigravity mock agent");
+
+    let env = expect_fixture_event(&mut fixture.client, "Antigravity NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse Antigravity NewAgent");
+    assert_eq!(new_agent.backend_kind, BackendKind::Antigravity);
+
+    let start = expect_fixture_agent_start(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "Antigravity AgentStart",
+    )
+    .await;
+    assert_eq!(start.backend_kind, BackendKind::Antigravity);
+    let session_id = start
+        .session_id
+        .clone()
+        .expect("Antigravity AgentStart session_id");
+
+    loop {
+        let env = expect_fixture_event(&mut fixture.client, "Antigravity ChatEvent").await;
+        if env.kind != FrameKind::ChatEvent || env.stream != new_agent.instance_stream {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse Antigravity ChatEvent");
+        if matches!(event, ChatEvent::StreamEnd(_)) {
+            break;
+        }
+    }
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions after Antigravity spawn");
+    let session_list = loop {
+        let env = expect_fixture_event(&mut fixture.client, "Antigravity SessionList").await;
+        if env.kind == FrameKind::SessionList {
+            break env
+                .parse_payload::<SessionListPayload>()
+                .expect("parse Antigravity SessionList");
+        }
+    };
+    let session = session_list
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .expect("persisted Antigravity session");
+    assert_eq!(session.backend_kind, BackendKind::Antigravity);
+    assert!(
+        !session.resumable,
+        "Antigravity native UUID sessions without a backing AGY db must not be resumable"
+    );
+
+    set_stored_session_resumable(fixture.store_dir(), &session_id, false);
+    let _db_guard = AntigravityConversationDbGuard::create(&session_id);
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions after creating fake Antigravity db");
+    let session_list = loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "Antigravity SessionList with fake native db",
+        )
+        .await;
+        if env.kind == FrameKind::SessionList {
+            break env
+                .parse_payload::<SessionListPayload>()
+                .expect("parse Antigravity SessionList with fake native db");
+        }
+    };
+    let session = session_list
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .expect("persisted Antigravity session with fake native db");
+    assert!(
+        session.resumable,
+        "Antigravity native UUID sessions with a backing AGY db should be resumable"
+    );
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Antigravity resumed from stale false".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session_id.clone(),
+                prompt: Some("resume antigravity".to_string()),
+            },
+        })
+        .await
+        .expect("resume Antigravity mock agent after fake native db");
+    let resumed_agent = loop {
+        let env = expect_fixture_event(&mut fixture.client, "resumed Antigravity NewAgent").await;
+        match env.kind {
+            FrameKind::NewAgent => {
+                let payload: NewAgentPayload = env
+                    .parse_payload()
+                    .expect("parse resumed Antigravity NewAgent");
+                if payload.backend_kind == BackendKind::Antigravity {
+                    break payload;
+                }
+            }
+            FrameKind::CommandError => {
+                let error = env
+                    .parse_payload::<CommandErrorPayload>()
+                    .expect("parse unexpected resume CommandError");
+                panic!(
+                    "DB-backed Antigravity session with stale stored false must resume: {error:?}"
+                );
+            }
+            _ => {}
+        }
+    };
+    let resumed_start = expect_fixture_agent_start(
+        &mut fixture.client,
+        &resumed_agent.instance_stream,
+        "resumed Antigravity AgentStart",
+    )
+    .await;
+    assert_eq!(
+        resumed_start.session_id.as_ref(),
+        Some(&session_id),
+        "Antigravity resume must reopen the native session id even if the stored raw resumable flag was stale false"
+    );
+
+    fixture
+        .client
+        .close_agent(&new_agent.instance_stream)
+        .await
+        .expect("close Antigravity agent");
+    loop {
+        let env = expect_fixture_event(&mut fixture.client, "Antigravity AgentClosed").await;
+        if env.kind == FrameKind::AgentClosed {
+            break;
+        }
+    }
+    let session_list = loop {
+        let env =
+            expect_fixture_event(&mut fixture.client, "Antigravity SessionList after close").await;
+        if env.kind == FrameKind::SessionList {
+            break env
+                .parse_payload::<SessionListPayload>()
+                .expect("parse Antigravity SessionList after close");
+        }
+    };
+    let session = session_list
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .expect("persisted Antigravity session after close");
+    assert!(
+        session.resumable,
+        "Antigravity native UUID sessions with a backing AGY db should remain resumable after close"
+    );
+}
+
+#[tokio::test]
+async fn antigravity_direct_resume_missing_native_db_reports_startup_failure() {
+    init_tracing();
+
+    let mut fixture = Fixture::new().await;
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Antigravity".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![workspace.path().to_string_lossy().to_string()],
+                prompt: "hello antigravity".to_string(),
+                images: None,
+                backend_kind: BackendKind::Antigravity,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn Antigravity mock agent");
+
+    let env = expect_fixture_event(&mut fixture.client, "Antigravity NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse Antigravity NewAgent");
+    let start = expect_fixture_agent_start(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "Antigravity AgentStart",
+    )
+    .await;
+    let session_id = start
+        .session_id
+        .clone()
+        .expect("Antigravity AgentStart session_id");
+
+    loop {
+        let env = expect_fixture_event(&mut fixture.client, "Antigravity ChatEvent").await;
+        if env.kind != FrameKind::ChatEvent || env.stream != new_agent.instance_stream {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse Antigravity ChatEvent");
+        if matches!(event, ChatEvent::StreamEnd(_)) {
+            break;
+        }
+    }
+
+    let db_guard = AntigravityConversationDbGuard::create(&session_id);
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions with fake Antigravity db");
+    let session_list = loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "Antigravity SessionList with fake native db",
+        )
+        .await;
+        if env.kind == FrameKind::SessionList {
+            break env
+                .parse_payload::<SessionListPayload>()
+                .expect("parse Antigravity SessionList with fake native db");
+        }
+    };
+    let session = session_list
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .expect("persisted Antigravity session with fake native db");
+    assert!(
+        session.resumable,
+        "test setup must first observe the Antigravity session as resumable"
+    );
+    drop(db_guard);
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Antigravity resume after db removal".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session_id.clone(),
+                prompt: Some("resume after db removal".to_string()),
+            },
+        })
+        .await
+        .expect("send Antigravity resume after native db removal");
+
+    let resumed_agent = loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "Antigravity resume-missing-db NewAgent",
+        )
+        .await;
+        match env.kind {
+            FrameKind::NewAgent => {
+                let payload: NewAgentPayload = env
+                    .parse_payload()
+                    .expect("parse Antigravity resume-missing-db NewAgent");
+                if payload.backend_kind == BackendKind::Antigravity {
+                    break payload;
+                }
+            }
+            FrameKind::CommandError => {
+                let error = env
+                    .parse_payload::<CommandErrorPayload>()
+                    .expect("parse unexpected resume CommandError");
+                panic!(
+                    "direct resume should become agent startup failure, not CommandError: {error:?}"
+                );
+            }
+            _ => {}
+        }
+    };
+    let bootstrap: AgentBootstrapPayload = loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "Antigravity resume-missing-db AgentBootstrap",
+        )
+        .await;
+        if env.kind == FrameKind::AgentBootstrap && env.stream == resumed_agent.instance_stream {
+            break env
+                .parse_payload()
+                .expect("parse Antigravity resume-missing-db AgentBootstrap");
+        }
+    };
+    let resumed_start = bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::AgentStart(start) => Some(start),
+            _ => None,
+        })
+        .expect("Antigravity resume-missing-db bootstrap must include AgentStart");
+    assert_eq!(resumed_start.session_id.as_ref(), Some(&session_id));
+    let error = bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::AgentError(error) => Some(error),
+            _ => None,
+        })
+        .expect("Antigravity resume-missing-db bootstrap must include AgentError");
+    assert_eq!(error.code, AgentErrorCode::Unsupported);
+    assert!(error.fatal);
+    assert!(
+        error
+            .message
+            .contains("cannot resume non-resumable session"),
+        "unexpected resume-missing-db error: {error:?}"
+    );
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("connection should remain usable after Antigravity resume-missing-db failure");
+    loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "SessionList after Antigravity resume-missing-db failure",
+        )
+        .await;
+        if env.kind == FrameKind::SessionList {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn antigravity_direct_resume_non_resumable_without_alias_reports_startup_failure() {
+    init_tracing();
+
+    let mut fixture = Fixture::new().await;
+    let session_id = SessionId(Uuid::new_v4().to_string());
+    write_antigravity_session_record_without_alias(fixture.store_dir(), &session_id);
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: Some(CustomAgentId("mismatched-custom-agent".to_string())),
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session_id.clone(),
+                prompt: Some("resume non-resumable".to_string()),
+            },
+        })
+        .await
+        .expect("send Antigravity non-resumable resume");
+
+    let resumed_agent = loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "Antigravity non-resumable no-alias NewAgent",
+        )
+        .await;
+        match env.kind {
+            FrameKind::NewAgent => {
+                let payload: NewAgentPayload = env
+                    .parse_payload()
+                    .expect("parse Antigravity non-resumable no-alias NewAgent");
+                if payload.session_id.as_ref() == Some(&session_id) {
+                    break payload;
+                }
+            }
+            FrameKind::CommandError => {
+                let error = env
+                    .parse_payload::<CommandErrorPayload>()
+                    .expect("parse unexpected non-resumable CommandError");
+                panic!(
+                    "non-resumable direct resume should become agent startup failure, not CommandError: {error:?}"
+                );
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(resumed_agent.name, format!("Session {session_id}"));
+
+    let bootstrap: AgentBootstrapPayload = loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "Antigravity non-resumable no-alias AgentBootstrap",
+        )
+        .await;
+        if env.kind == FrameKind::AgentBootstrap && env.stream == resumed_agent.instance_stream {
+            break env
+                .parse_payload()
+                .expect("parse Antigravity non-resumable no-alias AgentBootstrap");
+        }
+    };
+    let error = bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::AgentError(error) => Some(error),
+            _ => None,
+        })
+        .expect("Antigravity non-resumable no-alias bootstrap must include AgentError");
+    assert_eq!(error.code, AgentErrorCode::Unsupported);
+    assert!(error.fatal);
+    assert!(
+        error
+            .message
+            .contains("cannot resume non-resumable session"),
+        "unexpected non-resumable no-alias error: {error:?}"
+    );
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("connection should remain usable after non-resumable no-alias failure");
+    loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "SessionList after non-resumable no-alias failure",
+        )
+        .await;
+        if env.kind == FrameKind::SessionList {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn antigravity_direct_resume_missing_record_reports_startup_failure() {
+    init_tracing();
+
+    let mut fixture = Fixture::new().await;
+    let session_id = SessionId(Uuid::new_v4().to_string());
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session_id.clone(),
+                prompt: Some("resume missing".to_string()),
+            },
+        })
+        .await
+        .expect("send missing-record resume");
+
+    let resumed_agent = loop {
+        let env = expect_fixture_event(&mut fixture.client, "missing-record resume NewAgent").await;
+        if env.kind != FrameKind::NewAgent {
+            continue;
+        }
+        let payload: NewAgentPayload = env
+            .parse_payload()
+            .expect("parse missing-record resume NewAgent");
+        if payload.session_id.as_ref() == Some(&session_id) {
+            break payload;
+        }
+    };
+    assert_eq!(resumed_agent.name, format!("Session {session_id}"));
+
+    let bootstrap: AgentBootstrapPayload = loop {
+        let env =
+            expect_fixture_event(&mut fixture.client, "missing-record resume AgentBootstrap").await;
+        if env.kind == FrameKind::AgentBootstrap && env.stream == resumed_agent.instance_stream {
+            break env
+                .parse_payload()
+                .expect("parse missing-record resume AgentBootstrap");
+        }
+    };
+    let error = bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::AgentError(error) => Some(error),
+            _ => None,
+        })
+        .expect("missing-record resume bootstrap must include AgentError");
+    assert_eq!(error.code, AgentErrorCode::Unsupported);
+    assert!(error.fatal);
+    assert!(
+        error.message.contains("cannot resume missing session"),
+        "unexpected missing-record resume error: {error:?}"
+    );
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("connection should remain usable after missing-record resume failure");
+    loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "SessionList after missing-record resume failure",
+        )
+        .await;
+        if env.kind == FrameKind::SessionList {
+            break;
+        }
+    }
 }
 
 #[tokio::test]
@@ -1306,12 +2121,10 @@ async fn assert_backend_emits_stream_deltas(
         !response.final_text.trim().is_empty(),
         "expected non-empty streamed response for {backend_kind:?}"
     );
-    if backend_kind != BackendKind::Gemini {
-        assert!(
-            response.delta_count > 0,
-            "expected at least one StreamDelta for {backend_kind:?}"
-        );
-    }
+    assert!(
+        response.delta_count > 0,
+        "expected at least one StreamDelta for {backend_kind:?}"
+    );
 }
 
 async fn assert_backend_emits_typing_status(
@@ -1611,14 +2424,12 @@ async fn assert_backend_emits_typing_and_streaming_on_follow_up_turns(
             "expected non-empty follow-up response for {backend_kind:?}; events={:?}",
             turn.events
         );
-        if backend_kind != BackendKind::Gemini {
-            assert!(
-                turn.delta_count > 0,
-                "expected streamed deltas on follow-up turn {:?} for {backend_kind:?}; events={:?}",
-                prompt,
-                turn.events
-            );
-        }
+        assert!(
+            turn.delta_count > 0,
+            "expected streamed deltas on follow-up turn {:?} for {backend_kind:?}; events={:?}",
+            prompt,
+            turn.events
+        );
     }
 }
 
@@ -2037,8 +2848,8 @@ async fn assert_backend_interrupts_long_running_command(
         BackendKind::Codex => {
             "Immediately run the test harness `./interrupt_test.sh` in the current working directory using your command execution capability. Start it before any explanation, do not ask for confirmation, and do not use any other tools."
         }
-        BackendKind::Gemini => {
-            "Use the run_shell_command tool exactly once to execute exactly `./interrupt_test.sh` in the current working directory. Start the command immediately. Do not use any other tools."
+        BackendKind::Antigravity => {
+            "Execute exactly `./interrupt_test.sh` in the current working directory. Start the command immediately. Do not use any other tools."
         }
         BackendKind::Kiro => {
             "Use the available tools to run the test harness `./interrupt_test.sh` in the current working directory immediately. Do not ask for clarification, and do not only describe a plan."
@@ -2165,11 +2976,15 @@ async fn assert_backend_interrupts_long_running_command(
 
 #[tokio::test]
 async fn resumable_real_backends_remember_secret() {
-    let backends = [BackendKind::Claude, BackendKind::Codex, BackendKind::Gemini];
+    let backends = [
+        BackendKind::Claude,
+        BackendKind::Codex,
+        BackendKind::Antigravity,
+    ];
     let mut failures = Vec::new();
 
     for backend_kind in backends {
-        eprintln!("RUNNING interrupt test for {}", backend_label(backend_kind));
+        eprintln!("RUNNING resume test for {}", backend_label(backend_kind));
         if !backend_binary_available(backend_kind) {
             eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
             continue;
@@ -2212,16 +3027,12 @@ async fn real_backends_emit_stream_deltas() {
     let backends = [
         BackendKind::Claude,
         BackendKind::Codex,
-        BackendKind::Gemini,
+        BackendKind::Antigravity,
         BackendKind::Kiro,
     ];
     let mut failures = Vec::new();
 
     for backend_kind in backends {
-        if backend_kind == BackendKind::Gemini {
-            eprintln!("SKIPPED: gemini streaming deltas are not stable in this live backend test");
-            continue;
-        }
         if !backend_binary_available(backend_kind) {
             eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
             continue;
@@ -2264,7 +3075,7 @@ async fn real_backends_emit_typing_status() {
     let backends = [
         BackendKind::Claude,
         BackendKind::Codex,
-        BackendKind::Gemini,
+        BackendKind::Antigravity,
         BackendKind::Kiro,
     ];
     let mut failures = Vec::new();

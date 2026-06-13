@@ -71,7 +71,7 @@ enum BackendKindInput {
     Kiro,
     Claude,
     Codex,
-    Gemini,
+    Antigravity,
 }
 
 impl From<BackendKindInput> for BackendKind {
@@ -81,7 +81,7 @@ impl From<BackendKindInput> for BackendKind {
             BackendKindInput::Kiro => Self::Kiro,
             BackendKindInput::Claude => Self::Claude,
             BackendKindInput::Codex => Self::Codex,
-            BackendKindInput::Gemini => Self::Gemini,
+            BackendKindInput::Antigravity => Self::Antigravity,
         }
     }
 }

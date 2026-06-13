@@ -3,8 +3,8 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::send::send_frame;
 use crate::state::{
-    ActiveProjectRef, AppState, DockVisibility, LeftTab, PendingWorkbenchCreate, TabContent,
-    sort_project_infos,
+    ActiveAgentRef, ActiveProjectRef, AppState, DockVisibility, LeftTab, PendingWorkbenchCreate,
+    TabContent, sort_project_infos,
 };
 
 use protocol::{
@@ -30,6 +30,10 @@ pub fn resume_session(
     session_id: SessionId,
     project_id: Option<ProjectId>,
 ) {
+    if open_existing_session_agent(state, &host_id, &session_id, project_id.clone()) {
+        return;
+    }
+
     let target_project = project_id.map(|pid| ActiveProjectRef {
         host_id: host_id.clone(),
         project_id: pid,
@@ -56,6 +60,42 @@ pub fn resume_session(
             log::error!("failed to send SpawnAgent (resume): {error}");
         }
     });
+}
+
+fn open_existing_session_agent(
+    state: &AppState,
+    host_id: &str,
+    session_id: &SessionId,
+    project_id: Option<ProjectId>,
+) -> bool {
+    let existing = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .find(|agent| {
+                agent.host_id == host_id
+                    && agent.backend_kind == BackendKind::Antigravity
+                    && agent.session_id.as_ref() == Some(session_id)
+            })
+            .cloned()
+    });
+    let Some(agent) = existing else {
+        return false;
+    };
+
+    let target_project = project_id.map(|pid| ActiveProjectRef {
+        host_id: host_id.to_owned(),
+        project_id: pid,
+    });
+    state.switch_active_project(target_project);
+    state.open_tab(
+        TabContent::chat_with_agent(ActiveAgentRef {
+            host_id: host_id.to_owned(),
+            agent_id: agent.agent_id,
+        }),
+        agent.name,
+        true,
+    );
+    true
 }
 
 pub fn begin_new_chat(state: &AppState, backend_override: Option<BackendKind>) {
@@ -780,5 +820,55 @@ mod wasm_tests {
             }
             other => panic!("expected Fork params, got {other:?}"),
         }
+    }
+
+    #[wasm_bindgen_test]
+    fn resume_session_opens_current_agent_locally() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let session_id = SessionId("antigravity-session".to_owned());
+            let agent_id = AgentId("antigravity-agent".to_owned());
+            state.agents.update(|agents| {
+                agents.push(crate::state::AgentInfo {
+                    host_id: "host-a".to_owned(),
+                    agent_id: agent_id.clone(),
+                    name: "Antigravity chat".to_owned(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: BackendKind::Antigravity,
+                    workspace_roots: vec!["/repo".to_owned()],
+                    project_id: Some(ProjectId("project-a".to_owned())),
+                    parent_agent_id: None,
+                    session_id: Some(session_id.clone()),
+                    custom_agent_id: None,
+                    created_at_ms: 0,
+                    instance_stream: StreamPath("/agent/antigravity-agent".to_owned()),
+                    started: true,
+                    fatal_error: None,
+                });
+            });
+
+            resume_session(
+                &state,
+                "host-a".to_owned(),
+                session_id,
+                Some(ProjectId("project-a".to_owned())),
+            );
+
+            assert_eq!(
+                state.active_project.get_untracked(),
+                Some(ActiveProjectRef {
+                    host_id: "host-a".to_owned(),
+                    project_id: ProjectId("project-a".to_owned()),
+                })
+            );
+            assert_eq!(
+                state.active_agent.get_untracked(),
+                Some(ActiveAgentRef {
+                    host_id: "host-a".to_owned(),
+                    agent_id,
+                })
+            );
+        });
     }
 }

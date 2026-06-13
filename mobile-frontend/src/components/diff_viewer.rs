@@ -2125,8 +2125,8 @@ mod wasm_tests {
                 m.insert(
                     host_for_mount.clone(),
                     host_settings(
-                        Some(BackendKind::Gemini),
-                        vec![BackendKind::Codex, BackendKind::Gemini],
+                        Some(BackendKind::Antigravity),
+                        vec![BackendKind::Codex, BackendKind::Antigravity],
                     ),
                 );
             });
@@ -2138,7 +2138,7 @@ mod wasm_tests {
             state.host_settings_by_host.update(|m| {
                 m.insert(
                     host_for_mount.clone(),
-                    host_settings(None, vec![BackendKind::Codex, BackendKind::Gemini]),
+                    host_settings(None, vec![BackendKind::Codex, BackendKind::Antigravity]),
                 );
             });
             observed_for_mount
@@ -2160,7 +2160,11 @@ mod wasm_tests {
         let got = observed.borrow();
         assert_eq!(
             got.as_slice(),
-            &[Some(BackendKind::Gemini), Some(BackendKind::Codex), None],
+            &[
+                Some(BackendKind::Antigravity),
+                Some(BackendKind::Codex),
+                None
+            ],
             "effective backend must be default → first-enabled → none"
         );
     }

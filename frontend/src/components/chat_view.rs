@@ -743,7 +743,7 @@ pub fn ChatView(
                             BackendKind::Kiro => ("backend-badge kiro", "Kiro"),
                             BackendKind::Claude => ("backend-badge claude", "Claude"),
                             BackendKind::Codex => ("backend-badge codex", "Codex"),
-                            BackendKind::Gemini => ("backend-badge gemini", "Gemini"),
+                            BackendKind::Antigravity => ("backend-badge antigravity", "Antigravity"),
                         };
                         view! { <span class=badge_class>{label}</span> }
                     })}
@@ -1387,6 +1387,19 @@ mod wasm_tests {
         // asserting that the unmounted suffix is represented by the
         // bottom spacer.
         scroller.set_scroll_top(0);
+        // `set_scroll_top` moves the DOM, but the windowing Memo only
+        // re-anchors to the top once the production `scroll` listener
+        // observes the new position (updating `scroll_top_sig`) and marks
+        // `user_scrolled_up`, which stops sticky-bottom auto-scroll from
+        // re-pinning to the end. The browser dispatches `scroll`
+        // asynchronously; under full-suite event-loop load that dispatch
+        // can land after the assertion, leaving the list bottom-anchored
+        // (bottom spacer 0px). Dispatch it synchronously so the
+        // scrolled-to-top precondition is deterministic — this drives the
+        // exact same listener the browser would.
+        scroller
+            .dispatch_event(&web_sys::Event::new("scroll").unwrap())
+            .unwrap();
         next_tick().await;
 
         let mounted = message_rows(&container);

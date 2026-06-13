@@ -2877,8 +2877,8 @@ mod tests {
                 settings.insert(
                     "host-b".to_owned(),
                     HostSettings {
-                        enabled_backends: vec![BackendKind::Gemini],
-                        default_backend: Some(BackendKind::Gemini),
+                        enabled_backends: vec![BackendKind::Antigravity],
+                        default_backend: Some(BackendKind::Antigravity),
                         enable_mobile_connections: false,
                         mobile_broker_url: None,
                         tyde_debug_mcp_enabled: false,

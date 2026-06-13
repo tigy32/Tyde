@@ -2304,6 +2304,8 @@ fn spawn_team_registry_actor(actor: TeamRegistryActor, rx: mpsc::Receiver<TeamRe
 mod tests {
     use super::*;
     use crate::store::agent_teams::AgentTeamsStore;
+    use std::collections::HashSet;
+
     use protocol::{
         BackendKind, CustomAgentId, ProjectId, TeamCreatePayload, TeamMemberCreateSpec,
     };
@@ -2320,6 +2322,7 @@ mod tests {
             role_preset_ids,
             personality_preset_ids,
             legacy_backend_kind: Some(BackendKind::Claude),
+            purged_gemini_session_ids: HashSet::new(),
         }
     }
 

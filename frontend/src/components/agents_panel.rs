@@ -55,7 +55,7 @@ fn backend_class(kind: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Kiro => "backend-badge kiro",
         protocol::BackendKind::Claude => "backend-badge claude",
         protocol::BackendKind::Codex => "backend-badge codex",
-        protocol::BackendKind::Gemini => "backend-badge gemini",
+        protocol::BackendKind::Antigravity => "backend-badge antigravity",
     }
 }
 
@@ -65,7 +65,7 @@ fn backend_label(kind: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Kiro => "Kiro",
         protocol::BackendKind::Claude => "Claude",
         protocol::BackendKind::Codex => "Codex",
-        protocol::BackendKind::Gemini => "Gemini",
+        protocol::BackendKind::Antigravity => "Antigravity",
     }
 }
 

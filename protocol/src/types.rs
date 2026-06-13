@@ -356,14 +356,14 @@ pub enum BackendKind {
     Kiro,
     Claude,
     Codex,
-    Gemini,
+    Antigravity,
 }
 
 impl BackendKind {
     pub const fn supports_image_input(self) -> bool {
         match self {
             Self::Kiro | Self::Claude | Self::Codex => true,
-            Self::Tycode | Self::Gemini => false,
+            Self::Tycode | Self::Antigravity => false,
         }
     }
 }
@@ -3138,7 +3138,7 @@ pub struct AgentErrorPayload {
 /// Events a backend emits on a chat stream. Mirrors the Tycode
 /// `ChatEvent` enum in `tycode-core/src/chat/events.rs`; any semantic
 /// change must be made there first so every backend (Claude, Codex,
-/// Gemini, Kiro, Tycode) shares one contract.
+/// Antigravity, Kiro, Tycode) shares one contract.
 ///
 /// ## Invariants backends MUST uphold
 ///

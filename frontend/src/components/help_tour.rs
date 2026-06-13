@@ -26,7 +26,7 @@ static STEPS: [TourStep; 5] = [
     TourStep {
         title: "Start a chat",
         body: "New Chat opens a conversation with an agent inside the current \
-               project. Use the ▾ to pick a backend (Claude, Codex, Gemini…) \
+               project. Use the ▾ to pick a backend (Claude, Codex, Antigravity…) \
                or a custom agent, then describe a task in plain language.",
         selector: ".home-actions",
         hidden_hint: "The New Chat button lives on the home screen and at the \

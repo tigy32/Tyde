@@ -28,18 +28,18 @@ use protocol::{
     ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
     ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
     SessionId, SessionListPayload, SessionSchemaEntry, SessionSchemasPayload,
-    SessionSettingsSchema, SetSettingPayload, Skill, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
-    SteeringScope, SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
-    TeamDraftUpdatePayload, TeamId, TeamMember, TeamMemberBindingNotifyPayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload,
-    TeamMemberRole, TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload,
-    TeamMemberState, TeamMemberUpdatePayload, TeamNotifyPayload, TeamRenamePayload,
-    TeamSetManagerPayload, TerminalCreatePayload, TerminalId, TerminalLaunchTarget,
-    TerminalResizePayload, TerminalSendPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
-    WorkbenchRoot,
+    SessionSettingsSchema, SessionSummary, SetSettingPayload, Skill, SkillNotifyPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TeamCreatePayload,
+    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
+    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
+    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId,
+    TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
+    TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
+    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, WorkbenchCreatePayload,
+    WorkbenchRemovePayload, WorkbenchRoot,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -92,7 +92,7 @@ use crate::store::mcp_servers::{McpServerStore, RESERVED_MCP_SERVER_NAMES};
 use crate::store::mobile_pairings::MobilePairingsStore;
 use crate::store::project::{ProjectStore, ProjectStoreError};
 use crate::store::review::ReviewStore;
-use crate::store::session::{SessionRecord, SessionStore};
+use crate::store::session::{SessionRecord, SessionStore, session_record_is_resumable};
 use crate::store::settings::HostSettingsStore;
 use crate::store::skills::SkillStore;
 use crate::store::steering::SteeringStore;
@@ -518,12 +518,13 @@ impl HostHandle {
             .map(|project| project.id.clone())
             .collect::<Vec<_>>();
 
-        let sessions = state
+        let mut sessions = state
             .session_store
             .lock()
             .await
             .summaries()
             .unwrap_or_else(|err| panic!("failed to list sessions for host registration: {err}"));
+        normalize_antigravity_session_resumability(&mut sessions);
 
         let mcp_servers = state
             .mcp_server_store
@@ -1779,16 +1780,104 @@ impl HostHandle {
                 }
             }
             SpawnAgentParams::Resume { session_id, prompt } => {
-                let record = session_store
-                    .lock()
-                    .await
-                    .get(&session_id)
-                    .unwrap_or_else(|| panic!("cannot resume missing session {}", session_id));
-                assert!(
-                    record.resumable,
-                    "cannot resume non-resumable session {}",
-                    session_id
-                );
+                let record = session_store.lock().await.get(&session_id);
+                let Some(record) = record else {
+                    let resolved_name = payload
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("Session {}", session_id));
+                    let initial_alias = payload.name.clone().map(|name| InitialAgentAlias {
+                        name,
+                        persistence: InitialAgentAliasPersistence::User,
+                    });
+                    return self
+                        .spawn_resolved_agent(ResolvedSpawnRequest {
+                            name: resolved_name,
+                            origin,
+                            custom_agent_id: payload.custom_agent_id.clone(),
+                            team_id: team_context.as_ref().map(|context| context.team_id.clone()),
+                            team_member_id: team_context
+                                .as_ref()
+                                .map(|context| context.team_member_id.clone()),
+                            parent_agent_id: payload.parent_agent_id,
+                            parent_session_id,
+                            project_id: payload.project_id.clone(),
+                            backend_kind: host_settings
+                                .default_backend
+                                .or_else(|| host_settings.enabled_backends.first().copied())
+                                .unwrap_or(protocol::BackendKind::Claude),
+                            workspace_roots: Vec::new(),
+                            initial_input: prompt.map(|prompt| protocol::SendMessagePayload {
+                                message: prompt,
+                                images: None,
+                                origin: None,
+                                tool_response: None,
+                            }),
+                            cost_hint: None,
+                            session_settings: None,
+                            session_settings_schema: None,
+                            startup_mcp_servers: Vec::new(),
+                            resolved_spawn_config: ResolvedSpawnConfig::default(),
+                            resume_session_id: Some(session_id.clone()),
+                            fork_from_session_id: None,
+                            startup_warning: None,
+                            startup_failure: Some(AgentStartupFailure::unsupported(format!(
+                                "cannot resume missing session {}",
+                                session_id
+                            ))),
+                            initial_alias,
+                            use_mock_backend,
+                        })
+                        .await;
+                };
+                if !session_record_is_resumable(&record) {
+                    let resolved_name = payload
+                        .name
+                        .clone()
+                        .or_else(|| record.user_alias.clone())
+                        .or_else(|| record.alias.clone())
+                        .unwrap_or_else(|| format!("Session {}", session_id));
+                    let initial_alias = payload.name.clone().map(|name| InitialAgentAlias {
+                        name,
+                        persistence: InitialAgentAliasPersistence::User,
+                    });
+                    return self
+                        .spawn_resolved_agent(ResolvedSpawnRequest {
+                            name: resolved_name,
+                            origin,
+                            custom_agent_id: record.custom_agent_id.clone(),
+                            team_id: team_context.as_ref().map(|context| context.team_id.clone()),
+                            team_member_id: team_context
+                                .as_ref()
+                                .map(|context| context.team_member_id.clone()),
+                            parent_agent_id: payload.parent_agent_id,
+                            parent_session_id,
+                            project_id: record.project_id.clone(),
+                            backend_kind: record.backend_kind,
+                            workspace_roots: record.workspace_roots.clone(),
+                            initial_input: prompt.map(|prompt| protocol::SendMessagePayload {
+                                message: prompt,
+                                images: None,
+                                origin: None,
+                                tool_response: None,
+                            }),
+                            cost_hint: None,
+                            session_settings: None,
+                            session_settings_schema: None,
+                            startup_mcp_servers: Vec::new(),
+                            resolved_spawn_config: ResolvedSpawnConfig::default(),
+                            resume_session_id: Some(session_id.clone()),
+                            fork_from_session_id: None,
+                            startup_warning: None,
+                            startup_failure: Some(AgentStartupFailure::unsupported(format!(
+                                "cannot resume non-resumable session {}",
+                                session_id
+                            ))),
+                            initial_alias,
+                            use_mock_backend,
+                        })
+                        .await;
+                }
                 if let Some(requested_custom_agent_id) = payload.custom_agent_id.as_ref() {
                     assert_eq!(
                         record.custom_agent_id.as_ref(),
@@ -2239,7 +2328,7 @@ impl HostHandle {
                         crate::backend::backend_fork_unsupported_message(backend_kind),
                     )
                 });
-                let non_resumable_failure = (!record.resumable).then(|| {
+                let non_resumable_failure = (!session_record_is_resumable(&record)).then(|| {
                     AgentStartupFailure::unsupported(format!(
                         "cannot fork non-resumable session {}",
                         from_session_id
@@ -3820,7 +3909,7 @@ impl HostHandle {
             .into_iter()
             .find(|record| record.id == *session_id)
             .ok_or_else(|| format!("cannot resume missing session {session_id}"))?;
-        if !record.resumable {
+        if !session_record_is_resumable(&record) {
             return Err(format!("cannot resume non-resumable session {session_id}"));
         }
         Ok(())
@@ -4076,12 +4165,14 @@ impl HostHandle {
         const OPERATION: &str = "list_sessions";
         let sessions = {
             let state = self.state.lock().await;
-            state
+            let mut sessions = state
                 .session_store
                 .lock()
                 .await
                 .summaries()
-                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+            normalize_antigravity_session_resumability(&mut sessions);
+            sessions
         };
 
         let payload = SessionListPayload { sessions };
@@ -4547,6 +4638,7 @@ impl HostHandle {
                 }
             }
         }
+        fan_out_session_lists(&mut state).await;
 
         true
     }
@@ -6851,7 +6943,8 @@ fn spawn_host_inner(
     use_mock_backend: bool,
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
-    let session_store = SessionStore::load(paths.session)?;
+    let (session_store, purged_gemini_session_ids) =
+        SessionStore::load_with_migration(paths.session)?;
     let project_store = ProjectStore::load(paths.project)?;
     let review_store = ReviewStore::load(paths.review)?;
     let settings_store = HostSettingsStore::load(paths.settings)?;
@@ -6875,6 +6968,7 @@ fn spawn_host_inner(
         role_preset_ids,
         personality_preset_ids,
         legacy_backend_kind: host_settings.default_backend,
+        purged_gemini_session_ids,
     };
     let team_store = AgentTeamsStore::load(paths.agent_team, &team_refs)?;
     let project_store = Arc::new(Mutex::new(project_store));
@@ -7460,12 +7554,13 @@ async fn emit_new_agent_for_stream(
 }
 
 async fn fan_out_session_lists(state: &mut HostState) {
-    let sessions = state
+    let mut sessions = state
         .session_store
         .lock()
         .await
         .summaries()
         .unwrap_or_else(|err| panic!("failed to list sessions for fanout: {err}"));
+    normalize_antigravity_session_resumability(&mut sessions);
     let payload = serde_json::to_value(SessionListPayload { sessions })
         .expect("failed to serialize SessionList payload for host stream fanout");
 
@@ -7488,6 +7583,31 @@ async fn fan_out_session_lists(state: &mut HostState) {
     for path in dead_paths {
         state.host_streams.remove(&path);
     }
+}
+
+fn normalize_antigravity_session_resumability(sessions: &mut [SessionSummary]) {
+    normalize_antigravity_session_resumability_with(
+        sessions,
+        crate::backend::antigravity::is_antigravity_session_resumable,
+    );
+}
+
+fn normalize_antigravity_session_resumability_with<F>(
+    sessions: &mut [SessionSummary],
+    is_antigravity_resumable: F,
+) where
+    F: Fn(&SessionId) -> bool,
+{
+    for session in sessions {
+        if session.backend_kind == protocol::BackendKind::Antigravity {
+            session.resumable = !antigravity_summary_is_permanently_non_resumable(session)
+                && is_antigravity_resumable(&session.id);
+        }
+    }
+}
+
+fn antigravity_summary_is_permanently_non_resumable(session: &SessionSummary) -> bool {
+    session.compacted_to_session_id.is_some() || (!session.resumable && session.parent_id.is_some())
 }
 
 async fn fan_out_project_notify(state: &mut HostState, payload: ProjectNotifyPayload) {
@@ -7763,6 +7883,7 @@ async fn agent_team_validation_refs(
         role_preset_ids,
         personality_preset_ids,
         legacy_backend_kind: None,
+        purged_gemini_session_ids: HashSet::new(),
     })
 }
 
@@ -8408,6 +8529,70 @@ mod tests {
                 servers.iter().all(|s| s.name != "tyde-config"),
                 "non-help spawns must not get config tools: {custom_agent_id:?}"
             );
+        }
+    }
+
+    #[test]
+    fn antigravity_session_summary_resumability_requires_native_db() {
+        let missing_id = SessionId("55a3c5e1-a2e1-44c1-9246-6e3de751803d".to_owned());
+        let existing_id = SessionId("66666666-6666-4666-8666-666666666666".to_owned());
+        let compacted_id = SessionId("77777777-7777-4777-8777-777777777777".to_owned());
+        let backend_native_id = SessionId("88888888-8888-4888-8888-888888888888".to_owned());
+        let replacement_id = SessionId("99999999-9999-4999-8999-999999999999".to_owned());
+        let parent_id = SessionId("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_owned());
+        let synthetic_id = SessionId("antigravity-legacy".to_owned());
+        let claude_id = SessionId("claude-session".to_owned());
+        let mut compacted_summary =
+            test_session_summary(BackendKind::Antigravity, compacted_id.clone(), false);
+        compacted_summary.compacted_to_session_id = Some(replacement_id);
+        let mut backend_native_summary =
+            test_session_summary(BackendKind::Antigravity, backend_native_id.clone(), false);
+        backend_native_summary.parent_id = Some(parent_id);
+        let mut summaries = vec![
+            test_session_summary(BackendKind::Antigravity, missing_id.clone(), true),
+            test_session_summary(BackendKind::Antigravity, existing_id.clone(), false),
+            compacted_summary,
+            backend_native_summary,
+            test_session_summary(BackendKind::Antigravity, synthetic_id, true),
+            test_session_summary(BackendKind::Claude, claude_id.clone(), true),
+        ];
+
+        normalize_antigravity_session_resumability_with(&mut summaries, |session_id| {
+            session_id == &existing_id
+                || session_id == &compacted_id
+                || session_id == &backend_native_id
+        });
+
+        assert!(!summaries[0].resumable);
+        assert!(summaries[1].resumable);
+        assert!(!summaries[2].resumable);
+        assert!(!summaries[3].resumable);
+        assert!(!summaries[4].resumable);
+        assert!(summaries[5].resumable);
+    }
+
+    fn test_session_summary(
+        backend_kind: BackendKind,
+        id: SessionId,
+        resumable: bool,
+    ) -> SessionSummary {
+        SessionSummary {
+            id,
+            backend_kind,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            alias: None,
+            user_alias: None,
+            parent_id: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            message_count: 0,
+            token_count: None,
+            resumable,
+            compacted_from_session_id: None,
+            compacted_to_session_id: None,
+            compacted_at_ms: None,
+            compaction_summary_preview: None,
         }
     }
 
@@ -10331,10 +10516,10 @@ mod tests {
             BackendKind::Codex
         );
         assert_eq!(
-            host.resolve_ai_reviewer_backend_kind(Some(BackendKind::Gemini))
+            host.resolve_ai_reviewer_backend_kind(Some(BackendKind::Antigravity))
                 .await
                 .expect("explicit backend override"),
-            BackendKind::Gemini
+            BackendKind::Antigravity
         );
 
         let _ = std::fs::remove_dir_all(&dir);

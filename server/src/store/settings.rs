@@ -3,13 +3,14 @@ use std::path::{Path, PathBuf};
 
 use protocol::{BackendKind, HostSettingValue, HostSettings};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const CANONICAL_BACKENDS: [BackendKind; 5] = [
     BackendKind::Tycode,
     BackendKind::Kiro,
     BackendKind::Claude,
     BackendKind::Codex,
-    BackendKind::Gemini,
+    BackendKind::Antigravity,
 ];
 
 /// Preference order for choosing the initial default backend when seeding a
@@ -17,7 +18,7 @@ const CANONICAL_BACKENDS: [BackendKind; 5] = [
 const DEFAULT_BACKEND_PREFERENCE: [BackendKind; 5] = [
     BackendKind::Claude,
     BackendKind::Codex,
-    BackendKind::Gemini,
+    BackendKind::Antigravity,
     BackendKind::Kiro,
     BackendKind::Tycode,
 ];
@@ -34,6 +35,7 @@ pub struct HostSettingsStore {
 
 impl HostSettingsStore {
     pub fn load(path: PathBuf) -> Result<Self, String> {
+        Self::migrate_legacy_gemini_settings(&path)?;
         let _ = Self::read_from_disk(&path)?;
         Ok(Self { path })
     }
@@ -92,6 +94,123 @@ impl HostSettingsStore {
         Ok(settings)
     }
 
+    fn migrate_legacy_gemini_settings(path: &Path) -> Result<(), String> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(format!(
+                    "Failed to read settings store {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        let mut value = serde_json::from_str::<Value>(&contents)
+            .map_err(|err| format!("Failed to parse settings store {}: {err}", path.display()))?;
+        let settings = value
+            .get_mut("settings")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                format!(
+                    "Failed to migrate settings store {}: settings must be an object",
+                    path.display()
+                )
+            })?;
+
+        let mut changed = false;
+        let mut migrated_to_antigravity = false;
+        if let Some(enabled) = settings
+            .get_mut("enabled_backends")
+            .and_then(Value::as_array_mut)
+        {
+            for backend in enabled {
+                if backend.as_str() == Some("gemini") {
+                    *backend = Value::String("antigravity".to_string());
+                    changed = true;
+                    migrated_to_antigravity = true;
+                }
+            }
+        }
+
+        let mut ensure_antigravity_enabled = false;
+        if settings.get("default_backend").and_then(Value::as_str) == Some("gemini") {
+            settings.insert(
+                "default_backend".to_string(),
+                Value::String("antigravity".to_string()),
+            );
+            ensure_antigravity_enabled = true;
+            changed = true;
+            migrated_to_antigravity = true;
+        }
+        if ensure_antigravity_enabled {
+            let enabled = settings
+                .entry("enabled_backends".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    format!(
+                        "Failed to migrate settings store {}: enabled_backends must be an array",
+                        path.display()
+                    )
+                })?;
+            if !enabled
+                .iter()
+                .any(|backend| backend.as_str() == Some("antigravity"))
+            {
+                enabled.push(Value::String("antigravity".to_string()));
+                changed = true;
+            }
+        }
+
+        let tiers_enabled = settings
+            .get("complexity_tiers_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let configs = settings
+            .entry("backend_tier_configs".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| {
+                format!(
+                    "Failed to migrate settings store {}: backend_tier_configs must be an object",
+                    path.display()
+                )
+            })?;
+        if configs.remove("gemini").is_some() {
+            changed = true;
+            migrated_to_antigravity = true;
+        }
+        if tiers_enabled && migrated_to_antigravity && !configs.contains_key("antigravity") {
+            configs.insert(
+                "antigravity".to_string(),
+                serde_json::to_value(crate::backend::builtin_tier_config(
+                    BackendKind::Antigravity,
+                ))
+                .map_err(|err| {
+                    format!(
+                        "Failed to serialize Antigravity tier defaults while migrating settings store {}: {err}",
+                        path.display()
+                    )
+                })?,
+            );
+            changed = true;
+        }
+
+        if changed {
+            let store = serde_json::from_value::<StoreFile>(value).map_err(|err| {
+                format!(
+                    "Failed to parse migrated settings store {}: {err}",
+                    path.display()
+                )
+            })?;
+            let settings = validate_settings(store.settings).map_err(|err| {
+                format!("Invalid migrated settings store {}: {err}", path.display())
+            })?;
+            Self::save(path, &settings)?;
+        }
+        Ok(())
+    }
+
     fn read_from_disk(path: &Path) -> Result<HostSettings, String> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
@@ -100,8 +219,7 @@ impl HostSettingsStore {
                         format!("Failed to parse settings store {}: {err}", path.display())
                     })?;
                 // Other builds/branches may know backend kinds this build
-                // doesn't (real incident: a sibling branch wrote
-                // "antigravity"). Skip those entries instead of refusing to
+                // doesn't yet. Skip those entries instead of refusing to
                 // load the whole file. A later save rewrites the file
                 // without them — acceptable loss; everything else survives.
                 let skipped = strip_unknown_backend_kinds(&mut value);
@@ -398,7 +516,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(
             &path,
-            r#"{"settings":{"enabled_backends":["claude","antigravity","codex"],"default_backend":"claude"}}"#,
+            r#"{"settings":{"enabled_backends":["claude","future_backend","codex"],"default_backend":"claude"}}"#,
         )
         .expect("write store file");
 
@@ -417,7 +535,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(
             &path,
-            r#"{"settings":{"enabled_backends":["claude"],"complexity_tiers_enabled":true,"backend_tier_configs":{"claude":{"low":{"model":{"string":"haiku"}},"high":{}},"antigravity":{"low":{"model":{"string":"Gemini 3.5 Flash (Low)"}},"high":{}}}}}"#,
+            r#"{"settings":{"enabled_backends":["claude"],"complexity_tiers_enabled":true,"backend_tier_configs":{"claude":{"low":{"model":{"string":"haiku"}},"high":{}},"future_backend":{"low":{"model":{"string":"Future Low"}},"high":{}}}}}"#,
         )
         .expect("write store file");
 
@@ -441,7 +559,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(
             &path,
-            r#"{"settings":{"enabled_backends":["claude","antigravity"],"default_backend":"antigravity"}}"#,
+            r#"{"settings":{"enabled_backends":["claude","future_backend"],"default_backend":"future_backend"}}"#,
         )
         .expect("write store file");
 
@@ -488,6 +606,57 @@ mod tests {
             .expect("apply no-op setting");
         assert_eq!(after, before);
         assert_eq!(store.get().expect("re-read settings"), before);
+    }
+
+    #[test]
+    fn migrates_gemini_settings_to_antigravity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "settings": {
+    "enabled_backends": ["gemini", "claude", "gemini"],
+    "default_backend": "gemini",
+    "complexity_tiers_enabled": true,
+    "backend_tier_configs": {
+      "gemini": {
+        "low": {"model": {"string": "legacy-low"}},
+        "high": {"model": {"string": "legacy-high"}}
+      }
+    }
+  }
+}"#,
+        )
+        .expect("write legacy settings");
+
+        let store = HostSettingsStore::load(path.clone()).expect("load migrated settings");
+        let settings = store.get().expect("get migrated settings");
+        assert_eq!(
+            settings.enabled_backends,
+            vec![BackendKind::Claude, BackendKind::Antigravity]
+        );
+        assert_eq!(settings.default_backend, Some(BackendKind::Antigravity));
+        assert!(
+            !settings
+                .backend_tier_configs
+                .contains_key(&BackendKind::Claude)
+        );
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("read migrated file")
+                .contains("gemini")
+        );
+        let antigravity = settings
+            .backend_tier_configs
+            .get(&BackendKind::Antigravity)
+            .expect("antigravity tier config seeded");
+        assert_eq!(
+            antigravity.low.0.get("model"),
+            Some(&SessionSettingValue::String(
+                "Gemini 3.5 Flash (Low)".to_string()
+            ))
+        );
     }
 
     #[test]

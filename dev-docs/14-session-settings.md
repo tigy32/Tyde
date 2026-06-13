@@ -268,8 +268,10 @@ Each backend implements this to declare its supported settings. Examples:
 **Codex:**
 - `reasoning_effort`: Select — low, medium, high, xhigh (nullable: true)
 
-**Gemini:**
-- `model`: Select — gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite, etc. (default: auto-gemini-2.5, nullable: true)
+**Antigravity:**
+- `model`: Select — exact `agy models` labels such as
+  `Gemini 3.5 Flash (Medium)` (default: `Gemini 3.5 Flash (Medium)`,
+  nullable: false)
 
 **Mock:**
 - Empty fields (no configurable settings).
@@ -398,7 +400,7 @@ fn collect_session_schemas(enabled: &[BackendKind]) -> Vec<SessionSettingsSchema
     enabled.iter().map(|kind| match kind {
         BackendKind::Claude => ClaudeBackend::session_settings_schema(),
         BackendKind::Codex => CodexBackend::session_settings_schema(),
-        BackendKind::Gemini => GeminiBackend::session_settings_schema(),
+        BackendKind::Antigravity => AntigravityBackend::session_settings_schema(),
         // ...
     }).collect()
 }
@@ -464,7 +466,7 @@ fn resolve_settings(
 Each backend keeps its own `cost_hint_defaults()` — a private function that
 maps `SpawnCostHint` to that backend's setting values. This is an evolution
 of the existing `codex_backend_defaults()` / `claude_backend_defaults()` /
-`gemini_backend_model()` functions, extended to return
+`antigravity_cost_hint_defaults()` functions, extended to return
 `SessionSettingsValues` instead of ad-hoc tuples.
 
 ### 6.3 Agent Actor
@@ -514,10 +516,10 @@ let effort = match resolved.0.get("effort") {
 ```
 
 The existing `claude_backend_defaults()` / `codex_backend_defaults()` /
-`gemini_backend_model()` functions evolve into `cost_hint_defaults()` per
-backend, returning `SessionSettingsValues` instead of ad-hoc tuples. The
-resolution logic (section 6.2) is shared — each backend calls the same
-`resolve_settings()` helper with its own `cost_hint_defaults()`.
+`antigravity_cost_hint_defaults()` functions evolve into
+`cost_hint_defaults()` per backend, returning `SessionSettingsValues` instead
+of ad-hoc tuples. The resolution logic (section 6.2) is shared — each backend
+calls the same `resolve_settings()` helper with its own `cost_hint_defaults()`.
 
 ---
 
@@ -656,8 +658,9 @@ backend-specific knowledge inside the backend and avoids the host needing a
 centralized mapping table that couples it to every backend's model tiers.
 
 The existing `codex_backend_defaults()` / `claude_backend_defaults()` /
-`gemini_backend_model()` functions evolve into `cost_hint_defaults()` methods
-that return `SessionSettingsValues` instead of ad-hoc tuples.
+`antigravity_cost_hint_defaults()` functions evolve into
+`cost_hint_defaults()` methods that return `SessionSettingsValues` instead of
+ad-hoc tuples.
 
 ### Why `Integer` in addition to `Select` and `Toggle`?
 
@@ -692,12 +695,13 @@ machinery.
 
 ### Server crate
 - Add `session_settings_schema()` to `Backend` trait (sync, static).
-- Implement for each backend (Claude, Codex, Gemini, Mock, Tycode, Kiro).
+- Implement for each backend (Claude, Codex, Antigravity, Mock, Tycode, Kiro).
 - Add `session_settings: SessionSettingsValues` to `BackendSpawnConfig`
   (keep existing `cost_hint`).
 - Evolve `codex_backend_defaults()`, `claude_backend_defaults()`,
-  `gemini_backend_model()` into per-backend `cost_hint_defaults()` functions
-  that return `SessionSettingsValues` instead of ad-hoc tuples.
+  `antigravity_cost_hint_defaults()` into per-backend
+  `cost_hint_defaults()` functions that return `SessionSettingsValues` instead
+  of ad-hoc tuples.
 - Add shared `resolve_settings()` helper (used by each backend in `spawn()`
   to merge cost_hint defaults + explicit session settings + schema defaults).
 - Add schema collection in host actor.

@@ -1,7 +1,7 @@
 pub mod acp;
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
-pub mod gemini;
 pub mod kiro;
 pub mod mock;
 pub mod setup;
@@ -42,6 +42,20 @@ pub(crate) fn protocol_images_to_attachments(
     } else {
         Some(attachments)
     }
+}
+
+pub(crate) fn tyde_owned_no_root_cwd(backend: &str) -> Result<String, String> {
+    let dir = crate::paths::home_dir()?
+        .join(".tyde")
+        .join(backend)
+        .join("no-root");
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        format!(
+            "Failed to create Tyde-owned no-root cwd '{}': {err}",
+            dir.display()
+        )
+    })?;
+    Ok(dir.to_string_lossy().to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -185,8 +199,8 @@ pub trait Backend: Send + 'static {
 
     /// Create a new backend session.
     /// Returns a handle to send input and an EventStream to read output.
-    /// The backend must start the session with `initial_input` and know its
-    /// native resumable session ID before returning.
+    /// The backend must start the session with `initial_input` and know the
+    /// protocol-visible session ID before returning.
     fn spawn(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
@@ -261,7 +275,7 @@ pub(crate) fn session_settings_schema_for_backend(
         BackendKind::Kiro => kiro::KiroBackend::session_settings_schema(),
         BackendKind::Claude => claude::ClaudeBackend::session_settings_schema(),
         BackendKind::Codex => codex::CodexBackend::session_settings_schema(),
-        BackendKind::Gemini => gemini::GeminiBackend::session_settings_schema(),
+        BackendKind::Antigravity => antigravity::AntigravityBackend::session_settings_schema(),
     }
 }
 
@@ -274,7 +288,7 @@ pub(crate) fn resolve_backend_session_settings(
         BackendKind::Kiro => kiro::resolve_session_settings(config),
         BackendKind::Claude => claude::resolve_session_settings(config),
         BackendKind::Codex => codex::resolve_session_settings(config),
-        BackendKind::Gemini => gemini::resolve_session_settings(config),
+        BackendKind::Antigravity => antigravity::resolve_session_settings(config),
     }
 }
 
@@ -340,7 +354,7 @@ pub(crate) fn builtin_tier_config(kind: BackendKind) -> BackendTierConfig {
     let defaults: fn(SpawnCostHint) -> SessionSettingsValues = match kind {
         BackendKind::Claude => claude::claude_cost_hint_defaults,
         BackendKind::Codex => codex::codex_cost_hint_defaults,
-        BackendKind::Gemini => gemini::gemini_cost_hint_defaults,
+        BackendKind::Antigravity => antigravity::antigravity_cost_hint_defaults,
         BackendKind::Kiro => kiro::kiro_cost_hint_defaults,
         BackendKind::Tycode => |_| SessionSettingsValues::default(),
     };

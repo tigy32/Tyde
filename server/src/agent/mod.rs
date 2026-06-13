@@ -15,9 +15,10 @@ use protocol::{
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
+use crate::backend::antigravity::AntigravityBackend;
+use crate::backend::antigravity::is_antigravity_native_session_id;
 use crate::backend::claude::ClaudeBackend;
 use crate::backend::codex::CodexBackend;
-use crate::backend::gemini::GeminiBackend;
 use crate::backend::kiro::KiroBackend;
 use crate::backend::mock::MockBackend;
 use crate::backend::tycode::TycodeBackend;
@@ -487,7 +488,7 @@ impl<B: Backend> BackendSender for B {
 }
 
 /// Spawn the correct backend based on `backend_kind`.
-/// If the backend already knows its native resumable session ID, return it.
+/// Return the live backend session ID. Some backends mint Tyde-owned IDs for non-resumable sessions.
 async fn spawn_backend(
     agent_id: &AgentId,
     backend_kind: BackendKind,
@@ -535,8 +536,9 @@ async fn spawn_backend(
             .await;
             Ok((Box::new(b), events, session_id))
         }
-        BackendKind::Gemini => {
-            let (b, events) = GeminiBackend::spawn(workspace_roots, config, initial_input).await?;
+        BackendKind::Antigravity => {
+            let (b, events) =
+                AntigravityBackend::spawn(workspace_roots, config, initial_input).await?;
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
@@ -582,8 +584,9 @@ async fn resume_backend(
             .await;
             (Box::new(b), events)
         }
-        BackendKind::Gemini => {
-            let (b, events) = GeminiBackend::resume(workspace_roots, config, session_id).await?;
+        BackendKind::Antigravity => {
+            let (b, events) =
+                AntigravityBackend::resume(workspace_roots, config, session_id).await?;
             (Box::new(b), events)
         }
     };
@@ -647,9 +650,9 @@ async fn fork_backend(
             .await;
             Ok((Box::new(b), events, session_id))
         }
-        BackendKind::Gemini => {
+        BackendKind::Antigravity => {
             let (b, events) =
-                GeminiBackend::fork(workspace_roots, config, from_session_id, initial_input)
+                AntigravityBackend::fork(workspace_roots, config, from_session_id, initial_input)
                     .await?;
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
@@ -2800,7 +2803,8 @@ async fn persist_agent_session(
         token_count: None,
         created_at_ms: Some(current_start.created_at_ms),
         updated_at_ms: Some(current_start.created_at_ms),
-        resumable: current_start.origin != AgentOrigin::BackendNative,
+        resumable: current_start.origin != AgentOrigin::BackendNative
+            && backend_session_is_resumable(current_start.backend_kind, session_id),
     };
 
     {
@@ -2825,6 +2829,13 @@ async fn persist_agent_session(
     }
 
     Ok(())
+}
+
+fn backend_session_is_resumable(backend_kind: BackendKind, session_id: &SessionId) -> bool {
+    match backend_kind {
+        BackendKind::Antigravity => is_antigravity_native_session_id(session_id),
+        BackendKind::Tycode | BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex => true,
+    }
 }
 
 async fn append_event<T: serde::Serialize>(

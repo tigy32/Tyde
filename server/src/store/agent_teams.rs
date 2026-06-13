@@ -24,6 +24,7 @@ pub struct AgentTeamValidationRefs {
     pub role_preset_ids: HashSet<TeamRolePresetId>,
     pub personality_preset_ids: HashSet<TeamPersonalityPresetId>,
     pub legacy_backend_kind: Option<BackendKind>,
+    pub purged_gemini_session_ids: HashSet<SessionId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -609,7 +610,14 @@ impl AgentTeamsStore {
         refs: &AgentTeamValidationRefs,
     ) -> Result<AgentTeamsStoreFile, String> {
         match std::fs::read_to_string(path) {
-            Ok(contents) => migrate_store_file(path, &contents, refs),
+            Ok(contents) => {
+                let (file, changed) = migrate_store_file(path, &contents, refs)?;
+                validate_store_file(&file, refs)?;
+                if changed {
+                    Self::save(path, &file)?;
+                }
+                Ok(file)
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 Ok(AgentTeamsStoreFile::default())
             }
@@ -752,7 +760,8 @@ fn migrate_store_file(
     path: &Path,
     contents: &str,
     refs: &AgentTeamValidationRefs,
-) -> Result<AgentTeamsStoreFile, String> {
+) -> Result<(AgentTeamsStoreFile, bool), String> {
+    let mut changed = false;
     let mut value = serde_json::from_str::<Value>(contents).map_err(|err| {
         format!(
             "Failed to parse agent teams store {}: {err}",
@@ -774,17 +783,23 @@ fn migrate_store_file(
             migrate_v2_to_v3(path, &mut value)?;
             migrate_v3_to_v4(path, &mut value, refs)?;
             migrate_v4_to_v5(&mut value);
+            changed = true;
         }
         2 => {
             migrate_v2_to_v3(path, &mut value)?;
             migrate_v3_to_v4(path, &mut value, refs)?;
             migrate_v4_to_v5(&mut value);
+            changed = true;
         }
         3 => {
             migrate_v3_to_v4(path, &mut value, refs)?;
             migrate_v4_to_v5(&mut value);
+            changed = true;
         }
-        4 => migrate_v4_to_v5(&mut value),
+        4 => {
+            migrate_v4_to_v5(&mut value);
+            changed = true;
+        }
         version if version == u64::from(STORE_VERSION) => {}
         other => {
             return Err(format!(
@@ -792,12 +807,62 @@ fn migrate_store_file(
             ));
         }
     }
-    serde_json::from_value::<AgentTeamsStoreFile>(value).map_err(|err| {
+    if migrate_legacy_gemini_members(path, &mut value, refs)? {
+        changed = true;
+    }
+    let file = serde_json::from_value::<AgentTeamsStoreFile>(value).map_err(|err| {
         format!(
             "Failed to parse agent teams store {}: {err}",
             path.display()
         )
-    })
+    })?;
+    Ok((file, changed))
+}
+
+fn migrate_legacy_gemini_members(
+    path: &Path,
+    value: &mut Value,
+    refs: &AgentTeamValidationRefs,
+) -> Result<bool, String> {
+    let members = value
+        .get_mut("members")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            format!(
+                "Failed to migrate agent teams store {}: members must be an object",
+                path.display()
+            )
+        })?;
+    let mut changed = false;
+    for member in members.values_mut() {
+        let member = member.as_object_mut().ok_or_else(|| {
+            format!(
+                "Failed to migrate agent teams store {}: member must be an object",
+                path.display()
+            )
+        })?;
+        if member.get("backend_kind").and_then(Value::as_str) == Some("gemini") {
+            member.insert(
+                "backend_kind".to_string(),
+                Value::String("antigravity".to_string()),
+            );
+            if member
+                .get("session_id")
+                .is_some_and(|value| !value.is_null())
+            {
+                member.insert("session_id".to_string(), Value::Null);
+            }
+            changed = true;
+        } else if let Some(session_id) = member.get("session_id").and_then(Value::as_str)
+            && refs
+                .purged_gemini_session_ids
+                .contains(&SessionId(session_id.to_string()))
+        {
+            member.insert("session_id".to_string(), Value::Null);
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 fn migrate_v1_to_v2(path: &Path, value: &mut Value) -> Result<(), String> {
@@ -1199,6 +1264,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             legacy_backend_kind: Some(BackendKind::Claude),
+            purged_gemini_session_ids: HashSet::new(),
         }
     }
 
@@ -1398,6 +1464,130 @@ mod tests {
         assert!(
             err.contains("legacy team members require a host default_backend"),
             "unexpected migration error: {err}"
+        );
+    }
+
+    #[test]
+    fn migrates_gemini_members_and_purged_session_refs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent_teams.json");
+        let contents = json!({
+            "version": STORE_VERSION,
+            "teams": {
+                "team-1": {
+                    "id": "team-1",
+                    "name": "Migrated Team",
+                    "manager_member_id": "member-manager",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                }
+            },
+            "members": {
+                "member-manager": {
+                    "id": "member-manager",
+                    "team_id": "team-1",
+                    "role": "manager",
+                    "state": "active",
+                    "name": "Manager",
+                    "description": "Coordinates work",
+                    "custom_agent_id": "custom-1",
+                    "backend_kind": "gemini",
+                    "session_id": "gemini-session",
+                    "project_ids": ["project-1"],
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                },
+                "member-report": {
+                    "id": "member-report",
+                    "team_id": "team-1",
+                    "role": "report",
+                    "state": "active",
+                    "name": "Report",
+                    "description": "Reports work",
+                    "custom_agent_id": "custom-1",
+                    "backend_kind": "claude",
+                    "session_id": "purged-session",
+                    "project_ids": ["project-1"],
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                }
+            }
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&contents).expect("serialize teams store"),
+        )
+        .expect("write teams store");
+        let mut refs = refs();
+        refs.enabled_backend_kinds.insert(BackendKind::Antigravity);
+        refs.purged_gemini_session_ids = [SessionId("purged-session".to_string())]
+            .into_iter()
+            .collect();
+
+        let store = AgentTeamsStore::load(path.clone(), &refs).expect("load migrated teams store");
+        let snapshot = store.snapshot();
+        let manager = snapshot
+            .members
+            .get(&TeamMemberId("member-manager".to_string()))
+            .expect("manager");
+        assert_eq!(manager.backend_kind, BackendKind::Antigravity);
+        assert_eq!(manager.session_id, None);
+        let report = snapshot
+            .members
+            .get(&TeamMemberId("member-report".to_string()))
+            .expect("report");
+        assert_eq!(report.backend_kind, BackendKind::Claude);
+        assert_eq!(report.session_id, None);
+        let rewritten = std::fs::read_to_string(path).expect("read rewritten teams store");
+        assert!(!rewritten.contains("gemini"));
+        assert!(!rewritten.contains("purged-session"));
+    }
+
+    #[test]
+    fn invalid_migrated_gemini_members_are_not_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent_teams.json");
+        let contents = json!({
+            "version": STORE_VERSION,
+            "teams": {
+                "team-1": {
+                    "id": "team-1",
+                    "name": "Invalid Migrated Team",
+                    "manager_member_id": "member-manager",
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                }
+            },
+            "members": {
+                "member-manager": {
+                    "id": "member-manager",
+                    "team_id": "team-1",
+                    "role": "manager",
+                    "state": "active",
+                    "name": "Manager",
+                    "description": "Coordinates work",
+                    "custom_agent_id": "custom-1",
+                    "backend_kind": "gemini",
+                    "session_id": null,
+                    "project_ids": ["project-1"],
+                    "created_at_ms": 1,
+                    "updated_at_ms": 1
+                }
+            }
+        });
+        let original = serde_json::to_string_pretty(&contents).expect("serialize teams store");
+        std::fs::write(&path, &original).expect("write teams store");
+
+        let err = AgentTeamsStore::load(path.clone(), &refs())
+            .expect_err("disabled migrated backend should fail validation");
+        assert!(
+            err.contains("disabled backend Antigravity"),
+            "unexpected validation error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read teams store after failed migration"),
+            original,
+            "failed migration must not rewrite the store before validation"
         );
     }
 

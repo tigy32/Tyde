@@ -3,13 +3,13 @@ mod fixture;
 use fixture::Fixture;
 use protocol::types::AgentClosedPayload;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentControlStatus, AgentErrorPayload, AgentOrigin,
-    AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent, ClientErrorCode,
-    ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope, FrameKind,
-    HostBootstrapPayload, ListSessionsPayload, NewAgentPayload, Project, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectId, ProjectNotifyPayload,
-    ProjectRenamePayload, ProjectRootPath, SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
-    StreamPath, write_envelope,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentControlStatus, AgentErrorCode,
+    AgentErrorPayload, AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent,
+    ClientErrorCode, ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope,
+    FrameKind, HostBootstrapPayload, ListSessionsPayload, NewAgentPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectId,
+    ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SessionListPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath, write_envelope,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -623,37 +623,6 @@ async fn expect_no_agent_error_message(
                 );
             }
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-        }
-    }
-}
-
-async fn expect_connection_close(client: &mut client::Connection, context: &str) {
-    loop {
-        match client
-            .next_event()
-            .await
-            .expect("next_event while waiting for connection close failed")
-        {
-            None => return,
-            Some(env)
-                if fixture::is_builtin_team_custom_agent_notify(&env)
-                    || matches!(
-                        env.kind,
-                        FrameKind::HostSettings
-                            | FrameKind::SessionSettings
-                            | FrameKind::TeamPresetCatalogNotify
-                            | FrameKind::SessionSchemas
-                            | FrameKind::BackendSetup
-                            | FrameKind::QueuedMessages
-                            | FrameKind::SessionList
-                    ) =>
-            {
-                continue;
-            }
-            Some(env) => panic!(
-                "expected connection close before {context}, got kind={} stream={}",
-                env.kind, env.stream
-            ),
         }
     }
 }
@@ -1682,9 +1651,60 @@ async fn backend_native_child_sessions_are_non_resumable() {
         .await
         .expect("resume-native-child write failed");
 
-    expect_connection_close(
+    let resumed_agent = loop {
+        let env = expect_next_event(
+            &mut fixture.client,
+            "resume of non-resumable backend-native child session",
+        )
+        .await;
+        match env.kind {
+            FrameKind::NewAgent => {
+                let payload: NewAgentPayload = env
+                    .parse_payload()
+                    .expect("parse non-resumable child resume NewAgent");
+                if payload.session_id.as_ref() == Some(&child.id) {
+                    break payload;
+                }
+            }
+            FrameKind::CommandError => {
+                let error: CommandErrorPayload = env
+                    .parse_payload()
+                    .expect("parse unexpected non-resumable child resume CommandError");
+                panic!(
+                    "non-resumable backend-native child resume should become agent startup failure, not CommandError: {error:?}"
+                );
+            }
+            _ => {}
+        }
+    };
+
+    let resumed_start = expect_agent_start_on_stream(
         &mut fixture.client,
-        "resume of non-resumable backend-native child session",
+        &resumed_agent.instance_stream,
+        "non-resumable child resume AgentStart",
+    )
+    .await;
+    assert_eq!(resumed_start.session_id.as_ref(), Some(&child.id));
+
+    let error = expect_agent_error_containing(
+        &mut fixture.client,
+        &resumed_agent.instance_stream,
+        &format!("cannot resume non-resumable session {}", child.id),
+        "non-resumable child resume AgentError",
+    )
+    .await;
+    assert_eq!(error.code, AgentErrorCode::Unsupported);
+    assert!(error.fatal);
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("connection should remain usable after non-resumable child resume failure");
+    let _ = expect_kind(
+        &mut fixture.client,
+        FrameKind::SessionList,
+        "SessionList after non-resumable child resume failure",
     )
     .await;
 }

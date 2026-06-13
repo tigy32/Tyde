@@ -89,18 +89,17 @@ Kiro uses ACP capability negotiation and server-side rejection:
 This makes read-only fail closed even if an ACP server asks the client to perform
 an operation after capabilities were negotiated.
 
-### Gemini
+### Antigravity
 
-Gemini CLI is launched without `-y` in read-only mode and with
-`--approval-mode plan`, which Gemini documents as its read-only mode. Tyde also
-prepends the shared read-only instruction.
+Antigravity CLI does not expose a documented, enforceable read-only mode for
+Tyde to rely on. `agy --help` exposes `--sandbox`, but that flag is not a Tyde
+read-only contract and must not be treated as equivalent to
+`BackendAccessMode::ReadOnly`.
 
-Gemini normally reads MCP configuration from `.gemini/settings.json` under the
-current workspace. Writing that file would itself violate read-only mode, so for
-local read-only MCP sessions Tyde creates a temporary working directory,
-materializes the Gemini settings there, and passes `--include-directories` for
-the real workspace root. Remote read-only Gemini sessions that need temporary MCP
-settings fail instead of writing remote configuration.
+Antigravity read-only spawns therefore fail closed before launching `agy` with a
+clear backend error. Unrestricted Antigravity sessions pass
+`--dangerously-skip-permissions` so headless print-mode turns do not block on
+interactive approvals.
 
 ### Mock
 

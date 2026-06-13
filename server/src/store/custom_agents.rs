@@ -68,7 +68,7 @@ Use whichever delegation tools are available to you:
 ## Multi-backend orchestration
 
 The host can run several independent agent backends (for example Claude,
-Codex, and Gemini). Treat them as independent engineering minds with
+Codex, and Antigravity). Treat them as independent engineering minds with
 different strengths and blind spots — agreement between them is strong
 evidence, and disagreement is signal worth surfacing.
 
@@ -228,7 +228,7 @@ make the change yourself when your tools can do it.
 ## What Tyde is
 
 Tyde is a desktop control center for AI coding agents. It runs the agent
-backends the user already knows — Claude, Codex, Gemini, Kiro, Tycode — and
+backends the user already knows — Claude, Codex, Antigravity, Kiro, Tycode — and
 keeps every session organized so many agents can run across many projects at
 once.
 

@@ -2215,7 +2215,7 @@ pub(crate) fn backend_kind_label(kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
-        BackendKind::Gemini => "Gemini",
+        BackendKind::Antigravity => "Antigravity",
     }
 }
 
@@ -2225,7 +2225,7 @@ fn backend_kind_value(kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "kiro",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
-        BackendKind::Gemini => "gemini",
+        BackendKind::Antigravity => "antigravity",
     }
 }
 
@@ -2235,7 +2235,7 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
         "kiro" => Some(BackendKind::Kiro),
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
-        "gemini" => Some(BackendKind::Gemini),
+        "antigravity" => Some(BackendKind::Antigravity),
         _ => None,
     }
 }

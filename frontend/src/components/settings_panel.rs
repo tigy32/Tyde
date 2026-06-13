@@ -612,7 +612,7 @@ impl SettingsTab {
                 "Kiro",
                 "Claude",
                 "Codex",
-                "Gemini",
+                "Antigravity",
                 "Anthropic",
                 "OpenAI",
                 "Google",
@@ -2623,7 +2623,7 @@ fn all_backends() -> [BackendKind; 5] {
         BackendKind::Kiro,
         BackendKind::Claude,
         BackendKind::Codex,
-        BackendKind::Gemini,
+        BackendKind::Antigravity,
     ]
 }
 
@@ -2633,7 +2633,7 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
         "kiro" => Some(BackendKind::Kiro),
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
-        "gemini" => Some(BackendKind::Gemini),
+        "antigravity" => Some(BackendKind::Antigravity),
         _ => None,
     }
 }
@@ -2644,7 +2644,7 @@ fn backend_value(kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "kiro",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
-        BackendKind::Gemini => "gemini",
+        BackendKind::Antigravity => "antigravity",
     }
 }
 
@@ -2654,7 +2654,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
-        BackendKind::Gemini => "Gemini",
+        BackendKind::Antigravity => "Antigravity",
     }
 }
 
@@ -2664,7 +2664,7 @@ fn backend_description(kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "Kiro ACP backend",
         BackendKind::Claude => "Anthropic Claude — advanced reasoning and coding",
         BackendKind::Codex => "OpenAI Codex — code completion and generation",
-        BackendKind::Gemini => "Google Gemini — multimodal AI assistant",
+        BackendKind::Antigravity => "Google Antigravity CLI — agentic coding assistant",
     }
 }
 
@@ -2674,7 +2674,7 @@ fn backend_badge_class(kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "backend-badge kiro",
         BackendKind::Claude => "backend-badge claude",
         BackendKind::Codex => "backend-badge codex",
-        BackendKind::Gemini => "backend-badge gemini",
+        BackendKind::Antigravity => "backend-badge antigravity",
     }
 }
 

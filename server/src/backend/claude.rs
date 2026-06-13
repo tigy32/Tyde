@@ -7234,11 +7234,20 @@ fn system_time_to_ms(time: SystemTime) -> u64 {
 }
 
 fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, String> {
-    workspace_roots
+    if let Some(root) = workspace_roots
         .iter()
-        .find(|root| !root.trim().is_empty() && !root.starts_with("ssh://"))
+        .find(|root| !root.trim().is_empty() && !root.trim_start().starts_with("ssh://"))
         .cloned()
-        .ok_or("Claude backend requires at least one local workspace root".to_string())
+    {
+        return Ok(root);
+    }
+    if workspace_roots
+        .iter()
+        .any(|root| !root.trim().is_empty() && root.trim_start().starts_with("ssh://"))
+    {
+        return Err("Claude backend requires at least one local workspace root".to_string());
+    }
+    crate::backend::tyde_owned_no_root_cwd("claude")
 }
 
 // ---------------------------------------------------------------------------
@@ -7491,16 +7500,11 @@ impl ClaudeBackend {
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
         tokio::spawn(async move {
-            let roots = if workspace_roots.is_empty() {
-                vec!["/tmp".to_string()]
-            } else {
-                workspace_roots
-            };
             let steering_content = claude_steering_content(&config);
             let agent_identity = claude_agent_identity(&config);
             let session_result = if let Some(from_session_id) = fork_from_session_id.as_ref() {
                 ClaudeSession::fork(
-                    &roots,
+                    &workspace_roots,
                     ClaudeForkConfig {
                         from_session_id: &from_session_id.0,
                         ssh_host: None,
@@ -7514,7 +7518,7 @@ impl ClaudeBackend {
                 .await
             } else {
                 ClaudeSession::spawn(
-                    &roots,
+                    &workspace_roots,
                     None,
                     &config.startup_mcp_servers,
                     steering_content.as_deref(),
@@ -7960,11 +7964,6 @@ impl Backend for ClaudeBackend {
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
 
-        let roots = if workspace_roots.is_empty() {
-            vec!["/tmp".to_string()]
-        } else {
-            workspace_roots
-        };
         let session_id = session_id.0;
         let backend_session_id =
             Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
@@ -7974,7 +7973,7 @@ impl Backend for ClaudeBackend {
             let steering_content = claude_steering_content(&config);
             let agent_identity = claude_agent_identity(&config);
             let (session, mut raw_events) = match ClaudeSession::spawn(
-                &roots,
+                &workspace_roots,
                 None,
                 &config.startup_mcp_servers,
                 steering_content.as_deref(),
@@ -8240,6 +8239,22 @@ mod tests {
             turn_event_gate: Mutex::new(()),
         };
         (inner, event_rx)
+    }
+
+    #[test]
+    fn claude_pick_workspace_root_uses_tyde_no_root_cwd_for_empty_roots() {
+        let root = pick_workspace_root(&[]).expect("empty roots should resolve to no-root cwd");
+
+        assert!(Path::new(&root).is_dir());
+        assert!(Path::new(&root).ends_with(Path::new(".tyde").join("claude").join("no-root")));
+    }
+
+    #[test]
+    fn claude_pick_workspace_root_keeps_ssh_only_roots_invalid() {
+        let err = pick_workspace_root(&["ssh://devbox.example.com/workspace".to_string()])
+            .expect_err("ssh-only local roots should remain invalid");
+
+        assert!(err.contains("requires at least one local workspace root"));
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,6 +8,8 @@ use protocol::{
     BackendKind, CustomAgentId, ProjectId, SessionId, SessionSettingsValues, SessionSummary,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
 
 use crate::backend::BackendSession;
 
@@ -62,8 +64,14 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn load(path: PathBuf) -> Result<Self, String> {
+        Self::load_with_migration(path).map(|(store, _purged_gemini_session_ids)| store)
+    }
+
+    pub fn load_with_migration(path: PathBuf) -> Result<(Self, HashSet<SessionId>), String> {
+        let purged_gemini_session_ids = Self::purge_legacy_gemini_sessions(&path)?;
+        Self::mark_non_native_antigravity_sessions_non_resumable(&path)?;
         let _ = Self::read_from_disk(&path)?;
-        Ok(Self { path })
+        Ok((Self { path }, purged_gemini_session_ids))
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
@@ -343,25 +351,123 @@ impl SessionStore {
         let records = self.list()?;
         Ok(records
             .into_iter()
-            .map(|record| SessionSummary {
-                id: record.id,
-                backend_kind: record.backend_kind,
-                workspace_roots: record.workspace_roots,
-                project_id: record.project_id,
-                alias: record.alias,
-                user_alias: record.user_alias,
-                parent_id: record.parent_id,
-                created_at_ms: record.created_at_ms,
-                updated_at_ms: record.updated_at_ms,
-                message_count: record.message_count,
-                token_count: record.token_count,
-                resumable: record.resumable,
-                compacted_from_session_id: record.compacted_from_session_id,
-                compacted_to_session_id: record.compacted_to_session_id,
-                compacted_at_ms: record.compacted_at_ms,
-                compaction_summary_preview: record.compaction_summary_preview,
+            .map(|record| {
+                let resumable = session_record_is_resumable(&record);
+                SessionSummary {
+                    id: record.id,
+                    backend_kind: record.backend_kind,
+                    workspace_roots: record.workspace_roots,
+                    project_id: record.project_id,
+                    alias: record.alias,
+                    user_alias: record.user_alias,
+                    parent_id: record.parent_id,
+                    created_at_ms: record.created_at_ms,
+                    updated_at_ms: record.updated_at_ms,
+                    message_count: record.message_count,
+                    token_count: record.token_count,
+                    resumable,
+                    compacted_from_session_id: record.compacted_from_session_id,
+                    compacted_to_session_id: record.compacted_to_session_id,
+                    compacted_at_ms: record.compacted_at_ms,
+                    compaction_summary_preview: record.compaction_summary_preview,
+                }
             })
             .collect())
+    }
+
+    fn purge_legacy_gemini_sessions(path: &Path) -> Result<HashSet<SessionId>, String> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+            Err(err) => {
+                return Err(format!(
+                    "Failed to read session store {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        let mut value = serde_json::from_str::<Value>(&contents)
+            .map_err(|err| format!("Failed to parse session store {}: {err}", path.display()))?;
+        let records = value
+            .get_mut("records")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                format!(
+                    "Failed to migrate session store {}: records must be an object",
+                    path.display()
+                )
+            })?;
+        let mut purged = HashSet::new();
+        records.retain(|session_id, record| {
+            let is_gemini = record.get("backend_kind").and_then(Value::as_str) == Some("gemini");
+            if is_gemini {
+                purged.insert(SessionId(session_id.clone()));
+                return false;
+            }
+            true
+        });
+        if !purged.is_empty() {
+            write_json_value_atomically(path, &value).map_err(|err| {
+                format!(
+                    "Failed to rewrite migrated session store {}: {err}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(purged)
+    }
+
+    fn mark_non_native_antigravity_sessions_non_resumable(path: &Path) -> Result<(), String> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(format!(
+                    "Failed to read session store {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        let mut value = serde_json::from_str::<Value>(&contents)
+            .map_err(|err| format!("Failed to parse session store {}: {err}", path.display()))?;
+        let records = value
+            .get_mut("records")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                format!(
+                    "Failed to migrate session store {}: records must be an object",
+                    path.display()
+                )
+            })?;
+
+        let mut changed = false;
+        for (session_id, record) in records {
+            let Some(record) = record.as_object_mut() else {
+                return Err(format!(
+                    "Failed to migrate session store {}: record {session_id} must be an object",
+                    path.display()
+                ));
+            };
+            let is_antigravity =
+                record.get("backend_kind").and_then(Value::as_str) == Some("antigravity");
+            if is_antigravity
+                && !is_native_antigravity_session_id(session_id)
+                && record.get("resumable").and_then(Value::as_bool) != Some(false)
+            {
+                record.insert("resumable".to_string(), Value::Bool(false));
+                changed = true;
+            }
+        }
+
+        if changed {
+            write_json_value_atomically(path, &value).map_err(|err| {
+                format!(
+                    "Failed to rewrite migrated session store {}: {err}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(())
     }
 
     fn read_from_disk(path: &Path) -> Result<HashMap<String, SessionRecord>, String> {
@@ -422,6 +528,35 @@ impl SessionStore {
     }
 }
 
+fn write_json_value_atomically(path: &Path, value: &Value) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|err| format!("Failed to serialize migrated session store: {err}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Session store path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|err| format!("Failed to create session store directory: {err}"))?;
+    let tmp_path = parent.join(format!(
+        ".{}.tmp.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("sessions.json"),
+        now_ms()
+    ));
+    let mut file = std::fs::File::create(&tmp_path)
+        .map_err(|err| format!("Failed to create temp session store file: {err}"))?;
+    file.write_all(json.as_bytes())
+        .map_err(|err| format!("Failed to write temp session store file: {err}"))?;
+    file.sync_all()
+        .map_err(|err| format!("Failed to sync temp session store file: {err}"))?;
+    std::fs::rename(&tmp_path, path).map_err(|err| {
+        format!(
+            "Failed to atomically replace session store {}: {err}",
+            path.display()
+        )
+    })
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -429,9 +564,81 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn is_native_antigravity_session_id(session_id: &str) -> bool {
+    session_id.len() == 36 && Uuid::parse_str(session_id).is_ok()
+}
+
+pub(crate) fn session_record_is_resumable(record: &SessionRecord) -> bool {
+    session_record_is_resumable_with(record, |session_id| {
+        crate::backend::antigravity::is_antigravity_session_resumable(session_id)
+    })
+}
+
+fn session_record_is_resumable_with<F>(record: &SessionRecord, is_antigravity_resumable: F) -> bool
+where
+    F: Fn(&SessionId) -> bool,
+{
+    match record.backend_kind {
+        BackendKind::Antigravity => {
+            !antigravity_record_is_permanently_non_resumable(record)
+                && is_antigravity_resumable(&record.id)
+        }
+        BackendKind::Tycode | BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex => {
+            record.resumable
+        }
+    }
+}
+
+fn antigravity_record_is_permanently_non_resumable(record: &SessionRecord) -> bool {
+    record.compacted_to_session_id.is_some() || (!record.resumable && record.parent_id.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_store_purges_legacy_gemini_records_on_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "records": {
+    "gemini-session": {
+      "id": "gemini-session",
+      "backend_kind": "gemini",
+      "workspace_roots": ["/tmp"],
+      "created_at_ms": 1,
+      "updated_at_ms": 2
+    },
+    "claude-session": {
+      "id": "claude-session",
+      "backend_kind": "claude",
+      "workspace_roots": ["/tmp"],
+      "created_at_ms": 3,
+      "updated_at_ms": 4
+    }
+  }
+}"#,
+        )
+        .expect("write legacy session store");
+
+        let (store, purged) =
+            SessionStore::load_with_migration(path.clone()).expect("load migrated session store");
+        assert_eq!(
+            purged,
+            [SessionId("gemini-session".to_string())]
+                .into_iter()
+                .collect()
+        );
+        let summaries = store.summaries().expect("summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, SessionId("claude-session".to_string()));
+        let rewritten = std::fs::read_to_string(path).expect("read rewritten store");
+        assert!(!rewritten.contains("gemini"));
+        assert!(rewritten.contains("claude-session"));
+    }
 
     #[test]
     fn session_store_loads_legacy_records_without_compaction_fields() {
@@ -464,5 +671,136 @@ mod tests {
         assert!(summary.compacted_to_session_id.is_none());
         assert!(summary.compacted_at_ms.is_none());
         assert!(summary.compaction_summary_preview.is_none());
+    }
+
+    #[test]
+    fn session_store_marks_legacy_synthetic_antigravity_sessions_non_resumable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "records": {
+    "antigravity-55a3c5e1-a2e1-44c1-9246-6e3de751803d": {
+      "id": "antigravity-55a3c5e1-a2e1-44c1-9246-6e3de751803d",
+      "backend_kind": "antigravity",
+      "workspace_roots": [],
+      "created_at_ms": 1,
+      "updated_at_ms": 2,
+      "resumable": true
+    },
+    "55a3c5e1-a2e1-44c1-9246-6e3de751803d": {
+      "id": "55a3c5e1-a2e1-44c1-9246-6e3de751803d",
+      "backend_kind": "antigravity",
+      "workspace_roots": [],
+      "created_at_ms": 3,
+      "updated_at_ms": 4,
+      "resumable": true
+    }
+  }
+}"#,
+        )
+        .expect("write antigravity session store");
+
+        let store = SessionStore::load(path).expect("load migrated session store");
+        let synthetic = store
+            .get(&SessionId(
+                "antigravity-55a3c5e1-a2e1-44c1-9246-6e3de751803d".to_string(),
+            ))
+            .expect("synthetic antigravity record");
+        assert!(!synthetic.resumable);
+
+        let native = store
+            .get(&SessionId(
+                "55a3c5e1-a2e1-44c1-9246-6e3de751803d".to_string(),
+            ))
+            .expect("native antigravity record");
+        assert!(native.resumable);
+    }
+
+    #[test]
+    fn session_summaries_mark_native_antigravity_missing_db_non_resumable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sessions.json");
+        let session_id = Uuid::new_v4().to_string();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{
+  "records": {{
+    "{session_id}": {{
+      "id": "{session_id}",
+      "backend_kind": "antigravity",
+      "workspace_roots": [],
+      "created_at_ms": 1,
+      "updated_at_ms": 2,
+      "resumable": true
+    }}
+  }}
+}}"#
+            ),
+        )
+        .expect("write antigravity session store");
+
+        let store = SessionStore::load(path).expect("load session store");
+        let summaries = store.summaries().expect("summaries");
+        assert_eq!(summaries.len(), 1);
+        assert!(
+            !summaries[0].resumable,
+            "native Antigravity UUID without a backing AGY db must not be emitted resumable"
+        );
+    }
+
+    #[test]
+    fn antigravity_record_resumability_allows_transient_missing_db_to_recover() {
+        let session_id = SessionId("55a3c5e1-a2e1-44c1-9246-6e3de751803d".to_owned());
+        let record = test_record(BackendKind::Antigravity, session_id.clone(), false);
+
+        assert!(!session_record_is_resumable_with(&record, |_| false));
+        assert!(session_record_is_resumable_with(&record, |id| id == &session_id));
+    }
+
+    #[test]
+    fn antigravity_record_resumability_preserves_permanent_false_records() {
+        let old_session_id = SessionId("55a3c5e1-a2e1-44c1-9246-6e3de751803d".to_owned());
+        let new_session_id = SessionId("66666666-6666-4666-8666-666666666666".to_owned());
+        let parent_session_id = SessionId("77777777-7777-4777-8777-777777777777".to_owned());
+
+        let mut compacted = test_record(BackendKind::Antigravity, old_session_id.clone(), false);
+        compacted.compacted_to_session_id = Some(new_session_id);
+        assert!(
+            !session_record_is_resumable_with(&compacted, |_| true),
+            "compacted Antigravity records must stay non-resumable even when a native db exists"
+        );
+
+        let mut backend_native = test_record(BackendKind::Antigravity, old_session_id, false);
+        backend_native.parent_id = Some(parent_session_id);
+        assert!(
+            !session_record_is_resumable_with(&backend_native, |_| true),
+            "backend-native Antigravity child records must stay non-resumable even when a native db exists"
+        );
+    }
+
+    fn test_record(backend_kind: BackendKind, id: SessionId, resumable: bool) -> SessionRecord {
+        SessionRecord {
+            id,
+            backend_kind,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            custom_agent_id: None,
+            alias: None,
+            user_alias: None,
+            parent_id: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            message_count: 0,
+            token_count: None,
+            session_settings: None,
+            resumable,
+            compacted_from_session_id: None,
+            compacted_to_session_id: None,
+            compacted_at_ms: None,
+            compaction_summary_preview: None,
+        }
     }
 }

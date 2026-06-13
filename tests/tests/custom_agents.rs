@@ -1012,8 +1012,8 @@ async fn tool_policy_rejection_for_non_claude_backends() {
             },
         ),
         (
-            "gemini-allow",
-            BackendKind::Gemini,
+            "antigravity-allow",
+            BackendKind::Antigravity,
             ToolPolicy::AllowList {
                 tools: vec!["Read".to_string()],
             },

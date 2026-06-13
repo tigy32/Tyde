@@ -246,8 +246,8 @@ handled differently, by **when** the exit happens:
 stdin discipline, control-protocol framing, and resume flags are all **internal
 to the concrete backend**. The agent actor only ever calls `send()`,
 `interrupt()`, `session_id()`, and `shutdown()` and consumes `ChatEvent`s. None
-of those signatures or their semantics change, so Codex, Gemini, Kiro, Tycode,
-and Mock are untouched.
+of those signatures or their semantics change, so Codex, Antigravity, Kiro,
+Tycode, and Mock are untouched.
 
 ---
 

@@ -12,7 +12,7 @@ fn backend_label_for(kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
-        BackendKind::Gemini => "Gemini",
+        BackendKind::Antigravity => "Antigravity",
     }
 }
 
@@ -75,7 +75,7 @@ pub fn HomeView() -> impl IntoView {
             <div class="home-getstarted">
                 <h2 class="home-getstarted-title">"Getting started"</h2>
                 <p class="home-getstarted-lede">
-                    "Tyde is a control center for AI coding agents. It runs the agent backends you already know — Claude, Codex, Gemini and more — and keeps every session organized, so you can run many agents across many projects at once."
+                    "Tyde is a control center for AI coding agents. It runs the agent backends you already know — Claude, Codex, Antigravity and more — and keeps every session organized, so you can run many agents across many projects at once."
                 </p>
                 <ol class="home-getstarted-steps">
                     <li class="home-getstarted-step" class:done=move || has_backend.get()>
@@ -85,7 +85,7 @@ pub fn HomeView() -> impl IntoView {
                         <div class="home-getstarted-body">
                             <div class="home-getstarted-step-title">"Connect an agent backend"</div>
                             <p class="home-getstarted-step-desc">
-                                "Tyde brings no AI of its own — it runs external agent backends like Claude, Codex, and Gemini. Pick one, install it, and sign in; backends already on your machine are enabled automatically."
+                                "Tyde brings no AI of its own — it runs external agent backends like Claude, Codex, and Antigravity. Pick one, install it, and sign in; backends already on your machine are enabled automatically."
                             </p>
                             <Show when=move || !has_backend.get()>
                                 <button

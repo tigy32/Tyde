@@ -89,8 +89,10 @@ Tyde reports unsupported behavior instead.
   builds that do not expose `thread/fork` must fail gracefully as unsupported
   with an update-Codex message. Do not ship a rollout-file or session-file copy
   fallback.
-- **Gemini**: unsupported for now. Tyde does not have a native Gemini fork or ACP
-  transport path wired up.
+- **Antigravity**: fork is unsupported for now. Resumable Antigravity sessions
+  use the native `agy` conversation UUID as the Tyde `SessionId` and resume via
+  exact `--conversation=<UUID>`; legacy Tyde-minted `antigravity-...` sessions
+  remain non-resumable because they have no native conversation ID.
 
 ## Testing requirements
 

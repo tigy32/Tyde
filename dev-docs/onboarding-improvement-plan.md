@@ -33,7 +33,7 @@ Implemented (in working tree, verified live + by wasm/unit tests):
 - Backend taglines in the New Chat picker; contextual tooltips on disabled
   `+` buttons.
 - Server seeds enabled backends from installed CLIs on first run and picks a
-  default (Claude > Codex > Gemini > Kiro > Tycode).
+  default (Claude > Codex > Antigravity > Kiro > Tycode).
 
 Decisions from Mike:
 
@@ -112,8 +112,8 @@ not curing each concept individually.
    (a) toggle it on, (b) click **Install** (runs a shell command, output in the
    bottom dock), (c) click **Sign in** (OAuth / API key in the terminal). No
    recommendation on *which* backend a newcomer should pick; five equal toggles
-   (Claude / Codex / Kiro / Tycode / Gemini). Failures surface as raw terminal
-   text.
+   (Claude / Codex / Kiro / Tycode / Antigravity). Failures surface as raw
+   terminal text.
    - `frontend/src/components/settings_panel.rs:2386-2540` (BackendCard)
 
 5. **Projects vs roots is never explained.** To give the agent code access the
