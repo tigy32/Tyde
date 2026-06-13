@@ -13002,9 +13002,23 @@ for raw_line in sys.stdin:
         outcome
     }
 
+    const RUN_REAL_AI_TESTS_ENV: &str = "TYDE_RUN_REAL_AI_TESTS";
+    const RUN_CLAUDE_INTEGRATION_ENV: &str = "TYDE_RUN_CLAUDE_INTEGRATION";
+
+    fn live_claude_tests_enabled() -> bool {
+        std::env::var(RUN_REAL_AI_TESTS_ENV).ok().as_deref() == Some("1")
+            || std::env::var(RUN_CLAUDE_INTEGRATION_ENV).ok().as_deref() == Some("1")
+    }
+
     fn live_test_workspace_root() -> String {
         std::env::var("TYDE_CLAUDE_TEST_WORKSPACE")
             .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_string())
+    }
+
+    fn skip_live_claude_test() {
+        eprintln!(
+            "Skipping live Claude integration test; set {RUN_REAL_AI_TESTS_ENV}=1 or {RUN_CLAUDE_INTEGRATION_ENV}=1"
+        );
     }
 
     fn format_live_events(events: &[Value]) -> String {
@@ -13034,10 +13048,10 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
-    #[ignore = "requires local Claude CLI auth and network; set TYDE_RUN_CLAUDE_INTEGRATION=1"]
+    #[ignore = "requires --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
     async fn live_claude_turn_succeeds_at_high_effort() {
-        if std::env::var("TYDE_RUN_CLAUDE_INTEGRATION").ok().as_deref() != Some("1") {
-            eprintln!("Skipping live Claude integration test; set TYDE_RUN_CLAUDE_INTEGRATION=1");
+        if !live_claude_tests_enabled() {
+            skip_live_claude_test();
             return;
         }
 
@@ -13063,10 +13077,10 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
-    #[ignore = "requires local Claude CLI auth and network; set TYDE_RUN_CLAUDE_INTEGRATION=1"]
+    #[ignore = "requires --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
     async fn live_claude_workflow_emits_tool_progress_snapshots() {
-        if std::env::var("TYDE_RUN_CLAUDE_INTEGRATION").ok().as_deref() != Some("1") {
-            eprintln!("Skipping live Claude integration test; set TYDE_RUN_CLAUDE_INTEGRATION=1");
+        if !live_claude_tests_enabled() {
+            skip_live_claude_test();
             return;
         }
 
@@ -13136,10 +13150,10 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
-    #[ignore = "requires local Claude CLI auth and network; set TYDE_RUN_CLAUDE_INTEGRATION=1"]
+    #[ignore = "requires --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
     async fn live_claude_resume_tracks_per_turn_and_cumulative_usage() {
-        if std::env::var("TYDE_RUN_CLAUDE_INTEGRATION").ok().as_deref() != Some("1") {
-            eprintln!("Skipping live Claude integration test; set TYDE_RUN_CLAUDE_INTEGRATION=1");
+        if !live_claude_tests_enabled() {
+            skip_live_claude_test();
             return;
         }
 
@@ -13213,10 +13227,10 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
-    #[ignore = "requires local Claude CLI auth and network; set TYDE_RUN_CLAUDE_INTEGRATION=1"]
+    #[ignore = "requires --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
     async fn live_claude_tool_turn_emits_stream_end_before_tool_events() {
-        if std::env::var("TYDE_RUN_CLAUDE_INTEGRATION").ok().as_deref() != Some("1") {
-            eprintln!("Skipping live Claude integration test; set TYDE_RUN_CLAUDE_INTEGRATION=1");
+        if !live_claude_tests_enabled() {
+            skip_live_claude_test();
             return;
         }
 

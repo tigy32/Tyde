@@ -44,6 +44,16 @@ it in a comment and ideally raise it with the user first.
 - **Do not** run `backend.rs` tests unless you are changing a backend.
 - If you do change a backend, all `backend.rs` tests for the backend you
   touched must pass before committing.
+- Real-AI tests are ignored by default and must stay opt-in. Do not set
+  `TYDE_RUN_REAL_AI_TESTS`, `TYDE_LIVE_CODEX_TEST`, or
+  `TYDE_RUN_CLAUDE_INTEGRATION` unless the user explicitly approves running
+  tests that may spend money.
+- To run the real backend integration tests intentionally:
+  `TYDE_RUN_REAL_AI_TESTS=1 cargo test -p tests --test backend real_ -- --ignored --nocapture`
+- To run the lower-level live backend tests intentionally:
+  `TYDE_RUN_REAL_AI_TESTS=1 cargo test -p server live_codex -- --ignored --nocapture`
+  and
+  `TYDE_RUN_REAL_AI_TESTS=1 cargo test -p server live_claude -- --ignored --nocapture`
 - All other tests must always pass.
 
 ### 4. Local commits only

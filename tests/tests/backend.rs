@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 const REAL_BACKEND_TIMEOUT: Duration = Duration::from_secs(60);
 const REAL_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const RUN_REAL_AI_TESTS_ENV: &str = "TYDE_RUN_REAL_AI_TESTS";
 const SOLID_RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC";
 
 fn init_tracing() {
@@ -73,8 +74,16 @@ fn remote_network_is_available() -> bool {
     "example.com:443".to_socket_addrs().is_ok()
 }
 
+fn real_ai_tests_enabled() -> bool {
+    std::env::var(RUN_REAL_AI_TESTS_ENV).ok().as_deref() == Some("1")
+}
+
 fn backend_runtime_available(backend_kind: BackendKind) -> bool {
     if !backend_binary_available(backend_kind) {
+        return false;
+    }
+    if !real_ai_tests_enabled() {
+        eprintln!("SKIPPED: real AI backend tests require {RUN_REAL_AI_TESTS_ENV}=1");
         return false;
     }
 
@@ -2971,10 +2980,11 @@ async fn assert_backend_interrupts_long_running_command(
 }
 
 // ---------------------------------------------------------------------------
-// Real backend tests — skip unavailable backends, 60s timeout per event
+// Real backend tests — opt-in because they can make real AI calls
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn resumable_real_backends_remember_secret() {
     let backends = [
         BackendKind::Claude,
@@ -3023,6 +3033,7 @@ async fn resumable_real_backends_remember_secret() {
 }
 
 #[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_backends_emit_stream_deltas() {
     let backends = [
         BackendKind::Claude,
@@ -3071,6 +3082,7 @@ async fn real_backends_emit_stream_deltas() {
 }
 
 #[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_backends_emit_typing_status() {
     let backends = [
         BackendKind::Claude,
@@ -3119,6 +3131,7 @@ async fn real_backends_emit_typing_status() {
 }
 
 #[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_claude_first_turn_native_subagent_appears_in_host_stream() {
     let backend_kind = BackendKind::Claude;
     if !backend_binary_available(backend_kind) {
@@ -3211,6 +3224,7 @@ async fn real_claude_first_turn_native_subagent_appears_in_host_stream() {
 }
 
 #[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_codex_emits_tool_events_for_file_copy() {
     let backends = [BackendKind::Codex];
     let mut failures = Vec::new();
@@ -3254,6 +3268,7 @@ async fn real_codex_emits_tool_events_for_file_copy() {
 }
 
 #[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_codex_emits_token_usage() {
     let backend_kind = BackendKind::Codex;
 
@@ -3282,6 +3297,7 @@ async fn real_codex_emits_token_usage() {
 }
 
 #[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_backends_interrupt_long_running_command() {
     let backends = [BackendKind::Claude, BackendKind::Codex, BackendKind::Kiro];
     let mut failures = Vec::new();
@@ -3325,6 +3341,7 @@ async fn real_backends_interrupt_long_running_command() {
 }
 
 #[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_kiro_emits_typing_and_streaming_on_follow_up_turns() {
     let backend_kind = BackendKind::Kiro;
 
@@ -3353,6 +3370,7 @@ async fn real_kiro_emits_typing_and_streaming_on_follow_up_turns() {
 }
 
 #[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_kiro_follow_up_user_message_echo_is_not_duplicated() {
     let backend_kind = BackendKind::Kiro;
 
@@ -3381,6 +3399,7 @@ async fn real_kiro_follow_up_user_message_echo_is_not_duplicated() {
 }
 
 #[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_codex_describes_image_input() {
     let backends = [BackendKind::Codex];
     let mut failures = Vec::new();
@@ -3424,6 +3443,7 @@ async fn real_codex_describes_image_input() {
 }
 
 #[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_codex_low_cost_name_generation_prompt_returns_non_empty_response() {
     let backends = [BackendKind::Codex];
     let mut failures = Vec::new();

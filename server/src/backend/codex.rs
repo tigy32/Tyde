@@ -7167,6 +7167,14 @@ for line in sys.stdin:
             .collect()
     }
 
+    const RUN_REAL_AI_TESTS_ENV: &str = "TYDE_RUN_REAL_AI_TESTS";
+    const LIVE_CODEX_TEST_ENV: &str = "TYDE_LIVE_CODEX_TEST";
+
+    fn live_codex_tests_enabled() -> bool {
+        std::env::var(RUN_REAL_AI_TESTS_ENV).ok().as_deref() == Some("1")
+            || std::env::var(LIVE_CODEX_TEST_ENV).ok().as_deref() == Some("1")
+    }
+
     fn live_test_verbose() -> bool {
         std::env::var("TYDE_LIVE_CODEX_TEST_VERBOSE")
             .ok()
@@ -7176,6 +7184,12 @@ for line in sys.stdin:
 
     fn live_test_log(msg: &str) {
         eprintln!("[live-codex-test] {msg}");
+    }
+
+    fn skip_live_codex_test() {
+        eprintln!(
+            "Skipping live Codex test (set {RUN_REAL_AI_TESTS_ENV}=1 or {LIVE_CODEX_TEST_ENV}=1 to run)."
+        );
     }
 
     fn test_file_change(path: &str, lines_added: u64, lines_removed: u64) -> CodexFileChange {
@@ -8197,14 +8211,14 @@ for line in sys.stdin:
     }
 
     #[test]
-    #[ignore = "Live Codex test. Run with TYDE_LIVE_CODEX_TEST=1 and a valid Codex login/session."]
+    #[ignore = "Live Codex test. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
     fn live_codex_spawn_agent_round_trip_emits_subagent_callbacks() {
         live_test_log("starting live codex sub-agent test");
-        if std::env::var("TYDE_LIVE_CODEX_TEST").ok().as_deref() != Some("1") {
-            eprintln!("Skipping live Codex test (set TYDE_LIVE_CODEX_TEST=1 to run).");
+        if !live_codex_tests_enabled() {
+            skip_live_codex_test();
             return;
         }
-        live_test_log("preflight: TYDE_LIVE_CODEX_TEST=1 set");
+        live_test_log("preflight: live Codex test env set");
 
         let codex_available = std::process::Command::new("codex")
             .arg("--version")
@@ -8477,11 +8491,11 @@ If you skip spawn_agent or wait_agent, this test fails."#;
     }
 
     #[test]
-    #[ignore = "Live Codex test. Run with TYDE_LIVE_CODEX_TEST=1 and a valid Codex login/session."]
+    #[ignore = "Live Codex test. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
     fn live_codex_session_can_call_tyde_debug_mcp_tool_via_rpc() {
         live_test_log("starting live codex MCP RPC test");
-        if std::env::var("TYDE_LIVE_CODEX_TEST").ok().as_deref() != Some("1") {
-            eprintln!("Skipping live Codex test (set TYDE_LIVE_CODEX_TEST=1 to run).");
+        if !live_codex_tests_enabled() {
+            skip_live_codex_test();
             return;
         }
 
@@ -8600,11 +8614,11 @@ If you skip spawn_agent or wait_agent, this test fails."#;
     }
 
     #[test]
-    #[ignore = "Live Codex test. Run with TYDE_LIVE_CODEX_TEST=1 and a valid Codex login/session."]
+    #[ignore = "Live Codex test. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
     fn live_codex_session_can_call_tyde_agent_control_mcp_tool_via_rpc() {
         live_test_log("starting live codex agent-control MCP RPC test");
-        if std::env::var("TYDE_LIVE_CODEX_TEST").ok().as_deref() != Some("1") {
-            eprintln!("Skipping live Codex test (set TYDE_LIVE_CODEX_TEST=1 to run).");
+        if !live_codex_tests_enabled() {
+            skip_live_codex_test();
             return;
         }
 
@@ -8734,11 +8748,11 @@ If you skip spawn_agent or wait_agent, this test fails."#;
     }
 
     #[test]
-    #[ignore = "Live Codex test. Run with TYDE_LIVE_CODEX_TEST=1 and a valid Codex login/session."]
+    #[ignore = "Live Codex test. Use --ignored and TYDE_RUN_REAL_AI_TESTS=1."]
     fn live_codex_model_emits_mcp_tool_call_for_tyde_debug_tool() {
         live_test_log("starting live codex model-driven MCP test");
-        if std::env::var("TYDE_LIVE_CODEX_TEST").ok().as_deref() != Some("1") {
-            eprintln!("Skipping live Codex test (set TYDE_LIVE_CODEX_TEST=1 to run).");
+        if !live_codex_tests_enabled() {
+            skip_live_codex_test();
             return;
         }
 
