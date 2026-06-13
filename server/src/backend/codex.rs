@@ -3163,6 +3163,16 @@ fn codex_normalize_tool_name(tool_name: &str) -> String {
 }
 
 fn codex_tool_name_is_spawn(tool_name: &str) -> bool {
+    // Tyde's own `tyde-agent-control` MCP spawn tool (`tyde_spawn_agent`) is
+    // already handled by the agent-control spawn path, which creates the child
+    // Tyde session. The Codex *native* sub-agent detector must NOT also fire on
+    // it: the broad `ends_with("spawnagent")` rule below would otherwise match
+    // `tyde_spawn_agent`, producing a duplicate `backend_native` session
+    // alongside the real `agent_control` one for every MCP spawn. See the
+    // `tyde_spawn_agent_is_not_a_native_codex_spawn` regression test.
+    if codex_tool_name_is_tyde_agent_control_spawn(tool_name) {
+        return false;
+    }
     let normalized = codex_normalize_tool_name(tool_name);
     normalized == "spawnagent"
         || normalized == "spawnsubagent"
@@ -3170,6 +3180,14 @@ fn codex_tool_name_is_spawn(tool_name: &str) -> bool {
         || normalized.ends_with("spawnagent")
         || normalized.ends_with("spawnsubagent")
         || normalized.contains("delegate")
+}
+
+/// Whether `tool_name` is Tyde's `tyde-agent-control` `tyde_spawn_agent` MCP
+/// tool. Matches the bare name as well as any MCP namespacing (e.g.
+/// `mcp__tyde-agent-control__tyde_spawn_agent`), since normalization strips the
+/// separators.
+fn codex_tool_name_is_tyde_agent_control_spawn(tool_name: &str) -> bool {
+    codex_normalize_tool_name(tool_name).contains("tydespawnagent")
 }
 
 fn codex_tool_name_is_wait(tool_name: &str) -> bool {
@@ -10367,5 +10385,61 @@ Do not describe the tool, and do not skip the tool call."#;
                 .any(|entry| entry == "mcp_servers.tyde-debug.http_headers.x-ignored=\"value\""),
             "expected Codex MCP config to emit HTTP header overrides: {overrides:?}"
         );
+    }
+
+    /// Regression: a Codex agent calling Tyde's `tyde_spawn_agent` MCP tool must
+    /// NOT be picked up by the *native* Codex sub-agent detector. The tool call
+    /// is rendered to the UI separately (via `emitter.tool_request`); the native
+    /// detector creating a second session would duplicate every MCP-spawned
+    /// sub-agent (one `agent_control` session + one phantom `backend_native`
+    /// session inheriting the parent's backend/project). See the
+    /// `Antigravity Cli Migration` orchestrator that spawned 2 children but
+    /// produced 4 sessions.
+    #[test]
+    fn tyde_spawn_agent_is_not_a_native_codex_spawn() {
+        // The name classifier excludes Tyde's tool, bare and MCP-namespaced.
+        assert!(!codex_tool_name_is_spawn("tyde_spawn_agent"));
+        assert!(!codex_tool_name_is_spawn(
+            "mcp__tyde-agent-control__tyde_spawn_agent"
+        ));
+
+        // The full parse path (used by `spawn_codex_subagent_if_needed`) returns
+        // None for a real `mcpToolCall` item, so no phantom session is spawned.
+        for tool in [
+            "tyde_spawn_agent",
+            "mcp__tyde-agent-control__tyde_spawn_agent",
+        ] {
+            let tyde_mcp_item = json!({
+                "id": "item_tyde_0",
+                "type": "mcpToolCall",
+                "tool": tool,
+                "args": { "name": "Codex RCA", "prompt": "do the thing" },
+            });
+            assert!(
+                parse_codex_subagent_spawn(&tyde_mcp_item).is_none(),
+                "{tool} must not be treated as a native Codex sub-agent spawn"
+            );
+            assert!(!codex_item_looks_like_spawn_tool(&tyde_mcp_item));
+        }
+    }
+
+    /// Companion guard: the exclusion above must not blind the detector to
+    /// Codex's genuine native spawn/delegate tools.
+    #[test]
+    fn genuine_native_codex_spawn_is_still_detected() {
+        assert!(codex_tool_name_is_spawn("spawn_agent"));
+        assert!(codex_tool_name_is_spawn("spawn_subagent"));
+        assert!(codex_tool_name_is_spawn("delegate"));
+
+        let native_item = json!({
+            "id": "item_native_0",
+            "type": "mcpToolCall",
+            "tool": "spawn_subagent",
+            "prompt": "investigate the regression",
+        });
+        let parsed = parse_codex_subagent_spawn(&native_item)
+            .expect("a genuine native spawn tool must still be detected");
+        assert_eq!(parsed.item_id, "item_native_0");
+        assert!(codex_item_looks_like_spawn_tool(&native_item));
     }
 }
