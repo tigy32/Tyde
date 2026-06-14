@@ -38,8 +38,6 @@ const ANTIGRAVITY_DEFAULT_MODEL: &str = "Gemini 3.5 Flash (Medium)";
 const ANTIGRAVITY_LOW_MODEL: &str = "Gemini 3.5 Flash (Low)";
 const ANTIGRAVITY_HIGH_MODEL: &str = "Gemini 3.1 Pro (High)";
 const ANTIGRAVITY_ERROR_PREFIXES: &[&str] = &["Authentication required", "Error:"];
-const READ_ONLY_UNSUPPORTED_MESSAGE: &str =
-    "Antigravity CLI has no enforceable read-only mode; refusing read_only spawn";
 
 static ANTIGRAVITY_TURN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ANTIGRAVITY_MCP_CONFIG_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -157,10 +155,6 @@ impl Backend for AntigravityBackend {
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
-        if config.resolved_spawn_config.access_mode == BackendAccessMode::ReadOnly {
-            return Err(READ_ONLY_UNSUPPORTED_MESSAGE.to_string());
-        }
-
         let (primary_root, extra_roots) = resolve_workspace_roots(&workspace_roots)?;
         let resolved_settings = resolve_session_settings(&config);
         let _ = selected_model(&resolved_settings)?;
@@ -232,9 +226,6 @@ impl Backend for AntigravityBackend {
         config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
-        if config.resolved_spawn_config.access_mode == BackendAccessMode::ReadOnly {
-            return Err(READ_ONLY_UNSUPPORTED_MESSAGE.to_string());
-        }
         if !is_antigravity_native_session_id(&session_id) {
             return Err(format!(
                 "Antigravity resume requires a native agy conversation UUID, got {session_id}"
@@ -400,11 +391,6 @@ impl AntigravityInner {
         mut session_capture: Option<SessionCapture>,
     ) -> Result<PreparedTurn, String> {
         let mut state = self.state.lock().await;
-        if state.access_mode == BackendAccessMode::ReadOnly {
-            let err = READ_ONLY_UNSUPPORTED_MESSAGE.to_string();
-            fail_session_capture(&mut session_capture, &err);
-            return Err(err);
-        }
         if state.active_turn.is_some() {
             let err = "Antigravity is still processing the previous turn.".to_string();
             fail_session_capture(&mut session_capture, &err);
@@ -917,8 +903,11 @@ pub(crate) fn antigravity_cli_args(
         log_file.to_string_lossy().to_string(),
     ];
     match access_mode {
+        // NOTE: `--sandbox` and `--dangerously-skip-permissions` must be
+        // mutually exclusive: a known `agy` bug lets that combination bypass
+        // the sandbox, so each access mode pushes exactly one of them.
         BackendAccessMode::Unrestricted => args.push("--dangerously-skip-permissions".to_string()),
-        BackendAccessMode::ReadOnly => {}
+        BackendAccessMode::ReadOnly => args.push("--sandbox".to_string()),
     }
     args.push("--model".to_string());
     args.push(model.to_string());
@@ -2146,31 +2135,27 @@ mod tests {
         })
     }
 
-    #[tokio::test]
-    async fn read_only_spawn_rejects_before_launch() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let err = match AntigravityBackend::spawn(
-            vec![dir.path().to_string_lossy().to_string()],
-            BackendSpawnConfig {
-                resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
-                    access_mode: BackendAccessMode::ReadOnly,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            protocol::SendMessagePayload {
-                message: "hello".to_string(),
-                images: None,
-                origin: None,
-                tool_response: None,
-            },
-        )
-        .await
-        {
-            Ok(_) => panic!("read-only spawn must fail"),
-            Err(err) => err,
-        };
-        assert!(err.contains("no enforceable read-only mode"));
+    #[test]
+    fn read_only_no_longer_produces_read_only_refusal() {
+        // ReadOnly is now enforced by passing `--sandbox` to `agy` rather than a
+        // hard refusal. We assert the arg builder no longer surfaces the old "no
+        // enforceable read-only mode" error. (A full live spawn is not exercised
+        // here because `agy` does not run in CI.)
+        let log_file = Path::new("/tmp/tyde-agy-readonly.log");
+        let args = antigravity_cli_args(
+            BackendAccessMode::ReadOnly,
+            ANTIGRAVITY_DEFAULT_MODEL,
+            &[],
+            None,
+            log_file,
+            "hello",
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("no enforceable read-only mode")),
+            "read-only args must not carry the old refusal error: {args:?}"
+        );
     }
 
     #[tokio::test]
@@ -2607,5 +2592,56 @@ mod tests {
             "unexpected restore error: {err}"
         );
         std::fs::remove_dir_all(&path).expect("clean failed restore directory");
+    }
+
+    #[test]
+    fn cli_args_read_only_uses_sandbox_not_skip_permissions() {
+        let args = antigravity_cli_args(
+            BackendAccessMode::ReadOnly,
+            ANTIGRAVITY_DEFAULT_MODEL,
+            &["/extra/one".to_string()],
+            None,
+            Path::new("/tmp/tyde-agy-ro.log"),
+            "hello",
+        );
+        assert!(
+            args.iter().any(|arg| arg == "--sandbox"),
+            "read-only args must enforce the sandbox: {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions"),
+            "read-only args must not skip permissions (combining --sandbox with \
+             --dangerously-skip-permissions bypasses the sandbox): {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--gemini_dir" || arg.starts_with("--gemini_dir")),
+            "read-only args must not relocate the gemini dir: {args:?}"
+        );
+    }
+
+    #[test]
+    fn cli_args_unrestricted_skips_permissions_without_sandbox() {
+        let args = antigravity_cli_args(
+            BackendAccessMode::Unrestricted,
+            ANTIGRAVITY_DEFAULT_MODEL,
+            &["/extra/one".to_string()],
+            None,
+            Path::new("/tmp/tyde-agy-rw.log"),
+            "hello",
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--dangerously-skip-permissions"),
+            "unrestricted args must skip permissions: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--sandbox"),
+            "unrestricted args must not enable the sandbox (combining --sandbox \
+             with --dangerously-skip-permissions bypasses the sandbox): {args:?}"
+        );
     }
 }
