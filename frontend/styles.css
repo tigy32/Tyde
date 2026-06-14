@@ -535,6 +535,63 @@ details summary:focus:not(:focus-visible) {
     cursor: grabbing;
 }
 
+/* Workbench hierarchy — a project and its workbenches form one group; the
+   children read as nested, subordinate rows beneath the parent project. */
+.rail-project-group {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.rail-workbench-children {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-top: 3px;
+}
+
+/* When expanded, indent the children under a vertical guide line that ties
+   them visually to their parent project. */
+.project-rail.expanded .rail-workbench-children {
+    margin-left: 10px;
+    padding-left: 10px;
+    border-left: 1px solid var(--border-primary);
+}
+
+/* Workbench rows are lighter than their parent so the parent reads as the
+   "head" of the group: no solid box, dimmer/smaller tag and label. */
+.rail-item.rail-workbench {
+    background: transparent;
+    border-color: transparent;
+}
+
+.rail-item.rail-workbench:hover {
+    background: var(--surface-2);
+    border-color: var(--border-primary);
+}
+
+.rail-item.rail-workbench .rail-tag {
+    font-size: 0.68rem;
+    color: var(--text-tertiary);
+}
+
+.rail-item.rail-workbench .rail-label {
+    font-weight: 400;
+    color: var(--text-tertiary);
+}
+
+.rail-item.rail-workbench.active {
+    background: var(--surface-3);
+    border-color: var(--border-secondary);
+}
+
+.rail-item.rail-workbench.active .rail-tag,
+.rail-item.rail-workbench.active .rail-label,
+.rail-item.rail-workbench:hover .rail-tag,
+.rail-item.rail-workbench:hover .rail-label {
+    color: var(--text-primary);
+}
+
 .rail-project-remove {
     display: none;
     align-items: center;
