@@ -522,24 +522,77 @@ fn parse_optional_version_path_result(value: Option<&String>) -> Result<Option<V
     }
 }
 
+/// Number of times to retry the binary upload before giving up. Streaming a
+/// large binary into `ssh ... 'cat > file'` over stdin can intermittently
+/// truncate, so each attempt verifies size + sha256 on the remote and we retry
+/// the whole upload on any mismatch.
+const INSTALL_UPLOAD_ATTEMPTS: usize = 3;
+
 async fn install_binary(
     ssh_destination: &str,
     version: Version,
     binary: &[u8],
 ) -> Result<(), String> {
+    let expected_len = binary.len();
+    let expected_sha = sha256_hex(binary);
+    // The remote script writes stdin to a temp file, then refuses to install it
+    // unless both the byte count and (when a sha256 tool is available) the
+    // digest match what we sent. `cat` happily returns success on a truncated
+    // stream, so without this check a partial transfer silently installs a
+    // corrupt binary. The EXIT trap removes the temp file on any failure.
     let command = format!(
         r#"set -eu
 version={version}
+expected_len={expected_len}
+expected_sha={expected_sha}
 install_dir="$HOME/.tyde/bin/$version"
 mkdir -p "$install_dir" "$HOME/.tyde/logs" "$HOME/.tyde/run"
 tmp="$install_dir/tyde-server.tmp.$$"
+trap 'rm -f "$tmp"' EXIT
 cat > "$tmp"
+actual_len=$(wc -c < "$tmp" | tr -d ' ')
+if [ "$actual_len" != "$expected_len" ]; then
+  echo "tyde-server upload truncated: expected $expected_len bytes, received $actual_len" >&2
+  exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  actual_sha=$(sha256sum "$tmp" | awk '{{print $1}}')
+elif command -v shasum >/dev/null 2>&1; then
+  actual_sha=$(shasum -a 256 "$tmp" | awk '{{print $1}}')
+else
+  actual_sha=""
+fi
+if [ -n "$actual_sha" ] && [ "$actual_sha" != "$expected_sha" ]; then
+  echo "tyde-server upload corrupted: sha256 mismatch (expected $expected_sha, received $actual_sha)" >&2
+  exit 1
+fi
 chmod 755 "$tmp"
 mv "$tmp" "$install_dir/tyde-server"
+trap - EXIT
 ln -sfn "$version" "$HOME/.tyde/bin/current"
 "#
     );
-    ssh_with_stdin(ssh_destination, &command, binary).await
+
+    let mut last_err = String::new();
+    for attempt in 1..=INSTALL_UPLOAD_ATTEMPTS {
+        match ssh_with_stdin(ssh_destination, &command, binary).await {
+            Ok(()) => return Ok(()),
+            Err(err) => last_err = format!("attempt {attempt}/{INSTALL_UPLOAD_ATTEMPTS}: {err}"),
+        }
+    }
+    Err(format!(
+        "failed to upload a complete tyde-server binary after {INSTALL_UPLOAD_ATTEMPTS} attempts ({last_err})"
+    ))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 async fn stop_managed_server(ssh_destination: &str) -> Result<(), String> {
@@ -589,6 +642,13 @@ tail_launch_log() {{
     tail -n 80 "$log_file" >&2 || true
   fi
 }}
+# Remove any stale socket left by a previous server. Otherwise the readiness
+# check below ([ -S "$socket" ]) can pass against the old socket and report a
+# successful launch even when the new process crashed immediately, masking the
+# real failure as a later "NotRunning" observation. Safe here: this path is
+# only reached when no managed server is running (NotRunning, or after the old
+# one was stopped).
+rm -f "$socket"
 nohup "$bin" host --uds >> "$log_file" 2>&1 < /dev/null &
 pid=$!
 printf '%s\n' "$pid" > "$pid_file"

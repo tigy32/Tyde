@@ -1009,7 +1009,7 @@ fn HostsTab() -> impl IntoView {
                                 {is_managed_remote.then(|| {
                                     let lifecycle_text = lifecycle_status_text(&lifecycle_status);
                                     view! {
-                                        <p class="host-card-transport">{format!("Tyde server: {lifecycle_text}")}</p>
+                                        <p class="host-card-lifecycle">{format!("Tyde server: {lifecycle_text}")}</p>
                                     }
                                 })}
                             </div>

@@ -6749,6 +6749,17 @@ kbd {
     white-space: nowrap;
 }
 
+/* Lifecycle/status line for managed remote hosts. Unlike .host-card-transport
+   this must NOT truncate: it carries multi-line error messages the user needs
+   to read in full (e.g. failed-launch diagnostics). */
+.host-card-lifecycle {
+    font-family: var(--font-mono);
+    font-size: 0.846rem;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
 .host-card-status {
     display: flex;
     align-items: center;
