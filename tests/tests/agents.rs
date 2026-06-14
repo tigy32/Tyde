@@ -461,6 +461,32 @@ async fn expect_turn_on_stream(
     assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
 }
 
+async fn expect_operation_cancelled_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_text: &str,
+) {
+    let mut saw_cancel = false;
+
+    loop {
+        let env = expect_chat_event_on_stream(client, stream, "OperationCancelled").await;
+        let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+        match event {
+            ChatEvent::OperationCancelled(data) => {
+                assert!(
+                    data.message.contains(expected_text),
+                    "unexpected cancellation message on {}: {}",
+                    stream,
+                    data.message
+                );
+                saw_cancel = true;
+            }
+            ChatEvent::TypingStatusChanged(false) if saw_cancel => return,
+            _ => {}
+        }
+    }
+}
+
 async fn expect_replayed_turn_on_stream(
     client: &mut client::Connection,
     stream: &StreamPath,
@@ -1875,22 +1901,19 @@ async fn interrupting_parked_backend_native_child_emits_relay_rejection() {
 }
 
 #[tokio::test]
-async fn cancelling_parent_cascades_to_user_children_and_closes_relay_children() {
+async fn interrupting_parent_keeps_agent_control_children_running() {
     let mut fixture = Fixture::new().await;
-
-    let (parent_new, _parent_start, relay_new, _relay_start) =
-        spawn_parent_with_native_child(&mut fixture.client).await;
 
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
-            name: Some("user-child".to_owned()),
+            name: Some("interrupt-parent".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: Some(parent_new.agent_id.clone()),
+            parent_agent_id: None,
             project_id: None,
             params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/user-child".to_owned()],
-                prompt: "user child".to_owned(),
+                workspace_roots: vec!["/tmp/interrupt-parent".to_owned()],
+                prompt: "__mock_hold_until_interrupt__ parent waiting".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
@@ -1899,30 +1922,61 @@ async fn cancelling_parent_cascades_to_user_children_and_closes_relay_children()
             },
         })
         .await
-        .expect("spawn user child failed");
+        .expect("spawn parent failed");
 
-    let env = expect_next_event(&mut fixture.client, "user child NewAgent").await;
+    let env = expect_next_event(&mut fixture.client, "interrupt parent NewAgent").await;
     assert_eq!(env.kind, FrameKind::NewAgent);
-    let user_child_new: NewAgentPayload = env.parse_payload().expect("parse user child NewAgent");
+    let parent_new: NewAgentPayload = env.parse_payload().expect("parse parent NewAgent");
+
+    let env = expect_next_event(&mut fixture.client, "interrupt parent AgentStart").await;
+    assert_eq!(env.kind, FrameKind::AgentStart);
+    assert_eq!(env.stream, parent_new.instance_stream);
+
+    let env = expect_chat_event_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "parent TypingStatusChanged(true)",
+    )
+    .await;
+    let event: ChatEvent = env.parse_payload().expect("parse parent typing true");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+
+    let base_url = fixture.agent_control_http_url().await;
+    let child_agent_id = mcp_spawn_agent(
+        &format!("{base_url}?agent_id={}", parent_new.agent_id.0),
+        "agent-control child first",
+        "agent-control-child",
+    )
+    .await;
+
+    let child_new = expect_replayed_new_agent(
+        &mut fixture.client,
+        &child_agent_id,
+        "agent-control child NewAgent",
+    )
+    .await;
+    assert_eq!(child_new.origin, AgentOrigin::AgentControl);
     assert_eq!(
-        user_child_new.parent_agent_id.as_ref(),
+        child_new.parent_agent_id.as_ref(),
         Some(&parent_new.agent_id)
     );
 
-    let env = expect_next_event(&mut fixture.client, "user child AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    let user_child_start: AgentStartPayload =
-        env.parse_payload().expect("parse user child AgentStart");
-    assert_eq!(user_child_start.origin, AgentOrigin::User);
+    let child_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "agent-control child AgentStart",
+    )
+    .await;
+    assert_eq!(child_start.origin, AgentOrigin::AgentControl);
     assert_eq!(
-        user_child_start.parent_agent_id.as_ref(),
+        child_start.parent_agent_id.as_ref(),
         Some(&parent_new.agent_id)
     );
 
     expect_turn_on_stream(
         &mut fixture.client,
-        &user_child_new.instance_stream,
-        "mock backend response to: user child",
+        &child_new.instance_stream,
+        "mock backend response to: agent-control child first",
     )
     .await;
 
@@ -1931,57 +1985,27 @@ async fn cancelling_parent_cascades_to_user_children_and_closes_relay_children()
         .interrupt(&parent_new.instance_stream)
         .await
         .expect("interrupt parent failed");
-
-    let parent_err = expect_agent_error_message(
+    expect_operation_cancelled_on_stream(
         &mut fixture.client,
         &parent_new.instance_stream,
-        "agent backend closed",
-        "parent termination after interrupt",
+        "mock backend interrupted held turn",
     )
     .await;
-    assert!(parent_err.fatal);
-
-    let user_child_err = expect_agent_error_message(
-        &mut fixture.client,
-        &user_child_new.instance_stream,
-        "agent backend closed",
-        "user child termination after parent interrupt",
-    )
-    .await;
-    assert!(
-        user_child_err.fatal,
-        "user-spawned child should terminate when parent is cancelled"
-    );
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     fixture
         .client
-        .send_message(&user_child_new.instance_stream, "after cancel".to_owned())
+        .send_message(
+            &child_new.instance_stream,
+            "agent-control child follow-up".to_owned(),
+        )
         .await
-        .expect("send_message to terminated user child should still write protocol frame");
-    let user_child_not_running = expect_agent_error_message(
+        .expect("child should accept follow-up after parent interrupt");
+    expect_turn_on_stream(
         &mut fixture.client,
-        &user_child_new.instance_stream,
-        "agent not running",
-        "terminated user child should reject follow-up input",
+        &child_new.instance_stream,
+        "mock backend response to: agent-control child follow-up",
     )
     .await;
-    assert!(!user_child_not_running.fatal);
-
-    fixture
-        .client
-        .send_message(&relay_new.instance_stream, "after relay close".to_owned())
-        .await
-        .expect("send_message to terminated relay child should still write protocol frame");
-    let relay_not_running = expect_agent_error_message(
-        &mut fixture.client,
-        &relay_new.instance_stream,
-        "agent not running",
-        "relay child should terminate after parent backend closes its event channel",
-    )
-    .await;
-    assert!(!relay_not_running.fatal);
 }
 
 #[tokio::test]

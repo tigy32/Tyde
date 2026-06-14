@@ -2989,6 +2989,13 @@ impl HostHandle {
         const OPERATION: &str = "workbench_remove";
         self.validate_workbench_remove_blockers(project).await?;
 
+        {
+            let mut state = self.state.lock().await;
+            if let Some(subscription) = state.project_streams.remove(&payload.id) {
+                subscription.task.abort();
+            }
+        }
+
         for root in roots {
             let exists = tokio::fs::try_exists(&root.worktree_root.0)
                 .await
@@ -4528,37 +4535,15 @@ impl HostHandle {
     }
 
     pub(crate) async fn interrupt_agent(&self, agent_id: &AgentId) -> InterruptOutcome {
-        let (parent_handle, candidate_handles) = {
+        let agent_handle = {
             let state = self.state.lock().await;
-            let Some(parent_handle) = state.registry.agent_handle(agent_id) else {
-                return InterruptOutcome::NotRunning;
-            };
-            let candidate_handles = state
-                .registry
-                .agent_ids()
-                .into_iter()
-                .filter(|candidate_id| candidate_id != agent_id)
-                .filter_map(|candidate_id| state.registry.agent_handle(&candidate_id))
-                .collect::<Vec<_>>();
-            (parent_handle, candidate_handles)
+            state.registry.agent_handle(agent_id)
         };
 
-        let mut tyde_owned_children = Vec::new();
-        for handle in candidate_handles {
-            let start = handle.snapshot();
-            if start.parent_agent_id.as_ref() == Some(agent_id)
-                && start.origin != AgentOrigin::BackendNative
-            {
-                tyde_owned_children.push(handle);
-            }
+        match agent_handle {
+            Some(handle) => handle.interrupt().await,
+            None => InterruptOutcome::NotRunning,
         }
-
-        let outcome = parent_handle.interrupt().await;
-        for child in tyde_owned_children {
-            let _ = child.interrupt().await;
-        }
-
-        outcome
     }
 
     pub(crate) async fn close_agent(&self, agent_id: &AgentId) -> bool {
