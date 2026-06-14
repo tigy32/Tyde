@@ -9,13 +9,17 @@ mod logging;
 mod remote_bootstrap;
 mod router;
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use devtools_protocol::UiDebugResponseSubmission;
 use host_config::RemoteHostLifecycleSnapshot;
 use host_store::{ConfiguredHostStore, HostStore, UpsertConfiguredHostRequest};
 use router::ProxyRouterHandle;
-use tauri::Manager;
+use tauri::{Manager, RunEvent, WindowEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[cfg(target_os = "macos")]
 mod macos_webview_defaults {
@@ -156,6 +160,62 @@ struct ShellState {
     ui_debug: Arc<devtools::UiDebugBridgeState>,
 }
 
+#[derive(Default)]
+struct QuitConfirmation {
+    confirmed_exit: AtomicBool,
+    dialog_open: AtomicBool,
+}
+
+impl QuitConfirmation {
+    fn is_confirmed_exit(&self) -> bool {
+        self.confirmed_exit.load(Ordering::SeqCst)
+    }
+
+    fn consume_confirmed_exit(&self) -> bool {
+        self.confirmed_exit.swap(false, Ordering::SeqCst)
+    }
+
+    fn mark_confirmed_exit(&self) {
+        self.confirmed_exit.store(true, Ordering::SeqCst);
+    }
+
+    fn try_open_dialog(&self) -> bool {
+        !self.dialog_open.swap(true, Ordering::SeqCst)
+    }
+
+    fn close_dialog(&self) {
+        self.dialog_open.store(false, Ordering::SeqCst);
+    }
+}
+
+fn request_quit_confirmation(app: tauri::AppHandle, confirmation: Arc<QuitConfirmation>) {
+    if !confirmation.try_open_dialog() {
+        return;
+    }
+
+    let mut dialog = app
+        .dialog()
+        .message("Are you sure you want to quit Tyde?")
+        .title("Quit Tyde?")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Quit".to_owned(),
+            "Cancel".to_owned(),
+        ));
+
+    if let Some(window) = app.get_webview_window("main") {
+        dialog = dialog.parent(&window);
+    }
+
+    dialog.show(move |should_quit| {
+        confirmation.close_dialog();
+        if should_quit {
+            confirmation.mark_confirmed_exit();
+            app.exit(0);
+        }
+    });
+}
+
 #[tauri::command]
 async fn connect_host(
     app: tauri::AppHandle,
@@ -290,8 +350,25 @@ pub fn run() {
 
     tracing::info!("starting tyde shell");
 
-    tauri::Builder::default()
+    let quit_confirmation = Arc::new(QuitConfirmation::default());
+    let quit_confirmation_for_window = quit_confirmation.clone();
+    let quit_confirmation_for_run = quit_confirmation.clone();
+
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .on_window_event(move |window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if quit_confirmation_for_window.is_confirmed_exit() {
+                    return;
+                }
+
+                api.prevent_close();
+                request_quit_confirmation(
+                    window.app_handle().clone(),
+                    quit_confirmation_for_window.clone(),
+                );
+            }
+        })
         .setup(|app| {
             tracing::info!("setup: spawning host and router");
             let host_store_path =
@@ -346,8 +423,21 @@ pub fn run() {
             submit_ui_debug_response,
             submit_feedback
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run desktop shell");
+        .build(tauri::generate_context!())
+        .expect("failed to build desktop shell");
+
+    app.run(move |app, event| {
+        if let RunEvent::ExitRequested { code, api, .. } = event {
+            if code == Some(tauri::RESTART_EXIT_CODE)
+                || quit_confirmation_for_run.consume_confirmed_exit()
+            {
+                return;
+            }
+
+            api.prevent_exit();
+            request_quit_confirmation(app.clone(), quit_confirmation_for_run.clone());
+        }
+    });
 }
 
 pub fn run_host_stdio() -> Result<(), String> {
