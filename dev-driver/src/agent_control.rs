@@ -20,7 +20,6 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
-const AWAIT_TOOL_RESPONSE_GUARD_MS: u64 = 90_000;
 const DEFAULT_READ_LIMIT: usize = 100;
 const MAX_READ_LIMIT: usize = 1_000;
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1353,10 +1352,7 @@ async fn dispatch_tool(control: &AgentControlHandle, params: CallToolParams) -> 
                     Err(err) => return ToolCallResult::text_error(err),
                 }
             }
-            match control
-                .await_agents(Some(agent_ids), Some(AWAIT_TOOL_RESPONSE_GUARD_MS))
-                .await
-            {
+            match control.await_agents(Some(agent_ids), None).await {
                 Ok(result) => ToolCallResult::json(result),
                 Err(err) => ToolCallResult::text_error(err),
             }
@@ -1708,6 +1704,62 @@ mod tests {
             "mock backend response to: hello",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn await_tool_does_not_return_while_still_thinking() {
+        let (host, _tempdir) = test_host();
+        let control = connect_runtime(host).await;
+        let request = SpawnRequest {
+            workspace_roots: vec!["/tmp/test".to_string()],
+            prompt: "__mock_hold_until_interrupt__ dev-driver await".to_string(),
+            backend_kind: BackendKind::Claude,
+            parent_agent_id: None,
+            project_id: None,
+            name: Some("held-tool-agent".to_string()),
+            cost_hint: None,
+            access_mode: BackendAccessMode::Unrestricted,
+        };
+
+        let spawned = control
+            .spawn_agent(request)
+            .await
+            .expect("spawn should succeed");
+        let mut arguments = Map::new();
+        arguments.insert("agent_ids".to_string(), json!([spawned.agent_id.clone()]));
+        let await_call = dispatch_tool(
+            &control,
+            CallToolParams {
+                name: "tyde_await_agents".to_string(),
+                arguments: Some(arguments),
+            },
+        );
+        tokio::pin!(await_call);
+
+        assert!(
+            timeout(Duration::from_millis(50), &mut await_call)
+                .await
+                .is_err(),
+            "await tool should not return a still_thinking snapshot before the agent is ready"
+        );
+
+        control
+            .interrupt(AgentId(spawned.agent_id.clone()))
+            .await
+            .expect("interrupt should succeed");
+        let result = timeout(Duration::from_secs(5), &mut await_call)
+            .await
+            .expect("await tool should finish after interrupt");
+        assert!(!result.is_error);
+        let body: Value =
+            serde_json::from_str(&result.content[0].text).expect("await result should be JSON");
+        assert_eq!(
+            body.get("ready")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default(),
+            1
+        );
     }
 
     #[tokio::test]

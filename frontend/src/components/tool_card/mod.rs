@@ -16,8 +16,9 @@ use std::sync::Arc;
 
 use leptos::prelude::*;
 use protocol::{
-    SubAgentProgress, ToolExecutionResult, ToolProgressData, ToolProgressUpdate, ToolRequestType,
-    WorkflowRunState, WorkflowRunStatus,
+    AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind, SubAgentProgress,
+    ToolExecutionResult, ToolProgressData, ToolProgressUpdate, ToolRequestType, WorkflowRunState,
+    WorkflowRunStatus,
 };
 use wasm_bindgen::JsCast;
 
@@ -271,15 +272,26 @@ pub fn ToolCardView(
             Some(ToolProgressUpdate::SubAgent(progress)) => Some(progress),
             _ => None,
         });
+    let agent_control_progress: Signal<Option<AgentControlProgress>> =
+        Signal::derive(move || match progress.get().map(|data| data.update) {
+            Some(ToolProgressUpdate::AgentControl(progress)) => Some(progress),
+            _ => None,
+        });
     // A background task can outlive its tool call: the Workflow tool
     // result is just the run id, the real work keeps going.
-    let background_running = Signal::derive(move || {
-        workflow_run
-            .get()
-            .is_some_and(|run| run.status == WorkflowRunStatus::Running)
-            || subagent_progress
+    let background_running = Signal::derive({
+        let state = state.clone();
+        move || {
+            workflow_run
                 .get()
-                .is_some_and(|progress| !progress.completed)
+                .is_some_and(|run| run.status == WorkflowRunStatus::Running)
+                || subagent_progress
+                    .get()
+                    .is_some_and(|progress| !progress.completed)
+                || agent_control_progress.get().is_some_and(|progress| {
+                    agent_control_progress_has_active_agents(&state, agent_ref.get(), &progress)
+                })
+        }
     });
     // The body shape (workflow panel vs regular renderer) flips at most
     // once, when the first snapshot arrives — memoized so per-snapshot
@@ -315,6 +327,11 @@ pub fn ToolCardView(
         workflow_run
             .get()
             .map(|run| run.workflow_name)
+            .or_else(|| {
+                agent_control_progress
+                    .get()
+                    .map(|progress| agent_control_header_detail(&progress))
+            })
             .or_else(|| header_detail.clone())
     };
 
@@ -386,6 +403,11 @@ pub fn ToolCardView(
                         }
                         view! {
                             <div>
+                                {move || {
+                                    agent_control_progress.get().map(|progress| {
+                                        agent_control_status_list(agent_ref, progress)
+                                    })
+                                }}
                                 {move || {
                                     subagent_progress.get().map(|progress| {
                                         subagent_status_line(agent_ref, progress)
@@ -504,6 +526,259 @@ fn workflow_card_body(
             </div>
             <WorkflowRunPanel run=run />
         </div>
+    }
+}
+
+fn agent_control_header_detail(progress: &AgentControlProgress) -> String {
+    match (progress.progress_kind, progress.agents.len()) {
+        (AgentControlProgressKind::Spawn, 1) => "Spawned agent".to_owned(),
+        (AgentControlProgressKind::Spawn, count) => format!("Spawned {count} agents"),
+        (AgentControlProgressKind::Await, 1) => "Awaiting agent".to_owned(),
+        (AgentControlProgressKind::Await, count) => format!("Awaiting {count} agents"),
+    }
+}
+
+fn agent_control_progress_has_active_agents(
+    state: &AppState,
+    parent_ref: Option<ActiveAgentRef>,
+    progress: &AgentControlProgress,
+) -> bool {
+    let Some(parent_ref) = parent_ref else {
+        return false;
+    };
+    if progress.progress_kind == AgentControlProgressKind::Await {
+        return false;
+    }
+    progress.agents.iter().any(|agent| {
+        agent_control_agent_is_active(
+            state,
+            &parent_ref.host_id,
+            &agent.agent_id,
+            progress.progress_kind,
+        )
+    })
+}
+
+fn agent_control_agent_is_active(
+    state: &AppState,
+    host_id: &str,
+    agent_id: &protocol::AgentId,
+    progress_kind: AgentControlProgressKind,
+) -> bool {
+    let agent = state.agents.with(|agents| {
+        agents
+            .iter()
+            .find(|agent| agent.host_id == host_id && agent.agent_id == *agent_id)
+            .cloned()
+    });
+    match agent {
+        Some(agent) if agent.fatal_error.is_some() => false,
+        Some(agent) if !agent.started => true,
+        Some(_) => {
+            let typing = state
+                .agent_turn_active
+                .with(|map| map.get(agent_id).copied().unwrap_or(false));
+            let streaming = state.streaming_text.with(|map| map.contains_key(agent_id));
+            typing || streaming
+        }
+        None => matches!(progress_kind, AgentControlProgressKind::Spawn),
+    }
+}
+
+fn agent_control_status_list(
+    parent_ref: Signal<Option<ActiveAgentRef>>,
+    progress: AgentControlProgress,
+) -> impl IntoView {
+    let progress_kind = progress.progress_kind;
+    let agents = progress.agents;
+    let title = match progress_kind {
+        AgentControlProgressKind::Spawn => "Spawned agents",
+        AgentControlProgressKind::Await => "Awaiting agents",
+    };
+
+    view! {
+        <div class="tool-live-agent-control">
+            <div class="tool-live-agent-control-title">{title}</div>
+            <For
+                each=move || agents.clone()
+                key=|agent| agent.agent_id.0.clone()
+                let:agent
+            >
+                <AgentControlAgentRow
+                    parent_ref=parent_ref
+                    progress_kind=progress_kind
+                    agent=agent
+                />
+            </For>
+        </div>
+    }
+}
+
+#[derive(Clone)]
+enum AgentControlDerivedStatus {
+    Starting,
+    Running,
+    Idle,
+    Failed(String),
+    Unknown,
+}
+
+impl AgentControlDerivedStatus {
+    fn label(&self) -> String {
+        match self {
+            Self::Starting => "Starting".to_owned(),
+            Self::Running => "Running".to_owned(),
+            Self::Idle => "Idle".to_owned(),
+            Self::Failed(message) if message.trim().is_empty() => "Failed".to_owned(),
+            Self::Failed(message) => format!("Failed: {}", truncate_inline(message, 72)),
+            Self::Unknown => "Unknown".to_owned(),
+        }
+    }
+
+    fn class(&self) -> &'static str {
+        match self {
+            Self::Starting | Self::Running => "tool-live-agent-status running",
+            Self::Idle => "tool-live-agent-status idle",
+            Self::Failed(_) => "tool-live-agent-status failed",
+            Self::Unknown => "tool-live-agent-status unknown",
+        }
+    }
+}
+
+#[component]
+fn AgentControlAgentRow(
+    parent_ref: Signal<Option<ActiveAgentRef>>,
+    progress_kind: AgentControlProgressKind,
+    agent: AgentControlAgentRef,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let agent_id = agent.agent_id;
+    let fallback_name = agent.name;
+
+    let display_name = Signal::derive({
+        let state = state.clone();
+        let agent_id = agent_id.clone();
+        let fallback_name = fallback_name.clone();
+        move || {
+            let state_name = parent_ref.get().and_then(|parent| {
+                state.agents.with(|agents| {
+                    agents
+                        .iter()
+                        .find(|agent| agent.host_id == parent.host_id && agent.agent_id == agent_id)
+                        .map(|agent| agent.name.clone())
+                })
+            });
+            state_name
+                .or_else(|| fallback_name.clone())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| agent_id.0.clone())
+        }
+    });
+
+    let derived_status = Signal::derive({
+        let state = state.clone();
+        let agent_id = agent_id.clone();
+        move || {
+            let Some(parent) = parent_ref.get() else {
+                return AgentControlDerivedStatus::Unknown;
+            };
+            let agent = state.agents.with(|agents| {
+                agents
+                    .iter()
+                    .find(|agent| agent.host_id == parent.host_id && agent.agent_id == agent_id)
+                    .cloned()
+            });
+            match agent {
+                Some(agent) if agent.fatal_error.is_some() => {
+                    AgentControlDerivedStatus::Failed(agent.fatal_error.unwrap_or_default())
+                }
+                Some(agent) if !agent.started => AgentControlDerivedStatus::Starting,
+                Some(_) => {
+                    let typing = state
+                        .agent_turn_active
+                        .with(|map| map.get(&agent_id).copied().unwrap_or(false));
+                    let streaming = state.streaming_text.with(|map| map.contains_key(&agent_id));
+                    if typing || streaming {
+                        AgentControlDerivedStatus::Running
+                    } else {
+                        AgentControlDerivedStatus::Idle
+                    }
+                }
+                None if progress_kind == AgentControlProgressKind::Spawn => {
+                    AgentControlDerivedStatus::Starting
+                }
+                None => AgentControlDerivedStatus::Unknown,
+            }
+        }
+    });
+
+    let preview = Signal::derive({
+        let state = state.clone();
+        let agent_id = agent_id.clone();
+        move || {
+            let handles = state.streaming_text.with(|map| {
+                map.get(&agent_id)
+                    .map(|stream| (stream.text.clone(), stream.reasoning.clone()))
+            })?;
+            let text = handles.0.get();
+            let preview_source = if text.trim().is_empty() {
+                handles.1.get()
+            } else {
+                text
+            };
+            streaming_preview(&preview_source)
+        }
+    });
+
+    let open_state = state.clone();
+    let open_agent_id = agent_id.clone();
+    let on_open = move |_: web_sys::MouseEvent| {
+        let Some(parent) = parent_ref.get_untracked() else {
+            log::error!("Open agent clicked on an agent-control card with no resolved agent");
+            return;
+        };
+        open_state.open_tab(
+            TabContent::chat_with_agent(ActiveAgentRef {
+                host_id: parent.host_id,
+                agent_id: open_agent_id.clone(),
+            }),
+            display_name.get_untracked(),
+            true,
+        );
+    };
+
+    view! {
+        <div class="tool-live-agent-row">
+            <div class="tool-live-agent-main">
+                <span class="tool-live-agent-name">{move || display_name.get()}</span>
+                <span class=move || derived_status.get().class()>
+                    {move || derived_status.get().label()}
+                </span>
+            </div>
+            <button class="tool-live-link" on:click=on_open>"Open agent"</button>
+            {move || preview.get().map(|text| view! {
+                <div class="tool-live-agent-preview">{text}</div>
+            })}
+        </div>
+    }
+}
+
+fn streaming_preview(text: &str) -> Option<String> {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        None
+    } else {
+        Some(truncate_inline(&compact, 140))
+    }
+}
+
+fn truncate_inline(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}\u{2026}")
+    } else {
+        truncated
     }
 }
 
@@ -1011,11 +1286,12 @@ mod completion_summary_tests {
 mod live_card_wasm_tests {
     use super::*;
     use crate::components::tool_card::test_utils::*;
-    use crate::state::AppState;
+    use crate::state::{AgentInfo, AppState, StreamingState};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowAgentState,
-        WorkflowAgentStatus,
+        AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind, AgentId, AgentOrigin,
+        BackendKind, StreamPath, ToolExecutionCompletedData, ToolProgressData, ToolRequest,
+        WorkflowAgentState, WorkflowAgentStatus,
     };
     use serde_json::json;
     use wasm_bindgen_test::*;
@@ -1100,6 +1376,63 @@ mod live_card_wasm_tests {
                 completed,
             }),
         }
+    }
+
+    fn agent_control_progress_data(progress_kind: AgentControlProgressKind) -> ToolProgressData {
+        ToolProgressData {
+            tool_call_id: "toolu_agent_control".to_owned(),
+            tool_name: match progress_kind {
+                AgentControlProgressKind::Spawn => "tyde_spawn_agent",
+                AgentControlProgressKind::Await => "tyde_await_agents",
+            }
+            .to_owned(),
+            update: ToolProgressUpdate::AgentControl(AgentControlProgress {
+                progress_kind,
+                agents: vec![AgentControlAgentRef {
+                    agent_id: AgentId("agent-sub".to_owned()),
+                    name: Some("Worker".to_owned()),
+                }],
+            }),
+        }
+    }
+
+    fn agent_info(id: &str, name: &str, started: bool) -> AgentInfo {
+        AgentInfo {
+            host_id: "host-1".to_owned(),
+            agent_id: AgentId(id.to_owned()),
+            name: name.to_owned(),
+            origin: AgentOrigin::AgentControl,
+            backend_kind: BackendKind::Codex,
+            workspace_roots: vec!["/tmp/work".to_owned()],
+            project_id: None,
+            parent_agent_id: Some(chat_agent_ref().agent_id),
+            session_id: None,
+            custom_agent_id: None,
+            workflow: None,
+            created_at_ms: 1,
+            instance_stream: StreamPath(format!("/agents/{id}")),
+            started,
+            fatal_error: None,
+        }
+    }
+
+    fn streaming_state(text: &str) -> StreamingState {
+        StreamingState {
+            agent_name: "codex".to_owned(),
+            model: None,
+            text: ArcRwSignal::new(text.to_owned()),
+            reasoning: ArcRwSignal::new(String::new()),
+            tool_requests: ArcRwSignal::new(Vec::new()),
+        }
+    }
+
+    fn tool_header_status(container: &HtmlElement) -> String {
+        container
+            .query_selector(".tool-status-text")
+            .expect("query status")
+            .expect("status element")
+            .text_content()
+            .unwrap_or_default()
     }
 
     fn workflow_state(status: WorkflowRunStatus) -> WorkflowRunState {
@@ -1207,5 +1540,116 @@ mod live_card_wasm_tests {
             "finished line visible: {body}"
         );
         assert!(body.contains("Done"), "tool status is Done: {body}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn agent_control_spawn_card_tracks_live_agent_state() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_spawn_agent");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Spawn)),
+        );
+        let agent_id = AgentId("agent-sub".to_owned());
+        state.agents.update(|agents| {
+            agents.push(agent_info("agent-sub", "Worker Real", true));
+        });
+        state.agent_turn_active.update(|map| {
+            map.insert(agent_id.clone(), true);
+        });
+        state.streaming_text.update(|map| {
+            map.insert(
+                agent_id.clone(),
+                streaming_state("Implementing live tool cards"),
+            );
+        });
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("Running\u{2026}"),
+            "header stays live: {body}"
+        );
+        assert!(body.contains("Worker Real"), "AppState name wins: {body}");
+        assert!(body.contains("Running"), "agent status visible: {body}");
+        assert!(
+            body.contains("Implementing live tool cards"),
+            "streaming preview visible: {body}"
+        );
+        assert!(body.contains("Open agent"), "open-agent affordance: {body}");
+
+        state.agent_turn_active.update(|map| {
+            map.remove(&agent_id);
+        });
+        state.streaming_text.update(|map| {
+            map.remove(&agent_id);
+        });
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(body.contains("Idle"), "agent row goes idle: {body}");
+        assert!(
+            body.contains("Done"),
+            "card completes when child idle: {body}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn agent_control_spawn_card_treats_unknown_agent_as_starting() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_spawn_agent");
+        let (container, _state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Spawn)),
+        );
+        next_tick().await;
+
+        let body = text(&container);
+        assert_eq!(
+            tool_header_status(&container),
+            "Running\u{2026}",
+            "unknown spawned agent keeps header live"
+        );
+        assert!(
+            body.contains("Starting"),
+            "unknown spawned agent row starts optimistic: {body}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn agent_control_await_card_header_follows_tool_lifecycle() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+        );
+        let agent_id = AgentId("agent-sub".to_owned());
+        state.agents.update(|agents| {
+            agents.push(agent_info("agent-sub", "Awaited Worker", true));
+        });
+        state.agent_turn_active.update(|map| {
+            map.insert(agent_id.clone(), true);
+        });
+        state.streaming_text.update(|map| {
+            map.insert(agent_id, streaming_state("Still finishing follow-up work"));
+        });
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("Awaited Worker"),
+            "awaited agent row visible: {body}"
+        );
+        assert!(
+            body.contains("Still finishing follow-up work"),
+            "awaited agent preview remains live: {body}"
+        );
+        assert!(
+            body.contains("Running"),
+            "row status can still show running: {body}"
+        );
+        assert_eq!(
+            tool_header_status(&container),
+            "Done",
+            "completed await tool header should not stay running"
+        );
     }
 }

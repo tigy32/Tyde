@@ -303,7 +303,9 @@ pub fn WorkflowView(agent_ref: ActiveAgentRef, tool_call_id: ToolCallId) -> impl
             let signal = state.tool_progress.with(|map| map.get(&key).cloned())?;
             match signal.get().update {
                 ToolProgressUpdate::Workflow(run) => Some(run),
-                ToolProgressUpdate::SubAgent(_) | ToolProgressUpdate::Other { .. } => None,
+                ToolProgressUpdate::SubAgent(_)
+                | ToolProgressUpdate::AgentControl(_)
+                | ToolProgressUpdate::Other { .. } => None,
             }
         }
     });

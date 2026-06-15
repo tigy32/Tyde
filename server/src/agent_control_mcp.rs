@@ -16,10 +16,10 @@ use rmcp::{
     },
     model::{
         CallToolRequestParams, CallToolResult, Content, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerInfo,
+        ProgressNotificationParam, ProgressToken, ServerCapabilities, ServerInfo,
     },
     schemars,
-    service::RequestContext,
+    service::{Peer, RequestContext},
     tool, tool_router,
     transport::{
         StreamableHttpServerConfig,
@@ -30,7 +30,8 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::time::sleep;
+use tokio::time::{Instant, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::host::HostHandle;
@@ -38,7 +39,8 @@ use crate::team_registry::team_preset_catalog;
 
 pub const AGENT_CONTROL_AGENT_ID_HEADER: &str = "x-tyde-agent-id";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
-const AWAIT_TOOL_RESPONSE_GUARD: Duration = Duration::from_secs(90);
+const AWAIT_TOOL_PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
+const AGENT_CONTROL_SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
 const DEFAULT_READ_LIMIT: usize = 50;
 const MAX_READ_LIMIT: usize = 200;
 const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
@@ -196,6 +198,39 @@ struct AwaitAgentsResult {
     still_thinking: Vec<AwaitAgentStatus>,
 }
 
+#[derive(Clone)]
+struct AwaitProgressReporter {
+    peer: Peer<RoleServer>,
+    progress_token: ProgressToken,
+    interval: Duration,
+}
+
+impl AwaitProgressReporter {
+    fn from_context(context: &RequestContext<RoleServer>) -> Option<Self> {
+        context
+            .meta
+            .get_progress_token()
+            .map(|progress_token| Self {
+                peer: context.peer.clone(),
+                progress_token,
+                interval: AWAIT_TOOL_PROGRESS_INTERVAL,
+            })
+    }
+
+    async fn notify(&self, progress: f64, still_thinking_count: usize) {
+        let message = format!("Waiting for {still_thinking_count} Tyde agent(s)");
+        let _ = self
+            .peer
+            .notify_progress(ProgressNotificationParam {
+                progress_token: self.progress_token.clone(),
+                progress,
+                total: None,
+                message: Some(message),
+            })
+            .await;
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ReadAgentResult {
     agent_id: String,
@@ -329,12 +364,13 @@ impl TydeAgentControlMcpServer {
     async fn tyde_await_agents(
         &self,
         Parameters(input): Parameters<AwaitAgentsToolInput>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let agent_ids = match parse_agent_ids(input.agent_ids) {
             Ok(ids) => ids,
             Err(err) => return Ok(err_text(err)),
         };
-        match do_await_agents(&self.host, agent_ids).await {
+        match do_await_agents(&self.host, agent_ids, context).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
         }
@@ -565,7 +601,7 @@ pub fn start_server(
                     Default::default(),
                     StreamableHttpServerConfig {
                         stateful_mode: false,
-                        sse_keep_alive: None,
+                        sse_keep_alive: Some(AGENT_CONTROL_SSE_KEEP_ALIVE),
                         ..Default::default()
                     },
                 );
@@ -891,14 +927,19 @@ async fn do_list_agents(host: &HostHandle) -> Result<Vec<AgentOverview>, String>
 async fn do_await_agents(
     host: &HostHandle,
     agent_ids: Vec<AgentId>,
+    context: RequestContext<RoleServer>,
 ) -> Result<AwaitAgentsResult, String> {
-    do_await_agents_with_response_guard(host, agent_ids, AWAIT_TOOL_RESPONSE_GUARD).await
+    let cancellation_token = context.ct.clone();
+    let progress_reporter = AwaitProgressReporter::from_context(&context);
+    do_await_agents_with_progress(host, agent_ids, Some(cancellation_token), progress_reporter)
+        .await
 }
 
-async fn do_await_agents_with_response_guard(
+async fn do_await_agents_with_progress(
     host: &HostHandle,
     agent_ids: Vec<AgentId>,
-    response_guard: Duration,
+    cancellation_token: Option<CancellationToken>,
+    progress_reporter: Option<AwaitProgressReporter>,
 ) -> Result<AwaitAgentsResult, String> {
     if agent_ids.is_empty() {
         return Err("agent_ids must contain at least one agent_id".to_string());
@@ -911,13 +952,29 @@ async fn do_await_agents_with_response_guard(
     }
 
     let mut status_rx = host.subscribe_agent_status_changes().await;
-    let guard_sleep = sleep(response_guard);
-    tokio::pin!(guard_sleep);
+    let progress_interval = progress_reporter
+        .as_ref()
+        .map(|reporter| reporter.interval)
+        .unwrap_or(AWAIT_TOOL_PROGRESS_INTERVAL);
+    let mut progress_tick =
+        tokio::time::interval_at(Instant::now() + progress_interval, progress_interval);
+    progress_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut progress_count = 0.0;
+    let mut emitted_initial_progress = false;
 
     loop {
         let result = await_result_from_snapshot(host, &agent_ids).await?;
         if !result.ready.is_empty() || result.still_thinking.is_empty() {
             return Ok(result);
+        }
+        if let Some(progress_reporter) = progress_reporter.as_ref()
+            && !emitted_initial_progress
+        {
+            progress_count += 1.0;
+            progress_reporter
+                .notify(progress_count, result.still_thinking.len())
+                .await;
+            emitted_initial_progress = true;
         }
 
         tokio::select! {
@@ -926,7 +983,25 @@ async fn do_await_agents_with_response_guard(
                     return Err("agent status notification channel closed".to_string());
                 }
             }
-            _ = &mut guard_sleep => {
+            _ = progress_tick.tick(), if progress_reporter.is_some() => {
+                let result = await_result_from_snapshot(host, &agent_ids).await?;
+                if !result.ready.is_empty() || result.still_thinking.is_empty() {
+                    return Ok(result);
+                }
+                if let Some(progress_reporter) = progress_reporter.as_ref() {
+                    progress_count += 1.0;
+                    progress_reporter
+                        .notify(progress_count, result.still_thinking.len())
+                        .await;
+                }
+            }
+            _ = async {
+                if let Some(cancellation_token) = cancellation_token.as_ref() {
+                    cancellation_token.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
                 return await_result_from_snapshot(host, &agent_ids).await;
             }
         }
@@ -1160,6 +1235,7 @@ async fn healthz_handler() -> impl IntoResponse {
 mod tests {
     use super::*;
     use protocol::StreamPath;
+    use tokio::time::{sleep, timeout};
 
     #[test]
     fn rejects_non_loopback_bind_addr() {
@@ -1238,7 +1314,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn await_agents_returns_snapshot_before_tool_deadline() {
+    async fn await_agents_does_not_return_while_still_thinking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("mock host");
+        let spawned = do_spawn_agent(
+            &host,
+            SpawnAgentToolInput {
+                workspace_roots: vec!["/tmp/test".to_string()],
+                prompt: "__mock_hold_until_interrupt__ keep waiting".to_string(),
+                backend_kind: Some(BackendKindInput::Claude),
+                parent_agent_id: None,
+                project_id: None,
+                name: Some("held-agent".to_string()),
+                cost_hint: None,
+                access_mode: None,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .expect("spawn held agent");
+        let cancellation_token = CancellationToken::new();
+        let await_future = do_await_agents_with_progress(
+            &host,
+            vec![AgentId(spawned.agent_id)],
+            Some(cancellation_token.clone()),
+            None,
+        );
+        tokio::pin!(await_future);
+
+        assert!(
+            timeout(Duration::from_millis(50), &mut await_future)
+                .await
+                .is_err(),
+            "await should not return a still_thinking snapshot before an agent is ready"
+        );
+
+        cancellation_token.cancel();
+        let result = timeout(Duration::from_secs(1), &mut await_future)
+            .await
+            .expect("await should finish after cancellation")
+            .expect("await should return a cancellation snapshot");
+        assert!(result.ready.is_empty());
+        assert_eq!(result.still_thinking.len(), 1);
+        assert_eq!(
+            result.still_thinking[0].status,
+            AgentControlStatus::Thinking
+        );
+    }
+
+    #[tokio::test]
+    async fn await_agents_returns_snapshot_on_request_cancellation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let host = crate::host::spawn_host_with_mock_backend(
             dir.path().join("sessions.json"),
@@ -1254,7 +1385,7 @@ mod tests {
                 backend_kind: Some(BackendKindInput::Claude),
                 parent_agent_id: None,
                 project_id: None,
-                name: Some("slow-agent".to_string()),
+                name: Some("cancel-agent".to_string()),
                 cost_hint: None,
                 access_mode: None,
             }
@@ -1263,13 +1394,21 @@ mod tests {
         )
         .await
         .expect("spawn slow agent");
-        let result = do_await_agents_with_response_guard(
+        let cancellation_token = CancellationToken::new();
+        let cancel_task_token = cancellation_token.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(10)).await;
+            cancel_task_token.cancel();
+        });
+
+        let result = do_await_agents_with_progress(
             &host,
             vec![AgentId(spawned.agent_id)],
-            Duration::from_millis(10),
+            Some(cancellation_token),
+            None,
         )
         .await
-        .expect("await should return a status snapshot");
+        .expect("await should return a status snapshot on cancellation");
 
         assert!(result.ready.is_empty());
         assert_eq!(result.still_thinking.len(), 1);

@@ -6,11 +6,12 @@ pub mod validator;
 #[cfg(feature = "framing")]
 pub use framing::{FrameError, read_envelope, write_envelope};
 pub use types::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentControlStatus,
-    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload,
-    AgentStartPayload, AgentWorkflowMetadata, AskUserQuestion, AskUserQuestionOption,
-    BackendAccessMode, BackendKind, BackendSetupAction, BackendSetupCommand, BackendSetupInfo,
-    BackendSetupPayload, BackendSetupStatus, BackendTierConfig, BrokerUrl, BrowseBootstrapListing,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentControlAgentRef,
+    AgentControlProgress, AgentControlProgressKind, AgentControlStatus, AgentErrorCode,
+    AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
+    AgentWorkflowMetadata, AskUserQuestion, AskUserQuestionOption, BackendAccessMode, BackendKind,
+    BackendSetupAction, BackendSetupCommand, BackendSetupInfo, BackendSetupPayload,
+    BackendSetupStatus, BackendTierConfig, BrokerUrl, BrowseBootstrapListing,
     BrowseBootstrapPayload, CancelQueuedMessagePayload, CancelWorkflowPayload, ChatEvent,
     ChatMessage, ChatMessageId, ClientErrorCode, ClientErrorPayload, CloseAgentPayload,
     CommandErrorCode, CommandErrorPayload, ContextBreakdown, CustomAgent, CustomAgentDeletePayload,

@@ -19,6 +19,9 @@ use protocol::{
     WorkflowRunState, WorkflowRunStatus,
 };
 
+use crate::backend::agent_control_progress::{
+    await_progress_data_for_tool, spawn_progress_data_for_tool_result,
+};
 use crate::backend::turn_emitter::{
     AgentName, AssistantMessagePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
@@ -2044,6 +2047,11 @@ impl ClaudeInner {
         {
             self.emitter.task_update(&tasks);
         }
+        if let Some(progress) =
+            await_progress_data_for_tool(&tool_call.id, &tool_call.name, &tool_call.arguments)
+        {
+            self.emitter.tool_progress(&progress);
+        }
         self.emitter.tool_request(
             &tool_call.id,
             &tool_call.name,
@@ -2059,6 +2067,12 @@ impl ClaudeInner {
         tool_result: Value,
         error: Option<String>,
     ) {
+        if success
+            && let Some(progress) =
+                spawn_progress_data_for_tool_result(tool_call_id, tool_name, &tool_result)
+        {
+            self.emitter.tool_progress(&progress);
+        }
         self.emitter.tool_completed(ToolCompletedPayload {
             tool_call_id,
             tool_name,

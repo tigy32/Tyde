@@ -3610,6 +3610,7 @@ pub struct ToolProgressData {
 pub enum ToolProgressUpdate {
     SubAgent(SubAgentProgress),
     Workflow(WorkflowRunState),
+    AgentControl(AgentControlProgress),
     Other { payload: Value },
 }
 
@@ -3623,6 +3624,28 @@ pub struct SubAgentProgress {
     pub last_tool_name: Option<String>,
     pub tool_calls: u64,
     pub completed: bool,
+}
+
+/// Live Tyde agent-control MCP progress for tool cards that spawn or wait on
+/// first-class Tyde agents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlProgress {
+    pub progress_kind: AgentControlProgressKind,
+    pub agents: Vec<AgentControlAgentRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlProgressKind {
+    Spawn,
+    Await,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlAgentRef {
+    pub agent_id: AgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Full snapshot of a Claude Code workflow run, reduced server-side
@@ -3929,5 +3952,52 @@ mod search_serde_tests {
     fn project_search_cancel_round_trip() {
         let payload = ProjectSearchCancelPayload { search_id: 42 };
         assert_eq!(round_trip(&payload), payload);
+    }
+}
+
+#[cfg(test)]
+mod tool_progress_serde_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn agent_control_progress_round_trip() {
+        let payload = ToolProgressData {
+            tool_call_id: "toolu_await".to_owned(),
+            tool_name: "tyde_await_agents".to_owned(),
+            update: ToolProgressUpdate::AgentControl(AgentControlProgress {
+                progress_kind: AgentControlProgressKind::Await,
+                agents: vec![AgentControlAgentRef {
+                    agent_id: AgentId("agent-123".to_owned()),
+                    name: Some("Worker".to_owned()),
+                }],
+            }),
+        };
+
+        let encoded = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(
+            encoded,
+            json!({
+                "tool_call_id": "toolu_await",
+                "tool_name": "tyde_await_agents",
+                "update": {
+                    "kind": "agent_control",
+                    "progress_kind": "await",
+                    "agents": [{
+                        "agent_id": "agent-123",
+                        "name": "Worker"
+                    }]
+                }
+            })
+        );
+
+        let decoded: ToolProgressData = serde_json::from_value(encoded).expect("deserialize");
+        let ToolProgressUpdate::AgentControl(progress) = decoded.update else {
+            panic!("expected AgentControl progress");
+        };
+        assert_eq!(progress.progress_kind, AgentControlProgressKind::Await);
+        assert_eq!(progress.agents.len(), 1);
+        assert_eq!(progress.agents[0].agent_id, AgentId("agent-123".to_owned()));
+        assert_eq!(progress.agents[0].name.as_deref(), Some("Worker"));
     }
 }

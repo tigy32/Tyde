@@ -14,6 +14,10 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use protocol::BackendAccessMode;
 
+use crate::backend::agent_control_progress::{
+    await_progress_data_for_tool, is_tyde_agent_control_spawn_tool_name,
+    spawn_progress_data_for_tool_result,
+};
 use crate::backend::turn_emitter::{
     AgentName, MessageMetadataUpdatePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
@@ -2209,6 +2213,7 @@ impl CodexInner {
                         "args": item
                     }),
                 );
+                self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item);
                 self.spawn_codex_subagent_if_needed(item).await;
             }
             "mcpToolCall" | "dynamicToolCall" => {
@@ -2227,6 +2232,7 @@ impl CodexInner {
                         "args": item
                     }),
                 );
+                self.emit_agent_control_await_progress_if_needed(&item_id, &tool_name, item);
                 self.spawn_codex_subagent_if_needed(item).await;
             }
             _ => {}
@@ -2462,6 +2468,9 @@ impl CodexInner {
                     .unwrap_or(item_type);
                 let success = item.get("status").and_then(Value::as_str) == Some("completed")
                     || item.get("success").and_then(Value::as_bool) == Some(true);
+                if success {
+                    self.emit_agent_control_spawn_progress_if_needed(&item_id, tool_name, item);
+                }
                 self.emit_tool_execution_completed(
                     &item_id,
                     tool_name,
@@ -2498,6 +2507,9 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("collab_tool");
                 let success = codex_item_success(item);
+                if success {
+                    self.emit_agent_control_spawn_progress_if_needed(&item_id, tool_name, item);
+                }
                 self.emit_tool_execution_completed(
                     &item_id,
                     tool_name,
@@ -2835,6 +2847,30 @@ impl CodexInner {
             error: error.as_deref(),
         });
         self.mark_tool_completed(tool_call_id).await;
+    }
+
+    fn emit_agent_control_await_progress_if_needed(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+    ) {
+        if let Some(progress) = await_progress_data_for_tool(tool_call_id, tool_name, arguments) {
+            self.emitter.tool_progress(&progress);
+        }
+    }
+
+    fn emit_agent_control_spawn_progress_if_needed(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_result: &Value,
+    ) {
+        if let Some(progress) =
+            spawn_progress_data_for_tool_result(tool_call_id, tool_name, tool_result)
+        {
+            self.emitter.tool_progress(&progress);
+        }
     }
 
     fn emit_modify_file_request(
@@ -3187,7 +3223,7 @@ fn codex_tool_name_is_spawn(tool_name: &str) -> bool {
 /// `mcp__tyde-agent-control__tyde_spawn_agent`), since normalization strips the
 /// separators.
 fn codex_tool_name_is_tyde_agent_control_spawn(tool_name: &str) -> bool {
-    codex_normalize_tool_name(tool_name).contains("tydespawnagent")
+    is_tyde_agent_control_spawn_tool_name(tool_name)
 }
 
 fn codex_tool_name_is_wait(tool_name: &str) -> bool {

@@ -9131,6 +9131,76 @@ pre.tool-error-pre {
     margin-bottom: var(--space-2);
 }
 
+.tool-live-agent-control {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin-bottom: var(--space-2);
+}
+
+.tool-live-agent-control-title {
+    font-size: 0.769rem;
+    font-weight: 600;
+    color: var(--text-tertiary, var(--text-secondary));
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.tool-live-agent-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 2px var(--space-2);
+    align-items: center;
+    padding: var(--space-1) 0;
+}
+
+.tool-live-agent-main {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.tool-live-agent-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.846rem;
+    color: var(--text-primary);
+}
+
+.tool-live-agent-status {
+    flex-shrink: 0;
+    font-size: 0.769rem;
+}
+
+.tool-live-agent-status.running {
+    color: var(--accent-primary);
+}
+
+.tool-live-agent-status.idle {
+    color: var(--success);
+}
+
+.tool-live-agent-status.failed {
+    color: var(--error);
+}
+
+.tool-live-agent-status.unknown {
+    color: var(--text-tertiary, var(--text-secondary));
+}
+
+.tool-live-agent-preview {
+    grid-column: 1 / -1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.769rem;
+    color: var(--text-tertiary, var(--text-secondary));
+}
+
 .tool-live-title {
     font-size: 0.846rem;
     color: var(--text-secondary);

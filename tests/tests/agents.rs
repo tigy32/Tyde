@@ -11,8 +11,18 @@ use protocol::{
     ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SessionListPayload,
     SpawnAgentParams, SpawnAgentPayload, StreamPath, write_envelope,
 };
+use rmcp::{
+    ClientHandler, ServiceExt,
+    model::{
+        CallToolRequest, CallToolRequestParams, ClientRequest, Meta, NumberOrString,
+        ProgressNotificationParam, ProgressToken, RawContent, ServerResult,
+    },
+    service::{NotificationContext, PeerRequestOptions, RoleClient},
+    transport::StreamableHttpClientTransport,
+};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
+use std::future::{self, Future};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -384,6 +394,21 @@ async fn expect_project_notify(
 
 fn assert_awaited_agent_idle(result: &tyde_dev_driver::agent_control::AwaitAgentStatus) {
     assert_eq!(result.status, AgentControlStatus::Idle);
+}
+
+struct ProgressRecorder {
+    tx: tokio::sync::mpsc::UnboundedSender<ProgressNotificationParam>,
+}
+
+impl ClientHandler for ProgressRecorder {
+    fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        let _ = self.tx.send(params);
+        future::ready(())
+    }
 }
 
 async fn assert_read_agent_contains(
@@ -1398,6 +1423,124 @@ async fn agent_control_http_rejects_unknown_tool_arguments() {
         fixture.agent_ids().await.is_empty(),
         "unknown tool arguments must not fall back to the default backend and spawn an agent"
     );
+}
+
+#[tokio::test]
+async fn agent_control_http_await_emits_progress_notifications() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("await-progress".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/await-progress".to_owned()],
+                prompt: "__mock_hold_until_interrupt__ await progress".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn held agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "await progress NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse await progress NewAgent");
+
+    let base_url = fixture.agent_control_http_url().await;
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let transport = StreamableHttpClientTransport::from_uri(base_url);
+    let service = ProgressRecorder { tx: progress_tx }
+        .serve(transport)
+        .await
+        .expect("connect to agent-control MCP");
+    let progress_token = ProgressToken(NumberOrString::String("await-progress-test".into()));
+    let arguments = json!({
+        "agent_ids": [new_agent.agent_id.0.clone()]
+    })
+    .as_object()
+    .cloned();
+    let request = ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams {
+        meta: None,
+        name: "tyde_await_agents".into(),
+        arguments,
+        task: None,
+    }));
+    let handle = service
+        .send_request_with_option(
+            request,
+            PeerRequestOptions {
+                timeout: None,
+                meta: Some(Meta::with_progress_token(progress_token.clone())),
+            },
+        )
+        .await
+        .expect("send await request");
+    let response = handle.await_response();
+    tokio::pin!(response);
+
+    let progress = tokio::select! {
+        progress = progress_rx.recv() => {
+            progress.expect("progress channel should stay open")
+        }
+        result = &mut response => {
+            panic!("await request completed before progress notification: {result:?}");
+        }
+    };
+    assert_eq!(progress.progress_token, progress_token);
+    assert!(progress.progress >= 1.0);
+    assert!(
+        progress
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("Waiting for 1 Tyde agent")),
+        "unexpected progress message: {:?}",
+        progress.message
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut response)
+            .await
+            .is_err(),
+        "await request must not return while the agent is still thinking"
+    );
+
+    fixture
+        .client
+        .interrupt(&new_agent.instance_stream)
+        .await
+        .expect("interrupt held agent");
+
+    let server_result = tokio::time::timeout(Duration::from_secs(5), &mut response)
+        .await
+        .expect("await tool should finish after interrupt")
+        .expect("await tool response should succeed");
+    let ServerResult::CallToolResult(result) = server_result else {
+        panic!("expected CallToolResult, got {server_result:?}");
+    };
+    assert_eq!(result.is_error, Some(false));
+    let content = result
+        .content
+        .first()
+        .expect("await result should include content");
+    let RawContent::Text(text) = &content.raw else {
+        panic!("expected text await result, got {:?}", content.raw);
+    };
+    let body: Value = serde_json::from_str(&text.text).expect("parse await result JSON");
+    assert_eq!(
+        body.get("ready")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default(),
+        1
+    );
+
+    service.cancel().await.expect("cancel MCP client");
 }
 
 #[tokio::test]
