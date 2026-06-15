@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::*;
 pub use mobile_shell_types::{
@@ -421,6 +421,10 @@ pub struct AppState {
     // Agents & Chat
     pub agents: RwSignal<Vec<AgentInfo>>,
     pub active_agent: RwSignal<Option<ActiveAgentRef>>,
+    /// Agents whose `AgentBootstrap` has been requested or received on this
+    /// frontend connection. Mobile asks for bootstraps lazily when a chat is
+    /// opened instead of replaying every transcript on startup.
+    pub agent_load_requests: RwSignal<HashSet<AgentRef>>,
     pub chat_messages: RwSignal<HashMap<AgentRef, Vec<ChatMessageEntry>>>,
     /// Per-agent index from server-issued `ChatMessageId` to the position
     /// in `chat_messages[agent]` that carries it. Populated when a row is
@@ -510,6 +514,7 @@ impl AppState {
 
             agents: RwSignal::new(Vec::new()),
             active_agent: RwSignal::new(None),
+            agent_load_requests: RwSignal::new(HashSet::new()),
             chat_messages: RwSignal::new(HashMap::new()),
             chat_message_index: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
@@ -729,6 +734,9 @@ impl AppState {
             .update(|projects| projects.retain(|p| p.local_host_id != *host));
         self.agents
             .update(|agents| agents.retain(|a| a.local_host_id != *host));
+        self.agent_load_requests.update(|m| {
+            m.retain(|k| k.local_host_id != *host);
+        });
         self.sessions
             .update(|sessions| sessions.retain(|s| s.local_host_id != *host));
 

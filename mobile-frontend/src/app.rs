@@ -638,6 +638,9 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
     state
         .agents
         .update(|agents| agents.retain(|a| a.local_host_id != *host));
+    state.agent_load_requests.update(|m| {
+        m.retain(|k| k.local_host_id != *host);
+    });
     state
         .sessions
         .update(|sessions| sessions.retain(|s| s.local_host_id != *host));

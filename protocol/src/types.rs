@@ -479,6 +479,7 @@ pub enum FrameKind {
     // Input events (client -> server)
     SetSetting,
     SpawnAgent,
+    LoadAgent,
     ListSessions,
     DeleteSession,
     SendMessage,
@@ -616,6 +617,7 @@ impl fmt::Display for FrameKind {
             Self::Reject => f.write_str("reject"),
             Self::SetSetting => f.write_str("set_setting"),
             Self::SpawnAgent => f.write_str("spawn_agent"),
+            Self::LoadAgent => f.write_str("load_agent"),
             Self::ListSessions => f.write_str("list_sessions"),
             Self::DeleteSession => f.write_str("delete_session"),
             Self::SendMessage => f.write_str("send_message"),
@@ -1476,6 +1478,9 @@ pub struct InterruptPayload {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CloseAgentPayload {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LoadAgentPayload {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListSessionsPayload {}

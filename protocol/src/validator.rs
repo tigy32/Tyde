@@ -13,23 +13,23 @@ use crate::{
     CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind, HostBootstrapPayload,
     HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
     HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
-    ListSessionsPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
-    MobileAccessStatePayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
-    MobilePairingCancelPayload, MobilePairingOfferPayload, MobilePairingStartPayload,
-    NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectNotifyPayload,
-    ProjectRenamePayload, ProjectReorderPayload, ProjectSearchCompletePayload,
-    ProjectSearchResultsPayload, ReviewEventPayload, RunBackendSetupPayload, SessionListPayload,
-    SessionSchemasPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
-    StreamPath, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
-    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
-    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
-    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload, McpServerNotifyPayload,
+    McpServerUpsertPayload, MobileAccessStatePayload, MobileDeviceRenamePayload,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferPayload,
+    MobilePairingStartPayload, NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectSearchCompletePayload, ProjectSearchResultsPayload, ReviewEventPayload,
+    RunBackendSetupPayload, SessionListPayload, SessionSchemasPayload, SetSettingPayload,
+    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringNotifyPayload, SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
+    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
+    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
+    TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload,
+    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload, WelcomePayload,
     WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
@@ -504,6 +504,16 @@ impl ProtocolValidator {
         };
 
         match envelope.kind {
+            FrameKind::LoadAgent => {
+                let _: LoadAgentPayload = envelope.parse_payload().map_err(|error| {
+                    build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!("failed to parse LoadAgent payload: {error}"),
+                    )
+                })?;
+            }
             FrameKind::AgentBootstrap => {
                 if state.saw_bootstrap {
                     return Err(build_violation(

@@ -7,25 +7,25 @@ use protocol::{
     CancelWorkflowPayload, ClientErrorCode, ClientErrorPayload, CustomAgentDeletePayload,
     CustomAgentUpsertPayload, DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FrameKind,
     HostBrowseClosePayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
-    InterruptPayload, ListSessionsPayload, McpServerDeletePayload, McpServerUpsertPayload,
-    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
-    MobilePairingStartPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
-    ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload,
-    ProjectSearchPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
-    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewId,
-    ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
-    SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
-    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringUpsertPayload, StreamPath, TeamCompactPayload, TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
-    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
-    TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload,
-    TerminalClosePayload, TerminalCreatePayload, TerminalId, TerminalResizePayload,
-    TerminalSendPayload, TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
-    WorkflowRefreshPayload,
+    InterruptPayload, ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload,
+    McpServerUpsertPayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
+    MobilePairingCancelPayload, MobilePairingStartPayload, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload,
+    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
+    ReviewActionPayload, ReviewCreatePayload, ReviewId, ReviewSubscribePayload,
+    RunBackendSetupPayload, SendMessagePayload, SendQueuedMessageNowPayload, SetAgentNamePayload,
+    SetSessionSettingsPayload, SetSettingPayload, SkillRefreshPayload, SpawnAgentParams,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringUpsertPayload, StreamPath,
+    TeamCompactPayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
+    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
+    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberShufflePayload,
+    TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload, TerminalClosePayload,
+    TerminalCreatePayload, TerminalId, TerminalResizePayload, TerminalSendPayload,
+    TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowRefreshPayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -403,6 +403,18 @@ pub(crate) async fn route_client_envelope(
 
     if envelope.stream.0.starts_with("/agent/") {
         match envelope.kind {
+            FrameKind::LoadAgent => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path)?;
+                let _: LoadAgentPayload = parse_payload(&envelope, "load_agent")?;
+                host.load_agent_stream(
+                    connection_host_stream,
+                    host_output_stream,
+                    agent_id,
+                    stream_path,
+                )
+                .await?;
+            }
             FrameKind::SendMessage => {
                 let stream_path = envelope.stream.clone();
                 let agent_id = parse_agent_id(&stream_path)?;

@@ -361,6 +361,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 let agent_id = payload.agent_id.clone();
                 let instance_stream = payload.instance_stream.clone();
                 let origin = payload.origin;
+                let started = payload.session_id.is_some();
                 log::info!(
                     "mobile_apply_new_agent host={} agent_id={} instance_stream={} origin={:?}",
                     host,
@@ -381,7 +382,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     custom_agent_id: payload.custom_agent_id,
                     created_at_ms: payload.created_at_ms,
                     instance_stream: payload.instance_stream,
-                    started: false,
+                    started,
                     fatal_error: None,
                 };
                 state.agents.update(|agents| {
@@ -924,6 +925,9 @@ fn has_compaction_in_progress_for_host(state: &AppState, host: &LocalHostId) -> 
 }
 
 fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
+    state.agent_load_requests.update(|m| {
+        m.remove(agent_ref);
+    });
     state.chat_messages.update(|m| {
         m.remove(agent_ref);
     });
@@ -1491,6 +1495,9 @@ fn apply_host_bootstrap(state: &AppState, host: &LocalHostId, payload: HostBoots
         }));
         sort_project_infos(projects);
     });
+    state.agent_load_requests.update(|loads| {
+        loads.retain(|agent_ref| agent_ref.local_host_id != *host);
+    });
     state.mcp_servers_by_host.update(|outer| {
         let inner = outer.entry(host.clone()).or_default();
         inner.clear();
@@ -1561,14 +1568,11 @@ fn apply_host_bootstrap(state: &AppState, host: &LocalHostId, payload: HostBoots
                 .iter_mut()
                 .find(|a| a.local_host_id == *host && a.agent_id == info.agent_id)
             {
-                // `agent_info_from_payload` zeroes runtime-only fields
-                // (`started`, `fatal_error`) because `NewAgentPayload`
-                // doesn't carry them. It may also omit `session_id`
-                // before backend startup completes. Preserve whatever the live event
-                // stream had set on the existing entry so a bootstrap
-                // re-application doesn't reset an already-started agent
-                // to `started: false`.
-                info.started = existing.started;
+                // `NewAgentPayload` may omit `session_id` before backend
+                // startup completes. Preserve a more complete live event
+                // stream view so a bootstrap re-application doesn't reset
+                // an already-started agent to `started: false`.
+                info.started = info.started || existing.started;
                 info.fatal_error = existing.fatal_error.clone();
                 if info.session_id.is_none() {
                     info.session_id = existing.session_id.clone();
@@ -1582,6 +1586,7 @@ fn apply_host_bootstrap(state: &AppState, host: &LocalHostId, payload: HostBoots
 }
 
 fn agent_info_from_payload(host: &LocalHostId, payload: NewAgentPayload) -> AgentInfo {
+    let started = payload.session_id.is_some();
     AgentInfo {
         local_host_id: host.clone(),
         agent_id: payload.agent_id,
@@ -1595,7 +1600,7 @@ fn agent_info_from_payload(host: &LocalHostId, payload: NewAgentPayload) -> Agen
         custom_agent_id: payload.custom_agent_id,
         created_at_ms: payload.created_at_ms,
         instance_stream: payload.instance_stream,
-        started: false,
+        started,
         fatal_error: None,
     }
 }
@@ -1617,6 +1622,9 @@ fn apply_agent_bootstrap(
         agent_ref.agent_id,
         payload.events.len()
     );
+    state.agent_load_requests.update(|m| {
+        m.insert(agent_ref.clone());
+    });
     // Replace prior per-agent chat/stream/queue/task state so the bootstrap
     // snapshot is authoritative.
     state.chat_messages.update(|m| {

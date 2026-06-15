@@ -188,6 +188,17 @@ fn host_stream(state: &AppState, host: &LocalHostId) -> Result<protocol::StreamP
         .ok_or("no host stream".to_owned())
 }
 
+pub async fn load_agent(state: &AppState, agent_ref: &AgentRef) -> Result<(), String> {
+    let stream = agent_instance_stream(state, agent_ref).ok_or("agent not found")?;
+    send_frame(
+        &agent_ref.local_host_id,
+        stream,
+        protocol::FrameKind::LoadAgent,
+        &protocol::LoadAgentPayload {},
+    )
+    .await
+}
+
 pub fn project_stream(project_id: &protocol::ProjectId) -> protocol::StreamPath {
     protocol::StreamPath(format!("/project/{}", project_id.0))
 }

@@ -118,7 +118,16 @@ use crate::workflows::store::WorkflowRunStore;
 
 struct HostSubscriber {
     stream: Stream,
+    agent_replay: AgentReplayMode,
+    known_agent_streams: HashSet<StreamPath>,
+    attached_agent_streams: HashSet<StreamPath>,
     last_session_schemas: Option<Vec<SessionSchemaEntry>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentReplayMode {
+    Eager,
+    Lazy,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -405,6 +414,7 @@ impl HostHandle {
     pub(crate) async fn register_host_stream(
         &self,
         host_stream: Stream,
+        agent_replay: AgentReplayMode,
     ) -> Vec<(AgentHandle, Stream)> {
         let backend_setup = setup::collect_backend_setup().await;
         let mut state = self.state.lock().await;
@@ -414,6 +424,9 @@ impl HostHandle {
             host_path.clone(),
             HostSubscriber {
                 stream: host_stream,
+                agent_replay,
+                known_agent_streams: HashSet::new(),
+                attached_agent_streams: HashSet::new(),
                 last_session_schemas: None,
             },
         );
@@ -615,7 +628,7 @@ impl HostHandle {
                 )
             });
             let start = agent_handle.snapshot();
-            let Some(subscriber) = state.host_streams.get(&host_path) else {
+            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
                 panic!(
                     "host stream {} disappeared during registration bootstrap build",
                     host_path
@@ -638,9 +651,20 @@ impl HostHandle {
                 created_at_ms: start.created_at_ms,
                 instance_stream: instance_stream.clone(),
             };
-            let agent_stream = subscriber.stream.with_path(instance_stream);
+            subscriber
+                .known_agent_streams
+                .insert(instance_stream.clone());
+            let attach_eagerly = matches!(subscriber.agent_replay, AgentReplayMode::Eager);
+            let agent_stream = subscriber.stream.with_path(instance_stream.clone());
+            if attach_eagerly {
+                subscriber
+                    .attached_agent_streams
+                    .insert(instance_stream.clone());
+            }
             agents.push(new_agent);
-            deferred_attachments.push((agent_handle, agent_stream));
+            if attach_eagerly {
+                deferred_attachments.push((agent_handle, agent_stream));
+            }
         }
 
         let bootstrap = HostBootstrapPayload {
@@ -2458,8 +2482,25 @@ impl HostHandle {
             );
             let host_streams = state
                 .host_streams
-                .iter()
-                .map(|(path, subscriber)| (path.clone(), subscriber.stream.clone()))
+                .iter_mut()
+                .map(|(path, subscriber)| {
+                    let instance_stream = new_instance_stream(&spawned.start.agent_id);
+                    subscriber
+                        .known_agent_streams
+                        .insert(instance_stream.clone());
+                    let attach_eagerly = matches!(subscriber.agent_replay, AgentReplayMode::Eager);
+                    if attach_eagerly {
+                        subscriber
+                            .attached_agent_streams
+                            .insert(instance_stream.clone());
+                    }
+                    (
+                        path.clone(),
+                        subscriber.stream.clone(),
+                        attach_eagerly,
+                        instance_stream,
+                    )
+                })
                 .collect::<Vec<_>>();
             (
                 spawned.start,
@@ -2470,10 +2511,16 @@ impl HostHandle {
         };
 
         let mut dead_paths = Vec::new();
-        for (path, stream) in host_streams {
-            if emit_new_agent_for_stream(&start, &agent_handle, &stream)
-                .await
-                .is_err()
+        for (path, stream, attach_eagerly, instance_stream) in host_streams {
+            if emit_new_agent_for_stream(
+                &start,
+                &agent_handle,
+                &stream,
+                instance_stream,
+                attach_eagerly,
+            )
+            .await
+            .is_err()
             {
                 dead_paths.push(path);
             }
@@ -2582,8 +2629,25 @@ impl HostHandle {
                     .spawn(request, session_store, sub_agent_spawn_tx, review_registry);
             let host_streams = state
                 .host_streams
-                .iter()
-                .map(|(path, subscriber)| (path.clone(), subscriber.stream.clone()))
+                .iter_mut()
+                .map(|(path, subscriber)| {
+                    let instance_stream = new_instance_stream(&spawned.start.agent_id);
+                    subscriber
+                        .known_agent_streams
+                        .insert(instance_stream.clone());
+                    let attach_eagerly = matches!(subscriber.agent_replay, AgentReplayMode::Eager);
+                    if attach_eagerly {
+                        subscriber
+                            .attached_agent_streams
+                            .insert(instance_stream.clone());
+                    }
+                    (
+                        path.clone(),
+                        subscriber.stream.clone(),
+                        attach_eagerly,
+                        instance_stream,
+                    )
+                })
                 .collect::<Vec<_>>();
             (
                 spawned.start,
@@ -2594,10 +2658,16 @@ impl HostHandle {
         };
 
         let mut dead_paths = Vec::new();
-        for (path, stream) in host_streams {
-            if emit_new_agent_for_stream(&start, &agent_handle, &stream)
-                .await
-                .is_err()
+        for (path, stream, attach_eagerly, instance_stream) in host_streams {
+            if emit_new_agent_for_stream(
+                &start,
+                &agent_handle,
+                &stream,
+                instance_stream,
+                attach_eagerly,
+            )
+            .await
+            .is_err()
             {
                 dead_paths.push(path);
             }
@@ -4566,6 +4636,62 @@ impl HostHandle {
         self.state.lock().await.registry.agent_handle(agent_id)
     }
 
+    pub(crate) async fn load_agent_stream(
+        &self,
+        connection_host_stream: &StreamPath,
+        host_output_stream: &Stream,
+        agent_id: AgentId,
+        agent_stream: StreamPath,
+    ) -> AppResult<()> {
+        let (agent_handle, stream) = {
+            let mut state = self.state.lock().await;
+            let agent_handle = state.registry.agent_handle(&agent_id).ok_or_else(|| {
+                AppError::not_found("load_agent", format!("agent {} is not running", agent_id))
+            })?;
+            let subscriber = state
+                .host_streams
+                .get_mut(connection_host_stream)
+                .ok_or_else(|| {
+                    AppError::not_found(
+                        "load_agent",
+                        format!("host stream {} is not registered", connection_host_stream),
+                    )
+                })?;
+            if !subscriber.known_agent_streams.contains(&agent_stream) {
+                return Err(AppError::not_found(
+                    "load_agent",
+                    format!(
+                        "agent stream {} was not advertised on host stream {}",
+                        agent_stream, connection_host_stream
+                    ),
+                ));
+            }
+            if subscriber.attached_agent_streams.contains(&agent_stream) {
+                return Ok(());
+            }
+            subscriber
+                .attached_agent_streams
+                .insert(agent_stream.clone());
+            (
+                agent_handle,
+                host_output_stream.with_path(agent_stream.clone()),
+            )
+        };
+
+        if agent_handle.attach(stream).await {
+            Ok(())
+        } else {
+            let mut state = self.state.lock().await;
+            if let Some(subscriber) = state.host_streams.get_mut(connection_host_stream) {
+                subscriber.attached_agent_streams.remove(&agent_stream);
+            }
+            Err(AppError::not_found(
+                "load_agent",
+                format!("agent {} is not running", agent_id),
+            ))
+        }
+    }
+
     pub(crate) async fn interrupt_agent(&self, agent_id: &AgentId) -> InterruptOutcome {
         let agent_handle = {
             let state = self.state.lock().await;
@@ -5460,8 +5586,25 @@ impl HostHandle {
                 .insert(spawned.start.agent_id.clone(), session_id.clone());
             let host_streams = state
                 .host_streams
-                .iter()
-                .map(|(path, subscriber)| (path.clone(), subscriber.stream.clone()))
+                .iter_mut()
+                .map(|(path, subscriber)| {
+                    let instance_stream = new_instance_stream(&spawned.start.agent_id);
+                    subscriber
+                        .known_agent_streams
+                        .insert(instance_stream.clone());
+                    let attach_eagerly = matches!(subscriber.agent_replay, AgentReplayMode::Eager);
+                    if attach_eagerly {
+                        subscriber
+                            .attached_agent_streams
+                            .insert(instance_stream.clone());
+                    }
+                    (
+                        path.clone(),
+                        subscriber.stream.clone(),
+                        attach_eagerly,
+                        instance_stream,
+                    )
+                })
                 .collect::<Vec<_>>();
             (spawned.start, spawned.handle, host_streams)
         };
@@ -5492,10 +5635,16 @@ impl HostHandle {
             });
 
         let mut dead_paths = Vec::new();
-        for (path, stream) in host_streams {
-            if emit_new_agent_for_stream(&start, &agent_handle, &stream)
-                .await
-                .is_err()
+        for (path, stream, attach_eagerly, instance_stream) in host_streams {
+            if emit_new_agent_for_stream(
+                &start,
+                &agent_handle,
+                &stream,
+                instance_stream,
+                attach_eagerly,
+            )
+            .await
+            .is_err()
             {
                 dead_paths.push(path);
             }
@@ -8160,9 +8309,9 @@ async fn emit_new_agent_for_stream(
     start: &AgentStartPayload,
     agent_handle: &AgentHandle,
     stream: &Stream,
+    instance_stream: StreamPath,
+    attach_eagerly: bool,
 ) -> Result<(), StreamClosed> {
-    let instance_stream = new_instance_stream(&start.agent_id);
-
     let new_agent = NewAgentPayload {
         agent_id: start.agent_id.clone(),
         name: start.name.clone(),
@@ -8185,12 +8334,14 @@ async fn emit_new_agent_for_stream(
     stream.send_value(FrameKind::NewAgent, payload)?;
 
     let agent_stream = stream.with_path(instance_stream);
-    let attached = agent_handle.attach(agent_stream).await;
-    assert!(
-        attached,
-        "failed to attach newly spawned agent stream {}; registry is inconsistent",
-        start.agent_id
-    );
+    if attach_eagerly {
+        let attached = agent_handle.attach(agent_stream).await;
+        assert!(
+            attached,
+            "failed to attach newly spawned agent stream {}; registry is inconsistent",
+            start.agent_id
+        );
+    }
 
     Ok(())
 }
@@ -9834,6 +9985,70 @@ mod tests {
         (agent_id, session_id)
     }
 
+    #[tokio::test]
+    async fn lazy_host_registration_defers_agent_bootstrap_until_load() {
+        let fixture = compact_fixture().await;
+        let (agent_id, _) =
+            spawn_idle_user_agent(&fixture.host, "remember lazy mobile startup").await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/lazy-agents-{}", Uuid::new_v4()));
+        let host_stream = Stream::new(host_path.clone(), tx);
+
+        assert!(
+            fixture
+                .host
+                .register_host_stream(host_stream.clone(), AgentReplayMode::Lazy)
+                .await
+                .is_empty()
+        );
+
+        let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("lazy registration should emit HostBootstrap")
+            .expect("output envelope");
+        assert_eq!(envelope.kind, FrameKind::HostBootstrap);
+        let bootstrap: HostBootstrapPayload = envelope.parse_payload().expect("host bootstrap");
+        let agent_stream = bootstrap
+            .agents
+            .iter()
+            .find_map(|agent| (agent.agent_id == agent_id).then_some(agent.instance_stream.clone()))
+            .expect("existing agent advertised in HostBootstrap");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "lazy registration must not replay agent transcripts until requested"
+        );
+
+        let load = protocol::Envelope::from_payload(
+            agent_stream.clone(),
+            FrameKind::LoadAgent,
+            0,
+            &protocol::LoadAgentPayload {},
+        )
+        .expect("load agent envelope");
+        crate::router::route_client_envelope(&fixture.host, &host_path, &host_stream, load)
+            .await
+            .expect("route load_agent");
+
+        let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("load_agent should emit AgentBootstrap")
+            .expect("output envelope");
+        assert_eq!(envelope.stream, agent_stream);
+        assert_eq!(envelope.kind, FrameKind::AgentBootstrap);
+        let bootstrap: protocol::AgentBootstrapPayload =
+            envelope.parse_payload().expect("agent bootstrap");
+        assert!(
+            bootstrap
+                .events
+                .iter()
+                .any(|event| matches!(event, protocol::AgentBootstrapEvent::AgentStart(_))),
+            "loaded agent bootstrap should include its AgentStart snapshot"
+        );
+    }
+
     async fn wait_for_agent_idle(host: &HostHandle, agent_id: &AgentId) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -10010,7 +10225,7 @@ mod tests {
         assert!(
             fixture
                 .host
-                .register_host_stream(host_stream.clone())
+                .register_host_stream(host_stream.clone(), AgentReplayMode::Eager)
                 .await
                 .is_empty()
         );
@@ -10168,7 +10383,7 @@ mod tests {
         assert!(
             fixture
                 .host
-                .register_host_stream(host_stream)
+                .register_host_stream(host_stream, AgentReplayMode::Eager)
                 .await
                 .is_empty()
         );

@@ -6,9 +6,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::components::chat_input::ChatInput;
 use crate::components::chat_message::ChatMessageView;
-use crate::components::ui::{
-    Button, ButtonSize, ButtonVariant, EmptyState, Pill, PillTone, Spinner,
-};
+use crate::components::ui::{Button, ButtonSize, ButtonVariant, EmptyState, Spinner};
 use crate::state::{AgentRef, AppState};
 
 const CHAT_STICKY_BOTTOM_THRESHOLD_PX: i32 = 80;
@@ -16,12 +14,14 @@ const CHAT_STICKY_BOTTOM_THRESHOLD_PX: i32 = 80;
 /// Conversation surface.
 ///
 /// Composition rules:
-/// - The header surfaces the agent name plus the current backend as a
-///   `Pill`, and exposes Stop while a turn is active. The back button
-///   is small but always has an accessible label.
-/// - The transcript shows task list → messages → queued messages →
-///   streaming → transient events, in that order, because that is the
+/// - The header surfaces the agent name plus the current backend in the
+///   subtitle, and exposes Stop while a turn is active. The back button is
+///   small but always has an accessible label.
+/// - The transcript shows task list → messages → streaming →
+///   transient events, in that order, because that is the
 ///   order users perceive them happening.
+/// - Queued messages live in the composer controls, not in the
+///   transcript, so pending sends do not appear twice.
 /// - Every test-relevant element exposes `data-mobile-test` so wasm
 ///   tests can locate it without depending on CSS class names.
 #[component]
@@ -230,12 +230,51 @@ pub fn ChatView() -> impl IntoView {
             .active_agent
             .get()
             .map(|ar| ar.as_agent_ref());
+        let active_agent_stream = active_agent.as_ref().and_then(|key| {
+            state_for_auto.agents.with(|agents| {
+                agents
+                    .iter()
+                    .find(|agent| {
+                        agent.local_host_id == key.local_host_id && agent.agent_id == key.agent_id
+                    })
+                    .map(|agent| agent.instance_stream.clone())
+            })
+        });
         if *last_active_for_auto.borrow() != active_agent {
             *last_active_for_auto.borrow_mut() = active_agent.clone();
             user_scrolled_up.set(false);
         }
 
         if let Some(key) = active_agent.as_ref() {
+            if active_agent_stream.is_some()
+                && state_for_auto
+                    .host_stream_untracked(&key.local_host_id)
+                    .is_some()
+                && !state_for_auto
+                    .agent_load_requests
+                    .with_untracked(|loads| loads.contains(key))
+            {
+                state_for_auto.agent_load_requests.update(|loads| {
+                    loads.insert(key.clone());
+                });
+                let state_for_load = state_for_auto.clone();
+                let key_for_load = key.clone();
+                spawn_local(async move {
+                    if let Err(error) =
+                        crate::actions::load_agent(&state_for_load, &key_for_load).await
+                    {
+                        log::error!(
+                            "load_agent failed host={} agent_id={}: {}",
+                            key_for_load.local_host_id,
+                            key_for_load.agent_id,
+                            error
+                        );
+                        state_for_load.agent_load_requests.update(|loads| {
+                            loads.remove(&key_for_load);
+                        });
+                    }
+                });
+            }
             track_active_chat_content(&state_for_auto, key);
         }
 
@@ -425,13 +464,11 @@ pub fn ChatView() -> impl IntoView {
                     let streaming = s_body.streaming_text.with(|m| m.get(&key).cloned());
                     let task_list = s_body.task_lists.with(|m| m.get(&key).cloned());
                     let transient = s_body.transient_events.with(|m| m.get(&key).cloned().unwrap_or_default());
-                    let queued = s_body.agent_message_queue.with(|m| m.get(&key).cloned().unwrap_or_default());
 
                     let no_content = messages.is_empty()
                         && streaming.is_none()
                         && task_list.is_none()
-                        && transient.is_empty()
-                        && queued.is_empty();
+                        && transient.is_empty();
 
                     if no_content {
                         return view! {
@@ -472,94 +509,6 @@ pub fn ChatView() -> impl IntoView {
                             {messages.into_iter().map(|entry| {
                                 view! { <ChatMessageView entry=entry /> }
                             }).collect::<Vec<_>>()}
-
-                            // Queued messages: messages the user typed while a
-                            // turn was already running. They haven't been sent
-                            // yet — surface them visually distinct from sent
-                            // messages so the user knows what's still pending.
-                            {if queued.is_empty() {
-                                view! { <div></div> }.into_any()
-                            } else {
-                                let count = queued.len();
-                                let key_for_rows = key.clone();
-                                view! {
-                                    <div class="queued-messages" data-mobile-test="chat-queued">
-                                        <div class="queued-messages-header">
-                                            <Pill
-                                                label=format!("{count} queued")
-                                                tone=PillTone::Accent
-                                                data_mobile_test="chat-queued-pill"
-                                            />
-                                        </div>
-                                        {queued.into_iter().map(|q| {
-                                            let row_text = if q.message.trim().is_empty() {
-                                                match q.images.len() {
-                                                    0 => "Queued message".to_owned(),
-                                                    1 => "Image attachment".to_owned(),
-                                                    count => format!("{count} image attachments"),
-                                                }
-                                            } else if q.images.is_empty() {
-                                                q.message
-                                            } else {
-                                                let suffix = if q.images.len() == 1 { "image" } else { "images" };
-                                                format!("{} (+{} {suffix})", q.message, q.images.len())
-                                            };
-                                            let send_now_id = q.id.clone();
-                                            let agent_ref_for_send_now = key_for_rows.clone();
-                                            let state_for_send_now = s_body.clone();
-                                            let on_send_now = Callback::new(move |_: ()| {
-                                                let aref = agent_ref_for_send_now.clone();
-                                                let qid = send_now_id.clone();
-                                                let state = state_for_send_now.clone();
-                                                spawn_local(async move {
-                                                    if let Err(e) = crate::actions::send_queued_message_now(
-                                                        &state, &aref, qid,
-                                                    ).await {
-                                                        log::error!("send_queued_message_now failed: {e}");
-                                                    }
-                                                });
-                                            });
-                                            let q_id = q.id.clone();
-                                            let agent_ref_for_cancel = key_for_rows.clone();
-                                            let state_for_cancel = s_body.clone();
-                                            let on_cancel = Callback::new(move |_: ()| {
-                                                let aref = agent_ref_for_cancel.clone();
-                                                let qid = q_id.clone();
-                                                let state = state_for_cancel.clone();
-                                                spawn_local(async move {
-                                                    if let Err(e) = crate::actions::cancel_queued_message(
-                                                        &state, &aref, qid,
-                                                    ).await {
-                                                        log::error!("cancel_queued_message failed: {e}");
-                                                    }
-                                                });
-                                            });
-                                            view! {
-                                                <div class="queued-message" data-mobile-test="chat-queued-row">
-                                                    <span class="queued-icon" aria-hidden="true">"\u{23F1}"</span>
-                                                    <span class="queued-text">{row_text}</span>
-                                                    <Button
-                                                        label="Send Now"
-                                                        variant=ButtonVariant::Primary
-                                                        size=ButtonSize::Compact
-                                                        data_mobile_test="chat-queued-send-now"
-                                                        aria_label="Send queued message now".to_string()
-                                                        on_click=on_send_now
-                                                    />
-                                                    <Button
-                                                        label="Delete"
-                                                        variant=ButtonVariant::Ghost
-                                                        size=ButtonSize::Compact
-                                                        data_mobile_test="chat-queued-cancel"
-                                                        aria_label="Delete queued message".to_string()
-                                                        on_click=on_cancel
-                                                    />
-                                                </div>
-                                            }
-                                        }).collect::<Vec<_>>()}
-                                    </div>
-                                }.into_any()
-                            }}
 
                             // Streaming message
                             {streaming.map(|s| {
@@ -658,9 +607,6 @@ fn track_active_chat_content(state: &AppState, key: &AgentRef) {
         let _ = m.contains_key(key);
     });
     state.transient_events.with(|m| {
-        let _ = m.get(key).map_or(0, Vec::len);
-    });
-    state.agent_message_queue.with(|m| {
         let _ = m.get(key).map_or(0, Vec::len);
     });
     if let Some(streaming) = state.streaming_text.with(|m| m.get(key).cloned()) {
@@ -940,10 +886,10 @@ mod wasm_tests {
         );
     }
 
-    /// Queued messages render with their pill count and per-row markers
-    /// so the user can see what's still pending while a turn runs.
+    /// Queued messages are managed by the composer, so the transcript
+    /// must not render a duplicate queued-message surface.
     #[wasm_bindgen_test]
-    async fn chat_renders_queued_messages_with_count_pill() {
+    async fn chat_does_not_render_queued_messages_in_transcript() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -989,21 +935,29 @@ mod wasm_tests {
             view! { <ChatView /> }
         });
         next_tick().await;
-        let queued_pill = container
-            .query_selector("[data-mobile-test='chat-queued-pill']")
+        let transcript = container
+            .query_selector("[data-mobile-test='chat-messages']")
             .unwrap()
-            .expect("queued pill must render");
+            .expect("chat messages container must render");
         assert!(
-            queued_pill
-                .text_content()
-                .unwrap_or_default()
-                .contains("2 queued"),
-            "queued pill must show count"
+            transcript
+                .query_selector("[data-mobile-test='chat-queued']")
+                .unwrap()
+                .is_none(),
+            "queued messages must not render in the transcript"
         );
-        let text = container.text_content().unwrap_or_default();
+        let transcript_text = transcript.text_content().unwrap_or_default();
         assert!(
-            text.contains("second pending") && text.contains("third pending"),
-            "queued message bodies must render"
+            !transcript_text.contains("second pending")
+                && !transcript_text.contains("third pending"),
+            "queued message bodies must stay out of the transcript: {transcript_text}"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-input-queued-list']")
+                .unwrap()
+                .is_some(),
+            "composer queued controls should remain available"
         );
     }
 
@@ -1173,11 +1127,10 @@ mod wasm_tests {
         );
     }
 
-    /// Each queued-message row exposes Send Now and Delete controls with
-    /// stable selectors — the count matches the queue length so desktop's
-    /// per-row queue-management parity is preserved.
+    /// The transcript should stay free of queued-message row controls;
+    /// the composer owns Send Now/Delete while a turn is running.
     #[wasm_bindgen_test]
-    async fn chat_queued_rows_expose_send_now_and_delete_buttons() {
+    async fn chat_transcript_omits_queued_row_controls() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -1216,39 +1169,44 @@ mod wasm_tests {
             view! { <ChatView /> }
         });
         next_tick().await;
-        // Two queued messages → two controls of each kind. We can't use
-        // querySelectorAll (NodeList feature is off in this web-sys
-        // build) so iterate via DOM children of the queued container.
-        let queued = container
-            .query_selector("[data-mobile-test='chat-queued']")
+        let transcript = container
+            .query_selector("[data-mobile-test='chat-messages']")
             .unwrap()
-            .expect("queued container must render");
-        let mut cancel_count = 0;
-        let mut send_now_count = 0;
-        let mut current = queued.first_element_child();
-        while let Some(el) = current.clone() {
-            if el.get_attribute("data-mobile-test").as_deref() == Some("chat-queued-row") {
-                if el
-                    .query_selector("[data-mobile-test='chat-queued-cancel']")
-                    .unwrap()
-                    .is_some()
-                {
-                    cancel_count += 1;
-                }
-                if el
-                    .query_selector("[data-mobile-test='chat-queued-send-now']")
-                    .unwrap()
-                    .is_some()
-                {
-                    send_now_count += 1;
-                }
-            }
-            current = el.next_element_sibling();
-        }
-        assert_eq!(cancel_count, 2, "each queued row must have a Delete button");
-        assert_eq!(
-            send_now_count, 2,
-            "each queued row must have a Send Now button"
+            .expect("chat messages container must render");
+        assert!(
+            transcript
+                .query_selector("[data-mobile-test='chat-queued-row']")
+                .unwrap()
+                .is_none(),
+            "queued rows must not render in transcript"
+        );
+        assert!(
+            transcript
+                .query_selector("[data-mobile-test='chat-queued-cancel']")
+                .unwrap()
+                .is_none(),
+            "queued Delete controls must not render in transcript"
+        );
+        assert!(
+            transcript
+                .query_selector("[data-mobile-test='chat-queued-send-now']")
+                .unwrap()
+                .is_none(),
+            "queued Send Now controls must not render in transcript"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-input-queued-send-now']")
+                .unwrap()
+                .is_some(),
+            "composer still exposes Send Now"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-input-queued-delete']")
+                .unwrap()
+                .is_some(),
+            "composer still exposes Delete"
         );
     }
 

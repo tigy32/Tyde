@@ -8,11 +8,11 @@ use mqtt_transport::{
 };
 use protocol::{
     BackendKind, BrokerUrl, ChatEvent, CommandErrorPayload, Envelope, FrameKind,
-    HostBootstrapPayload, HostSettingValue, ListSessionsPayload, MobileAccessErrorCode,
-    MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState, MobilePairingOfferPayload,
-    MobilePairingStartPayload, MobilePairingState, NewAgentPayload, ProjectCreatePayload,
-    ProjectRootPath, SendMessagePayload, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload,
-    StreamPath, TerminalCreatePayload, TerminalLaunchTarget, write_envelope,
+    HostBootstrapPayload, HostSettingValue, ListSessionsPayload, LoadAgentPayload,
+    MobileAccessErrorCode, MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState,
+    MobilePairingOfferPayload, MobilePairingStartPayload, MobilePairingState, NewAgentPayload,
+    ProjectCreatePayload, ProjectRootPath, SendMessagePayload, SetSettingPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamPath, TerminalCreatePayload, TerminalLaunchTarget, write_envelope,
 };
 use tokio::time::timeout;
 
@@ -180,6 +180,15 @@ async fn send_host_payload<T: serde::Serialize>(
     payload: &T,
 ) {
     let stream = host_stream(client);
+    send_stream_payload(client, stream, kind, payload).await;
+}
+
+async fn send_stream_payload<T: serde::Serialize>(
+    client: &mut client::Connection,
+    stream: StreamPath,
+    kind: FrameKind,
+    payload: &T,
+) {
     let seq = client
         .outgoing_seq
         .get(&stream)
@@ -190,7 +199,7 @@ async fn send_host_payload<T: serde::Serialize>(
     client.outgoing_seq.insert(stream, seq + 1);
     write_envelope(&mut client.writer, &envelope)
         .await
-        .expect("write host payload");
+        .expect("write payload");
 }
 
 fn host_stream(client: &client::Connection) -> StreamPath {
@@ -204,6 +213,17 @@ fn host_stream(client: &client::Connection) -> StreamPath {
         "expected exactly one host stream"
     );
     stream
+}
+
+async fn load_mobile_agent(client: &mut client::Connection, agent: &NewAgentPayload) {
+    send_stream_payload(
+        client,
+        agent.instance_stream.clone(),
+        FrameKind::LoadAgent,
+        &LoadAgentPayload {},
+    )
+    .await;
+    let _ = wait_for_kind(client, FrameKind::AgentBootstrap, "mobile AgentBootstrap").await;
 }
 
 #[tokio::test]
@@ -551,6 +571,8 @@ async fn mqtt_mobile_receives_agent_replay_sessions_and_chat_events() {
         session_env.parse_payload().expect("parse SessionList");
     assert_eq!(sessions.sessions.len(), 1);
 
+    load_mobile_agent(&mut mobile, &replayed_agent).await;
+
     mobile
         .send_message_payload(
             &replayed_agent.instance_stream,
@@ -663,6 +685,8 @@ async fn mqtt_mobile_reconnect_replays_bootstrap_state_again() {
     let sessions: protocol::SessionListPayload =
         session_env.parse_payload().expect("parse SessionList");
     assert_eq!(sessions.sessions.len(), 1);
+
+    load_mobile_agent(&mut second, &replayed_agent).await;
 
     second
         .send_message_payload(

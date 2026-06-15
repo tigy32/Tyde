@@ -8,10 +8,65 @@ use crate::state::{ActiveAgentRef, AgentInfo, AgentRef, AppState};
 use leptos::prelude::*;
 use protocol::AgentId;
 
+const STORAGE_HIDE_SUB_AGENTS: &str = "tyde-mobile-agents-hide-sub-agents";
+const BOOL_TRUE: &str = "true";
+const BOOL_FALSE: &str = "false";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentsSegment {
     Agents,
     Teams,
+}
+
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok()?
+}
+
+fn bool_to_str(value: bool) -> &'static str {
+    if value { BOOL_TRUE } else { BOOL_FALSE }
+}
+
+fn bool_from_str(value: &str) -> Option<bool> {
+    match value {
+        BOOL_TRUE => Some(true),
+        BOOL_FALSE => Some(false),
+        _ => None,
+    }
+}
+
+fn persist_hide_sub_agents(hidden: bool) {
+    if let Some(storage) = local_storage() {
+        let _ = storage.set_item(STORAGE_HIDE_SUB_AGENTS, bool_to_str(hidden));
+    }
+}
+
+fn restore_hide_sub_agents() -> bool {
+    let default = true;
+    let Some(storage) = local_storage() else {
+        return default;
+    };
+    match storage.get_item(STORAGE_HIDE_SUB_AGENTS) {
+        Ok(Some(raw)) => match bool_from_str(&raw) {
+            Some(value) => value,
+            None => {
+                log::warn!(
+                    "unrecognized agents hide-sub-agents preference in localStorage: {raw:?}; resetting to default"
+                );
+                persist_hide_sub_agents(default);
+                default
+            }
+        },
+        Ok(None) => {
+            persist_hide_sub_agents(default);
+            default
+        }
+        Err(error) => {
+            log::warn!(
+                "failed to read agents hide-sub-agents preference from localStorage: {error:?}"
+            );
+            default
+        }
+    }
 }
 
 /// Per-host agent list. Status dots carry semantic labels so screen
@@ -26,7 +81,7 @@ enum AgentsSegment {
 pub fn AgentsView() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let segment: RwSignal<AgentsSegment> = RwSignal::new(AgentsSegment::Agents);
-    let hide_sub_agents = RwSignal::new(false);
+    let hide_sub_agents = RwSignal::new(restore_hide_sub_agents());
     let collapsed_parents: RwSignal<HashSet<AgentId>> = RwSignal::new(HashSet::new());
 
     let s_new_chat = state.clone();
@@ -191,7 +246,12 @@ fn render_agents_body(
                             {if sub_agent_count == 0 {
                                 view! { <div></div> }.into_any()
                             } else {
-                                let toggle_hide = move |_| hide_sub_agents.update(|hidden| *hidden = !*hidden);
+                                let toggle_hide = move |_| {
+                                    hide_sub_agents.update(|hidden| {
+                                        *hidden = !*hidden;
+                                        persist_hide_sub_agents(*hidden);
+                                    });
+                                };
                                 view! {
                                     <div class="agents-list-controls" data-mobile-test="agents-list-controls">
                                         <span class="agents-subagent-count">
@@ -425,6 +485,26 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
+    fn test_storage() -> web_sys::Storage {
+        web_sys::window()
+            .unwrap()
+            .local_storage()
+            .unwrap()
+            .expect("localStorage")
+    }
+
+    fn set_hide_sub_agents_pref(hidden: bool) {
+        test_storage()
+            .set_item(STORAGE_HIDE_SUB_AGENTS, bool_to_str(hidden))
+            .expect("set hide sub-agents preference");
+    }
+
+    fn clear_hide_sub_agents_pref() {
+        test_storage()
+            .remove_item(STORAGE_HIDE_SUB_AGENTS)
+            .expect("remove hide sub-agents preference");
+    }
+
     fn fixture(host: &LocalHostId, id: &str, name: &str, fatal: Option<&str>) -> AgentInfo {
         AgentInfo {
             local_host_id: host.clone(),
@@ -455,6 +535,7 @@ mod wasm_tests {
     /// meaningful on a narrow phone row.
     #[wasm_bindgen_test]
     async fn agents_side_question_row_shows_aside_label() {
+        set_hide_sub_agents_pref(false);
         let host = LocalHostId("host-1".to_owned());
         let container = make_container();
         let host_for_mount = host.clone();
@@ -552,10 +633,11 @@ mod wasm_tests {
         );
     }
 
-    /// Sub-agents are visible by default, but the mobile list exposes a
-    /// direct Hide sub-agents control matching the desktop panel's filter.
+    /// Sub-agents are hidden by default, but the mobile list exposes a
+    /// direct Show sub-agents control and persists the user's selection.
     #[wasm_bindgen_test]
-    async fn agents_hide_subagents_toggle_hides_child_rows() {
+    async fn agents_hide_subagents_toggle_shows_child_rows_and_persists() {
+        clear_hide_sub_agents_pref();
         let host = LocalHostId("host-1".to_owned());
         let container = make_container();
         let host_for_mount = host.clone();
@@ -572,27 +654,68 @@ mod wasm_tests {
         next_tick().await;
         let initial_text = container.text_content().unwrap_or_default();
         assert!(
-            initial_text.contains("Parent agent") && initial_text.contains("Child agent"),
-            "parent and child should be visible before hiding: {initial_text}"
+            initial_text.contains("Parent agent") && !initial_text.contains("Child agent"),
+            "child should be hidden by default: {initial_text}"
+        );
+        assert!(
+            initial_text.contains("Show sub-agents"),
+            "default toggle should offer to show sub-agents: {initial_text}"
         );
 
         let toggle: HtmlElement = container
             .query_selector("[data-mobile-test='agents-hide-subagents']")
             .unwrap()
-            .expect("hide sub-agents toggle")
+            .expect("show sub-agents toggle")
             .dyn_into()
             .unwrap();
         toggle.click();
         next_tick().await;
 
-        let hidden_text = container.text_content().unwrap_or_default();
+        let shown_text = container.text_content().unwrap_or_default();
         assert!(
-            hidden_text.contains("Parent agent") && !hidden_text.contains("Child agent"),
-            "hiding sub-agents should keep parent and remove child row: {hidden_text}"
+            shown_text.contains("Parent agent") && shown_text.contains("Child agent"),
+            "showing sub-agents should reveal the child row: {shown_text}"
         );
         assert!(
-            hidden_text.contains("Show sub-agents"),
-            "active toggle should offer to show sub-agents again: {hidden_text}"
+            shown_text.contains("Hide sub-agents"),
+            "inactive toggle should offer to hide sub-agents again: {shown_text}"
+        );
+        assert_eq!(
+            test_storage()
+                .get_item(STORAGE_HIDE_SUB_AGENTS)
+                .expect("read stored preference")
+                .as_deref(),
+            Some(BOOL_FALSE),
+            "showing sub-agents must persist the selection"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn agents_restore_persisted_show_subagents_selection() {
+        set_hide_sub_agents_pref(false);
+        let host = LocalHostId("host-1".to_owned());
+        let container = make_container();
+        let host_for_mount = host.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.agents.set(vec![
+                fixture(&host_for_mount, "parent", "Parent agent", None),
+                child_fixture(&host_for_mount, "child", "Child agent", "parent"),
+            ]);
+            provide_context(state);
+            view! { <AgentsView /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Parent agent") && text.contains("Child agent"),
+            "persisted show-sub-agents selection should be restored: {text}"
+        );
+        assert!(
+            text.contains("Hide sub-agents"),
+            "restored selection should offer to hide sub-agents: {text}"
         );
     }
 
@@ -601,6 +724,7 @@ mod wasm_tests {
     /// sub-agents globally.
     #[wasm_bindgen_test]
     async fn agents_parent_child_count_can_collapse_children() {
+        set_hide_sub_agents_pref(false);
         let host = LocalHostId("host-1".to_owned());
         let container = make_container();
         let host_for_mount = host.clone();

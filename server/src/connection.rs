@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Connection;
 use crate::error::AppError;
-use crate::host::HostHandle;
+use crate::host::{AgentReplayMode, HostHandle};
 use crate::router::route_client_envelope;
 use crate::stream::Stream;
 
@@ -50,7 +50,13 @@ async fn run_connection_with_origin(
 
     let host_output_stream = Stream::new(host_stream.clone(), output_tx.clone());
 
-    let deferred_attachments = host.register_host_stream(host_output_stream.clone()).await;
+    let agent_replay = match origin {
+        ConnectionOrigin::Desktop => AgentReplayMode::Eager,
+        ConnectionOrigin::Mobile => AgentReplayMode::Lazy,
+    };
+    let deferred_attachments = host
+        .register_host_stream(host_output_stream.clone(), agent_replay)
+        .await;
     tokio::spawn(async move {
         for (agent_handle, stream) in deferred_attachments {
             agent_handle.attach(stream).await;
