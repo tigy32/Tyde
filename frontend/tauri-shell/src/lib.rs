@@ -9,16 +9,19 @@ mod logging;
 mod remote_bootstrap;
 mod router;
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use devtools_protocol::UiDebugResponseSubmission;
 use host_config::RemoteHostLifecycleSnapshot;
 use host_store::{ConfiguredHostStore, HostStore, UpsertConfiguredHostRequest};
 use router::ProxyRouterHandle;
-use tauri::{Manager, RunEvent, WindowEvent};
+use tauri::{Manager, RunEvent, Url, WindowEvent};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 #[cfg(target_os = "macos")]
@@ -216,6 +219,148 @@ fn request_quit_confirmation(app: tauri::AppHandle, confirmation: Arc<QuitConfir
     });
 }
 
+fn external_link_guard<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("external-link-guard")
+        .on_navigation(|_webview, url| {
+            if !should_open_externally(url) {
+                return true;
+            }
+
+            if let Err(err) = open_url_with_system_handler(url) {
+                tracing::warn!("failed to open external navigation {url}: {err}");
+            }
+            false
+        })
+        .build()
+}
+
+fn should_open_externally(url: &Url) -> bool {
+    if is_app_url(url) {
+        return false;
+    }
+
+    matches!(url.scheme(), "http" | "https" | "mailto")
+}
+
+fn is_app_url(url: &Url) -> bool {
+    match url.scheme() {
+        "tauri" | "asset" | "ipc" => return true,
+        "http" | "https" => {}
+        _ => return false,
+    }
+
+    let host = url.host_str();
+    if matches!(host, Some("tauri.localhost") | Some("asset.localhost")) {
+        return true;
+    }
+
+    cfg!(debug_assertions)
+        && matches!(host, Some("127.0.0.1" | "localhost" | "::1"))
+        && url.port_or_known_default() == Some(1420)
+}
+
+fn parse_external_url(value: &str) -> Result<Url, String> {
+    let url = Url::parse(value).map_err(|err| format!("invalid URL: {err}"))?;
+    if is_app_url(&url) {
+        return Err("refusing to open Tyde's own app URL externally".to_owned());
+    }
+
+    match url.scheme() {
+        "http" | "https" if url.host_str().is_some() => Ok(url),
+        "http" | "https" => Err("URL must include a host".to_owned()),
+        "mailto" if !url.path().is_empty() => Ok(url),
+        "mailto" => Err("mailto URL must include an address".to_owned()),
+        scheme => Err(format!("unsupported external URL scheme: {scheme}")),
+    }
+}
+
+fn open_url_with_system_handler(url: &Url) -> Result<(), String> {
+    let url = parse_external_url(url.as_str())?;
+    spawn_system_url_handler(url.as_str())
+}
+
+fn spawn_system_url_handler(url: &str) -> Result<(), String> {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = url;
+        return Err("opening external links is not supported on this platform".to_owned());
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let mut command = system_url_handler_command(url);
+        command
+            .spawn()
+            .map(|_| ())
+            .map_err(|err| format!("failed to launch system URL handler: {err}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn system_url_handler_command(url: &str) -> Command {
+    let mut command = Command::new("open");
+    command.arg(url);
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn system_url_handler_command(url: &str) -> Command {
+    let mut command = Command::new("rundll32.exe");
+    command.arg("url.dll,FileProtocolHandler").arg(url);
+    command
+}
+
+#[cfg(all(
+    not(target_os = "macos"),
+    not(target_os = "windows"),
+    not(any(target_os = "android", target_os = "ios"))
+))]
+fn system_url_handler_command(url: &str) -> Command {
+    let mut command = Command::new("xdg-open");
+    command.arg(url);
+    command
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let url = parse_external_url(&url)?;
+    spawn_system_url_handler(url.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_url_validation_allows_web_and_mail_links() {
+        assert!(parse_external_url("https://example.com/path?q=1").is_ok());
+        assert!(parse_external_url("http://example.com").is_ok());
+        assert!(parse_external_url("mailto:help@example.com").is_ok());
+    }
+
+    #[test]
+    fn external_url_validation_rejects_unsafe_or_internal_targets() {
+        assert!(parse_external_url("javascript:alert(1)").is_err());
+        assert!(parse_external_url("file:///etc/passwd").is_err());
+        assert!(parse_external_url("https://").is_err());
+        assert!(parse_external_url("tauri://localhost").is_err());
+        assert!(parse_external_url("http://tauri.localhost/").is_err());
+    }
+
+    #[test]
+    fn navigation_guard_opens_only_external_urls() {
+        assert!(!should_open_externally(
+            &Url::parse("tauri://localhost").unwrap()
+        ));
+        assert!(!should_open_externally(
+            &Url::parse("http://tauri.localhost/").unwrap()
+        ));
+        assert!(should_open_externally(
+            &Url::parse("https://example.com").unwrap()
+        ));
+    }
+}
+
 #[tauri::command]
 async fn connect_host(
     app: tauri::AppHandle,
@@ -355,6 +500,7 @@ pub fn run() {
     let quit_confirmation_for_run = quit_confirmation.clone();
 
     let app = tauri::Builder::default()
+        .plugin(external_link_guard())
         .plugin(tauri_plugin_dialog::init())
         .on_window_event(move |window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -421,7 +567,8 @@ pub fn run() {
             set_selected_host,
             mark_ui_debug_ready,
             submit_ui_debug_response,
-            submit_feedback
+            submit_feedback,
+            open_external_url
         ])
         .build(tauri::generate_context!())
         .expect("failed to build desktop shell");

@@ -131,6 +131,18 @@ pub async fn submit_feedback(feedback: String) -> Result<(), String> {
     Ok(())
 }
 
+pub async fn open_external_url(url: String) -> Result<(), String> {
+    #[derive(serde::Serialize)]
+    struct Args {
+        url: String,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args { url }).map_err(|e| e.to_string())?;
+    tauri_invoke("open_external_url", args)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(())
+}
+
 /// Show a native OK/Cancel confirmation dialog via tauri-plugin-dialog.
 ///
 /// Use this instead of `web_sys::Window::confirm_with_message` — the WKWebView

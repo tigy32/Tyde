@@ -218,14 +218,12 @@ fn install_click_listener(state: AppState) {
 
         ev.prevent_default();
 
-        if href.starts_with("http://")
-            || href.starts_with("https://")
-            || href.starts_with("mailto:")
-        {
-            // External link → open in system browser / mail client.
-            if let Some(window) = web_sys::window() {
-                let _ = window.open_with_url_and_target(&href, "_blank");
-            }
+        if is_external_href(&href) {
+            spawn_local(async move {
+                if let Err(err) = bridge::open_external_url(href.clone()).await {
+                    log::warn!("failed to open external chat link {href}: {err}");
+                }
+            });
         } else {
             let roots = state
                 .active_project_info_untracked()
@@ -248,6 +246,16 @@ fn install_click_listener(state: AppState) {
             callback,
         });
     });
+}
+
+fn is_external_href(href: &str) -> bool {
+    let Some((scheme, _)) = href.split_once(':') else {
+        return false;
+    };
+
+    scheme.eq_ignore_ascii_case("http")
+        || scheme.eq_ignore_ascii_case("https")
+        || scheme.eq_ignore_ascii_case("mailto")
 }
 
 fn drag_type_is_files(value: &str) -> bool {
@@ -430,13 +438,22 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{drag_type_is_files, resolve_chat_file_href};
+    use super::{drag_type_is_files, is_external_href, resolve_chat_file_href};
     use protocol::{ProjectPath, ProjectRootPath};
 
     #[test]
     fn recognizes_browser_file_drag_type() {
         assert!(drag_type_is_files("Files"));
         assert!(!drag_type_is_files("text/plain"));
+    }
+
+    #[test]
+    fn recognizes_external_chat_hrefs_case_insensitively() {
+        assert!(is_external_href("https://example.com"));
+        assert!(is_external_href("HTTP://example.com"));
+        assert!(is_external_href("mailto:help@example.com"));
+        assert!(!is_external_href("./src/main.rs"));
+        assert!(!is_external_href("file:///tmp/outside.rs"));
     }
 
     #[test]
