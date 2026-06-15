@@ -841,6 +841,7 @@ mod wasm_tests {
                     parent_agent_id: None,
                     session_id: Some(session_id.clone()),
                     custom_agent_id: None,
+                    workflow: None,
                     created_at_ms: 0,
                     instance_stream: StreamPath("/agent/antigravity-agent".to_owned()),
                     started: true,

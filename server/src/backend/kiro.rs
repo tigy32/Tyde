@@ -3976,6 +3976,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
             project_id: None,
             parent_agent_id: None,
             session_id: None,
+            workflow: None,
             created_at_ms: 0,
             instance_stream: agent_stream.clone(),
         };
@@ -4036,6 +4037,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                 team_members: vec![],
                 team_member_bindings: vec![],
                 agents: vec![new_agent],
+                workflow_summaries: vec![],
+                workflow_diagnostics: vec![],
+                workflow_runs: vec![],
             },
         )
         .expect("serialize HostBootstrap");
@@ -4061,6 +4065,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                         project_id: None,
                         parent_agent_id: None,
                         session_id: None,
+                        workflow: None,
                         created_at_ms: 0,
                     },
                 )],

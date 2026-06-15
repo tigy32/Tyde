@@ -9,11 +9,11 @@ mod runtime;
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentBootstrapPayload, AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
-    BackendSetupPayload, BrowseBootstrapPayload, CancelQueuedMessagePayload, CommandErrorPayload,
-    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    DeleteSessionPayload, Envelope, FrameError, FrameKind, HelloPayload, HostBootstrapPayload,
-    HostBrowseStartPayload, HostSettingsPayload, InterruptPayload, ListSessionsPayload,
-    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
+    BackendSetupPayload, BrowseBootstrapPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
+    CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
+    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameError, FrameKind, HelloPayload,
+    HostBootstrapPayload, HostBrowseStartPayload, HostSettingsPayload, InterruptPayload,
+    ListSessionsPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
     MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
     PROTOCOL_VERSION, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
     ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
@@ -34,8 +34,9 @@ use protocol::{
     TeamMemberUpdatePayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload,
     TeamSetManagerPayload, TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload,
     TerminalErrorPayload, TerminalExitPayload, TerminalId, TerminalOutputPayload,
-    TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, Version, WelcomePayload,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, read_envelope, write_envelope,
+    TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, TriggerWorkflowPayload,
+    Version, WelcomePayload, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload,
+    WorkflowRefreshPayload, WorkflowRunNotifyPayload, read_envelope, write_envelope,
 };
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
 #[cfg(unix)]
@@ -219,6 +220,30 @@ impl Connection {
         payload: McpServerDeletePayload,
     ) -> Result<(), FrameError> {
         self.send_host_payload(FrameKind::McpServerDelete, &payload)
+            .await
+    }
+
+    pub async fn workflow_refresh(
+        &mut self,
+        payload: WorkflowRefreshPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::WorkflowRefresh, &payload)
+            .await
+    }
+
+    pub async fn trigger_workflow(
+        &mut self,
+        payload: TriggerWorkflowPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TriggerWorkflow, &payload)
+            .await
+    }
+
+    pub async fn cancel_workflow(
+        &mut self,
+        payload: CancelWorkflowPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::CancelWorkflow, &payload)
             .await
     }
 
@@ -823,6 +848,14 @@ impl Connection {
                 }
                 FrameKind::McpServerNotify => {
                     let _: McpServerNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::WorkflowNotify => {
+                    let _: WorkflowNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::WorkflowRunNotify => {
+                    let _: WorkflowRunNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::TeamNotify => {

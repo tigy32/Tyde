@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use protocol::{
-    AgentControlStatus, AgentErrorCode, AgentId, AgentOrigin, AgentStartPayload, BackendAccessMode,
-    BackendKind, ChatEvent, CustomAgentId, ProjectId, SendMessagePayload, SessionId,
-    SessionSettingsSchema, SessionSettingsValues, SpawnCostHint, TeamId, TeamMemberId,
+    AgentControlStatus, AgentErrorCode, AgentId, AgentOrigin, AgentStartPayload,
+    AgentWorkflowMetadata, BackendAccessMode, BackendKind, ChatEvent, CustomAgentId, ProjectId,
+    SendMessagePayload, SessionId, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
+    TeamId, TeamMemberId,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -19,6 +20,7 @@ use crate::review::ReviewRegistryHandle;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
 use crate::store::session::SessionStore;
 use crate::sub_agent::HostSubAgentSpawnTx;
+use crate::workflows::mcp::WORKFLOW_PROGRESS_MCP_SERVER_NAME;
 
 pub(crate) struct AgentRegistry {
     agents: HashMap<AgentId, AgentEntry>,
@@ -116,6 +118,7 @@ pub(crate) struct ResolvedSpawnRequest {
     pub custom_agent_id: Option<CustomAgentId>,
     pub team_id: Option<TeamId>,
     pub team_member_id: Option<TeamMemberId>,
+    pub workflow: Option<AgentWorkflowMetadata>,
     pub parent_agent_id: Option<AgentId>,
     pub parent_session_id: Option<SessionId>,
     pub project_id: Option<ProjectId>,
@@ -175,6 +178,7 @@ pub(crate) struct RelaySpawnRequest {
     pub backend_kind: BackendKind,
     pub workspace_roots: Vec<String>,
     pub session_id: SessionId,
+    pub workflow: Option<AgentWorkflowMetadata>,
 }
 
 pub(crate) struct SpawnedAgent {
@@ -214,7 +218,9 @@ impl AgentRegistry {
     ) -> SpawnedAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
         for server in &mut request.startup_mcp_servers {
-            if server.name != "tyde-agent-control" && server.name != REVIEW_FEEDBACK_MCP_SERVER_NAME
+            if server.name != "tyde-agent-control"
+                && server.name != REVIEW_FEEDBACK_MCP_SERVER_NAME
+                && server.name != WORKFLOW_PROGRESS_MCP_SERVER_NAME
             {
                 continue;
             }
@@ -232,6 +238,7 @@ impl AgentRegistry {
             custom_agent_id: request.custom_agent_id.clone(),
             team_id: request.team_id.clone(),
             team_member_id: request.team_member_id.clone(),
+            workflow: request.workflow.clone(),
             project_id: request.project_id.clone(),
             parent_agent_id: request.parent_agent_id.clone(),
             session_id: request.resume_session_id.clone(),
@@ -288,6 +295,7 @@ impl AgentRegistry {
             custom_agent_id: request.custom_agent_id.clone(),
             team_id: None,
             team_member_id: None,
+            workflow: request.workflow.clone(),
             project_id: request.project_id.clone(),
             parent_agent_id: Some(request.parent_agent_id.clone()),
             session_id: Some(request.session_id.clone()),

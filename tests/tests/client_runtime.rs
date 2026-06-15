@@ -79,6 +79,8 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::SteeringNotify(_)
                 | HostEvent::SkillNotify(_)
                 | HostEvent::McpServerNotify(_)
+                | HostEvent::WorkflowNotify(_)
+                | HostEvent::WorkflowRunNotify(_)
                 | HostEvent::MobileAccessState(_)
                 | HostEvent::MobilePairingOffer(_)
                 | HostEvent::TeamNotify(_)

@@ -454,6 +454,7 @@ mod wasm_tests {
                 parent_agent_id: None,
                 session_id: None,
                 custom_agent_id: None,
+                workflow: None,
                 created_at_ms: 1,
                 instance_stream: StreamPath("/agent/a-1/inst".to_owned()),
                 started: true,

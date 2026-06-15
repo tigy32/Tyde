@@ -20,7 +20,7 @@ use protocol::{
     TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
     TerminalBootstrapPayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
-    TerminalStartPayload, WelcomePayload,
+    TerminalStartPayload, WelcomePayload, WorkflowNotifyPayload, WorkflowRunNotifyPayload,
 };
 
 use crate::state::{
@@ -197,6 +197,9 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
         team_members: Vec::new(),
         team_member_bindings: Vec::new(),
         agents: Vec::new(),
+        workflow_summaries: Vec::new(),
+        workflow_diagnostics: Vec::new(),
+        workflow_runs: Vec::new(),
     };
 
     let welcome_env = Envelope::from_payload(host_stream.clone(), FrameKind::Welcome, 0, &welcome)
@@ -674,6 +677,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     parent_agent_id: payload.parent_agent_id,
                     session_id: payload.session_id,
                     custom_agent_id: payload.custom_agent_id,
+                    workflow: payload.workflow,
                     created_at_ms: payload.created_at_ms,
                     instance_stream: payload.instance_stream,
                     started: false,
@@ -1606,6 +1610,40 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse mcp_server_notify payload: {error}"),
             ),
         },
+        FrameKind::WorkflowNotify => match envelope.parse_payload::<WorkflowNotifyPayload>() {
+            Ok(payload) => {
+                state.workflow_summaries.update(|map| {
+                    map.insert(host_id.to_string(), payload.summaries);
+                });
+                state.workflow_diagnostics.update(|map| {
+                    map.insert(host_id.to_string(), payload.diagnostics);
+                });
+            }
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse workflow_notify payload: {error}"),
+            ),
+        },
+        FrameKind::WorkflowRunNotify => {
+            match envelope.parse_payload::<WorkflowRunNotifyPayload>() {
+                Ok(payload) => {
+                    state.workflow_runs.update(|map| {
+                        let host_map = map.entry(host_id.to_string()).or_default();
+                        host_map.insert(payload.run.id.clone(), payload.run);
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse workflow_run_notify payload: {error}"),
+                ),
+            }
+        }
         FrameKind::SteeringNotify => match envelope.parse_payload::<SteeringNotifyPayload>() {
             Ok(SteeringNotifyPayload::Upsert { steering }) => {
                 state.steering.update(|map| {
@@ -3282,6 +3320,19 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
             host_map.insert(custom_agent.id.clone(), custom_agent);
         }
     });
+    state.workflow_summaries.update(|map| {
+        map.insert(host_id.to_string(), payload.workflow_summaries);
+    });
+    state.workflow_diagnostics.update(|map| {
+        map.insert(host_id.to_string(), payload.workflow_diagnostics);
+    });
+    state.workflow_runs.update(|map| {
+        let host_map = map.entry(host_id.to_string()).or_default();
+        host_map.clear();
+        for run in payload.workflow_runs {
+            host_map.insert(run.id.clone(), run);
+        }
+    });
     state.team_preset_catalogs.update(|map| {
         map.insert(host_id.to_string(), payload.team_preset_catalog);
     });
@@ -3358,6 +3409,7 @@ fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo
         parent_agent_id: payload.parent_agent_id,
         session_id: payload.session_id,
         custom_agent_id: payload.custom_agent_id,
+        workflow: payload.workflow,
         created_at_ms: payload.created_at_ms,
         instance_stream: payload.instance_stream,
         started: false,
@@ -3680,6 +3732,9 @@ mod tests {
                 team_members: Vec::new(),
                 team_member_bindings: Vec::new(),
                 agents: Vec::new(),
+                workflow_summaries: Vec::new(),
+                workflow_diagnostics: Vec::new(),
+                workflow_runs: Vec::new(),
             },
         )
         .expect("synthetic HostBootstrap")

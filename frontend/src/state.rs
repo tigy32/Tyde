@@ -4,18 +4,19 @@ use std::collections::{HashMap, HashSet};
 use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
 use protocol::{
-    AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, ChatMessageId, CustomAgent,
-    CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry,
-    HostBrowseErrorPayload, HostPlatform, HostSettings, McpServerConfig, McpServerId,
-    MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload, Project,
-    ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath,
+    AgentId, AgentOrigin, AgentWorkflowMetadata, BackendKind, BackendSetupInfo, ChatMessage,
+    ChatMessageId, CustomAgent, CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath,
+    HostBrowseEntry, HostBrowseErrorPayload, HostPlatform, HostSettings, McpServerConfig,
+    McpServerId, MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload,
+    Project, ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath,
     ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, ProjectSearchFileResult,
     QueuedMessageEntry, Review, ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary,
     SessionId, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId, Steering,
     SteeringId, StreamPath, TaskList, Team, TeamDraft, TeamDraftId, TeamId, TeamMember,
     TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
     TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
-    ToolExecutionCompletedData, ToolProgressData, ToolRequest,
+    ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowDiagnostic, WorkflowRunId,
+    WorkflowRunSnapshot, WorkflowSummary,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +58,7 @@ pub struct AgentInfo {
     pub parent_agent_id: Option<AgentId>,
     pub session_id: Option<SessionId>,
     pub custom_agent_id: Option<CustomAgentId>,
+    pub workflow: Option<AgentWorkflowMetadata>,
     pub created_at_ms: u64,
     pub instance_stream: StreamPath,
     pub started: bool,
@@ -357,6 +359,16 @@ pub enum LeftTab {
     Files,
     Git,
     Search,
+}
+
+/// Which tab of the right dock is currently shown. Stored in `AppState` so
+/// global UI actions such as command-palette entries can open a specific panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightTab {
+    Agents,
+    Sessions,
+    Teams,
+    Workflows,
 }
 
 /// All persistent state for the project-wide search panel. Lives in `AppState`
@@ -857,6 +869,7 @@ pub struct AppState {
     pub tabs_enabled: RwSignal<bool>,
     pub left_dock: RwSignal<DockVisibility>,
     pub right_dock: RwSignal<DockVisibility>,
+    pub right_tab: RwSignal<RightTab>,
     pub bottom_dock: RwSignal<DockVisibility>,
     pub file_tree: RwSignal<HashMap<ProjectId, Vec<ProjectRootListing>>>,
     pub git_status: RwSignal<HashMap<ProjectId, Vec<ProjectRootGitStatus>>>,
@@ -917,6 +930,9 @@ pub struct AppState {
     pub mcp_servers: RwSignal<HashMap<String, HashMap<McpServerId, McpServerConfig>>>,
     pub steering: RwSignal<HashMap<String, HashMap<SteeringId, Steering>>>,
     pub skills: RwSignal<HashMap<String, HashMap<SkillId, Skill>>>,
+    pub workflow_summaries: RwSignal<HashMap<String, Vec<WorkflowSummary>>>,
+    pub workflow_diagnostics: RwSignal<HashMap<String, Vec<WorkflowDiagnostic>>>,
+    pub workflow_runs: RwSignal<HashMap<String, HashMap<WorkflowRunId, WorkflowRunSnapshot>>>,
     /// Host-scoped team records, keyed by host_id then TeamId. Populated from
     /// `TeamNotify::Upsert` and pruned by `TeamNotify::Delete`.
     pub teams: RwSignal<HashMap<String, HashMap<TeamId, Team>>>,
@@ -1126,6 +1142,7 @@ impl AppState {
             tabs_enabled: RwSignal::new(true),
             left_dock: RwSignal::new(DockVisibility::Visible),
             right_dock: RwSignal::new(DockVisibility::Visible),
+            right_tab: RwSignal::new(RightTab::Agents),
             bottom_dock: RwSignal::new(DockVisibility::Hidden),
             file_tree: RwSignal::new(HashMap::new()),
             git_status: RwSignal::new(HashMap::new()),
@@ -1168,6 +1185,9 @@ impl AppState {
             mcp_servers: RwSignal::new(HashMap::new()),
             steering: RwSignal::new(HashMap::new()),
             skills: RwSignal::new(HashMap::new()),
+            workflow_summaries: RwSignal::new(HashMap::new()),
+            workflow_diagnostics: RwSignal::new(HashMap::new()),
+            workflow_runs: RwSignal::new(HashMap::new()),
             teams: RwSignal::new(HashMap::new()),
             team_members: RwSignal::new(HashMap::new()),
             team_member_bindings: RwSignal::new(HashMap::new()),
@@ -1957,6 +1977,15 @@ impl AppState {
             map.remove(host_id);
         });
         self.skills.update(|map| {
+            map.remove(host_id);
+        });
+        self.workflow_summaries.update(|map| {
+            map.remove(host_id);
+        });
+        self.workflow_diagnostics.update(|map| {
+            map.remove(host_id);
+        });
+        self.workflow_runs.update(|map| {
             map.remove(host_id);
         });
         self.teams.update(|map| {
@@ -2962,6 +2991,7 @@ mod tests {
                 parent_agent_id: None,
                 session_id: None,
                 custom_agent_id: None,
+                workflow: None,
                 created_at_ms: 0,
                 instance_stream: StreamPath(format!("/agents/{}", id.0)),
                 started: true,

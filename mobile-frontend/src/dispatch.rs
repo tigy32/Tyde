@@ -168,6 +168,9 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
         team_members: Vec::new(),
         team_member_bindings: Vec::new(),
         agents: Vec::new(),
+        workflow_summaries: Vec::new(),
+        workflow_diagnostics: Vec::new(),
+        workflow_runs: Vec::new(),
     };
 
     let welcome_env = Envelope::from_payload(host_stream.clone(), FrameKind::Welcome, 0, &welcome)
@@ -739,6 +742,12 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     }
                 });
             }
+        }
+        FrameKind::WorkflowNotify => {
+            let _ = envelope.parse_payload::<protocol::WorkflowNotifyPayload>();
+        }
+        FrameKind::WorkflowRunNotify => {
+            let _ = envelope.parse_payload::<protocol::WorkflowRunNotifyPayload>();
         }
         FrameKind::SteeringNotify => {
             if let Ok(payload) = envelope.parse_payload::<SteeringNotifyPayload>() {
@@ -2082,6 +2091,7 @@ mod wasm_tests {
                     project_id: None,
                     parent_agent_id: None,
                     session_id: None,
+                    workflow: None,
                     created_at_ms: 1,
                     instance_stream: StreamPath("/agent/old-agent/inst".to_owned()),
                 },
@@ -2137,6 +2147,7 @@ mod wasm_tests {
                     project_id: None,
                     parent_agent_id: None,
                     session_id: None,
+                    workflow: None,
                     created_at_ms: 2,
                     instance_stream: StreamPath("/agent/new-agent/inst".to_owned()),
                 },
@@ -2356,6 +2367,7 @@ mod wasm_tests {
             project_id: None,
             parent_agent_id: None,
             session_id: None,
+            workflow: None,
             created_at_ms: 1,
             instance_stream: StreamPath("/agent/a-1/inst".to_owned()),
         };
@@ -2396,6 +2408,9 @@ mod wasm_tests {
             team_members: Vec::new(),
             team_member_bindings: Vec::new(),
             agents: vec![agent_payload.clone()],
+            workflow_summaries: Vec::new(),
+            workflow_diagnostics: Vec::new(),
+            workflow_runs: Vec::new(),
         };
         dispatch_envelope(
             &state,
@@ -2468,6 +2483,7 @@ mod wasm_tests {
                     project_id: None,
                     parent_agent_id: None,
                     session_id: None,
+                    workflow: None,
                     created_at_ms: 1,
                     instance_stream: instance_stream.clone(),
                 },
@@ -2486,6 +2502,7 @@ mod wasm_tests {
             project_id: None,
             parent_agent_id: None,
             session_id: None,
+            workflow: None,
             created_at_ms: 1,
         };
         let chat_event = protocol::ChatEvent::MessageAdded(protocol::ChatMessage {

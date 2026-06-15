@@ -7,7 +7,8 @@ use crate::components::search_panel::SearchPanel;
 use crate::components::sessions_panel::SessionsPanel;
 use crate::components::teams_panel::TeamsPanel;
 use crate::components::terminal_view::TerminalView;
-use crate::state::{AppState, LeftTab};
+use crate::components::workflows_panel::WorkflowsPanel;
+use crate::state::{AppState, LeftTab, RightTab};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum DockPosition {
@@ -25,16 +26,9 @@ pub fn DockZone(position: DockPosition) -> impl IntoView {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum RightTab {
-    Agents,
-    Sessions,
-    Teams,
-}
-
 #[component]
 fn RightDock() -> impl IntoView {
-    let active_tab = RwSignal::new(RightTab::Agents);
+    let active_tab = expect_context::<AppState>().right_tab;
 
     let tab_class = move |target: RightTab| {
         move || {
@@ -71,6 +65,13 @@ fn RightDock() -> impl IntoView {
             "display: none;"
         }
     };
+    let workflows_style = move || {
+        if active_tab.get() == RightTab::Workflows {
+            ""
+        } else {
+            "display: none;"
+        }
+    };
 
     view! {
         <div class="dock-inner">
@@ -84,6 +85,9 @@ fn RightDock() -> impl IntoView {
                 <button class={tab_class(RightTab::Teams)} on:click=move |_| active_tab.set(RightTab::Teams)>
                     "Teams"
                 </button>
+                <button class={tab_class(RightTab::Workflows)} on:click=move |_| active_tab.set(RightTab::Workflows)>
+                    "Workflows"
+                </button>
             </div>
             <div class="dock-tab-content">
                 <div class="dock-tab-mount" style=agents_style>
@@ -94,6 +98,9 @@ fn RightDock() -> impl IntoView {
                 </div>
                 <div class="dock-tab-mount" style=teams_style>
                     <TeamsPanel />
+                </div>
+                <div class="dock-tab-mount" style=workflows_style>
+                    <WorkflowsPanel />
                 </div>
             </div>
         </div>

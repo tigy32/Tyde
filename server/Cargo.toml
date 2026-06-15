@@ -29,6 +29,7 @@ portable-pty = "0.8"
 rmcp = { version = "0.15.0", default-features = false, features = ["macros", "schemars", "server", "transport-streamable-http-server"] }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml = "0.9"
 tempfile = "3"
 tokio.workspace = true
 tokio-util = "0.7"

@@ -4,23 +4,24 @@ use std::sync::{Arc, Mutex};
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentBootstrapPayload, AgentErrorPayload, AgentRenamedPayload, AgentStartPayload,
-    BackendSetupPayload, ChatEvent, CommandErrorPayload, CustomAgentNotifyPayload, Envelope,
-    FrameError, FrameKind, HostBootstrapPayload, HostSettingsPayload, InterruptPayload,
-    ListSessionsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
-    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, ProjectAddRootPayload,
-    ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
-    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
-    ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload, SessionListPayload,
-    SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload,
-    SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload, StreamPath,
-    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
-    TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
-    TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
-    TerminalStartPayload, WorkbenchCreatePayload, WorkbenchRemovePayload, read_envelope,
-    write_envelope,
+    BackendSetupPayload, CancelWorkflowPayload, ChatEvent, CommandErrorPayload,
+    CustomAgentNotifyPayload, Envelope, FrameError, FrameKind, HostBootstrapPayload,
+    HostSettingsPayload, InterruptPayload, ListSessionsPayload, McpServerNotifyPayload,
+    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
+    ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
+    SendMessagePayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
+    SetAgentNamePayload, SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload,
+    SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
+    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload, TerminalClosePayload,
+    TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
+    TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, TriggerWorkflowPayload,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
+    WorkflowRunNotifyPayload, read_envelope, write_envelope,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -139,6 +140,8 @@ pub enum HostEvent {
     TeamPresetCatalogNotify(TeamPresetCatalogNotifyPayload),
     TeamDraftNotify(TeamDraftNotifyPayload),
     TeamMemberShuffleSuggestionNotify(TeamMemberShuffleSuggestionNotifyPayload),
+    WorkflowNotify(WorkflowNotifyPayload),
+    WorkflowRunNotify(WorkflowRunNotifyPayload),
     AgentClosed(AgentClosedPayload),
     NewAgent(AgentEndpoint),
     NewTerminal(TerminalEndpoint),
@@ -146,7 +149,7 @@ pub enum HostEvent {
 
 pub enum AgentEvent {
     Bootstrap(AgentBootstrapPayload),
-    Start(AgentStartPayload),
+    Start(Box<AgentStartPayload>),
     Renamed(AgentRenamedPayload),
     Error(AgentErrorPayload),
     Chat(Box<ChatEvent>),
@@ -292,6 +295,25 @@ impl HostCommands {
         payload: protocol::TeamMemberShufflePayload,
     ) -> Result<(), ClientError> {
         self.send(FrameKind::TeamMemberShuffle, &payload).await
+    }
+
+    pub async fn workflow_refresh(&self) -> Result<(), ClientError> {
+        self.send(
+            FrameKind::WorkflowRefresh,
+            &WorkflowRefreshPayload::default(),
+        )
+        .await
+    }
+
+    pub async fn trigger_workflow(
+        &self,
+        payload: TriggerWorkflowPayload,
+    ) -> Result<(), ClientError> {
+        self.send(FrameKind::TriggerWorkflow, &payload).await
+    }
+
+    pub async fn cancel_workflow(&self, payload: CancelWorkflowPayload) -> Result<(), ClientError> {
+        self.send(FrameKind::CancelWorkflow, &payload).await
     }
 
     pub async fn open_project(
@@ -867,6 +889,22 @@ async fn handle_host_envelope(
             let _ = host_tx.send(HostEvent::McpServerNotify(payload)).await;
             true
         }
+        FrameKind::WorkflowNotify => {
+            let payload: WorkflowNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::WorkflowNotify(payload)).await;
+            true
+        }
+        FrameKind::WorkflowRunNotify => {
+            let payload: WorkflowRunNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::WorkflowRunNotify(payload)).await;
+            true
+        }
         FrameKind::TeamNotify => {
             let payload: TeamNotifyPayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
@@ -1080,7 +1118,7 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
                 "agent_start payload agent_id {} does not match stream {}",
                 payload.agent_id, envelope.stream
             );
-            AgentEvent::Start(payload)
+            AgentEvent::Start(Box::new(payload))
         }
         FrameKind::AgentError => {
             let payload: AgentErrorPayload = match envelope.parse_payload() {

@@ -8,12 +8,12 @@ use crate::types::{
 };
 use crate::{
     AgentClosedPayload, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload,
-    ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload, CommandErrorPayload,
-    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    DeleteSessionPayload, Envelope, FrameKind, HostBootstrapPayload, HostBrowseClosePayload,
-    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseListPayload,
-    HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload, ListSessionsPayload,
-    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
+    CancelWorkflowPayload, ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload,
+    CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
+    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind, HostBootstrapPayload,
+    HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
+    ListSessionsPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
     MobileAccessStatePayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
     MobilePairingCancelPayload, MobilePairingOfferPayload, MobilePairingStartPayload,
     NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
@@ -31,8 +31,9 @@ use crate::{
     TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
     TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
-    ToolExecutionCompletedData, ToolRequest, WelcomePayload, WorkbenchCreatePayload,
-    WorkbenchRemovePayload,
+    ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload, WelcomePayload,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
+    WorkflowRunNotifyPayload,
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 32;
@@ -268,6 +269,12 @@ impl ProtocolValidator {
             FrameKind::ProjectNotify => {
                 parse_host_payload::<ProjectNotifyPayload>(self, envelope, "ProjectNotify")
             }
+            FrameKind::WorkflowNotify => {
+                parse_host_payload::<WorkflowNotifyPayload>(self, envelope, "WorkflowNotify")
+            }
+            FrameKind::WorkflowRunNotify => {
+                parse_host_payload::<WorkflowRunNotifyPayload>(self, envelope, "WorkflowRunNotify")
+            }
             FrameKind::CustomAgentNotify => {
                 parse_host_payload::<CustomAgentNotifyPayload>(self, envelope, "CustomAgentNotify")
             }
@@ -331,6 +338,15 @@ impl ProtocolValidator {
             ),
             FrameKind::ClientError => {
                 parse_host_payload::<ClientErrorPayload>(self, envelope, "ClientError")
+            }
+            FrameKind::TriggerWorkflow => {
+                parse_host_payload::<TriggerWorkflowPayload>(self, envelope, "TriggerWorkflow")
+            }
+            FrameKind::CancelWorkflow => {
+                parse_host_payload::<CancelWorkflowPayload>(self, envelope, "CancelWorkflow")
+            }
+            FrameKind::WorkflowRefresh => {
+                parse_host_payload::<WorkflowRefreshPayload>(self, envelope, "WorkflowRefresh")
             }
             FrameKind::SpawnAgent => {
                 let payload: SpawnAgentPayload = envelope.parse_payload().map_err(|error| {
@@ -554,6 +570,7 @@ impl ProtocolValidator {
                     payload.parent_agent_id.as_ref(),
                     payload.team_id.as_ref(),
                     payload.team_member_id.as_ref(),
+                    payload.workflow.as_ref(),
                 ) {
                     return Err(build_violation(
                         &recent_frames,
@@ -659,6 +676,7 @@ impl ProtocolValidator {
             payload.parent_agent_id.as_ref(),
             payload.team_id.as_ref(),
             payload.team_member_id.as_ref(),
+            payload.workflow.as_ref(),
         )
         .map_err(|message| self.violation(envelope, Some(payload.backend_kind), message))?;
 
@@ -885,6 +903,7 @@ fn validate_agent_origin(
     parent_agent_id: Option<&crate::AgentId>,
     team_id: Option<&crate::TeamId>,
     team_member_id: Option<&crate::TeamMemberId>,
+    workflow: Option<&crate::AgentWorkflowMetadata>,
 ) -> Result<(), String> {
     match origin {
         AgentOrigin::BackendNative if parent_agent_id.is_none() => {
@@ -896,10 +915,14 @@ fn validate_agent_origin(
         AgentOrigin::TeamMember if team_id.is_none() || team_member_id.is_none() => {
             Err("team_member agents must include team_id and team_member_id".to_owned())
         }
+        AgentOrigin::Workflow if workflow.is_none() => {
+            Err("workflow agents must include workflow metadata".to_owned())
+        }
         AgentOrigin::User
         | AgentOrigin::AgentControl
         | AgentOrigin::SideQuestion
         | AgentOrigin::BackendNative
+        | AgentOrigin::Workflow
             if team_id.is_some() || team_member_id.is_some() =>
         {
             Err("non-team_member agents must not include team_id or team_member_id".to_owned())
@@ -908,7 +931,17 @@ fn validate_agent_origin(
         | AgentOrigin::AgentControl
         | AgentOrigin::SideQuestion
         | AgentOrigin::BackendNative
-        | AgentOrigin::TeamMember => Ok(()),
+        | AgentOrigin::TeamMember
+            if workflow.is_some() =>
+        {
+            Err("non-workflow agents must not include workflow metadata".to_owned())
+        }
+        AgentOrigin::User
+        | AgentOrigin::AgentControl
+        | AgentOrigin::SideQuestion
+        | AgentOrigin::BackendNative
+        | AgentOrigin::TeamMember
+        | AgentOrigin::Workflow => Ok(()),
     }
 }
 
@@ -1039,6 +1072,7 @@ fn validate_agent_bootstrap_event(
                 payload.parent_agent_id.as_ref(),
                 payload.team_id.as_ref(),
                 payload.team_member_id.as_ref(),
+                payload.workflow.as_ref(),
             )
             .map_err(|message| {
                 build_violation(recent_frames, envelope, Some(state.backend_kind), message)
@@ -1539,6 +1573,7 @@ mod tests {
             project_id: None,
             parent_agent_id: None,
             session_id: None,
+            workflow: None,
             created_at_ms: 0,
             instance_stream: agent_stream(),
         }
@@ -1584,6 +1619,9 @@ mod tests {
                 team_members: vec![],
                 team_member_bindings: vec![],
                 agents,
+                workflow_summaries: vec![],
+                workflow_diagnostics: vec![],
+                workflow_runs: vec![],
             },
         )
         .expect("serialize HostBootstrap")
@@ -1606,6 +1644,7 @@ mod tests {
             project_id: None,
             parent_agent_id: None,
             session_id: None,
+            workflow: None,
             created_at_ms: 0,
         }
     }
@@ -1919,6 +1958,50 @@ mod tests {
             .expect_err("user origin should not include team ids");
 
         assert!(violation.to_string().contains("non-team_member"));
+    }
+
+    #[test]
+    fn accepts_workflow_origin_with_metadata() {
+        let mut payload = new_agent_payload(AgentOrigin::Workflow, None, None);
+        payload.workflow = Some(crate::AgentWorkflowMetadata {
+            workflow_id: crate::WorkflowId("build".to_owned()),
+            workflow_run_id: crate::WorkflowRunId("run-1".to_owned()),
+        });
+
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&host_bootstrap_with_agents(vec![payload]))
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_workflow_origin_without_metadata() {
+        let mut validator = ProtocolValidator::new();
+        let violation = validator
+            .validate_envelope(&host_bootstrap_with_agents(vec![new_agent_payload(
+                AgentOrigin::Workflow,
+                None,
+                None,
+            )]))
+            .expect_err("workflow origin should require workflow metadata");
+
+        assert!(violation.to_string().contains("workflow metadata"));
+    }
+
+    #[test]
+    fn rejects_non_workflow_origin_with_workflow_metadata() {
+        let mut payload = new_agent_payload(AgentOrigin::User, None, None);
+        payload.workflow = Some(crate::AgentWorkflowMetadata {
+            workflow_id: crate::WorkflowId("build".to_owned()),
+            workflow_run_id: crate::WorkflowRunId("run-1".to_owned()),
+        });
+
+        let mut validator = ProtocolValidator::new();
+        let violation = validator
+            .validate_envelope(&host_bootstrap_with_agents(vec![payload]))
+            .expect_err("user origin should reject workflow metadata");
+
+        assert!(violation.to_string().contains("non-workflow"));
     }
 
     #[test]

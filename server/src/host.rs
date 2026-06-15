@@ -12,14 +12,15 @@ use protocol::types::{
     TeamCompactNotifyPayload, TeamCompactPayload, TeamCompactStatus,
 };
 use protocol::{
-    AgentControlStatus, AgentId, AgentInput, AgentOrigin, AgentStartPayload, BackendSetupPayload,
-    BrowseBootstrapListing, BrowseBootstrapPayload, CustomAgent, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, GitBranchName, HostAbsPath,
-    HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
-    HostSettingsPayload, ImageData, McpServerConfig, McpServerDeletePayload, McpServerId,
-    McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
-    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    AgentControlStatus, AgentId, AgentInput, AgentOrigin, AgentStartPayload, AgentWorkflowMetadata,
+    BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, CancelWorkflowPayload,
+    CustomAgent, CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    FrameKind, GitBranchName, HostAbsPath, HostBootstrapPayload, HostBrowseInitial,
+    HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload, ImageData, McpServerConfig,
+    McpServerDeletePayload, McpServerId, McpServerNotifyPayload, McpServerUpsertPayload,
+    McpTransportConfig, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
+    MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
     ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
@@ -38,8 +39,10 @@ use protocol::{
     TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
     TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
-    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, WorkbenchCreatePayload,
-    WorkbenchRemovePayload, WorkbenchRoot,
+    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowNotifyPayload,
+    WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus,
+    WorkflowStepRunId, WorkflowStepRunSnapshot,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -106,6 +109,12 @@ use crate::team_registry::{
     TeamRegistryHandle, TeamRegistrySnapshot, team_preset_validation_refs,
 };
 use crate::terminal_stream::{TerminalHandle, TerminalLaunchInfo, create_terminal};
+use crate::workflows::mcp::{
+    WORKFLOW_PROGRESS_MCP_SERVER_NAME, WorkflowFinishToolInput, WorkflowMcpHandle,
+    WorkflowReportStepToolInput,
+};
+use crate::workflows::registry::WorkflowCatalog;
+use crate::workflows::store::WorkflowRunStore;
 
 struct HostSubscriber {
     stream: Stream,
@@ -117,6 +126,7 @@ pub struct HostRuntimeConfig {
     pub debug_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
+    pub workflow_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub kiro_probe_program: Option<String>,
     pub mobile_pairing_ttl: Option<std::time::Duration>,
 }
@@ -198,6 +208,9 @@ pub(crate) struct HostState {
     pub agent_control_mcp: AgentControlMcpHandle,
     pub config_mcp: ConfigMcpHandle,
     pub review_mcp: ReviewMcpHandle,
+    pub workflow_mcp: WorkflowMcpHandle,
+    pub workflow_catalog: WorkflowCatalog,
+    pub workflow_run_store: WorkflowRunStore,
     pub mobile_access: MobileAccessHandle,
     kiro_session_schema: KiroSessionSchemaState,
     kiro_probe_program: Option<String>,
@@ -347,6 +360,7 @@ struct HostStorePaths {
     skills_index: PathBuf,
     skills_root_dir: PathBuf,
     mobile_pairings: PathBuf,
+    workflow_runs: PathBuf,
 }
 
 impl SubAgentEmitter for HostSubAgentEmitter {
@@ -586,6 +600,9 @@ impl HostHandle {
                 return Vec::new();
             }
         };
+        let workflow_summaries = state.workflow_catalog.summaries();
+        let workflow_diagnostics = state.workflow_catalog.diagnostics();
+        let workflow_runs = state.workflow_run_store.list();
 
         let agent_ids = state.registry.agent_ids();
         let mut agents = Vec::new();
@@ -617,6 +634,7 @@ impl HostHandle {
                 project_id: start.project_id.clone(),
                 parent_agent_id: start.parent_agent_id.clone(),
                 session_id: start.session_id.clone(),
+                workflow: start.workflow.clone(),
                 created_at_ms: start.created_at_ms,
                 instance_stream: instance_stream.clone(),
             };
@@ -642,6 +660,9 @@ impl HostHandle {
             team_members: team_snapshot.members,
             team_member_bindings: team_snapshot.bindings,
             agents,
+            workflow_summaries,
+            workflow_diagnostics,
+            workflow_runs,
         };
 
         let payload = serde_json::to_value(&bootstrap)
@@ -1340,6 +1361,7 @@ impl HostHandle {
                 start.origin,
                 None,
                 team_context.clone(),
+                None,
             )
             .await;
         let new_session_id = match self.wait_for_agent_session_id_result(&new_agent_id).await {
@@ -1511,7 +1533,7 @@ impl HostHandle {
         payload: SpawnAgentPayload,
         origin: AgentOrigin,
     ) -> AgentId {
-        self.spawn_agent_with_origin_and_config(payload, origin, None)
+        self.spawn_agent_with_origin_and_config(payload, origin, None, None)
             .await
     }
 
@@ -1520,12 +1542,14 @@ impl HostHandle {
         payload: SpawnAgentPayload,
         origin: AgentOrigin,
         resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
+        workflow: Option<AgentWorkflowMetadata>,
     ) -> AgentId {
         self.spawn_agent_with_origin_config_and_team(
             payload,
             origin,
             resolved_spawn_config_override,
             None,
+            workflow,
         )
         .await
     }
@@ -1536,6 +1560,7 @@ impl HostHandle {
         origin: AgentOrigin,
         resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
         team_context: Option<TeamSpawnContext>,
+        workflow: Option<AgentWorkflowMetadata>,
     ) -> AgentId {
         tracing::info!(
             parent_agent_id = ?payload.parent_agent_id,
@@ -1755,6 +1780,7 @@ impl HostHandle {
                     team_member_id: team_context
                         .as_ref()
                         .map(|context| context.team_member_id.clone()),
+                    workflow: workflow.clone(),
                     parent_agent_id: payload.parent_agent_id,
                     parent_session_id,
                     project_id,
@@ -1799,6 +1825,7 @@ impl HostHandle {
                             team_member_id: team_context
                                 .as_ref()
                                 .map(|context| context.team_member_id.clone()),
+                            workflow: workflow.clone(),
                             parent_agent_id: payload.parent_agent_id,
                             parent_session_id,
                             project_id: payload.project_id.clone(),
@@ -1850,6 +1877,7 @@ impl HostHandle {
                             team_member_id: team_context
                                 .as_ref()
                                 .map(|context| context.team_member_id.clone()),
+                            workflow: workflow.clone(),
                             parent_agent_id: payload.parent_agent_id,
                             parent_session_id,
                             project_id: record.project_id.clone(),
@@ -2069,6 +2097,7 @@ impl HostHandle {
                     team_member_id: team_context
                         .as_ref()
                         .map(|context| context.team_member_id.clone()),
+                    workflow: workflow.clone(),
                     parent_agent_id: payload.parent_agent_id,
                     parent_session_id,
                     project_id,
@@ -2128,6 +2157,7 @@ impl HostHandle {
                             custom_agent_id: payload.custom_agent_id,
                             team_id: None,
                             team_member_id: None,
+                            workflow: None,
                             parent_agent_id: payload.parent_agent_id,
                             parent_session_id: Some(from_session_id.clone()),
                             project_id: payload.project_id,
@@ -2379,6 +2409,7 @@ impl HostHandle {
                     custom_agent_id: effective_custom_agent_id,
                     team_id: None,
                     team_member_id: None,
+                    workflow: None,
                     parent_agent_id: payload.parent_agent_id,
                     parent_session_id: Some(from_session_id.clone()),
                     project_id,
@@ -3807,6 +3838,7 @@ impl HostHandle {
                     team_id: plan.team.id.clone(),
                     team_member_id: plan.member.id.clone(),
                 }),
+                None,
             )
             .await;
         match self.wait_for_agent_session_id_result(&agent_id).await {
@@ -4697,6 +4729,10 @@ impl HostHandle {
         self.state.lock().await.review_mcp.url.clone()
     }
 
+    pub async fn workflow_mcp_url(&self) -> String {
+        self.state.lock().await.workflow_mcp.url.clone()
+    }
+
     pub(crate) async fn propose_review_comment(
         &self,
         review_id: ReviewId,
@@ -4709,10 +4745,572 @@ impl HostHandle {
         registry.ai_suggestion(review_id, suggestion).await
     }
 
-    /// Spawn an agent and return its AgentId (for use by agent-control MCP).
-    pub(crate) async fn spawn_agent_and_return_id(&self, payload: SpawnAgentPayload) -> AgentId {
-        self.spawn_agent_with_origin(payload, AgentOrigin::AgentControl)
+    /// Spawn an agent from agent-control MCP, inheriting workflow context from
+    /// the calling agent when applicable.
+    pub(crate) async fn spawn_agent_from_agent_control(
+        &self,
+        mut payload: SpawnAgentPayload,
+        caller_agent_id: Option<&AgentId>,
+    ) -> Result<AgentId, String> {
+        let workflow = if let Some(caller_agent_id) = caller_agent_id {
+            self.workflow_metadata_for_agent(caller_agent_id).await
+        } else {
+            None
+        };
+        if let Some(workflow) = workflow {
+            let backend_kind = match &payload.params {
+                SpawnAgentParams::New { backend_kind, .. } => *backend_kind,
+                SpawnAgentParams::Resume { .. } | SpawnAgentParams::Fork { .. } => {
+                    return Err(
+                        "workflow child agents spawned through MCP must use kind=new".to_owned(),
+                    );
+                }
+            };
+            self.ensure_workflow_backend_declared(&workflow, backend_kind)
+                .await?;
+            if let Some(caller_agent_id) = caller_agent_id {
+                payload.parent_agent_id = Some(caller_agent_id.clone());
+            }
+            let agent_id = self
+                .spawn_agent_with_origin_and_config(
+                    payload,
+                    AgentOrigin::Workflow,
+                    None,
+                    Some(workflow.clone()),
+                )
+                .await;
+            self.workflow_note_agent(&workflow.workflow_run_id, agent_id.clone(), false)
+                .await?;
+            return Ok(agent_id);
+        }
+
+        Ok(self
+            .spawn_agent_with_origin(payload, AgentOrigin::AgentControl)
+            .await)
+    }
+
+    async fn workflow_metadata_for_agent(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<AgentWorkflowMetadata> {
+        self.state
+            .lock()
             .await
+            .registry
+            .agent_handle(agent_id)
+            .map(|handle| handle.snapshot().workflow)
+            .unwrap_or(None)
+    }
+
+    async fn ensure_workflow_backend_declared(
+        &self,
+        workflow: &AgentWorkflowMetadata,
+        backend_kind: protocol::BackendKind,
+    ) -> Result<(), String> {
+        let declared = {
+            let state = self.state.lock().await;
+            let run = state
+                .workflow_run_store
+                .get(&workflow.workflow_run_id)
+                .ok_or_else(|| format!("unknown workflow run {}", workflow.workflow_run_id))?;
+            state
+                .workflow_catalog
+                .resolve(&workflow.workflow_id, run.project_id.as_ref())
+                .map(|definition| definition.summary.declared_backends)
+        }
+        .ok_or_else(|| format!("unknown workflow_id {}", workflow.workflow_id))?;
+        if declared.contains(&backend_kind) {
+            Ok(())
+        } else {
+            Err(format!(
+                "workflow {} did not declare backend {:?}",
+                workflow.workflow_id, backend_kind
+            ))
+        }
+    }
+
+    pub(crate) async fn refresh_workflows(&self) -> AppResult<()> {
+        let payload = {
+            let mut state = self.state.lock().await;
+            let projects = state.project_store.lock().await.list().map_err(|error| {
+                AppError::internal_message(
+                    "workflow_refresh",
+                    error.to_string(),
+                    anyhow!(error.to_string()),
+                )
+            })?;
+            state.workflow_catalog = WorkflowCatalog::discover(&projects);
+            WorkflowNotifyPayload {
+                summaries: state.workflow_catalog.summaries(),
+                diagnostics: state.workflow_catalog.diagnostics(),
+            }
+        };
+        let mut state = self.state.lock().await;
+        fan_out_workflow_notify(&mut state, payload).await;
+        Ok(())
+    }
+
+    pub(crate) async fn trigger_workflow(&self, payload: TriggerWorkflowPayload) -> AppResult<()> {
+        const OPERATION: &str = "trigger_workflow";
+        let workflow_id = payload.workflow_id;
+        let project_id = payload.project_id;
+        let inputs = payload.inputs;
+        let (definition, workspace_roots, workflow_mcp, settings, use_mock_backend) = {
+            let state = self.state.lock().await;
+            let definition = state
+                .workflow_catalog
+                .resolve(&workflow_id, project_id.as_ref())
+                .ok_or_else(|| {
+                    AppError::not_found(OPERATION, format!("unknown workflow {workflow_id}"))
+                })?;
+            let workspace_roots = if let Some(project_id) = project_id.as_ref() {
+                let project = state
+                    .project_store
+                    .lock()
+                    .await
+                    .get(project_id)
+                    .ok_or_else(|| {
+                        AppError::not_found(OPERATION, format!("unknown project {project_id}"))
+                    })?;
+                project
+                    .root_paths()
+                    .into_iter()
+                    .map(|root| root.0)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let settings = state.settings_store.lock().await.get().map_err(|error| {
+                AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+            })?;
+            (
+                definition,
+                workspace_roots,
+                state.workflow_mcp.clone(),
+                settings,
+                state.use_mock_backend,
+            )
+        };
+
+        let now = crate::agent::now_ms();
+        let run_id = WorkflowRunId(Uuid::new_v4().to_string());
+        let run = WorkflowRunSnapshot {
+            id: run_id.clone(),
+            workflow_id: definition.summary.id.clone(),
+            workflow_name: definition.summary.name.clone(),
+            source: definition.summary.source.clone(),
+            project_id: project_id.clone(),
+            coordinator_agent_id: None,
+            coordinator: definition.summary.coordinator.clone(),
+            status: WorkflowRunSnapshotStatus::Running,
+            inputs: inputs.clone(),
+            steps: Vec::new(),
+            agent_ids: Vec::new(),
+            summary: None,
+            error: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+            completed_at_ms: None,
+        };
+        {
+            let mut state = self.state.lock().await;
+            state
+                .workflow_run_store
+                .upsert(run.clone())
+                .map_err(|error| {
+                    AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+                })?;
+            fan_out_workflow_run_notify(&mut state, run).await;
+        }
+
+        let prompt = crate::workflows::runner::build_coordinator_prompt(
+            &run_id,
+            &definition.summary,
+            &definition.body,
+            &inputs,
+        );
+        let workflow_metadata = AgentWorkflowMetadata {
+            workflow_id: definition.summary.id.clone(),
+            workflow_run_id: run_id.clone(),
+        };
+        let mut startup_mcp_servers = {
+            let state = self.state.lock().await;
+            startup_mcp_servers_for_settings(
+                &settings,
+                &workspace_roots,
+                &state.debug_mcp,
+                &state.agent_control_mcp,
+                &state.config_mcp,
+                None,
+            )
+        };
+        if !workflow_mcp.url.is_empty() {
+            startup_mcp_servers.push(StartupMcpServer {
+                name: WORKFLOW_PROGRESS_MCP_SERVER_NAME.to_owned(),
+                transport: StartupMcpTransport::Http {
+                    url: workflow_mcp.url.clone(),
+                    headers: HashMap::new(),
+                    bearer_token_env_var: None,
+                },
+            });
+        }
+        let resolved_spawn_config = ResolvedSpawnConfig {
+            access_mode: definition.summary.coordinator.access_mode,
+            ..Default::default()
+        };
+        let request = ResolvedSpawnRequest {
+            name: format!("Workflow: {}", definition.summary.name),
+            origin: AgentOrigin::Workflow,
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            workflow: Some(workflow_metadata),
+            parent_agent_id: None,
+            parent_session_id: None,
+            project_id,
+            backend_kind: definition.summary.coordinator.backend,
+            workspace_roots,
+            initial_input: Some(SendMessagePayload {
+                message: prompt,
+                images: None,
+                origin: None,
+                tool_response: None,
+            }),
+            cost_hint: None,
+            session_settings: None,
+            session_settings_schema: None,
+            startup_mcp_servers,
+            resolved_spawn_config,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            startup_warning: None,
+            startup_failure: None,
+            initial_alias: Some(InitialAgentAlias {
+                name: format!("Workflow: {}", definition.summary.name),
+                persistence: InitialAgentAliasPersistence::User,
+            }),
+            use_mock_backend,
+        };
+        let coordinator_agent_id = self.spawn_resolved_agent(request).await;
+        self.workflow_note_agent(&run_id, coordinator_agent_id.clone(), true)
+            .await
+            .map_err(|error| {
+                AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+            })?;
+        self.spawn_workflow_completion_watcher(run_id, coordinator_agent_id);
+        Ok(())
+    }
+
+    pub(crate) async fn cancel_workflow(&self, payload: CancelWorkflowPayload) -> AppResult<()> {
+        const OPERATION: &str = "cancel_workflow";
+        let run = {
+            let state = self.state.lock().await;
+            state
+                .workflow_run_store
+                .get(&payload.run_id)
+                .ok_or_else(|| {
+                    AppError::not_found(
+                        OPERATION,
+                        format!("unknown workflow run {}", payload.run_id),
+                    )
+                })?
+        };
+        if is_workflow_terminal(run.status) {
+            return Ok(());
+        }
+        let mut interrupt_ids = run.agent_ids.clone();
+        if let Some(coordinator) = run.coordinator_agent_id.as_ref() {
+            let subtree = {
+                let state = self.state.lock().await;
+                state.registry.agent_subtree_post_order(coordinator)
+            };
+            interrupt_ids.extend(subtree.into_iter().map(|(id, _)| id));
+        }
+        interrupt_ids.sort_by(|left, right| left.0.cmp(&right.0));
+        interrupt_ids.dedup();
+        for agent_id in interrupt_ids {
+            let _ = self.interrupt_agent(&agent_id).await;
+        }
+        self.workflow_update_run_allow_terminal(payload.run_id, |run| {
+            if is_workflow_terminal(run.status) {
+                return;
+            }
+            let now = crate::agent::now_ms();
+            run.status = WorkflowRunSnapshotStatus::Cancelled;
+            run.error = Some("Workflow cancelled by user".to_owned());
+            run.updated_at_ms = now;
+            run.completed_at_ms = Some(now);
+        })
+        .await
+        .map_err(|error| AppError::internal_message(OPERATION, error.clone(), anyhow!(error)))?;
+        Ok(())
+    }
+
+    pub(crate) async fn workflow_report_step(
+        &self,
+        caller_agent_id: AgentId,
+        input: WorkflowReportStepToolInput,
+    ) -> Result<WorkflowRunSnapshot, String> {
+        let metadata = self
+            .workflow_metadata_for_agent(&caller_agent_id)
+            .await
+            .ok_or_else(|| "calling agent is not part of a workflow".to_owned())?;
+        let status = crate::workflows::mcp::parse_step_status(input.status.as_deref())?;
+        let referenced_agent = input
+            .agent_id
+            .as_deref()
+            .map(parse_workflow_agent_id)
+            .transpose()?;
+        if let Some(agent_id) = referenced_agent.as_ref() {
+            self.ensure_agent_belongs_to_workflow(&metadata.workflow_run_id, agent_id)
+                .await?;
+        }
+        let step_id = input
+            .step_id
+            .filter(|value| !value.trim().is_empty())
+            .map(WorkflowStepRunId)
+            .unwrap_or_else(|| WorkflowStepRunId(Uuid::new_v4().to_string()));
+        let parent_step_id = input
+            .parent_step_id
+            .filter(|value| !value.trim().is_empty())
+            .map(WorkflowStepRunId);
+        let title = input
+            .title
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Workflow step".to_owned());
+        self.workflow_update_run(metadata.workflow_run_id, move |run| {
+            let now = crate::agent::now_ms();
+            if let Some(step) = run.steps.iter_mut().find(|step| step.id == step_id) {
+                step.title = title.clone();
+                step.status = status;
+                step.agent_id = referenced_agent.clone();
+                step.message = input.message.clone();
+                step.updated_at_ms = now;
+                if matches!(
+                    status,
+                    protocol::WorkflowStepRunSnapshotStatus::Completed
+                        | protocol::WorkflowStepRunSnapshotStatus::Failed
+                        | protocol::WorkflowStepRunSnapshotStatus::Cancelled
+                ) {
+                    step.completed_at_ms = Some(now);
+                }
+            } else {
+                run.steps.push(WorkflowStepRunSnapshot {
+                    id: step_id.clone(),
+                    parent_step_id: parent_step_id.clone(),
+                    title: title.clone(),
+                    status,
+                    agent_id: referenced_agent.clone(),
+                    message: input.message.clone(),
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                    completed_at_ms: if matches!(
+                        status,
+                        protocol::WorkflowStepRunSnapshotStatus::Completed
+                            | protocol::WorkflowStepRunSnapshotStatus::Failed
+                            | protocol::WorkflowStepRunSnapshotStatus::Cancelled
+                    ) {
+                        Some(now)
+                    } else {
+                        None
+                    },
+                });
+            }
+            run.updated_at_ms = now;
+        })
+        .await
+    }
+
+    pub(crate) async fn workflow_finish(
+        &self,
+        caller_agent_id: AgentId,
+        input: WorkflowFinishToolInput,
+    ) -> Result<WorkflowRunSnapshot, String> {
+        let metadata = self
+            .workflow_metadata_for_agent(&caller_agent_id)
+            .await
+            .ok_or_else(|| "calling agent is not part of a workflow".to_owned())?;
+        let status = match input.status.as_deref().map(str::trim) {
+            Some("completed" | "complete" | "success" | "succeeded") => {
+                WorkflowRunSnapshotStatus::Completed
+            }
+            Some("failed" | "error") => WorkflowRunSnapshotStatus::Failed,
+            Some("cancelled" | "canceled") => WorkflowRunSnapshotStatus::Cancelled,
+            Some(other) => return Err(format!("unknown workflow finish status {other:?}")),
+            None if input.success == Some(false) => WorkflowRunSnapshotStatus::Failed,
+            None => WorkflowRunSnapshotStatus::Completed,
+        };
+        self.workflow_update_run(metadata.workflow_run_id, move |run| {
+            let now = crate::agent::now_ms();
+            run.status = status;
+            run.summary = input.summary.clone();
+            run.error = input.error.clone();
+            run.updated_at_ms = now;
+            run.completed_at_ms = Some(now);
+        })
+        .await
+    }
+
+    async fn workflow_note_agent(
+        &self,
+        run_id: &WorkflowRunId,
+        agent_id: AgentId,
+        coordinator: bool,
+    ) -> Result<WorkflowRunSnapshot, String> {
+        let run_id = run_id.clone();
+        self.workflow_update_run_allow_terminal(run_id, move |run| {
+            if coordinator {
+                run.coordinator_agent_id = Some(agent_id.clone());
+            }
+            if !run.agent_ids.contains(&agent_id) {
+                run.agent_ids.push(agent_id);
+            }
+            run.updated_at_ms = crate::agent::now_ms();
+        })
+        .await
+    }
+
+    async fn workflow_update_run<F>(
+        &self,
+        run_id: WorkflowRunId,
+        update: F,
+    ) -> Result<WorkflowRunSnapshot, String>
+    where
+        F: FnOnce(&mut WorkflowRunSnapshot),
+    {
+        self.workflow_update_run_inner(run_id, false, update).await
+    }
+
+    async fn workflow_update_run_allow_terminal<F>(
+        &self,
+        run_id: WorkflowRunId,
+        update: F,
+    ) -> Result<WorkflowRunSnapshot, String>
+    where
+        F: FnOnce(&mut WorkflowRunSnapshot),
+    {
+        self.workflow_update_run_inner(run_id, true, update).await
+    }
+
+    async fn workflow_update_run_inner<F>(
+        &self,
+        run_id: WorkflowRunId,
+        allow_terminal_update: bool,
+        update: F,
+    ) -> Result<WorkflowRunSnapshot, String>
+    where
+        F: FnOnce(&mut WorkflowRunSnapshot),
+    {
+        let mut state = self.state.lock().await;
+        let mut run = state
+            .workflow_run_store
+            .get(&run_id)
+            .ok_or_else(|| format!("unknown workflow run {run_id}"))?;
+        if !allow_terminal_update && is_workflow_terminal(run.status) {
+            return Err(format!(
+                "workflow run {run_id} is already {}",
+                workflow_status_label(run.status)
+            ));
+        }
+        update(&mut run);
+        state.workflow_run_store.upsert(run.clone())?;
+        fan_out_workflow_run_notify(&mut state, run.clone()).await;
+        Ok(run)
+    }
+
+    async fn ensure_agent_belongs_to_workflow(
+        &self,
+        run_id: &WorkflowRunId,
+        agent_id: &AgentId,
+    ) -> Result<(), String> {
+        let run = {
+            let state = self.state.lock().await;
+            state
+                .workflow_run_store
+                .get(run_id)
+                .ok_or_else(|| format!("unknown workflow run {run_id}"))?
+        };
+        if run.agent_ids.contains(agent_id) {
+            return Ok(());
+        }
+        if let Some(coordinator) = run.coordinator_agent_id.as_ref() {
+            let subtree = {
+                let state = self.state.lock().await;
+                state.registry.agent_subtree_post_order(coordinator)
+            };
+            if subtree.iter().any(|(id, _)| id == agent_id) {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "agent_id {agent_id} is not associated with workflow run {run_id}"
+        ))
+    }
+
+    fn spawn_workflow_completion_watcher(
+        &self,
+        run_id: WorkflowRunId,
+        coordinator_agent_id: AgentId,
+    ) {
+        let host = self.clone();
+        tokio::spawn(async move {
+            let mut status_rx = host.subscribe_agent_status_changes().await;
+            loop {
+                let run_status = {
+                    let state = host.state.lock().await;
+                    state.workflow_run_store.get(&run_id).map(|run| run.status)
+                };
+                let Some(run_status) = run_status else {
+                    return;
+                };
+                if is_workflow_terminal(run_status) {
+                    return;
+                }
+                match host.agent_status_snapshot(&coordinator_agent_id).await {
+                    Some(status) if status.terminated => {
+                        let _ = host
+                            .workflow_fail_if_running(
+                                run_id.clone(),
+                                "Workflow coordinator ended before calling tyde_workflow_finish",
+                            )
+                            .await;
+                        return;
+                    }
+                    None => {
+                        let _ = host
+                            .workflow_fail_if_running(
+                                run_id.clone(),
+                                "Workflow coordinator closed before calling tyde_workflow_finish",
+                            )
+                            .await;
+                        return;
+                    }
+                    Some(_) => {}
+                }
+                if status_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    async fn workflow_fail_if_running(
+        &self,
+        run_id: WorkflowRunId,
+        message: &'static str,
+    ) -> Result<(), String> {
+        self.workflow_update_run_allow_terminal(run_id, |run| {
+            if run.status != WorkflowRunSnapshotStatus::Running {
+                return;
+            }
+            let now = crate::agent::now_ms();
+            run.status = WorkflowRunSnapshotStatus::Failed;
+            run.error = Some(message.to_owned());
+            run.updated_at_ms = now;
+            run.completed_at_ms = Some(now);
+        })
+        .await
+        .map(|_| ())
     }
 
     fn schedule_agent_session_registration(
@@ -4843,6 +5441,7 @@ impl HostHandle {
             name: request.name.clone(),
             origin: AgentOrigin::BackendNative,
             custom_agent_id: parent_start.custom_agent_id.clone(),
+            workflow: None,
             parent_agent_id: parent_start.agent_id.clone(),
             project_id: parent_start.project_id.clone(),
             backend_kind: parent_start.backend_kind,
@@ -5847,6 +6446,7 @@ impl HostHandle {
             custom_agent_id,
             team_id: None,
             team_member_id: None,
+            workflow: None,
             parent_agent_id: None,
             parent_session_id: None,
             project_id: Some(project_id.clone()),
@@ -6068,6 +6668,7 @@ impl HostHandle {
                 payload,
                 protocol::AgentOrigin::AgentControl,
                 Some(reviewer_spawn_config),
+                None,
             )
             .await;
         if let Some(agent_handle) = self.agent_handle(&agent_id).await {
@@ -6807,6 +7408,10 @@ pub fn spawn_host() -> HostHandle {
             skills_index: skills_index_path,
             skills_root_dir,
             mobile_pairings: mobile_pairings_path,
+            workflow_runs: crate::paths::home_dir()
+                .unwrap_or_else(|err| panic!("failed to resolve home dir: {err}"))
+                .join(".tyde")
+                .join("workflow_runs.json"),
         },
         false,
         HostRuntimeConfig::default(),
@@ -6869,6 +7474,7 @@ pub fn spawn_host_with_store_paths_and_runtime_config(
             skills_index: parent.join("skills.json"),
             skills_root_dir: parent.join("skills"),
             mobile_pairings: MobilePairingsStore::path_for_store_parent(&parent),
+            workflow_runs: parent.join("workflow_runs.json"),
         },
         false,
         runtime_config,
@@ -6917,6 +7523,7 @@ pub fn spawn_host_with_mock_backend_and_runtime_config(
             skills_index: parent.join("skills.json"),
             skills_root_dir: parent.join("skills"),
             mobile_pairings: MobilePairingsStore::path_for_store_parent(&parent),
+            workflow_runs: parent.join("workflow_runs.json"),
         },
         true,
         runtime_config,
@@ -6931,6 +7538,8 @@ fn spawn_host_inner(
     let (session_store, purged_gemini_session_ids) =
         SessionStore::load_with_migration(paths.session)?;
     let project_store = ProjectStore::load(paths.project)?;
+    let workflow_catalog = WorkflowCatalog::discover(&project_store.list()?);
+    let workflow_run_store = WorkflowRunStore::load(paths.workflow_runs)?;
     let review_store = ReviewStore::load(paths.review)?;
     let settings_store = HostSettingsStore::load(paths.settings)?;
     let host_settings = settings_store.get()?;
@@ -6993,6 +7602,7 @@ fn spawn_host_inner(
     let agent_control_mcp_placeholder = AgentControlMcpHandle { url: String::new() };
     let config_mcp_placeholder = ConfigMcpHandle { url: String::new() };
     let review_mcp_placeholder = ReviewMcpHandle { url: String::new() };
+    let workflow_mcp_placeholder = WorkflowMcpHandle { url: String::new() };
     let host = HostHandle {
         state: Arc::new(Mutex::new(HostState {
             registry: AgentRegistry::new(),
@@ -7012,6 +7622,9 @@ fn spawn_host_inner(
             agent_control_mcp: agent_control_mcp_placeholder,
             config_mcp: config_mcp_placeholder,
             review_mcp: review_mcp_placeholder,
+            workflow_mcp: workflow_mcp_placeholder,
+            workflow_catalog,
+            workflow_run_store,
             mobile_access: mobile_access.clone(),
             kiro_session_schema: KiroSessionSchemaState::Pending,
             kiro_probe_program: runtime_config.kiro_probe_program.clone(),
@@ -7093,6 +7706,25 @@ fn spawn_host_inner(
         .try_lock()
         .expect("newly created host state must be unlocked")
         .review_mcp = review_mcp;
+
+    let workflow_mcp = match crate::workflows::mcp::start_server(
+        runtime_config.workflow_mcp_bind_addr,
+        host.clone(),
+    ) {
+        Ok(handle) => handle,
+        Err(err) if runtime_config.workflow_mcp_bind_addr.is_none() => {
+            tracing::warn!(
+                "workflow MCP server unavailable; continuing without it: {}",
+                err
+            );
+            WorkflowMcpHandle { url: String::new() }
+        }
+        Err(err) => return Err(err),
+    };
+    host.state
+        .try_lock()
+        .expect("newly created host state must be unlocked")
+        .workflow_mcp = workflow_mcp;
 
     spawn_host_sub_agent_task(host.clone(), sub_agent_spawn_rx);
     spawn_host_review_delivery_task(host.clone(), review_delivery_rx);
@@ -7482,6 +8114,30 @@ pub(crate) fn mcp_url_for_agent(base_url: &str, agent_id: &AgentId) -> String {
     )
 }
 
+fn is_workflow_terminal(status: WorkflowRunSnapshotStatus) -> bool {
+    matches!(
+        status,
+        WorkflowRunSnapshotStatus::Completed
+            | WorkflowRunSnapshotStatus::Failed
+            | WorkflowRunSnapshotStatus::Cancelled
+    )
+}
+
+fn workflow_status_label(status: WorkflowRunSnapshotStatus) -> &'static str {
+    match status {
+        WorkflowRunSnapshotStatus::Running => "running",
+        WorkflowRunSnapshotStatus::Completed => "completed",
+        WorkflowRunSnapshotStatus::Failed => "failed",
+        WorkflowRunSnapshotStatus::Cancelled => "cancelled",
+    }
+}
+
+fn parse_workflow_agent_id(value: &str) -> Result<AgentId, String> {
+    let trimmed = value.trim();
+    Uuid::parse_str(trimmed).map_err(|_| format!("invalid workflow agent_id {value:?}"))?;
+    Ok(AgentId(trimmed.to_owned()))
+}
+
 fn percent_encode_query_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -7519,6 +8175,7 @@ async fn emit_new_agent_for_stream(
         project_id: start.project_id.clone(),
         parent_agent_id: start.parent_agent_id.clone(),
         session_id: start.session_id.clone(),
+        workflow: start.workflow.clone(),
         created_at_ms: start.created_at_ms,
         instance_stream: instance_stream.clone(),
     };
@@ -7688,6 +8345,49 @@ async fn fan_out_mcp_server_notify(state: &mut HostState, payload: McpServerNoti
             continue;
         };
         if emit_mcp_server_notify_for_subscriber(&payload, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
+async fn fan_out_workflow_notify(state: &mut HostState, payload: WorkflowNotifyPayload) {
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_workflow_notify_for_subscriber(&payload, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
+async fn fan_out_workflow_run_notify(state: &mut HostState, run: WorkflowRunSnapshot) {
+    let payload = WorkflowRunNotifyPayload { run };
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_workflow_run_notify_for_subscriber(&payload, subscriber)
             .await
             .is_err()
         {
@@ -8108,6 +8808,28 @@ async fn emit_mcp_server_notify_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::McpServerNotify, payload)
+}
+
+async fn emit_workflow_notify_for_subscriber(
+    payload: &WorkflowNotifyPayload,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(payload)
+        .expect("failed to serialize WorkflowNotify payload for host stream fanout");
+    subscriber
+        .stream
+        .send_value(FrameKind::WorkflowNotify, payload)
+}
+
+async fn emit_workflow_run_notify_for_subscriber(
+    payload: &WorkflowRunNotifyPayload,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(payload)
+        .expect("failed to serialize WorkflowRunNotify payload for host stream fanout");
+    subscriber
+        .stream
+        .send_value(FrameKind::WorkflowRunNotify, payload)
 }
 
 async fn emit_host_settings_for_subscriber(
@@ -9541,6 +10263,7 @@ mod tests {
                 },
                 AgentOrigin::User,
                 Some(resolved),
+                None,
                 None,
             )
             .await;

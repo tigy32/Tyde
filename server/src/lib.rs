@@ -22,6 +22,7 @@ pub(crate) mod stream;
 pub(crate) mod sub_agent;
 pub(crate) mod team_registry;
 pub(crate) mod terminal_stream;
+pub(crate) mod workflows;
 
 pub use backend::{acp, antigravity, claude, codex, kiro, subprocess};
 

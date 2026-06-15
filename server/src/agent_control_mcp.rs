@@ -621,6 +621,7 @@ async fn do_spawn_agent(
         .as_deref()
         .map(parse_agent_id)
         .transpose()?;
+    let caller_agent_id = request_agent_id.clone();
     let parent_agent_id = explicit_parent.or(request_agent_id);
     let requested_name = input.name.filter(|value| !value.trim().is_empty());
 
@@ -643,7 +644,9 @@ async fn do_spawn_agent(
         },
     };
 
-    let agent_id = host.spawn_agent_and_return_id(payload).await;
+    let agent_id = host
+        .spawn_agent_from_agent_control(payload, caller_agent_id.as_ref())
+        .await?;
     let status = host.agent_status_snapshot(&agent_id).await;
     let agent_status = status
         .as_ref()

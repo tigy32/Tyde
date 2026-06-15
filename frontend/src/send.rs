@@ -3,17 +3,19 @@ use std::collections::HashMap;
 
 use protocol::types::{AgentCompactPayload, TeamCompactPayload};
 use protocol::{
-    CloseAgentPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
+    CancelWorkflowPayload, CloseAgentPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
     CustomAgentUpsertPayload, Envelope, FrameKind, ImageData, McpServerConfig,
     McpServerDeletePayload, McpServerId, McpServerUpsertPayload, MobileDeviceId,
     MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferId,
-    MobilePairingStartPayload, SkillRefreshPayload, Steering, SteeringDeletePayload, SteeringId,
-    SteeringUpsertPayload, StreamPath, TeamDeletePayload, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftId,
-    TeamDraftMemberEdit, TeamDraftMemberId, TeamDraftShufflePayload, TeamDraftShuffleScope,
-    TeamDraftUpdatePayload, TeamId, TeamMemberActivatePayload, TeamMemberCreatePayload,
-    TeamMemberCreateSpec, TeamMemberDeletePayload, TeamMemberId, TeamMemberShufflePayload,
-    TeamMemberUpdatePayload, TeamSetManagerPayload, TeamTemplateId,
+    MobilePairingStartPayload, ProjectId, SkillRefreshPayload, Steering, SteeringDeletePayload,
+    SteeringId, SteeringUpsertPayload, StreamPath, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftId, TeamDraftMemberEdit, TeamDraftMemberId,
+    TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload, TeamId,
+    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
+    TeamMemberDeletePayload, TeamMemberId, TeamMemberShufflePayload, TeamMemberUpdatePayload,
+    TeamSetManagerPayload, TeamTemplateId, TriggerWorkflowPayload, WorkflowId,
+    WorkflowRefreshPayload, WorkflowRunId,
 };
 use serde::Serialize;
 
@@ -265,6 +267,49 @@ pub async fn skill_refresh(host_id: &str, host_stream: StreamPath) -> Result<(),
         host_stream,
         FrameKind::SkillRefresh,
         &SkillRefreshPayload {},
+    )
+    .await
+}
+
+pub async fn workflow_refresh(host_id: &str, host_stream: StreamPath) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::WorkflowRefresh,
+        &WorkflowRefreshPayload::default(),
+    )
+    .await
+}
+
+pub async fn trigger_workflow(
+    host_id: &str,
+    host_stream: StreamPath,
+    workflow_id: WorkflowId,
+    project_id: Option<ProjectId>,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TriggerWorkflow,
+        &TriggerWorkflowPayload {
+            workflow_id,
+            project_id,
+            inputs: HashMap::new(),
+        },
+    )
+    .await
+}
+
+pub async fn cancel_workflow(
+    host_id: &str,
+    host_stream: StreamPath,
+    run_id: WorkflowRunId,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::CancelWorkflow,
+        &CancelWorkflowPayload { run_id },
     )
     .await
 }

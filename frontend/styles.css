@@ -9274,3 +9274,189 @@ pre.tool-error-pre {
     color: var(--text-secondary);
     padding: var(--space-3);
 }
+
+/* ===== Workflows Panel ===== */
+.agent-card-workflow-badge {
+    font-size: 0.69rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--accent-secondary, #8ab4ff);
+    padding: 0.05rem 0.35rem;
+    border: 1px solid var(--accent-secondary, #8ab4ff);
+    border-radius: 3px;
+    margin-left: 0.3rem;
+}
+
+.workflows-panel,
+.workflows-panel-body {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.workflows-panel {
+    height: 100%;
+}
+
+.workflows-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-3);
+    border-bottom: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.1));
+}
+
+.workflows-panel-body {
+    gap: var(--space-4);
+    overflow: auto;
+    padding: var(--space-3);
+}
+
+.workflow-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.workflow-section h3 {
+    margin: 0;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-tertiary);
+}
+
+.workflow-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.1));
+    border-radius: 8px;
+    background: var(--surface-secondary, rgba(255, 255, 255, 0.03));
+}
+
+.catalog-card {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.workflow-card-main {
+    min-width: 0;
+}
+
+.workflow-card-title {
+    font-weight: 650;
+    color: var(--text-primary);
+}
+
+.workflow-card-description,
+.workflow-card-meta,
+.workflow-step-message,
+.workflow-run-summary {
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+}
+
+.workflow-card-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-top: var(--space-1);
+}
+
+.workflow-run-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-3);
+}
+
+.workflow-status {
+    font-weight: 650;
+}
+
+.workflow-status.running { color: var(--accent-primary); }
+.workflow-status.completed { color: var(--success); }
+.workflow-status.failed { color: var(--error); }
+.workflow-status.cancelled { color: var(--text-tertiary); }
+
+.workflow-diagnostic {
+    border-radius: 6px;
+    padding: var(--space-2);
+    font-size: 0.82rem;
+}
+
+.workflow-diagnostic.error {
+    color: var(--error);
+    background: rgba(255, 80, 80, 0.08);
+}
+
+.workflow-diagnostic.warning {
+    color: var(--warning, #f0c36a);
+    background: rgba(240, 195, 106, 0.08);
+}
+
+.workflow-run-error {
+    color: var(--error);
+    font-size: 0.82rem;
+}
+
+.workflow-agent-list,
+.workflow-step-tree,
+.workflow-step-children {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.workflow-agent-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    width: 100%;
+    border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.1));
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-primary);
+    padding: var(--space-2);
+    cursor: pointer;
+}
+
+.workflow-agent-row:hover {
+    background: var(--surface-hover, rgba(255, 255, 255, 0.06));
+}
+
+.workflow-agent-row-label {
+    color: var(--text-tertiary);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.workflow-agent-row-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.workflow-step {
+    border-left: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.1));
+    padding-left: var(--space-2);
+}
+
+.workflow-step-summary {
+    cursor: pointer;
+    color: var(--text-primary);
+}
+
+.workflow-step-status {
+    margin-left: var(--space-2);
+    color: var(--text-tertiary);
+    font-size: 0.76rem;
+}

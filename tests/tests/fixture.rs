@@ -139,6 +139,11 @@ impl Fixture {
         self.host.review_mcp_url().await
     }
 
+    #[allow(dead_code)]
+    pub async fn workflow_mcp_http_url(&self) -> String {
+        self.host.workflow_mcp_url().await
+    }
+
     fn session_store_path(&self) -> PathBuf {
         self.session_store_dir.path().join("sessions.json")
     }

@@ -30,3 +30,4 @@ pub mod terminal_view;
 pub mod tool_card;
 pub mod workbench;
 pub mod workflow_view;
+pub mod workflows_panel;

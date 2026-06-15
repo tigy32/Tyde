@@ -4,27 +4,28 @@ use anyhow::anyhow;
 use protocol::types::{AgentCompactPayload, CloseAgentPayload};
 use protocol::{
     AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, CancelQueuedMessagePayload,
-    ClientErrorCode, ClientErrorPayload, CustomAgentDeletePayload, CustomAgentUpsertPayload,
-    DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FrameKind, HostBrowseClosePayload,
-    HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload, InterruptPayload,
-    ListSessionsPayload, McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceRenamePayload,
-    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingStartPayload,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
-    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload,
-    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
-    ReviewActionPayload, ReviewCreatePayload, ReviewId, ReviewSubscribePayload,
-    RunBackendSetupPayload, SendMessagePayload, SendQueuedMessageNowPayload, SetAgentNamePayload,
-    SetSessionSettingsPayload, SetSettingPayload, SkillRefreshPayload, SpawnAgentParams,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringUpsertPayload, StreamPath,
-    TeamCompactPayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberShufflePayload,
-    TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload, TerminalClosePayload,
-    TerminalCreatePayload, TerminalId, TerminalResizePayload, TerminalSendPayload,
-    WorkbenchCreatePayload, WorkbenchRemovePayload,
+    CancelWorkflowPayload, ClientErrorCode, ClientErrorPayload, CustomAgentDeletePayload,
+    CustomAgentUpsertPayload, DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FrameKind,
+    HostBrowseClosePayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
+    InterruptPayload, ListSessionsPayload, McpServerDeletePayload, McpServerUpsertPayload,
+    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
+    MobilePairingStartPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
+    ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload,
+    ProjectSearchPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewId,
+    ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
+    SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringUpsertPayload, StreamPath, TeamCompactPayload, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload,
+    TerminalClosePayload, TerminalCreatePayload, TerminalId, TerminalResizePayload,
+    TerminalSendPayload, TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    WorkflowRefreshPayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -177,6 +178,24 @@ pub(crate) async fn route_client_envelope(
             FrameKind::SkillRefresh => {
                 let payload: SkillRefreshPayload = parse_payload(&envelope, "skill_refresh")?;
                 host.refresh_skills(payload).await?;
+            }
+            FrameKind::WorkflowRefresh => {
+                let _: WorkflowRefreshPayload = parse_payload(&envelope, "workflow_refresh")?;
+                host.refresh_workflows().await?;
+            }
+            FrameKind::TriggerWorkflow => {
+                let payload: TriggerWorkflowPayload = parse_payload(&envelope, "trigger_workflow")?;
+                ensure_non_empty(
+                    "trigger_workflow",
+                    "workflow_id",
+                    payload.workflow_id.0.as_str(),
+                )?;
+                host.trigger_workflow(payload).await?;
+            }
+            FrameKind::CancelWorkflow => {
+                let payload: CancelWorkflowPayload = parse_payload(&envelope, "cancel_workflow")?;
+                ensure_non_empty("cancel_workflow", "run_id", payload.run_id.0.as_str())?;
+                host.cancel_workflow(payload).await?;
             }
             FrameKind::McpServerUpsert => {
                 let payload: McpServerUpsertPayload =

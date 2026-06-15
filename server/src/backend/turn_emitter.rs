@@ -812,6 +812,7 @@ mod tests {
             project_id: None,
             parent_agent_id: None,
             session_id: None,
+            workflow: None,
             created_at_ms: 0,
             instance_stream: agent_stream.clone(),
         };
@@ -871,6 +872,9 @@ mod tests {
                 team_members: vec![],
                 team_member_bindings: vec![],
                 agents: vec![new_agent.clone()],
+                workflow_summaries: vec![],
+                workflow_diagnostics: vec![],
+                workflow_runs: vec![],
             },
         )
         .expect("serialize HostBootstrap");
@@ -894,6 +898,7 @@ mod tests {
                     project_id: new_agent.project_id,
                     parent_agent_id: new_agent.parent_agent_id,
                     session_id: None,
+                    workflow: None,
                     created_at_ms: new_agent.created_at_ms,
                 })],
             },

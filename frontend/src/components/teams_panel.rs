@@ -2859,6 +2859,7 @@ mod wasm_tests {
                 parent_agent_id: None,
                 session_id: None,
                 custom_agent_id: None,
+                workflow: None,
                 created_at_ms: 0,
                 // Mirror the real backend format `/agent/<id>/<uuid>`.
                 // Using a stable suffix keeps tests deterministic.
@@ -5091,6 +5092,7 @@ mod wasm_tests {
                 parent_agent_id: None,
                 session_id: None,
                 custom_agent_id: None,
+                workflow: None,
                 created_at_ms: 0,
                 instance_stream: StreamPath("/agent/a-mgr/inst".to_owned()),
                 started: true,
@@ -5107,6 +5109,7 @@ mod wasm_tests {
                 parent_agent_id: None,
                 session_id: None,
                 custom_agent_id: None,
+                workflow: None,
                 created_at_ms: 0,
                 instance_stream: StreamPath("/agent/a-rep/inst".to_owned()),
                 started: true,
@@ -5307,6 +5310,7 @@ mod wasm_tests {
                 parent_agent_id: None,
                 session_id: None,
                 custom_agent_id: None,
+                workflow: None,
                 created_at_ms: 0,
                 instance_stream: StreamPath("/agent/a-mgr/inst".to_owned()),
                 started: true,

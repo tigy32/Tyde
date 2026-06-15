@@ -763,6 +763,7 @@ pub(crate) fn spawn_agent_actor(
             startup_failure,
             initial_alias,
             use_mock_backend,
+            workflow: _,
             ..
         } = request;
         let mut current_start = start.clone();
@@ -4120,6 +4121,7 @@ mod tests {
             project_id: None,
             parent_agent_id: None,
             session_id: None,
+            workflow: None,
             created_at_ms: 1,
         };
         let (status_handle, _rx) = AgentStatusHandle::new();

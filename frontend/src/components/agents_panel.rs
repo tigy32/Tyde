@@ -346,6 +346,10 @@ fn agent_card(
     let name = agent.name.clone();
     let backend = agent.backend_kind;
     let is_side_question = matches!(agent.origin, protocol::AgentOrigin::SideQuestion);
+    let workflow_badge_title = agent
+        .workflow
+        .as_ref()
+        .map(|metadata| format!("Workflow run {}", metadata.workflow_run_id));
     let created = agent.created_at_ms;
     let started = agent.started;
     let has_fatal = agent.fatal_error.is_some();
@@ -741,6 +745,9 @@ fn agent_card(
                         "Aside"
                     </span>
                 })}
+                {workflow_badge_title.map(|title| view! {
+                    <span class="agent-card-workflow-badge" title=title>"Workflow"</span>
+                })}
                 <span class={format!("{} agent-card-backend", backend_class(backend))}>{backend_label(backend)}</span>
             </div>
             {error_msg.map(|msg| view! {
@@ -776,6 +783,7 @@ mod tests {
             parent_agent_id: parent.map(|p| AgentId(p.to_string())),
             session_id: None,
             custom_agent_id: None,
+            workflow: None,
             created_at_ms: 0,
             instance_stream: StreamPath("s".to_string()),
             started,
@@ -1171,6 +1179,7 @@ mod wasm_tests {
                 parent_agent_id: None,
                 session_id: None,
                 custom_agent_id: None,
+                workflow: None,
                 created_at_ms: 0,
                 // Mirror the real backend format `/agent/<id>/<uuid>`.
                 // Using a stable suffix keeps tests deterministic; the
@@ -1536,6 +1545,7 @@ mod wasm_tests {
                 project_id: None,
                 parent_agent_id: None,
                 session_id: None,
+                workflow: None,
                 created_at_ms,
                 instance_stream: agent_stream(agent_id),
             },
@@ -1559,6 +1569,7 @@ mod wasm_tests {
                 project_id: None,
                 parent_agent_id: None,
                 session_id: None,
+                workflow: None,
                 created_at_ms,
             },
         );
@@ -2019,6 +2030,7 @@ mod wasm_tests {
                 parent_agent_id: None,
                 session_id: None,
                 custom_agent_id: None,
+                workflow: None,
                 created_at_ms: 1,
                 instance_stream: StreamPath("/agent/a-new/inst".to_owned()),
                 started: true,
@@ -2044,6 +2056,7 @@ mod wasm_tests {
                 parent_agent_id: None,
                 session_id: None,
                 custom_agent_id: None,
+                workflow: None,
                 created_at_ms: 1,
                 instance_stream: StreamPath("/agent/a-new/inst".to_owned()),
                 started: true,

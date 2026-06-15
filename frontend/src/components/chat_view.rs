@@ -1548,6 +1548,7 @@ mod wasm_tests {
                     parent_agent_id: None,
                     session_id: None,
                     custom_agent_id: Some(CustomAgentId("ca-1".to_owned())),
+                    workflow: None,
                     created_at_ms: 0,
                     instance_stream: StreamPath("/agent/agent-mgr".to_owned()),
                     started: true,

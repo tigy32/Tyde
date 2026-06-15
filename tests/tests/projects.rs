@@ -274,11 +274,23 @@ async fn request_project_diff(
     payload: ProjectReadDiffPayload,
     context: &str,
 ) -> ProjectGitDiffPayload {
+    let expected = payload.clone();
     client
         .project_read_diff(project_id, payload)
         .await
         .expect("project_read_diff failed");
-    expect_project_git_diff(client, context).await
+    loop {
+        let diff = expect_project_git_diff(client, context).await;
+        // Project streams can also push remembered live diff refreshes; wait
+        // for the response that echoes the command payload under test.
+        if diff.root == expected.root
+            && diff.scope == expected.scope
+            && diff.path == expected.path
+            && diff.context_mode == expected.context_mode
+        {
+            return diff;
+        }
+    }
 }
 
 async fn create_project(

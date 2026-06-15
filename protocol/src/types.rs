@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -260,6 +260,36 @@ impl fmt::Display for TeamId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+pub struct WorkflowId(pub String);
+
+impl fmt::Display for WorkflowId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkflowRunId(pub String);
+
+impl fmt::Display for WorkflowRunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkflowStepRunId(pub String);
+
+impl fmt::Display for WorkflowStepRunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct TeamMemberId(pub String);
 
 impl fmt::Display for TeamMemberId {
@@ -397,6 +427,8 @@ pub enum AgentOrigin {
     BackendNative,
     /// Spawned as a persistent member of a server-owned agent team.
     TeamMember,
+    /// Spawned by a Tyde Workflow coordinator or by a workflow coordinator via MCP.
+    Workflow,
 }
 
 /// Tool-visible status for agent-control MCP responses.
@@ -513,6 +545,9 @@ pub enum FrameKind {
     ClientError,
 
     SetSessionSettings,
+    TriggerWorkflow,
+    CancelWorkflow,
+    WorkflowRefresh,
 
     // Output events (server -> client)
     HostBootstrap,
@@ -569,6 +604,8 @@ pub enum FrameKind {
     ReviewEvent,
     ReviewSubscribe,
     ProjectEvent,
+    WorkflowNotify,
+    WorkflowRunNotify,
 }
 
 impl fmt::Display for FrameKind {
@@ -643,6 +680,9 @@ impl fmt::Display for FrameKind {
             Self::MobileDeviceRevoke => f.write_str("mobile_device_revoke"),
             Self::MobileDeviceRename => f.write_str("mobile_device_rename"),
             Self::ClientError => f.write_str("client_error"),
+            Self::TriggerWorkflow => f.write_str("trigger_workflow"),
+            Self::CancelWorkflow => f.write_str("cancel_workflow"),
+            Self::WorkflowRefresh => f.write_str("workflow_refresh"),
             Self::HostBootstrap => f.write_str("host_bootstrap"),
             Self::AgentBootstrap => f.write_str("agent_bootstrap"),
             Self::ProjectBootstrap => f.write_str("project_bootstrap"),
@@ -700,6 +740,8 @@ impl fmt::Display for FrameKind {
             Self::ReviewEvent => f.write_str("review_event"),
             Self::ReviewSubscribe => f.write_str("review_subscribe"),
             Self::ProjectEvent => f.write_str("project_event"),
+            Self::WorkflowNotify => f.write_str("workflow_notify"),
+            Self::WorkflowRunNotify => f.write_str("workflow_run_notify"),
         }
     }
 }
@@ -747,6 +789,187 @@ pub struct WelcomePayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCoordinatorSpec {
+    pub backend: BackendKind,
+    #[serde(default)]
+    pub access_mode: BackendAccessMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowInputSpec {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub input_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TriggerSurface {
+    GitPanel,
+    ReviewHub,
+    ChatInput,
+    FileView { glob: String },
+    Global,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkflowSourceScope {
+    Global,
+    Project {
+        project_id: ProjectId,
+        root: ProjectRootPath,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSource {
+    pub scope: WorkflowSourceScope,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowDiagnosticSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowDiagnostic {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<WorkflowId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<WorkflowSource>,
+    pub severity: WorkflowDiagnosticSeverity,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSummary {
+    pub id: WorkflowId,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub triggers: Vec<TriggerSurface>,
+    #[serde(default)]
+    pub inputs: Vec<WorkflowInputSpec>,
+    pub coordinator: WorkflowCoordinatorSpec,
+    #[serde(default)]
+    pub declared_backends: Vec<BackendKind>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub source: WorkflowSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRunSnapshotStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowStepRunSnapshotStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentWorkflowMetadata {
+    pub workflow_id: WorkflowId,
+    pub workflow_run_id: WorkflowRunId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowStepRunSnapshot {
+    pub id: WorkflowStepRunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_step_id: Option<WorkflowStepRunId>,
+    pub title: String,
+    pub status: WorkflowStepRunSnapshotStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunSnapshot {
+    pub id: WorkflowRunId,
+    pub workflow_id: WorkflowId,
+    pub workflow_name: String,
+    pub source: WorkflowSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_agent_id: Option<AgentId>,
+    pub coordinator: WorkflowCoordinatorSpec,
+    pub status: WorkflowRunSnapshotStatus,
+    #[serde(default)]
+    pub inputs: HashMap<String, Value>,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStepRunSnapshot>,
+    #[serde(default)]
+    pub agent_ids: Vec<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowNotifyPayload {
+    pub summaries: Vec<WorkflowSummary>,
+    pub diagnostics: Vec<WorkflowDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunNotifyPayload {
+    pub run: WorkflowRunSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerWorkflowPayload {
+    pub workflow_id: WorkflowId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
+    #[serde(default)]
+    pub inputs: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelWorkflowPayload {
+    pub run_id: WorkflowRunId,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRefreshPayload {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostBootstrapPayload {
     pub settings: HostSettings,
     pub mobile_access: MobileAccessStatePayload,
@@ -764,6 +987,12 @@ pub struct HostBootstrapPayload {
     pub team_members: Vec<TeamMember>,
     pub team_member_bindings: Vec<TeamMemberBindingPayload>,
     pub agents: Vec<NewAgentPayload>,
+    #[serde(default)]
+    pub workflow_summaries: Vec<WorkflowSummary>,
+    #[serde(default)]
+    pub workflow_diagnostics: Vec<WorkflowDiagnostic>,
+    #[serde(default)]
+    pub workflow_runs: Vec<WorkflowRunSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1437,6 +1666,8 @@ pub struct AgentStartPayload {
     pub parent_agent_id: Option<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<AgentWorkflowMetadata>,
     pub created_at_ms: u64,
 }
 
@@ -1468,6 +1699,8 @@ pub struct NewAgentPayload {
     pub parent_agent_id: Option<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<AgentWorkflowMetadata>,
     pub created_at_ms: u64,
     pub instance_stream: StreamPath,
 }
@@ -3591,8 +3824,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_twelve() {
-        assert_eq!(PROTOCOL_VERSION, 12);
+    fn protocol_version_is_thirteen() {
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     #[test]

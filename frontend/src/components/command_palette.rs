@@ -1,10 +1,12 @@
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::spawn_local;
 
 use crate::actions::begin_new_chat;
-use crate::state::{AppState, DockVisibility, TabContent, root_display_name};
+use crate::send;
+use crate::state::{AppState, DockVisibility, RightTab, TabContent, root_display_name};
 
-use protocol::{ProjectFileKind, ProjectPath};
+use protocol::{ProjectFileKind, ProjectId, ProjectPath, WorkflowId, WorkflowSourceScope};
 
 #[derive(Clone, Debug)]
 struct CommandEntry {
@@ -28,6 +30,11 @@ const COMMANDS: &[CommandEntry] = &[
         name: "Toggle Right Panel",
         shortcut: None,
         id: "toggle_right",
+    },
+    CommandEntry {
+        name: "Open Workflows",
+        shortcut: None,
+        id: "open_workflows",
     },
     CommandEntry {
         name: "Toggle Bottom Panel",
@@ -66,6 +73,12 @@ enum PaletteResult {
     },
     Command {
         entry_index: usize,
+    },
+    WorkflowRun {
+        host_id: String,
+        workflow_id: WorkflowId,
+        project_id: Option<ProjectId>,
+        name: String,
     },
 }
 
@@ -111,6 +124,10 @@ fn execute_command(state: &AppState, id: &str) {
         "toggle_left" => toggle_dock(state.left_dock),
         "toggle_right" => toggle_dock(state.right_dock),
         "toggle_bottom" => toggle_dock(state.bottom_dock),
+        "open_workflows" => {
+            state.right_dock.set(DockVisibility::Visible);
+            state.right_tab.set(RightTab::Workflows);
+        }
         "go_home" => state.open_tab(TabContent::Home, "Home".to_string(), false),
         "go_chat" => {
             // Activate the most recent chat tab, or open a new chat
@@ -154,6 +171,28 @@ fn do_select(results: Memo<Vec<PaletteResult>>, idx: usize) {
         PaletteResult::Command { entry_index } => {
             execute_command(&state, COMMANDS[*entry_index].id);
         }
+        PaletteResult::WorkflowRun {
+            host_id,
+            workflow_id,
+            project_id,
+            ..
+        } => {
+            let host_stream = state
+                .host_streams
+                .with_untracked(|streams| streams.get(host_id).cloned());
+            if let Some(host_stream) = host_stream {
+                let host_id = host_id.clone();
+                let workflow_id = workflow_id.clone();
+                let project_id = project_id.clone();
+                spawn_local(async move {
+                    if let Err(error) =
+                        send::trigger_workflow(&host_id, host_stream, workflow_id, project_id).await
+                    {
+                        log::error!("failed to trigger workflow from palette: {error}");
+                    }
+                });
+            }
+        }
     }
     state.command_palette_open.set(false);
 }
@@ -164,6 +203,7 @@ pub fn CommandPalette() -> impl IntoView {
     let open = state.command_palette_open;
     let file_tree = state.file_tree;
     let active_project = state.active_project;
+    let workflow_state = state.clone();
 
     let input = RwSignal::new(String::new());
     let selected_index = RwSignal::new(0usize);
@@ -176,22 +216,68 @@ pub fn CommandPalette() -> impl IntoView {
 
         if command_mode {
             let query = query_raw[1..].trim();
-            let mut scored: Vec<(usize, u32)> = COMMANDS
+            let mut scored: Vec<(PaletteResult, u32)> = COMMANDS
                 .iter()
                 .enumerate()
                 .filter_map(|(i, cmd)| {
                     if query.is_empty() {
-                        Some((i, 0))
+                        Some((PaletteResult::Command { entry_index: i }, 0))
                     } else {
-                        fuzzy_score(query, cmd.name).map(|s| (i, s))
+                        fuzzy_score(query, cmd.name)
+                            .map(|s| (PaletteResult::Command { entry_index: i }, s))
                     }
                 })
                 .collect();
+            let active_project_ref = workflow_state.active_project.get();
+            let active_host_id = active_project_ref
+                .as_ref()
+                .map(|active| active.host_id.clone())
+                .or_else(|| workflow_state.selected_host_id.get());
+            if let Some(host_id) = active_host_id {
+                let active_project_id = active_project_ref
+                    .as_ref()
+                    .map(|active| active.project_id.clone());
+                let workflows = workflow_state
+                    .workflow_summaries
+                    .with(|map| map.get(&host_id).cloned().unwrap_or_default());
+                for workflow in workflows {
+                    let visible = match &workflow.source.scope {
+                        WorkflowSourceScope::Global => true,
+                        WorkflowSourceScope::Project { project_id, .. } => {
+                            active_project_id.as_ref() == Some(project_id)
+                        }
+                    };
+                    if !visible {
+                        continue;
+                    }
+                    let label = format!("Run Workflow {}", workflow.name);
+                    let Some(score) = (if query.is_empty() {
+                        Some(0)
+                    } else {
+                        fuzzy_score(query, &label).or_else(|| fuzzy_score(query, &workflow.id.0))
+                    }) else {
+                        continue;
+                    };
+                    let project_id = match &workflow.source.scope {
+                        WorkflowSourceScope::Project { project_id, .. } => Some(project_id.clone()),
+                        WorkflowSourceScope::Global => active_project_id.clone(),
+                    };
+                    scored.push((
+                        PaletteResult::WorkflowRun {
+                            host_id: host_id.clone(),
+                            workflow_id: workflow.id,
+                            project_id,
+                            name: workflow.name,
+                        },
+                        score,
+                    ));
+                }
+            }
             scored.sort_by_key(|score| std::cmp::Reverse(score.1));
             scored
                 .into_iter()
                 .take(10)
-                .map(|(i, _)| PaletteResult::Command { entry_index: i })
+                .map(|(result, _)| result)
                 .collect()
         } else {
             let query = query_raw.trim();
@@ -371,6 +457,18 @@ pub fn CommandPalette() -> impl IntoView {
                                                 {shortcut.map(|s| view! {
                                                     <kbd class="cp-cmd-shortcut">{s}</kbd>
                                                 })}
+                                            </div>
+                                        }.into_any()
+                                    }
+                                    PaletteResult::WorkflowRun { name, .. } => {
+                                        view! {
+                                            <div
+                                                class="cp-result-item"
+                                                class:selected=is_selected
+                                                on:click=on_click
+                                            >
+                                                <span class="cp-cmd-name">{format!("Run Workflow: {name}")}</span>
+                                                <span class="cp-file-path">"Workflows"</span>
                                             </div>
                                         }.into_any()
                                     }

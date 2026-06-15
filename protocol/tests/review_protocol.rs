@@ -711,9 +711,13 @@ fn bootstrap_payloads_round_trip() {
             project_id: Some(project_id()),
             parent_agent_id: None,
             session_id: None,
+            workflow: None,
             created_at_ms: 1,
             instance_stream: StreamPath("/agent/agent-1/instance-1".to_owned()),
         }],
+        workflow_summaries: vec![],
+        workflow_diagnostics: vec![],
+        workflow_runs: vec![],
     });
 
     round_trip_json_without_eq(&AgentBootstrapPayload {
