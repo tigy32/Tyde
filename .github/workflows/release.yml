@@ -284,7 +284,8 @@ jobs:
           releaseDraft: true
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           tauriScript: npx --prefix ../.. tauri
-          args: ${{ matrix.tauri-args }}
+          # MSI rejects semver prerelease labels; stable Windows builds still use all bundles.
+          args: ${{ matrix.tauri-args }}${{ matrix.platform == 'windows-latest' && contains(env.RELEASE_TAG, '-') && ' --bundles nsis' || '' }}
 
       - name: Package Linux headless Tyde binary
         if: startsWith(matrix.platform, 'ubuntu')
