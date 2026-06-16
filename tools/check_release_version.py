@@ -9,8 +9,7 @@ import sys
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
-    print("ERROR: Python 3.11+ is required for tomllib", file=sys.stderr)
-    sys.exit(1)
+    tomllib = None
 
 
 def normalize_expected(raw: str) -> str:
@@ -39,19 +38,70 @@ def read_package_lock_versions(path: pathlib.Path) -> dict[str, str]:
     return versions
 
 
+def parse_toml_string_value(line: str) -> str | None:
+    _, _, value = line.partition("=")
+    value = value.strip()
+    if not value.startswith('"'):
+        return None
+    end = value.find('"', 1)
+    if end == -1:
+        return None
+    return value[1:end]
+
+
 def read_cargo_package_version(path: pathlib.Path) -> str:
-    with path.open("rb") as handle:
-        data = tomllib.load(handle)
-    return data["package"]["version"]
+    if tomllib is not None:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+        return data["package"]["version"]
+
+    in_package = False
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped == "[package]":
+            in_package = True
+            continue
+        if in_package and stripped.startswith("["):
+            break
+        if in_package and stripped.startswith("version"):
+            value = parse_toml_string_value(stripped)
+            if value is not None:
+                return value
+    raise KeyError(f"{path} missing [package].version")
 
 
 def read_cargo_lock_versions(
     path: pathlib.Path, package_names: set[str]
 ) -> dict[str, str]:
-    with path.open("rb") as handle:
-        data = tomllib.load(handle)
+    if tomllib is not None:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+        packages = data.get("package", [])
+    else:
+        packages = []
+        current: dict[str, str] | None = None
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if stripped == "[[package]]":
+                if current is not None:
+                    packages.append(current)
+                current = {}
+                continue
+            if current is None:
+                continue
+            if stripped.startswith("name"):
+                value = parse_toml_string_value(stripped)
+                if value is not None:
+                    current["name"] = value
+            elif stripped.startswith("version"):
+                value = parse_toml_string_value(stripped)
+                if value is not None:
+                    current["version"] = value
+        if current is not None:
+            packages.append(current)
+
     versions = {}
-    for package in data.get("package", []):
+    for package in packages:
         name = package.get("name")
         if name in package_names:
             versions[f"Cargo.lock {name}"] = package["version"]
