@@ -1,3 +1,4 @@
+pub mod agent_monitor_view;
 pub mod agents_panel;
 pub mod center_zone;
 pub mod chat_input;

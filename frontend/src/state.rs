@@ -67,6 +67,25 @@ pub struct AgentInfo {
     pub fatal_error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AgentMonitorKey {
+    pub host_id: String,
+    pub agent_id: AgentId,
+}
+
+impl AgentMonitorKey {
+    pub fn new(host_id: impl Into<String>, agent_id: AgentId) -> Self {
+        Self {
+            host_id: host_id.into(),
+            agent_id,
+        }
+    }
+
+    pub fn from_agent(agent: &AgentInfo) -> Self {
+        Self::new(agent.host_id.clone(), agent.agent_id.clone())
+    }
+}
+
 // ── Tab system ──────────────────────────────────────────────────────────
 
 /// Maximum number of tab content components mounted at once. The active tab
@@ -119,6 +138,7 @@ pub struct PendingTeamMember {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TabContent {
     Home,
+    AgentMonitor,
     Chat {
         agent_ref: Option<ActiveAgentRef>,
         /// `Some` only while the user has opened a team member whose live
@@ -957,6 +977,10 @@ pub struct AppState {
     /// (never replayed on host attach).
     pub team_member_shuffle_suggestions:
         RwSignal<HashMap<String, HashMap<TeamId, TeamMemberShuffleSuggestionEntry>>>,
+    /// Session-local manual ordering for the Agent Monitor center view.
+    /// Empty means "use the derived default sort"; once the user reorders,
+    /// known rows stay in this order until Reset.
+    pub agent_monitor_order: RwSignal<Vec<AgentMonitorKey>>,
     pub agents_panel_filters: RwSignal<HashMap<Option<ActiveProjectRef>, AgentsPanelFilters>>,
     pub sessions_panel_filters: RwSignal<HashMap<Option<ActiveProjectRef>, SessionsPanelFilters>>,
     /// Per-review full state. Server is the source of truth: a `ReviewView`
@@ -1194,6 +1218,7 @@ impl AppState {
             team_preset_catalogs: RwSignal::new(HashMap::new()),
             team_drafts: RwSignal::new(HashMap::new()),
             team_member_shuffle_suggestions: RwSignal::new(HashMap::new()),
+            agent_monitor_order: RwSignal::new(Vec::new()),
             agents_panel_filters: RwSignal::new(HashMap::new()),
             sessions_panel_filters: RwSignal::new(HashMap::new()),
             reviews: RwSignal::new(HashMap::new()),

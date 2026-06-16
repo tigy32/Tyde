@@ -5,6 +5,7 @@ use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::actions::begin_new_chat;
+use crate::components::agent_monitor_view::AgentMonitorView;
 use crate::components::chat_view::ChatView;
 use crate::components::diff_view::ReviewableDiffView;
 use crate::components::file_view::FileView;
@@ -384,6 +385,7 @@ fn TabButton(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TabKind {
     Home,
+    AgentMonitor,
     Chat,
     File,
     Diff,
@@ -417,6 +419,7 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
         state.center_zone.with(|cz| {
             match cz.tabs.iter().find(|t| t.id == tab_id).map(|t| &t.content) {
                 Some(TabContent::Home) => TabKind::Home,
+                Some(TabContent::AgentMonitor) => TabKind::AgentMonitor,
                 Some(TabContent::Chat { .. }) => TabKind::Chat,
                 Some(TabContent::File { .. }) => TabKind::File,
                 Some(TabContent::Diff { .. }) => TabKind::Diff,
@@ -438,6 +441,9 @@ fn TabMount(tab_id: TabId) -> impl IntoView {
                         <div class="center-content-scroll">
                             <HomeView />
                         </div>
+                    }.into_any(),
+                    TabKind::AgentMonitor => view! {
+                        <AgentMonitorView />
                     }.into_any(),
                     TabKind::Chat => {
                         // Per-tab agent_ref Signal — re-derives on the
@@ -608,6 +614,15 @@ pub fn CenterZone() -> impl IntoView {
         begin_new_chat(&state_for_new_chat, None);
     };
 
+    let state_for_agent_monitor = state.clone();
+    let on_agent_monitor = move |_| {
+        state_for_agent_monitor.open_tab(
+            TabContent::AgentMonitor,
+            "Agent Monitor".to_owned(),
+            true,
+        );
+    };
+
     let on_toggle_menu = move |ev: web_sys::MouseEvent| {
         ev.stop_propagation();
         if menu_open.get_untracked() {
@@ -752,6 +767,14 @@ pub fn CenterZone() -> impl IntoView {
 
                 <div class="pinned-tab-actions">
                     <span class="tab-bar-divider" aria-hidden="true"></span>
+                    <button
+                        class="center-tool-btn"
+                        title="Open Agent Monitor"
+                        aria-label="Open Agent Monitor"
+                        on:click=on_agent_monitor
+                    >
+                        "Agents"
+                    </button>
                     <div class="new-chat-split">
                         <button
                             class="new-chat-btn"

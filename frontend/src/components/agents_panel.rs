@@ -7,8 +7,8 @@ use protocol::{AgentId, FrameKind, SetAgentNamePayload};
 
 use crate::send::{close_agent, compact_agent, send_frame};
 use crate::state::{
-    ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, ConnectionStatus,
-    StreamingState, TabContent,
+    ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, CompactionOldInfo,
+    ConnectionStatus, StreamingState, TabContent,
 };
 
 /// Pure predicate used by the Agents panel filter memo. Extracted so the
@@ -49,7 +49,7 @@ pub fn agent_passes_filters(
     true
 }
 
-fn backend_class(kind: protocol::BackendKind) -> &'static str {
+pub(crate) fn backend_class(kind: protocol::BackendKind) -> &'static str {
     match kind {
         protocol::BackendKind::Tycode => "backend-badge tycode",
         protocol::BackendKind::Kiro => "backend-badge kiro",
@@ -59,7 +59,7 @@ fn backend_class(kind: protocol::BackendKind) -> &'static str {
     }
 }
 
-fn backend_label(kind: protocol::BackendKind) -> &'static str {
+pub(crate) fn backend_label(kind: protocol::BackendKind) -> &'static str {
     match kind {
         protocol::BackendKind::Tycode => "Tycode",
         protocol::BackendKind::Kiro => "Kiro",
@@ -69,7 +69,7 @@ fn backend_label(kind: protocol::BackendKind) -> &'static str {
     }
 }
 
-fn relative_time(created_at_ms: u64) -> String {
+pub(crate) fn relative_time(created_at_ms: u64) -> String {
     let now = js_sys::Date::now() as u64;
     let diff_secs = now.saturating_sub(created_at_ms) / 1000;
 
@@ -84,7 +84,8 @@ fn relative_time(created_at_ms: u64) -> String {
     }
 }
 
-enum DerivedAgentState {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DerivedAgentState {
     Initializing,
     Thinking,
     Idle,
@@ -92,7 +93,41 @@ enum DerivedAgentState {
     Terminated,
 }
 
-fn status_icon(derived: &DerivedAgentState) -> &'static str {
+pub(crate) fn derive_agent_state(
+    agent: &AgentInfo,
+    streaming: &HashMap<AgentId, StreamingState>,
+    turn_active: &HashMap<AgentId, bool>,
+    compaction: &HashMap<AgentId, CompactionOldInfo>,
+) -> DerivedAgentState {
+    if agent.fatal_error.is_some() {
+        return DerivedAgentState::Terminated;
+    }
+    if !agent.started {
+        return DerivedAgentState::Initializing;
+    }
+    if compaction.contains_key(&agent.agent_id) {
+        return DerivedAgentState::Compacting;
+    }
+    let typing = turn_active.get(&agent.agent_id).copied().unwrap_or(false);
+    let streaming_open = streaming.contains_key(&agent.agent_id);
+    if typing || streaming_open {
+        DerivedAgentState::Thinking
+    } else {
+        DerivedAgentState::Idle
+    }
+}
+
+pub(crate) fn status_label(derived: &DerivedAgentState) -> &'static str {
+    match derived {
+        DerivedAgentState::Initializing => "Initializing",
+        DerivedAgentState::Thinking => "Thinking",
+        DerivedAgentState::Compacting => "Compacting",
+        DerivedAgentState::Idle => "Idle",
+        DerivedAgentState::Terminated => "Terminated",
+    }
+}
+
+pub(crate) fn status_icon(derived: &DerivedAgentState) -> &'static str {
     match derived {
         DerivedAgentState::Initializing => "\u{25F7}", // ◷ clock (CSS animates)
         DerivedAgentState::Thinking => "\u{25F7}",     // ◷ clock (CSS animates)
@@ -102,7 +137,7 @@ fn status_icon(derived: &DerivedAgentState) -> &'static str {
     }
 }
 
-fn status_class(derived: &DerivedAgentState) -> &'static str {
+pub(crate) fn status_class(derived: &DerivedAgentState) -> &'static str {
     match derived {
         DerivedAgentState::Initializing => "agent-card-status running",
         DerivedAgentState::Thinking => "agent-card-status running",
@@ -351,8 +386,6 @@ fn agent_card(
         .as_ref()
         .map(|metadata| format!("Workflow run {}", metadata.workflow_run_id));
     let created = agent.created_at_ms;
-    let started = agent.started;
-    let has_fatal = agent.fatal_error.is_some();
     let custom_agent_id = agent.custom_agent_id.clone();
     let custom_agent_host_id = agent.host_id.clone();
     let custom_agent_state = state.clone();
@@ -468,28 +501,19 @@ fn agent_card(
         });
     };
 
+    let agent_for_derived = agent.clone();
     let derived = {
-        let agent_id = agent_id.clone();
         let streaming = state.streaming_text;
         let turn_active = state.agent_turn_active;
         let compaction = state.compaction_in_progress;
         move || {
-            if has_fatal {
-                return DerivedAgentState::Terminated;
-            }
-            if !started {
-                return DerivedAgentState::Initializing;
-            }
-            if compaction.with(|map| map.contains_key(&agent_id)) {
-                return DerivedAgentState::Compacting;
-            }
-            let typing = turn_active.with(|map| map.get(&agent_id).copied().unwrap_or(false));
-            let streaming_open = streaming.with(|map| map.contains_key(&agent_id));
-            if typing || streaming_open {
-                DerivedAgentState::Thinking
-            } else {
-                DerivedAgentState::Idle
-            }
+            compaction.with(|compaction| {
+                turn_active.with(|turn_active| {
+                    streaming.with(|streaming| {
+                        derive_agent_state(&agent_for_derived, streaming, turn_active, compaction)
+                    })
+                })
+            })
         }
     };
 
