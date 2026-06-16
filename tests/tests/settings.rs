@@ -242,7 +242,7 @@ async fn backend_setup_payload_uses_sign_in_command_and_versioned_tycode_probe()
     write_fake_tycode_binary(temp_home.path());
     let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());
 
-    let mut fixture = Fixture::new().await;
+    let mut fixture = Fixture::new_with_real_backend_probe().await;
     let payload = fixture.bootstrap.backend_setup.clone();
     expect_no_backend_setup_replay(&mut fixture.client).await;
 

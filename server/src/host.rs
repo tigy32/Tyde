@@ -138,6 +138,14 @@ pub struct HostRuntimeConfig {
     pub workflow_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub kiro_probe_program: Option<String>,
     pub mobile_pairing_ttl: Option<std::time::Duration>,
+    /// Skip probing the real backend CLIs (`<cli> --version`, codex model
+    /// discovery, etc.) when collecting backend setup. Each probe spawns a
+    /// real subprocess and codex discovery makes a network RPC, costing
+    /// several seconds per host spawn — fine once at app startup, but ruinous
+    /// in the test suite where every fixture spawns a host. Tests set this so
+    /// `collect_backend_setup` returns an empty stub instantly. Defaults to
+    /// `false` so production startup is unaffected.
+    pub skip_real_backend_probe: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +231,7 @@ pub(crate) struct HostState {
     pub mobile_access: MobileAccessHandle,
     kiro_session_schema: KiroSessionSchemaState,
     kiro_probe_program: Option<String>,
+    skip_real_backend_probe: bool,
     host_streams: HashMap<StreamPath, HostSubscriber>,
     project_streams: HashMap<ProjectId, ProjectStreamSubscription>,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
@@ -416,7 +425,7 @@ impl HostHandle {
         host_stream: Stream,
         agent_replay: AgentReplayMode,
     ) -> Vec<(AgentHandle, Stream)> {
-        let backend_setup = setup::collect_backend_setup().await;
+        let backend_setup = self.collect_backend_setup_respecting_probe().await;
         let mut state = self.state.lock().await;
         let host_path = host_stream.path().clone();
 
@@ -4368,9 +4377,22 @@ impl HostHandle {
     }
 
     pub(crate) async fn fan_out_backend_setup(&self) {
-        let payload = setup::collect_backend_setup().await;
+        let payload = self.collect_backend_setup_respecting_probe().await;
         let mut state = self.state.lock().await;
         fan_out_backend_setup(&mut state, payload).await;
+    }
+
+    /// Collect backend setup, honoring the `skip_real_backend_probe` runtime
+    /// flag. When skipping (test fixtures), returns an empty stub instantly
+    /// instead of spawning real `<cli> --version` subprocesses and a codex
+    /// model-discovery network RPC on every host spawn.
+    async fn collect_backend_setup_respecting_probe(&self) -> BackendSetupPayload {
+        let skip = self.state.lock().await.skip_real_backend_probe;
+        if skip {
+            setup::stub_backend_setup()
+        } else {
+            setup::collect_backend_setup().await
+        }
     }
 
     fn schedule_session_schema_refresh(&self) {
@@ -7636,11 +7658,19 @@ pub fn spawn_host_with_mock_backend(
     project_path: PathBuf,
     settings_path: PathBuf,
 ) -> Result<HostHandle, String> {
+    // The mock backend is test-only, so skip the real `<cli> --version` /
+    // codex-model-discovery probing by default — it costs several seconds per
+    // host spawn and tests don't depend on the host's installed-CLI
+    // detection. Tests that *do* assert on probe output use
+    // `spawn_host_with_mock_backend_and_runtime_config` with the flag cleared.
     spawn_host_with_mock_backend_and_runtime_config(
         session_path,
         project_path,
         settings_path,
-        HostRuntimeConfig::default(),
+        HostRuntimeConfig {
+            skip_real_backend_probe: true,
+            ..HostRuntimeConfig::default()
+        },
     )
 }
 
@@ -7777,6 +7807,7 @@ fn spawn_host_inner(
             mobile_access: mobile_access.clone(),
             kiro_session_schema: KiroSessionSchemaState::Pending,
             kiro_probe_program: runtime_config.kiro_probe_program.clone(),
+            skip_real_backend_probe: runtime_config.skip_real_backend_probe,
             host_streams: HashMap::new(),
             project_streams: HashMap::new(),
             terminal_streams: HashMap::new(),

@@ -1,0 +1,48 @@
+# cargo-nextest configuration.
+#
+# nextest runs each test in its own process and parallelizes across *all* test
+# binaries at once (plain `cargo test` runs binaries one after another), which
+# is the main reason the integration suite is much faster under nextest.
+#
+# Run with:  cargo nextest run
+#        or:  cargo nextest run --profile ci
+
+# Several backend tests stand up a *fake* CLI/app-server (a real subprocess:
+# `python3`, a shell script, etc.) and serialize themselves with an in-process
+# mutex — CODEX_FAKE_APP_SERVER_SERIAL, FAKE_CLAUDE_ENV_LOCK,
+# ANTIGRAVITY_MCP_CONFIG_MUTEX. Those mutexes work under `cargo test`, where
+# every test shares one process, but nextest runs each test in its own process
+# so the mutexes no longer apply. Run concurrently, these subprocess-heavy
+# tests both clobber the process-global state the mutex protected and starve
+# each other's request timeouts (Codex's is 45s, Claude's is 2s), so they
+# flake. Pinning them to a single thread restores the one-at-a-time behavior
+# the in-process mutexes were providing.
+[test-groups]
+serial-backend-fakes = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/backend::codex::tests::codex_backend_fork/) | test(/backend::claude::tests::(fake_|resume_session_missing)/) | test(/backend::antigravity::tests::(install_antigravity_mcp_config|mcp_guard)/)'
+test-group = 'serial-backend-fakes'
+
+[[profile.ci.overrides]]
+filter = 'test(/backend::codex::tests::codex_backend_fork/) | test(/backend::claude::tests::(fake_|resume_session_missing)/) | test(/backend::antigravity::tests::(install_antigravity_mcp_config|mcp_guard)/)'
+test-group = 'serial-backend-fakes'
+
+[profile.default]
+# A healthy integration test finishes well under 30s; anything slower is
+# flagged in the run output so a creeping regression (e.g. a fixture that
+# started spawning real subprocesses) is visible instead of silently bloating
+# the suite.
+slow-timeout = "30s"
+retries = 0
+# Print failure output as soon as a test fails, and again in the final summary.
+failure-output = "immediate-final"
+
+[profile.ci]
+slow-timeout = "60s"
+# Retry flaky tests a couple of times before declaring failure, and keep going
+# after the first failure so one bad test doesn't mask others.
+retries = 2
+fail-fast = false
+failure-output = "immediate-final"
+final-status-level = "slow"

@@ -57,9 +57,33 @@ impl Fixture {
         Self::new_with_runtime_config(server::HostRuntimeConfig::default()).await
     }
 
+    /// Like [`Fixture::new`] but actually probes the real backend CLIs
+    /// (`<cli> --version`, codex model discovery, etc.). Spawning real
+    /// subprocesses costs several seconds per fixture, so only the handful of
+    /// tests asserting on backend-setup *contents* should use this — everyone
+    /// else gets the fast stub via `new`/`new_with_runtime_config`.
+    #[allow(dead_code)]
+    pub async fn new_with_real_backend_probe() -> Self {
+        Self::new_with_runtime_config_inner(server::HostRuntimeConfig::default(), false).await
+    }
+
     #[allow(dead_code)]
     pub async fn new_with_runtime_config(runtime_config: server::HostRuntimeConfig) -> Self {
+        Self::new_with_runtime_config_inner(runtime_config, true).await
+    }
+
+    async fn new_with_runtime_config_inner(
+        mut runtime_config: server::HostRuntimeConfig,
+        skip_real_backend_probe: bool,
+    ) -> Self {
         init_tracing();
+
+        // Real backend probing spawns `<cli> --version` for every backend and
+        // runs codex model discovery (a network RPC) on every host spawn —
+        // several seconds each, paid once per fixture. The default test
+        // fixture skips it so the suite stays fast; tests that assert on probe
+        // output opt back in via `new_with_real_backend_probe`.
+        runtime_config.skip_real_backend_probe = skip_real_backend_probe;
 
         let session_store_dir = tempfile::tempdir().expect("create session tempdir");
         let session_path = session_store_dir.path().join("sessions.json");

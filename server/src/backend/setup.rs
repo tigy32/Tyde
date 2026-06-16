@@ -31,16 +31,58 @@ const KIRO_CLI_CANDIDATES: &[&str] = &["kiro-cli", "kiro-cli-chat"];
 
 pub(crate) async fn collect_backend_setup() -> BackendSetupPayload {
     let platform = host_platform();
-    let mut backends = Vec::new();
-    for kind in [
+    // Probe every backend concurrently. Each probe spawns a real
+    // `<cli> --version` subprocess (capped at a 2s timeout) and the codex
+    // probe additionally runs model discovery, so running them sequentially
+    // made host startup wait for the *sum* of all probes. Joining them means
+    // we only wait for the slowest one.
+    let backends = futures_util::future::join_all(
+        [
+            BackendKind::Tycode,
+            BackendKind::Kiro,
+            BackendKind::Claude,
+            BackendKind::Codex,
+            BackendKind::Antigravity,
+        ]
+        .into_iter()
+        .map(|kind| probe_backend(kind, platform)),
+    )
+    .await;
+    BackendSetupPayload { backends }
+}
+
+/// Backend setup with no real CLI probing — used by test fixtures (and any
+/// host configured with `skip_real_backend_probe`) so spawning a host does
+/// not pay several seconds of subprocess + network cost per fixture. Reports
+/// every backend as not installed; tests drive backends through the mock
+/// backend rather than the host's installed-CLI detection.
+pub(crate) fn stub_backend_setup() -> BackendSetupPayload {
+    let platform = host_platform();
+    let backends = [
         BackendKind::Tycode,
         BackendKind::Kiro,
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Antigravity,
-    ] {
-        backends.push(probe_backend(kind, platform).await);
-    }
+    ]
+    .into_iter()
+    .map(|kind| {
+        let install_command = install_command(kind, platform);
+        let status = if install_command.is_none() {
+            BackendSetupStatus::Unsupported
+        } else {
+            BackendSetupStatus::NotInstalled
+        };
+        BackendSetupInfo {
+            backend_kind: kind,
+            status,
+            installed_version: None,
+            docs_url: docs_url(kind),
+            install_command,
+            sign_in_command: sign_in_command(kind),
+        }
+    })
+    .collect();
     BackendSetupPayload { backends }
 }
 
