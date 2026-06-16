@@ -831,16 +831,10 @@ fn HostsTab() -> impl IntoView {
                 Some(remote_command)
             };
             let lifecycle = if remote_command.is_none() {
-                bridge::RemoteHostLifecycleConfig::ManagedTyde {
-                    release: bridge::TydeReleaseTarget::Latest,
-                }
+                bridge::RemoteHostLifecycleConfig::ManagedTyde
             } else {
                 bridge::RemoteHostLifecycleConfig::Manual
             };
-            let should_prepare_managed = matches!(
-                &lifecycle,
-                bridge::RemoteHostLifecycleConfig::ManagedTyde { .. }
-            );
 
             let state = state.clone();
             spawn_local(async move {
@@ -880,36 +874,7 @@ fn HostsTab() -> impl IntoView {
                         };
                         refresh_configured_hosts(&state).await;
                         if let Some(host_id) = new_host_id {
-                            if should_prepare_managed {
-                                match bridge::ensure_configured_host_ready(host_id.clone()).await {
-                                    Ok(snapshot) => {
-                                        state.host_lifecycle_statuses.update(|statuses| {
-                                            statuses.insert(
-                                                host_id.clone(),
-                                                bridge::RemoteHostLifecycleStatus::Snapshot {
-                                                    snapshot,
-                                                },
-                                            );
-                                        });
-                                        connect_one_host(state.clone(), host_id).await;
-                                    }
-                                    Err(error) => {
-                                        error_sig.set(Some(format!(
-                                            "Failed to prepare remote host: {error}"
-                                        )));
-                                        state.host_lifecycle_statuses.update(|statuses| {
-                                            statuses.insert(
-                                                host_id,
-                                                bridge::RemoteHostLifecycleStatus::Error {
-                                                    message: error,
-                                                },
-                                            );
-                                        });
-                                    }
-                                }
-                            } else {
-                                connect_one_host(state.clone(), host_id).await;
-                            }
+                            connect_one_host(state.clone(), host_id).await;
                         }
                     }
                     Err(e) => error_sig.set(Some(format!("Failed to add host: {e}"))),
@@ -1052,26 +1017,7 @@ fn HostsTab() -> impl IntoView {
                                                     let state = connect_state.clone();
                                                     let host_id = host_id_for_connect.clone();
                                                     spawn_local(async move {
-                                                        match bridge::ensure_configured_host_ready(host_id.clone()).await {
-                                                            Ok(snapshot) => {
-                                                                state.host_lifecycle_statuses.update(|statuses| {
-                                                                    statuses.insert(
-                                                                        host_id.clone(),
-                                                                        bridge::RemoteHostLifecycleStatus::Snapshot { snapshot },
-                                                                    );
-                                                                });
-                                                                connect_one_host(state, host_id).await;
-                                                            }
-                                                            Err(error) => {
-                                                                error_sig.set(Some(format!("Failed to prepare remote host: {error}")));
-                                                                state.host_lifecycle_statuses.update(|statuses| {
-                                                                    statuses.insert(
-                                                                        host_id,
-                                                                        bridge::RemoteHostLifecycleStatus::Error { message: error },
-                                                                    );
-                                                                });
-                                                            }
-                                                        }
+                                                        connect_one_host(state, host_id).await;
                                                     });
                                                 }
                                             >
@@ -1125,7 +1071,7 @@ fn HostsTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Add Remote Host"</label>
-            <p class="settings-description">"Configure a remote host over SSH. Leave Remote command blank for managed install/launch from GitHub releases. Set Remote command only for a manual bridge command."</p>
+            <p class="settings-description">"Configure a remote host over SSH. Leave Remote command blank for managed install/launch of the same Tyde release as this app. Set Remote command only for a manual bridge command."</p>
             <div class="settings-form">
                 <div class="settings-form-row">
                     <label class="settings-form-label">
@@ -1201,7 +1147,7 @@ fn is_managed_remote_host(transport: &BridgeHostTransportConfig) -> bool {
     matches!(
         transport,
         BridgeHostTransportConfig::SshStdio {
-            lifecycle: bridge::RemoteHostLifecycleConfig::ManagedTyde { .. },
+            lifecycle: bridge::RemoteHostLifecycleConfig::ManagedTyde,
             ..
         }
     )
@@ -1218,9 +1164,9 @@ fn lifecycle_status_text(status: &bridge::RemoteHostLifecycleStatus) -> String {
             None => lifecycle_step_label(*step).to_string(),
         },
         bridge::RemoteHostLifecycleStatus::Snapshot { snapshot } => {
-            let target = snapshot.target_version;
+            let target = &snapshot.target_version;
             match &snapshot.running {
-                bridge::RemoteTydeRunningState::Managed { version } if *version == target => {
+                bridge::RemoteTydeRunningState::Managed { version } if version == target => {
                     format!("v{version} running")
                 }
                 bridge::RemoteTydeRunningState::Managed { version } => {
@@ -1262,7 +1208,7 @@ fn managed_lifecycle_button_label(status: &bridge::RemoteHostLifecycleStatus) ->
         }
         bridge::RemoteHostLifecycleStatus::Snapshot { snapshot } => match &snapshot.running {
             bridge::RemoteTydeRunningState::Managed { version }
-                if *version == snapshot.target_version =>
+                if version == &snapshot.target_version =>
             {
                 "Connect".to_string()
             }

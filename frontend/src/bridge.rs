@@ -10,7 +10,7 @@ pub use host_config::{
     ConfiguredHost, ConfiguredHostStore, HostDisconnectedEvent, HostErrorEvent, HostIdRequest,
     HostLifecycleEvent, HostLineEvent, HostTransportConfig, RemoteHostLifecycleConfig,
     RemoteHostLifecycleSnapshot, RemoteHostLifecycleStatus, RemoteHostLifecycleStep,
-    RemoteTydeRunningState, SendHostLineRequest, SetSelectedHostRequest, TydeReleaseTarget,
+    RemoteTydeRunningState, SendHostLineRequest, SetSelectedHostRequest,
     UpsertConfiguredHostRequest,
 };
 

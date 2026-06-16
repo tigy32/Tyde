@@ -789,6 +789,37 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
         statuses.insert(host_id.clone(), ConnectionStatus::Connecting);
     });
 
+    if is_managed_remote_host(&state, &host_id) {
+        match bridge::ensure_configured_host_ready(host_id.clone()).await {
+            Ok(snapshot) => {
+                state.host_lifecycle_statuses.update(|statuses| {
+                    statuses.insert(
+                        host_id.clone(),
+                        bridge::RemoteHostLifecycleStatus::Snapshot { snapshot },
+                    );
+                });
+            }
+            Err(error) => {
+                log::error!("failed to prepare remote host {}: {}", host_id, error);
+                state.host_lifecycle_statuses.update(|statuses| {
+                    statuses.insert(
+                        host_id.clone(),
+                        bridge::RemoteHostLifecycleStatus::Error {
+                            message: error.clone(),
+                        },
+                    );
+                });
+                state.connection_statuses.update(|statuses| {
+                    statuses.insert(
+                        host_id,
+                        ConnectionStatus::Error(format!("failed to prepare remote host: {error}")),
+                    );
+                });
+                return;
+            }
+        }
+    }
+
     if let Err(error) = bridge::connect_host(bridge::HostIdRequest {
         host_id: host_id.clone(),
     })
@@ -824,4 +855,21 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
         return;
     }
     log::info!("host.connect.done host={}", host_id);
+}
+
+fn is_managed_remote_host(state: &AppState, host_id: &str) -> bool {
+    state
+        .configured_hosts
+        .get_untracked()
+        .into_iter()
+        .any(|host| {
+            host.id == host_id
+                && matches!(
+                    host.transport,
+                    bridge::HostTransportConfig::SshStdio {
+                        lifecycle: bridge::RemoteHostLifecycleConfig::ManagedTyde,
+                        ..
+                    }
+                )
+        })
 }

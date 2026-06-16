@@ -7,8 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g. v0.8.1)'
+        description: 'Version tag (must start with v, e.g. v0.8.1)'
         required: true
+      publish:
+        description: 'Publish after artifacts are uploaded (required before remotes can download prereleases)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -20,6 +24,13 @@ jobs:
       RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify release tag format
+        run: |
+          if [[ "$RELEASE_TAG" != v* ]]; then
+            echo "::error::Release tag must start with v, got $RELEASE_TAG"
+            exit 1
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -33,16 +44,25 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$GITHUB_SHA"
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            edit_prerelease_flag=(--prerelease)
+            create_prerelease_flag=(--prerelease)
           else
-            gh release create "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$GITHUB_SHA"
+            edit_prerelease_flag=(--prerelease=false)
+            create_prerelease_flag=()
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$GITHUB_SHA" "${edit_prerelease_flag[@]}"
+          else
+            gh release create "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$GITHUB_SHA" "${create_prerelease_flag[@]}"
           fi
 
   build:
     needs: create-release
     env:
       RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
+      TYDE_RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -262,7 +282,7 @@ jobs:
           releaseName: Tyde ${{ env.RELEASE_TAG }}
           releaseBody: ''
           releaseDraft: true
-          prerelease: false
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           tauriScript: npx --prefix ../.. tauri
           args: ${{ matrix.tauri-args }}
 
@@ -433,12 +453,19 @@ jobs:
 
   publish-release:
     needs: build
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: |
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
     steps:
       - name: Publish release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "$RELEASE_TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"
+        run: |
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false --repo "$GITHUB_REPOSITORY"
+          else
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest --repo "$GITHUB_REPOSITORY"
+          fi

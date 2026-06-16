@@ -520,11 +520,16 @@ async fn setup_connection_transport(
             remote_command,
             lifecycle,
         } => {
+            if ssh_destination.trim_start().starts_with('-') {
+                return Err(format!(
+                    "ssh destination for host {host_id} must not start with '-'"
+                ));
+            }
             let command = match lifecycle {
                 RemoteHostLifecycleConfig::Manual => {
                     remote_command.unwrap_or_else(|| DEFAULT_REMOTE_HOST_COMMAND.to_string())
                 }
-                RemoteHostLifecycleConfig::ManagedTyde { .. } => managed_remote_bridge_command(),
+                RemoteHostLifecycleConfig::ManagedTyde => managed_remote_bridge_command(),
             };
             let mut child = Command::new("ssh");
             child

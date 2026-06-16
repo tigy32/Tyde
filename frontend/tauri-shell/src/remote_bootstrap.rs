@@ -6,9 +6,8 @@ use host_config::{
     ConfiguredHost, HostLifecycleEvent, HostTransportConfig, RemoteArchitecture,
     RemoteHostLifecycleConfig, RemoteHostLifecycleSnapshot, RemoteHostLifecycleStatus,
     RemoteHostLifecycleStep, RemoteOperatingSystem, RemotePlatform, RemoteTydeRunningState,
-    TydeReleaseTarget,
+    TydeReleaseVersion,
 };
-use protocol::Version;
 use reqwest::header::USER_AGENT;
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
@@ -19,6 +18,15 @@ use crate::bridge::HOST_LIFECYCLE_EVENT;
 
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/tigy32/Tyde/releases";
 const GITHUB_USER_AGENT: &str = "Tyde remote lifecycle";
+
+fn current_app_release_version() -> Result<TydeReleaseVersion, String> {
+    let tag = option_env!("TYDE_RELEASE_TAG").ok_or_else(|| {
+        "this Tyde build does not include release metadata, so managed remote install is disabled; use an official release build or configure a manual remote command"
+            .to_string()
+    })?;
+    tag.parse::<TydeReleaseVersion>()
+        .map_err(|err| format!("invalid TYDE_RELEASE_TAG {tag:?}: {err}"))
+}
 
 pub async fn probe_configured_host_lifecycle(
     app: AppHandle,
@@ -33,6 +41,7 @@ pub async fn ensure_configured_host_ready(
     host: ConfiguredHost,
 ) -> Result<RemoteHostLifecycleSnapshot, String> {
     let managed = managed_ssh_host(&host)?;
+    let target_version = current_app_release_version()?;
 
     emit_running(&app, &host.id, RemoteHostLifecycleStep::ProbePlatform, None);
     let platform = probe_platform(&managed.ssh_destination).await?;
@@ -43,15 +52,16 @@ pub async fn ensure_configured_host_ready(
         RemoteHostLifecycleStep::ResolveRelease,
         None,
     );
-    let release = resolve_release(&managed.release).await?;
+    let release = resolve_release(target_version).await?;
 
     emit_running(
         &app,
         &host.id,
         RemoteHostLifecycleStep::ProbeInstallation,
-        Some(release.version),
+        Some(release.version.clone()),
     );
-    let mut snapshot = probe_snapshot(&managed.ssh_destination, platform, release.version).await?;
+    let mut snapshot =
+        probe_snapshot(&managed.ssh_destination, platform, release.version.clone()).await?;
     emit_snapshot(&app, &host.id, snapshot.clone());
 
     if !snapshot.installed_target {
@@ -59,7 +69,7 @@ pub async fn ensure_configured_host_ready(
             &app,
             &host.id,
             RemoteHostLifecycleStep::DownloadAsset,
-            Some(snapshot.target_version),
+            Some(snapshot.target_version.clone()),
         );
         let asset = select_release_asset(&release, snapshot.platform)?;
         let archive = download_asset(&asset.download_url).await?;
@@ -69,13 +79,13 @@ pub async fn ensure_configured_host_ready(
             &app,
             &host.id,
             RemoteHostLifecycleStep::InstallBinary,
-            Some(snapshot.target_version),
+            Some(snapshot.target_version.clone()),
         );
-        install_binary(&managed.ssh_destination, snapshot.target_version, &binary).await?;
+        install_binary(&managed.ssh_destination, &snapshot.target_version, &binary).await?;
         snapshot = probe_snapshot(
             &managed.ssh_destination,
             snapshot.platform,
-            snapshot.target_version,
+            snapshot.target_version.clone(),
         )
         .await?;
         emit_snapshot(&app, &host.id, snapshot.clone());
@@ -87,7 +97,7 @@ pub async fn ensure_configured_host_ready(
                 &app,
                 &host.id,
                 RemoteHostLifecycleStep::Connect,
-                Some(snapshot.target_version),
+                Some(snapshot.target_version.clone()),
             );
             emit_snapshot(&app, &host.id, snapshot.clone());
             Ok(snapshot)
@@ -97,14 +107,14 @@ pub async fn ensure_configured_host_ready(
                 &app,
                 &host.id,
                 RemoteHostLifecycleStep::StopOldServer,
-                Some(snapshot.target_version),
+                Some(snapshot.target_version.clone()),
             );
             stop_managed_server(&managed.ssh_destination).await?;
             launch_and_verify(
                 &app,
                 &host.id,
                 &managed.ssh_destination,
-                snapshot.target_version,
+                snapshot.target_version.clone(),
             )
             .await
         }
@@ -113,7 +123,7 @@ pub async fn ensure_configured_host_ready(
                 &app,
                 &host.id,
                 &managed.ssh_destination,
-                snapshot.target_version,
+                snapshot.target_version.clone(),
             )
             .await
         }
@@ -127,21 +137,27 @@ pub async fn ensure_configured_host_ready(
 
 struct ManagedSshHost {
     ssh_destination: String,
-    release: TydeReleaseTarget,
 }
 
 fn managed_ssh_host(host: &ConfiguredHost) -> Result<ManagedSshHost, String> {
     match &host.transport {
         HostTransportConfig::SshStdio {
             ssh_destination,
-            lifecycle: RemoteHostLifecycleConfig::ManagedTyde { release },
+            lifecycle: RemoteHostLifecycleConfig::ManagedTyde,
             remote_command: None,
-        } => Ok(ManagedSshHost {
-            ssh_destination: ssh_destination.clone(),
-            release: release.clone(),
-        }),
+        } => {
+            if ssh_destination.trim_start().starts_with('-') {
+                return Err(format!(
+                    "ssh destination for host '{}' must not start with '-'",
+                    host.id
+                ));
+            }
+            Ok(ManagedSshHost {
+                ssh_destination: ssh_destination.clone(),
+            })
+        }
         HostTransportConfig::SshStdio {
-            lifecycle: RemoteHostLifecycleConfig::ManagedTyde { .. },
+            lifecycle: RemoteHostLifecycleConfig::ManagedTyde,
             remote_command: Some(_),
             ..
         } => Err(format!(
@@ -163,17 +179,19 @@ async fn probe_managed_host(
     host_id: &str,
     managed: &ManagedSshHost,
 ) -> Result<RemoteHostLifecycleSnapshot, String> {
+    let target_version = current_app_release_version()?;
+
     emit_running(app, host_id, RemoteHostLifecycleStep::ProbePlatform, None);
     let platform = probe_platform(&managed.ssh_destination).await?;
 
     emit_running(app, host_id, RemoteHostLifecycleStep::ResolveRelease, None);
-    let release = resolve_release(&managed.release).await?;
+    let release = resolve_release(target_version).await?;
 
     emit_running(
         app,
         host_id,
         RemoteHostLifecycleStep::ProbeInstallation,
-        Some(release.version),
+        Some(release.version.clone()),
     );
     let snapshot = probe_snapshot(&managed.ssh_destination, platform, release.version).await?;
     emit_snapshot(app, host_id, snapshot.clone());
@@ -184,26 +202,26 @@ async fn launch_and_verify(
     app: &AppHandle,
     host_id: &str,
     ssh_destination: &str,
-    version: Version,
+    version: TydeReleaseVersion,
 ) -> Result<RemoteHostLifecycleSnapshot, String> {
     emit_running(
         app,
         host_id,
         RemoteHostLifecycleStep::LaunchServer,
-        Some(version),
+        Some(version.clone()),
     );
-    launch_server(ssh_destination, version).await?;
+    launch_server(ssh_destination, &version).await?;
 
     emit_running(
         app,
         host_id,
         RemoteHostLifecycleStep::VerifyRunning,
-        Some(version),
+        Some(version.clone()),
     );
     let platform = probe_platform(ssh_destination).await?;
-    let snapshot = probe_snapshot(ssh_destination, platform, version).await?;
-    match snapshot.running {
-        RemoteTydeRunningState::Managed { version: running } if running == version => {
+    let snapshot = probe_snapshot(ssh_destination, platform, version.clone()).await?;
+    match &snapshot.running {
+        RemoteTydeRunningState::Managed { version: running } if running == &version => {
             emit_snapshot(app, host_id, snapshot.clone());
             Ok(snapshot)
         }
@@ -231,7 +249,7 @@ struct GitHubAsset {
 
 #[derive(Debug, Clone)]
 struct ReleaseInfo {
-    version: Version,
+    version: TydeReleaseVersion,
     assets: Vec<ReleaseAssetInfo>,
 }
 
@@ -241,13 +259,8 @@ struct ReleaseAssetInfo {
     download_url: String,
 }
 
-async fn resolve_release(target: &TydeReleaseTarget) -> Result<ReleaseInfo, String> {
-    let url = match target {
-        TydeReleaseTarget::Latest => format!("{GITHUB_RELEASES_API}/latest"),
-        TydeReleaseTarget::Version { version } => {
-            format!("{GITHUB_RELEASES_API}/tags/v{version}")
-        }
-    };
+async fn resolve_release(expected: TydeReleaseVersion) -> Result<ReleaseInfo, String> {
+    let url = format!("{GITHUB_RELEASES_API}/tags/{}", expected.github_tag());
 
     let release = reqwest::Client::new()
         .get(url)
@@ -261,12 +274,23 @@ async fn resolve_release(target: &TydeReleaseTarget) -> Result<ReleaseInfo, Stri
         .await
         .map_err(|err| format!("failed to parse GitHub release response: {err}"))?;
 
-    let version = release.tag_name.parse::<Version>().map_err(|err| {
-        format!(
-            "GitHub release tag {:?} is not semver: {err}",
-            release.tag_name
-        )
-    })?;
+    let version = release
+        .tag_name
+        .parse::<TydeReleaseVersion>()
+        .map_err(|err| {
+            format!(
+                "GitHub release tag {:?} is not a valid Tyde release version: {err}",
+                release.tag_name
+            )
+        })?;
+    if version != expected {
+        return Err(format!(
+            "GitHub release tag {} resolved to {}, expected {}",
+            expected.github_tag(),
+            version.github_tag(),
+            expected.github_tag()
+        ));
+    }
 
     Ok(ReleaseInfo {
         version,
@@ -296,7 +320,7 @@ fn select_release_asset(
     release: &ReleaseInfo,
     platform: RemotePlatform,
 ) -> Result<SelectedReleaseAsset, String> {
-    let (asset_name, kind) = release_asset_name(platform, release.version)?;
+    let (asset_name, kind) = release_asset_name(platform)?;
     let asset = release
         .assets
         .iter()
@@ -313,10 +337,7 @@ fn select_release_asset(
     })
 }
 
-fn release_asset_name(
-    platform: RemotePlatform,
-    _version: Version,
-) -> Result<(String, ReleaseAssetKind), String> {
+fn release_asset_name(platform: RemotePlatform) -> Result<(String, ReleaseAssetKind), String> {
     match (platform.os, platform.arch) {
         (RemoteOperatingSystem::Linux, RemoteArchitecture::X86_64) => Ok((
             "tyde-server-x86_64-unknown-linux-musl.zip".to_string(),
@@ -415,11 +436,12 @@ fn parse_remote_arch(value: &str) -> Result<RemoteArchitecture, String> {
 async fn probe_snapshot(
     ssh_destination: &str,
     platform: RemotePlatform,
-    target_version: Version,
+    target_version: TydeReleaseVersion,
 ) -> Result<RemoteHostLifecycleSnapshot, String> {
+    let target_version_sh = shell_quote(target_version.as_str());
     let command = format!(
         r#"set -eu
-target_version={target_version}
+target_version={target_version_sh}
 if [ -x "$HOME/.tyde/bin/$target_version/tyde-server" ]; then
   echo installed_target=1
 else
@@ -460,15 +482,16 @@ fi
     let parsed = parse_key_value_lines(&output)?;
     let installed_target = parse_bool_field(&parsed, "installed_target")?;
     let current_link_version =
-        parse_optional_version_path_result(parsed.get("current_link_version"))?;
+        parse_optional_release_version_path_result(parsed.get("current_link_version"))?;
     let running = match parsed.get("running").map(String::as_str) {
         Some("not_running") => RemoteTydeRunningState::NotRunning,
         Some("unknown_socket") => RemoteTydeRunningState::UnknownSocket,
         Some("managed") => {
-            let version = parse_optional_version_path_result(parsed.get("running_version"))?
-                .ok_or_else(|| {
-                    "managed remote Tyde process is missing its version file".to_string()
-                })?;
+            let version =
+                parse_optional_release_version_path_result(parsed.get("running_version"))?
+                    .ok_or_else(|| {
+                        "managed remote Tyde process is missing its version file".to_string()
+                    })?;
             RemoteTydeRunningState::Managed { version }
         }
         Some(other) => return Err(format!("unexpected remote running state {other:?}")),
@@ -506,30 +529,37 @@ fn parse_bool_field(parsed: &HashMap<String, String>, key: &str) -> Result<bool,
     }
 }
 
-fn parse_optional_version_path(value: &str) -> Option<Result<Version, String>> {
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn parse_optional_release_version_path(value: &str) -> Option<Result<TydeReleaseVersion, String>> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
     }
     let last_component = trimmed.rsplit('/').next().unwrap_or(trimmed);
-    Some(last_component.parse::<Version>())
+    Some(last_component.parse::<TydeReleaseVersion>())
 }
 
-fn parse_optional_version_path_result(value: Option<&String>) -> Result<Option<Version>, String> {
+fn parse_optional_release_version_path_result(
+    value: Option<&String>,
+) -> Result<Option<TydeReleaseVersion>, String> {
     match value {
-        Some(value) => parse_optional_version_path(value).transpose(),
+        Some(value) => parse_optional_release_version_path(value).transpose(),
         None => Ok(None),
     }
 }
 
 async fn install_binary(
     ssh_destination: &str,
-    version: Version,
+    version: &TydeReleaseVersion,
     binary: &[u8],
 ) -> Result<(), String> {
+    let version_sh = shell_quote(version.as_str());
     let command = format!(
         r#"set -eu
-version={version}
+version={version_sh}
 install_dir="$HOME/.tyde/bin/$version"
 mkdir -p "$install_dir" "$HOME/.tyde/logs" "$HOME/.tyde/run"
 tmp="$install_dir/tyde-server.tmp.$$"
@@ -569,10 +599,11 @@ rm -f "$pid_file" "$version_file"
     ssh_capture(ssh_destination, command).await.map(|_| ())
 }
 
-async fn launch_server(ssh_destination: &str, version: Version) -> Result<(), String> {
+async fn launch_server(ssh_destination: &str, version: &TydeReleaseVersion) -> Result<(), String> {
+    let version_sh = shell_quote(version.as_str());
     let command = format!(
         r#"set -eu
-version={version}
+version={version_sh}
 bin="$HOME/.tyde/bin/$version/tyde-server"
 socket="$HOME/.tyde/tyde.sock"
 pid_file="$HOME/.tyde/run/tyde-host.pid"
@@ -681,7 +712,7 @@ fn emit_running(
     app: &AppHandle,
     host_id: &str,
     step: RemoteHostLifecycleStep,
-    target_version: Option<Version>,
+    target_version: Option<TydeReleaseVersion>,
 ) {
     let _ = app.emit(
         HOST_LIFECYCLE_EVENT,
@@ -719,12 +750,8 @@ fn emit_error(app: &AppHandle, host_id: &str, message: String) {
 mod tests {
     use super::*;
 
-    fn v(major: u32, minor: u32, patch: u32) -> Version {
-        Version {
-            major,
-            minor,
-            patch,
-        }
+    fn release(value: &str) -> TydeReleaseVersion {
+        value.parse().unwrap()
     }
 
     #[test]
@@ -756,8 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_versioned_portable_assets() {
-        let version = v(0, 8, 0);
+    fn selects_portable_assets() {
         let linux_x64 = RemotePlatform {
             os: RemoteOperatingSystem::Linux,
             arch: RemoteArchitecture::X86_64,
@@ -767,14 +793,14 @@ mod tests {
             arch: RemoteArchitecture::Aarch64,
         };
         assert_eq!(
-            release_asset_name(linux_x64, version).unwrap(),
+            release_asset_name(linux_x64).unwrap(),
             (
                 "tyde-server-x86_64-unknown-linux-musl.zip".to_string(),
                 ReleaseAssetKind::Zip
             )
         );
         assert_eq!(
-            release_asset_name(mac_arm, version).unwrap(),
+            release_asset_name(mac_arm).unwrap(),
             (
                 "tyde-server-aarch64-apple-darwin.zip".to_string(),
                 ReleaseAssetKind::Zip
@@ -785,15 +811,17 @@ mod tests {
     #[test]
     fn parses_version_path_last_component() {
         assert_eq!(
-            parse_optional_version_path("0.8.0").unwrap().unwrap(),
-            v(0, 8, 0)
-        );
-        assert_eq!(
-            parse_optional_version_path("/Users/me/.tyde/bin/0.8.0")
+            parse_optional_release_version_path("0.8.0")
                 .unwrap()
                 .unwrap(),
-            v(0, 8, 0)
+            release("0.8.0")
         );
-        assert!(parse_optional_version_path("").is_none());
+        assert_eq!(
+            parse_optional_release_version_path("/Users/me/.tyde/bin/0.8.0-beta.1")
+                .unwrap()
+                .unwrap(),
+            release("0.8.0-beta.1")
+        );
+        assert!(parse_optional_release_version_path("").is_none());
     }
 }

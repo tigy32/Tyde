@@ -4,8 +4,7 @@
 //! *configured hosts* — the user's list of local/remote endpoints and the
 //! transport used to reach each one. They are persisted by the shell to
 //! `~/.tyde/configured_hosts.json` and also serialized across the
-//! `tauri::invoke` boundary to the WASM frontend. The only protocol type reused
-//! here is `Version`, so semver values stay strongly typed everywhere.
+//! `tauri::invoke` boundary to the WASM frontend.
 //!
 //! Per `dev-docs/01-philosophy.md` there must be one source of truth for any
 //! wire-crossing type. These types intentionally live in their own tiny crate
@@ -17,21 +16,127 @@
 //! `dev-docs/12-remote-hosts.md`; they are not NDJSON frame payloads for a
 //! connected host.
 
-use protocol::Version;
+use std::fmt;
+use std::str::FromStr;
+
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 
 /// Identifier for the always-present local embedded host.
 pub const LOCAL_HOST_ID: &str = "local";
 
-/// Which Tyde release the shell should install for a managed remote host.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TydeReleaseTarget {
-    /// Resolve the current latest GitHub release at lifecycle time.
-    #[default]
-    Latest,
-    /// Install and launch one exact release version.
-    Version { version: Version },
+/// Tyde release identifier without the leading GitHub tag `v`.
+///
+/// Stable releases look like `0.8.19`; prereleases look like
+/// `0.8.20-beta.1`. Managed remotes use this value both to resolve the
+/// matching GitHub release tag (`v{version}`) and as the remote install
+/// directory name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TydeReleaseVersion(String);
+
+impl TydeReleaseVersion {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let value = raw.trim().strip_prefix('v').unwrap_or(raw.trim());
+        validate_release_version(value)?;
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn github_tag(&self) -> String {
+        format!("v{}", self.0)
+    }
+}
+
+impl fmt::Display for TydeReleaseVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for TydeReleaseVersion {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for TydeReleaseVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for TydeReleaseVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ReleaseVersionVisitor;
+
+        impl<'de> Visitor<'de> for ReleaseVersionVisitor {
+            type Value = TydeReleaseVersion;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a Tyde release version like 0.8.19 or 0.8.20-beta.1")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                TydeReleaseVersion::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(ReleaseVersionVisitor)
+    }
+}
+
+fn validate_release_version(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("release version must not be empty".to_string());
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Err("release version must not contain path separators".to_string());
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err("release version must not contain whitespace".to_string());
+    }
+
+    let (core, prerelease) = value
+        .split_once('-')
+        .map_or((value, None), |(core, prerelease)| (core, Some(prerelease)));
+    let parts = core.split('.').collect::<Vec<_>>();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return Err("release version must start with numeric major.minor.patch".to_string());
+    }
+
+    if let Some(prerelease) = prerelease
+        && (prerelease.is_empty()
+            || prerelease.split('.').any(|part| {
+                part.is_empty()
+                    || !part
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            }))
+    {
+        return Err(
+            "release prerelease identifiers may contain only ASCII letters, digits, and hyphens"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Who owns the remote Tyde daemon lifecycle for an SSH host.
@@ -44,10 +149,10 @@ pub enum RemoteHostLifecycleConfig {
     /// The desktop shell may install versioned Tyde binaries under
     /// `~/.tyde/bin/<version>/tyde`, maintain `~/.tyde/bin/current`, and launch
     /// the remote `tyde host --uds` daemon when needed.
-    ManagedTyde {
-        #[serde(default)]
-        release: TydeReleaseTarget,
-    },
+    ///
+    /// Managed remotes always install the exact release that built the current
+    /// desktop app, so the frontend and remote server stay in lockstep.
+    ManagedTyde,
 }
 
 /// How the shell should reach a configured host.
@@ -183,7 +288,7 @@ pub enum RemoteTydeRunningState {
     NotRunning,
     /// Running daemon launched by Tyde's managed lifecycle path.
     Managed {
-        version: Version,
+        version: TydeReleaseVersion,
     },
     /// A socket exists, but the shell cannot prove it owns the daemon.
     UnknownSocket,
@@ -193,9 +298,9 @@ pub enum RemoteTydeRunningState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteHostLifecycleSnapshot {
-    pub target_version: Version,
+    pub target_version: TydeReleaseVersion,
     pub installed_target: bool,
-    pub current_link_version: Option<Version>,
+    pub current_link_version: Option<TydeReleaseVersion>,
     pub running: RemoteTydeRunningState,
     pub platform: RemotePlatform,
 }
@@ -222,7 +327,7 @@ pub enum RemoteHostLifecycleStatus {
     Idle,
     Running {
         step: RemoteHostLifecycleStep,
-        target_version: Option<Version>,
+        target_version: Option<TydeReleaseVersion>,
     },
     Snapshot {
         snapshot: RemoteHostLifecycleSnapshot,
@@ -243,6 +348,36 @@ pub struct HostLifecycleEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_versions_accept_prereleases() -> Result<(), Box<dyn std::error::Error>> {
+        let stable = TydeReleaseVersion::parse("v0.8.19")?;
+        assert_eq!(stable.as_str(), "0.8.19");
+        assert_eq!(stable.github_tag(), "v0.8.19");
+
+        let beta = TydeReleaseVersion::parse("0.8.20-beta.1")?;
+        assert_eq!(beta.to_string(), "0.8.20-beta.1");
+        assert_eq!(beta.github_tag(), "v0.8.20-beta.1");
+
+        assert!(TydeReleaseVersion::parse("0.8").is_err());
+        assert!(TydeReleaseVersion::parse("../0.8.19").is_err());
+        assert!(TydeReleaseVersion::parse("0.8.19 beta").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn managed_lifecycle_accepts_legacy_release_field() -> Result<(), Box<dyn std::error::Error>> {
+        let json = r#"{"kind":"managed_tyde","release":{"kind":"latest"}}"#;
+        let decoded: RemoteHostLifecycleConfig = serde_json::from_str(json)?;
+        assert_eq!(decoded, RemoteHostLifecycleConfig::ManagedTyde);
+        let encoded = serde_json::to_string(&decoded)?;
+        assert_eq!(encoded, r#"{"kind":"managed_tyde"}"#);
+
+        let pinned = r#"{"kind":"managed_tyde","release":{"kind":"version","version":{"major":0,"minor":8,"patch":7}}}"#;
+        let decoded: RemoteHostLifecycleConfig = serde_json::from_str(pinned)?;
+        assert_eq!(decoded, RemoteHostLifecycleConfig::ManagedTyde);
+        Ok(())
+    }
 
     #[test]
     fn host_line_delivery_id_is_backward_compatible() -> Result<(), Box<dyn std::error::Error>> {
