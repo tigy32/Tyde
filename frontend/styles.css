@@ -568,7 +568,6 @@ details summary:focus:not(:focus-visible) {
     display: flex;
     flex-direction: column;
     gap: 3px;
-    margin-top: 3px;
 }
 
 /* When expanded, indent the children under a vertical guide line that ties
