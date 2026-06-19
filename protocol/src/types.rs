@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -526,6 +526,13 @@ pub enum FrameKind {
     ProjectReadFile,
     ProjectSearch,
     ProjectSearchCancel,
+    CodeIntelSubscribeFile,
+    CodeIntelUnsubscribeFile,
+    CodeIntelSetVisibleRange,
+    CodeIntelHover,
+    CodeIntelNavigate,
+    CodeIntelFindReferences,
+    CodeIntelCancelReferences,
     ProjectStageFile,
     ProjectStageHunk,
     ProjectUnstageFile,
@@ -585,6 +592,14 @@ pub enum FrameKind {
     ProjectFileContents,
     ProjectSearchResults,
     ProjectSearchComplete,
+    CodeIntelStatus,
+    CodeIntelFileModel,
+    CodeIntelDiagnostics,
+    CodeIntelHoverResult,
+    CodeIntelNavigateResult,
+    CodeIntelReferencesResults,
+    CodeIntelReferencesComplete,
+    CodeIntelError,
     ProjectGitDiff,
     ProjectGitCommitResult,
     NewTerminal,
@@ -664,6 +679,13 @@ impl fmt::Display for FrameKind {
             Self::ProjectReadFile => f.write_str("project_read_file"),
             Self::ProjectSearch => f.write_str("project_search"),
             Self::ProjectSearchCancel => f.write_str("project_search_cancel"),
+            Self::CodeIntelSubscribeFile => f.write_str("code_intel_subscribe_file"),
+            Self::CodeIntelUnsubscribeFile => f.write_str("code_intel_unsubscribe_file"),
+            Self::CodeIntelSetVisibleRange => f.write_str("code_intel_set_visible_range"),
+            Self::CodeIntelHover => f.write_str("code_intel_hover"),
+            Self::CodeIntelNavigate => f.write_str("code_intel_navigate"),
+            Self::CodeIntelFindReferences => f.write_str("code_intel_find_references"),
+            Self::CodeIntelCancelReferences => f.write_str("code_intel_cancel_references"),
             Self::ProjectStageFile => f.write_str("project_stage_file"),
             Self::ProjectStageHunk => f.write_str("project_stage_hunk"),
             Self::ProjectUnstageFile => f.write_str("project_unstage_file"),
@@ -721,6 +743,14 @@ impl fmt::Display for FrameKind {
             Self::ProjectFileContents => f.write_str("project_file_contents"),
             Self::ProjectSearchResults => f.write_str("project_search_results"),
             Self::ProjectSearchComplete => f.write_str("project_search_complete"),
+            Self::CodeIntelStatus => f.write_str("code_intel_status"),
+            Self::CodeIntelFileModel => f.write_str("code_intel_file_model"),
+            Self::CodeIntelDiagnostics => f.write_str("code_intel_diagnostics"),
+            Self::CodeIntelHoverResult => f.write_str("code_intel_hover_result"),
+            Self::CodeIntelNavigateResult => f.write_str("code_intel_navigate_result"),
+            Self::CodeIntelReferencesResults => f.write_str("code_intel_references_results"),
+            Self::CodeIntelReferencesComplete => f.write_str("code_intel_references_complete"),
+            Self::CodeIntelError => f.write_str("code_intel_error"),
             Self::ProjectGitDiff => f.write_str("project_git_diff"),
             Self::ProjectGitCommitResult => f.write_str("project_git_commit_result"),
             Self::NewTerminal => f.write_str("new_terminal"),
@@ -2555,9 +2585,26 @@ pub enum ProjectGitChangeKind {
     TypeChanged,
 }
 
+/// Monotonic per-file version counter, owned by the project-stream actor. Each
+/// file read, filesystem-watcher change, and agent write bumps the **same**
+/// counter for that file. Every [`ProjectFileContentsPayload`] and every
+/// `CodeIntel*` frame carries the version of the contents it describes so the
+/// client can apply semantic decorations only against the matching text (see
+/// `dev-docs/24-code-intelligence.md` §2.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProjectFileVersion(pub u64);
+
+impl fmt::Display for ProjectFileVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectFileContentsPayload {
     pub path: ProjectPath,
+    pub version: ProjectFileVersion,
     pub contents: Option<String>,
     pub is_binary: bool,
 }
@@ -2637,6 +2684,356 @@ pub struct ProjectSearchCompletePayload {
     pub cancelled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+// ── Code intelligence ─────────────────────────────────────────────────────
+//
+// Server-owned code intelligence (go-to-definition, hover, diagnostics,
+// find-references). These frames ride the existing `/project/<project_id>`
+// stream. Positions on the wire are **byte offsets** into the file contents at
+// the carried `ProjectFileVersion`; UTF-16 conversion is confined to the
+// rust-analyzer provider, server-side. See `dev-docs/24-code-intelligence.md`.
+
+/// Open language identifier on the wire — NOT a closed enum. Adding pyright /
+/// gopls adds no protocol variant. The closed server-side `Language` enum lives
+/// in the server only; the frontend treats this as an opaque display label.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CodeIntelLanguageId(pub String);
+
+impl fmt::Display for CodeIntelLanguageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Open provider identifier on the wire — NOT a closed enum (e.g.
+/// "rust-analyzer", "pyright"). Rendered as an opaque label by the frontend.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CodeIntelProviderId(pub String);
+
+impl fmt::Display for CodeIntelProviderId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Shared half-open byte range `[start, end)` into a file or a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ByteRange {
+    /// Inclusive byte offset.
+    pub start: u32,
+    /// Exclusive byte offset.
+    pub end: u32,
+}
+
+// ── Code-intel: status (server → client) ──────────────────────────────────
+
+/// Tagged scope that carries identity, so the UI knows *which* provider/file a
+/// status pertains to — not just *that* something changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeIntelStatusScope {
+    Project,
+    Provider {
+        root: ProjectRootPath,
+    },
+    File {
+        path: ProjectPath,
+        version: ProjectFileVersion,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeIntelState {
+    /// No provider matches this language.
+    Unsupported,
+    /// A provider exists but the backing binary is absent.
+    Unavailable,
+    Starting,
+    Indexing,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeIntelResourceMode {
+    Full,
+    Limited,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelStatusPayload {
+    pub scope: CodeIntelStatusScope,
+    pub state: CodeIntelState,
+    pub resource_mode: CodeIntelResourceMode,
+    /// Present while indexing; mapped from RA `$/progress`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_done: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_work: Option<u32>,
+    /// Human-readable hint, e.g. "rustup component add rust-analyzer".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+// ── Code-intel: input events (client → server) ─────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelSubscribeFilePayload {
+    pub path: ProjectPath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelUnsubscribeFilePayload {
+    pub path: ProjectPath,
+}
+
+/// Pure prioritization hint. Never gates which identifiers are clickable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelSetVisibleRangePayload {
+    pub path: ProjectPath,
+    pub version: ProjectFileVersion,
+    pub range: ByteRange,
+}
+
+/// On-demand hover. `hover_id` is a client-chosen domain id (cf. `search_id`)
+/// that correlates the streamed result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelHoverPayload {
+    pub hover_id: u64,
+    pub path: ProjectPath,
+    pub version: ProjectFileVersion,
+    /// Byte offset into the file.
+    pub offset: u32,
+}
+
+/// Miss-fill for a click whose target has not been pushed yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelNavigatePayload {
+    pub navigate_id: u64,
+    pub path: ProjectPath,
+    pub version: ProjectFileVersion,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelFindReferencesPayload {
+    /// Domain id, like `search_id`.
+    pub references_id: u64,
+    pub path: ProjectPath,
+    pub version: ProjectFileVersion,
+    /// The symbol to find references to.
+    pub offset: u32,
+    pub include_declaration: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelCancelReferencesPayload {
+    pub references_id: u64,
+}
+
+// ── Code-intel: file model (server → client) ───────────────────────────────
+
+/// Progressive coverage of the file, NOT a permanent range gate. A `ByteRange`
+/// with `completeness: Partial` is a transient chunk on the way to an eventual
+/// `FullFile` + `Complete` model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeIntelModelRange {
+    FullFile,
+    ByteRange { range: ByteRange },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeIntelCompleteness {
+    /// Whole file resolved: every occurrence has its target(s).
+    Complete,
+    /// More occurrences/targets still streaming toward `Complete`.
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeIntelRole {
+    Definition,
+    Reference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelLocation {
+    pub path: ProjectPath,
+    pub range: ByteRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelOccurrence {
+    /// The clickable identifier span.
+    pub range: ByteRange,
+    pub role: CodeIntelRole,
+    /// Short label for tooltip/affordance.
+    pub display: String,
+    /// Empty until targets stream in; the client merges by `range`. LSP
+    /// `textDocument/definition` can return multiple locations, so this is a
+    /// list, not a single target.
+    #[serde(default)]
+    pub definition: Vec<CodeIntelLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelFileModelPayload {
+    pub path: ProjectPath,
+    pub version: ProjectFileVersion,
+    pub provider: CodeIntelProviderId,
+    pub language: CodeIntelLanguageId,
+    pub model_range: CodeIntelModelRange,
+    pub completeness: CodeIntelCompleteness,
+    pub occurrences: Vec<CodeIntelOccurrence>,
+}
+
+// ── Code-intel: diagnostics (server → client) ──────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeIntelSeverity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelDiagnostic {
+    pub range: ByteRange,
+    pub severity: CodeIntelSeverity,
+    pub message: String,
+    /// e.g. "rustc", "clippy".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// Full-file replace snapshot of diagnostics, pushed unsolicited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelDiagnosticsPayload {
+    pub path: ProjectPath,
+    pub version: ProjectFileVersion,
+    /// Replaces the prior set wholesale.
+    pub diagnostics: Vec<CodeIntelDiagnostic>,
+}
+
+// ── Code-intel: navigate / hover results (server → client) ─────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelNavigateResultPayload {
+    pub navigate_id: u64,
+    pub path: ProjectPath,
+    pub version: ProjectFileVersion,
+    /// Empty means "no definition found here" (a valid answer, not an error).
+    pub targets: Vec<CodeIntelLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelHoverResultPayload {
+    pub hover_id: u64,
+    pub path: ProjectPath,
+    pub version: ProjectFileVersion,
+    /// None means "nothing to show here" (a valid answer, not an error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contents: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<ByteRange>,
+}
+
+// ── Code-intel: find-references (server → client, streamed) ─────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelReferenceLine {
+    /// 1-based line number.
+    pub line_number: u32,
+    /// Sent verbatim.
+    pub line_text: String,
+    /// Byte ranges into `line_text`.
+    pub ranges: Vec<ByteRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelReferencesFileResult {
+    pub path: ProjectPath,
+    pub lines: Vec<CodeIntelReferenceLine>,
+    /// Per-file cap hit.
+    pub truncated: bool,
+}
+
+/// One matching file's references. Streamed incrementally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelReferencesResultsPayload {
+    pub references_id: u64,
+    pub file: CodeIntelReferencesFileResult,
+}
+
+/// Terminal frame: totals, truncation, cancellation, error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelReferencesCompletePayload {
+    pub references_id: u64,
+    pub total_files: u32,
+    pub total_references: u32,
+    pub truncated: bool,
+    pub cancelled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+// ── Code-intel: errors (server → client) ───────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeIntelErrorCode {
+    /// Binary absent.
+    ProviderUnavailable,
+    ProviderCrashed,
+    UnsupportedLanguage,
+    /// Request referenced a version the server no longer holds.
+    StaleVersion,
+    Timeout,
+    /// Malformed LSP traffic from the provider.
+    ProtocolError,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeIntelErrorContext {
+    Subscribe {
+        path: ProjectPath,
+    },
+    Hover {
+        hover_id: u64,
+        path: ProjectPath,
+    },
+    Navigate {
+        navigate_id: u64,
+        path: ProjectPath,
+    },
+    FindReferences {
+        references_id: u64,
+        path: ProjectPath,
+    },
+    Provider {
+        language: CodeIntelLanguageId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelErrorPayload {
+    pub code: CodeIntelErrorCode,
+    pub message: String,
+    pub context: CodeIntelErrorContext,
+    pub fatal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3852,8 +4249,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_thirteen() {
-        assert_eq!(PROTOCOL_VERSION, 13);
+    fn protocol_version_is_fourteen() {
+        assert_eq!(PROTOCOL_VERSION, 14);
     }
 
     #[test]
@@ -3952,6 +4349,358 @@ mod search_serde_tests {
     fn project_search_cancel_round_trip() {
         let payload = ProjectSearchCancelPayload { search_id: 42 };
         assert_eq!(round_trip(&payload), payload);
+    }
+
+    #[test]
+    fn project_file_contents_carries_version() {
+        let payload = ProjectFileContentsPayload {
+            path: ProjectPath {
+                root: ProjectRootPath("/repo".to_owned()),
+                relative_path: "src/main.rs".to_owned(),
+            },
+            version: ProjectFileVersion(7),
+            contents: Some("fn main() {}".to_owned()),
+            is_binary: false,
+        };
+        let json = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(json["version"], serde_json::json!(7));
+    }
+}
+
+#[cfg(test)]
+mod code_intel_serde_tests {
+    use super::*;
+
+    fn round_trip<T>(value: &T) -> T
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        let json = serde_json::to_string(value).expect("serialize");
+        serde_json::from_str(&json).expect("deserialize")
+    }
+
+    fn sample_path() -> ProjectPath {
+        ProjectPath {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "src/lib.rs".to_owned(),
+        }
+    }
+
+    fn sample_location() -> CodeIntelLocation {
+        CodeIntelLocation {
+            path: sample_path(),
+            range: ByteRange { start: 4, end: 9 },
+        }
+    }
+
+    #[test]
+    fn code_intel_frame_kinds_display_snake_case() {
+        assert_eq!(
+            FrameKind::CodeIntelSubscribeFile.to_string(),
+            "code_intel_subscribe_file"
+        );
+        assert_eq!(
+            FrameKind::CodeIntelUnsubscribeFile.to_string(),
+            "code_intel_unsubscribe_file"
+        );
+        assert_eq!(
+            FrameKind::CodeIntelSetVisibleRange.to_string(),
+            "code_intel_set_visible_range"
+        );
+        assert_eq!(FrameKind::CodeIntelHover.to_string(), "code_intel_hover");
+        assert_eq!(
+            FrameKind::CodeIntelNavigate.to_string(),
+            "code_intel_navigate"
+        );
+        assert_eq!(
+            FrameKind::CodeIntelFindReferences.to_string(),
+            "code_intel_find_references"
+        );
+        assert_eq!(
+            FrameKind::CodeIntelCancelReferences.to_string(),
+            "code_intel_cancel_references"
+        );
+        assert_eq!(FrameKind::CodeIntelStatus.to_string(), "code_intel_status");
+        assert_eq!(
+            FrameKind::CodeIntelFileModel.to_string(),
+            "code_intel_file_model"
+        );
+        assert_eq!(
+            FrameKind::CodeIntelDiagnostics.to_string(),
+            "code_intel_diagnostics"
+        );
+        assert_eq!(
+            FrameKind::CodeIntelHoverResult.to_string(),
+            "code_intel_hover_result"
+        );
+        assert_eq!(
+            FrameKind::CodeIntelNavigateResult.to_string(),
+            "code_intel_navigate_result"
+        );
+        assert_eq!(
+            FrameKind::CodeIntelReferencesResults.to_string(),
+            "code_intel_references_results"
+        );
+        assert_eq!(
+            FrameKind::CodeIntelReferencesComplete.to_string(),
+            "code_intel_references_complete"
+        );
+        assert_eq!(FrameKind::CodeIntelError.to_string(), "code_intel_error");
+    }
+
+    #[test]
+    fn subscribe_unsubscribe_round_trip() {
+        let subscribe = CodeIntelSubscribeFilePayload {
+            path: sample_path(),
+        };
+        assert_eq!(round_trip(&subscribe), subscribe);
+        let unsubscribe = CodeIntelUnsubscribeFilePayload {
+            path: sample_path(),
+        };
+        assert_eq!(round_trip(&unsubscribe), unsubscribe);
+    }
+
+    #[test]
+    fn set_visible_range_round_trip() {
+        let payload = CodeIntelSetVisibleRangePayload {
+            path: sample_path(),
+            version: ProjectFileVersion(3),
+            range: ByteRange { start: 0, end: 120 },
+        };
+        assert_eq!(round_trip(&payload), payload);
+    }
+
+    #[test]
+    fn hover_and_navigate_round_trip() {
+        let hover = CodeIntelHoverPayload {
+            hover_id: 1,
+            path: sample_path(),
+            version: ProjectFileVersion(2),
+            offset: 42,
+        };
+        assert_eq!(round_trip(&hover), hover);
+        let navigate = CodeIntelNavigatePayload {
+            navigate_id: 9,
+            path: sample_path(),
+            version: ProjectFileVersion(2),
+            offset: 42,
+        };
+        assert_eq!(round_trip(&navigate), navigate);
+    }
+
+    #[test]
+    fn find_and_cancel_references_round_trip() {
+        let find = CodeIntelFindReferencesPayload {
+            references_id: 5,
+            path: sample_path(),
+            version: ProjectFileVersion(4),
+            offset: 17,
+            include_declaration: true,
+        };
+        assert_eq!(round_trip(&find), find);
+        let cancel = CodeIntelCancelReferencesPayload { references_id: 5 };
+        assert_eq!(round_trip(&cancel), cancel);
+    }
+
+    #[test]
+    fn status_payload_round_trips_every_scope_and_state() {
+        let scopes = [
+            CodeIntelStatusScope::Project,
+            CodeIntelStatusScope::Provider {
+                root: ProjectRootPath("/repo".to_owned()),
+            },
+            CodeIntelStatusScope::File {
+                path: sample_path(),
+                version: ProjectFileVersion(8),
+            },
+        ];
+        let states = [
+            CodeIntelState::Unsupported,
+            CodeIntelState::Unavailable,
+            CodeIntelState::Starting,
+            CodeIntelState::Indexing,
+            CodeIntelState::Ready,
+            CodeIntelState::Failed,
+        ];
+        let modes = [
+            CodeIntelResourceMode::Full,
+            CodeIntelResourceMode::Limited,
+            CodeIntelResourceMode::Unavailable,
+        ];
+        for scope in &scopes {
+            for state in &states {
+                for mode in &modes {
+                    let payload = CodeIntelStatusPayload {
+                        scope: scope.clone(),
+                        state: *state,
+                        resource_mode: *mode,
+                        work_done: Some(3),
+                        total_work: Some(10),
+                        message: Some("indexing".to_owned()),
+                    };
+                    assert_eq!(round_trip(&payload), payload);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_model_round_trip_all_variants() {
+        for model_range in [
+            CodeIntelModelRange::FullFile,
+            CodeIntelModelRange::ByteRange {
+                range: ByteRange { start: 1, end: 2 },
+            },
+        ] {
+            for completeness in [
+                CodeIntelCompleteness::Complete,
+                CodeIntelCompleteness::Partial,
+            ] {
+                let payload = CodeIntelFileModelPayload {
+                    path: sample_path(),
+                    version: ProjectFileVersion(6),
+                    provider: CodeIntelProviderId("rust-analyzer".to_owned()),
+                    language: CodeIntelLanguageId("rust".to_owned()),
+                    model_range: model_range.clone(),
+                    completeness,
+                    occurrences: vec![
+                        CodeIntelOccurrence {
+                            range: ByteRange { start: 4, end: 9 },
+                            role: CodeIntelRole::Definition,
+                            display: "foo".to_owned(),
+                            definition: vec![sample_location()],
+                        },
+                        CodeIntelOccurrence {
+                            range: ByteRange { start: 20, end: 23 },
+                            role: CodeIntelRole::Reference,
+                            display: "bar".to_owned(),
+                            definition: vec![],
+                        },
+                    ],
+                };
+                assert_eq!(round_trip(&payload), payload);
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostics_round_trip_all_severities() {
+        for severity in [
+            CodeIntelSeverity::Error,
+            CodeIntelSeverity::Warning,
+            CodeIntelSeverity::Information,
+            CodeIntelSeverity::Hint,
+        ] {
+            let payload = CodeIntelDiagnosticsPayload {
+                path: sample_path(),
+                version: ProjectFileVersion(2),
+                diagnostics: vec![CodeIntelDiagnostic {
+                    range: ByteRange { start: 0, end: 5 },
+                    severity,
+                    message: "mismatched types".to_owned(),
+                    source: Some("rustc".to_owned()),
+                }],
+            };
+            assert_eq!(round_trip(&payload), payload);
+        }
+    }
+
+    #[test]
+    fn navigate_and_hover_results_round_trip() {
+        let navigate = CodeIntelNavigateResultPayload {
+            navigate_id: 9,
+            path: sample_path(),
+            version: ProjectFileVersion(2),
+            targets: vec![sample_location()],
+        };
+        assert_eq!(round_trip(&navigate), navigate);
+        let hover = CodeIntelHoverResultPayload {
+            hover_id: 1,
+            path: sample_path(),
+            version: ProjectFileVersion(2),
+            contents: Some("`fn foo()`".to_owned()),
+            range: Some(ByteRange { start: 4, end: 9 }),
+        };
+        assert_eq!(round_trip(&hover), hover);
+    }
+
+    #[test]
+    fn references_results_and_complete_round_trip() {
+        let results = CodeIntelReferencesResultsPayload {
+            references_id: 5,
+            file: CodeIntelReferencesFileResult {
+                path: sample_path(),
+                lines: vec![CodeIntelReferenceLine {
+                    line_number: 12,
+                    line_text: "    foo();".to_owned(),
+                    ranges: vec![ByteRange { start: 4, end: 7 }],
+                }],
+                truncated: false,
+            },
+        };
+        assert_eq!(round_trip(&results), results);
+        let complete = CodeIntelReferencesCompletePayload {
+            references_id: 5,
+            total_files: 2,
+            total_references: 7,
+            truncated: false,
+            cancelled: false,
+            error: None,
+        };
+        assert_eq!(round_trip(&complete), complete);
+    }
+
+    #[test]
+    fn error_round_trip_all_codes_and_contexts() {
+        let codes = [
+            CodeIntelErrorCode::ProviderUnavailable,
+            CodeIntelErrorCode::ProviderCrashed,
+            CodeIntelErrorCode::UnsupportedLanguage,
+            CodeIntelErrorCode::StaleVersion,
+            CodeIntelErrorCode::Timeout,
+            CodeIntelErrorCode::ProtocolError,
+            CodeIntelErrorCode::Internal,
+        ];
+        let contexts = [
+            CodeIntelErrorContext::Subscribe {
+                path: sample_path(),
+            },
+            CodeIntelErrorContext::Hover {
+                hover_id: 1,
+                path: sample_path(),
+            },
+            CodeIntelErrorContext::Navigate {
+                navigate_id: 2,
+                path: sample_path(),
+            },
+            CodeIntelErrorContext::FindReferences {
+                references_id: 3,
+                path: sample_path(),
+            },
+            CodeIntelErrorContext::Provider {
+                language: CodeIntelLanguageId("rust".to_owned()),
+            },
+        ];
+        for code in &codes {
+            for context in &contexts {
+                let payload = CodeIntelErrorPayload {
+                    code: *code,
+                    message: "boom".to_owned(),
+                    context: context.clone(),
+                    fatal: true,
+                };
+                assert_eq!(round_trip(&payload), payload);
+            }
+        }
+    }
+
+    #[test]
+    fn occurrence_definition_defaults_to_empty() {
+        let occurrence: CodeIntelOccurrence = serde_json::from_str(
+            r#"{"range":{"start":0,"end":3},"role":"reference","display":"x"}"#,
+        )
+        .expect("deserialize");
+        assert!(occurrence.definition.is_empty());
     }
 }
 

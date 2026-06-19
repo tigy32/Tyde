@@ -370,6 +370,29 @@ impl ClaudeProcessRuntime {
     }
 }
 
+impl Drop for ClaudeProcessRuntime {
+    /// Reaps the child and aborts the reader tasks. This Drop genuinely fires
+    /// on both real leak paths:
+    ///
+    /// - Process self-exit (the dominant leak): the stdout reader hits EOF and
+    ///   calls `mark_process_exited`, which `take()`s the runtime out of its
+    ///   slot in `ClaudeInner`; the taken runtime then drops here. (It does NOT
+    ///   wait for the `Arc<ClaudeInner>` cycle to resolve, so it fires promptly
+    ///   even while other tasks still hold `ClaudeInner`.) The detached reaper
+    ///   `wait()`s the child, fixing the case where the old bare `try_wait`
+    ///   raced the not-yet-reaped child and left a zombie.
+    /// - Client disconnect / teardown: `shutdown()` → `shutdown_process()` →
+    ///   `kill()` reaps the still-running child first; Drop is then a no-op
+    ///   (child already `None`).
+    ///
+    /// So Drop is a real reaper on exit and a last-ditch net otherwise.
+    fn drop(&mut self) {
+        self.stdout_task.abort();
+        self.stderr_task.abort();
+        crate::backend::subprocess::reap_group_child_slot(&self.child);
+    }
+}
+
 #[derive(Default)]
 struct SegmentState {
     has_content: bool,

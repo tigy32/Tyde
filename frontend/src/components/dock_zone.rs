@@ -3,6 +3,7 @@ use leptos::prelude::*;
 use crate::components::agents_panel::AgentsPanel;
 use crate::components::file_explorer::FileExplorer;
 use crate::components::git_panel::GitPanel;
+use crate::components::references_panel::ReferencesPanel;
 use crate::components::search_panel::SearchPanel;
 use crate::components::sessions_panel::SessionsPanel;
 use crate::components::teams_panel::TeamsPanel;
@@ -145,6 +146,9 @@ fn LeftDock() -> impl IntoView {
                 <button class={tab_class(LeftTab::Search)} on:click=move |_| active_tab.set(LeftTab::Search)>
                     "Search"
                 </button>
+                <button class={tab_class(LeftTab::References)} on:click=move |_| active_tab.set(LeftTab::References)>
+                    "Refs"
+                </button>
             </div>
             <div class="dock-tab-content">
                 <div class="dock-tab-mount" style=tab_style(LeftTab::Files)>
@@ -155,6 +159,9 @@ fn LeftDock() -> impl IntoView {
                 </div>
                 <div class="dock-tab-mount" style=tab_style(LeftTab::Search)>
                     <SearchPanel />
+                </div>
+                <div class="dock-tab-mount" style=tab_style(LeftTab::References)>
+                    <ReferencesPanel />
                 </div>
             </div>
         </div>

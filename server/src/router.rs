@@ -4,28 +4,31 @@ use anyhow::anyhow;
 use protocol::types::{AgentCompactPayload, CloseAgentPayload};
 use protocol::{
     AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, CancelQueuedMessagePayload,
-    CancelWorkflowPayload, ClientErrorCode, ClientErrorPayload, CustomAgentDeletePayload,
-    CustomAgentUpsertPayload, DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FrameKind,
-    HostBrowseClosePayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
-    InterruptPayload, ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload,
-    McpServerUpsertPayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
-    MobilePairingCancelPayload, MobilePairingStartPayload, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
-    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload,
-    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
-    ReviewActionPayload, ReviewCreatePayload, ReviewId, ReviewSubscribePayload,
-    RunBackendSetupPayload, SendMessagePayload, SendQueuedMessageNowPayload, SetAgentNamePayload,
-    SetSessionSettingsPayload, SetSettingPayload, SkillRefreshPayload, SpawnAgentParams,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringUpsertPayload, StreamPath,
-    TeamCompactPayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberShufflePayload,
-    TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload, TerminalClosePayload,
-    TerminalCreatePayload, TerminalId, TerminalResizePayload, TerminalSendPayload,
-    TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowRefreshPayload,
+    CancelWorkflowPayload, ClientErrorCode, ClientErrorPayload, CodeIntelCancelReferencesPayload,
+    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
+    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
+    CodeIntelUnsubscribeFilePayload, CustomAgentDeletePayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FrameKind, HostBrowseClosePayload,
+    HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload, InterruptPayload,
+    ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload, McpServerUpsertPayload,
+    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
+    MobilePairingStartPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
+    ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload,
+    ProjectSearchPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewId,
+    ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
+    SendQueuedMessageNowPayload, SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringUpsertPayload, StreamPath, TeamCompactPayload, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload,
+    TerminalClosePayload, TerminalCreatePayload, TerminalId, TerminalResizePayload,
+    TerminalSendPayload, TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    WorkflowRefreshPayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -652,6 +655,104 @@ pub(crate) async fn route_client_envelope(
                 let payload: ProjectSearchCancelPayload =
                     parse_payload(&envelope, "project_search_cancel")?;
                 host.cancel_project_search(project_id, payload).await?;
+            }
+            FrameKind::CodeIntelSubscribeFile => {
+                let payload: CodeIntelSubscribeFilePayload =
+                    parse_payload(&envelope, "code_intel_subscribe_file")?;
+                ensure_non_empty(
+                    "code_intel_subscribe_file",
+                    "root",
+                    payload.path.root.0.as_str(),
+                )?;
+                ensure_non_empty(
+                    "code_intel_subscribe_file",
+                    "relative_path",
+                    payload.path.relative_path.as_str(),
+                )?;
+                host.code_intel_subscribe_file(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
+            }
+            FrameKind::CodeIntelUnsubscribeFile => {
+                let payload: CodeIntelUnsubscribeFilePayload =
+                    parse_payload(&envelope, "code_intel_unsubscribe_file")?;
+                ensure_non_empty(
+                    "code_intel_unsubscribe_file",
+                    "root",
+                    payload.path.root.0.as_str(),
+                )?;
+                host.code_intel_unsubscribe_file(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
+            }
+            FrameKind::CodeIntelSetVisibleRange => {
+                let payload: CodeIntelSetVisibleRangePayload =
+                    parse_payload(&envelope, "code_intel_set_visible_range")?;
+                ensure_non_empty(
+                    "code_intel_set_visible_range",
+                    "root",
+                    payload.path.root.0.as_str(),
+                )?;
+                host.code_intel_set_visible_range(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
+            }
+            FrameKind::CodeIntelHover => {
+                let payload: CodeIntelHoverPayload = parse_payload(&envelope, "code_intel_hover")?;
+                ensure_non_empty("code_intel_hover", "root", payload.path.root.0.as_str())?;
+                host.code_intel_hover(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
+            }
+            FrameKind::CodeIntelNavigate => {
+                let payload: CodeIntelNavigatePayload =
+                    parse_payload(&envelope, "code_intel_navigate")?;
+                ensure_non_empty("code_intel_navigate", "root", payload.path.root.0.as_str())?;
+                host.code_intel_navigate(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
+            }
+            FrameKind::CodeIntelFindReferences => {
+                let payload: CodeIntelFindReferencesPayload =
+                    parse_payload(&envelope, "code_intel_find_references")?;
+                ensure_non_empty(
+                    "code_intel_find_references",
+                    "root",
+                    payload.path.root.0.as_str(),
+                )?;
+                host.code_intel_find_references(
+                    connection_host_stream,
+                    &project_output_stream,
+                    project_id,
+                    payload,
+                )
+                .await?;
+            }
+            FrameKind::CodeIntelCancelReferences => {
+                let payload: CodeIntelCancelReferencesPayload =
+                    parse_payload(&envelope, "code_intel_cancel_references")?;
+                host.code_intel_cancel_references(project_id, payload)
+                    .await?;
             }
             FrameKind::ProjectReadDiff => {
                 let payload: ProjectReadDiffPayload =

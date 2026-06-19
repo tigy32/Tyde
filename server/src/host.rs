@@ -14,13 +14,15 @@ use protocol::types::{
 use protocol::{
     AgentControlStatus, AgentId, AgentInput, AgentOrigin, AgentStartPayload, AgentWorkflowMetadata,
     BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, CancelWorkflowPayload,
-    CustomAgent, CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    FrameKind, GitBranchName, HostAbsPath, HostBootstrapPayload, HostBrowseInitial,
-    HostBrowseListPayload, HostBrowseStartPayload, HostSettingsPayload, ImageData, McpServerConfig,
-    McpServerDeletePayload, McpServerId, McpServerNotifyPayload, McpServerUpsertPayload,
-    McpTransportConfig, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
-    MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
+    CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
+    CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, GitBranchName, HostAbsPath,
+    HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
+    HostSettingsPayload, ImageData, McpServerConfig, McpServerDeletePayload, McpServerId,
+    McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
     ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
@@ -68,6 +70,7 @@ use crate::backend::{
     validate_session_settings_values,
 };
 use crate::browse_stream;
+use crate::code_intel::CodeIntelRouter;
 use crate::config_mcp::ConfigMcpHandle;
 use crate::debug_mcp::DebugMcpHandle;
 use crate::error::{AppError, AppResult};
@@ -76,7 +79,7 @@ use crate::mobile_access::{
 };
 use crate::project_stream::{
     ProjectDiffRequestKey, ProjectStreamHandle, ProjectStreamSubscription, SearchSummary,
-    build_dir_listing, commit, discard_file, is_not_git_repository_error, read_diff, read_file,
+    build_dir_listing, commit, discard_file, is_not_git_repository_error, read_diff,
     search_project, spawn_project_subscription, stage_file, stage_hunk, unstage_file,
 };
 use crate::review::actor::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
@@ -242,6 +245,10 @@ pub(crate) struct HostState {
     /// and aborts as soon as the value no longer matches (a superseding search
     /// or an explicit cancel changed it).
     project_search_ids: HashMap<ProjectId, Arc<AtomicU64>>,
+    /// Per-project thin code-intelligence router. Maps each `CodeIntel*` frame
+    /// to the owning root's `CodeIntelService` actor (lazily spawned). Holds no
+    /// provider state itself. See `server/src/code_intel/`.
+    code_intel_routers: HashMap<ProjectId, CodeIntelRouter>,
     /// Workbench projects currently being removed. Removal validates
     /// blockers against a snapshot and then runs slow git subprocesses
     /// outside the state lock; agent spawns and terminal creation check
@@ -5844,19 +5851,20 @@ impl HostHandle {
         payload: ProjectReadFilePayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "project_read_file";
-        self.ensure_host_project_subscription(
-            connection_host_stream,
-            project_output_stream,
-            project_id.clone(),
-            OPERATION,
-        )
-        .await?;
-        let project_store = {
-            let state = self.state.lock().await;
-            Arc::clone(&state.project_store)
-        };
-        let project = load_project(&project_store, &project_id, OPERATION).await?;
-        let contents = read_file(&project, payload)
+        let handle = self
+            .ensure_host_project_subscription(
+                connection_host_stream,
+                project_output_stream,
+                project_id.clone(),
+                OPERATION,
+            )
+            .await?;
+        // Route the read through the project-stream actor so the centralized
+        // per-file version counter (the single bump point) assigns the version
+        // carried on the contents the client renders.
+        let contents = handle
+            .read_file(payload)
+            .await
             .map_err(|error| project_command_error(OPERATION, error))?;
         let payload = serde_json::to_value(&contents).map_err(|error| {
             AppError::internal_message(
@@ -5973,6 +5981,211 @@ impl HostHandle {
             // Only clear if it still points at the search being cancelled, so a
             // newer search that already replaced it keeps running.
             let _ = slot.compare_exchange(payload.search_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// Subscribe a file for code intelligence. We resolve the file's current
+    /// version from the project-stream actor's centralized counter so the
+    /// pushed semantic model carries the version of the contents the client is
+    /// rendering (the version-equals-rendered rule, spec §2.4), then delegate
+    /// to the project's thin router → the owning root's `CodeIntelService`.
+    /// Ensure the project subscription exists and **validate the path/root
+    /// against the loaded project** (the same check the read path uses) before
+    /// any code-intel routing. This is the security/robustness gate: a
+    /// bad/unknown root fails here with a surfaced `CommandError` and never
+    /// reaches the router, so a `CodeIntelService` is never spawned for a root
+    /// that isn't a real project root. Returns the project-stream handle so the
+    /// caller can reuse it (e.g. to peek the file version).
+    async fn ensure_validated_code_intel_path(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+        project_id: ProjectId,
+        path: ProjectPath,
+        operation: &'static str,
+    ) -> AppResult<ProjectStreamHandle> {
+        let handle = self
+            .ensure_host_project_subscription(
+                connection_host_stream,
+                project_output_stream,
+                project_id,
+                operation,
+            )
+            .await?;
+        handle
+            .validate_path(path)
+            .await
+            .map_err(|error| project_command_error(operation, error))?;
+        Ok(handle)
+    }
+
+    pub(crate) async fn code_intel_subscribe_file(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+        project_id: ProjectId,
+        payload: CodeIntelSubscribeFilePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "code_intel_subscribe_file";
+        let handle = self
+            .ensure_validated_code_intel_path(
+                connection_host_stream,
+                project_output_stream,
+                project_id.clone(),
+                payload.path.clone(),
+                OPERATION,
+            )
+            .await?;
+        let mut state = self.state.lock().await;
+        state
+            .code_intel_routers
+            .entry(project_id)
+            .or_insert_with(|| CodeIntelRouter::new(handle.clone()))
+            .subscribe(payload, project_output_stream.clone());
+        Ok(())
+    }
+
+    pub(crate) async fn code_intel_unsubscribe_file(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+        project_id: ProjectId,
+        payload: CodeIntelUnsubscribeFilePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "code_intel_unsubscribe_file";
+        let handle = self
+            .ensure_validated_code_intel_path(
+                connection_host_stream,
+                project_output_stream,
+                project_id.clone(),
+                payload.path.clone(),
+                OPERATION,
+            )
+            .await?;
+        let mut state = self.state.lock().await;
+        state
+            .code_intel_routers
+            .entry(project_id)
+            .or_insert_with(|| CodeIntelRouter::new(handle.clone()))
+            .unsubscribe(payload.path);
+        Ok(())
+    }
+
+    pub(crate) async fn code_intel_set_visible_range(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+        project_id: ProjectId,
+        payload: CodeIntelSetVisibleRangePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "code_intel_set_visible_range";
+        let handle = self
+            .ensure_validated_code_intel_path(
+                connection_host_stream,
+                project_output_stream,
+                project_id.clone(),
+                payload.path.clone(),
+                OPERATION,
+            )
+            .await?;
+        let mut state = self.state.lock().await;
+        state
+            .code_intel_routers
+            .entry(project_id)
+            .or_insert_with(|| CodeIntelRouter::new(handle.clone()))
+            .set_visible_range(payload);
+        Ok(())
+    }
+
+    pub(crate) async fn code_intel_hover(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+        project_id: ProjectId,
+        payload: CodeIntelHoverPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "code_intel_hover";
+        let handle = self
+            .ensure_validated_code_intel_path(
+                connection_host_stream,
+                project_output_stream,
+                project_id.clone(),
+                payload.path.clone(),
+                OPERATION,
+            )
+            .await?;
+        let mut state = self.state.lock().await;
+        state
+            .code_intel_routers
+            .entry(project_id)
+            .or_insert_with(|| CodeIntelRouter::new(handle.clone()))
+            .hover(payload, project_output_stream.clone());
+        Ok(())
+    }
+
+    pub(crate) async fn code_intel_navigate(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+        project_id: ProjectId,
+        payload: CodeIntelNavigatePayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "code_intel_navigate";
+        let handle = self
+            .ensure_validated_code_intel_path(
+                connection_host_stream,
+                project_output_stream,
+                project_id.clone(),
+                payload.path.clone(),
+                OPERATION,
+            )
+            .await?;
+        let mut state = self.state.lock().await;
+        state
+            .code_intel_routers
+            .entry(project_id)
+            .or_insert_with(|| CodeIntelRouter::new(handle.clone()))
+            .navigate(payload, project_output_stream.clone());
+        Ok(())
+    }
+
+    pub(crate) async fn code_intel_find_references(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+        project_id: ProjectId,
+        payload: CodeIntelFindReferencesPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "code_intel_find_references";
+        let handle = self
+            .ensure_validated_code_intel_path(
+                connection_host_stream,
+                project_output_stream,
+                project_id.clone(),
+                payload.path.clone(),
+                OPERATION,
+            )
+            .await?;
+        let mut state = self.state.lock().await;
+        state
+            .code_intel_routers
+            .entry(project_id)
+            .or_insert_with(|| CodeIntelRouter::new(handle.clone()))
+            .find_references(payload, project_output_stream.clone());
+        Ok(())
+    }
+
+    pub(crate) async fn code_intel_cancel_references(
+        &self,
+        project_id: ProjectId,
+        payload: CodeIntelCancelReferencesPayload,
+    ) -> AppResult<()> {
+        // Cancel carries no path, so there is nothing to validate and nothing
+        // to spawn — it only broadcasts to services that already exist.
+        let mut state = self.state.lock().await;
+        if let Some(router) = state.code_intel_routers.get_mut(&project_id) {
+            router.cancel_references(payload);
         }
         Ok(())
     }
@@ -7814,6 +8027,7 @@ fn spawn_host_inner(
             browse_streams: HashMap::new(),
             workbench_parent_locks: HashMap::new(),
             project_search_ids: HashMap::new(),
+            code_intel_routers: HashMap::new(),
             removing_projects: HashSet::new(),
         })),
     };

@@ -5,18 +5,20 @@ use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
 use protocol::{
     AgentId, AgentOrigin, AgentWorkflowMetadata, BackendKind, BackendSetupInfo, ChatMessage,
-    ChatMessageId, CustomAgent, CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath,
-    HostBrowseEntry, HostBrowseErrorPayload, HostPlatform, HostSettings, McpServerConfig,
-    McpServerId, MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload,
-    Project, ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath,
-    ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, ProjectSearchFileResult,
-    QueuedMessageEntry, Review, ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary,
-    SessionId, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId, Steering,
-    SteeringId, StreamPath, TaskList, Team, TeamDraft, TeamDraftId, TeamId, TeamMember,
-    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
-    ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowDiagnostic, WorkflowRunId,
-    WorkflowRunSnapshot, WorkflowSummary,
+    ChatMessageId, CodeIntelDiagnostic, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelLocation, CodeIntelOccurrence, CodeIntelReferencesFileResult, CodeIntelStatusPayload,
+    CustomAgent, CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry,
+    HostBrowseErrorPayload, HostPlatform, HostSettings, McpServerConfig, McpServerId,
+    MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload, Project,
+    ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId,
+    ProjectPath, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
+    ProjectSearchFileResult, QueuedMessageEntry, Review, ReviewCommentId, ReviewId,
+    ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry, SessionSettingsValues,
+    SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, Team, TeamDraft,
+    TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId,
+    TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog,
+    TerminalId, ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowDiagnostic,
+    WorkflowRunId, WorkflowRunSnapshot, WorkflowSummary,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,6 +381,9 @@ pub enum LeftTab {
     Files,
     Git,
     Search,
+    /// Find-references results panel (M5). Auto-activated when a Shift+F12
+    /// find-references query runs.
+    References,
 }
 
 /// Which tab of the right dock is currently shown. Stored in `AppState` so
@@ -417,6 +422,48 @@ pub struct ProjectSearchUiState {
     pub total_files: u32,
     pub total_matches: u32,
     pub truncated: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProjectReferencesMode {
+    #[default]
+    References,
+    DefinitionTargets,
+}
+
+/// All persistent state for the find-references results panel (M5). Lives in
+/// `AppState` so streamed results survive the panel being display-toggled and so
+/// `dispatch` can append incoming `code_intel_references_results` frames. Mirrors
+/// [`ProjectSearchUiState`], correlated by a `references_id` domain id and the
+/// owning project context so late frames from a previously-active project cannot
+/// populate the current panel.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProjectReferencesUiState {
+    pub mode: ProjectReferencesMode,
+    pub host_id: Option<String>,
+    pub project_id: Option<ProjectId>,
+    pub source_path: Option<ProjectPath>,
+    pub source_version: Option<ProjectFileVersion>,
+    /// The `references_id` of the most recently issued query. Incoming result /
+    /// complete frames are ignored unless they carry this id and match the stored
+    /// host/project context.
+    pub active_references_id: u64,
+    /// True between issuing a query and its terminal `complete` frame.
+    pub in_flight: bool,
+    /// The identifier the query is about, for the panel header. `None` when the
+    /// symbol text wasn't captured.
+    pub symbol: Option<String>,
+    /// One entry per matching file, in arrival order.
+    pub results: Vec<CodeIntelReferencesFileResult>,
+    /// For `DefinitionTargets` mode, one target per rendered result row in
+    /// flattened file/line order. References mode leaves this empty and rows
+    /// navigate by line as before.
+    pub row_targets: Vec<CodeIntelLocation>,
+    pub total_files: u32,
+    pub total_references: u32,
+    pub truncated: bool,
+    pub cancelled: bool,
     pub error: Option<String>,
 }
 
@@ -476,8 +523,185 @@ impl ChatRowHandle {
 #[derive(Clone, Debug)]
 pub struct OpenFile {
     pub path: ProjectPath,
+    /// Version of these contents, from the project-stream actor's centralized
+    /// counter. Code-intel frames apply only when their version equals this.
+    pub version: ProjectFileVersion,
     pub contents: Option<String>,
     pub is_binary: bool,
+}
+
+/// Key for the code-intelligence signal. Carries the explicit owning
+/// `(host_id, project_id)` plus the file path, so two projects/hosts that share
+/// the same root-path string can't collide. The `ProjectFileVersion` is tracked
+/// *inside* [`CodeIntelFileState`] (the version-equals-rendered rule), not in
+/// the key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CodeIntelKey {
+    pub host_id: String,
+    pub project_id: ProjectId,
+    pub path: ProjectPath,
+}
+
+/// The semantic data the server pushed for one file version.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CodeIntelData {
+    pub status: Option<CodeIntelStatusPayload>,
+    pub model: Option<CodeIntelFileModelPayload>,
+    pub error: Option<CodeIntelErrorPayload>,
+    /// Latest full-file diagnostics snapshot for this version. A
+    /// `code_intel_diagnostics` frame **replaces** this set wholesale (spec
+    /// §4.2) — diagnostics are not merged like the definition model.
+    pub diagnostics: Vec<CodeIntelDiagnostic>,
+}
+
+impl CodeIntelData {
+    /// Merge an incoming file model into the existing one for the same `(path,
+    /// version)`. The server delivers the whole-file model **incrementally**
+    /// (spec §2.1/§4.2): the first frame carries occurrence ranges, later frames
+    /// at the same version fill in `definition` targets per occurrence. So
+    /// occurrences are merged **by range**, and within a matching range the
+    /// `definition` targets are **unioned** (deduped) rather than overwritten —
+    /// a later frame that re-sends a range with an empty/partial `definition`
+    /// must never wipe a target that an earlier frame already resolved. This is
+    /// what makes the streamed go-to-definition map (M3) converge instead of
+    /// flapping. The latest frame's `completeness` / `model_range` / `provider`
+    /// / `language` win; `role` takes the latest, `display` the latest non-empty.
+    pub fn merge_model(&mut self, incoming: CodeIntelFileModelPayload) {
+        match self.model.as_mut() {
+            None => self.model = Some(incoming),
+            Some(existing) => {
+                for occurrence in incoming.occurrences {
+                    match existing
+                        .occurrences
+                        .iter_mut()
+                        .find(|candidate| candidate.range == occurrence.range)
+                    {
+                        Some(slot) => merge_occurrence(slot, occurrence),
+                        None => existing.occurrences.push(occurrence),
+                    }
+                }
+                existing.completeness = incoming.completeness;
+                existing.model_range = incoming.model_range;
+                existing.provider = incoming.provider;
+                existing.language = incoming.language;
+                existing.version = incoming.version;
+            }
+        }
+    }
+}
+
+/// Merge an incoming occurrence into an existing one with the same range.
+/// `definition` targets are unioned (deduped) so already-resolved targets
+/// survive a later frame that re-sends the range with an empty/partial set;
+/// `role` takes the latest value and `display` the latest non-empty value.
+fn merge_occurrence(slot: &mut CodeIntelOccurrence, incoming: CodeIntelOccurrence) {
+    for location in incoming.definition {
+        if !slot.definition.contains(&location) {
+            slot.definition.push(location);
+        }
+    }
+    slot.role = incoming.role;
+    if !incoming.display.is_empty() {
+        slot.display = incoming.display;
+    }
+}
+
+/// Per-file code-intelligence state, implementing the version-equals-rendered
+/// rule (`dev-docs/24-code-intelligence.md` §6): a frame is *applied* only when
+/// its version equals the version of the file contents currently rendered; a
+/// *newer* frame is *stashed* until the matching contents arrive; an *older*
+/// frame is *dropped*.
+///
+/// The data is held in `by_version` (the "keyed by version" dimension); the
+/// applied data is `by_version[rendered_version]`. This unifies apply and stash
+/// into a single insert and makes both stale-drop directions fall out of the
+/// `rendered_version` bookkeeping.
+const CODE_INTEL_PRE_CONTENT_STASH_LIMIT: usize = 8;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CodeIntelFileState {
+    /// Version of the file contents currently rendered (from
+    /// `ProjectFileContents`). `None` until the first contents arrive.
+    pub rendered_version: Option<ProjectFileVersion>,
+    pub by_version: std::collections::BTreeMap<ProjectFileVersion, CodeIntelData>,
+}
+
+impl CodeIntelFileState {
+    /// Merge a versioned code-intel frame, honoring apply / stash / drop.
+    /// `apply` mutates the [`CodeIntelData`] for that version. A frame older
+    /// than the rendered version is dropped (it would paint over newer text).
+    pub fn merge_versioned(
+        &mut self,
+        version: ProjectFileVersion,
+        apply: impl FnOnce(&mut CodeIntelData),
+    ) {
+        if let Some(rendered) = self.rendered_version
+            && version < rendered
+        {
+            // Older than what's on screen: drop.
+            return;
+        }
+        // Equal (apply) or newer (stash): both merge into `by_version`.
+        apply(self.by_version.entry(version).or_default());
+        if self.rendered_version.is_none() {
+            while self.by_version.len() > CODE_INTEL_PRE_CONTENT_STASH_LIMIT {
+                self.by_version.pop_first();
+            }
+        }
+    }
+
+    /// Record that file contents at `version` are now rendered. Drops any
+    /// stashed data older than `version` (it can never be shown again), which
+    /// promotes the matching-version data to "applied".
+    pub fn set_rendered_version(&mut self, version: ProjectFileVersion) {
+        self.rendered_version = Some(version);
+        self.by_version.retain(|candidate, _| *candidate >= version);
+    }
+
+    /// The data to render right now: the entry matching the rendered version,
+    /// or `None` if contents haven't arrived or no frame matches yet.
+    pub fn applied(&self) -> Option<&CodeIntelData> {
+        self.by_version.get(&self.rendered_version?)
+    }
+}
+
+/// Context for the most recent on-demand go-to-definition request (M2), stored
+/// when the `code_intel_navigate` frame is sent. A `code_intel_navigate_result`
+/// is only acted on when it still matches this whole context — same
+/// `navigate_id`, same owning host/project, and the source file still open at
+/// the same rendered version — so a result that arrives after the tab closed,
+/// the file changed, or the user switched projects is dropped instead of
+/// yanking the user somewhere unexpected.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodeIntelNavigateContext {
+    pub navigate_id: u64,
+    pub host_id: String,
+    pub project_id: ProjectId,
+    pub path: ProjectPath,
+    pub version: ProjectFileVersion,
+}
+
+/// On-demand hover popover state (M2). The anchor is captured (in viewport
+/// coordinates) when the hover request fires, so the popover can be positioned
+/// over the hovered span the moment the correlated `code_intel_hover_result`
+/// arrives. `contents` is `None` while the request is in flight — the popover
+/// renders nothing until real markdown lands (no empty flash).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HoverPopover {
+    pub hover_id: u64,
+    pub path: ProjectPath,
+    pub version: ProjectFileVersion,
+    /// Absolute file byte offset the hover targets. Used to dedupe rapid
+    /// mousemoves over the same identifier so the popover doesn't flicker.
+    pub offset: u32,
+    /// Left edge of the hovered span, viewport-relative px.
+    pub anchor_left: f64,
+    /// Top edge of the hovered span, viewport-relative px.
+    pub anchor_top: f64,
+    /// Bottom edge of the hovered span, viewport-relative px.
+    pub anchor_bottom: f64,
+    /// Rendered markdown, or `None` until the result arrives.
+    pub contents: Option<String>,
 }
 
 /// Cache key for `diff_contents`. Carries the explicit owning `(host_id,
@@ -894,6 +1118,11 @@ pub struct AppState {
     pub file_tree: RwSignal<HashMap<ProjectId, Vec<ProjectRootListing>>>,
     pub git_status: RwSignal<HashMap<ProjectId, Vec<ProjectRootGitStatus>>>,
     pub open_files: RwSignal<HashMap<ProjectPath, OpenFile>>,
+    /// Server-pushed code-intelligence state, keyed by `(host_id, project_id,
+    /// path)`. Kept separate from `Token`/syntax data on purpose (spec §6): the
+    /// per-row token path has a wasm test guarding against text mangling, and
+    /// semantic decorations must never ride that path.
+    pub code_intel: RwSignal<HashMap<CodeIntelKey, CodeIntelFileState>>,
     pub diff_contents: RwSignal<HashMap<DiffKey, DiffViewState>>,
     pub terminals: RwSignal<Vec<TerminalInfo>>,
     pub active_terminal: RwSignal<Option<ActiveTerminalRef>>,
@@ -917,12 +1146,36 @@ pub struct AppState {
     pub left_tab: RwSignal<LeftTab>,
     /// Persistent state for the project-wide Search panel.
     pub search_state: RwSignal<ProjectSearchUiState>,
+    /// Persistent state for the find-references results panel (M5).
+    pub references_state: RwSignal<ProjectReferencesUiState>,
     /// Bumped to request the Search panel focus (and select) its query input —
     /// e.g. on the Cmd/Ctrl+Shift+F shortcut or the "search in folder" action.
     pub search_focus_seq: RwSignal<u32>,
     /// When set, the file view for this `ProjectPath` should scroll so the
     /// given 1-based line is visible. Consumed (cleared) by the file view.
     pub pending_goto_line: RwSignal<Option<(ProjectPath, u32)>>,
+    /// Like `pending_goto_line` but addressed by an absolute file **byte
+    /// offset** (from a go-to-definition target, whose range is byte-based). The
+    /// file view converts it to a line via its `FileLines` and consumes it. Kept
+    /// separate so the existing line-based goto machinery and its tests are
+    /// untouched.
+    pub pending_goto_offset: RwSignal<Option<(ProjectPath, u32)>>,
+    /// Monotonic source of `navigate_id` / `hover_id` domain ids for on-demand
+    /// code-intel requests (cf. `search_id`). Bumped per request.
+    pub code_intel_request_seq: RwSignal<u64>,
+    /// Context for the most recent `code_intel_navigate` the client sent. A
+    /// result is acted on only when it still matches this context (id + owning
+    /// host/project + source file open at the same rendered version).
+    pub code_intel_navigate_ctx: RwSignal<Option<CodeIntelNavigateContext>>,
+    /// The most recent `hover_id` the client sent. Supersedes older hovers.
+    pub code_intel_active_hover: RwSignal<u64>,
+    /// The current hover popover, or `None` when nothing is hovered. The
+    /// `HoverPopover` component renders from this signal (no `window.*`).
+    pub code_intel_hover: RwSignal<Option<HoverPopover>>,
+    /// The file (and rendered version) the user most recently interacted with in
+    /// a file view, so the F12 keybinding (which has no file context of its own)
+    /// can navigate from the current caret in that file.
+    pub code_intel_focus: RwSignal<Option<(ProjectPath, ProjectFileVersion)>>,
     pub host_settings_by_host: RwSignal<HashMap<String, HostSettings>>,
     pub backend_setup_by_host: RwSignal<HashMap<String, Vec<BackendSetupInfo>>>,
     pub agent_message_queue: RwSignal<HashMap<AgentId, Vec<QueuedMessageEntry>>>,
@@ -1171,6 +1424,7 @@ impl AppState {
             file_tree: RwSignal::new(HashMap::new()),
             git_status: RwSignal::new(HashMap::new()),
             open_files: RwSignal::new(HashMap::new()),
+            code_intel: RwSignal::new(HashMap::new()),
             diff_contents: RwSignal::new(HashMap::new()),
             terminals: RwSignal::new(Vec::new()),
             active_terminal: RwSignal::new(None),
@@ -1185,8 +1439,15 @@ impl AppState {
             find_bar_open: RwSignal::new(false),
             left_tab: RwSignal::new(LeftTab::Files),
             search_state: RwSignal::new(ProjectSearchUiState::default()),
+            references_state: RwSignal::new(ProjectReferencesUiState::default()),
             search_focus_seq: RwSignal::new(0),
             pending_goto_line: RwSignal::new(None),
+            pending_goto_offset: RwSignal::new(None),
+            code_intel_request_seq: RwSignal::new(0),
+            code_intel_navigate_ctx: RwSignal::new(None),
+            code_intel_active_hover: RwSignal::new(0),
+            code_intel_hover: RwSignal::new(None),
+            code_intel_focus: RwSignal::new(None),
             host_settings_by_host: RwSignal::new(HashMap::new()),
             backend_setup_by_host: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),
@@ -1854,6 +2115,9 @@ impl AppState {
         // incoming project's active tab so the first render after switch
         // mounts content (avoids a one-frame empty flash before the Effect
         // in `App` fires).
+        self.references_state
+            .set(ProjectReferencesUiState::default());
+
         match (next.is_some(), restored) {
             (true, Some(memory)) => {
                 let cz = memory.center_zone.unwrap_or_default();
@@ -2135,6 +2399,61 @@ impl AppState {
         });
     }
 
+    /// Tear down all client state for a closing File tab: drop the cached
+    /// contents and the code-intel state, and tell the server to stop pushing
+    /// for this file. The subscribe sent on open (`actions::open_project_path`)
+    /// is matched here so the server doesn't keep a dangling subscription.
+    fn close_open_file(&self, path: &ProjectPath) {
+        self.open_files.update(|files| {
+            files.remove(path);
+        });
+        self.drop_code_intel_for_path(path);
+    }
+
+    /// Remove every code-intel entry for `path` and send a matching
+    /// `code_intel_unsubscribe_file` for each owning `(host, project)`. The
+    /// signal cleanup runs everywhere (including native tests); the network
+    /// send is wasm-only since there is no transport off the browser.
+    fn drop_code_intel_for_path(&self, path: &ProjectPath) {
+        let mut removed: Vec<CodeIntelKey> = Vec::new();
+        self.code_intel.update(|map| {
+            removed = map
+                .keys()
+                .filter(|key| &key.path == path)
+                .cloned()
+                .collect();
+            for key in &removed {
+                map.remove(key);
+            }
+        });
+        #[cfg(target_arch = "wasm32")]
+        {
+            for key in removed {
+                let stream = StreamPath(format!("/project/{}", key.project_id.0));
+                let payload = protocol::CodeIntelUnsubscribeFilePayload { path: path.clone() };
+                let host_id = key.host_id.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(error) = crate::send::send_frame(
+                        &host_id,
+                        stream,
+                        protocol::FrameKind::CodeIntelUnsubscribeFile,
+                        &payload,
+                    )
+                    .await
+                    {
+                        log::error!("failed to send CodeIntelUnsubscribeFile: {error}");
+                    }
+                });
+            }
+        }
+        // The network send is wasm-only; on the native test build there is no
+        // transport, so the signal cleanup above is the whole effect.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = removed;
+        }
+    }
+
     pub fn close_tab(&self, id: TabId) {
         let content = self.center_zone.with_untracked(|cz| {
             cz.tabs
@@ -2145,10 +2464,7 @@ impl AppState {
         if let Some(content) = content {
             match &content {
                 TabContent::File { path } => {
-                    let path = path.clone();
-                    self.open_files.update(|files| {
-                        files.remove(&path);
-                    });
+                    self.close_open_file(path);
                 }
                 TabContent::Diff {
                     host_id,
@@ -2199,10 +2515,7 @@ impl AppState {
         for (tab_id, content) in &to_close {
             match content {
                 TabContent::File { path } => {
-                    let path = path.clone();
-                    self.open_files.update(|files| {
-                        files.remove(&path);
-                    });
+                    self.close_open_file(path);
                 }
                 TabContent::Diff {
                     host_id,
@@ -2250,10 +2563,7 @@ impl AppState {
         for (tab_id, content) in &to_close {
             match content {
                 TabContent::File { path } => {
-                    let path = path.clone();
-                    self.open_files.update(|files| {
-                        files.remove(&path);
-                    });
+                    self.close_open_file(path);
                 }
                 TabContent::Diff {
                     host_id,
@@ -2292,10 +2602,7 @@ impl AppState {
         for (tab_id, content) in &to_close {
             match content {
                 TabContent::File { path } => {
-                    let path = path.clone();
-                    self.open_files.update(|files| {
-                        files.remove(&path);
-                    });
+                    self.close_open_file(path);
                 }
                 TabContent::Diff {
                     host_id,
@@ -2343,6 +2650,325 @@ impl AppState {
                 _ => None,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod code_intel_tests {
+    use super::*;
+    use protocol::{
+        ByteRange, CodeIntelCompleteness, CodeIntelLanguageId, CodeIntelLocation,
+        CodeIntelModelRange, CodeIntelOccurrence, CodeIntelProviderId, CodeIntelResourceMode,
+        CodeIntelRole, CodeIntelState, CodeIntelStatusScope,
+    };
+
+    fn path() -> ProjectPath {
+        ProjectPath {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "src/main.rs".to_owned(),
+        }
+    }
+
+    fn status(version: ProjectFileVersion, state: CodeIntelState) -> CodeIntelStatusPayload {
+        CodeIntelStatusPayload {
+            scope: CodeIntelStatusScope::File {
+                path: path(),
+                version,
+            },
+            state,
+            resource_mode: CodeIntelResourceMode::Full,
+            work_done: None,
+            total_work: None,
+            message: None,
+        }
+    }
+
+    fn model(version: ProjectFileVersion) -> CodeIntelFileModelPayload {
+        CodeIntelFileModelPayload {
+            path: path(),
+            version,
+            provider: CodeIntelProviderId("mock".to_owned()),
+            language: CodeIntelLanguageId("rust".to_owned()),
+            model_range: CodeIntelModelRange::FullFile,
+            completeness: CodeIntelCompleteness::Complete,
+            occurrences: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn frame_at_rendered_version_is_applied() {
+        let mut s = CodeIntelFileState::default();
+        s.set_rendered_version(ProjectFileVersion(5));
+        s.merge_versioned(ProjectFileVersion(5), |d| {
+            d.status = Some(status(ProjectFileVersion(5), CodeIntelState::Ready));
+        });
+        let applied = s.applied().expect("data applied at rendered version");
+        assert_eq!(
+            applied.status.as_ref().map(|st| st.state),
+            Some(CodeIntelState::Ready)
+        );
+    }
+
+    #[test]
+    fn older_frame_is_dropped() {
+        let mut s = CodeIntelFileState::default();
+        s.set_rendered_version(ProjectFileVersion(5));
+        s.merge_versioned(ProjectFileVersion(4), |d| {
+            d.model = Some(model(ProjectFileVersion(4)));
+        });
+        // Nothing applied (v4 dropped), and no v4 entry stashed.
+        assert!(s.applied().is_none());
+        assert!(s.by_version.is_empty());
+    }
+
+    #[test]
+    fn newer_frame_is_stashed_then_applied_when_contents_arrive() {
+        let mut s = CodeIntelFileState::default();
+        s.set_rendered_version(ProjectFileVersion(5));
+        // A v6 model arrives before the v6 contents: must not paint over v5.
+        s.merge_versioned(ProjectFileVersion(6), |d| {
+            d.model = Some(model(ProjectFileVersion(6)));
+        });
+        assert!(s.applied().is_none(), "v6 must not apply over v5 text");
+        assert!(s.by_version.contains_key(&ProjectFileVersion(6)));
+
+        // v6 contents land: the stashed v6 model is now the applied data, and
+        // the stale v5 entry is dropped.
+        s.set_rendered_version(ProjectFileVersion(6));
+        let applied = s.applied().expect("v6 data applied once contents arrive");
+        assert!(applied.model.is_some());
+        assert!(!s.by_version.contains_key(&ProjectFileVersion(5)));
+    }
+
+    #[test]
+    fn frame_before_any_contents_is_stashed() {
+        let mut s = CodeIntelFileState::default();
+        // No rendered version yet (contents not arrived).
+        s.merge_versioned(ProjectFileVersion(1), |d| {
+            d.status = Some(status(ProjectFileVersion(1), CodeIntelState::Indexing));
+        });
+        assert!(s.applied().is_none());
+        s.set_rendered_version(ProjectFileVersion(1));
+        assert_eq!(
+            s.applied()
+                .and_then(|d| d.status.as_ref())
+                .map(|st| st.state),
+            Some(CodeIntelState::Indexing)
+        );
+    }
+
+    #[test]
+    fn pre_content_version_stash_is_bounded() {
+        let mut s = CodeIntelFileState::default();
+        for version in 1..=10 {
+            s.merge_versioned(ProjectFileVersion(version), |d| {
+                d.status = Some(status(
+                    ProjectFileVersion(version),
+                    CodeIntelState::Indexing,
+                ));
+            });
+        }
+        assert_eq!(s.by_version.len(), CODE_INTEL_PRE_CONTENT_STASH_LIMIT);
+        assert!(
+            !s.by_version.contains_key(&ProjectFileVersion(1)),
+            "oldest pre-content versions are dropped once the stash is capped"
+        );
+        assert!(s.by_version.contains_key(&ProjectFileVersion(10)));
+    }
+
+    #[test]
+    fn version_change_drops_stale_decorations_and_ignores_late_old_frames() {
+        // §M4 external-change correctness: a file rendered at v5 with applied
+        // decorations reloads to v6. The stale v5 decorations must be dropped
+        // (not painted over v6 text), a late v5 frame arriving *after* the bump
+        // must be ignored, and a v6 frame applies cleanly.
+        let mut s = CodeIntelFileState::default();
+        s.set_rendered_version(ProjectFileVersion(5));
+        s.merge_versioned(ProjectFileVersion(5), |d| {
+            d.model = Some(model(ProjectFileVersion(5)));
+            d.diagnostics = vec![diagnostic()];
+        });
+        assert!(s.applied().expect("v5 applied").model.is_some());
+
+        // v6 contents arrive (the reload): v5 decorations are dropped.
+        s.set_rendered_version(ProjectFileVersion(6));
+        assert!(!s.by_version.contains_key(&ProjectFileVersion(5)));
+        assert!(
+            s.applied().is_none(),
+            "no v6 frame yet ⇒ nothing applied (never the stale v5 data)"
+        );
+
+        // A late v5 frame (in-flight before the bump) is dropped, not stashed.
+        s.merge_versioned(ProjectFileVersion(5), |d| {
+            d.diagnostics = vec![diagnostic()];
+        });
+        assert!(!s.by_version.contains_key(&ProjectFileVersion(5)));
+
+        // The fresh v6 model applies at the new rendered version.
+        s.merge_versioned(ProjectFileVersion(6), |d| {
+            d.model = Some(model(ProjectFileVersion(6)));
+        });
+        let applied = s.applied().expect("v6 applied after reload");
+        assert_eq!(
+            applied.model.as_ref().map(|m| m.version),
+            Some(ProjectFileVersion(6))
+        );
+    }
+
+    fn diagnostic() -> CodeIntelDiagnostic {
+        CodeIntelDiagnostic {
+            range: ByteRange { start: 0, end: 1 },
+            severity: protocol::CodeIntelSeverity::Error,
+            message: "boom".to_owned(),
+            source: None,
+        }
+    }
+
+    fn occurrence(start: u32, end: u32, definition: Vec<CodeIntelLocation>) -> CodeIntelOccurrence {
+        CodeIntelOccurrence {
+            range: ByteRange { start, end },
+            role: CodeIntelRole::Reference,
+            display: "sym".to_owned(),
+            definition,
+        }
+    }
+
+    #[test]
+    fn merge_model_merges_occurrences_by_range() {
+        let mut data = CodeIntelData::default();
+
+        // First frame: two bare occurrences (no targets yet), Partial.
+        let mut first = model(ProjectFileVersion(2));
+        first.completeness = CodeIntelCompleteness::Partial;
+        first.occurrences = vec![occurrence(0, 3, vec![]), occurrence(10, 13, vec![])];
+        data.merge_model(first);
+
+        // Second frame at the same version: fills in the target for the [0,3)
+        // occurrence and adds a new occurrence; marks the model Complete.
+        let target = CodeIntelLocation {
+            path: path(),
+            range: ByteRange {
+                start: 99,
+                end: 102,
+            },
+        };
+        let mut second = model(ProjectFileVersion(2));
+        second.completeness = CodeIntelCompleteness::Complete;
+        second.occurrences = vec![
+            occurrence(0, 3, vec![target.clone()]),
+            occurrence(20, 23, vec![]),
+        ];
+        data.merge_model(second);
+
+        // Third frame: re-sends [0,3) with an EMPTY definition (e.g. a fresh
+        // semanticTokens pass before its definition re-resolves). The already-
+        // resolved target MUST survive — this is the incremental-streaming
+        // invariant that M3 relies on.
+        let mut third = model(ProjectFileVersion(2));
+        third.occurrences = vec![occurrence(0, 3, vec![])];
+        data.merge_model(third);
+
+        let merged = data.model.expect("model present after merge");
+        // [0,3) updated in place (target filled), [10,13) preserved, [20,23) added.
+        assert_eq!(merged.occurrences.len(), 3);
+        let zero = merged
+            .occurrences
+            .iter()
+            .find(|o| o.range == ByteRange { start: 0, end: 3 })
+            .expect("[0,3) occurrence retained by range");
+        assert_eq!(
+            zero.definition,
+            vec![target],
+            "resolved target survives a later same-range frame with an empty definition"
+        );
+        assert!(
+            merged
+                .occurrences
+                .iter()
+                .any(|o| o.range == ByteRange { start: 10, end: 13 }),
+            "untouched occurrence is preserved, not wiped by the second frame"
+        );
+        // Latest frame's completeness wins.
+        assert_eq!(merged.completeness, CodeIntelCompleteness::Complete);
+    }
+
+    #[test]
+    fn merge_accumulates_byte_range_chunks_then_completes() {
+        // §M6: a large file streams transient `ByteRange` + `Partial` chunks
+        // (visible window first) converging on a final `FullFile` + `Complete`
+        // frame. The client must accumulate occurrences across chunks and only
+        // flip to "complete" on the Complete frame — ByteRange is a pacing
+        // window, never a permanent scope gate.
+        let mut data = CodeIntelData::default();
+
+        // Visible chunk first: occurrence [20,23) with its target resolved.
+        let resolved = CodeIntelLocation {
+            path: path(),
+            range: ByteRange {
+                start: 99,
+                end: 102,
+            },
+        };
+        let mut visible_chunk = model(ProjectFileVersion(7));
+        visible_chunk.model_range = CodeIntelModelRange::ByteRange {
+            range: ByteRange { start: 20, end: 23 },
+        };
+        visible_chunk.completeness = CodeIntelCompleteness::Partial;
+        visible_chunk.occurrences = vec![occurrence(20, 23, vec![resolved.clone()])];
+        data.merge_model(visible_chunk);
+        // A ByteRange Partial chunk must NOT read as complete.
+        assert_eq!(
+            data.model.as_ref().unwrap().completeness,
+            CodeIntelCompleteness::Partial,
+            "a ByteRange chunk is never complete on its own"
+        );
+
+        // Offscreen chunk next: a different byte window, still Partial.
+        let mut offscreen_chunk = model(ProjectFileVersion(7));
+        offscreen_chunk.model_range = CodeIntelModelRange::ByteRange {
+            range: ByteRange { start: 0, end: 3 },
+        };
+        offscreen_chunk.completeness = CodeIntelCompleteness::Partial;
+        offscreen_chunk.occurrences = vec![occurrence(0, 3, vec![])];
+        data.merge_model(offscreen_chunk);
+        assert_eq!(
+            data.model.as_ref().unwrap().completeness,
+            CodeIntelCompleteness::Partial,
+            "still streaming → still Partial after a second chunk"
+        );
+        assert_eq!(
+            data.model.as_ref().unwrap().occurrences.len(),
+            2,
+            "chunks accumulate by range — coverage grows, nothing dropped"
+        );
+
+        // Final FullFile + Complete marker: flips the whole-file coverage signal.
+        let mut complete = model(ProjectFileVersion(7));
+        complete.model_range = CodeIntelModelRange::FullFile;
+        complete.completeness = CodeIntelCompleteness::Complete;
+        complete.occurrences = Vec::new();
+        data.merge_model(complete);
+
+        let merged = data.model.expect("model present");
+        assert_eq!(
+            merged.completeness,
+            CodeIntelCompleteness::Complete,
+            "coverage only flips to complete on the Complete frame"
+        );
+        assert_eq!(
+            merged.model_range,
+            CodeIntelModelRange::FullFile,
+            "the model converges to whole-file scope"
+        );
+        // Both chunks' occurrences survive the Complete marker, and the visible
+        // chunk's resolved target is preserved.
+        assert_eq!(merged.occurrences.len(), 2);
+        let visible = merged
+            .occurrences
+            .iter()
+            .find(|o| o.range == ByteRange { start: 20, end: 23 })
+            .expect("visible occurrence retained");
+        assert_eq!(visible.definition, vec![resolved]);
     }
 }
 
@@ -2646,6 +3272,7 @@ mod tests {
                     file_path.clone(),
                     OpenFile {
                         path: file_path.clone(),
+                        version: ProjectFileVersion(1),
                         contents: None,
                         is_binary: false,
                     },
@@ -2789,6 +3416,7 @@ mod tests {
                     file_path.clone(),
                     OpenFile {
                         path: file_path.clone(),
+                        version: ProjectFileVersion(1),
                         contents: None,
                         is_binary: false,
                     },
@@ -2831,6 +3459,7 @@ mod tests {
                     file_path.clone(),
                     OpenFile {
                         path: file_path.clone(),
+                        version: ProjectFileVersion(1),
                         contents: None,
                         is_binary: false,
                     },
@@ -3152,6 +3781,7 @@ mod tests {
                     file_path.clone(),
                     OpenFile {
                         path: file_path.clone(),
+                        version: ProjectFileVersion(1),
                         contents: None,
                         is_binary: false,
                     },

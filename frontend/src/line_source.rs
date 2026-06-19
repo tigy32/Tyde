@@ -54,6 +54,42 @@ impl FileLines {
         self.starts.len().saturating_sub(1)
     }
 
+    /// Absolute byte offset where line `i` starts. Panics if `i >= self.len()`.
+    /// Used to map an absolute file byte range (e.g. a code-intel diagnostic)
+    /// into per-line offsets for decoration overlays.
+    pub fn line_start(&self, i: usize) -> u32 {
+        self.starts[i]
+    }
+
+    /// Absolute byte offset of the end of line `i`'s *content* — the trailing
+    /// `\n` (if any) is excluded, matching [`line`](Self::line). Panics if
+    /// `i >= self.len()`.
+    pub fn line_content_end(&self, i: usize) -> u32 {
+        let start = self.starts[i] as usize;
+        let raw_end = self.starts[i + 1] as usize;
+        let end = if raw_end > start && self.text.as_bytes()[raw_end - 1] == b'\n' {
+            raw_end - 1
+        } else {
+            raw_end
+        };
+        end as u32
+    }
+
+    /// The 0-based index of the line containing absolute byte offset `byte`.
+    /// A `byte` at or past EOF clamps to the last line; an empty file yields 0.
+    /// `starts` is sorted, so this is a binary search.
+    pub fn line_for_byte(&self, byte: u32) -> usize {
+        let line_count = self.len();
+        if line_count == 0 {
+            return 0;
+        }
+        // Find the last line whose start is <= byte.
+        match self.starts[..line_count].binary_search(&byte) {
+            Ok(exact) => exact,
+            Err(insert) => insert.saturating_sub(1),
+        }
+    }
+
     /// Slice the file bytes for line `i`. Trailing `\n` is excluded so the
     /// returned slice contains just the line's text. Panics if `i >=
     /// self.len()` — callers iterate bounded by `len()`.
@@ -160,5 +196,34 @@ mod tests {
         let src: LineSource = f.into();
         assert_eq!(src.len(), 3);
         assert_eq!(src.line(2), "z");
+    }
+
+    #[test]
+    fn line_start_and_content_end() {
+        let f = FileLines::new("ab\ncde\nf");
+        assert_eq!(f.line_start(0), 0);
+        assert_eq!(f.line_content_end(0), 2); // "ab", excludes '\n' at byte 2
+        assert_eq!(f.line_start(1), 3);
+        assert_eq!(f.line_content_end(1), 6); // "cde"
+        assert_eq!(f.line_start(2), 7);
+        assert_eq!(f.line_content_end(2), 8); // "f", no trailing newline
+    }
+
+    #[test]
+    fn line_for_byte_maps_offsets_to_lines() {
+        let f = FileLines::new("ab\ncde\nf");
+        // line 0 spans bytes 0..3 (incl '\n'), line 1 bytes 3..7, line 2 7..8.
+        assert_eq!(f.line_for_byte(0), 0);
+        assert_eq!(f.line_for_byte(2), 0); // the '\n'
+        assert_eq!(f.line_for_byte(3), 1); // 'c'
+        assert_eq!(f.line_for_byte(6), 1); // the second '\n'
+        assert_eq!(f.line_for_byte(7), 2); // 'f'
+        assert_eq!(f.line_for_byte(999), 2); // past EOF clamps to last line
+    }
+
+    #[test]
+    fn line_for_byte_empty_file() {
+        let f = FileLines::new("");
+        assert_eq!(f.line_for_byte(0), 0);
     }
 }

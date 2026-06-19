@@ -8,12 +8,14 @@ use crate::state::{
 };
 
 use protocol::{
-    AgentId, BackendKind, CustomAgentId, FrameKind, GitBranchName, ImageData, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectId, ProjectPath, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload,
-    ProjectSearchPayload, SessionId, SessionSettingsValues, SetSessionSettingsPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath, WorkbenchCreatePayload,
-    WorkbenchRemovePayload,
+    AgentId, BackendKind, ByteRange, CodeIntelCancelReferencesPayload,
+    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
+    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload, CustomAgentId, FrameKind,
+    GitBranchName, ImageData, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectFileVersion,
+    ProjectId, ProjectPath, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload,
+    SessionId, SessionSettingsValues, SetSessionSettingsPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamPath, WorkbenchCreatePayload, WorkbenchRemovePayload,
 };
 
 /// Resume a session on the given host. Synchronously switches the active
@@ -329,21 +331,370 @@ pub fn open_project_path(state: &AppState, path: ProjectPath) {
     crate::perf::mark_start(&perf_key);
     crate::perf::log_phase("file_open", "click", &perf_key, "");
 
-    let payload = ProjectReadFilePayload { path };
+    let read_payload = ProjectReadFilePayload { path: path.clone() };
+    let subscribe_payload = CodeIntelSubscribeFilePayload { path };
     let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
 
     spawn_local(async move {
+        // Send the read first, then the code-intel subscribe, on the same
+        // stream. The server processes them in arrival order, so the read bumps
+        // the file version before the subscribe peeks it — the pushed semantic
+        // model then carries the same version as the rendered contents.
         if let Err(error) = send_frame(
             &active_project.host_id,
-            project_stream,
+            project_stream.clone(),
             FrameKind::ProjectReadFile,
-            &payload,
+            &read_payload,
         )
         .await
         {
             log::error!("failed to send ProjectReadFile: {error}");
+            return;
+        }
+        if let Err(error) = send_frame(
+            &active_project.host_id,
+            project_stream,
+            FrameKind::CodeIntelSubscribeFile,
+            &subscribe_payload,
+        )
+        .await
+        {
+            log::error!("failed to send CodeIntelSubscribeFile: {error}");
         }
     });
+}
+
+/// Mint the next code-intel domain id (shared by navigate + hover, like a
+/// monotonic `search_id`).
+fn next_code_intel_id(state: &AppState) -> u64 {
+    let mut id = 0;
+    state.code_intel_request_seq.update(|seq| {
+        *seq = seq.wrapping_add(1).max(1);
+        id = *seq;
+    });
+    id
+}
+
+/// Cmd/Ctrl+click / F12 go-to-definition (M3). First consult the **pushed**
+/// whole-file model for a resolved definition under `offset`: if the occurrence
+/// there already carries a target (and the model matches the rendered version),
+/// jump **locally** with no server round-trip. Only on a miss — the occurrence
+/// hasn't resolved yet, or no model has arrived — fall back to the on-demand
+/// `code_intel_navigate` miss-fill (M2).
+pub fn navigate_to_definition(
+    state: &AppState,
+    path: ProjectPath,
+    version: ProjectFileVersion,
+    offset: u32,
+) {
+    if try_local_definition_jump(state, &path, version, offset) {
+        return;
+    }
+    request_navigate(state, path, version, offset);
+}
+
+/// Attempt a local go-to-definition against the pushed model. Returns `true`
+/// (and performs the jump) when an occurrence containing `offset` has at least
+/// one resolved `definition` target at the rendered version; otherwise `false`,
+/// leaving navigation to the on-demand fallback.
+fn try_local_definition_jump(
+    state: &AppState,
+    path: &ProjectPath,
+    version: ProjectFileVersion,
+    offset: u32,
+) -> bool {
+    let Some(active) = state.active_project_ref_untracked() else {
+        return false;
+    };
+    let key = crate::state::CodeIntelKey {
+        host_id: active.host_id,
+        project_id: active.project_id,
+        path: path.clone(),
+    };
+    let target = state.code_intel.with_untracked(|map| {
+        let file = map.get(&key)?;
+        // Version-equals-rendered: never navigate from a model computed against
+        // text the user is no longer viewing.
+        if file.rendered_version != Some(version) {
+            return None;
+        }
+        let model = file.applied()?.model.as_ref()?;
+        let occurrence = model
+            .occurrences
+            .iter()
+            .find(|occ| occ.range.start <= offset && offset < occ.range.end)?;
+        // Multiple targets (overloads / trait impls) take the first for now,
+        // matching the M2 on-demand result handling.
+        occurrence.definition.first().cloned()
+    });
+    match target {
+        Some(location) => {
+            // Supersede any in-flight M2 miss-fill: an earlier unresolved click
+            // may have sent a `code_intel_navigate` and recorded its context. If
+            // we jump locally now, a late `code_intel_navigate_result` for that
+            // older click must NOT still yank the user to its (stale) target.
+            // Clearing the context makes `apply_code_intel_navigate_result` drop
+            // any such result on arrival.
+            state.code_intel_navigate_ctx.set(None);
+            state
+                .pending_goto_offset
+                .set(Some((location.path.clone(), location.range.start)));
+            open_project_path(state, location.path);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Send a `code_intel_set_visible_range` hint so the server prioritizes
+/// resolving the on-screen occurrences first (M3). Pure prioritization — it
+/// never changes which identifiers are clickable. Debounced at the call site so
+/// scrolling doesn't flood the stream.
+pub fn send_visible_range(
+    state: &AppState,
+    path: ProjectPath,
+    version: ProjectFileVersion,
+    range: ByteRange,
+) {
+    let Some(active) = state.active_project_ref_untracked() else {
+        return;
+    };
+    let payload = CodeIntelSetVisibleRangePayload {
+        path,
+        version,
+        range,
+    };
+    let project_stream = StreamPath(format!("/project/{}", active.project_id.0));
+    let host_id = active.host_id;
+    spawn_local(async move {
+        if let Err(error) = send_frame(
+            &host_id,
+            project_stream,
+            FrameKind::CodeIntelSetVisibleRange,
+            &payload,
+        )
+        .await
+        {
+            log::error!("failed to send CodeIntelSetVisibleRange: {error}");
+        }
+    });
+}
+
+/// On-demand go-to-definition (M2 miss-fill): resolve the definition at
+/// `offset` bytes into `path`. Mints a fresh `navigate_id`, records it as the
+/// active one (so a superseded result is ignored), and streams the request to
+/// the active project. The jump happens later, when the correlated
+/// `code_intel_navigate_result` arrives (see `dispatch.rs`).
+pub fn request_navigate(
+    state: &AppState,
+    path: ProjectPath,
+    version: ProjectFileVersion,
+    offset: u32,
+) {
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        log::error!("request_navigate: no active project");
+        return;
+    };
+    let navigate_id = next_code_intel_id(state);
+    // Record the full context so the result is only acted on while it still
+    // applies (same host/project, source file still open at this version).
+    state
+        .code_intel_navigate_ctx
+        .set(Some(crate::state::CodeIntelNavigateContext {
+            navigate_id,
+            host_id: active_project.host_id.clone(),
+            project_id: active_project.project_id.clone(),
+            path: path.clone(),
+            version,
+        }));
+    let payload = CodeIntelNavigatePayload {
+        navigate_id,
+        path,
+        version,
+        offset,
+    };
+    let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
+    let host_id = active_project.host_id;
+    spawn_local(async move {
+        if let Err(error) = send_frame(
+            &host_id,
+            project_stream,
+            FrameKind::CodeIntelNavigate,
+            &payload,
+        )
+        .await
+        {
+            log::error!("failed to send CodeIntelNavigate: {error}");
+        }
+    });
+}
+
+/// On-demand hover: request type/doc markdown at `offset` bytes into `path`.
+/// Mints a fresh `hover_id`, records it active (superseding older hovers), and
+/// seeds the popover with the captured anchor rect and `None` contents — the
+/// popover renders nothing until the correlated result fills the markdown in.
+#[allow(clippy::too_many_arguments)]
+pub fn request_hover(
+    state: &AppState,
+    path: ProjectPath,
+    version: ProjectFileVersion,
+    offset: u32,
+    anchor_left: f64,
+    anchor_top: f64,
+    anchor_bottom: f64,
+) {
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        return;
+    };
+    let hover_id = next_code_intel_id(state);
+    state.code_intel_active_hover.set(hover_id);
+    state.code_intel_hover.set(Some(crate::state::HoverPopover {
+        hover_id,
+        path: path.clone(),
+        version,
+        offset,
+        anchor_left,
+        anchor_top,
+        anchor_bottom,
+        contents: None,
+    }));
+    let payload = CodeIntelHoverPayload {
+        hover_id,
+        path,
+        version,
+        offset,
+    };
+    let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
+    let host_id = active_project.host_id;
+    spawn_local(async move {
+        if let Err(error) = send_frame(
+            &host_id,
+            project_stream,
+            FrameKind::CodeIntelHover,
+            &payload,
+        )
+        .await
+        {
+            log::error!("failed to send CodeIntelHover: {error}");
+        }
+    });
+}
+
+/// Dismiss the hover popover and supersede any in-flight hover so its late
+/// result is ignored. Called on mouseleave / scroll. Supersedes the active
+/// hover id **even when no popover is currently visible**, so a request that is
+/// still in flight (debounce fired, result not yet back) is dropped on arrival.
+pub fn dismiss_hover(state: &AppState) {
+    // Mint a fresh id as the active hover so any in-flight result (which carries
+    // an older id) is dropped by `apply_code_intel_hover_result`.
+    let superseded = next_code_intel_id(state);
+    state.code_intel_active_hover.set(superseded);
+    if state.code_intel_hover.with_untracked(|h| h.is_some()) {
+        state.code_intel_hover.set(None);
+    }
+}
+
+/// Start a streamed find-references query (Shift+F12 / M5). Mints a fresh
+/// `references_id` (which supersedes any prior query — late frames for an older
+/// id are dropped by `dispatch`), resets the panel to an in-flight empty state,
+/// switches the left dock to the References tab, and streams the request to the
+/// active project. Results arrive incrementally on
+/// `code_intel_references_results` frames and finish with a
+/// `code_intel_references_complete`.
+pub fn start_find_references(
+    state: &AppState,
+    path: ProjectPath,
+    version: ProjectFileVersion,
+    offset: u32,
+    symbol: Option<String>,
+) {
+    let Some(active_project) = state.active_project_ref_untracked() else {
+        log::error!("start_find_references: no active project");
+        return;
+    };
+    let references_id = next_code_intel_id(state);
+    state
+        .references_state
+        .set(crate::state::ProjectReferencesUiState {
+            host_id: Some(active_project.host_id.clone()),
+            project_id: Some(active_project.project_id.clone()),
+            source_path: Some(path.clone()),
+            source_version: Some(version),
+            active_references_id: references_id,
+            in_flight: true,
+            symbol,
+            ..Default::default()
+        });
+    state.left_tab.set(LeftTab::References);
+
+    let payload = CodeIntelFindReferencesPayload {
+        references_id,
+        path,
+        version,
+        offset,
+        include_declaration: true,
+    };
+    let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
+    let host_id = active_project.host_id;
+    spawn_local(async move {
+        if let Err(error) = send_frame(
+            &host_id,
+            project_stream,
+            FrameKind::CodeIntelFindReferences,
+            &payload,
+        )
+        .await
+        {
+            log::error!("failed to send CodeIntelFindReferences: {error}");
+        }
+    });
+}
+
+/// Cancel the in-flight find-references query (if any). Marks the panel not
+/// in-flight and sends a `code_intel_cancel_references` for the active id; the
+/// server terminates the query with a `cancelled` completion. A no-op when no
+/// query is active.
+pub fn cancel_find_references(state: &AppState) {
+    let (mode, references_id) = state
+        .references_state
+        .with_untracked(|s| (s.mode, s.active_references_id));
+    if mode != crate::state::ProjectReferencesMode::References {
+        return;
+    }
+    if references_id == 0 {
+        return;
+    }
+    let Some((host_id, project_id)) = state
+        .references_state
+        .with_untracked(|s| Some((s.host_id.clone()?, s.project_id.clone()?)))
+    else {
+        return;
+    };
+    state.references_state.update(|s| s.in_flight = false);
+    let payload = CodeIntelCancelReferencesPayload { references_id };
+    let project_stream = StreamPath(format!("/project/{}", project_id.0));
+    spawn_local(async move {
+        if let Err(error) = send_frame(
+            &host_id,
+            project_stream,
+            FrameKind::CodeIntelCancelReferences,
+            &payload,
+        )
+        .await
+        {
+            log::error!("failed to send CodeIntelCancelReferences: {error}");
+        }
+    });
+}
+
+/// Dismiss the references panel: cancel any in-flight query and clear the
+/// results. Resetting `active_references_id` to `0` means any late frame for the
+/// old id is dropped by `dispatch`.
+pub fn clear_references(state: &AppState) {
+    cancel_find_references(state);
+    state
+        .references_state
+        .set(crate::state::ProjectReferencesUiState::default());
 }
 
 /// Issue a project-wide search using the current `search_state` parameters.

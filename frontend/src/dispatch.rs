@@ -6,27 +6,35 @@ use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId,
     AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload,
-    BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent, CommandErrorPayload,
-    CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload, HostBrowseEntriesPayload,
-    HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload, McpServerNotifyPayload,
-    MobileAccessStatePayload, MobilePairingOfferPayload, MobilePairingState, NewAgentPayload,
-    NewTerminalPayload, ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    BrowseBootstrapListing, BrowseBootstrapPayload, ByteRange, ChatEvent,
+    CodeIntelDiagnosticsPayload, CodeIntelErrorContext, CodeIntelErrorPayload,
+    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelLocation,
+    CodeIntelNavigateResultPayload, CodeIntelReferenceLine, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesFileResult, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
+    CodeIntelStatusScope, CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind,
+    HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    HostBrowseOpenedPayload, HostSettingsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
+    MobilePairingOfferPayload, MobilePairingState, NewAgentPayload, NewTerminalPayload,
+    ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
     ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectSearchCompletePayload,
-    ProjectSearchResultsPayload, ProtocolValidator, QueuedMessagesPayload, RejectPayload,
-    ReviewBootstrapPayload, ReviewCommentSource, ReviewErrorContext, ReviewEventPayload, ReviewId,
-    ReviewSuggestionState, SessionId, SessionListPayload, SessionSchemasPayload,
-    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
-    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
-    TerminalBootstrapPayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
-    TerminalStartPayload, WelcomePayload, WorkflowNotifyPayload, WorkflowRunNotifyPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectPath,
+    ProjectSearchCompletePayload, ProjectSearchResultsPayload, ProtocolValidator,
+    QueuedMessagesPayload, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
+    ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionId,
+    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload,
+    SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
+    TeamMemberId, TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload,
+    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload,
+    TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
+    WelcomePayload, WorkflowNotifyPayload, WorkflowRunNotifyPayload,
 };
 
+use crate::line_source::FileLines;
 use crate::state::{
-    ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry, ConnectionStatus,
-    OpenFile, ProjectInfo, ReviewActionTarget, SessionInfo, StreamingState, StreamingToolRequest,
-    TabContent, TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent, reduce_diff_response,
+    ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry, CodeIntelKey,
+    ConnectionStatus, OpenFile, ProjectInfo, ProjectReferencesMode, ProjectReferencesUiState,
+    ReviewActionTarget, SessionInfo, StreamingState, StreamingToolRequest, TabContent,
+    TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent, reduce_diff_response,
     root_display_name, sort_project_infos,
 };
 
@@ -1295,16 +1303,46 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     } else {
                         base_label
                     };
+                    let version = payload.version;
                     state.open_files.update(|files| {
                         files.insert(
                             path.clone(),
                             OpenFile {
                                 path: payload.path,
+                                version,
                                 contents: payload.contents,
                                 is_binary: payload.is_binary,
                             },
                         );
                     });
+                    // Record the rendered version so code-intel frames apply
+                    // only against this text (version-equals-rendered rule).
+                    // §M4: when this is a *reload* to a newer version of an
+                    // already-open file (external edit / branch switch / agent
+                    // write), `set_rendered_version` drops the now-stale
+                    // older-version decorations, and we send a fresh
+                    // `code_intel_subscribe_file` so the server re-pushes the
+                    // semantic model + diagnostics at the new version. The
+                    // subscribe carries no version; the server peeks the same
+                    // centralized counter that stamped these contents, so the
+                    // re-push lands at exactly this rendered version.
+                    if let Some(project_id) = resolve_project_id(&envelope.stream) {
+                        let key = CodeIntelKey {
+                            host_id: host_id.to_owned(),
+                            project_id: project_id.clone(),
+                            path: path.clone(),
+                        };
+                        let mut version_advanced = false;
+                        state.code_intel.update(|map| {
+                            let entry = map.entry(key).or_default();
+                            let prior = entry.rendered_version;
+                            entry.set_rendered_version(version);
+                            version_advanced = matches!(prior, Some(prior) if version > prior);
+                        });
+                        if version_advanced {
+                            refresh_code_intel_subscription(host_id, &project_id, &path);
+                        }
+                    }
                     state.open_tab(TabContent::File { path }, label, true);
                 }
                 Err(error) => report_dispatch_error(
@@ -1359,6 +1397,206 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     &envelope.stream,
                     envelope.kind,
                     format!("failed to parse project_search_complete payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::CodeIntelStatus => {
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                log::warn!(
+                    "code_intel_status on non-project stream {}",
+                    envelope.stream
+                );
+                return;
+            };
+            match envelope.parse_payload::<CodeIntelStatusPayload>() {
+                Ok(payload) => apply_code_intel_status(state, host_id, project_id, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse code_intel_status payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::CodeIntelFileModel => {
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                log::warn!(
+                    "code_intel_file_model on non-project stream {}",
+                    envelope.stream
+                );
+                return;
+            };
+            match envelope.parse_payload::<CodeIntelFileModelPayload>() {
+                Ok(payload) => {
+                    let key = CodeIntelKey {
+                        host_id: host_id.to_owned(),
+                        project_id,
+                        path: payload.path.clone(),
+                    };
+                    let version = payload.version;
+                    // Only apply for a file that is currently open/subscribed.
+                    // A frame that lands after the tab was closed must NOT
+                    // resurrect the entry via `or_default()` (leak + stale).
+                    if code_intel_file_is_open(state, &key) {
+                        state.code_intel.update(|map| {
+                            map.entry(key)
+                                .or_default()
+                                .merge_versioned(version, |data| data.merge_model(payload));
+                        });
+                    } else {
+                        log::debug!(
+                            "dropping code_intel_file_model for closed file {}",
+                            payload.path.relative_path
+                        );
+                    }
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse code_intel_file_model payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::CodeIntelDiagnostics => {
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                log::warn!(
+                    "code_intel_diagnostics on non-project stream {}",
+                    envelope.stream
+                );
+                return;
+            };
+            match envelope.parse_payload::<CodeIntelDiagnosticsPayload>() {
+                Ok(payload) => {
+                    let key = CodeIntelKey {
+                        host_id: host_id.to_owned(),
+                        project_id,
+                        path: payload.path.clone(),
+                    };
+                    let version = payload.version;
+                    // Like the file model: only apply for an open/subscribed
+                    // file, and merge under the version-equals-rendered rule. A
+                    // diagnostics frame is a full-file replace, so it overwrites
+                    // the prior set wholesale rather than merging.
+                    if code_intel_file_is_open(state, &key) {
+                        state.code_intel.update(|map| {
+                            map.entry(key)
+                                .or_default()
+                                .merge_versioned(version, |data| {
+                                    data.diagnostics = payload.diagnostics;
+                                });
+                        });
+                    } else {
+                        log::debug!(
+                            "dropping code_intel_diagnostics for closed file {}",
+                            payload.path.relative_path
+                        );
+                    }
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse code_intel_diagnostics payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::CodeIntelNavigateResult => {
+            if resolve_project_id(&envelope.stream).is_none() {
+                log::warn!(
+                    "code_intel_navigate_result on non-project stream {}",
+                    envelope.stream
+                );
+                return;
+            }
+            match envelope.parse_payload::<CodeIntelNavigateResultPayload>() {
+                Ok(payload) => apply_code_intel_navigate_result(state, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse code_intel_navigate_result payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::CodeIntelHoverResult => {
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                log::warn!(
+                    "code_intel_hover_result on non-project stream {}",
+                    envelope.stream
+                );
+                return;
+            };
+            match envelope.parse_payload::<CodeIntelHoverResultPayload>() {
+                Ok(payload) => apply_code_intel_hover_result(state, host_id, project_id, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse code_intel_hover_result payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::CodeIntelError => {
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                log::warn!("code_intel_error on non-project stream {}", envelope.stream);
+                return;
+            };
+            match envelope.parse_payload::<CodeIntelErrorPayload>() {
+                Ok(payload) => apply_code_intel_error(state, host_id, project_id, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse code_intel_error payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::CodeIntelReferencesResults => {
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                log::warn!(
+                    "code_intel_references_results on non-project stream {}",
+                    envelope.stream
+                );
+                return;
+            };
+            match envelope.parse_payload::<CodeIntelReferencesResultsPayload>() {
+                Ok(payload) => {
+                    apply_code_intel_references_results(state, host_id, project_id, payload)
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse code_intel_references_results payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::CodeIntelReferencesComplete => {
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                log::warn!(
+                    "code_intel_references_complete on non-project stream {}",
+                    envelope.stream
+                );
+                return;
+            };
+            match envelope.parse_payload::<CodeIntelReferencesCompletePayload>() {
+                Ok(payload) => {
+                    apply_code_intel_references_complete(state, host_id, project_id, payload)
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse code_intel_references_complete payload: {error}"),
                 ),
             }
         }
@@ -1890,6 +2128,465 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
             log::warn!("unexpected frame kind from server: {}", envelope.kind);
         }
     }
+}
+
+/// Apply a `code_intel_status` frame to the per-file signal. Only file-scoped
+/// statuses carry a version and a path; they merge under the
+/// version-equals-rendered rule. Project/Provider-scoped statuses are not yet
+/// surfaced per-file in M0 (no key to attach them to) and are logged.
+fn apply_code_intel_status(
+    state: &AppState,
+    host_id: &str,
+    project_id: ProjectId,
+    payload: CodeIntelStatusPayload,
+) {
+    let CodeIntelStatusScope::File { path, version } = payload.scope.clone() else {
+        log::debug!("code_intel_status (non-file scope) ignored in M0 frontend");
+        return;
+    };
+    let key = CodeIntelKey {
+        host_id: host_id.to_owned(),
+        project_id,
+        path: path.clone(),
+    };
+    // Only apply for a file that is currently open/subscribed; a status frame
+    // that arrives after the tab closed must not resurrect a cleaned-up entry.
+    if !code_intel_file_is_open(state, &key) {
+        log::debug!(
+            "dropping code_intel_status for closed file {}",
+            path.relative_path
+        );
+        return;
+    }
+    state.code_intel.update(|map| {
+        map.entry(key)
+            .or_default()
+            .merge_versioned(version, |data| data.status = Some(payload));
+    });
+}
+
+/// Send a fresh `code_intel_subscribe_file` after an open file reloaded at a
+/// newer version (§M4), so the server re-pushes the semantic model + diagnostics
+/// for the new rendered version. The network send is wasm-only (there is no
+/// transport off the browser); on the native test build this is a no-op and the
+/// signal-level reset (`set_rendered_version` dropping stale data) is the whole
+/// observable effect.
+#[cfg(target_arch = "wasm32")]
+fn refresh_code_intel_subscription(host_id: &str, project_id: &ProjectId, path: &ProjectPath) {
+    let stream = StreamPath(format!("/project/{}", project_id.0));
+    let payload = protocol::CodeIntelSubscribeFilePayload { path: path.clone() };
+    let host_id = host_id.to_owned();
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(error) = crate::send::send_frame(
+            &host_id,
+            stream,
+            protocol::FrameKind::CodeIntelSubscribeFile,
+            &payload,
+        )
+        .await
+        {
+            log::error!("failed to send code-intel refresh subscribe: {error}");
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn refresh_code_intel_subscription(_host_id: &str, _project_id: &ProjectId, _path: &ProjectPath) {}
+
+/// Whether a code-intel frame for `key` should be applied: true only if the
+/// file is currently open/subscribed — either it already has a code-intel entry
+/// or its contents are in `open_files`. Used to drop late frames that arrive
+/// after a tab closed (and was unsubscribed) instead of resurrecting state.
+fn code_intel_file_is_open(state: &AppState, key: &CodeIntelKey) -> bool {
+    state.code_intel.with_untracked(|map| map.contains_key(key))
+        || state
+            .open_files
+            .with_untracked(|files| files.contains_key(&key.path))
+}
+
+fn record_code_intel_error_for_path(
+    state: &AppState,
+    host_id: &str,
+    project_id: &ProjectId,
+    path: ProjectPath,
+    payload: CodeIntelErrorPayload,
+) {
+    let key = CodeIntelKey {
+        host_id: host_id.to_owned(),
+        project_id: project_id.clone(),
+        path: path.clone(),
+    };
+    if !code_intel_file_is_open(state, &key) {
+        log::debug!(
+            "dropping code_intel_error for closed file {}",
+            path.relative_path
+        );
+        return;
+    }
+    let version = state
+        .code_intel
+        .with_untracked(|map| map.get(&key).and_then(|file| file.rendered_version))
+        .or_else(|| {
+            state
+                .open_files
+                .with_untracked(|files| files.get(&path).map(|file| file.version))
+        });
+    let Some(version) = version else {
+        return;
+    };
+    state.code_intel.update(|map| {
+        map.entry(key)
+            .or_default()
+            .merge_versioned(version, |data| data.error = Some(payload));
+    });
+}
+
+fn references_context_matches(
+    state: &ProjectReferencesUiState,
+    active_project: Option<&crate::state::ActiveProjectRef>,
+    host_id: &str,
+    project_id: &ProjectId,
+    references_id: u64,
+) -> bool {
+    state.active_references_id == references_id
+        && state.host_id.as_deref() == Some(host_id)
+        && state.project_id.as_ref() == Some(project_id)
+        && active_project
+            .map(|active| active.host_id == host_id && &active.project_id == project_id)
+            .unwrap_or(false)
+}
+
+fn definition_target_line(state: &AppState, target: &CodeIntelLocation) -> CodeIntelReferenceLine {
+    let contents = state.open_files.with_untracked(|files| {
+        files
+            .get(&target.path)
+            .and_then(|file| file.contents.as_ref().cloned())
+    });
+    let Some(contents) = contents else {
+        return CodeIntelReferenceLine {
+            line_number: 0,
+            line_text: format!(
+                "{}: byte {} (preview unavailable)",
+                target.path.relative_path, target.range.start
+            ),
+            ranges: Vec::new(),
+        };
+    };
+    let lines = FileLines::new(&contents);
+    if lines.len() == 0 {
+        return CodeIntelReferenceLine {
+            line_number: 0,
+            line_text: "(empty file)".to_owned(),
+            ranges: Vec::new(),
+        };
+    }
+    let line_index = lines.line_for_byte(target.range.start);
+    let line_start = lines.line_start(line_index);
+    let line_end = lines.line_content_end(line_index);
+    let start = target
+        .range
+        .start
+        .clamp(line_start, line_end)
+        .saturating_sub(line_start);
+    let end = target
+        .range
+        .end
+        .clamp(line_start, line_end)
+        .saturating_sub(line_start)
+        .max(start);
+    let ranges = if start < end {
+        vec![ByteRange { start, end }]
+    } else {
+        Vec::new()
+    };
+    CodeIntelReferenceLine {
+        line_number: (line_index + 1) as u32,
+        line_text: lines.line(line_index).to_owned(),
+        ranges,
+    }
+}
+
+fn definition_target_results(
+    state: &AppState,
+    targets: &[CodeIntelLocation],
+) -> (Vec<CodeIntelReferencesFileResult>, Vec<CodeIntelLocation>) {
+    let mut grouped: Vec<(CodeIntelReferencesFileResult, Vec<CodeIntelLocation>)> = Vec::new();
+    for target in targets {
+        let line = definition_target_line(state, target);
+        if let Some((file, row_targets)) = grouped
+            .iter_mut()
+            .find(|(file, _)| file.path == target.path)
+        {
+            file.lines.push(line);
+            row_targets.push(target.clone());
+        } else {
+            grouped.push((
+                CodeIntelReferencesFileResult {
+                    path: target.path.clone(),
+                    lines: vec![line],
+                    truncated: false,
+                },
+                vec![target.clone()],
+            ));
+        }
+    }
+    let mut results = Vec::with_capacity(grouped.len());
+    let mut row_targets = Vec::with_capacity(targets.len());
+    for (file, targets) in grouped {
+        row_targets.extend(targets);
+        results.push(file);
+    }
+    (results, row_targets)
+}
+
+fn apply_code_intel_error(
+    state: &AppState,
+    host_id: &str,
+    project_id: ProjectId,
+    payload: CodeIntelErrorPayload,
+) {
+    match payload.context.clone() {
+        CodeIntelErrorContext::Subscribe { path }
+        | CodeIntelErrorContext::Hover { path, .. }
+        | CodeIntelErrorContext::Navigate { path, .. } => {
+            record_code_intel_error_for_path(state, host_id, &project_id, path, payload);
+        }
+        CodeIntelErrorContext::FindReferences {
+            references_id,
+            path,
+        } => {
+            record_code_intel_error_for_path(state, host_id, &project_id, path, payload.clone());
+            let active = state.active_project_ref_untracked();
+            state.references_state.update(|s| {
+                if !references_context_matches(
+                    s,
+                    active.as_ref(),
+                    host_id,
+                    &project_id,
+                    references_id,
+                ) {
+                    return;
+                }
+                s.in_flight = false;
+                s.cancelled = false;
+                s.error = Some(payload.message.clone());
+            });
+        }
+        CodeIntelErrorContext::Provider { .. } => {
+            let keys = state.code_intel.with_untracked(|map| {
+                map.keys()
+                    .filter(|key| key.host_id == host_id && key.project_id == project_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+            state.code_intel.update(|map| {
+                for key in keys {
+                    if let Some(version) = map.get(&key).and_then(|file| file.rendered_version) {
+                        map.entry(key.clone())
+                            .or_default()
+                            .merge_versioned(version, |data| data.error = Some(payload.clone()));
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Apply a `code_intel_navigate_result` (M2 go-to-definition miss-fill).
+/// Ignored if superseded (a newer `navigate_id` was sent). Empty `targets` is an
+/// honest "no definition here" — nothing happens. A single target opens
+/// directly; multiple targets populate the reusable references panel as a
+/// chooser and the user's row click performs the byte-offset jump.
+pub(crate) fn apply_code_intel_navigate_result(
+    state: &AppState,
+    payload: CodeIntelNavigateResultPayload,
+) {
+    // The result must still match the full context we recorded when sending:
+    // same navigate id, same owning host/project (no project switch), and the
+    // source file still open at the same rendered version. Otherwise the user
+    // has moved on and navigating would be a surprise jump — drop it.
+    let Some(ctx) = state.code_intel_navigate_ctx.get_untracked() else {
+        return;
+    };
+    if payload.navigate_id != ctx.navigate_id {
+        return; // superseded by a newer navigate request
+    }
+    let Some(active) = state.active_project_ref_untracked() else {
+        return;
+    };
+    if active.host_id != ctx.host_id || active.project_id != ctx.project_id {
+        return; // project switched since the request
+    }
+    let source_key = CodeIntelKey {
+        host_id: ctx.host_id.clone(),
+        project_id: ctx.project_id.clone(),
+        path: payload.path.clone(),
+    };
+    let source_current = state.open_files.with_untracked(|files| {
+        files
+            .get(&payload.path)
+            .map(|file| file.version == payload.version)
+            .unwrap_or(false)
+    }) && state.code_intel.with_untracked(|map| {
+        map.get(&source_key)
+            .map(|file| file.rendered_version == Some(payload.version))
+            .unwrap_or(false)
+    });
+    if !source_current {
+        return; // source file closed or changed version since the request
+    }
+    // Consume the context so a duplicate/late result can't re-fire.
+    state.code_intel_navigate_ctx.set(None);
+
+    let mut targets = payload.targets;
+    if targets.is_empty() {
+        log::debug!("code_intel_navigate_result: no definition at this position");
+        return;
+    }
+    if targets.len() == 1 {
+        let target = targets.remove(0);
+        state
+            .pending_goto_offset
+            .set(Some((target.path.clone(), target.range.start)));
+        crate::actions::open_project_path(state, target.path);
+        return;
+    }
+
+    let (results, row_targets) = definition_target_results(state, &targets);
+    let total_files = results.len() as u32;
+    let total_references = row_targets.len() as u32;
+    state.references_state.set(ProjectReferencesUiState {
+        mode: ProjectReferencesMode::DefinitionTargets,
+        host_id: Some(ctx.host_id),
+        project_id: Some(ctx.project_id),
+        source_path: Some(ctx.path),
+        source_version: Some(ctx.version),
+        active_references_id: 0,
+        in_flight: false,
+        symbol: None,
+        results,
+        row_targets,
+        total_files,
+        total_references,
+        truncated: false,
+        cancelled: false,
+        error: None,
+    });
+    state.left_tab.set(crate::state::LeftTab::References);
+}
+
+/// Apply a `code_intel_hover_result`. Ignored if superseded. Honors the
+/// version-equals-rendered rule (a hover computed against text the user no
+/// longer views is dropped). Empty/`None` contents dismisses the popover
+/// ("nothing to show here"); otherwise the markdown fills the popover that was
+/// seeded with the anchor rect at request time.
+fn apply_code_intel_hover_result(
+    state: &AppState,
+    host_id: &str,
+    project_id: ProjectId,
+    payload: CodeIntelHoverResultPayload,
+) {
+    if payload.hover_id != state.code_intel_active_hover.get_untracked() {
+        return; // superseded
+    }
+    let key = CodeIntelKey {
+        host_id: host_id.to_owned(),
+        project_id,
+        path: payload.path.clone(),
+    };
+    let version_matches = state.code_intel.with_untracked(|map| {
+        map.get(&key)
+            .map(|file| file.rendered_version == Some(payload.version))
+            .unwrap_or(false)
+    });
+    let contents = match (version_matches, payload.contents) {
+        (true, Some(text)) if !text.trim().is_empty() => Some(text),
+        _ => None,
+    };
+    state.code_intel_hover.update(|hover| {
+        // Only fill the popover we seeded for this exact hover id.
+        let matches = hover
+            .as_ref()
+            .map(|popover| popover.hover_id == payload.hover_id)
+            .unwrap_or(false);
+        if !matches {
+            return;
+        }
+        match contents {
+            Some(text) => {
+                if let Some(popover) = hover.as_mut() {
+                    popover.contents = Some(text);
+                }
+            }
+            None => *hover = None, // nothing to show: dismiss
+        }
+    });
+}
+
+/// Apply a streamed `code_intel_references_results` frame (M5): append one
+/// matching file's references to the panel. Frames carrying a stale/superseded
+/// `references_id` (a newer query is active, or the panel was cleared) are
+/// dropped — the active id is the correlation, exactly like `search_id`.
+fn apply_code_intel_references_results(
+    state: &AppState,
+    host_id: &str,
+    project_id: ProjectId,
+    payload: CodeIntelReferencesResultsPayload,
+) {
+    let active = state.active_project_ref_untracked();
+    state.references_state.update(|s| {
+        if !references_context_matches(
+            s,
+            active.as_ref(),
+            host_id,
+            &project_id,
+            payload.references_id,
+        ) {
+            return; // superseded / cleared / inactive project
+        }
+        s.results.push(payload.file);
+        s.total_files = s.results.len() as u32;
+        s.total_references = s
+            .results
+            .iter()
+            .map(|file| {
+                file.lines
+                    .iter()
+                    .map(|line| line.ranges.len() as u32)
+                    .sum::<u32>()
+            })
+            .sum();
+        s.truncated = s.results.iter().any(|file| file.truncated);
+    });
+}
+
+/// Apply the terminal `code_intel_references_complete` frame (M5): record the
+/// totals / truncation / cancellation / error and mark the query finished.
+/// Dropped if it doesn't match the active `references_id`.
+fn apply_code_intel_references_complete(
+    state: &AppState,
+    host_id: &str,
+    project_id: ProjectId,
+    payload: CodeIntelReferencesCompletePayload,
+) {
+    let active = state.active_project_ref_untracked();
+    state.references_state.update(|s| {
+        if !references_context_matches(
+            s,
+            active.as_ref(),
+            host_id,
+            &project_id,
+            payload.references_id,
+        ) {
+            return; // superseded / cleared / inactive project
+        }
+        s.in_flight = false;
+        s.total_files = payload.total_files;
+        s.total_references = payload.total_references;
+        s.truncated = payload.truncated;
+        s.cancelled = payload.cancelled;
+        s.error = payload.error;
+    });
 }
 
 fn resolve_review_id(stream: &StreamPath) -> Option<ReviewId> {
@@ -3957,6 +4654,72 @@ mod tests {
     }
 
     #[test]
+    fn code_intel_error_frame_records_file_error() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "code-intel-error-host";
+            let project_id = ProjectId("code-intel-error-project".to_owned());
+            let path = ProjectPath {
+                root: ProjectRootPath("/repo".to_owned()),
+                relative_path: "src/main.rs".to_owned(),
+            };
+
+            prime_host_for_tests(&state, host_id);
+            dispatch_envelope(
+                &state,
+                host_id,
+                project_bootstrap_envelope(&project_id, "Project", 0),
+            );
+            state.open_files.update(|files| {
+                files.insert(
+                    path.clone(),
+                    OpenFile {
+                        path: path.clone(),
+                        version: protocol::ProjectFileVersion(1),
+                        contents: Some("fn main() {}".to_owned()),
+                        is_binary: false,
+                    },
+                );
+            });
+            let key = CodeIntelKey {
+                host_id: host_id.to_owned(),
+                project_id: project_id.clone(),
+                path: path.clone(),
+            };
+            state.code_intel.update(|map| {
+                map.entry(key.clone())
+                    .or_default()
+                    .set_rendered_version(protocol::ProjectFileVersion(1));
+            });
+
+            let payload = protocol::CodeIntelErrorPayload {
+                code: protocol::CodeIntelErrorCode::Internal,
+                message: "semanticTokens/full failed".to_owned(),
+                context: protocol::CodeIntelErrorContext::Subscribe { path },
+                fatal: false,
+            };
+            let envelope = Envelope::from_payload(
+                StreamPath(format!("/project/{}", project_id.0)),
+                FrameKind::CodeIntelError,
+                1,
+                &payload,
+            )
+            .expect("synthetic CodeIntelError");
+            dispatch_envelope(&state, host_id, envelope);
+
+            state.code_intel.with_untracked(|map| {
+                let error = map
+                    .get(&key)
+                    .and_then(|file| file.applied())
+                    .and_then(|data| data.error.as_ref())
+                    .expect("error recorded for rendered file");
+                assert_eq!(error.message, "semanticTokens/full failed");
+            });
+        });
+    }
+
+    #[test]
     fn file_list_remove_is_scoped_to_root() {
         let project_id = ProjectId("project".to_owned());
         let mut file_tree = HashMap::new();
@@ -4001,5 +4764,482 @@ mod tests {
             .expect("root-b");
         assert!(root_a.entries.is_empty());
         assert_eq!(root_b.entries[0].relative_path, "same.txt");
+    }
+}
+
+/// §M4 frontend external-change correctness, exercised end-to-end through the
+/// real dispatch + send path in a headless browser. These need the wasm
+/// transport (the refresh subscribe is a network send), so they are wasm-only.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use crate::state::{AppState, CodeIntelKey};
+    use protocol::{CodeIntelDiagnostic, ProjectFileVersion, ProjectPath, ProjectRootPath};
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// Yield to the browser event loop so `spawn_local` sends flush.
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    /// Install a Tauri `invoke` stub that records every outbound call into
+    /// `window.__test_send_calls`, so a test can inspect the frames put on the
+    /// wire.
+    fn install_send_stub() {
+        js_sys::eval(
+            r#"
+            (function() {
+                window.__test_send_calls = [];
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    return Promise.resolve();
+                };
+                window.__TAURI__.event = window.__TAURI__.event || {};
+                window.__TAURI__.event.listen = function() { return Promise.resolve(null); };
+            })();
+            "#,
+        )
+        .expect("install send stub");
+    }
+
+    /// Count `code_intel_subscribe_file` frames captured by the send stub.
+    fn subscribe_frames_sent() -> u32 {
+        js_sys::eval(
+            r#"
+            (function() {
+                let n = 0;
+                for (const [cmd, args] of (window.__test_send_calls || [])) {
+                    if (cmd !== "send_host_line") continue;
+                    const env = JSON.parse(JSON.parse(args).line);
+                    if (env.kind === "code_intel_subscribe_file") n++;
+                }
+                return n;
+            })()
+            "#,
+        )
+        .expect("probe send calls")
+        .as_f64()
+        .unwrap_or(0.0) as u32
+    }
+
+    fn project_bootstrap_envelope(project_id: &ProjectId, seq: u64) -> Envelope {
+        Envelope::from_payload(
+            StreamPath(format!("/project/{}", project_id.0)),
+            FrameKind::ProjectBootstrap,
+            seq,
+            &ProjectBootstrapPayload {
+                project: protocol::Project {
+                    id: project_id.clone(),
+                    name: "M4".to_owned(),
+                    sort_order: 0,
+                    source: protocol::ProjectSource::Standalone {
+                        roots: vec![ProjectRootPath("/repo".to_owned())],
+                    },
+                },
+                file_list: ProjectFileListPayload {
+                    incremental: false,
+                    roots: Vec::new(),
+                },
+                git_status: ProjectGitStatusPayload { roots: Vec::new() },
+                review_summaries: Vec::new(),
+            },
+        )
+        .expect("synthetic ProjectBootstrap")
+    }
+
+    fn file_contents_envelope(
+        project_id: &ProjectId,
+        path: &ProjectPath,
+        version: ProjectFileVersion,
+        seq: u64,
+    ) -> Envelope {
+        Envelope::from_payload(
+            StreamPath(format!("/project/{}", project_id.0)),
+            FrameKind::ProjectFileContents,
+            seq,
+            &ProjectFileContentsPayload {
+                path: path.clone(),
+                version,
+                contents: Some("fn main() {}".to_owned()),
+                is_binary: false,
+            },
+        )
+        .expect("synthetic ProjectFileContents")
+    }
+
+    fn stale_diagnostic(message: &str) -> CodeIntelDiagnostic {
+        CodeIntelDiagnostic {
+            range: protocol::ByteRange { start: 0, end: 1 },
+            severity: protocol::CodeIntelSeverity::Error,
+            message: message.to_owned(),
+            source: None,
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn reload_at_new_version_drops_stale_and_sends_refresh_subscribe() {
+        install_send_stub();
+        let state = AppState::new();
+        let host_id = "m4-host";
+        let project_id = ProjectId("m4-project".to_owned());
+        let path = ProjectPath {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "src/main.rs".to_owned(),
+        };
+
+        prime_host_for_tests(&state, host_id);
+        dispatch_envelope(&state, host_id, project_bootstrap_envelope(&project_id, 0));
+
+        // First contents at v1: this is the initial open, not a reload (no
+        // prior rendered version), so no refresh subscribe fires.
+        dispatch_envelope(
+            &state,
+            host_id,
+            file_contents_envelope(&project_id, &path, ProjectFileVersion(1), 1),
+        );
+        for _ in 0..5 {
+            next_tick().await;
+        }
+        assert_eq!(
+            subscribe_frames_sent(),
+            0,
+            "initial contents must not trigger a refresh subscribe"
+        );
+
+        // Stash a v1 decoration so we can prove it is dropped on the reload.
+        let key = CodeIntelKey {
+            host_id: host_id.to_owned(),
+            project_id: project_id.clone(),
+            path: path.clone(),
+        };
+        state.code_intel.update(|map| {
+            if let Some(entry) = map.get_mut(&key) {
+                entry.merge_versioned(ProjectFileVersion(1), |d| {
+                    d.diagnostics = vec![stale_diagnostic("stale")];
+                });
+            }
+        });
+
+        // Reload: v2 contents arrive (external edit / branch switch).
+        dispatch_envelope(
+            &state,
+            host_id,
+            file_contents_envelope(&project_id, &path, ProjectFileVersion(2), 2),
+        );
+        for _ in 0..5 {
+            next_tick().await;
+        }
+
+        // The rendered version advanced and the stale v1 decorations were
+        // dropped (never paint v1 over v2 text).
+        state.code_intel.with_untracked(|map| {
+            let entry = map.get(&key).expect("code-intel entry");
+            assert_eq!(entry.rendered_version, Some(ProjectFileVersion(2)));
+            assert!(
+                !entry.by_version.contains_key(&ProjectFileVersion(1)),
+                "stale v1 decorations must be dropped on reload"
+            );
+        });
+
+        // A fresh refresh subscribe was sent so the server re-pushes at the new
+        // version.
+        assert_eq!(
+            subscribe_frames_sent(),
+            1,
+            "a reload to a newer version must send exactly one refresh subscribe"
+        );
+
+        // A late v1 frame arriving after the bump is ignored (dropped), not
+        // stashed — it can never paint over v2.
+        state.code_intel.update(|map| {
+            if let Some(entry) = map.get_mut(&key) {
+                entry.merge_versioned(ProjectFileVersion(1), |d| {
+                    d.diagnostics = vec![stale_diagnostic("late")];
+                });
+            }
+        });
+        state.code_intel.with_untracked(|map| {
+            let entry = map.get(&key).expect("code-intel entry");
+            assert!(
+                !entry.by_version.contains_key(&ProjectFileVersion(1)),
+                "a late old-version frame after the bump must be dropped"
+            );
+        });
+    }
+
+    // ── M5: find-references dispatch correlation ────────────────────────────
+
+    fn references_results_envelope(
+        project_id: &ProjectId,
+        references_id: u64,
+        relative: &str,
+        seq: u64,
+    ) -> Envelope {
+        Envelope::from_payload(
+            StreamPath(format!("/project/{}", project_id.0)),
+            FrameKind::CodeIntelReferencesResults,
+            seq,
+            &protocol::CodeIntelReferencesResultsPayload {
+                references_id,
+                file: protocol::CodeIntelReferencesFileResult {
+                    path: ProjectPath {
+                        root: ProjectRootPath("/repo".to_owned()),
+                        relative_path: relative.to_owned(),
+                    },
+                    lines: vec![protocol::CodeIntelReferenceLine {
+                        line_number: 1,
+                        line_text: "foo();".to_owned(),
+                        ranges: vec![protocol::ByteRange { start: 0, end: 3 }],
+                    }],
+                    truncated: false,
+                },
+            },
+        )
+        .expect("synthetic CodeIntelReferencesResults")
+    }
+
+    fn references_complete_envelope(
+        project_id: &ProjectId,
+        references_id: u64,
+        total_files: u32,
+        total_references: u32,
+        seq: u64,
+    ) -> Envelope {
+        Envelope::from_payload(
+            StreamPath(format!("/project/{}", project_id.0)),
+            FrameKind::CodeIntelReferencesComplete,
+            seq,
+            &protocol::CodeIntelReferencesCompletePayload {
+                references_id,
+                total_files,
+                total_references,
+                truncated: false,
+                cancelled: false,
+                error: None,
+            },
+        )
+        .expect("synthetic CodeIntelReferencesComplete")
+    }
+
+    /// The most recent `code_intel_find_references` frame the send stub captured,
+    /// as `(references_id, offset)`. `None` if no such frame was sent.
+    fn last_find_references_frame() -> Option<(u64, u32)> {
+        let value = js_sys::eval(
+            r#"
+            (function() {
+                for (let i = (window.__test_send_calls || []).length - 1; i >= 0; i--) {
+                    const [cmd, args] = window.__test_send_calls[i];
+                    if (cmd !== "send_host_line") continue;
+                    const env = JSON.parse(JSON.parse(args).line);
+                    if (env.kind === "code_intel_find_references") {
+                        return env.payload.references_id + ":" + env.payload.offset;
+                    }
+                }
+                return null;
+            })()
+            "#,
+        )
+        .expect("probe find-references frame");
+        let text = value.as_string()?;
+        let (id, offset) = text.split_once(':')?;
+        Some((id.parse().ok()?, offset.parse().ok()?))
+    }
+
+    /// `start_find_references` (the Shift+F12 entry point) mints a references id,
+    /// sends a `code_intel_find_references` carrying the requested byte offset,
+    /// switches the left dock to the References tab, and primes the panel as
+    /// in-flight for that id.
+    #[wasm_bindgen_test]
+    async fn start_find_references_sends_frame_and_opens_panel() {
+        install_send_stub();
+        let state = AppState::new();
+        let host_id = "m5-send-host";
+        let project_id = ProjectId("m5-send-project".to_owned());
+        prime_host_for_tests(&state, host_id);
+        dispatch_envelope(&state, host_id, project_bootstrap_envelope(&project_id, 0));
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: project_id.clone(),
+            }));
+
+        let path = ProjectPath {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "src/main.rs".to_owned(),
+        };
+        crate::actions::start_find_references(
+            &state,
+            path,
+            ProjectFileVersion(1),
+            12,
+            Some("foo".to_owned()),
+        );
+        for _ in 0..5 {
+            next_tick().await;
+        }
+
+        // The panel is primed in-flight for the freshly-minted id, on the Refs tab.
+        let active_id = state
+            .references_state
+            .with_untracked(|s| s.active_references_id);
+        assert!(active_id > 0, "a references id was minted");
+        assert!(state.references_state.with_untracked(|s| s.in_flight));
+        assert_eq!(
+            state.references_state.with_untracked(|s| s.symbol.clone()),
+            Some("foo".to_owned())
+        );
+        assert_eq!(
+            state.left_tab.get_untracked(),
+            crate::state::LeftTab::References
+        );
+
+        // The frame went out with the requested offset and the minted id.
+        let frame = last_find_references_frame().expect("a find-references frame was sent");
+        assert_eq!(
+            frame,
+            (active_id, 12),
+            "frame carries the minted id + offset"
+        );
+    }
+
+    /// Streamed references frames populate the panel only for the active
+    /// `references_id`; a superseded (older id) frame is ignored, and the
+    /// terminal complete records the totals + clears the in-flight flag.
+    #[wasm_bindgen_test]
+    async fn references_apply_only_for_active_id() {
+        let state = AppState::new();
+        let host_id = "m5-host";
+        let project_id = ProjectId("m5-project".to_owned());
+        prime_host_for_tests(&state, host_id);
+        dispatch_envelope(&state, host_id, project_bootstrap_envelope(&project_id, 0));
+
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: project_id.clone(),
+            }));
+
+        // The newest query has id 2 active and is in flight for this project.
+        state.references_state.update(|s| {
+            s.host_id = Some(host_id.to_owned());
+            s.project_id = Some(project_id.clone());
+            s.source_path = Some(ProjectPath {
+                root: ProjectRootPath("/repo".to_owned()),
+                relative_path: "src/main.rs".to_owned(),
+            });
+            s.source_version = Some(ProjectFileVersion(1));
+            s.active_references_id = 2;
+            s.in_flight = true;
+        });
+
+        // A superseded (older id 1) results frame is dropped.
+        dispatch_envelope(
+            &state,
+            host_id,
+            references_results_envelope(&project_id, 1, "src/old.rs", 1),
+        );
+        assert!(
+            state
+                .references_state
+                .with_untracked(|s| s.results.is_empty()),
+            "a superseded older references-id result must be ignored"
+        );
+
+        // A results frame for the active id populates the panel.
+        dispatch_envelope(
+            &state,
+            host_id,
+            references_results_envelope(&project_id, 2, "src/a.rs", 2),
+        );
+        state.references_state.with_untracked(|s| {
+            assert_eq!(s.results.len(), 1, "active-id result populates the panel");
+            assert_eq!(s.results[0].path.relative_path, "src/a.rs");
+            assert_eq!(s.total_files, 1, "running file total updates per result");
+            assert_eq!(
+                s.total_references, 1,
+                "running reference total updates per result"
+            );
+            assert!(s.in_flight, "still in flight until the terminal frame");
+        });
+
+        // The terminal complete for the active id records totals + finishes.
+        dispatch_envelope(
+            &state,
+            host_id,
+            references_complete_envelope(&project_id, 2, 3, 7, 3),
+        );
+        state.references_state.with_untracked(|s| {
+            assert!(!s.in_flight, "complete clears the in-flight flag");
+            assert_eq!(s.total_files, 3);
+            assert_eq!(s.total_references, 7);
+        });
+    }
+
+    #[wasm_bindgen_test]
+    async fn project_switch_clears_references_and_drops_late_project_frames() {
+        let state = AppState::new();
+        let host_id = "m5-switch-host";
+        let project_a = ProjectId("project-a".to_owned());
+        let project_b = ProjectId("project-b".to_owned());
+        prime_host_for_tests(&state, host_id);
+        dispatch_envelope(&state, host_id, project_bootstrap_envelope(&project_a, 0));
+        dispatch_envelope(&state, host_id, project_bootstrap_envelope(&project_b, 0));
+
+        let source = ProjectPath {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "src/main.rs".to_owned(),
+        };
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: host_id.to_owned(),
+                project_id: project_a.clone(),
+            }));
+        state.references_state.set(ProjectReferencesUiState {
+            host_id: Some(host_id.to_owned()),
+            project_id: Some(project_a.clone()),
+            source_path: Some(source),
+            source_version: Some(ProjectFileVersion(1)),
+            active_references_id: 9,
+            in_flight: true,
+            ..Default::default()
+        });
+
+        state.switch_active_project(Some(crate::state::ActiveProjectRef {
+            host_id: host_id.to_owned(),
+            project_id: project_b.clone(),
+        }));
+        state.references_state.with_untracked(|s| {
+            assert_eq!(
+                s.active_references_id, 0,
+                "switching projects clears/cancels the references panel state"
+            );
+            assert!(s.results.is_empty());
+        });
+
+        dispatch_envelope(
+            &state,
+            host_id,
+            references_results_envelope(&project_a, 9, "src/a.rs", 1),
+        );
+        state.references_state.with_untracked(|s| {
+            assert!(
+                s.results.is_empty(),
+                "late references from the previously-active project must be ignored"
+            );
+            assert_eq!(s.total_references, 0);
+        });
     }
 }
