@@ -9,18 +9,17 @@
 //! [`protocol_driver`](crate::protocol_driver) consumes. MQTT keep-alive PINGREQ
 //! is driven from inside `poll` (which the driver always has in flight), so no
 //! extra task is needed.
+//!
+//! The pure codec/ack-decision helpers live in [`crate::wasm_codec`] so they can
+//! be unit-tested on the native target (this module is wasm-only).
 
-use std::collections::VecDeque;
 use std::time::Duration;
 
 use bytes::BytesMut;
 use futures_channel::mpsc::{UnboundedReceiver, unbounded};
 use futures_util::StreamExt;
 use mqttbytes::QoS;
-use mqttbytes::v5::{
-    Connect, ConnectProperties, ConnectReturnCode, Packet, PubAck, PubAckProperties, PubAckReason,
-    Publish, SubAck, SubscribeReasonCode, read,
-};
+use mqttbytes::v5::{Connect, ConnectProperties, ConnectReturnCode, Packet, Publish, read};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use wasm_bindgen::JsCast;
@@ -29,15 +28,17 @@ use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
 
 use crate::chunking::MAX_PLAINTEXT_CHUNK_LEN;
 use crate::config::ParticipantRole;
-use crate::error::{MqttTransportError, PublishRejection};
+use crate::error::MqttTransportError;
 use crate::link::{IncomingPublish, LinkEvent, MqttLink};
 use crate::time::{Instant, Interval, interval_at};
 use crate::types::{BrokerAuth, BrokerEndpoint};
+use crate::wasm_codec::{
+    PubAckMatch, SubAckMatch, classify_puback, classify_suback, encode_disconnect, encode_pingreq,
+    incoming_publish_puback,
+};
 
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
 const MAX_MQTT_PACKET_SIZE: usize = MAX_PLAINTEXT_CHUNK_LEN + 1024;
-/// MQTT5 PUBACK reason code for "Quota exceeded" (0x97).
-const PUBACK_QUOTA_EXCEEDED: u8 = 0x97;
 
 /// A signal produced by one of the WebSocket JS callbacks.
 enum WsSignal {
@@ -82,9 +83,13 @@ pub(crate) struct WasmMqttLink {
     ws: WebSocket,
     events: UnboundedReceiver<WsSignal>,
     incoming: BytesMut,
-    pending: VecDeque<LinkEvent>,
     ping: Interval,
     next_pkid: u16,
+    /// pkid of the QoS1 PUBLISH currently awaiting its PUBACK (the driver is
+    /// strictly sequential, so at most one is outstanding).
+    outstanding_publish_pkid: Option<u16>,
+    /// pkid of the SUBSCRIBE currently awaiting its SUBACK.
+    pending_subscribe_pkid: Option<u16>,
     // Closures must outlive the socket; dropping them detaches the callbacks.
     _on_open: Closure<dyn FnMut(Event)>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
@@ -159,9 +164,10 @@ impl WasmMqttLink {
             ws,
             events: rx,
             incoming: BytesMut::new(),
-            pending: VecDeque::new(),
             ping,
             next_pkid: 0,
+            outstanding_publish_pkid: None,
+            pending_subscribe_pkid: None,
             _on_open: on_open,
             _on_message: on_message,
             _on_close: on_close,
@@ -264,6 +270,49 @@ impl WasmMqttLink {
         }
     }
 
+    /// Turn a decoded incoming packet into a [`LinkEvent`], performing the
+    /// required side effects: PUBACK an incoming QoS1 PUBLISH, and match
+    /// PUBACK/SUBACK pkids against the outstanding/pending operation.
+    fn handle_incoming(&mut self, packet: Packet) -> Result<LinkEvent, MqttTransportError> {
+        match packet {
+            Packet::Publish(publish) => {
+                if let Some(ack) = incoming_publish_puback(publish.qos, publish.pkid)? {
+                    self.send_bytes(&ack).map_err(|err| {
+                        MqttTransportError::BrokerDisconnected {
+                            reason: format!("failed to send PUBACK: {err}"),
+                        }
+                    })?;
+                }
+                Ok(LinkEvent::Publish(IncomingPublish {
+                    topic: publish.topic.into_bytes(),
+                    payload: publish.payload.to_vec(),
+                    retain: publish.retain,
+                }))
+            }
+            Packet::PubAck(puback) => {
+                match classify_puback(self.outstanding_publish_pkid, puback) {
+                    PubAckMatch::Matched(result) => {
+                        self.outstanding_publish_pkid = None;
+                        Ok(LinkEvent::PubAck(result))
+                    }
+                    PubAckMatch::Ignored => Ok(LinkEvent::Other),
+                }
+            }
+            Packet::SubAck(suback) => match classify_suback(self.pending_subscribe_pkid, suback) {
+                SubAckMatch::Matched { result, debug } => {
+                    self.pending_subscribe_pkid = None;
+                    Ok(LinkEvent::SubAck { result, debug })
+                }
+                SubAckMatch::Ignored => Ok(LinkEvent::Other),
+            },
+            Packet::Disconnect(disconnect) => Ok(LinkEvent::Disconnect {
+                reason: format!("{disconnect:?}"),
+            }),
+            // PINGRESP, a stray CONNACK, … — the driver ignores these.
+            _ => Ok(LinkEvent::Other),
+        }
+    }
+
     fn send_bytes(&self, bytes: &[u8]) -> Result<(), String> {
         self.ws
             .send_with_u8_array(bytes)
@@ -280,11 +329,8 @@ impl WasmMqttLink {
     }
 
     fn send_pingreq(&self) -> Result<(), MqttTransportError> {
-        let mut buffer = BytesMut::new();
-        mqttbytes::v5::PingReq
-            .write(&mut buffer)
-            .map_err(|err| publish_err(format!("failed to encode PINGREQ: {err:?}")))?;
-        self.send_bytes(&buffer)
+        let bytes = encode_pingreq()?;
+        self.send_bytes(&bytes)
             .map_err(|err| MqttTransportError::BrokerDisconnected {
                 reason: format!("failed to send PINGREQ: {err}"),
             })
@@ -294,33 +340,36 @@ impl WasmMqttLink {
 impl MqttLink for WasmMqttLink {
     async fn subscribe(&mut self, topic: &str) -> Result<(), MqttTransportError> {
         let mut subscribe = mqttbytes::v5::Subscribe::new(topic.to_owned(), QoS::AtLeastOnce);
-        subscribe.pkid = self.allocate_pkid();
+        let pkid = self.allocate_pkid();
+        subscribe.pkid = pkid;
         let mut buffer = BytesMut::new();
         subscribe
             .write(&mut buffer)
             .map_err(|err| subscribe_err(format!("failed to encode SUBSCRIBE: {err:?}")))?;
         self.send_bytes(&buffer)
-            .map_err(|err| subscribe_err(format!("failed to send SUBSCRIBE: {err}")))
+            .map_err(|err| subscribe_err(format!("failed to send SUBSCRIBE: {err}")))?;
+        self.pending_subscribe_pkid = Some(pkid);
+        Ok(())
     }
 
     async fn publish(&mut self, topic: &str, payload: Vec<u8>) -> Result<(), MqttTransportError> {
         let mut publish = Publish::new(topic.to_owned(), QoS::AtLeastOnce, payload);
-        publish.pkid = self.allocate_pkid();
+        let pkid = self.allocate_pkid();
+        publish.pkid = pkid;
         let mut buffer = BytesMut::new();
         publish
             .write(&mut buffer)
             .map_err(|err| publish_err(format!("failed to encode PUBLISH: {err:?}")))?;
         self.send_bytes(&buffer)
-            .map_err(|err| publish_err(format!("failed to send PUBLISH: {err}")))
+            .map_err(|err| publish_err(format!("failed to send PUBLISH: {err}")))?;
+        self.outstanding_publish_pkid = Some(pkid);
+        Ok(())
     }
 
     async fn poll(&mut self) -> Result<LinkEvent, MqttTransportError> {
         loop {
-            if let Some(event) = self.pending.pop_front() {
-                return Ok(event);
-            }
             if let Some(packet) = self.read_packet()? {
-                return Ok(translate_packet(packet));
+                return self.handle_incoming(packet);
             }
 
             tokio::select! {
@@ -346,92 +395,12 @@ impl MqttLink for WasmMqttLink {
     }
 
     async fn disconnect(&mut self) {
+        // Send a graceful DISCONNECT before tearing down the socket, matching the
+        // native backend.
+        if let Ok(bytes) = encode_disconnect() {
+            let _send_result = self.send_bytes(&bytes);
+        }
         let _close_result = self.ws.close();
-    }
-}
-
-/// Translate a decoded MQTT packet into a [`LinkEvent`]. Packets the driver does
-/// not act on (PINGRESP, a stray CONNACK, …) map to [`LinkEvent::Other`], the
-/// same way the native backend reports ignored incoming events.
-fn translate_packet(packet: Packet) -> LinkEvent {
-    match packet {
-        Packet::Publish(publish) => LinkEvent::Publish(IncomingPublish {
-            topic: publish.topic.into_bytes(),
-            payload: publish.payload.to_vec(),
-            retain: publish.retain,
-        }),
-        Packet::PubAck(puback) => LinkEvent::PubAck(validate_puback(puback)),
-        Packet::SubAck(suback) => {
-            let debug = format!("{suback:?}");
-            LinkEvent::SubAck {
-                result: validate_suback(suback),
-                debug,
-            }
-        }
-        Packet::Disconnect(disconnect) => LinkEvent::Disconnect {
-            reason: format!("{disconnect:?}"),
-        },
-        _ => LinkEvent::Other,
-    }
-}
-
-fn validate_puback(puback: PubAck) -> Result<(), MqttTransportError> {
-    match puback.reason {
-        PubAckReason::Success => Ok(()),
-        reason => Err(MqttTransportError::PublishRejected {
-            reason: PublishRejection {
-                code: puback_reason_code(reason),
-                code_name: format!("{reason:?}"),
-                reason_string: puback_reason_string(puback.properties.as_ref()),
-            },
-        }),
-    }
-}
-
-fn puback_reason_string(properties: Option<&PubAckProperties>) -> Option<String> {
-    properties.and_then(|properties| properties.reason_string.clone())
-}
-
-/// Map mqttbytes' `PubAckReason` to its canonical MQTT5 numeric reason code (the
-/// driver classifies quota rejections on this code).
-fn puback_reason_code(reason: PubAckReason) -> u8 {
-    match reason {
-        PubAckReason::Success => 0x00,
-        PubAckReason::NoMatchingSubscribers => 0x10,
-        PubAckReason::UnspecifiedError => 0x80,
-        PubAckReason::ImplementationSpecificError => 0x83,
-        PubAckReason::NotAuthorized => 0x87,
-        PubAckReason::TopicNameInvalid => 0x90,
-        PubAckReason::PacketIdentifierInUse => 0x91,
-        PubAckReason::QuotaExceeded => PUBACK_QUOTA_EXCEEDED,
-        PubAckReason::PayloadFormatInvalid => 0x99,
-    }
-}
-
-fn validate_suback(suback: SubAck) -> Result<(), MqttTransportError> {
-    let mut codes = suback.return_codes.into_iter();
-    let first = codes
-        .next()
-        .ok_or_else(|| MqttTransportError::SubscribeRejected {
-            reason: "SUBACK contained no reason codes".to_string(),
-        })?;
-    if codes.next().is_some() {
-        return Err(MqttTransportError::SubscribeRejected {
-            reason: "SUBACK contained more reason codes than requested subscriptions".to_string(),
-        });
-    }
-    match first {
-        // mqttbytes encodes a granted QoS as QoS0/QoS1/QoS2; we always request
-        // QoS1, so only QoS1 is a successful grant.
-        SubscribeReasonCode::QoS1 => Ok(()),
-        SubscribeReasonCode::QoS0 | SubscribeReasonCode::QoS2 => {
-            Err(MqttTransportError::SubscribeRejected {
-                reason: format!("broker granted unsupported QoS: {first:?}"),
-            })
-        }
-        reason => Err(MqttTransportError::SubscribeRejected {
-            reason: format!("{reason:?}"),
-        }),
     }
 }
 
