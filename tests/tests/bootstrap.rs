@@ -153,6 +153,7 @@ async fn stable_reconnect_does_not_emit_unchanged_session_schemas_after_bootstra
         settings_path,
         server::HostRuntimeConfig {
             kiro_probe_program: Some(missing_kiro.to_string_lossy().into_owned()),
+            skip_real_backend_probe: true,
             ..Default::default()
         },
     )

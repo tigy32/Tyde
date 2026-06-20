@@ -904,6 +904,38 @@ fn close_agent_tabs_in_cz(center_zone: &mut CenterZoneState, host_id: &str, agen
     }
 }
 
+fn close_host_runtime_tabs_in_cz(center_zone: &mut CenterZoneState, host_id: &str) {
+    let remove_ids: Vec<_> = center_zone
+        .tabs
+        .iter()
+        .filter(|tab| match &tab.content {
+            TabContent::Chat {
+                agent_ref,
+                pending_team_member,
+            } => {
+                agent_ref
+                    .as_ref()
+                    .is_some_and(|agent_ref| agent_ref.host_id == host_id)
+                    || pending_team_member
+                        .as_ref()
+                        .is_some_and(|pending| pending.host_id == host_id)
+            }
+            TabContent::Diff {
+                host_id: tab_host, ..
+            }
+            | TabContent::Comments {
+                host_id: tab_host, ..
+            } => tab_host == host_id,
+            TabContent::Workflow { agent_ref, .. } => agent_ref.host_id == host_id,
+            TabContent::Home | TabContent::AgentMonitor | TabContent::File { .. } => false,
+        })
+        .map(|tab| tab.id)
+        .collect();
+    for id in remove_ids {
+        center_zone.close(id);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionInfo {
     pub host_id: String,
@@ -2173,6 +2205,22 @@ impl AppState {
     }
 
     pub fn clear_host_runtime(&self, host_id: &str) {
+        let host_project_ids: HashSet<ProjectId> = self.projects.with_untracked(|projects| {
+            projects
+                .iter()
+                .filter(|project| project.host_id == host_id)
+                .map(|project| project.project.id.clone())
+                .collect()
+        });
+        let active_project_on_host = self
+            .active_project
+            .get_untracked()
+            .as_ref()
+            .is_some_and(|active| active.host_id == host_id);
+        if active_project_on_host {
+            self.switch_active_project(None);
+        }
+
         let reviews_before = self.reviews.with_untracked(|m| m.len());
         let action_gates_before = self.review_action_pending.with_untracked(|m| m.len());
         let target_gates_before = self
@@ -2182,7 +2230,8 @@ impl AppState {
             .review_create_pending
             .with_untracked(|m| m.iter().filter(|((h, _), _)| h == host_id).count());
         log::info!(
-            "host.clear_host_runtime.start host={host_id} reviews_retained={reviews_before} action_gates_retained={action_gates_before} target_gates_retained={target_gates_before} host_create_pending={create_pending_before}"
+            "host.clear_host_runtime.start host={host_id} host_projects={} reviews_before={reviews_before} action_gates_before={action_gates_before} target_gates_before={target_gates_before} host_create_pending={create_pending_before}",
+            host_project_ids.len()
         );
         // Drop chat-related per-agent state for every agent on this host before
         // we forget the agent list itself. Without this, a reconnect re-replays
@@ -2195,8 +2244,26 @@ impl AppState {
                 .map(|agent| agent.agent_id.clone())
                 .collect()
         });
-        if !agent_ids.is_empty() {
-            let drop_set: std::collections::HashSet<AgentId> = agent_ids.iter().cloned().collect();
+        let drop_set: HashSet<AgentId> = agent_ids.iter().cloned().collect();
+        self.center_zone
+            .update(|center_zone| close_host_runtime_tabs_in_cz(center_zone, host_id));
+        self.prune_tab_lru();
+        self.project_view_memory.update(|memories| {
+            for memory in memories.values_mut() {
+                if let Some(center_zone) = memory.center_zone.as_mut() {
+                    close_host_runtime_tabs_in_cz(center_zone, host_id);
+                }
+                if memory
+                    .active_terminal
+                    .as_ref()
+                    .is_some_and(|active| active.host_id == host_id)
+                {
+                    memory.active_terminal = None;
+                }
+                memory.diff_contents.retain(|key, _| key.host_id != host_id);
+            }
+        });
+        if !drop_set.is_empty() {
             self.chat_rows.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
@@ -2229,6 +2296,95 @@ impl AppState {
             });
         }
 
+        let compaction_ids: HashSet<AgentId> = self.compaction_in_progress.with_untracked(|map| {
+            map.iter()
+                .filter(|(_, info)| info.host_id == host_id)
+                .map(|(agent_id, _)| agent_id.clone())
+                .collect()
+        });
+        let mut compaction_drop_set = drop_set.clone();
+        compaction_drop_set.extend(compaction_ids);
+        self.compaction_in_progress.update(|map| {
+            map.retain(|_, info| info.host_id != host_id);
+        });
+        self.compaction_errors.update(|map| {
+            map.retain(|id, _| !compaction_drop_set.contains(id));
+        });
+        self.compaction_pending_completion.update(|map| {
+            map.retain(|(host, _), _| host != host_id);
+        });
+        self.compaction_pending_close.update(|set| {
+            set.retain(|(host, _)| host != host_id);
+        });
+
+        let review_ids: HashSet<ReviewId> = self.reviews.with_untracked(|reviews| {
+            reviews
+                .iter()
+                .filter(|(_, review)| host_project_ids.contains(&review.project_id))
+                .map(|(review_id, _)| review_id.clone())
+                .collect()
+        });
+        let summary_review_ids: HashSet<ReviewId> =
+            self.review_summaries.with_untracked(|summaries| {
+                summaries
+                    .iter()
+                    .filter(|(project_id, _)| host_project_ids.contains(project_id))
+                    .flat_map(|(_, summaries)| summaries.iter().map(|summary| summary.id.clone()))
+                    .collect()
+            });
+        let mut host_review_ids = review_ids;
+        host_review_ids.extend(summary_review_ids);
+
+        self.file_tree.update(|map| {
+            map.retain(|project_id, _| !host_project_ids.contains(project_id));
+        });
+        self.git_status.update(|map| {
+            map.retain(|project_id, _| !host_project_ids.contains(project_id));
+        });
+        self.code_intel.update(|map| {
+            map.retain(|key, _| key.host_id != host_id);
+        });
+        self.diff_contents.update(|map| {
+            map.retain(|key, _| key.host_id != host_id);
+        });
+        self.code_intel_navigate_ctx.update(|ctx| {
+            if ctx.as_ref().is_some_and(|ctx| ctx.host_id == host_id) {
+                *ctx = None;
+            }
+        });
+        self.review_summaries.update(|map| {
+            map.retain(|project_id, _| !host_project_ids.contains(project_id));
+        });
+        self.reviews.update(|map| {
+            map.retain(|_, review| !host_project_ids.contains(&review.project_id));
+        });
+        self.review_action_pending.update(|map| {
+            map.retain(|review_id, _| !host_review_ids.contains(review_id));
+        });
+        self.review_action_target_pending.update(|set| {
+            set.retain(|(review_id, _)| !host_review_ids.contains(review_id));
+        });
+        self.review_create_pending.update(|map| {
+            map.retain(|(host, _), _| host != host_id);
+        });
+        self.agent_monitor_order.update(|order| {
+            order.retain(|key| key.host_id != host_id);
+        });
+        self.agents_panel_filters.update(|map| {
+            map.retain(|active, _| {
+                active
+                    .as_ref()
+                    .is_none_or(|active| active.host_id != host_id)
+            });
+        });
+        self.sessions_panel_filters.update(|map| {
+            map.retain(|active, _| {
+                active
+                    .as_ref()
+                    .is_none_or(|active| active.host_id != host_id)
+            });
+        });
+
         self.host_streams.update(|streams| {
             streams.remove(host_id);
         });
@@ -2249,6 +2405,15 @@ impl AppState {
         });
         self.backend_setup_by_host.update(|setup| {
             setup.remove(host_id);
+        });
+        self.mobile_access_state.update(|map| {
+            map.remove(host_id);
+        });
+        self.mobile_pairing_offer.update(|map| {
+            map.remove(host_id);
+        });
+        self.mobile_pairing_start_pending.update(|set| {
+            set.remove(host_id);
         });
         self.session_schemas.update(|schemas| {
             schemas.remove(host_id);
@@ -2307,18 +2472,19 @@ impl AppState {
             .update(|map| map.retain(|key, _| key.host_id != host_id));
         self.pending_workbench_creates
             .update(|pending| pending.retain(|entry| entry.host_id != host_id));
-
-        if self
-            .active_project
-            .get_untracked()
-            .as_ref()
-            .is_some_and(|active| active.host_id == host_id)
-        {
-            self.switch_active_project(None);
-        }
-        // active_agent is a Memo over center_zone; we cannot clear it directly.
-        // Stale Chat tabs referencing the disconnected host are a known
-        // follow-up bug (deferred from the perf plan).
+        self.pending_terminal_focus.update(|focus| {
+            if focus.as_deref() == Some(host_id) {
+                *focus = None;
+            }
+        });
+        self.browse_dialog.update(|dialog| {
+            if dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.host_id.get_untracked() == host_id)
+            {
+                *dialog = None;
+            }
+        });
         if self
             .active_terminal
             .get_untracked()
@@ -3758,6 +3924,481 @@ mod tests {
                     .with_untracked(|m| m.contains_key(&agent_b1)),
                 "host_b agent's task_lists must survive"
             );
+        });
+    }
+
+    #[test]
+    fn clear_host_runtime_drops_only_that_hosts_project_runtime_state() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+
+            let host_a = "host-a";
+            let host_b = "host-b";
+            let project_a = ProjectId("project-a".to_owned());
+            let project_b = ProjectId("project-b".to_owned());
+            let review_a = ReviewId("review-a".to_owned());
+            let review_b = ReviewId("review-b".to_owned());
+            let path_a = test_path("a");
+            let path_b = test_path("b");
+            let active_a = ActiveProjectRef {
+                host_id: host_a.to_owned(),
+                project_id: project_a.clone(),
+            };
+            let active_b = ActiveProjectRef {
+                host_id: host_b.to_owned(),
+                project_id: project_b.clone(),
+            };
+
+            let mk_project = |host: &str, id: &ProjectId| ProjectInfo {
+                host_id: host.to_owned(),
+                project: Project {
+                    id: id.clone(),
+                    name: id.0.clone(),
+                    sort_order: 0,
+                    source: protocol::ProjectSource::Standalone {
+                        roots: vec![ProjectRootPath(format!("/repo/{}", id.0))],
+                    },
+                },
+            };
+            let mk_review = |id: &ReviewId, project_id: &ProjectId| Review {
+                id: id.clone(),
+                project_id: project_id.clone(),
+                origin_agent_id: AgentId(format!("agent-{}", id.0)),
+                origin_session_id: SessionId(format!("session-{}", id.0)),
+                selection: protocol::ReviewDiffSelection::Workspace {
+                    scope: ProjectDiffScope::Unstaged,
+                },
+                status: protocol::ReviewStatus::Draft,
+                diffs: Vec::new(),
+                comments: Vec::new(),
+                suggestions: Vec::new(),
+                ai_reviewer: protocol::ReviewAiReviewerState {
+                    status: protocol::ReviewAiReviewerStatus::Idle,
+                    agent_id: None,
+                    error: None,
+                },
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            };
+            let mk_summary = |id: &ReviewId| ReviewSummary {
+                id: id.clone(),
+                scope: protocol::ReviewSummaryScope::Workspace,
+                status: protocol::ReviewStatus::Draft,
+                origin_session_id: SessionId(format!("session-{}", id.0)),
+                origin_agent_id: AgentId(format!("agent-{}", id.0)),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                user_comment_count: 1,
+                pending_suggestion_count: 0,
+                file_comment_counts: Vec::new(),
+            };
+            let mk_diff_key = |host: &str, project_id: &ProjectId, name: &str| {
+                DiffKey::new(
+                    host,
+                    project_id.clone(),
+                    ProjectRootPath(format!("/repo/{name}")),
+                    ProjectDiffScope::Unstaged,
+                    "",
+                )
+            };
+            let mk_diff_state = |name: &str| DiffViewState {
+                root: ProjectRootPath(format!("/repo/{name}")),
+                scope: ProjectDiffScope::Unstaged,
+                path: None,
+                context_mode: DiffContextMode::Hunks,
+                pending: false,
+                files: Vec::new(),
+            };
+
+            state.projects.update(|projects| {
+                projects.push(mk_project(host_a, &project_a));
+                projects.push(mk_project(host_b, &project_b));
+            });
+            state.file_tree.update(|map| {
+                map.insert(
+                    project_a.clone(),
+                    vec![ProjectRootListing {
+                        root: ProjectRootPath("/repo/a".to_owned()),
+                        entries: Vec::new(),
+                    }],
+                );
+                map.insert(
+                    project_b.clone(),
+                    vec![ProjectRootListing {
+                        root: ProjectRootPath("/repo/b".to_owned()),
+                        entries: Vec::new(),
+                    }],
+                );
+            });
+            state.git_status.update(|map| {
+                map.insert(
+                    project_a.clone(),
+                    vec![ProjectRootGitStatus {
+                        root: ProjectRootPath("/repo/a".to_owned()),
+                        branch: None,
+                        ahead: 0,
+                        behind: 0,
+                        clean: true,
+                        files: Vec::new(),
+                    }],
+                );
+                map.insert(
+                    project_b.clone(),
+                    vec![ProjectRootGitStatus {
+                        root: ProjectRootPath("/repo/b".to_owned()),
+                        branch: None,
+                        ahead: 0,
+                        behind: 0,
+                        clean: true,
+                        files: Vec::new(),
+                    }],
+                );
+            });
+            state.reviews.update(|map| {
+                map.insert(review_a.clone(), mk_review(&review_a, &project_a));
+                map.insert(review_b.clone(), mk_review(&review_b, &project_b));
+            });
+            state.review_summaries.update(|map| {
+                map.insert(project_a.clone(), vec![mk_summary(&review_a)]);
+                map.insert(project_b.clone(), vec![mk_summary(&review_b)]);
+            });
+            state.review_action_pending.update(|map| {
+                map.insert(
+                    review_a.clone(),
+                    ReviewActionGate {
+                        submit: true,
+                        ..ReviewActionGate::default()
+                    },
+                );
+                map.insert(
+                    review_b.clone(),
+                    ReviewActionGate {
+                        submit: true,
+                        ..ReviewActionGate::default()
+                    },
+                );
+            });
+            state.review_action_target_pending.update(|set| {
+                set.insert((review_a.clone(), ReviewActionTarget::AddComment));
+                set.insert((review_b.clone(), ReviewActionTarget::AddComment));
+            });
+            state.review_create_pending.update(|map| {
+                map.insert((host_a.to_owned(), project_a.clone()), 1);
+                map.insert((host_b.to_owned(), project_b.clone()), 1);
+            });
+            state.code_intel.update(|map| {
+                map.insert(
+                    CodeIntelKey {
+                        host_id: host_a.to_owned(),
+                        project_id: project_a.clone(),
+                        path: path_a.clone(),
+                    },
+                    CodeIntelFileState::default(),
+                );
+                map.insert(
+                    CodeIntelKey {
+                        host_id: host_b.to_owned(),
+                        project_id: project_b.clone(),
+                        path: path_b.clone(),
+                    },
+                    CodeIntelFileState::default(),
+                );
+            });
+            let stray_diff_key_a = mk_diff_key(host_a, &project_a, "stray-a");
+            let stray_diff_state_a = mk_diff_state("stray-a");
+            let diff_key_b = mk_diff_key(host_b, &project_b, "b");
+            let diff_state_b = mk_diff_state("b");
+            state.diff_contents.update(|map| {
+                map.insert(mk_diff_key(host_a, &project_a, "a"), mk_diff_state("a"));
+                map.insert(diff_key_b.clone(), diff_state_b.clone());
+            });
+            state
+                .code_intel_navigate_ctx
+                .set(Some(CodeIntelNavigateContext {
+                    navigate_id: 1,
+                    host_id: host_a.to_owned(),
+                    project_id: project_a.clone(),
+                    path: path_a.clone(),
+                    version: ProjectFileVersion(1),
+                }));
+            state.project_view_memory.update(|map| {
+                map.insert(active_a.clone(), ProjectViewMemory::default());
+                map.insert(
+                    active_b.clone(),
+                    ProjectViewMemory {
+                        diff_contents: HashMap::from([
+                            (stray_diff_key_a.clone(), stray_diff_state_a.clone()),
+                            (diff_key_b.clone(), diff_state_b.clone()),
+                        ]),
+                        ..ProjectViewMemory::default()
+                    },
+                );
+            });
+            state.agents_panel_filters.update(|map| {
+                map.insert(Some(active_a.clone()), AgentsPanelFilters::default());
+                map.insert(Some(active_b.clone()), AgentsPanelFilters::default());
+                map.insert(None, AgentsPanelFilters::default());
+            });
+            state.sessions_panel_filters.update(|map| {
+                map.insert(Some(active_a.clone()), SessionsPanelFilters::default());
+                map.insert(Some(active_b.clone()), SessionsPanelFilters::default());
+                map.insert(None, SessionsPanelFilters::default());
+            });
+            state.agent_monitor_order.set(vec![
+                AgentMonitorKey::new(host_a, AgentId("agent-a".to_owned())),
+                AgentMonitorKey::new(host_b, AgentId("agent-b".to_owned())),
+            ]);
+            state.switch_active_project(Some(active_a.clone()));
+
+            state.clear_host_runtime(host_a);
+
+            assert_eq!(state.active_project.get_untracked(), None);
+            assert!(
+                !state.projects.with_untracked(|projects| {
+                    projects
+                        .iter()
+                        .any(|project| project.host_id == host_a || project.project.id == project_a)
+                }),
+                "host_a project metadata must be removed"
+            );
+            assert!(
+                state.projects.with_untracked(|projects| {
+                    projects
+                        .iter()
+                        .any(|project| project.host_id == host_b && project.project.id == project_b)
+                }),
+                "host_b project metadata must survive"
+            );
+            assert!(
+                !state
+                    .file_tree
+                    .with_untracked(|m| m.contains_key(&project_a))
+            );
+            assert!(
+                state
+                    .file_tree
+                    .with_untracked(|m| m.contains_key(&project_b))
+            );
+            assert!(
+                !state
+                    .git_status
+                    .with_untracked(|m| m.contains_key(&project_a))
+            );
+            assert!(
+                state
+                    .git_status
+                    .with_untracked(|m| m.contains_key(&project_b))
+            );
+            assert!(!state.reviews.with_untracked(|m| m.contains_key(&review_a)));
+            assert!(state.reviews.with_untracked(|m| m.contains_key(&review_b)));
+            assert!(
+                !state
+                    .review_summaries
+                    .with_untracked(|m| m.contains_key(&project_a))
+            );
+            assert!(
+                state
+                    .review_summaries
+                    .with_untracked(|m| m.contains_key(&project_b))
+            );
+            assert!(
+                !state
+                    .review_action_pending
+                    .with_untracked(|m| m.contains_key(&review_a))
+            );
+            assert!(
+                state
+                    .review_action_pending
+                    .with_untracked(|m| m.contains_key(&review_b))
+            );
+            assert!(
+                !state
+                    .review_action_target_pending
+                    .with_untracked(|set| set.iter().any(|(review_id, _)| review_id == &review_a))
+            );
+            assert!(
+                state
+                    .review_action_target_pending
+                    .with_untracked(|set| set.iter().any(|(review_id, _)| review_id == &review_b))
+            );
+            assert!(
+                !state
+                    .review_create_pending
+                    .with_untracked(|m| m.contains_key(&(host_a.to_owned(), project_a.clone())))
+            );
+            assert!(
+                state
+                    .review_create_pending
+                    .with_untracked(|m| m.contains_key(&(host_b.to_owned(), project_b.clone())))
+            );
+            assert!(
+                !state
+                    .code_intel
+                    .with_untracked(|m| m.keys().any(|key| key.host_id == host_a))
+            );
+            assert!(
+                state
+                    .code_intel
+                    .with_untracked(|m| m.keys().any(|key| key.host_id == host_b))
+            );
+            assert!(
+                !state
+                    .diff_contents
+                    .with_untracked(|m| m.keys().any(|key| key.host_id == host_a))
+            );
+            assert_eq!(state.code_intel_navigate_ctx.get_untracked(), None);
+            assert!(
+                !state
+                    .project_view_memory
+                    .with_untracked(|m| m.keys().any(|key| key.host_id == host_a))
+            );
+            assert!(
+                state
+                    .project_view_memory
+                    .with_untracked(|m| m.keys().any(|key| key.host_id == host_b))
+            );
+            assert!(state.project_view_memory.with_untracked(|m| {
+                m.get(&active_b).is_some_and(|memory| {
+                    memory.diff_contents.keys().all(|key| key.host_id != host_a)
+                        && memory.diff_contents.keys().any(|key| key.host_id == host_b)
+                })
+            }));
+            assert!(!state.agents_panel_filters.with_untracked(|m| {
+                m.keys()
+                    .any(|key| key.as_ref().is_some_and(|key| key.host_id == host_a))
+            }));
+            assert!(state.agents_panel_filters.with_untracked(|m| {
+                m.contains_key(&Some(active_b.clone())) && m.contains_key(&None)
+            }));
+            assert!(!state.sessions_panel_filters.with_untracked(|m| {
+                m.keys()
+                    .any(|key| key.as_ref().is_some_and(|key| key.host_id == host_a))
+            }));
+            assert!(state.sessions_panel_filters.with_untracked(|m| {
+                m.contains_key(&Some(active_b.clone())) && m.contains_key(&None)
+            }));
+            assert_eq!(
+                state
+                    .agent_monitor_order
+                    .with_untracked(|order| order.clone()),
+                vec![AgentMonitorKey::new(host_b, AgentId("agent-b".to_owned()))]
+            );
+        });
+    }
+
+    #[test]
+    fn clear_host_runtime_closes_host_tabs_even_without_agent_record() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_a = "host-a";
+            let host_b = "host-b";
+            let agent_a = ActiveAgentRef {
+                host_id: host_a.to_owned(),
+                agent_id: AgentId("missing-agent-a".to_owned()),
+            };
+            let agent_b = ActiveAgentRef {
+                host_id: host_b.to_owned(),
+                agent_id: AgentId("agent-b".to_owned()),
+            };
+            let project_a = ProjectId("project-a".to_owned());
+            let project_b = ProjectId("project-b".to_owned());
+            let root_a = ProjectRootPath("/repo/a".to_owned());
+            let root_b = ProjectRootPath("/repo/b".to_owned());
+
+            let mut host_a_tab_ids = Vec::new();
+            let mut host_b_tab_id = None;
+            state.center_zone.update(|cz| {
+                host_a_tab_ids.push(cz.open(
+                    TabContent::chat_with_agent(agent_a.clone()),
+                    "stale agent".to_owned(),
+                    true,
+                ));
+                host_a_tab_ids.push(cz.open(
+                    TabContent::team_member_draft(
+                        host_a.to_owned(),
+                        TeamMemberId("member-a".to_owned()),
+                    ),
+                    "team draft".to_owned(),
+                    true,
+                ));
+                host_a_tab_ids.push(cz.open(
+                    TabContent::Diff {
+                        host_id: host_a.to_owned(),
+                        project_id: project_a.clone(),
+                        root: root_a.clone(),
+                        scope: ProjectDiffScope::Unstaged,
+                        path: "src/lib.rs".to_owned(),
+                    },
+                    "diff".to_owned(),
+                    true,
+                ));
+                host_a_tab_ids.push(cz.open(
+                    TabContent::Comments {
+                        host_id: host_a.to_owned(),
+                        project_id: project_a.clone(),
+                    },
+                    "comments".to_owned(),
+                    true,
+                ));
+                host_a_tab_ids.push(cz.open(
+                    TabContent::Workflow {
+                        agent_ref: agent_a.clone(),
+                        tool_call_id: ToolCallId("tool-a".to_owned()),
+                    },
+                    "workflow".to_owned(),
+                    true,
+                ));
+                host_b_tab_id = Some(cz.open(
+                    TabContent::Diff {
+                        host_id: host_b.to_owned(),
+                        project_id: project_b.clone(),
+                        root: root_b,
+                        scope: ProjectDiffScope::Unstaged,
+                        path: "src/main.rs".to_owned(),
+                    },
+                    "host b diff".to_owned(),
+                    true,
+                ));
+                cz.open(
+                    TabContent::chat_with_agent(agent_b),
+                    "host b agent".to_owned(),
+                    true,
+                );
+            });
+            state.tab_lru.set(host_a_tab_ids.clone());
+
+            state.clear_host_runtime(host_a);
+
+            assert!(state.center_zone.with_untracked(|cz| {
+                cz.tabs.iter().all(|tab| match &tab.content {
+                    TabContent::Chat {
+                        agent_ref,
+                        pending_team_member,
+                    } => {
+                        agent_ref
+                            .as_ref()
+                            .is_none_or(|agent_ref| agent_ref.host_id != host_a)
+                            && pending_team_member
+                                .as_ref()
+                                .is_none_or(|pending| pending.host_id != host_a)
+                    }
+                    TabContent::Diff { host_id, .. } | TabContent::Comments { host_id, .. } => {
+                        host_id != host_a
+                    }
+                    TabContent::Workflow { agent_ref, .. } => agent_ref.host_id != host_a,
+                    TabContent::Home | TabContent::AgentMonitor | TabContent::File { .. } => true,
+                })
+            }));
+            assert!(
+                state.center_zone.with_untracked(|cz| {
+                    cz.tabs.iter().any(|tab| Some(tab.id) == host_b_tab_id)
+                })
+            );
+            assert!(state.tab_lru.with_untracked(|lru| {
+                host_a_tab_ids.iter().all(|tab_id| !lru.contains(tab_id))
+            }));
         });
     }
 
