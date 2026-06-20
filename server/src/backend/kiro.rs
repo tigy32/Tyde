@@ -3991,6 +3991,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                     minor: 0,
                     patch: 0,
                 },
+                release_version: None,
             },
         )
         .expect("serialize Welcome");

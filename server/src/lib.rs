@@ -54,6 +54,35 @@ impl ServerConfig {
     }
 }
 
+/// Process-global, exact host build version used to populate `release_version`
+/// in the mobile Welcome/Reject/QR payloads (the web/PWA bundle key).
+///
+/// The `server` crate is unversioned (0.0.0); the real release version lives in
+/// the host *binary* (`tyde-server`, `tauri-shell`), so each binary sets this
+/// once at startup from its own `env!("CARGO_PKG_VERSION")` via
+/// [`set_host_release_version`]. When unset (e.g. in unit tests), the payload
+/// field is simply `None`, which is backward-compatible.
+static HOST_RELEASE_VERSION: std::sync::OnceLock<protocol::TydeReleaseVersion> =
+    std::sync::OnceLock::new();
+
+/// Record the host's release version. Idempotent; a malformed value is ignored
+/// (logged) rather than panicking the host. Call once at binary startup.
+pub fn set_host_release_version(raw: &str) {
+    match protocol::TydeReleaseVersion::parse(raw) {
+        Ok(version) => {
+            let _ = HOST_RELEASE_VERSION.set(version);
+        }
+        Err(error) => {
+            tracing::warn!(raw, %error, "ignoring invalid host release version");
+        }
+    }
+}
+
+/// The host's release version, if a binary recorded one.
+pub fn host_release_version() -> Option<protocol::TydeReleaseVersion> {
+    HOST_RELEASE_VERSION.get().cloned()
+}
+
 pub struct Connection {
     pub reader: Box<dyn AsyncBufRead + Unpin + Send>,
     pub writer: Box<dyn AsyncWrite + Unpin + Send>,

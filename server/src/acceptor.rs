@@ -69,6 +69,7 @@ where
             message: message.clone(),
             server_protocol_version: config.protocol_version,
             server_tyde_version: config.tyde_version,
+            release_version: crate::host_release_version(),
         };
         send_reject(&mut write_half, first.stream.clone(), reject).await?;
         return Err(HandshakeError::InvalidHandshake(message));
@@ -80,6 +81,7 @@ where
             message: format!("first frame must be hello, received {}", first.kind),
             server_protocol_version: config.protocol_version,
             server_tyde_version: config.tyde_version,
+            release_version: crate::host_release_version(),
         };
         send_reject(&mut write_half, first.stream.clone(), reject).await?;
         return Err(HandshakeError::UnexpectedKind {
@@ -98,6 +100,7 @@ where
             message: message.clone(),
             server_protocol_version: config.protocol_version,
             server_tyde_version: config.tyde_version,
+            release_version: crate::host_release_version(),
         };
         send_reject(&mut write_half, first.stream.clone(), reject).await?;
         return Err(HandshakeError::InvalidHandshake(message));
@@ -111,6 +114,7 @@ where
                 message: format!("invalid hello payload: {err}"),
                 server_protocol_version: config.protocol_version,
                 server_tyde_version: config.tyde_version,
+                release_version: crate::host_release_version(),
             };
             send_reject(&mut write_half, first.stream.clone(), reject).await?;
             return Err(HandshakeError::InvalidPayload(err));
@@ -126,6 +130,7 @@ where
             ),
             server_protocol_version: config.protocol_version,
             server_tyde_version: config.tyde_version,
+            release_version: crate::host_release_version(),
         };
         send_reject(&mut write_half, first.stream.clone(), reject).await?;
         return Err(HandshakeError::IncompatibleProtocol {
@@ -137,6 +142,7 @@ where
     let welcome = WelcomePayload {
         protocol_version: config.protocol_version,
         tyde_version: config.tyde_version,
+        release_version: crate::host_release_version(),
     };
     let envelope = Envelope::from_payload(first.stream.clone(), FrameKind::Welcome, 0, &welcome)
         .map_err(HandshakeError::InvalidPayload)?;

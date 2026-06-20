@@ -111,6 +111,11 @@ pub struct MobilePairingQrPayload {
     pub room: RoomId,
     pub psk: PreSharedKey,
     pub host_label: String,
+    /// Exact, prerelease-capable host build version used by the web/PWA loader
+    /// to select the matching versioned bundle. `Option` for backward
+    /// compatibility with QR codes from older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_version: Option<protocol::TydeReleaseVersion>,
 }
 
 impl MobilePairingQrPayload {
@@ -130,6 +135,9 @@ impl MobilePairingQrPayload {
             room,
             psk,
             host_label,
+            // Populated by the host from its real build version (see
+            // `server::host_release_version`); `new` leaves it unset.
+            release_version: None,
         }
     }
 
@@ -497,11 +505,11 @@ mod tests {
     use protocol::PROTOCOL_VERSION;
 
     #[test]
-    fn default_broker_endpoint_is_emqx_mqtts() {
+    fn default_broker_endpoint_is_emqx_wss() {
         let endpoint = default_mobile_broker_endpoint();
         assert_eq!(endpoint.url.as_str(), DEFAULT_MOBILE_MQTT_BROKER_URL);
-        assert_eq!(endpoint.url.as_str(), "mqtts://broker.emqx.io:8883");
-        assert_ne!(endpoint.url.as_str(), "wss://broker.tyde.dev/relay");
+        assert_eq!(endpoint.url.as_str(), "wss://broker.emqx.io:8084/mqtt");
+        assert_ne!(endpoint.url.as_str(), "mqtts://broker.emqx.io:8883");
         assert_eq!(endpoint.auth, BrokerAuth::Anonymous);
         validate_broker_url(&endpoint.url).expect("default broker URL is valid");
     }

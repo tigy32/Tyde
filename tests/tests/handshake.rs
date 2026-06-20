@@ -61,6 +61,7 @@ async fn handshake_rejects_wrong_first_frame_kind() {
     let payload = WelcomePayload {
         protocol_version: PROTOCOL_VERSION,
         tyde_version: TYDE_VERSION,
+        release_version: None,
     };
     let frame = Envelope::from_payload(stream, FrameKind::Welcome, 0, &payload)
         .expect("failed to serialize welcome payload");

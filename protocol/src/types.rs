@@ -7,13 +7,21 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Prerelease-capable, traversal-safe release identifier used as the versioned
+/// bundle key for the web/PWA client. Single source of truth lives in
+/// `host-config`; re-exported here so wire payloads and downstream crates use
+/// `protocol::TydeReleaseVersion`.
+pub use host_config::TydeReleaseVersion;
+
 pub const PROTOCOL_VERSION: u32 = 13;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
     patch: 14,
 };
-pub const DEFAULT_MOBILE_MQTT_BROKER_URL: &str = "mqtts://broker.emqx.io:8883";
+/// Shared MQTT-over-WebSocket-Secure endpoint reachable from both the native
+/// host and the browser/PWA client (no mixed content; broker terminates TLS).
+pub const DEFAULT_MOBILE_MQTT_BROKER_URL: &str = "wss://broker.emqx.io:8084/mqtt";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Version {
@@ -788,6 +796,12 @@ pub struct HelloPayload {
 pub struct WelcomePayload {
     pub protocol_version: u32,
     pub tyde_version: Version,
+    /// Exact, prerelease-capable host build version used by the web client to
+    /// select the matching versioned bundle. `Option` for backward
+    /// compatibility; `protocol_version`/`tyde_version` are unchanged so the
+    /// exact-match handshake gate is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_version: Option<TydeReleaseVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1311,6 +1325,10 @@ pub struct RejectPayload {
     pub message: String,
     pub server_protocol_version: u32,
     pub server_tyde_version: Version,
+    /// Exact, prerelease-capable host build version (see [`WelcomePayload`]),
+    /// so a rejected web client can self-heal by booting the host's bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_version: Option<TydeReleaseVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

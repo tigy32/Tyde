@@ -720,13 +720,16 @@ impl MobileAccessActor {
             created_at_ms,
             key_fingerprint,
         };
-        let qr_payload = MobilePairingQrPayload::new(
+        let mut qr_payload = MobilePairingQrPayload::new(
             PROTOCOL_VERSION,
             broker,
             credential.room,
             credential.psk.clone(),
             "Tyde Host".to_owned(),
         );
+        // Advertise the host's real build version so the web/PWA loader can pick
+        // the matching versioned bundle.
+        qr_payload.release_version = crate::host_release_version();
         let qr_uri = match qr_payload.to_uri() {
             Ok(uri) => MobilePairingQrUri(uri),
             Err(err) => {
