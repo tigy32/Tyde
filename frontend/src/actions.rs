@@ -136,7 +136,8 @@ pub fn spawn_new_chat(
     state: &AppState,
     initial_message: String,
     initial_images: Option<Vec<ImageData>>,
-) {
+    on_send_error: impl FnOnce(String) + 'static,
+) -> bool {
     let initial_message = initial_message.trim().to_owned();
     if initial_message.is_empty()
         && initial_images
@@ -144,7 +145,7 @@ pub fn spawn_new_chat(
             .is_none_or(|images| images.is_empty())
     {
         log::error!("spawn_new_chat: initial input must include text or images");
-        return;
+        return false;
     }
 
     let active_project = state.active_project_ref_untracked();
@@ -152,11 +153,11 @@ pub fn spawn_new_chat(
         Some(active_project) => {
             let Some(project) = state.active_project_info_untracked() else {
                 log::error!("spawn_new_chat: active project not found");
-                return;
+                return false;
             };
             let Some(host_stream) = state.host_stream_untracked(&active_project.host_id) else {
                 log::error!("spawn_new_chat: host stream missing for active project host");
-                return;
+                return false;
             };
             (
                 active_project.host_id,
@@ -174,7 +175,7 @@ pub fn spawn_new_chat(
             Some((host_id, host_stream)) => (host_id, host_stream, None, Vec::new()),
             None => {
                 log::error!("spawn_new_chat: no selected connected host");
-                return;
+                return false;
             }
         },
     };
@@ -183,7 +184,7 @@ pub fn spawn_new_chat(
         Some(kind) => kind,
         None => {
             log::error!("spawn_new_chat: no backend available — enable one in settings");
-            return;
+            return false;
         }
     };
 
@@ -221,8 +222,10 @@ pub fn spawn_new_chat(
         if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SpawnAgent, &payload).await
         {
             log::error!("failed to send SpawnAgent: {error}");
+            on_send_error(error);
         }
     });
+    true
 }
 
 /// Build the spawn payload for a BTW / side-question fork. Kept pure (no

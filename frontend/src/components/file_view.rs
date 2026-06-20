@@ -745,7 +745,8 @@ mod wasm_tests {
         container
             .set_attribute(
                 "style",
-                "position: absolute; top: 0; left: 0; width: 800px; height: 600px; \
+                "position: fixed; top: 0; left: 0; width: 800px; height: 600px; \
+                 z-index: 2147483647; background: white; \
                  display: flex; flex-direction: column;",
             )
             .unwrap();

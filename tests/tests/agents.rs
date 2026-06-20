@@ -6,7 +6,7 @@ use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentControlStatus, AgentErrorCode,
     AgentErrorPayload, AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent,
     ClientErrorCode, ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope,
-    FrameKind, HostBootstrapPayload, ListSessionsPayload, NewAgentPayload, Project,
+    FrameKind, HostBootstrapPayload, ListSessionsPayload, MessageSender, NewAgentPayload, Project,
     ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectId,
     ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SessionListPayload,
     SpawnAgentParams, SpawnAgentPayload, StreamPath, write_envelope,
@@ -449,6 +449,7 @@ fn chat_event_contains(event: &Envelope, expected_text: &str) -> bool {
 
 const MOCK_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_native_child__";
 const MOCK_NATIVE_CHILD_AND_DROP_SENTINEL: &str = "__mock_spawn_native_child_and_drop__";
+const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
 
 async fn expect_turn_on_stream(
     client: &mut client::Connection,
@@ -481,6 +482,34 @@ async fn expect_turn_on_stream(
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
     assert!(matches!(event, ChatEvent::StreamEnd(..)));
 
+    let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(false)").await;
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+}
+
+async fn expect_error_message_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_text: &str,
+) {
+    loop {
+        let env = expect_chat_event_on_stream(client, stream, "MessageAdded(Error)").await;
+        let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+        if let ChatEvent::MessageAdded(message) = event
+            && matches!(message.sender, MessageSender::Error)
+        {
+            assert!(
+                message.content.contains(expected_text),
+                "unexpected error message on {}: {}",
+                stream,
+                message.content
+            );
+            return;
+        }
+    }
+}
+
+async fn expect_typing_false_on_stream(client: &mut client::Connection, stream: &StreamPath) {
     let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(false)").await;
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
     assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
@@ -900,6 +929,74 @@ async fn agent_lifecycle() {
 
     // 6. Receive follow-up turn: StreamStart → StreamDelta → StreamEnd
     expect_turn(&mut fixture.client, "mock backend response to: follow up").await;
+}
+
+#[tokio::test]
+async fn agent_recovers_after_backend_error_without_idle() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("error-recovery-agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn_agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+    let agent_stream = new_agent.instance_stream.clone();
+
+    let env = expect_next_event(&mut fixture.client, "AgentStart").await;
+    assert_eq!(env.kind, FrameKind::AgentStart);
+    assert_eq!(env.stream, agent_stream);
+
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: hello",
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message(&agent_stream, MOCK_ERROR_WITHOUT_IDLE_SENTINEL.to_owned())
+        .await
+        .expect("send error sentinel failed");
+
+    expect_error_message_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend emitted error without idle",
+    )
+    .await;
+    expect_typing_false_on_stream(&mut fixture.client, &agent_stream).await;
+
+    fixture
+        .client
+        .send_message(&agent_stream, "after backend error".to_owned())
+        .await
+        .expect("send follow-up failed");
+
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: after backend error",
+    )
+    .await;
 }
 
 #[tokio::test]

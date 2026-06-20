@@ -139,6 +139,24 @@ fn active_instance_stream(state: &AppState) -> Option<StreamPath> {
         .map(|a| a.instance_stream.clone())
 }
 
+fn active_instance_stream_tracked(state: &AppState) -> Option<StreamPath> {
+    let active_agent = state.active_agent.get()?;
+    state.agents.with(|agents| {
+        agents
+            .iter()
+            .find(|a| a.host_id == active_agent.host_id && a.agent_id == active_agent.agent_id)
+            .map(|a| a.instance_stream.clone())
+    })
+}
+
+fn active_chat_target_ready_tracked(state: &AppState) -> bool {
+    if state.active_agent.get().is_some() {
+        active_instance_stream_tracked(state).is_some()
+    } else {
+        true
+    }
+}
+
 fn selected_backend_kind(state: &AppState) -> Option<BackendKind> {
     if let Some(active_agent) = state.active_agent.get_untracked() {
         let agents = state.agents.get_untracked();
@@ -328,9 +346,21 @@ fn draft_backend_notice(state: &AppState) -> Option<DraftBackendNotice> {
     not_installed.then_some(DraftBackendNotice::NotInstalled(backend))
 }
 
+fn restore_submitted_input(
+    state: &AppState,
+    pending_images: RwSignal<Vec<PendingImage>>,
+    draft: String,
+    images: Vec<PendingImage>,
+) {
+    if state.chat_input.get_untracked().is_empty() && pending_images.get_untracked().is_empty() {
+        state.chat_input.set(draft);
+        pending_images.set(images);
+    }
+}
+
 fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage>>) {
-    let text = state.chat_input.get_untracked();
-    let text = text.trim().to_owned();
+    let draft = state.chat_input.get_untracked();
+    let text = draft.trim().to_owned();
     let images = pending_images.get_untracked();
     let payload_images = pending_images_to_payload(&images);
     if text.is_empty() && payload_images.is_none() {
@@ -343,9 +373,6 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
     if draft_backend_notice(state).is_some() {
         return;
     }
-
-    state.chat_input.set(String::new());
-    pending_images.set(Vec::new());
 
     if state.active_agent.get_untracked().is_none() {
         // Active tab has no live agent. If it's a draft team-member tab,
@@ -363,6 +390,11 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
                 );
                 return;
             };
+            state.chat_input.set(String::new());
+            pending_images.set(Vec::new());
+            let restore_state = state.clone();
+            let restore_draft = draft.clone();
+            let restore_images = images.clone();
             spawn_local(async move {
                 if let Err(error) = crate::send::team_member_activate(
                     &pending.host_id,
@@ -374,11 +406,30 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
                 .await
                 {
                     log::error!("team_member_activate (with prompt) failed: {error}");
+                    restore_submitted_input(
+                        &restore_state,
+                        pending_images,
+                        restore_draft,
+                        restore_images,
+                    );
                 }
             });
             return;
         }
-        spawn_new_chat(state, text, payload_images);
+        let restore_state = state.clone();
+        let restore_draft = draft.clone();
+        let restore_images = images.clone();
+        if spawn_new_chat(state, text, payload_images, move |_| {
+            restore_submitted_input(
+                &restore_state,
+                pending_images,
+                restore_draft,
+                restore_images,
+            );
+        }) {
+            state.chat_input.set(String::new());
+            pending_images.set(Vec::new());
+        }
         return;
     }
 
@@ -389,9 +440,17 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
 
     let instance_stream = match active_instance_stream(state) {
         Some(stream) => stream,
-        None => return,
+        None => {
+            log::error!("submit_chat_input: active agent stream missing");
+            return;
+        }
     };
 
+    state.chat_input.set(String::new());
+    pending_images.set(Vec::new());
+    let restore_state = state.clone();
+    let restore_draft = draft.clone();
+    let restore_images = images.clone();
     spawn_local(async move {
         let payload = SendMessagePayload {
             message: text,
@@ -403,6 +462,12 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
             send_frame(&host_id, instance_stream, FrameKind::SendMessage, &payload).await
         {
             log::error!("failed to send message: {e}");
+            restore_submitted_input(
+                &restore_state,
+                pending_images,
+                restore_draft,
+                restore_images,
+            );
         }
     });
 }
@@ -452,8 +517,8 @@ fn interrupt_active_turn(state: &AppState) {
 }
 
 fn steer_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage>>) {
-    let text = state.chat_input.get_untracked();
-    let text = text.trim().to_owned();
+    let draft = state.chat_input.get_untracked();
+    let text = draft.trim().to_owned();
     let images = pending_images.get_untracked();
     let payload_images = pending_images_to_payload(&images);
     if text.is_empty() && payload_images.is_none() {
@@ -468,11 +533,17 @@ fn steer_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage>
 
     let instance_stream = match active_instance_stream(state) {
         Some(stream) => stream,
-        None => return,
+        None => {
+            log::error!("steer_chat_input: active agent stream missing");
+            return;
+        }
     };
 
     state.chat_input.set(String::new());
     pending_images.set(Vec::new());
+    let restore_state = state.clone();
+    let restore_draft = draft.clone();
+    let restore_images = images.clone();
 
     spawn_local(async move {
         if let Err(e) = send_frame(
@@ -484,6 +555,12 @@ fn steer_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage>
         .await
         {
             log::error!("failed to interrupt conversation for steer: {e}");
+            restore_submitted_input(
+                &restore_state,
+                pending_images,
+                restore_draft,
+                restore_images,
+            );
             return;
         }
 
@@ -497,6 +574,12 @@ fn steer_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage>
             send_frame(&host_id, instance_stream, FrameKind::SendMessage, &payload).await
         {
             log::error!("failed to send steer message: {e}");
+            restore_submitted_input(
+                &restore_state,
+                pending_images,
+                restore_draft,
+                restore_images,
+            );
         }
     });
 }
@@ -656,6 +739,7 @@ pub fn ChatInput() -> impl IntoView {
         let has_text = ui_state.chat_input.with(|s| !s.trim().is_empty());
         let has_images = ui_images.with(|images| !images.is_empty());
         let has_input = has_text || has_images;
+        let target_ready = active_chat_target_ready_tracked(&ui_state);
         let is_thinking = active_agent_is_initializing_tracked(&ui_state)
             || ui_state
                 .active_agent
@@ -667,11 +751,15 @@ pub fn ChatInput() -> impl IntoView {
                 })
                 .unwrap_or(false);
 
-        let send_enabled = is_connected && has_input;
-        let interrupt_enabled = is_connected && is_thinking;
+        let send_enabled = is_connected && has_input && target_ready;
+        let interrupt_enabled = is_connected && is_thinking && target_ready;
         // (send_enabled, interrupt_enabled, is_steer). `is_steer` (running with
         // input) gates the secondary Steer and Cancel items in the dropdown.
-        (send_enabled, interrupt_enabled, is_thinking && has_input)
+        (
+            send_enabled,
+            interrupt_enabled,
+            is_thinking && has_input && target_ready,
+        )
     });
 
     let readonly_state = state.clone();
@@ -721,10 +809,11 @@ pub fn ChatInput() -> impl IntoView {
         matches!(
             submit_on_enter_state.chat_context_connection_status(),
             ConnectionStatus::Connected
-        ) && (submit_on_enter_state
-            .chat_input
-            .with(|s| !s.trim().is_empty())
-            || submit_on_enter_images.with(|images| !images.is_empty()))
+        ) && active_chat_target_ready_tracked(&submit_on_enter_state)
+            && (submit_on_enter_state
+                .chat_input
+                .with(|s| !s.trim().is_empty())
+                || submit_on_enter_images.with(|images| !images.is_empty()))
     };
 
     let on_keydown_state = state.clone();
@@ -1423,6 +1512,35 @@ mod wasm_tests {
         assert!(
             c.has_attribute("disabled"),
             "caret must be disabled with no menu items (no session)"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn stale_active_agent_disables_send_and_keeps_draft() {
+        let state = AppState::new();
+        configure(&state, false, false, "hello");
+        state.agents.set(Vec::new());
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let p = primary(&container);
+        assert!(
+            p.has_attribute("disabled"),
+            "Send must be disabled when the active chat tab has no live agent stream"
+        );
+
+        dispatch_keydown(&textarea(&container), "Enter", true, false);
+        next_tick().await;
+
+        assert_eq!(
+            state.chat_input.get_untracked(),
+            "hello",
+            "keyboard submit must not clear a draft that has no live agent stream"
         );
     }
 

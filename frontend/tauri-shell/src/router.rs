@@ -402,8 +402,21 @@ where
             command = rx.recv() => {
                 match command {
                     Some(ConnectionCommand::SendLine { line, reply }) => {
-                        let result = write_line(&mut writer, line).await;
-                        let _ = reply.send(result);
+                        match write_line(&mut writer, line).await {
+                            Ok(()) => {
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    host_id,
+                                    connection_id,
+                                    %error,
+                                    "closing host connection after write failed"
+                                );
+                                let _ = reply.send(Err(error));
+                                break;
+                            }
+                        }
                     }
                     Some(ConnectionCommand::Disconnect) | None => break,
                 }

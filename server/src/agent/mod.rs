@@ -1123,6 +1123,7 @@ pub(crate) fn spawn_agent_actor(
                         return;
                     };
                     let mut real_idle_transition = false;
+                    let mut synthesize_idle_after_error = false;
                     match &event {
                         ChatEvent::MessageAdded(message) => {
                             if let Some(compaction) = active_compaction.as_mut() {
@@ -1141,9 +1142,24 @@ pub(crate) fn spawn_agent_actor(
                                 }
                             }
                             if matches!(message.sender, MessageSender::Error) {
+                                let error_ends_turn =
+                                    in_turn && pending_tool_response_ids.is_empty();
+                                if error_ends_turn {
+                                    tracing::warn!(
+                                        agent_id = %current_start.agent_id,
+                                        "backend error event ended active turn without idle marker"
+                                    );
+                                    real_idle_transition = true;
+                                    synthesize_idle_after_error = true;
+                                    in_turn = false;
+                                    idle_transition_armed = false;
+                                }
                                 let msg = message.content.clone();
                                 status_handle.update(|s| {
                                     s.turn_completed = true;
+                                    if error_ends_turn {
+                                        s.is_thinking = false;
+                                    }
                                     s.last_error = Some(msg);
                                     s.activity_counter = s.activity_counter.saturating_add(1);
                                 }).await;
@@ -1198,6 +1214,11 @@ pub(crate) fn spawn_agent_actor(
                                 real_idle_transition = true;
                                 in_turn = false;
                                 idle_transition_armed = false;
+                            } else if in_turn {
+                                tracing::warn!(
+                                    agent_id = %current_start.agent_id,
+                                    "ignoring backend idle marker before idle was armed"
+                                );
                             }
                             status_handle.update(|s| {
                                 s.is_thinking = typing;
@@ -1260,6 +1281,16 @@ pub(crate) fn spawn_agent_actor(
                         &event,
                     )
                     .await;
+                    if synthesize_idle_after_error {
+                        append_chat_event(
+                            &canonical_stream,
+                            &mut event_log,
+                            &mut subscribers,
+                            &mut replay_state,
+                            &ChatEvent::TypingStatusChanged(false),
+                        )
+                        .await;
+                    }
 
                     if real_idle_transition
                         && let Some(compaction) = active_compaction.take()

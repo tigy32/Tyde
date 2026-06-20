@@ -43,6 +43,7 @@ pub(crate) const MOCK_DUPLICATE_IDLE_SENTINEL: &str = "__mock_duplicate_idle__";
 /// then exit without completing the turn.  The events channel closes when the
 /// task exits, which drives the agent actor into `enter_terminal_failure`.
 pub(crate) const MOCK_DIE_AFTER_BUSY_SENTINEL: &str = "__mock_die_after_busy__";
+pub(crate) const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
 const MOCK_EXIT_PLAN_MODE_SENTINEL: &str = "__mock_exit_plan_mode__";
 const MOCK_HISTORY_SENTINEL: &str = "__mock_history__";
 const MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID: &str = "mock-exit-plan-tool";
@@ -388,6 +389,8 @@ fn start_mock_command_loop(
                     return;
                 }
                 pending_exit_plan_mode = Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
+            } else if initial_message.contains(MOCK_ERROR_WITHOUT_IDLE_SENTINEL) {
+                emit_mock_error(&events_tx, "mock backend emitted error without idle");
             } else {
                 if !emit_turn(
                     &events_tx,
@@ -441,6 +444,8 @@ fn start_mock_command_loop(
                             return;
                         }
                         pending_exit_plan_mode = Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
+                    } else if payload.message.contains(MOCK_ERROR_WITHOUT_IDLE_SENTINEL) {
+                        emit_mock_error(&events_tx, "mock backend emitted error without idle");
                     } else {
                         if !emit_turn(&events_tx, &session_id_for_task, &payload.message, false)
                             .await
