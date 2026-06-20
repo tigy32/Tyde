@@ -1,7 +1,7 @@
 {
   "name": "tyde",
   "private": true,
-  "version": "0.8.19-beta.1",
+  "version": "0.8.19-beta.2",
   "scripts": {
     "tauri": "cargo tauri",
     "mobile:dev": "cd mobile/src-tauri && tauri dev",

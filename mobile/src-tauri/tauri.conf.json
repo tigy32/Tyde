@@ -1,7 +1,7 @@
 {
   "productName": "Tyde Mobile",
   "mainBinaryName": "tyde-mobile",
-  "version": "0.8.19-beta.1",
+  "version": "0.8.19-beta.2",
   "identifier": "com.tyde.mobile",
   "build": {
     "beforeDevCommand": {

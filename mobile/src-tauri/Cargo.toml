@@ -1,6 +1,6 @@
 [package]
 name = "tyde-mobile-shell"
-version = "0.8.19-beta.1"
+version = "0.8.19-beta.2"
 edition.workspace = true
 default-run = "tyde-mobile"
 

@@ -2077,16 +2077,8 @@ impl AppState {
         self.git_status.update(|map| {
             map.retain(|project_id, _| !host_project_ids.contains(project_id));
         });
-        self.code_intel.update(|map| {
-            map.retain(|key, _| key.host_id != host_id);
-        });
         self.diff_contents.update(|map| {
             map.retain(|key, _| key.host_id != host_id);
-        });
-        self.code_intel_navigate_ctx.update(|ctx| {
-            if ctx.as_ref().is_some_and(|ctx| ctx.host_id == host_id) {
-                *ctx = None;
-            }
         });
         self.review_summaries.update(|map| {
             map.retain(|project_id, _| !host_project_ids.contains(project_id));
@@ -3310,8 +3302,6 @@ mod tests {
             let project_b = ProjectId("project-b".to_owned());
             let review_a = ReviewId("review-a".to_owned());
             let review_b = ReviewId("review-b".to_owned());
-            let path_a = test_path("a");
-            let path_b = test_path("b");
             let active_a = ActiveProjectRef {
                 host_id: host_a.to_owned(),
                 project_id: project_a.clone(),
@@ -3458,24 +3448,6 @@ mod tests {
                 map.insert((host_a.to_owned(), project_a.clone()), 1);
                 map.insert((host_b.to_owned(), project_b.clone()), 1);
             });
-            state.code_intel.update(|map| {
-                map.insert(
-                    CodeIntelKey {
-                        host_id: host_a.to_owned(),
-                        project_id: project_a.clone(),
-                        path: path_a.clone(),
-                    },
-                    CodeIntelFileState::default(),
-                );
-                map.insert(
-                    CodeIntelKey {
-                        host_id: host_b.to_owned(),
-                        project_id: project_b.clone(),
-                        path: path_b.clone(),
-                    },
-                    CodeIntelFileState::default(),
-                );
-            });
             let stray_diff_key_a = mk_diff_key(host_a, &project_a, "stray-a");
             let stray_diff_state_a = mk_diff_state("stray-a");
             let diff_key_b = mk_diff_key(host_b, &project_b, "b");
@@ -3484,15 +3456,6 @@ mod tests {
                 map.insert(mk_diff_key(host_a, &project_a, "a"), mk_diff_state("a"));
                 map.insert(diff_key_b.clone(), diff_state_b.clone());
             });
-            state
-                .code_intel_navigate_ctx
-                .set(Some(CodeIntelNavigateContext {
-                    navigate_id: 1,
-                    host_id: host_a.to_owned(),
-                    project_id: project_a.clone(),
-                    path: path_a.clone(),
-                    version: ProjectFileVersion(1),
-                }));
             state.project_view_memory.update(|map| {
                 map.insert(active_a.clone(), ProjectViewMemory::default());
                 map.insert(
@@ -3605,20 +3568,9 @@ mod tests {
             );
             assert!(
                 !state
-                    .code_intel
-                    .with_untracked(|m| m.keys().any(|key| key.host_id == host_a))
-            );
-            assert!(
-                state
-                    .code_intel
-                    .with_untracked(|m| m.keys().any(|key| key.host_id == host_b))
-            );
-            assert!(
-                !state
                     .diff_contents
                     .with_untracked(|m| m.keys().any(|key| key.host_id == host_a))
             );
-            assert_eq!(state.code_intel_navigate_ctx.get_untracked(), None);
             assert!(
                 !state
                     .project_view_memory
