@@ -1,19 +1,33 @@
 mod chunking;
-mod client;
 mod config;
 mod error;
 mod framing;
 mod link;
-mod link_native;
 mod protocol_driver;
 mod reconnect;
 mod rendezvous;
 mod session;
 mod stream;
+mod time;
 mod topic;
 mod types;
 
+// MQTT I/O backend + its connect entry point are target-specific. Native uses
+// rumqttc (`link_native` + `client`); wasm uses a `web-sys::WebSocket` backend
+// (`link_wasm` + `client_wasm`). Both expose the same `connect`/`connect_ephemeral`.
+#[cfg(not(target_arch = "wasm32"))]
+mod client;
+#[cfg(target_arch = "wasm32")]
+mod client_wasm;
+#[cfg(not(target_arch = "wasm32"))]
+mod link_native;
+#[cfg(target_arch = "wasm32")]
+mod link_wasm;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub use client::{connect, connect_ephemeral};
+#[cfg(target_arch = "wasm32")]
+pub use client_wasm::{connect, connect_ephemeral};
 pub use config::{MqttConnectConfig, ParticipantRole};
 pub use error::{
     CounterViolation, CryptoError, FramingError, MqttTransportError, PublishRejection,

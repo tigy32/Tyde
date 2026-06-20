@@ -12,8 +12,6 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use futures_channel::mpsc::channel;
-use rand::RngCore;
-use rand::rngs::OsRng;
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
@@ -25,7 +23,8 @@ use crate::error::MqttTransportError;
 use crate::framing::SESSION_SALT_LEN;
 use crate::link_native::NativeMqttLink;
 use crate::protocol_driver::{
-    EphemeralDataRoom, ProtocolDriver, PublishPacer, negotiate_ephemeral_data_room,
+    EphemeralDataRoom, ProtocolDriver, PublishPacer, generate_session_salt,
+    negotiate_ephemeral_data_room,
 };
 use crate::stream::{EnvelopeStream, InboundEvent, OutboundChunk};
 
@@ -167,12 +166,6 @@ async fn negotiate_ephemeral_data_room_native(
     let mut link =
         NativeMqttLink::connect(&config.endpoint, config.role, overrides.tls_ca_pem.clone())?;
     negotiate_ephemeral_data_room(config, &inbound_topic, &outbound_topic, &mut link).await
-}
-
-fn generate_session_salt() -> [u8; SESSION_SALT_LEN] {
-    let mut salt = [0_u8; SESSION_SALT_LEN];
-    OsRng.fill_bytes(&mut salt);
-    salt
 }
 
 #[cfg(test)]

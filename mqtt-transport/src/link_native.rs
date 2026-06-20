@@ -153,8 +153,27 @@ fn puback_rejection(
     properties: Option<&PubAckProperties>,
 ) -> PublishRejection {
     PublishRejection {
-        code: reason,
+        code: puback_reason_code(reason),
+        code_name: format!("{reason:?}"),
         reason_string: properties.and_then(|properties| properties.reason_string.clone()),
+    }
+}
+
+/// Map rumqttc's (positionally-discriminated) `PubAckReason` to its canonical
+/// MQTT5 numeric reason code. rumqttc does not assign the wire values to the
+/// enum, so a `reason as u8` cast would be wrong (e.g. `QuotaExceeded` is
+/// variant 7, not 0x97); the driver classifies quota rejections on this code.
+fn puback_reason_code(reason: PubAckReason) -> u8 {
+    match reason {
+        PubAckReason::Success => 0x00,
+        PubAckReason::NoMatchingSubscribers => 0x10,
+        PubAckReason::UnspecifiedError => 0x80,
+        PubAckReason::ImplementationSpecificError => 0x83,
+        PubAckReason::NotAuthorized => 0x87,
+        PubAckReason::TopicNameInvalid => 0x90,
+        PubAckReason::PacketIdentifierInUse => 0x91,
+        PubAckReason::QuotaExceeded => 0x97,
+        PubAckReason::PayloadFormatInvalid => 0x99,
     }
 }
 
@@ -352,4 +371,92 @@ fn lower_hex(bytes: &[u8]) -> String {
         output.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+/// Codec-parity tests for the Phase-2 wasm backend. These run natively (no wasm
+/// runtime, no broker) and prove that the standalone `mqttbytes 0.6` codec the
+/// wasm backend uses (a) round-trips its own PUBLISH/SUBSCRIBE encoding and
+/// (b) produces packets the native rumqttc stack decodes identically — the
+/// cross-implementation interop guarantee the two transports rely on.
+#[cfg(test)]
+mod codec_parity_tests {
+    use bytes::BytesMut;
+
+    #[test]
+    fn mqttbytes_publish_round_trips_and_rumqttc_decodes_it() {
+        use mqttbytes::QoS as MbQoS;
+        use mqttbytes::v5::{Packet as MbPacket, Publish as MbPublish, read as mb_read};
+
+        let mut publish =
+            MbPublish::new("tyde/parity/topic", MbQoS::AtLeastOnce, b"frame".to_vec());
+        publish.pkid = 7;
+
+        let mut bytes = BytesMut::new();
+        publish.write(&mut bytes).expect("mqttbytes encode PUBLISH");
+        let wire = bytes.clone();
+
+        // (a) mqttbytes self round-trip.
+        match mb_read(&mut bytes, 64 * 1024).expect("mqttbytes decode") {
+            MbPacket::Publish(decoded) => {
+                assert_eq!(decoded.topic, "tyde/parity/topic");
+                assert_eq!(decoded.payload.as_ref(), b"frame");
+                assert_eq!(decoded.qos, MbQoS::AtLeastOnce);
+                assert_eq!(decoded.pkid, 7);
+            }
+            other => panic!("mqttbytes decoded unexpected packet: {other:?}"),
+        }
+
+        // (b) rumqttc decodes the very same bytes the wasm backend would send.
+        use rumqttc::v5::mqttbytes::QoS as RcQoS;
+        use rumqttc::v5::mqttbytes::v5::Packet as RcPacket;
+        let mut wire = wire;
+        match RcPacket::read(&mut wire, Some(64 * 1024))
+            .expect("rumqttc decode of mqttbytes PUBLISH")
+        {
+            RcPacket::Publish(decoded) => {
+                assert_eq!(decoded.topic.as_ref(), b"tyde/parity/topic");
+                assert_eq!(decoded.payload.as_ref(), b"frame");
+                assert_eq!(decoded.qos, RcQoS::AtLeastOnce);
+                assert_eq!(decoded.pkid, 7);
+            }
+            other => panic!("rumqttc decoded unexpected packet: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mqttbytes_subscribe_round_trips_and_rumqttc_decodes_it() {
+        use mqttbytes::QoS as MbQoS;
+        use mqttbytes::v5::{Packet as MbPacket, Subscribe as MbSubscribe, read as mb_read};
+
+        let mut subscribe = MbSubscribe::new("tyde/parity/topic", MbQoS::AtLeastOnce);
+        subscribe.pkid = 9;
+
+        let mut bytes = BytesMut::new();
+        subscribe
+            .write(&mut bytes)
+            .expect("mqttbytes encode SUBSCRIBE");
+        let wire = bytes.clone();
+
+        match mb_read(&mut bytes, 64 * 1024).expect("mqttbytes decode") {
+            MbPacket::Subscribe(decoded) => {
+                assert_eq!(decoded.pkid, 9);
+                assert_eq!(decoded.filters.len(), 1);
+                assert_eq!(decoded.filters[0].path, "tyde/parity/topic");
+                assert_eq!(decoded.filters[0].qos, MbQoS::AtLeastOnce);
+            }
+            other => panic!("mqttbytes decoded unexpected packet: {other:?}"),
+        }
+
+        use rumqttc::v5::mqttbytes::v5::Packet as RcPacket;
+        let mut wire = wire;
+        match RcPacket::read(&mut wire, Some(64 * 1024))
+            .expect("rumqttc decode of mqttbytes SUBSCRIBE")
+        {
+            RcPacket::Subscribe(decoded) => {
+                assert_eq!(decoded.filters.len(), 1);
+                assert_eq!(decoded.filters[0].path.as_str(), "tyde/parity/topic");
+            }
+            other => panic!("rumqttc decoded unexpected packet: {other:?}"),
+        }
+    }
 }

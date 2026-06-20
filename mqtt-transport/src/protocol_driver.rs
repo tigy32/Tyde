@@ -8,8 +8,10 @@
 //! MQTT library, so the same logic compiles against the native rumqttc backend
 //! today and a `web-sys::WebSocket` backend in Phase 2.
 //!
-//! It still uses tokio timers/`select!` for now; replacing those with
-//! wasm-friendly equivalents is deferred to Phase 2 per the design doc.
+//! Timers come from [`crate::time`] (tokio on native, wasmtimer on wasm) so this
+//! module names no runtime-specific timer; `tokio::select!` is just a macro and
+//! is used directly on both targets. tokio's `sync` channels are portable to
+//! wasm32, so they are used directly as well.
 
 use std::collections::VecDeque;
 use std::str;
@@ -19,10 +21,13 @@ use std::time::Duration;
 
 use futures_channel::mpsc::Receiver as OutboundReceiver;
 use futures_util::StreamExt;
+use rand::RngCore;
+use rand::rngs::OsRng;
 #[cfg(test)]
 use tokio::sync::Barrier;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Instant, interval_at, sleep};
+
+use crate::time::{Instant, interval_at, sleep};
 
 use crate::chunking::MAX_PLAINTEXT_CHUNK_LEN;
 use crate::config::{MqttConnectConfig, ParticipantRole};
@@ -720,6 +725,15 @@ impl PublishPacer {
             "MQTT broker quota exceeded; pacing subsequent publishes"
         );
     }
+}
+
+/// Generate a fresh random session salt. Shared by the native and wasm connect
+/// entry points; `rand`'s `OsRng` maps to the OS CSPRNG on native and to the
+/// WebCrypto-backed getrandom on wasm.
+pub(crate) fn generate_session_salt() -> [u8; SESSION_SALT_LEN] {
+    let mut salt = [0_u8; SESSION_SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+    salt
 }
 
 pub(crate) fn validate_post_session_handshake(

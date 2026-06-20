@@ -1,0 +1,8 @@
+# getrandom 0.3 has no default RNG backend on wasm32-unknown-unknown; it must be
+# told to use the JS/WebCrypto backend via this cfg (in addition to the crate's
+# `wasm_js` feature). mqtt-transport pulls getrandom 0.3 (reconnect jitter), so
+# this is required for `cargo build -p mqtt-transport --target wasm32-unknown-unknown`.
+# Scoped to the wasm target only; native builds are unaffected. The cfg is inert
+# for any crate that is not getrandom 0.3.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

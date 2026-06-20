@@ -1,22 +1,30 @@
 use std::fmt;
 
-use rumqttc::v5::mqttbytes::v5::PubAckReason;
-use rumqttc::v5::{ClientError, ConnectionError};
 use thiserror::Error;
+
+/// MQTT5 PUBACK reason code for "Quota exceeded" (0x97). Used to classify
+/// broker-side rate limiting for publish pacing, without naming any MQTT
+/// library's reason-code enum at the seam.
+pub(crate) const PUBACK_QUOTA_EXCEEDED: u8 = 0x97;
+
+/// Transport-neutral source error carried by the seam. The native backend boxes
+/// rumqttc's `ConnectionError`/`ClientError`; a wasm backend boxes its own error
+/// type. Either way the driver only ever needs `Display`.
+type BackendError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Error)]
 pub enum MqttTransportError {
     #[error("MQTT broker connection failed: {source}")]
-    BrokerConnect { source: Box<ConnectionError> },
+    BrokerConnect { source: BackendError },
 
     #[error("MQTT subscribe request failed: {source}")]
-    Subscribe { source: Box<ClientError> },
+    Subscribe { source: BackendError },
 
     #[error("MQTT subscribe was rejected: {reason}")]
     SubscribeRejected { reason: String },
 
     #[error("MQTT publish request failed: {source}")]
-    Publish { source: Box<ClientError> },
+    Publish { source: BackendError },
 
     #[error("MQTT publish was rejected: {reason}")]
     PublishRejected { reason: PublishRejection },
@@ -55,23 +63,29 @@ impl MqttTransportError {
     }
 }
 
+/// A rejected PUBLISH, in transport-neutral form. `code` is the MQTT5 numeric
+/// PUBACK reason code and `code_name` is its human name (e.g. `"QuotaExceeded"`)
+/// — the backend fills both from its own reason-code enum so the seam carries no
+/// library types. `code_name` preserves the exact text the previous
+/// `{PubAckReason:?}` Display produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishRejection {
-    pub code: PubAckReason,
+    pub code: u8,
+    pub code_name: String,
     pub reason_string: Option<String>,
 }
 
 impl PublishRejection {
     pub fn is_quota_exceeded(&self) -> bool {
-        self.code == PubAckReason::QuotaExceeded
+        self.code == PUBACK_QUOTA_EXCEEDED
     }
 }
 
 impl fmt::Display for PublishRejection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.reason_string.as_deref() {
-            Some(reason) => write!(f, "{:?}: {reason}", self.code),
-            None => write!(f, "{:?}", self.code),
+            Some(reason) => write!(f, "{}: {reason}", self.code_name),
+            None => write!(f, "{}", self.code_name),
         }
     }
 }
