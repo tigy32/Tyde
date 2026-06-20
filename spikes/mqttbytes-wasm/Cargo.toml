@@ -1,0 +1,18 @@
+# PHASE-0 SPIKE — throwaway. Isolated standalone workspace so it does NOT
+# join the main Tyde workspace. Tests whether rumqttc 0.25.1's v5::mqttbytes
+# packet codec compiles to wasm32-unknown-unknown with default-features=false.
+[package]
+name = "mqttbytes-wasm-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Empty table => this crate is its own workspace root, isolated from /Tyde.
+[workspace]
+
+[dependencies]
+rumqttc = { version = "=0.25.1", default-features = false }
+bytes = "1"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
