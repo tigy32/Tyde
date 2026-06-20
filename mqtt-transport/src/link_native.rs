@@ -61,11 +61,7 @@ impl MqttLink for NativeMqttLink {
             })
     }
 
-    async fn publish(
-        &mut self,
-        topic: &str,
-        payload: Vec<u8>,
-    ) -> Result<(), MqttTransportError> {
+    async fn publish(&mut self, topic: &str, payload: Vec<u8>) -> Result<(), MqttTransportError> {
         self.client
             .publish(topic.to_owned(), QoS::AtLeastOnce, false, payload)
             .await
@@ -75,13 +71,13 @@ impl MqttLink for NativeMqttLink {
     }
 
     async fn poll(&mut self) -> Result<LinkEvent, MqttTransportError> {
-        let event = self
-            .eventloop
-            .poll()
-            .await
-            .map_err(|source| MqttTransportError::BrokerConnect {
-                source: Box::new(source),
-            })?;
+        let event =
+            self.eventloop
+                .poll()
+                .await
+                .map_err(|source| MqttTransportError::BrokerConnect {
+                    source: Box::new(source),
+                })?;
         Ok(translate_event(event))
     }
 

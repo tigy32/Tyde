@@ -66,8 +66,7 @@ pub(crate) trait MqttLink {
 
     /// Enqueue a PUBLISH of `payload` to `topic` at QoS 1, retain=false. Does
     /// not await the PUBACK.
-    async fn publish(&mut self, topic: &str, payload: Vec<u8>)
-    -> Result<(), MqttTransportError>;
+    async fn publish(&mut self, topic: &str, payload: Vec<u8>) -> Result<(), MqttTransportError>;
 
     /// Drive the connection and return the next protocol-relevant event.
     async fn poll(&mut self) -> Result<LinkEvent, MqttTransportError>;

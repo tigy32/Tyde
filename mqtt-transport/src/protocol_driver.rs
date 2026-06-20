@@ -274,8 +274,16 @@ impl<L: MqttLink> ProtocolDriver<L> {
                             }
                         }
                         Err(error) => {
+                            // The link wraps a poll failure as `BrokerConnect`; the
+                            // original code formatted the bare `ConnectionError` here,
+                            // so unwrap the source to avoid double-prefixing the
+                            // resulting `BrokerDisconnected` reason string.
+                            let reason = match error {
+                                MqttTransportError::BrokerConnect { source } => source.to_string(),
+                                other => other.to_string(),
+                            };
                             send_inbound_error(self.inbound_tx.clone(), MqttTransportError::BrokerDisconnected {
-                                reason: error.to_string(),
+                                reason,
                             }).await;
                             return;
                         }
@@ -857,8 +865,7 @@ async fn await_open_and_accept<L: MqttLink>(
                         ),
                     }));
                 }
-                let request =
-                    decode_open_request(&config.room, &config.psk, &publish.payload)?;
+                let request = decode_open_request(&config.room, &config.psk, &publish.payload)?;
                 let server_nonce = random_nonce();
                 let accept = OpenAccept {
                     connection_id: request.connection_id,
@@ -1017,9 +1024,9 @@ async fn await_suback<L: MqttLink>(
                 });
             }
             LinkEvent::Publish(publish) => {
-                return Err(MqttTransportError::Framing(unexpected_publish_before_suback(
-                    &publish.topic,
-                )));
+                return Err(MqttTransportError::Framing(
+                    unexpected_publish_before_suback(&publish.topic),
+                ));
             }
             LinkEvent::PubAck(result) => result?,
             LinkEvent::Other => {}
