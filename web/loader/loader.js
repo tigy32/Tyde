@@ -2,7 +2,8 @@
 // (`https://tycode.dev/tyde/`). It learns the paired host's release version
 // from the pairing QR, validates it, looks it up in the server-controlled
 // manifest (the allowlist authority), and boots the matching immutable
-// versioned bundle under a strict CSP with Subresource Integrity.
+// versioned bundle under a strict CSP with Subresource Integrity covering
+// EVERY executable artifact (entry JS + wasm + chunks).
 //
 // This file is the ONLY part of the loader that touches the DOM/network. All
 // parsing and policy logic lives in the pure, unit-tested modules it imports.
@@ -12,9 +13,17 @@
 
 import { parsePairingUri } from "./pairing.js";
 import { resolveBootTarget } from "./manifest-policy.js";
+import { verifyArtifacts } from "./integrity.js";
 
 const MANIFEST_URL = "./manifest.json";
-const STORAGE_KEY = "tyde.loader.version"; // last successfully-paired version
+export const STORAGE_KEY = "tyde.loader.version"; // last successfully-paired version
+// Handoff contract with mobile-frontend (bridge::web::take_pending_pairing_uri):
+// the loader stashes the FULL raw `tyde-pair://…` URI here so the booted WASM
+// app can complete first-time pairing. sessionStorage (not the URL) is used so
+// the PSK-bearing URI never enters history/referrer; the app reads, validates,
+// and clears it. MUST match `PENDING_PAIRING_URI_KEY` in the Rust web bridge.
+export const PAIR_URI_KEY = "tyde.pair.uri";
+const BUNDLE_CACHE = "tyde-bundle-v1"; // shared with sw.js
 
 const ui = {};
 
@@ -46,6 +55,7 @@ function reasonToMessage(reason) {
       return "No matching client build is published for this host version yet. Try again later or re-pair after updating the host.";
     case "invalid-version":
       return "The pairing code carried an invalid version. Scan a fresh QR code.";
+    case "bad-policy":
     case "bad-entry-path":
     case "bad-integrity":
       return "The release manifest is malformed. Please report this.";
@@ -57,8 +67,10 @@ function reasonToMessage(reason) {
 }
 
 async function fetchManifest() {
-  // Network-first (the service worker also keeps a fallback copy): the manifest
-  // is the security authority, so we want the freshest allowlist we can get.
+  // Network-only: the manifest is the security authority (allowlist +
+  // blocked/minSupported revocations), so it must never be served from a stale
+  // cache. The service worker also refuses to cache it (see sw.js) — a forced
+  // outage fails closed rather than letting a stale allowlist permit a boot.
   const response = await fetch(MANIFEST_URL, { cache: "no-store" });
   if (!response.ok) {
     throw new Error(`manifest fetch failed: HTTP ${response.status}`);
@@ -66,12 +78,56 @@ async function fetchManifest() {
   return response.json();
 }
 
-// Boots a resolved target by injecting its entry module with SRI. The URL and
-// integrity come entirely from the manifest — never from the QR text — and the
-// page's CSP (`script-src 'self'`) confines execution to same-origin scripts.
-function bootTarget(target) {
+async function openBundleCache() {
+  if (typeof caches === "undefined") return null;
+  try {
+    return await caches.open(BUNDLE_CACHE);
+  } catch {
+    return null;
+  }
+}
+
+async function deleteCachedArtifacts(target) {
+  const cache = await openBundleCache();
+  if (!cache) return;
+  for (const artifact of target.artifacts) {
+    try {
+      await cache.delete(artifact.url);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// Boots a resolved target: SRI-verify every executable artifact, then inject
+// the entry module. The URLs and integrity hashes come entirely from the
+// manifest — never from the QR text — and the page CSP
+// (`script-src 'self' 'wasm-unsafe-eval'`) confines execution to same-origin
+// scripts plus wasm compilation.
+async function bootTarget(target) {
   show("booting");
   if (ui.bootingVersion) ui.bootingVersion.textContent = target.version;
+
+  // Verify entry JS + wasm + chunks before anything executes. Verified bytes
+  // are written into the bundle cache so the <script>/wasm load reads exactly
+  // those bytes (and offline relaunch works); a tampered artifact is never
+  // cached (#5a) and aborts the boot.
+  const cache = await openBundleCache();
+  let result;
+  try {
+    result = await verifyArtifacts(target.artifacts, { cache });
+  } catch (err) {
+    result = { ok: false, failures: [String(err && err.message ? err.message : err)] };
+  }
+  if (!result.ok) {
+    await deleteCachedArtifacts(target);
+    forgetVersion();
+    setError(
+      "The client bundle failed its integrity check and was not started.",
+      `version ${target.version}: ${result.failures.join(", ")}`,
+    );
+    return;
+  }
 
   const script = document.createElement("script");
   script.type = "module";
@@ -79,8 +135,10 @@ function bootTarget(target) {
   script.integrity = target.integrity; // manifest-controlled SRI digest
   script.crossOrigin = "anonymous";
   script.addEventListener("error", () => {
-    // Integrity mismatch or load failure: drop the remembered version so the
-    // user is not trapped, and fall back to pairing.
+    // Defense in depth: if the entry still fails to load (e.g. a poisoned cache
+    // entry slips past), purge the cached artifacts so a transient tampered 200
+    // can't wedge the user in permanent SRI-failure, and fall back to pairing.
+    void deleteCachedArtifacts(target);
     forgetVersion();
     setError(
       "The client bundle failed its integrity check or could not load.",
@@ -115,9 +173,21 @@ function forgetVersion() {
   }
 }
 
+// Stash the raw pairing URI for the booted app to consume (see PAIR_URI_KEY).
+function stashPairingUri(uri) {
+  try {
+    sessionStorage.setItem(PAIR_URI_KEY, uri);
+  } catch {
+    // Without sessionStorage the app simply shows its own pairing screen and
+    // the user pastes/scans again — degraded but not broken.
+  }
+}
+
 // Handles a raw pairing URI (from scan or paste): parse -> validate -> resolve
-// against the manifest -> boot. Surfaces a friendly error otherwise.
-async function handlePairingUri(uri, manifest) {
+// against the manifest -> stash URI for the app -> boot. Surfaces a friendly
+// error otherwise. The loader trusts ONLY release_version for its own decision;
+// the app re-parses the stashed URI authoritatively.
+export async function handlePairingUri(uri, manifest) {
   let parsed;
   try {
     parsed = parsePairingUri(uri);
@@ -140,8 +210,11 @@ async function handlePairingUri(uri, manifest) {
     setError(reasonToMessage(resolved.reason), `version ${parsed.releaseVersion}`);
     return;
   }
+  // Hand the FULL original URI to the booted app so first-time pairing can
+  // complete, then remember the version for future no-QR launches.
+  stashPairingUri(uri.trim());
   rememberVersion(resolved.version);
-  bootTarget(resolved);
+  await bootTarget(resolved);
 }
 
 // --- QR scanning -----------------------------------------------------------
@@ -237,6 +310,17 @@ async function init() {
   ui.scanButton = $("scan-button");
   ui.retryButton = $("retry-button");
 
+  // Bind the retry button FIRST, before any early return below, so a
+  // manifest-fetch or returning-user boot error still leaves a working "Try
+  // again" button (#8).
+  if (ui.retryButton) {
+    ui.retryButton.addEventListener("click", () => window.location.reload());
+  }
+
+  // Debug/escape hatch for support: clear a wedged stored version from the
+  // console without DevTools storage spelunking.
+  window.__tydeLoader = { forgetVersion, version: () => readVersion() };
+
   registerServiceWorker();
 
   // A backgrounded host that upgrades will reject the old client at handshake;
@@ -264,7 +348,7 @@ async function init() {
   if (remembered) {
     const resolved = resolveBootTarget(remembered, manifest);
     if (resolved.ok) {
-      bootTarget(resolved);
+      await bootTarget(resolved);
       return;
     }
     forgetVersion();
@@ -282,13 +366,6 @@ async function init() {
   if (ui.scanButton) {
     ui.scanButton.addEventListener("click", () => void startScan(manifest));
   }
-  if (ui.retryButton) {
-    ui.retryButton.addEventListener("click", () => window.location.reload());
-  }
-
-  // Debug/escape hatch for support: lets a user clear a wedged stored version
-  // from the console without DevTools storage spelunking.
-  window.__tydeLoader = { forgetVersion, version: () => readVersion() };
 }
 
 if (typeof document !== "undefined") {

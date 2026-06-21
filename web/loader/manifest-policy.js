@@ -58,22 +58,46 @@ function compareIdentifier(a, b) {
 const INTEGRITY_RE = /^sha(256|384|512)-[A-Za-z0-9+/]+={0,2}$/;
 
 // Defense in depth: even though the manifest is server-controlled, confirm the
-// path it hands back is a same-origin, traversal-free `/tyde/...` path.
+// path it hands back is a same-origin, traversal-free `/tyde/...` path. Rejects
+// raw `..`/`\`, percent-encoded traversal (`%2e`, `%2f`, `%5c` in any case),
+// and any path that — resolved as a URL — escapes the origin or the `/tyde/`
+// prefix.
 function isSafeBundlePath(path) {
+  if (typeof path !== "string") return false;
+  if (!path.startsWith("/tyde/")) return false;
+  if (path.includes("..") || path.includes("\\")) return false;
+  if (/%2e|%2f|%5c/i.test(path)) return false;
+  if (/\s/.test(path)) return false;
+  // Resolve against a fixed sentinel origin; a path that escapes it (e.g.
+  // protocol-relative `//evil`, or backslash tricks) lands on another origin.
+  let resolved;
+  try {
+    resolved = new URL(path, "https://loader.invalid");
+  } catch {
+    return false;
+  }
   return (
-    typeof path === "string" &&
-    path.startsWith("/tyde/") &&
-    !path.includes("..") &&
-    !path.includes("\\") &&
-    !/\s/.test(path)
+    resolved.origin === "https://loader.invalid" &&
+    resolved.pathname.startsWith("/tyde/")
   );
 }
 
+function isValidIntegrity(value) {
+  return typeof value === "string" && INTEGRITY_RE.test(value);
+}
+
 // Resolves the boot target for a version against the manifest. Returns either
-// `{ ok: true, version, path, entry, integrity }` or
-// `{ ok: false, reason }` where reason is one of:
-//   invalid-version | no-manifest | blocked | below-min-supported |
+// `{ ok: true, version, path, entry, integrity, artifacts }` (artifacts is the
+// full list of `{ url, integrity }` that must be SRI-verified before the bundle
+// runs — entry JS first, then wasm + chunks) or `{ ok: false, reason }` where
+// reason is one of:
+//   invalid-version | no-manifest | bad-policy | blocked | below-min-supported |
 //   not-in-manifest | bad-entry-path | bad-integrity
+//
+// FAIL-CLOSED: a manifest whose POLICY fields are malformed (non-array
+// `blocked`, or a present-but-invalid `minSupported`) is rejected wholesale
+// rather than silently degraded — a corrupted/partial manifest must never widen
+// what is allowed to boot.
 export function resolveBootTarget(version, manifest) {
   const norm = validateReleaseVersion(version);
   if (!norm) return { ok: false, reason: "invalid-version" };
@@ -81,12 +105,30 @@ export function resolveBootTarget(version, manifest) {
     return { ok: false, reason: "no-manifest" };
   }
 
+  // `blocked`: must be absent or an array. A non-array (object/string/number)
+  // is a malformed manifest → fail closed.
+  if (manifest.blocked !== undefined && !Array.isArray(manifest.blocked)) {
+    return { ok: false, reason: "bad-policy" };
+  }
   const blocked = Array.isArray(manifest.blocked) ? manifest.blocked : [];
-  if (blocked.includes(norm)) return { ok: false, reason: "blocked" };
+  // Normalize each blocked entry through the same validator so e.g. `v0.8.18`
+  // and `0.8.18` (or padded variants) match the normalized `norm`.
+  for (const raw of blocked) {
+    const normalizedBlock = validateReleaseVersion(raw);
+    if (normalizedBlock && normalizedBlock === norm) {
+      return { ok: false, reason: "blocked" };
+    }
+  }
 
-  if (typeof manifest.minSupported === "string") {
+  // `minSupported`: must be absent or a VALID version. A present-but-invalid
+  // floor is a malformed manifest → fail closed (do NOT ignore it).
+  if (manifest.minSupported !== undefined) {
+    if (typeof manifest.minSupported !== "string") {
+      return { ok: false, reason: "bad-policy" };
+    }
     const min = validateReleaseVersion(manifest.minSupported);
-    if (min && compareVersions(norm, min) < 0) {
+    if (!min) return { ok: false, reason: "bad-policy" };
+    if (compareVersions(norm, min) < 0) {
       return { ok: false, reason: "below-min-supported" };
     }
   }
@@ -107,8 +149,27 @@ export function resolveBootTarget(version, manifest) {
   if (typeof entry.path === "string" && !isSafeBundlePath(entry.path)) {
     return { ok: false, reason: "bad-entry-path" };
   }
-  if (typeof entry.integrity !== "string" || !INTEGRITY_RE.test(entry.integrity)) {
+  if (!isValidIntegrity(entry.integrity)) {
     return { ok: false, reason: "bad-integrity" };
+  }
+
+  // Build the full executable-artifact list. The entry JS is implicit; every
+  // additional executable artifact (the wasm and any code-split chunks) MUST be
+  // listed in `entry.artifacts` as `{ "<path>": "<integrity>" }` so it can be
+  // SRI-verified before the bundle runs. A tampered same-version `.wasm` is the
+  // gap the entry-only `<script integrity>` left open.
+  const artifacts = [{ url: target, integrity: entry.integrity }];
+  if (entry.artifacts !== undefined) {
+    if (typeof entry.artifacts !== "object" || Array.isArray(entry.artifacts)) {
+      return { ok: false, reason: "bad-integrity" };
+    }
+    for (const [url, integrity] of Object.entries(entry.artifacts)) {
+      if (!isSafeBundlePath(url)) return { ok: false, reason: "bad-entry-path" };
+      if (!isValidIntegrity(integrity)) {
+        return { ok: false, reason: "bad-integrity" };
+      }
+      artifacts.push({ url, integrity });
+    }
   }
 
   return {
@@ -117,5 +178,6 @@ export function resolveBootTarget(version, manifest) {
     path: typeof entry.path === "string" ? entry.path : target,
     entry: target,
     integrity: entry.integrity,
+    artifacts,
   };
 }

@@ -13,10 +13,21 @@
 // no benefit. This reader is deliberately small so the loader stays tiny and
 // auditable — it never `eval`s and never trusts lengths past the input bounds.
 
-export function decodeFirst(bytes) {
+// Hard caps so a malicious QR can't exhaust memory/stack. The real pairing
+// payload is a few hundred bytes with depth ~2 and a few dozen items; these
+// ceilings are far above that yet bound the worst case.
+export const MAX_CBOR_BYTES = 4096;
+const MAX_DEPTH = 32;
+const MAX_ITEMS = 4096;
+
+export function decodeFirst(bytes, options = {}) {
   const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const maxBytes = options.maxBytes ?? MAX_CBOR_BYTES;
+  if (view.length > maxBytes) {
+    throw new Error(`CBOR: input exceeds ${maxBytes}-byte cap`);
+  }
   const decoder = new Decoder(view);
-  const value = decoder.readItem();
+  const value = decoder.readItem(0);
   // We do not require the whole input to be consumed: the loader only needs the
   // top-level map, and trailing bytes (if any) are ignored by the caller. The
   // authoritative re-parse happens later in the real WASM app.
@@ -27,6 +38,13 @@ class Decoder {
   constructor(bytes) {
     this.bytes = bytes;
     this.pos = 0;
+    this.items = 0;
+  }
+
+  countItem() {
+    if (++this.items > MAX_ITEMS) {
+      throw new Error(`CBOR: item count exceeds ${MAX_ITEMS} cap`);
+    }
   }
 
   byte() {
@@ -69,7 +87,11 @@ class Decoder {
     throw new Error("CBOR: indefinite or reserved length is not supported");
   }
 
-  readItem() {
+  readItem(depth) {
+    if (depth > MAX_DEPTH) {
+      throw new Error(`CBOR: nesting exceeds ${MAX_DEPTH} levels`);
+    }
+    this.countItem();
     const initial = this.byte();
     const major = initial >> 5;
     const info = initial & 0x1f;
@@ -88,15 +110,15 @@ class Decoder {
       case 4: {
         const len = this.readArg(info);
         const arr = [];
-        for (let i = 0; i < len; i++) arr.push(this.readItem());
+        for (let i = 0; i < len; i++) arr.push(this.readItem(depth + 1));
         return arr;
       }
       case 5: {
         const len = this.readArg(info);
         const map = Object.create(null);
         for (let i = 0; i < len; i++) {
-          const key = this.readItem();
-          const value = this.readItem();
+          const key = this.readItem(depth + 1);
+          const value = this.readItem(depth + 1);
           // Only string keys are meaningful for the pairing payload; non-string
           // keys are stringified so the structure is still walkable.
           map[typeof key === "string" ? key : JSON.stringify(key)] = value;
@@ -106,7 +128,7 @@ class Decoder {
       case 6:
         // Tag: decode and discard the tag number, return the tagged item.
         this.readArg(info);
-        return this.readItem();
+        return this.readItem(depth + 1);
       case 7:
         return this.readSimple(info);
       default:

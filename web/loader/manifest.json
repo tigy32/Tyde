@@ -1,5 +1,5 @@
 {
-  "$comment": "Server-controlled allowlist of bootable Tyde web client versions. This is the AUTHORITY: the loader only boots a version that appears in `versions` and is not blocked / below minSupported. Phase 6 deploy regenerates this from the released bundles (see web/README.md). The values below are illustrative placeholders; `integrity` is the SRI digest of each version's entry module.",
+  "$comment": "Server-controlled allowlist of bootable Tyde web client versions. This is the AUTHORITY: the loader only boots a version present in `versions` that is not blocked / below minSupported, and it SRI-verifies every artifact listed (entry `integrity` PLUS every path in `artifacts`) before the bundle runs. Phase 6's generator MUST hash every executable artifact of a version — the entry .js, the .wasm, and any code-split chunks — not just the entry. Values below are illustrative placeholders.",
   "schemaVersion": 1,
   "minSupported": "0.8.19-beta.1",
   "blocked": ["0.8.18"],
@@ -7,12 +7,18 @@
     "0.8.19-beta.2": {
       "path": "/tyde/v0.8.19-beta.2/",
       "entry": "/tyde/v0.8.19-beta.2/tyde-mobile.js",
-      "integrity": "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      "integrity": "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "artifacts": {
+        "/tyde/v0.8.19-beta.2/tyde-mobile_bg.wasm": "sha384-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+      }
     },
     "0.8.19": {
       "path": "/tyde/v0.8.19/",
       "entry": "/tyde/v0.8.19/tyde-mobile.js",
-      "integrity": "sha384-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+      "integrity": "sha384-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "artifacts": {
+        "/tyde/v0.8.19/tyde-mobile_bg.wasm": "sha384-DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+      }
     }
   }
 }

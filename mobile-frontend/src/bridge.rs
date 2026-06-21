@@ -125,6 +125,19 @@ pub async fn set_paired_host_auto_connect(
     }
 }
 
+/// Web-only: consumes the pairing URI the PWA loader stashed in sessionStorage
+/// (see [`web::take_pending_pairing_uri`]) so first-time pairing completes after
+/// the loader boots this bundle. Native shells deliver pairing URIs through
+/// their own scan/paste flow, so this is always `None` there. Synchronous: a
+/// sessionStorage read needs no await.
+pub fn take_pending_pairing_uri() -> Option<String> {
+    if use_web_backend() {
+        web::take_pending_pairing_uri()
+    } else {
+        None
+    }
+}
+
 pub async fn frontend_attached(
     known_connection_instance_ids: &[KnownConnectionInstance],
 ) -> Result<(), String> {

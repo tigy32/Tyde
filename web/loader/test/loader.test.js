@@ -6,6 +6,7 @@ import {
   parsePairingUri,
   validateReleaseVersion,
   base64urlToBytes,
+  MAX_URI_LEN,
 } from "../pairing.js";
 import { resolveBootTarget, compareVersions } from "../manifest-policy.js";
 import {
@@ -184,6 +185,127 @@ test("resolveBootTarget handles a missing manifest", () => {
 });
 
 // --- returning-user path (end to end of the pure logic) --------------------
+
+// --- #2 artifact integrity coverage ----------------------------------------
+
+test("resolveBootTarget returns the full artifact list (entry + wasm)", () => {
+  const r = resolveBootTarget("0.8.19-beta.2", EXAMPLE_MANIFEST);
+  assert.equal(r.ok, true);
+  assert.equal(r.artifacts.length, 2);
+  assert.equal(r.artifacts[0].url, "/tyde/v0.8.19-beta.2/tyde-mobile.js");
+  assert.equal(r.artifacts[1].url, "/tyde/v0.8.19-beta.2/tyde-mobile_bg.wasm");
+  for (const a of r.artifacts) assert.match(a.integrity, /^sha384-/);
+});
+
+test("resolveBootTarget rejects a bad artifact path or integrity", () => {
+  const badArtifactPath = {
+    versions: {
+      "1.2.3": {
+        path: "/tyde/v1.2.3/",
+        entry: "/tyde/v1.2.3/app.js",
+        integrity: "sha384-" + "A".repeat(64),
+        artifacts: { "https://evil.example/x.wasm": "sha384-" + "B".repeat(64) },
+      },
+    },
+  };
+  assert.equal(resolveBootTarget("1.2.3", badArtifactPath).reason, "bad-entry-path");
+
+  const badArtifactIntegrity = {
+    versions: {
+      "1.2.3": {
+        path: "/tyde/v1.2.3/",
+        entry: "/tyde/v1.2.3/app.js",
+        integrity: "sha384-" + "A".repeat(64),
+        artifacts: { "/tyde/v1.2.3/x.wasm": "md5-nope" },
+      },
+    },
+  };
+  assert.equal(resolveBootTarget("1.2.3", badArtifactIntegrity).reason, "bad-integrity");
+
+  const artifactsNotObject = {
+    versions: {
+      "1.2.3": {
+        path: "/tyde/v1.2.3/",
+        entry: "/tyde/v1.2.3/app.js",
+        integrity: "sha384-" + "A".repeat(64),
+        artifacts: ["/tyde/v1.2.3/x.wasm"],
+      },
+    },
+  };
+  assert.equal(resolveBootTarget("1.2.3", artifactsNotObject).reason, "bad-integrity");
+});
+
+// --- #9 percent-encoded / off-origin path rejection -------------------------
+
+test("isSafeBundlePath (via resolveBootTarget) rejects percent-encoded traversal", () => {
+  for (const evil of [
+    "/tyde/v1.2.3/%2e%2e/evil.js",
+    "/tyde/v1.2.3/%2E%2E/evil.js",
+    "/tyde/v1.2.3/x%2fevil.js",
+    "/tyde/v1.2.3/x%5cevil.js",
+  ]) {
+    const m = {
+      versions: {
+        "1.2.3": { path: "/tyde/v1.2.3/", entry: evil, integrity: "sha384-" + "A".repeat(64) },
+      },
+    };
+    assert.equal(resolveBootTarget("1.2.3", m).reason, "bad-entry-path", evil);
+  }
+});
+
+// --- #4 fail-closed manifest policy -----------------------------------------
+
+test("resolveBootTarget fails closed on a non-array blocked list", () => {
+  const m = { ...EXAMPLE_MANIFEST, blocked: { "0.8.19-beta.2": true } };
+  assert.equal(resolveBootTarget("0.8.19-beta.2", m).reason, "bad-policy");
+});
+
+test("resolveBootTarget fails closed on an invalid minSupported", () => {
+  assert.equal(
+    resolveBootTarget("0.8.19-beta.2", { ...EXAMPLE_MANIFEST, minSupported: "not-semver" }).reason,
+    "bad-policy",
+  );
+  assert.equal(
+    resolveBootTarget("0.8.19-beta.2", { ...EXAMPLE_MANIFEST, minSupported: 819 }).reason,
+    "bad-policy",
+  );
+});
+
+test("blocked entries are normalized through validateReleaseVersion", () => {
+  // `v0.8.19-beta.2` must block the normalized `0.8.19-beta.2`.
+  const m = { ...EXAMPLE_MANIFEST, blocked: ["v0.8.19-beta.2"] };
+  assert.equal(resolveBootTarget("0.8.19-beta.2", m).reason, "blocked");
+});
+
+// --- #6 DoS caps + Rust-matching whitespace ---------------------------------
+
+test("validateReleaseVersion enforces a max length", () => {
+  assert.equal(validateReleaseVersion("0.8." + "9".repeat(300)), null);
+});
+
+test("validateReleaseVersion matches Rust whitespace semantics", () => {
+  // Rust's str::trim strips U+0085 (NEL) and U+3000 (ideographic space) — so do we.
+  assert.equal(validateReleaseVersion("0.8.19"), "0.8.19");
+  assert.equal(validateReleaseVersion("　0.8.19"), "0.8.19");
+  // U+FEFF (BOM) is NOT Unicode White_Space; Rust would keep it (then reject via
+  // the grammar). We must NOT silently strip it and accept — fail closed.
+  assert.equal(validateReleaseVersion("0.8.19﻿"), null);
+});
+
+test("parsePairingUri rejects an over-long URI", () => {
+  const huge = "tyde-pair://v1?" + "A".repeat(MAX_URI_LEN);
+  assert.throws(() => parsePairingUri(huge), /exceeds/);
+});
+
+test("cbor rejects over-deep nesting and oversized input", () => {
+  // 40 nested single-element arrays (0x81) then 0x00 — exceeds the depth cap.
+  const deep = new Uint8Array(41);
+  deep.fill(0x81, 0, 40);
+  deep[40] = 0x00;
+  assert.throws(() => decodeFirst(deep), /nesting exceeds/);
+
+  assert.throws(() => decodeFirst(new Uint8Array(5000)), /exceeds .*cap/);
+});
 
 test("returning-user flow: stored version re-resolves via the manifest", () => {
   // Simulates loader.init()'s fast path: a remembered version is re-checked

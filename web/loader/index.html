@@ -9,20 +9,26 @@
 
     <!--
       Strict Content Security Policy. The load-bearing directive is
-      `script-src 'self'`: only same-origin scripts may execute, and the
-      versioned bundle is additionally pinned with Subresource Integrity when
-      the loader injects it. No third-party JS is ever allowed.
+      `script-src 'self' 'wasm-unsafe-eval'`: only same-origin scripts may
+      execute, plus the WebAssembly compilation the Leptos/Trunk bundle needs
+      (`WebAssembly.instantiate`). We do NOT grant general `'unsafe-eval'`. The
+      versioned bundle is additionally pinned with Subresource Integrity — the
+      loader verifies every executable artifact (entry JS + wasm + chunks)
+      against the manifest hashes before it runs (see loader.js / integrity.js).
+      No third-party JS is ever allowed.
 
-      `connect-src` permits the WASM app to reach the wss broker and to fetch
-      the manifest/bundle. `style-src` allows inline styles because the injected
-      Leptos app styles itself with inline <style>/style= (these are not a
-      script-execution vector). `frame-ancestors` cannot be set via <meta>; the
-      Phase 6 deploy MUST also send it (and ideally this whole policy) as an
-      HTTP response header. See web/README.md.
+      `connect-src 'self' wss:` is intentionally narrow: the WASM app reaches
+      the broker over `wss://` and fetches the manifest/bundle from same-origin
+      (`'self'`). `https:` is deliberately omitted — add it back only if a
+      future feature needs cross-origin HTTPS. `style-src` allows inline styles
+      because the injected Leptos app styles itself with inline <style>/style=
+      (not a script-execution vector). `frame-ancestors` cannot be set via
+      <meta>; the Phase 6 deploy MUST also send it (and ideally this whole
+      policy) as an HTTP response header. See web/README.md.
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https: wss:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'"
     />
 
     <title>Tyde</title>

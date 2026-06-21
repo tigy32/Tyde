@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn record_json_round_trips_and_omits_psk_bytes() {
         let record = sample_record();
-        let json = serde_json::to_string(&[record.clone()]).expect("serialize");
+        let json = serde_json::to_string(std::slice::from_ref(&record)).expect("serialize");
         let psk_b64 = PreSharedKey::from_slice(&[9_u8; 32])
             .expect("psk")
             .as_base64url_no_pad();

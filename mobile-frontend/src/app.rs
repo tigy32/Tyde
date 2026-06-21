@@ -10,7 +10,7 @@ use crate::dispatch::{dispatch_envelope, reset_inbound_seq_for_host};
 use crate::send::{reset_seq_for_host, send_frame};
 use crate::state::{
     AppMode, AppState, ConnectionStatus, LocalHostId, MobileShellError, MobileTab,
-    PairedHostConnectionStatus, PairedHostSummary,
+    PairedHostConnectionStatus, PairedHostSummary, PairingScreen,
 };
 use protocol::MobileAccessErrorCode;
 
@@ -28,6 +28,7 @@ pub fn App() -> impl IntoView {
     install_event_listeners(state.clone());
     spawn_initial_paired_hosts_load(state.clone());
     install_app_mode_effect(state.clone());
+    spawn_boot_pairing_handoff(state.clone());
 
     view! {
         <div class="mobile-app" data-theme=move || state.theme.get()>
@@ -118,6 +119,33 @@ fn install_app_mode_effect(state: AppState) {
                 if hosts.is_empty() {
                     state.app_mode.set(AppMode::Onboarding);
                 }
+            }
+        }
+    });
+}
+
+/// Completes a first-time pairing initiated from the PWA loader. The loader
+/// scans/pastes the QR, stashes the raw `tyde-pair://…` URI in sessionStorage,
+/// and boots this bundle; here we consume that URI, run the AUTHORITATIVE parse
+/// (`preview_pairing_uri`), and drop the user on the pairing Confirm screen so
+/// one tap finishes the handshake. The loader never makes pairing decisions —
+/// it only routes us here — so a forged/invalid stash is rejected by the parse
+/// and the app simply falls back to its normal onboarding flow. No-op on native
+/// shells (the bridge returns `None`).
+fn spawn_boot_pairing_handoff(state: AppState) {
+    let Some(qr_uri) = bridge::take_pending_pairing_uri() else {
+        return;
+    };
+    spawn_local(async move {
+        match bridge::preview_pairing_uri(&qr_uri).await {
+            Ok(preview) => {
+                state
+                    .app_mode
+                    .set(AppMode::Pairing(PairingScreen::Confirm { qr_uri, preview }));
+            }
+            Err(error) => {
+                // Forged or stale handoff: ignore and stay in the normal flow.
+                log::warn!("ignoring loader pairing handoff: {error}");
             }
         }
     });

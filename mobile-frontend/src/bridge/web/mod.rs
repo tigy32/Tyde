@@ -43,6 +43,31 @@ pub async fn list_pending_host_lines() -> Result<Vec<HostLineEvent>, String> {
 
 // ── Pairing ───────────────────────────────────────────────────────────────
 
+/// sessionStorage key under which the web loader (`web/loader/loader.js`)
+/// stashes the full raw `tyde-pair://…` pairing URI before it boots this
+/// bundle, so first-time pairing can complete without a second scan. MUST stay
+/// in sync with `PAIR_URI_KEY` in the loader.
+const PENDING_PAIRING_URI_KEY: &str = "tyde.pair.uri";
+
+/// Reads and CLEARS the pending pairing URI the loader stashed (if any).
+///
+/// The URI is returned raw and unparsed — callers run the authoritative
+/// [`parse_and_validate`] / [`preview_pairing_uri`] themselves; the loader is
+/// trusted only to have routed us here, not to have validated the payload. The
+/// key is always cleared so a stale URI cannot replay on a later reload.
+pub fn take_pending_pairing_uri() -> Option<String> {
+    let storage = web_sys::window()?.session_storage().ok()??;
+    let value = storage.get_item(PENDING_PAIRING_URI_KEY).ok()??;
+    // Clear regardless of contents so a malformed/forged stash cannot persist.
+    let _ = storage.remove_item(PENDING_PAIRING_URI_KEY);
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
 pub async fn preview_pairing_uri(qr_uri: &str) -> Result<MobilePairingPreview, String> {
     let payload = parse_and_validate(qr_uri)?;
     Ok(MobilePairingPreview {
