@@ -1837,7 +1837,7 @@ fn DebugTab() -> impl IntoView {
 ///   * `enable_mobile_connections` — master kill switch.
 ///   * `mobile_broker_url` — optional override for the public MQTT
 ///     broker the host uses for the relay path. The default is a free
-///     public broker (`mqtts://broker.emqx.io:8883`); the user can
+///     public broker (`wss://broker.emqx.io:8084/mqtt`); the user can
 ///     point at their own broker by overriding here. Empty input
 ///     resets to "use server default" (None on the wire).
 ///
@@ -4355,7 +4355,7 @@ mod wasm_tests {
 
     /// When the host has no `mobile_broker_url` override, the broker
     /// URL input must render empty but display the
-    /// `mqtts://broker.emqx.io:8883` placeholder so the user can see
+    /// `wss://broker.emqx.io:8084/mqtt` placeholder so the user can see
     /// what the host default resolves to. This is the foundation of
     /// the "QR carries the broker URL even when the user hasn't set
     /// one" contract — the placeholder is purely informational so

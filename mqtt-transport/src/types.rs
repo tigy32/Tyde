@@ -537,6 +537,82 @@ mod tests {
     }
 
     #[test]
+    fn pairing_qr_decodes_legacy_cbor_without_release_version() {
+        // A legacy host serializes a payload that has no `release_version` field
+        // at all; decoding must succeed with `release_version == None`.
+        #[derive(serde::Serialize)]
+        struct LegacyQr {
+            v: u32,
+            protocol_version: u32,
+            tyde_version: protocol::Version,
+            broker: BrokerEndpoint,
+            policy: MqttTransportPolicy,
+            room: RoomId,
+            psk: PreSharedKey,
+            host_label: String,
+        }
+
+        let endpoint = default_mobile_broker_endpoint();
+        let legacy = LegacyQr {
+            v: MOBILE_QR_VERSION,
+            protocol_version: PROTOCOL_VERSION,
+            tyde_version: TYDE_VERSION,
+            broker: endpoint.clone(),
+            policy: MqttTransportPolicy::default(),
+            room: RoomId([3_u8; ROOM_ID_LEN]),
+            psk: PreSharedKey::from_slice(&[4_u8; PRE_SHARED_KEY_LEN]).expect("psk"),
+            host_label: "Legacy Host".to_owned(),
+        };
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&legacy, &mut bytes).expect("encode legacy CBOR");
+        let decoded = MobilePairingQrPayload::decode_cbor(&bytes).expect("decode legacy CBOR");
+        assert_eq!(decoded.release_version, None);
+        assert_eq!(decoded.broker, endpoint);
+        assert_eq!(decoded.host_label, "Legacy Host");
+    }
+
+    #[test]
+    fn pairing_qr_round_trips_some_release_version_and_omits_none() {
+        let version = protocol::TydeReleaseVersion::parse("0.8.19-beta.2").expect("valid version");
+        let mut payload = MobilePairingQrPayload::new(
+            PROTOCOL_VERSION,
+            default_mobile_broker_endpoint(),
+            RoomId([5_u8; ROOM_ID_LEN]),
+            PreSharedKey::from_slice(&[6_u8; PRE_SHARED_KEY_LEN]).expect("psk"),
+            "Tyde Host".to_owned(),
+        );
+        payload.release_version = Some(version.clone());
+
+        let uri = payload.to_uri().expect("encode QR URI");
+        let decoded = MobilePairingQrPayload::from_uri(&uri).expect("decode QR URI");
+        assert_eq!(decoded.release_version, Some(version));
+
+        // `new()` leaves release_version None; skip_serializing_if must omit the
+        // key entirely so the bytes match a legacy producer's.
+        let none = MobilePairingQrPayload::new(
+            PROTOCOL_VERSION,
+            default_mobile_broker_endpoint(),
+            RoomId([7_u8; ROOM_ID_LEN]),
+            PreSharedKey::from_slice(&[8_u8; PRE_SHARED_KEY_LEN]).expect("psk"),
+            "Tyde Host".to_owned(),
+        );
+        let bytes = none.encode_cbor().expect("encode none");
+        let value: ciborium::value::Value =
+            ciborium::from_reader(bytes.as_slice()).expect("decode to CBOR value");
+        let ciborium::value::Value::Map(entries) = value else {
+            panic!("expected CBOR map");
+        };
+        assert!(
+            !entries.iter().any(|(key, _)| matches!(
+                key,
+                ciborium::value::Value::Text(name) if name == "release_version"
+            )),
+            "release_version must be omitted when None"
+        );
+    }
+
+    #[test]
     fn pre_shared_key_debug_redacts_secret_material() {
         let psk = PreSharedKey::from_slice(&[9_u8; PRE_SHARED_KEY_LEN]).expect("psk");
         let encoded = psk.as_base64url_no_pad();

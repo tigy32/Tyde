@@ -4019,3 +4019,81 @@ mod tool_progress_serde_tests {
         assert_eq!(progress.agents[0].name.as_deref(), Some("Worker"));
     }
 }
+
+#[cfg(test)]
+mod release_version_back_compat_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn welcome_payload_deserializes_without_release_version() {
+        // Legacy hosts emit no `release_version`; it must default to None.
+        let legacy = json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "tyde_version": { "major": 0, "minor": 8, "patch": 14 },
+        });
+        let payload: WelcomePayload = serde_json::from_value(legacy).expect("deserialize legacy");
+        assert_eq!(payload.release_version, None);
+    }
+
+    #[test]
+    fn reject_payload_deserializes_without_release_version() {
+        let legacy = json!({
+            "code": "incompatible_protocol",
+            "message": "nope",
+            "server_protocol_version": PROTOCOL_VERSION,
+            "server_tyde_version": { "major": 0, "minor": 8, "patch": 14 },
+        });
+        let payload: RejectPayload = serde_json::from_value(legacy).expect("deserialize legacy");
+        assert_eq!(payload.release_version, None);
+    }
+
+    #[test]
+    fn welcome_payload_round_trips_some_release_version_and_omits_none() {
+        let version = TydeReleaseVersion::parse("0.8.19-beta.2").expect("valid version");
+        let payload = WelcomePayload {
+            protocol_version: PROTOCOL_VERSION,
+            tyde_version: TYDE_VERSION,
+            release_version: Some(version.clone()),
+        };
+        let encoded = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(encoded["release_version"], json!("0.8.19-beta.2"));
+        let decoded: WelcomePayload = serde_json::from_value(encoded).expect("round-trip");
+        assert_eq!(decoded.release_version, Some(version));
+
+        // `skip_serializing_if = "Option::is_none"` must omit the field entirely.
+        let none = WelcomePayload {
+            protocol_version: PROTOCOL_VERSION,
+            tyde_version: TYDE_VERSION,
+            release_version: None,
+        };
+        let encoded_none = serde_json::to_value(&none).expect("serialize none");
+        assert!(encoded_none.get("release_version").is_none());
+    }
+
+    #[test]
+    fn reject_payload_round_trips_some_release_version_and_omits_none() {
+        let version = TydeReleaseVersion::parse("0.8.20-beta.1").expect("valid version");
+        let payload = RejectPayload {
+            code: RejectCode::IncompatibleProtocol,
+            message: "drift".to_owned(),
+            server_protocol_version: PROTOCOL_VERSION,
+            server_tyde_version: TYDE_VERSION,
+            release_version: Some(version.clone()),
+        };
+        let encoded = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(encoded["release_version"], json!("0.8.20-beta.1"));
+        let decoded: RejectPayload = serde_json::from_value(encoded).expect("round-trip");
+        assert_eq!(decoded.release_version, Some(version));
+
+        let none = RejectPayload {
+            code: RejectCode::IncompatibleProtocol,
+            message: "drift".to_owned(),
+            server_protocol_version: PROTOCOL_VERSION,
+            server_tyde_version: TYDE_VERSION,
+            release_version: None,
+        };
+        let encoded_none = serde_json::to_value(&none).expect("serialize none");
+        assert!(encoded_none.get("release_version").is_none());
+    }
+}
