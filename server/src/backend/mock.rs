@@ -44,8 +44,11 @@ pub(crate) const MOCK_DUPLICATE_IDLE_SENTINEL: &str = "__mock_duplicate_idle__";
 /// task exits, which drives the agent actor into `enter_terminal_failure`.
 pub(crate) const MOCK_DIE_AFTER_BUSY_SENTINEL: &str = "__mock_die_after_busy__";
 pub(crate) const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
+pub(crate) const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str =
+    "__mock_tool_failure_without_idle__";
 const MOCK_EXIT_PLAN_MODE_SENTINEL: &str = "__mock_exit_plan_mode__";
 const MOCK_HISTORY_SENTINEL: &str = "__mock_history__";
+const MOCK_FAILED_TOOL_CALL_ID: &str = "mock-failed-tool";
 const MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID: &str = "mock-exit-plan-tool";
 const MOCK_EXIT_PLAN_MODE_PLAN: &str = "# Plan\n\nApprove the mock plan.";
 const MOCK_EXIT_PLAN_MODE_PLAN_PATH: &str = "/tmp/mock/.claude/plans/mock-plan.md";
@@ -391,6 +394,8 @@ fn start_mock_command_loop(
                 pending_exit_plan_mode = Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
             } else if initial_message.contains(MOCK_ERROR_WITHOUT_IDLE_SENTINEL) {
                 emit_mock_error(&events_tx, "mock backend emitted error without idle");
+            } else if initial_message.contains(MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL) {
+                emit_mock_tool_failure_without_idle(&events_tx);
             } else {
                 if !emit_turn(
                     &events_tx,
@@ -446,6 +451,11 @@ fn start_mock_command_loop(
                         pending_exit_plan_mode = Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
                     } else if payload.message.contains(MOCK_ERROR_WITHOUT_IDLE_SENTINEL) {
                         emit_mock_error(&events_tx, "mock backend emitted error without idle");
+                    } else if payload
+                        .message
+                        .contains(MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL)
+                    {
+                        emit_mock_tool_failure_without_idle(&events_tx);
                     } else {
                         if !emit_turn(&events_tx, &session_id_for_task, &payload.message, false)
                             .await
@@ -877,6 +887,39 @@ fn emit_mock_error(events_tx: &mpsc::UnboundedSender<ChatEvent>, message: &str) 
         context_breakdown: None,
         images: None,
     }));
+}
+
+fn emit_mock_tool_failure_without_idle(events_tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let message_id = Some(Uuid::new_v4().to_string());
+    let _ = events_tx.send(ChatEvent::TypingStatusChanged(true));
+    let _ = events_tx.send(ChatEvent::StreamStart(StreamStartData {
+        message_id: message_id.clone(),
+        agent: "mock".to_owned(),
+        model: Some(MOCK_MODEL.to_owned()),
+    }));
+    let _ = events_tx.send(ChatEvent::ToolRequest(ToolRequest {
+        tool_call_id: MOCK_FAILED_TOOL_CALL_ID.to_owned(),
+        tool_name: "Bash".to_owned(),
+        tool_type: ToolRequestType::RunCommand {
+            command: "mock interrupted command".to_owned(),
+            working_directory: "/tmp/test".to_owned(),
+        },
+    }));
+    let _ = events_tx.send(ChatEvent::ToolExecutionCompleted(
+        ToolExecutionCompletedData {
+            tool_call_id: MOCK_FAILED_TOOL_CALL_ID.to_owned(),
+            tool_name: "Bash".to_owned(),
+            tool_result: ToolExecutionResult::Error {
+                short_message: "Tool execution was interrupted".to_owned(),
+                detailed_message: "Claude history did not contain a tool_result before the conversation advanced; treating the tool as interrupted.".to_owned(),
+            },
+            success: false,
+            error: Some(
+                "Claude history did not contain a tool_result before the conversation advanced; treating the tool as interrupted."
+                    .to_owned(),
+            ),
+        },
+    ));
 }
 
 async fn maybe_spawn_native_child(

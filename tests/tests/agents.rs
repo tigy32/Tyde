@@ -450,6 +450,7 @@ fn chat_event_contains(event: &Envelope, expected_text: &str) -> bool {
 const MOCK_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_native_child__";
 const MOCK_NATIVE_CHILD_AND_DROP_SENTINEL: &str = "__mock_spawn_native_child_and_drop__";
 const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
+const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str = "__mock_tool_failure_without_idle__";
 
 async fn expect_turn_on_stream(
     client: &mut client::Connection,
@@ -513,6 +514,29 @@ async fn expect_typing_false_on_stream(client: &mut client::Connection, stream: 
     let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(false)").await;
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
     assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+}
+
+async fn expect_failed_tool_completion_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_error: &str,
+) {
+    loop {
+        let env = expect_chat_event_on_stream(client, stream, "ToolExecutionCompleted").await;
+        let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+        if let ChatEvent::ToolExecutionCompleted(completion) = event {
+            assert!(
+                !completion.success,
+                "expected failed tool completion on {stream}, got {completion:?}"
+            );
+            let error = completion.error.as_deref().unwrap_or_default();
+            assert!(
+                error.contains(expected_error),
+                "unexpected tool completion error on {stream}: {error}"
+            );
+            return;
+        }
+    }
 }
 
 async fn expect_operation_cancelled_on_stream(
@@ -995,6 +1019,77 @@ async fn agent_recovers_after_backend_error_without_idle() {
         &mut fixture.client,
         &agent_stream,
         "mock backend response to: after backend error",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn agent_recovers_after_backend_tool_failure_without_idle() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("tool-failure-recovery-agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn_agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+    let agent_stream = new_agent.instance_stream.clone();
+
+    let env = expect_next_event(&mut fixture.client, "AgentStart").await;
+    assert_eq!(env.kind, FrameKind::AgentStart);
+    assert_eq!(env.stream, agent_stream);
+
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: hello",
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message(
+            &agent_stream,
+            MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL.to_owned(),
+        )
+        .await
+        .expect("send tool failure sentinel failed");
+
+    expect_failed_tool_completion_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "history did not contain a tool_result",
+    )
+    .await;
+    expect_typing_false_on_stream(&mut fixture.client, &agent_stream).await;
+
+    fixture
+        .client
+        .send_message(&agent_stream, "after backend tool failure".to_owned())
+        .await
+        .expect("send follow-up failed");
+
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: after backend tool failure",
     )
     .await;
 }

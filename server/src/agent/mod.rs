@@ -10,7 +10,7 @@ use protocol::{
     ChatMessage, ChatMessageId, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin,
     MessageSender, QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext,
     SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues, SpawnCostHint,
-    StreamStartData, StreamTextDeltaData,
+    StreamStartData, StreamTextDeltaData, ToolExecutionCompletedData, ToolExecutionResult,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -1123,7 +1123,7 @@ pub(crate) fn spawn_agent_actor(
                         return;
                     };
                     let mut real_idle_transition = false;
-                    let mut synthesize_idle_after_error = false;
+                    let mut synthesize_idle_after_recovery = false;
                     match &event {
                         ChatEvent::MessageAdded(message) => {
                             if let Some(compaction) = active_compaction.as_mut() {
@@ -1150,7 +1150,7 @@ pub(crate) fn spawn_agent_actor(
                                         "backend error event ended active turn without idle marker"
                                     );
                                     real_idle_transition = true;
-                                    synthesize_idle_after_error = true;
+                                    synthesize_idle_after_recovery = true;
                                     in_turn = false;
                                     idle_transition_armed = false;
                                 }
@@ -1249,13 +1249,33 @@ pub(crate) fn spawn_agent_actor(
                             }).await;
                         }
                         ChatEvent::ToolExecutionCompleted(completion) => {
-                            if pending_tool_response_ids.remove(&completion.tool_call_id)
-                                && pending_tool_response_ids.is_empty()
-                                && in_turn
-                            {
+                            let completed_pending_response =
+                                pending_tool_response_ids.remove(&completion.tool_call_id);
+                            if completed_pending_response && pending_tool_response_ids.is_empty() && in_turn {
                                 idle_transition_armed = true;
                             }
+                            let interrupted_tool_ends_turn = !completed_pending_response
+                                && in_turn
+                                && pending_tool_response_ids.is_empty()
+                                && interrupted_tool_completion(completion);
+                            if interrupted_tool_ends_turn {
+                                tracing::warn!(
+                                    agent_id = %current_start.agent_id,
+                                    tool_call_id = %completion.tool_call_id,
+                                    tool_name = %completion.tool_name,
+                                    "interrupted tool completion ended active turn without idle marker"
+                                );
+                                real_idle_transition = true;
+                                synthesize_idle_after_recovery = true;
+                                in_turn = false;
+                                idle_transition_armed = false;
+                            }
                             status_handle.update(|s| {
+                                if interrupted_tool_ends_turn {
+                                    s.turn_completed = true;
+                                    s.is_thinking = false;
+                                    s.last_error = completion.error.clone();
+                                }
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
@@ -1281,7 +1301,7 @@ pub(crate) fn spawn_agent_actor(
                         &event,
                     )
                     .await;
-                    if synthesize_idle_after_error {
+                    if synthesize_idle_after_recovery {
                         append_chat_event(
                             &canonical_stream,
                             &mut event_log,
@@ -2867,6 +2887,39 @@ fn backend_session_is_resumable(backend_kind: BackendKind, session_id: &SessionI
     match backend_kind {
         BackendKind::Antigravity => is_antigravity_native_session_id(session_id),
         BackendKind::Tycode | BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex => true,
+    }
+}
+
+fn interrupted_tool_completion(completion: &ToolExecutionCompletedData) -> bool {
+    const CLAUDE_MISSING_TOOL_RESULT: &str = "history did not contain a tool_result";
+    const TOOL_INTERRUPTED: &str = "Tool execution was interrupted";
+
+    if completion.success {
+        return false;
+    }
+
+    if completion
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(CLAUDE_MISSING_TOOL_RESULT))
+    {
+        return true;
+    }
+
+    match &completion.tool_result {
+        ToolExecutionResult::Error {
+            short_message,
+            detailed_message,
+        } => {
+            short_message == TOOL_INTERRUPTED
+                && detailed_message.contains(CLAUDE_MISSING_TOOL_RESULT)
+        }
+        ToolExecutionResult::RunCommand { .. } => false,
+        ToolExecutionResult::ModifyFile { .. }
+        | ToolExecutionResult::ReadFiles { .. }
+        | ToolExecutionResult::SearchTypes { .. }
+        | ToolExecutionResult::GetTypeDocs { .. }
+        | ToolExecutionResult::Other { .. } => false,
     }
 }
 
