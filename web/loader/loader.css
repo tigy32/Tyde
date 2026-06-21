@@ -1,10 +1,26 @@
+/* Tyde web loader — the first screen a user sees. Dependency-free (no external
+   fonts/CDNs, to stay within the strict CSP), mobile-first, safe-area aware.
+   Intentionally self-contained: this styles ONLY the thin pairing/boot shell;
+   the versioned app ships and injects its own stylesheet once booted. */
+
 :root {
   color-scheme: dark;
   --bg: #0b0f14;
+  --bg-elev: #121821;
+  --card: #141b25;
+  --border: #243040;
   --fg: #e8edf3;
   --muted: #8b95a5;
   --accent: #3b82f6;
+  --accent-press: #2f6fd6;
   --error: #f87171;
+  --radius: 16px;
+  --gap: 16px;
+  /* Safe-area insets (iOS notch / home indicator); 0 on browsers without them. */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
 }
 
 * {
@@ -18,8 +34,10 @@ body {
   min-height: 100dvh;
   background: var(--bg);
   color: var(--fg);
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
-    sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+    "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 #app-root {
@@ -28,20 +46,65 @@ body {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  padding: 28px;
+  align-items: center;
+  padding: calc(24px + var(--safe-top)) calc(20px + var(--safe-right))
+    calc(24px + var(--safe-bottom)) calc(20px + var(--safe-left));
 }
 
+/* Each pairing/boot stage is a `.view`. Exactly one is shown at a time via the
+   `hidden` attribute. NOTE: `.view { display: flex }` would otherwise override
+   the UA `[hidden] { display: none }` rule and render every stage stacked at
+   once — this explicit override is load-bearing, not cosmetic. */
 .view {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+}
+
+.view[hidden] {
+  display: none;
+}
+
+/* Centered card. */
+.card {
+  width: 100%;
+  max-width: 420px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  max-width: 460px;
-  margin: 0 auto;
-  width: 100%;
+  gap: var(--gap);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 28px 24px;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset,
+    0 18px 50px -20px rgba(0, 0, 0, 0.65);
+}
+
+/* Brand lockup: a rounded "T" mark next to the wordmark. */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 11px;
+  background: linear-gradient(160deg, var(--accent), #6aa6ff);
+  color: #fff;
+  font-size: 22px;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.04em;
+  box-shadow: 0 6px 18px -8px rgba(59, 130, 246, 0.8);
 }
 
 .logo {
-  font-size: 28px;
+  font-size: 26px;
   font-weight: 700;
   letter-spacing: -0.03em;
 }
@@ -49,69 +112,153 @@ body {
 .status {
   color: var(--fg);
   font-size: 16px;
-  line-height: 1.45;
+  line-height: 1.5;
   margin: 0;
+}
+
+.status.muted {
+  color: var(--muted);
 }
 
 .status.error {
   color: var(--error);
+  font-weight: 600;
 }
 
 .hint {
   color: var(--muted);
   font-size: 13px;
-  line-height: 1.45;
+  line-height: 1.5;
   margin: 0;
 }
 
+.hint:empty {
+  display: none;
+}
+
 .mono {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   word-break: break-word;
 }
 
-button.primary {
+/* Buttons. `.primary` is the obvious action; `.secondary` is a calmer
+   alternative. Both are full-width and touch-comfortable (>=48px tall). */
+.btn {
   appearance: none;
-  border: none;
+  -webkit-appearance: none;
+  display: block;
+  width: 100%;
+  border: 1px solid transparent;
   border-radius: 12px;
-  background: var(--accent);
-  color: #fff;
   font-size: 16px;
   font-weight: 600;
   padding: 14px 16px;
+  min-height: 50px;
   cursor: pointer;
+  transition: background-color 0.12s ease, border-color 0.12s ease,
+    filter 0.12s ease;
 }
 
-button.primary:active {
-  filter: brightness(0.9);
+.btn.primary {
+  background: var(--accent);
+  color: #fff;
 }
 
+.btn.primary:active {
+  background: var(--accent-press);
+}
+
+.btn.secondary {
+  background: transparent;
+  color: var(--fg);
+  border-color: var(--border);
+}
+
+.btn.secondary:active {
+  background: var(--bg-elev);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* `.btn { display: block }` would otherwise beat the UA `[hidden]` rule, so the
+   scan button must be hidden explicitly — load-bearing for the Safari/iOS path
+   where scanning is unsupported and the button is set hidden. */
+.btn[hidden] {
+  display: none;
+}
+
+/* Paste fallback. */
 .paste {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
 
 .paste label {
-  color: var(--muted);
-  font-size: 13px;
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .paste textarea {
   width: 100%;
   border-radius: 12px;
-  border: 1px solid #243040;
-  background: #0f151c;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
   color: var(--fg);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 13px;
-  padding: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 12px 14px;
   resize: vertical;
+  min-height: 84px;
 }
 
+.paste textarea::placeholder {
+  color: var(--muted);
+}
+
+.paste textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+}
+
+/* Live camera preview while scanning. */
 #scan-video {
   width: 100%;
   max-height: 320px;
   border-radius: 12px;
+  border: 1px solid var(--border);
   background: #000;
   object-fit: cover;
+}
+
+#scan-video[hidden] {
+  display: none;
+}
+
+/* Boot spinner. */
+.spinner {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
 }

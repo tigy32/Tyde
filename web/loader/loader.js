@@ -14,6 +14,8 @@
 import { parsePairingUri } from "./pairing.js";
 import { resolveBootTarget } from "./manifest-policy.js";
 import { verifyArtifacts } from "./integrity.js";
+import { resolveBundleStylesheets } from "./styles.js";
+import { detectScanCapability, pairingUiState } from "./pairing-ui.js";
 
 const MANIFEST_URL = "./manifest.json";
 export const STORAGE_KEY = "tyde.loader.version"; // last successfully-paired version
@@ -129,6 +131,12 @@ async function bootTarget(target) {
     return;
   }
 
+  // Inject the bundle's own stylesheet(s) before its entry script so the
+  // mounted Leptos app is styled (the entry <script> alone carries no CSS). The
+  // hrefs come from the version's index.html and are confined to the version
+  // path; failure here is non-fatal so a styling hiccup never blocks the boot.
+  await injectBundleStyles(target);
+
   const script = document.createElement("script");
   script.type = "module";
   script.src = target.entry; // manifest-controlled, validated `/tyde/...` path
@@ -146,6 +154,54 @@ async function bootTarget(target) {
     );
   });
   document.head.appendChild(script);
+}
+
+// Fetches the resolved version's own index.html, extracts its same-origin
+// `<link rel="stylesheet">` tags (confined to the version directory, SRI
+// preserved), and injects them into the loader document so the booted app has
+// its CSS. Best-effort: any failure is swallowed — the app still boots, just
+// unstyled, which is strictly better than aborting the boot.
+async function injectBundleStyles(target) {
+  try {
+    const indexPath = target.path + "index.html";
+    const origin = typeof location !== "undefined" ? location.origin : null;
+    // Absolute base so relative hrefs in the bundle index resolve correctly.
+    const baseHref = origin
+      ? new URL(indexPath, origin).href
+      : "https://loader.invalid" + indexPath;
+
+    const response = await fetch(indexPath, { cache: "no-store" });
+    if (!response.ok) return;
+    const html = await response.text();
+
+    const sheets = resolveBundleStylesheets(html, {
+      baseHref,
+      versionPath: target.path,
+      origin,
+    });
+
+    const existing = new Set(
+      Array.from(document.querySelectorAll('link[rel="stylesheet"]')).map((l) =>
+        l.getAttribute("href"),
+      ),
+    );
+    for (const sheet of sheets) {
+      if (existing.has(sheet.href)) continue;
+      const link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href = sheet.href;
+      // Preserve the bundle's declared SRI + crossorigin verbatim. The
+      // stylesheet is same-origin (integrity works without CORS), so we do NOT
+      // synthesize a crossOrigin the bundle didn't declare — mirroring exactly
+      // how the bundle's own index.html loads it.
+      if (sheet.integrity) link.integrity = sheet.integrity;
+      if (sheet.crossorigin !== null) link.crossOrigin = sheet.crossorigin;
+      document.head.appendChild(link);
+      existing.add(sheet.href);
+    }
+  } catch {
+    // Styling is best-effort; never block the boot on it.
+  }
 }
 
 function rememberVersion(version) {
@@ -293,6 +349,25 @@ function registerServiceWorker() {
   });
 }
 
+// Applies a `pairingUiState` to the pair screen: lead with scanning where the
+// browser supports it, otherwise hide the scan button and make the paste flow
+// the obvious primary action. Returns the state so callers can decide whether
+// to wire up the scan button at all.
+function applyPairingUi(state) {
+  if (ui.scanButton) {
+    ui.scanButton.hidden = state.scanButtonHidden;
+    ui.scanButton.classList.toggle("primary", state.scanButtonPrimary);
+    ui.scanButton.classList.toggle("secondary", !state.scanButtonPrimary);
+  }
+  if (ui.connectButton) {
+    ui.connectButton.classList.toggle("primary", state.pastePrimary);
+    ui.connectButton.classList.toggle("secondary", !state.pastePrimary);
+  }
+  if (ui.pairStatus) ui.pairStatus.textContent = state.instruction;
+  if (ui.pasteLabel) ui.pasteLabel.textContent = state.pasteLabel;
+  return state;
+}
+
 // --- Entry point -----------------------------------------------------------
 
 async function init() {
@@ -307,7 +382,10 @@ async function init() {
   ui.scanStatus = $("scan-status");
   ui.pasteForm = $("paste-form");
   ui.pasteInput = $("paste-input");
+  ui.pasteLabel = $("paste-label");
+  ui.connectButton = $("connect-button");
   ui.scanButton = $("scan-button");
+  ui.pairStatus = $("pair-status");
   ui.retryButton = $("retry-button");
 
   // Bind the retry button FIRST, before any early return below, so a
@@ -354,7 +432,14 @@ async function init() {
     forgetVersion();
   }
 
-  // Pairing flow.
+  // Pairing flow. Decide the layout from real browser capability FIRST so the
+  // pair screen never leads with a scan button on a browser that can't scan
+  // (e.g. Safari/iOS), then reveal it.
+  const capability = detectScanCapability(
+    typeof window !== "undefined" ? window : undefined,
+    typeof navigator !== "undefined" ? navigator : undefined,
+  );
+  const state = applyPairingUi(pairingUiState(capability));
   show("pair");
   if (ui.pasteForm) {
     ui.pasteForm.addEventListener("submit", (event) => {
@@ -363,7 +448,9 @@ async function init() {
       void handlePairingUri(value, manifest);
     });
   }
-  if (ui.scanButton) {
+  // Only wire scanning where it actually works; otherwise the button stays
+  // hidden and the paste flow carries the user.
+  if (ui.scanButton && state.scanAvailable) {
     ui.scanButton.addEventListener("click", () => void startScan(manifest));
   }
 }

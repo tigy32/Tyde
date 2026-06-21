@@ -49,43 +49,70 @@
   <body>
     <main id="app-root">
       <section id="view-loading" class="view">
-        <div class="logo">Tyde</div>
-        <p class="status">Loading…</p>
+        <div class="card">
+          <div class="brand">
+            <span class="logo-mark" aria-hidden="true">T</span>
+            <span class="logo">Tyde</span>
+          </div>
+          <p class="status muted">Loading…</p>
+        </div>
       </section>
 
       <section id="view-pair" class="view" hidden>
-        <div class="logo">Tyde</div>
-        <p class="status">Pair with a Tyde host to begin.</p>
+        <div class="card">
+          <div class="brand">
+            <span class="logo-mark" aria-hidden="true">T</span>
+            <span class="logo">Tyde</span>
+          </div>
+          <p id="pair-status" class="status">Connect to your Tyde host to begin.</p>
 
-        <button id="scan-button" type="button" class="primary">Scan QR code</button>
-        <video id="scan-video" playsinline muted hidden></video>
-        <p id="scan-status" class="hint"></p>
+          <!-- Scan is hidden by default and revealed by loader.js only when the
+               browser actually supports camera scanning, so Safari/iOS — which
+               cannot scan — never sees a button that just errors. -->
+          <button id="scan-button" type="button" class="btn secondary" hidden>
+            Scan QR code
+          </button>
+          <video id="scan-video" playsinline muted hidden></video>
+          <p id="scan-status" class="hint"></p>
 
-        <form id="paste-form" class="paste">
-          <label for="paste-input">Or paste the pairing code</label>
-          <textarea
-            id="paste-input"
-            name="paste-input"
-            rows="3"
-            placeholder="tyde-pair://v1?…"
-            autocapitalize="off"
-            autocomplete="off"
-            spellcheck="false"
-          ></textarea>
-          <button type="submit" class="primary">Connect</button>
-        </form>
+          <form id="paste-form" class="paste">
+            <label id="paste-label" for="paste-input">Paste the pairing code from your Tyde host</label>
+            <textarea
+              id="paste-input"
+              name="paste-input"
+              rows="3"
+              placeholder="tyde-pair://v1?…"
+              autocapitalize="off"
+              autocomplete="off"
+              autocorrect="off"
+              spellcheck="false"
+            ></textarea>
+            <button id="connect-button" type="submit" class="btn primary">Connect</button>
+          </form>
+        </div>
       </section>
 
       <section id="view-booting" class="view" hidden>
-        <div class="logo">Tyde</div>
-        <p class="status">Starting client v<span id="booting-version"></span>…</p>
+        <div class="card">
+          <div class="brand">
+            <span class="logo-mark" aria-hidden="true">T</span>
+            <span class="logo">Tyde</span>
+          </div>
+          <p class="status muted">Starting client v<span id="booting-version"></span>…</p>
+          <div class="spinner" aria-hidden="true"></div>
+        </div>
       </section>
 
       <section id="view-error" class="view" hidden>
-        <div class="logo">Tyde</div>
-        <p id="error-message" class="status error"></p>
-        <p id="error-detail" class="hint mono"></p>
-        <button id="retry-button" type="button" class="primary">Try again</button>
+        <div class="card">
+          <div class="brand">
+            <span class="logo-mark" aria-hidden="true">T</span>
+            <span class="logo">Tyde</span>
+          </div>
+          <p id="error-message" class="status error"></p>
+          <p id="error-detail" class="hint mono"></p>
+          <button id="retry-button" type="button" class="btn primary">Try again</button>
+        </div>
       </section>
     </main>
 
