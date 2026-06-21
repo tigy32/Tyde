@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+
+    <!--
+      Strict Content Security Policy. The load-bearing directive is
+      `script-src 'self'`: only same-origin scripts may execute, and the
+      versioned bundle is additionally pinned with Subresource Integrity when
+      the loader injects it. No third-party JS is ever allowed.
+
+      `connect-src` permits the WASM app to reach the wss broker and to fetch
+      the manifest/bundle. `style-src` allows inline styles because the injected
+      Leptos app styles itself with inline <style>/style= (these are not a
+      script-execution vector). `frame-ancestors` cannot be set via <meta>; the
+      Phase 6 deploy MUST also send it (and ideally this whole policy) as an
+      HTTP response header. See web/README.md.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' https: wss:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'"
+    />
+
+    <title>Tyde</title>
+
+    <!-- PWA -->
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <meta name="theme-color" content="#0b0f14" />
+
+    <!-- iOS "Add to Home Screen" -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Tyde" />
+    <link rel="apple-touch-icon" href="./icons/icon-180.png" />
+
+    <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./loader.css" />
+  </head>
+  <body>
+    <main id="app-root">
+      <section id="view-loading" class="view">
+        <div class="logo">Tyde</div>
+        <p class="status">Loading…</p>
+      </section>
+
+      <section id="view-pair" class="view" hidden>
+        <div class="logo">Tyde</div>
+        <p class="status">Pair with a Tyde host to begin.</p>
+
+        <button id="scan-button" type="button" class="primary">Scan QR code</button>
+        <video id="scan-video" playsinline muted hidden></video>
+        <p id="scan-status" class="hint"></p>
+
+        <form id="paste-form" class="paste">
+          <label for="paste-input">Or paste the pairing code</label>
+          <textarea
+            id="paste-input"
+            name="paste-input"
+            rows="3"
+            placeholder="tyde-pair://v1?…"
+            autocapitalize="off"
+            autocomplete="off"
+            spellcheck="false"
+          ></textarea>
+          <button type="submit" class="primary">Connect</button>
+        </form>
+      </section>
+
+      <section id="view-booting" class="view" hidden>
+        <div class="logo">Tyde</div>
+        <p class="status">Starting client v<span id="booting-version"></span>…</p>
+      </section>
+
+      <section id="view-error" class="view" hidden>
+        <div class="logo">Tyde</div>
+        <p id="error-message" class="status error"></p>
+        <p id="error-detail" class="hint mono"></p>
+        <button id="retry-button" type="button" class="primary">Try again</button>
+      </section>
+    </main>
+
+    <script type="module" src="./loader.js"></script>
+  </body>
+</html>
