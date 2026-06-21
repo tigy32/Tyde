@@ -6,6 +6,10 @@ edition.workspace = true
 protocol = { path = "../protocol", default-features = false }
 host-config = { path = "../host-config" }
 mobile-shell-types = { path = "../mobile-shell-types" }
+# Direct-to-wasm MQTT transport for the browser (PWA) backend. The native
+# target also compiles this (rumqttc backend) so the runtime-detect shell
+# builds without any cfg split; only the wasm bundle actually runs the web path.
+mqtt-transport = { path = "../mqtt-transport" }
 leptos = { version = "0.8.17", features = ["csr"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -13,6 +17,9 @@ serde-wasm-bindgen = "0.6"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
+uuid = { version = "1", features = ["v4", "js"] }
+sha2 = "0.11.0"
+base64 = { workspace = true }
 web-sys = { version = "0.3", features = [
     "Clipboard",
     "Document",
@@ -21,17 +28,42 @@ web-sys = { version = "0.3", features = [
     "EventTarget",
     "HtmlElement",
     "HtmlTextAreaElement",
+    "HtmlMediaElement",
+    "HtmlVideoElement",
+    "MediaStream",
+    "MediaStreamTrack",
+    "MediaStreamConstraints",
+    "MediaDevices",
     "Navigator",
     "Node",
     "NodeList",
     "Storage",
     "Window",
     "console",
+    "IdbFactory",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbDatabase",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbObjectStore",
+    "IdbVersionChangeEvent",
+    "DomException",
+    "DomStringList",
 ] }
 log = "0.4"
 console_log = "1"
 console_error_panic_hook = "0.1"
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+
+# Native (compile-gate only) timers come from tokio::time; the wasm bundle uses
+# wasmtimer because tokio's `time` driver does not run on wasm32.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "io-util"] }
+wasmtimer = "0.4"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

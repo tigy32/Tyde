@@ -3700,6 +3700,7 @@ dependencies = [
 name = "mobile-frontend"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "console_error_panic_hook",
  "console_log",
  "host-config",
@@ -3707,14 +3708,19 @@ dependencies = [
  "leptos",
  "log",
  "mobile-shell-types",
+ "mqtt-transport",
  "protocol",
  "pulldown-cmark",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
+ "wasmtimer",
  "web-sys",
 ]
 

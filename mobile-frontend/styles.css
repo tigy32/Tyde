@@ -3319,3 +3319,46 @@ input, textarea, select {
     padding-top: var(--safe-area-top);
     padding-bottom: var(--safe-area-bottom);
 }
+
+/* In-app confirmation modal (ConfirmModal) — replaces window.confirm. */
+.confirm-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1.5rem;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+}
+
+.confirm-modal {
+    width: 100%;
+    max-width: 22rem;
+    border-radius: 1rem;
+    padding: 1.25rem;
+    background: var(--surface, #1c1c1e);
+    color: var(--text, #fff);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+.confirm-modal-title {
+    margin: 0 0 0.5rem;
+    font-size: 1.1rem;
+    font-weight: 600;
+}
+
+.confirm-modal-message {
+    margin: 0 0 1.25rem;
+    font-size: 0.95rem;
+    line-height: 1.4;
+    opacity: 0.85;
+}
+
+.confirm-modal-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
