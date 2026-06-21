@@ -63,6 +63,18 @@ test("loader.js performs the handoff: observe #app-root, hide #loader-shell", ()
   assert.match(loaderJs, /showLoaderShell/);
 });
 
+test("loader.js boots Trunk-style: dynamic import + init({module_or_path})", () => {
+  // The entry module only EXPORTS init; a bare <script src> would load it but
+  // never instantiate the wasm. The loader must import() the entry and call its
+  // init() with the explicit hashed wasm path.
+  assert.match(loaderJs, /await import\(/, "expected a dynamic import of the entry module");
+  assert.match(loaderJs, /module_or_path:/, "expected init() to receive an explicit wasm path");
+  assert.match(loaderJs, /selectBootUrls/, "expected the entry/wasm URLs to be resolved from the verified target");
+  // The old, broken boot (a <script type=module src> that never calls init)
+  // must be gone.
+  assert.doesNotMatch(loaderJs, /script\.src\s*=\s*target\.entry/, "the <script src> entry injection must be removed");
+});
+
 test("loader.css hides #loader-shell when the hidden attribute is set", () => {
   assert.match(loaderCss, /#loader-shell\[hidden\]\s*\{\s*display:\s*none/);
 });

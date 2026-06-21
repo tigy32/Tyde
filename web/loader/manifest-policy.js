@@ -181,3 +181,52 @@ export function resolveBootTarget(version, manifest) {
     artifacts,
   };
 }
+
+// Selects the two URLs the loader dynamically imports to boot a Trunk bundle:
+// the entry ES module (`entryUrl`) and the explicit hashed `…_bg.wasm` the
+// module's default `init()` must be called with (`wasmUrl`).
+//
+// WHY this is needed: Trunk's wasm-bindgen entry JS only EXPORTS its init
+// (`export { __wbg_init as default }`) — it does NOT auto-run. And the entry's
+// built-in default wasm path (from `import.meta.url`) is the UNHASHED
+// `…_bg.wasm`, which does not exist (the real file is content-hashed). So the
+// loader must dynamically `import()` the entry and call its `init()` with the
+// real hashed wasm path explicitly.
+//
+// Both URLs come straight from the already-validated, already-SRI-verified
+// `target` (its `entry` and `artifacts`), NOT from the QR or a re-fetched
+// index.html — so the dynamic `import()`/`init()` read exactly the bytes
+// integrity.js verified and cached. Defense in depth: each URL is re-confined to
+// the version's own `/tyde/v<ver>/` directory (`target.path`) and screened for
+// traversal, even though resolveBootTarget already vetted them. Returns
+// `{ ok: true, entryUrl, wasmUrl }` or `{ ok: false, reason }` where reason is
+// `bad-target` | `bad-entry-path` | `no-wasm-artifact`.
+export function selectBootUrls(target) {
+  if (!target || typeof target !== "object") {
+    return { ok: false, reason: "bad-target" };
+  }
+  const versionPath = typeof target.path === "string" ? target.path : null;
+  if (!versionPath || !versionPath.startsWith("/tyde/")) {
+    return { ok: false, reason: "bad-target" };
+  }
+  const underVersion = (url) =>
+    typeof url === "string" &&
+    url.startsWith(versionPath) &&
+    !url.includes("..") &&
+    !url.includes("\\") &&
+    !/%2e|%2f|%5c/i.test(url);
+
+  const entryUrl = target.entry;
+  if (!underVersion(entryUrl)) return { ok: false, reason: "bad-entry-path" };
+
+  const wasm = Array.isArray(target.artifacts)
+    ? target.artifacts.find(
+        (a) => a && typeof a.url === "string" && a.url.endsWith("_bg.wasm"),
+      )
+    : null;
+  if (!wasm || !underVersion(wasm.url)) {
+    return { ok: false, reason: "no-wasm-artifact" };
+  }
+
+  return { ok: true, entryUrl, wasmUrl: wasm.url };
+}

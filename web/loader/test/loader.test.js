@@ -9,7 +9,7 @@ import {
   extractPairingUri,
   MAX_URI_LEN,
 } from "../pairing.js";
-import { resolveBootTarget, compareVersions } from "../manifest-policy.js";
+import { resolveBootTarget, compareVersions, selectBootUrls } from "../manifest-policy.js";
 import {
   REAL_WITH_PRERELEASE,
   REAL_STABLE,
@@ -265,6 +265,57 @@ test("resolveBootTarget rejects a bad artifact path or integrity", () => {
     },
   };
   assert.equal(resolveBootTarget("1.2.3", artifactsNotObject).reason, "bad-integrity");
+});
+
+// --- selectBootUrls (Trunk-style dynamic-import boot) ----------------------
+
+test("selectBootUrls picks the entry module + hashed _bg.wasm from the target", () => {
+  const target = resolveBootTarget("0.8.19-beta.2", EXAMPLE_MANIFEST);
+  assert.equal(target.ok, true);
+  const urls = selectBootUrls(target);
+  assert.deepEqual(urls, {
+    ok: true,
+    entryUrl: "/tyde/v0.8.19-beta.2/tyde-mobile.js",
+    wasmUrl: "/tyde/v0.8.19-beta.2/tyde-mobile_bg.wasm",
+  });
+});
+
+test("selectBootUrls fails closed when no _bg.wasm artifact is present", () => {
+  const target = {
+    version: "1.2.3",
+    path: "/tyde/v1.2.3/",
+    entry: "/tyde/v1.2.3/app.js",
+    artifacts: [{ url: "/tyde/v1.2.3/app.js", integrity: "sha384-x" }],
+  };
+  assert.equal(selectBootUrls(target).reason, "no-wasm-artifact");
+});
+
+test("selectBootUrls re-confines both URLs to the version directory", () => {
+  // Entry outside the version path → rejected.
+  assert.equal(
+    selectBootUrls({
+      version: "1.2.3",
+      path: "/tyde/v1.2.3/",
+      entry: "/tyde/v9.9.9/app.js",
+      artifacts: [{ url: "/tyde/v1.2.3/app_bg.wasm", integrity: "sha384-x" }],
+    }).reason,
+    "bad-entry-path",
+  );
+  // Wasm artifact outside the version path → rejected as if absent.
+  assert.equal(
+    selectBootUrls({
+      version: "1.2.3",
+      path: "/tyde/v1.2.3/",
+      entry: "/tyde/v1.2.3/app.js",
+      artifacts: [{ url: "/tyde/v9.9.9/app_bg.wasm", integrity: "sha384-x" }],
+    }).reason,
+    "no-wasm-artifact",
+  );
+});
+
+test("selectBootUrls rejects a malformed target", () => {
+  assert.equal(selectBootUrls(null).reason, "bad-target");
+  assert.equal(selectBootUrls({ path: "/evil/v1/", entry: "/evil/v1/x.js" }).reason, "bad-target");
 });
 
 // --- #9 percent-encoded / off-origin path rejection -------------------------

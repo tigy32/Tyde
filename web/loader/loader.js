@@ -12,7 +12,7 @@
 // versioned, so every byte here is permanent surface.
 
 import { parsePairingUri, extractPairingUri } from "./pairing.js";
-import { resolveBootTarget } from "./manifest-policy.js";
+import { resolveBootTarget, selectBootUrls } from "./manifest-policy.js";
 import { verifyArtifacts } from "./integrity.js";
 import { resolveBundleStylesheets } from "./styles.js";
 import { detectScanCapability, pairingUiState } from "./pairing-ui.js";
@@ -121,11 +121,20 @@ async function deleteCachedArtifacts(target) {
   }
 }
 
-// Boots a resolved target: SRI-verify every executable artifact, then inject
-// the entry module. The URLs and integrity hashes come entirely from the
-// manifest — never from the QR text — and the page CSP
-// (`script-src 'self' 'wasm-unsafe-eval'`) confines execution to same-origin
-// scripts plus wasm compilation.
+// Boots a resolved target: SRI-verify every executable artifact, then run the
+// Trunk-style boot — dynamically `import()` the entry module and call its
+// default `init()` with the explicit hashed wasm path. The URLs and integrity
+// hashes come entirely from the manifest — never from the QR text — and the page
+// CSP (`script-src 'self' 'wasm-unsafe-eval'`) confines execution to same-origin
+// modules plus wasm compilation.
+//
+// Why a dynamic import and not a `<script type="module" src>`: Trunk's
+// wasm-bindgen entry only EXPORTS its init; a bare `<script src>` loads the
+// module but never calls init(), so the wasm is never instantiated and the app
+// never mounts. We import the module and invoke init() ourselves, passing the
+// real hashed `…_bg.wasm` (the entry's built-in default path is the unhashed,
+// nonexistent name). Both URLs are the artifacts integrity.js already verified
+// and cached, so the import reads exactly those verified bytes.
 async function bootTarget(target) {
   show("booting");
   if (ui.bootingVersion) ui.bootingVersion.textContent = target.version;
@@ -157,41 +166,62 @@ async function bootTarget(target) {
   // path; failure here is non-fatal so a styling hiccup never blocks the boot.
   await injectBundleStyles(target);
 
-  const script = document.createElement("script");
-  script.type = "module";
-  script.src = target.entry; // manifest-controlled, validated `/tyde/...` path
-  script.integrity = target.integrity; // manifest-controlled SRI digest
-  script.crossOrigin = "anonymous";
-  script.addEventListener("error", () => {
-    // Defense in depth: if the entry still fails to load (e.g. a poisoned cache
-    // entry slips past), purge the cached artifacts so a transient tampered 200
-    // can't wedge the user in permanent SRI-failure, and fall back to pairing.
-    void deleteCachedArtifacts(target);
+  // Resolve the EXPLICIT entry + hashed-wasm URLs from the verified target.
+  const urls = selectBootUrls(target);
+  if (!urls.ok) {
+    await deleteCachedArtifacts(target);
     forgetVersion();
-    // setError re-shows the shell, so a failure after we (somehow) hid it still
-    // surfaces the error view rather than a blank page.
     setError(
-      "The client bundle failed its integrity check or could not load.",
-      `version ${target.version}`,
+      "The client failed to start.",
+      `version ${target.version}: ${urls.reason}`,
     );
-  });
-  document.head.appendChild(script);
+    return;
+  }
 
   // Boot handoff: the app mounts into the SEPARATE #app-root (see index.html).
-  // Watch for its first appended child and, when it appears, hide the loader
-  // chrome so the styled app replaces the boot spinner. Without this the app
-  // mounts but stays hidden behind the still-visible "booting" view forever.
-  setUpBootHandoff(script);
+  // Set the observer up BEFORE init() runs so a mount that happens synchronously
+  // during init() is not missed; `finalizeHandoff` is invoked once init()
+  // resolves to hand off immediately if the app already produced DOM.
+  const finalizeHandoff = setUpBootHandoff();
+
+  try {
+    // Same-origin ES module — permitted by `script-src 'self'`. The SW serves
+    // the verified, cached bytes for this `/tyde/v<ver>/…` path.
+    const mod = await import(urls.entryUrl);
+    const initFn = mod && (mod.default || mod.init);
+    if (typeof initFn !== "function") {
+      throw new Error("entry module exposes no init()");
+    }
+    // Explicit hashed wasm path; `'wasm-unsafe-eval'` permits the compilation.
+    await initFn({ module_or_path: urls.wasmUrl });
+  } catch (err) {
+    // Defense in depth: if the boot fails (bad import, wasm instantiate error, a
+    // poisoned cache entry slipping past), purge the cached artifacts so a
+    // transient tampered 200 can't wedge the user in permanent failure, forget
+    // the version, and surface the error. setError re-shows the shell, so a
+    // failure after we (somehow) hid it still shows the error view, not a blank
+    // page.
+    await deleteCachedArtifacts(target);
+    forgetVersion();
+    setError(
+      "The client failed to start.",
+      String(err && err.message ? err.message : err),
+    );
+    return;
+  }
+
+  // init() resolved: the app has mounted (or will imminently). Hand off now if
+  // it already produced DOM in #app-root; the observer covers a late mount.
+  finalizeHandoff();
 }
 
-// Hides #loader-shell once the app actually mounts into #app-root. Uses a
-// MutationObserver for the precise moment, plus a timer fallback (started on the
-// entry script's `load`) in case the observer misses the mount. The error path
-// never triggers either, so a failed boot keeps the shell (and its error view)
-// visible.
-function setUpBootHandoff(script) {
+// Hides #loader-shell once the app actually mounts into #app-root. Sets up a
+// MutationObserver for the precise moment and returns a `finalize` callback the
+// caller invokes once init() resolves. The error path calls neither, so a failed
+// boot keeps the shell (and its error view) visible.
+function setUpBootHandoff() {
   const appRoot = document.getElementById("app-root");
-  if (!appRoot) return;
+  if (!appRoot) return () => {};
 
   let handed = false;
   const handoff = () => {
@@ -213,17 +243,20 @@ function setUpBootHandoff(script) {
     observer.observe(appRoot, { childList: true });
   }
 
-  // Safety net: once the entry module has loaded, give it a few seconds to
-  // mount, then hand off anyway IF the app actually produced DOM in #app-root.
-  // The child guard means a script that loads but never mounts (so the error
+  // Called once init() resolves. Common case: the Leptos app mounted
+  // synchronously during init(), so #app-root already has children → hand off
+  // now. Otherwise give an async mount a few seconds, then hand off only IF it
+  // actually produced DOM — so an app that loads but never mounts (the error
   // view should win) does not get the shell yanked out from under it.
-  if (script && typeof script.addEventListener === "function") {
-    script.addEventListener("load", () => {
-      setTimeout(() => {
-        if (appRoot.childNodes.length > 0) handoff();
-      }, 4000);
-    });
-  }
+  return () => {
+    if (appRoot.childNodes.length > 0) {
+      handoff();
+      return;
+    }
+    setTimeout(() => {
+      if (appRoot.childNodes.length > 0) handoff();
+    }, 4000);
+  };
 }
 
 // Fetches the resolved version's own index.html, extracts its same-origin
