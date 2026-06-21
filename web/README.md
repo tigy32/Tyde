@@ -146,32 +146,93 @@ forged/stale stash is rejected by the app's parse and cleared on read.
   forgets the stored version, and returns to pairing so the user re-scans the
   new QR and boots the matching bundle.
 
-## Phase 6 (deploy — OUT OF SCOPE here) will:
+## Phase 6 — deploy (`web/deploy/`)
 
-1. Build each release's `mobile-frontend` bundle with `trunk build --release`
-   (with `wasm-opt` installed, per Phase 0) into `/tyde/v<version>/`. Trunk
-   emits hash-stamped filenames; the entry module path is the value that goes
-   into the manifest's `entry`.
-2. **Generate `manifest.json`** by computing the SRI digest of **every
-   executable artifact** of the version — the entry `.js`, the `.wasm`, AND any
-   code-split chunks — not just the entry. Per artifact:
+Phase 6 tooling lives in `web/deploy/`:
+
+| File | Role |
+| --- | --- |
+| `deploy.sh` | One-command deploy: build bundle → generate manifest → sync loader + versioned bundle → invalidate. **Dry-run by default.** |
+| `generate-manifest.mjs` | Node, no deps. Hashes every executable artifact of a built `dist/` and merges a version record into `manifest.json` (additive). |
+| `cloudfront-setup.md` | One-time manual CloudFront setup: a `tyde/*` cache behavior + a CSP/HSTS/CORS `ResponseHeadersPolicy`. Owner runs it once. |
+
+### Where it publishes (ground truth)
+
+```
+tycode.dev → CloudFront E3JJ1OF4I8TP6U → S3 bucket tycode-static (us-west-2)
+our prefix → s3://tycode-static/tyde/         (loader shell, additive)
+           → s3://tycode-static/tyde/v<ver>/  (immutable app bundle)
+```
+
+`tycode-static` **already serves the live marketing site** at the bucket root
+(`index.html`, `blog.html`, `posts/…`, …). The deploy only ever writes under
+`tyde/`.
+
+### Runbook
+
+```sh
+# 0. One time only: add the tyde/* CloudFront behavior + security headers.
+#    Follow web/deploy/cloudfront-setup.md (owner runs it; not automated).
+
+# 1. ALWAYS dry-run first (default). Builds nothing, mutates nothing — it runs
+#    `aws s3 sync --dryrun` so you can confirm every write is under tyde/ with
+#    no deletes, and SKIPS the CloudFront invalidation.
+web/deploy/deploy.sh
+
+# 2. Real deploy. Version defaults to tools/check_release_version.py; pass one
+#    explicitly only if it matches the repo's canonical version.
+web/deploy/deploy.sh --confirm
+web/deploy/deploy.sh 0.8.19-beta.2 --confirm
+```
+
+`deploy.sh --confirm` then:
+
+1. `trunk build --release --public-url /tyde/v<ver>/` of `mobile-frontend` →
+   its `dist/` (Trunk emits hash-stamped filenames).
+2. `generate-manifest.mjs` computes **sha384** SRI for **every** executable
+   artifact — entry `.js`, the `.wasm`, and any chunks/snippets — and merges a
+   `{ path, entry, integrity, artifacts: { "<path>": "<sri>" } }` record into
+   `web/loader/manifest.json` (preserving other versions, `minSupported`,
+   `blocked`). The loader rejects the boot if ANY listed artifact's bytes don't
+   match, so the generator enumerates them all. Equivalent per-artifact hash:
 
    ```sh
    echo "sha384-$(openssl dgst -sha384 -binary <artifact> | openssl base64 -A)"
    ```
 
-   then merging a `{ path, entry, integrity, artifacts: { "<path>": "<sri>" } }`
-   record into `versions` (entry hash in `integrity`; wasm + chunk hashes in
-   `artifacts`), and setting `minSupported`/`blocked` per release policy. The
-   loader rejects the boot if ANY listed artifact's bytes don't match, so the
-   generator MUST enumerate them all. The manifest is the *server-controlled*
-   allowlist — published by the pipeline, not by any host.
-3. Publish `web/loader/` to the origin root (`/tyde/`) and sync the versioned
-   bundles to `/tyde/v<version>/` (S3 + CloudFront, or equivalent). Set
-   `Cache-Control: immutable` on `/tyde/v<version>/*` and short/no-cache on the
-   loader shell + `manifest.json`.
-4. Send the CSP (incl. `frame-ancestors 'none'`) and HSTS as **HTTP headers**.
-5. Rasterize `icons/icon.svg` to the PNG sizes listed in `icons/README.md`.
+3. Syncs `web/loader/` → `s3://tycode-static/tyde/` with **short cache**
+   (`max-age=60`) so loader logic + revocations propagate, then re-stamps
+   `manifest.json` as **`no-store`** (it is the revocation authority and must
+   never be cached).
+4. Syncs `dist/` → `s3://tycode-static/tyde/v<ver>/` with
+   `Cache-Control: public,max-age=31536000,immutable`, then fixes the `.wasm`
+   `Content-Type` to `application/wasm` (S3 would otherwise mislabel it and
+   break `WebAssembly.instantiateStreaming`).
+5. `aws cloudfront create-invalidation --distribution-id E3JJ1OF4I8TP6U
+   --paths '/tyde/*'`.
+
+### Guardrails (enforced by `deploy.sh`)
+
+- **Dry-run by default.** A bare invocation never touches prod; the real deploy
+  requires `--confirm`.
+- **Never `--delete`.** The sync is strictly additive; `--delete` is refused as
+  an input and never passed to `aws`.
+- **Scoped to `tyde/` only.** Every S3 destination is built from the bucket +
+  `tyde` prefix and asserted to live under `s3://tycode-static/tyde/` before any
+  write. The marketing keys at the bucket root, the `tycode.dev` bucket beyond
+  `tyde/`, and `tyggs.*` are **never** touched.
+- **Version validated.** The version must pass the host's release-version rules
+  and is cross-checked against `tools/check_release_version.py`.
+- **CSP only on `tyde/*`.** The security `ResponseHeadersPolicy` attaches solely
+  to the `tyde/*` behavior — never the default, which would break the marketing
+  pages (see `cloudfront-setup.md`).
+
+### Still needs a manual step
+
+- The CSP (incl. `frame-ancestors 'none'`) + HSTS + CORS are sent as **HTTP
+  headers** via the CloudFront `ResponseHeadersPolicy` in `cloudfront-setup.md`
+  (one-time).
+- Rasterize `icons/icon.svg` to the PNG sizes listed in `icons/README.md`.
 
 ## Verifiable locally vs. needs a device
 
