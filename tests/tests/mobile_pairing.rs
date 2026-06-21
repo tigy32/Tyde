@@ -307,7 +307,7 @@ async fn pairing_qr_embeds_configured_mqtt_endpoint_and_secret_room() {
     )
     .await;
     let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
-    let qr = MobilePairingQrPayload::from_uri(&offer.qr_uri.0).expect("parse QR");
+    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
 
     assert_eq!(qr.broker.url, broker_url);
     assert_eq!(qr.policy, MqttTransportPolicy::default());
@@ -363,7 +363,7 @@ async fn mqtt_pairing_accepts_mobile_tyde_hello_over_encrypted_stream() {
     )
     .await;
     let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
-    let qr = MobilePairingQrPayload::from_uri(&offer.qr_uri.0).expect("parse QR");
+    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
     assert_eq!(qr.broker.url, broker.broker_url);
 
     let mobile_stream = timeout(
@@ -515,7 +515,7 @@ async fn mqtt_mobile_receives_agent_replay_sessions_and_chat_events() {
     )
     .await;
     let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
-    let qr = MobilePairingQrPayload::from_uri(&offer.qr_uri.0).expect("parse QR");
+    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
 
     let mobile_stream = timeout(
         EVENT_TIMEOUT,
@@ -662,7 +662,7 @@ async fn mqtt_mobile_reconnect_replays_bootstrap_state_again() {
     )
     .await;
     let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
-    let qr = MobilePairingQrPayload::from_uri(&offer.qr_uri.0).expect("parse QR");
+    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
 
     let mut first = connect_mobile_client(&qr).await;
     expect_mobile_replay(&mut first, 1, "first mobile replay").await;

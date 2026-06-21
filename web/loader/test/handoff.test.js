@@ -54,6 +54,16 @@ test("handlePairingUri stashes the raw URI for the app on the pair path", async 
   assert.equal(sessionStore[PAIR_URI_KEY], REAL_WITH_PRERELEASE);
 });
 
+test("handlePairingUri stashes the INNER tyde-pair URI from the HTTPS QR form", async () => {
+  // The generic HTTPS QR carries the pairing URI in its fragment. The loader
+  // must normalize it down to the raw `tyde-pair://…` string the WASM app's
+  // `take_pending_pairing_uri` understands — never the wrapping https URL.
+  delete sessionStore[PAIR_URI_KEY];
+  const url = `https://tycode.dev/tyde/#${REAL_WITH_PRERELEASE}`;
+  await handlePairingUri(url, EXAMPLE_MANIFEST);
+  assert.equal(sessionStore[PAIR_URI_KEY], REAL_WITH_PRERELEASE);
+});
+
 test("handlePairingUri does NOT stash when the URI is not a pairing code", async () => {
   delete sessionStore[PAIR_URI_KEY];
   await handlePairingUri("https://evil.example/", EXAMPLE_MANIFEST);

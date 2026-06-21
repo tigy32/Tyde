@@ -6,6 +6,7 @@ import {
   parsePairingUri,
   validateReleaseVersion,
   base64urlToBytes,
+  extractPairingUri,
   MAX_URI_LEN,
 } from "../pairing.js";
 import { resolveBootTarget, compareVersions } from "../manifest-policy.js";
@@ -100,6 +101,37 @@ test("parsePairingUri returns null version for embedded injection strings", () =
     release_version: "/tyde/v9.9.9/../../evil",
   });
   assert.equal(parsePairingUri(slashed).releaseVersion, null);
+});
+
+// --- extractPairingUri (generic HTTPS QR normalization) --------------------
+
+test("extractPairingUri returns the raw tyde-pair:// URI unchanged", () => {
+  assert.equal(extractPairingUri(REAL_STABLE), REAL_STABLE);
+  // Surrounding whitespace is trimmed.
+  assert.equal(extractPairingUri(`  ${REAL_STABLE}  `), REAL_STABLE);
+});
+
+test("extractPairingUri pulls the inner URI out of the HTTPS fragment form", () => {
+  const url = `https://tycode.dev/tyde/#${REAL_STABLE}`;
+  assert.equal(extractPairingUri(url), REAL_STABLE);
+  // With a path/query before the fragment.
+  const withQuery = `https://tycode.dev/tyde/?utm=x#${REAL_WITH_PRERELEASE}`;
+  assert.equal(extractPairingUri(withQuery), REAL_WITH_PRERELEASE);
+});
+
+test("extractPairingUri decodes a percent-encoded fragment", () => {
+  const encoded = `https://tycode.dev/tyde/#${encodeURIComponent(REAL_STABLE)}`;
+  assert.equal(extractPairingUri(encoded), REAL_STABLE);
+});
+
+test("extractPairingUri rejects junk and non-pairing URLs", () => {
+  assert.equal(extractPairingUri("https://evil.example/"), null);
+  assert.equal(extractPairingUri("https://tycode.dev/tyde/#nothing-here"), null);
+  assert.equal(extractPairingUri("just some text"), null);
+  assert.equal(extractPairingUri(42), null);
+  assert.equal(extractPairingUri(null), null);
+  // Over-long input is rejected before any work.
+  assert.equal(extractPairingUri("#tyde-pair://" + "A".repeat(MAX_URI_LEN)), null);
 });
 
 // --- compareVersions --------------------------------------------------------

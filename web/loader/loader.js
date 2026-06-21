@@ -11,7 +11,7 @@
 // Keep this file small and rarely-changed: it is the one piece that is NOT
 // versioned, so every byte here is permanent surface.
 
-import { parsePairingUri } from "./pairing.js";
+import { parsePairingUri, extractPairingUri } from "./pairing.js";
 import { resolveBootTarget } from "./manifest-policy.js";
 import { verifyArtifacts } from "./integrity.js";
 import { resolveBundleStylesheets } from "./styles.js";
@@ -244,9 +244,14 @@ function stashPairingUri(uri) {
 // error otherwise. The loader trusts ONLY release_version for its own decision;
 // the app re-parses the stashed URI authoritatively.
 export async function handlePairingUri(uri, manifest) {
+  // The QR is now a generic HTTPS link whose fragment carries the
+  // `tyde-pair://…` URI; normalize to that inner URI so everything downstream
+  // (parse + the stashed value the WASM app's `take_pending_pairing_uri`
+  // reads) keeps working with a plain `tyde-pair://…` string.
+  const inner = extractPairingUri(uri) ?? (typeof uri === "string" ? uri.trim() : uri);
   let parsed;
   try {
-    parsed = parsePairingUri(uri);
+    parsed = parsePairingUri(inner);
   } catch (err) {
     setError(
       "That does not look like a Tyde pairing code.",
@@ -266,9 +271,9 @@ export async function handlePairingUri(uri, manifest) {
     setError(reasonToMessage(resolved.reason), `version ${parsed.releaseVersion}`);
     return;
   }
-  // Hand the FULL original URI to the booted app so first-time pairing can
-  // complete, then remember the version for future no-QR launches.
-  stashPairingUri(uri.trim());
+  // Hand the normalized `tyde-pair://…` URI to the booted app so first-time
+  // pairing can complete, then remember the version for future no-QR launches.
+  stashPairingUri(inner.trim());
   rememberVersion(resolved.version);
   await bootTarget(resolved);
 }
@@ -317,10 +322,16 @@ async function startScan(manifest) {
       if (!scanStream) return;
       try {
         const codes = await detector.detect(ui.video);
-        const hit = codes.find((c) => c.rawValue && c.rawValue.startsWith("tyde-pair://"));
+        // Match both the legacy raw `tyde-pair://…` QR and the generic HTTPS QR
+        // that carries the URI in its fragment (`…/#tyde-pair://…`).
+        const hit = codes.find(
+          (c) =>
+            c.rawValue &&
+            (c.rawValue.startsWith("tyde-pair://") || c.rawValue.includes("#tyde-pair://")),
+        );
         if (hit) {
           stopScan();
-          await handlePairingUri(hit.rawValue, manifest);
+          await handlePairingUri(extractPairingUri(hit.rawValue) ?? hit.rawValue, manifest);
           return;
         }
       } catch {
@@ -417,6 +428,25 @@ async function init() {
   } catch (err) {
     setError(reasonToMessage("no-manifest"), String(err && err.message ? err.message : err));
     return;
+  }
+
+  // Auto-pair from the URL fragment. The host's QR is a generic HTTPS link
+  // (`https://tycode.dev/tyde/#tyde-pair://v1?<payload>`) so the native iOS/
+  // Android Camera can open it.
+  //
+  // SECURITY: the PSK-bearing `tyde-pair://…` URI rides in the FRAGMENT (after
+  // `#`), which browsers never send to the origin — so the secret never
+  // reaches S3/CloudFront. We clear the fragment IMMEDIATELY (before any await
+  // that could let it leak into a later navigation/referrer) via
+  // `history.replaceState`, then pair from the in-memory copy.
+  const hash = window.location.hash;
+  if (hash) {
+    const fragment = hash.startsWith("#") ? hash.slice(1) : hash;
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+    if (fragment.includes("tyde-pair://")) {
+      await handlePairingUri(fragment, manifest);
+      return;
+    }
   }
 
   // Returning-user fast path: boot the remembered version with no QR, as long

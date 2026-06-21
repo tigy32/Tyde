@@ -13,6 +13,37 @@ import { decodeFirst, MAX_CBOR_BYTES } from "./cbor.js";
 
 export const PAIRING_PREFIX = "tyde-pair://v1?";
 
+// Pulls the inner `tyde-pair://…` pairing URI out of whatever was scanned or
+// pasted. The host's QR is now a generic HTTPS link
+// (`https://tycode.dev/tyde/#tyde-pair://v1?<payload>`) so the native iOS/
+// Android Camera can open it; the PSK-bearing URI rides in the URL FRAGMENT
+// (after `#`) and so is never sent to the origin. This accepts either form:
+//   - a raw `tyde-pair://…` string (legacy QR / in-app scanner / paste), or
+//   - an HTTPS URL whose fragment carries the `tyde-pair://…` URI.
+// Returns the inner `tyde-pair://…` string, or null when none is present. The
+// fragment is matched as-is first, then a guarded `decodeURIComponent` retry
+// covers cameras/links that percent-encode the fragment.
+export function extractPairingUri(raw) {
+  if (typeof raw !== "string") return null;
+  if (raw.length > MAX_URI_LEN) return null;
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("tyde-pair://")) return trimmed;
+
+  const hashIndex = trimmed.indexOf("#");
+  if (hashIndex === -1) return null;
+  const fragment = trimmed.slice(hashIndex + 1);
+  if (fragment.startsWith("tyde-pair://")) return fragment;
+
+  // Some scanners/links percent-encode the fragment; decode defensively.
+  try {
+    const decoded = decodeURIComponent(fragment);
+    if (decoded.startsWith("tyde-pair://")) return decoded;
+  } catch {
+    // Malformed percent-encoding — fall through to "not found".
+  }
+  return null;
+}
+
 // DoS ceilings. A real pairing URI is a few hundred chars; these bound the
 // worst case without rejecting any legitimate payload.
 export const MAX_URI_LEN = 4096;
