@@ -47,7 +47,17 @@
     <link rel="stylesheet" href="./loader.css" />
   </head>
   <body>
-    <main id="app-root">
+    <!--
+      The loader's own chrome (the four pairing/boot `.view` sections) lives in
+      `#loader-shell`. The booted Leptos app mounts into the SEPARATE, initially
+      empty `#app-root` below (mobile-frontend does
+      `mount_to(get_element_by_id("app-root"), App)`, appending children). They
+      MUST be distinct containers: when the app mounts, loader.js observes the
+      first child added to `#app-root` and hides `#loader-shell` so the styled
+      app replaces the loader spinner (the boot handoff). Previously both shared
+      `#app-root`, so the app mounted hidden behind the still-visible spinner.
+    -->
+    <main id="loader-shell">
       <section id="view-loading" class="view">
         <div class="card">
           <div class="brand">
@@ -115,6 +125,10 @@
         </div>
       </section>
     </main>
+
+    <!-- The booted WASM app mounts here. Kept in the DOM (empty) from the start
+         because the app does get_element_by_id("app-root") at boot. -->
+    <div id="app-root"></div>
 
     <script type="module" src="./loader.js"></script>
   </body>

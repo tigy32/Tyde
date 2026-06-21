@@ -41,9 +41,29 @@ function show(view) {
 }
 
 function setError(message, detail) {
+  // Make sure the loader chrome is visible to host the error view: a boot that
+  // already hid the shell (or a late failure) must un-hide it so the user sees
+  // the message instead of a blank page.
+  showLoaderShell();
   show("error");
   if (ui.errorMessage) ui.errorMessage.textContent = message;
   if (ui.errorDetail) ui.errorDetail.textContent = detail || "";
+}
+
+// The loader chrome (#loader-shell) and the app's mount target (#app-root) are
+// SEPARATE containers (see index.html). On a successful boot the app mounts into
+// #app-root; we then hide the shell so only the app shows. On failure we keep /
+// re-show the shell so the error view is visible.
+function hideLoaderShell() {
+  if (typeof document === "undefined") return;
+  const shell = document.getElementById("loader-shell");
+  if (shell) shell.hidden = true;
+}
+
+function showLoaderShell() {
+  if (typeof document === "undefined") return;
+  const shell = document.getElementById("loader-shell");
+  if (shell) shell.hidden = false;
 }
 
 // Maps a resolveBootTarget failure reason to a user-facing message.
@@ -148,12 +168,62 @@ async function bootTarget(target) {
     // can't wedge the user in permanent SRI-failure, and fall back to pairing.
     void deleteCachedArtifacts(target);
     forgetVersion();
+    // setError re-shows the shell, so a failure after we (somehow) hid it still
+    // surfaces the error view rather than a blank page.
     setError(
       "The client bundle failed its integrity check or could not load.",
       `version ${target.version}`,
     );
   });
   document.head.appendChild(script);
+
+  // Boot handoff: the app mounts into the SEPARATE #app-root (see index.html).
+  // Watch for its first appended child and, when it appears, hide the loader
+  // chrome so the styled app replaces the boot spinner. Without this the app
+  // mounts but stays hidden behind the still-visible "booting" view forever.
+  setUpBootHandoff(script);
+}
+
+// Hides #loader-shell once the app actually mounts into #app-root. Uses a
+// MutationObserver for the precise moment, plus a timer fallback (started on the
+// entry script's `load`) in case the observer misses the mount. The error path
+// never triggers either, so a failed boot keeps the shell (and its error view)
+// visible.
+function setUpBootHandoff(script) {
+  const appRoot = document.getElementById("app-root");
+  if (!appRoot) return;
+
+  let handed = false;
+  const handoff = () => {
+    if (handed) return;
+    handed = true;
+    hideLoaderShell();
+  };
+
+  if (typeof MutationObserver !== "undefined") {
+    const observer = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        if (m.addedNodes && m.addedNodes.length > 0) {
+          observer.disconnect();
+          handoff();
+          return;
+        }
+      }
+    });
+    observer.observe(appRoot, { childList: true });
+  }
+
+  // Safety net: once the entry module has loaded, give it a few seconds to
+  // mount, then hand off anyway IF the app actually produced DOM in #app-root.
+  // The child guard means a script that loads but never mounts (so the error
+  // view should win) does not get the shell yanked out from under it.
+  if (script && typeof script.addEventListener === "function") {
+    script.addEventListener("load", () => {
+      setTimeout(() => {
+        if (appRoot.childNodes.length > 0) handoff();
+      }, 4000);
+    });
+  }
 }
 
 // Fetches the resolved version's own index.html, extracts its same-origin

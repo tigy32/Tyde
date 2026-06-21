@@ -40,7 +40,10 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-#app-root {
+/* The loader's own chrome. Centers the active pairing/boot card. When the app
+   mounts into the separate #app-root, loader.js sets `hidden` here so only the
+   app shows (see #loader-shell[hidden] below). */
+#loader-shell {
   min-height: 100vh;
   min-height: 100dvh;
   display: flex;
@@ -49,6 +52,22 @@ body {
   align-items: center;
   padding: calc(24px + var(--safe-top)) calc(20px + var(--safe-right))
     calc(24px + var(--safe-bottom)) calc(20px + var(--safe-left));
+}
+
+/* `display: flex` would otherwise beat the UA `[hidden] { display: none }`, so
+   the boot handoff (hiding the shell once the app mounts) needs this explicit
+   override — load-bearing, not cosmetic. */
+#loader-shell[hidden] {
+  display: none;
+}
+
+/* The booted Leptos app mounts here. It ships and injects its own stylesheet
+   and lays itself out, so this stays a plain full-size container with no flex /
+   padding that could fight the app's CSS. */
+#app-root {
+  width: 100%;
+  min-height: 100vh;
+  min-height: 100dvh;
 }
 
 /* Each pairing/boot stage is a `.view`. Exactly one is shown at a time via the
