@@ -3,5 +3,22 @@
   "schemaVersion": 1,
   "minSupported": "0.8.19-beta.1",
   "blocked": [],
-  "versions": {}
+  "versions": {
+    "0.8.19-beta.2": {
+      "path": "/tyde/v0.8.19-beta.2/",
+      "entry": "/tyde/v0.8.19-beta.2/mobile-frontend-fbdcf453e007f345.js",
+      "integrity": "sha384-0p3ElvOWT6GUvxvJ7lr7HbvlCyjMdJcR277ktGOtcBsiHoaR40Dhl4tJ2KbPtTbB",
+      "artifacts": {
+        "/tyde/v0.8.19-beta.2/mobile-frontend-fbdcf453e007f345_bg.wasm": "sha384-gPhv7ZLlGi4bIpT/aXGCNiqBxWvOqkSZUUHSSYsILeX4/ID94xvuvSFDL05Mr+Wd"
+      }
+    },
+    "0.8.19-beta.3": {
+      "path": "/tyde/v0.8.19-beta.3/",
+      "entry": "/tyde/v0.8.19-beta.3/mobile-frontend-5bbff969dc35724d.js",
+      "integrity": "sha384-zP/nBPwTzm3DD2O8g2Du8TZ03D8GQ9FNP80kr3a7lcxBw3KtV1aSnJYzQAuwInjx",
+      "artifacts": {
+        "/tyde/v0.8.19-beta.3/mobile-frontend-5bbff969dc35724d_bg.wasm": "sha384-jhI/CtdoM6JtCTnVduo1ipD8sXnbuZBvgijfnjIMjNw3fm7E/TB69dv3GL1+KT7K"
+      }
+    }
+  }
 }
