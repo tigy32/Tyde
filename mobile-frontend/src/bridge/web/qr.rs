@@ -70,17 +70,19 @@ pub async fn scan_qr() -> Result<BarcodeScanResult, String> {
         .dyn_into()
         .map_err(|_| "video element had the wrong type".to_owned())?;
 
-    let overlay = match build_overlay(&document, &video, &cancelled) {
-        Ok(overlay) => overlay,
+    let (overlay, cancel_closure) = match build_overlay(&document, &video, &cancelled) {
+        Ok(parts) => parts,
         Err(error) => {
             stop_stream(&stream);
             return Err(error);
         }
     };
-    // Guard tears the camera + overlay down on every exit path below.
+    // Guard tears the camera + overlay down (and drops the cancel-button
+    // listener) on every exit path below — including the future being dropped.
     let guard = ScanGuard {
         stream: stream.clone(),
         overlay,
+        _cancel_closure: cancel_closure,
     };
 
     video.set_autoplay(true);
@@ -91,15 +93,34 @@ pub async fn scan_qr() -> Result<BarcodeScanResult, String> {
         let _ = JsFuture::from(play_promise).await;
     }
 
+    // `BarcodeDetector.detect()` can reject transiently — most commonly before
+    // the <video> has a decoded frame (`play()` resolving does NOT guarantee
+    // `readyState >= HAVE_CURRENT_DATA`), e.g. an InvalidStateError on the first
+    // poll on slower devices. So gate on `readyState` and treat per-frame
+    // rejections as transient: log and keep polling, bailing only after a run of
+    // consecutive failures so a genuinely broken detector still terminates.
+    const MAX_CONSECUTIVE_FAILURES: u32 = 40;
     let detector = new_barcode_detector()?;
+    let mut consecutive_failures: u32 = 0;
     let result = loop {
         if cancelled.get() {
             break Err("QR scan cancelled".to_owned());
         }
+        if video.ready_state() < web_sys::HtmlMediaElement::HAVE_CURRENT_DATA {
+            // No decoded frame yet — wait without counting it as a failure.
+            sleep_ms(120).await;
+            continue;
+        }
         match detect_once(&detector, &video).await {
             Ok(Some(content)) => break Ok(content),
-            Ok(None) => {}
-            Err(error) => break Err(error),
+            Ok(None) => consecutive_failures = 0,
+            Err(error) => {
+                consecutive_failures += 1;
+                log::warn!("QR detect transient error ({consecutive_failures}): {error}");
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    break Err(format!("QR scanning failed repeatedly: {error}"));
+                }
+            }
         }
         sleep_ms(250).await;
     };
@@ -171,11 +192,13 @@ async fn detect_once(
     Ok(None)
 }
 
+type CancelClosure = Closure<dyn FnMut()>;
+
 fn build_overlay(
     document: &web_sys::Document,
     video: &HtmlVideoElement,
     cancelled: &Rc<Cell<bool>>,
-) -> Result<web_sys::Element, String> {
+) -> Result<(web_sys::Element, CancelClosure), String> {
     let overlay = document
         .create_element("div")
         .map_err(|_| "failed to create scanner overlay".to_owned())?;
@@ -208,20 +231,23 @@ fn build_overlay(
     cancel
         .add_event_listener_with_callback("click", on_click.as_ref().unchecked_ref())
         .ok();
-    on_click.forget();
     overlay.append_child(&cancel).ok();
 
     if let Some(body) = document.body() {
         body.append_child(&overlay).ok();
     }
-    Ok(overlay)
+    // The closure is returned (not `forget`-ed) so `ScanGuard` owns it and drops
+    // it with the overlay — no per-scan closure leak.
+    Ok((overlay, on_click))
 }
 
 /// Stops the camera tracks and removes the overlay when scanning ends (normal
-/// completion, cancel, error, or the future being dropped).
+/// completion, cancel, error, or the future being dropped). Owns the cancel
+/// button's click closure so it is freed with the rest of the overlay.
 struct ScanGuard {
     stream: MediaStream,
     overlay: web_sys::Element,
+    _cancel_closure: CancelClosure,
 }
 
 impl Drop for ScanGuard {

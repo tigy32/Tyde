@@ -60,10 +60,20 @@ impl UnlistenHandle {
 }
 
 /// True when the bundle is running as a browser PWA (no Tauri shell injected).
-/// Cached: the host environment cannot change within a page lifetime.
+/// Cached: the host environment cannot change within a page lifetime. The
+/// detected mode is logged once on first use so a future `__TAURI__`-injected-
+/// late misdetection (web chosen when Tauri was expected, or vice-versa) is
+/// visible in the console rather than silently changing every host call.
 fn use_web_backend() -> bool {
     thread_local! {
-        static IS_WEB: bool = !tauri_present();
+        static IS_WEB: bool = {
+            let is_web = !tauri_present();
+            log::info!(
+                "mobile bridge backend selected: {}",
+                if is_web { "web (browser PWA)" } else { "tauri (native shell)" }
+            );
+            is_web
+        };
     }
     IS_WEB.with(|is_web| *is_web)
 }

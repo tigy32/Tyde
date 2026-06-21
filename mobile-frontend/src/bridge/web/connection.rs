@@ -13,8 +13,15 @@
 //! browser the manager and the Leptos app share one wasm context that is torn
 //! down together on reload — there is no detached frontend to buffer for — so
 //! host lines are delivered straight to the live listener with `delivery_id:
-//! None`, and the ack / pending-line / replay surface is a no-op. The
-//! connection-instance-id handshake the app uses to drop stale lines is kept.
+//! None`, and the ack / pending-line / replay surface is a no-op.
+//!
+//! Dropping the ack/replay buffer loses no data because a browser page-reload
+//! does not *resume* the old session: it tears down this wasm context entirely
+//! and, on the next connect, performs a fresh Tyde handshake whose bootstrap
+//! re-syncs the full host state (sessions, projects, agents, …). There is no
+//! mid-session continuation to preserve across the reload, so there is nothing
+//! the native buffer would have protected. The connection-instance-id handshake
+//! the app uses to drop stale lines within a live session is still kept.
 
 use std::cell::RefCell;
 use std::collections::HashMap;

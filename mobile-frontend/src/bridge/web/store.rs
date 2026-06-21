@@ -17,6 +17,8 @@
 //! because `WebPairedHostRecord` already stores no PSK material — only a key id
 //! + credential fingerprint, exactly like the native `PairedHostRecord`.
 
+use std::rc::Rc;
+
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mobile_shell_types::{
@@ -90,6 +92,18 @@ pub fn credential_fingerprint(
 
 // ── Host record store ────────────────────────────────────────────────────
 
+thread_local! {
+    /// Serializes every read-modify-write on the single-key host array, the way
+    /// the native single-threaded `StoreActor` did. The whole record set lives
+    /// under one IndexedDB key, so without this lock two mutators can each
+    /// `list()` the array, yield at an `.await`, then write back over each other:
+    /// a lost `last_connected_at_ms` update, or — worse — a `set_last_connected`
+    /// that read before a concurrent `forget` committed and rewrites the array
+    /// *after*, resurrecting the forgotten host pointed at a deleted PSK. Holding
+    /// this guard across each mutator's read→write makes those sequences atomic.
+    static HOST_WRITE_LOCK: Rc<tokio::sync::Mutex<()>> = Rc::new(tokio::sync::Mutex::new(()));
+}
+
 pub struct IndexedDbHostStore;
 
 impl IndexedDbHostStore {
@@ -121,6 +135,8 @@ impl IndexedDbHostStore {
     }
 
     pub async fn insert(&self, record: WebPairedHostRecord) -> Result<(), String> {
+        let lock = HOST_WRITE_LOCK.with(Rc::clone);
+        let _guard = lock.lock().await;
         let mut records = self.list().await?;
         if records
             .iter()
@@ -139,6 +155,8 @@ impl IndexedDbHostStore {
         &self,
         local_host_id: &LocalHostId,
     ) -> Result<Option<WebPairedHostRecord>, String> {
+        let lock = HOST_WRITE_LOCK.with(Rc::clone);
+        let _guard = lock.lock().await;
         let mut records = self.list().await?;
         let Some(index) = records
             .iter()
@@ -156,6 +174,8 @@ impl IndexedDbHostStore {
         local_host_id: &LocalHostId,
         auto_connect: bool,
     ) -> Result<(), String> {
+        let lock = HOST_WRITE_LOCK.with(Rc::clone);
+        let _guard = lock.lock().await;
         let mut records = self.list().await?;
         let Some(record) = records
             .iter_mut()
@@ -172,6 +192,8 @@ impl IndexedDbHostStore {
         local_host_id: &LocalHostId,
         last_connected_at_ms: Option<u64>,
     ) -> Result<(), String> {
+        let lock = HOST_WRITE_LOCK.with(Rc::clone);
+        let _guard = lock.lock().await;
         let mut records = self.list().await?;
         let Some(record) = records
             .iter_mut()
@@ -365,6 +387,39 @@ mod wasm_tests {
         let removed = store.remove(&id).await.expect("remove");
         assert_eq!(removed.map(|r| r.local_host_id), Some(id.clone()));
         assert!(store.get(&id).await.expect("get").is_none());
+    }
+
+    #[wasm_bindgen_test]
+    async fn forget_interleaved_with_set_last_connected_does_not_resurrect() {
+        let store = IndexedDbHostStore;
+        let psk_store = IndexedDbPskStore;
+        let psk = PreSharedKey::from_slice(&[8_u8; 32]).expect("psk");
+
+        // Pair: store the PSK, then a record that references it.
+        let key_id = psk_store.store(&psk).await.expect("store psk");
+        let mut record = unique_record("race");
+        record.psk_keychain_key_id = key_id.clone();
+        let id = record.local_host_id.clone();
+        store.insert(record).await.expect("insert");
+
+        // Interleave a last-connected write with a forget (remove record + delete
+        // PSK) on the same cooperative task. With the write lock these serialize;
+        // without it the set-last-connected RMW could resurrect the removed host.
+        let set_fut = store.set_last_connected_at_ms(&id, Some(987_654));
+        let forget_fut = async {
+            let _ = store.remove(&id).await;
+            let _ = psk_store.delete(&key_id).await;
+        };
+        let (_set_result, ()) = tokio::join!(set_fut, forget_fut);
+
+        assert!(
+            store.get(&id).await.expect("get").is_none(),
+            "forgotten host must not be resurrected by a concurrent write"
+        );
+        assert!(
+            psk_store.load(&key_id).await.is_err(),
+            "the removed host's PSK must not dangle"
+        );
     }
 
     #[wasm_bindgen_test]

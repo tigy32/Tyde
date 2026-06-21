@@ -1,3 +1,4 @@
+use leptos::html::Div;
 use leptos::prelude::*;
 
 use super::{Button, ButtonVariant};
@@ -32,6 +33,19 @@ pub fn ConfirmModal(
     };
     let test = data_mobile_test.unwrap_or("confirm-modal");
 
+    // Escape-to-cancel: the backdrop is focusable (`tabindex=-1`) and handles
+    // keydown directly, so the listener is scoped to the modal and torn down
+    // with it automatically (no document-level listener to leak / clean up).
+    // Focus it when it opens so it actually receives the key event.
+    let backdrop_ref: NodeRef<Div> = NodeRef::new();
+    Effect::new(move |_| {
+        if open.get()
+            && let Some(element) = backdrop_ref.get()
+        {
+            let _ = element.focus();
+        }
+    });
+
     view! {
         <Show when=move || open.get()>
             {
@@ -40,8 +54,27 @@ pub fn ConfirmModal(
                 let confirm_label = confirm_label.clone();
                 let cancel_label = cancel_label.clone();
                 view! {
-                    <div class="confirm-modal-backdrop" role="dialog" aria-modal="true" data-mobile-test=test>
-                        <div class="confirm-modal">
+                    // Click on the backdrop (outside the modal) cancels; clicks
+                    // inside stop propagating so they never reach the backdrop.
+                    // Escape on the focused backdrop also cancels.
+                    <div
+                        node_ref=backdrop_ref
+                        class="confirm-modal-backdrop"
+                        role="dialog"
+                        aria-modal="true"
+                        tabindex="-1"
+                        data-mobile-test=test
+                        on:click=move |_| on_cancel.run(())
+                        on:keydown=move |event: web_sys::KeyboardEvent| {
+                            if event.key() == "Escape" {
+                                on_cancel.run(());
+                            }
+                        }
+                    >
+                        <div
+                            class="confirm-modal"
+                            on:click=|event: web_sys::MouseEvent| event.stop_propagation()
+                        >
                             <h2 class="confirm-modal-title">{title}</h2>
                             <p class="confirm-modal-message">{message}</p>
                             <div class="confirm-modal-actions">
@@ -166,5 +199,36 @@ mod wasm_tests {
         confirm.click();
         next_tick().await;
         assert!(fired.get_untracked(), "confirm click must run on_confirm");
+    }
+
+    #[wasm_bindgen_test]
+    async fn backdrop_click_cancels() {
+        let open = RwSignal::new(true);
+        let cancelled = RwSignal::new(false);
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <ConfirmModal
+                    open=open
+                    title="Confirm"
+                    message="Proceed?"
+                    on_confirm=Callback::new(|_: ()| {})
+                    on_cancel=Callback::new(move |_: ()| cancelled.set(true))
+                />
+            }
+        });
+        next_tick().await;
+        let backdrop: HtmlElement = container
+            .query_selector("[data-mobile-test='confirm-modal']")
+            .unwrap()
+            .expect("backdrop present")
+            .dyn_into()
+            .unwrap();
+        backdrop.click();
+        next_tick().await;
+        assert!(
+            cancelled.get_untracked(),
+            "clicking the backdrop must run on_cancel"
+        );
     }
 }
