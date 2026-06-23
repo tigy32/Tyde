@@ -17,7 +17,7 @@
 //
 // Bump LOADER_CACHE when the precache list or shell logic changes.
 
-const LOADER_CACHE = "tyde-loader-v3";
+const LOADER_CACHE = "tyde-loader-v4";
 const BUNDLE_CACHE = "tyde-bundle-v1"; // shared with loader.js
 
 // Paths are relative to the SW scope (`/tyde/`).
@@ -32,6 +32,7 @@ const SHELL_ASSETS = [
   "./styles.js",
   "./manifest-policy.js",
   "./integrity.js",
+  "./vendor/jsqr.js",
   "./manifest.webmanifest",
   "./icons/icon.svg",
 ];
@@ -91,7 +92,7 @@ self.addEventListener("fetch", (event) => {
 
 function isShellAsset(url) {
   return (
-    /\/(index\.html|loader\.(js|css)|cbor\.js|pairing\.js|pairing-ui\.js|styles\.js|manifest-policy\.js|integrity\.js|manifest\.webmanifest)$/.test(
+    /\/(index\.html|loader\.(js|css)|cbor\.js|pairing\.js|pairing-ui\.js|styles\.js|manifest-policy\.js|integrity\.js|vendor\/jsqr\.js|manifest\.webmanifest)$/.test(
       url.pathname,
     ) || url.pathname.endsWith("/")
   );

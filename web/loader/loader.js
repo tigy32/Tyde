@@ -34,7 +34,7 @@ function $(id) {
 }
 
 function show(view) {
-  for (const name of ["loading", "pair", "booting", "error"]) {
+  for (const name of ["loading", "pair", "pairGuard", "booting", "error"]) {
     const el = ui[name];
     if (el) el.hidden = name !== view;
   }
@@ -332,6 +332,30 @@ function forgetVersion() {
   }
 }
 
+// True when the loader is running as an INSTALLED PWA — an iOS "Add to Home
+// Screen" web app (`navigator.standalone === true`) or any browser reporting
+// the standalone display-mode. Pure (globals injectable) so it is unit-testable.
+//
+// Why this matters: on iOS, scanning the host QR with the native Camera opens
+// the link in an EPHEMERAL in-app preview (Safari View Controller), not real
+// Safari. Auto-pairing there stashes state in a sessionStorage that is destroyed
+// the instant the user taps the X — losing the pairing. So when we are NOT in a
+// persistent (installed/standalone) context we must not silently auto-pair; we
+// show a guard screen and let the user choose. Inside a normal Safari tab the
+// guard still offers an explicit "Pair here anyway", so that user is never
+// blocked. Already-installed/standalone keeps auto-pairing exactly as before.
+export function isStandaloneContext(win, nav) {
+  if (!!nav && nav.standalone === true) return true;
+  if (
+    !!win &&
+    typeof win.matchMedia === "function" &&
+    win.matchMedia("(display-mode: standalone)").matches
+  ) {
+    return true;
+  }
+  return false;
+}
+
 // Stash the raw pairing URI for the booted app to consume (see PAIR_URI_KEY).
 function stashPairingUri(uri) {
   try {
@@ -383,12 +407,45 @@ export async function handlePairingUri(uri, manifest) {
 
 // --- QR scanning -----------------------------------------------------------
 //
-// Uses the native BarcodeDetector where available (Chrome/Android, recent
-// Safari). Everywhere else we feature-detect and steer the user to the paste
-// fallback, which always works.
+// Scanning needs only a camera (`getUserMedia`). To DECODE a frame we use the
+// native BarcodeDetector where available (the fast path on Chrome/Android), and
+// otherwise fall back to the bundled pure-JS jsQR decoder (web/loader/vendor/
+// jsqr.js, loaded as a same-origin classic <script> that assigns `window.jsQR`).
+// jsQR makes scanning work on iOS Safari, which has no BarcodeDetector. Both
+// paths funnel a decoded value through the same `handlePairingUri`.
 
 let scanStream = null;
 let scanRaf = 0;
+let scanCanvas = null;
+
+// Returns true when a decoded QR string is a Tyde pairing code — either the raw
+// `tyde-pair://…` form or the generic HTTPS QR that carries the URI in its
+// fragment (`…/#tyde-pair://…`). Pure; unit-tested.
+export function isPairingScanValue(value) {
+  return (
+    typeof value === "string" &&
+    (value.startsWith("tyde-pair://") || value.includes("#tyde-pair://"))
+  );
+}
+
+// Runs the bundled jsQR decoder over an ImageData and returns the decoded QR
+// string, or null when no QR is found. Pure (no DOM/camera) so the fallback
+// decode path is unit-testable with a fixture ImageData. `jsqr` is normally the
+// global the vendor <script> installs; it is injectable for tests.
+export function decodeQrImageData(imageData, jsqr) {
+  const decoder =
+    jsqr || (typeof globalThis !== "undefined" ? globalThis.jsQR : undefined);
+  if (typeof decoder !== "function" || !imageData) return null;
+  let result;
+  try {
+    result = decoder(imageData.data, imageData.width, imageData.height, {
+      inversionAttempts: "attemptBoth",
+    });
+  } catch {
+    return null;
+  }
+  return result && typeof result.data === "string" ? result.data : null;
+}
 
 function stopScan() {
   if (scanRaf) cancelAnimationFrame(scanRaf);
@@ -397,23 +454,41 @@ function stopScan() {
     for (const track of scanStream.getTracks()) track.stop();
     scanStream = null;
   }
-  if (ui.video) ui.video.hidden = true;
+  if (ui.video) {
+    ui.video.hidden = true;
+    ui.video.srcObject = null;
+  }
+}
+
+// Grabs the current video frame as ImageData via an offscreen <canvas> so jsQR
+// can read its pixels. Returns null until the video has real dimensions.
+function grabVideoFrame() {
+  const video = ui.video;
+  if (!video || !video.videoWidth || !video.videoHeight) return null;
+  if (!scanCanvas) scanCanvas = document.createElement("canvas");
+  scanCanvas.width = video.videoWidth;
+  scanCanvas.height = video.videoHeight;
+  const ctx = scanCanvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(video, 0, 0, scanCanvas.width, scanCanvas.height);
+  return ctx.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
 }
 
 async function startScan(manifest) {
-  const hasDetector = "BarcodeDetector" in window;
   const hasCamera =
     navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === "function";
-  if (!hasDetector || !hasCamera) {
+  if (!hasCamera) {
     if (ui.scanStatus) {
       ui.scanStatus.textContent =
         "Camera scanning is not available on this browser — paste the pairing code below instead.";
     }
     return;
   }
+
+  // Decode strategy: native BarcodeDetector if present, else the jsQR fallback.
+  const hasDetector = "BarcodeDetector" in window;
+
   try {
-    // eslint-disable-next-line no-undef
-    const detector = new BarcodeDetector({ formats: ["qr_code"] });
     scanStream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: "environment" },
     });
@@ -421,24 +496,41 @@ async function startScan(manifest) {
     ui.video.hidden = false;
     await ui.video.play();
 
+    let detector = null;
+    if (hasDetector) {
+      try {
+        // eslint-disable-next-line no-undef
+        detector = new BarcodeDetector({ formats: ["qr_code"] });
+      } catch {
+        detector = null; // unsupported format set, etc. → use jsQR.
+      }
+    }
+
+    const onDecoded = async (value) => {
+      stopScan();
+      await handlePairingUri(extractPairingUri(value) ?? value, manifest);
+    };
+
     const tick = async () => {
       if (!scanStream) return;
       try {
-        const codes = await detector.detect(ui.video);
-        // Match both the legacy raw `tyde-pair://…` QR and the generic HTTPS QR
-        // that carries the URI in its fragment (`…/#tyde-pair://…`).
-        const hit = codes.find(
-          (c) =>
-            c.rawValue &&
-            (c.rawValue.startsWith("tyde-pair://") || c.rawValue.includes("#tyde-pair://")),
-        );
-        if (hit) {
-          stopScan();
-          await handlePairingUri(extractPairingUri(hit.rawValue) ?? hit.rawValue, manifest);
-          return;
+        if (detector) {
+          const codes = await detector.detect(ui.video);
+          const hit = codes.find((c) => isPairingScanValue(c.rawValue));
+          if (hit) {
+            await onDecoded(hit.rawValue);
+            return;
+          }
+        } else {
+          const frame = grabVideoFrame();
+          const value = frame ? decodeQrImageData(frame) : null;
+          if (isPairingScanValue(value)) {
+            await onDecoded(value);
+            return;
+          }
         }
       } catch {
-        // Transient detect failures are ignored; keep scanning.
+        // Transient detect/draw failures are ignored; keep scanning.
       }
       scanRaf = requestAnimationFrame(tick);
     };
@@ -450,6 +542,63 @@ async function startScan(manifest) {
     }
     stopScan();
     void err;
+  }
+}
+
+// --- Safari-guard for in-app-browser pairing links -------------------------
+//
+// Shows #view-pair-guard for a pairing link opened in a non-persistent context.
+// The pairing URI is held ONLY in this closure (never re-written to the URL —
+// the fragment was already cleared by init() before any await), so dismissing
+// the in-app sheet doesn't leak it and "Pair here anyway" still has it.
+function showPairGuard(pairingUri, manifest) {
+  showLoaderShell();
+
+  // Best-effort "Open in Safari": re-attach the pairing URI as a fragment on a
+  // plain https link to this same loader. iOS has no reliable programmatic
+  // "escape to Safari", so this is a tap target the user can long-press →
+  // "Open in Safari", or that may hand off depending on OS/version. The secret
+  // rides in the fragment (never sent to the origin), preserving the no-leak
+  // property; it only ever lives in this anchor's href, not the current URL.
+  if (ui.guardOpenSafari) {
+    const base =
+      typeof location !== "undefined"
+        ? location.origin + location.pathname
+        : "";
+    ui.guardOpenSafari.href = base + "#" + pairingUri;
+  }
+
+  if (ui.guardPairAnyway && !ui.guardPairAnyway.__wired) {
+    ui.guardPairAnyway.__wired = true;
+    ui.guardPairAnyway.addEventListener("click", () => {
+      void handlePairingUri(pairingUri, manifest);
+    });
+  }
+
+  show("pairGuard");
+}
+
+// Routes a `tyde-pair://…`-bearing URL fragment detected on boot. In an
+// installed/standalone PWA the context is persistent, so we auto-pair exactly
+// as before. Otherwise (e.g. iOS's ephemeral in-app Camera preview / Safari
+// View Controller) we do NOT silently auto-pair — the pairing would be lost
+// when the preview is dismissed — and instead show the guard, keeping the URI
+// in memory so "Pair here anyway" can still proceed. The caller MUST have
+// already cleared the URL fragment before invoking this (no-leak invariant).
+// `standalone` is injectable for tests; it defaults to live detection.
+export async function routePairingFragment(fragment, manifest, standalone) {
+  const pairingUri = extractPairingUri(fragment) ?? fragment;
+  const persistent =
+    standalone !== undefined
+      ? standalone
+      : isStandaloneContext(
+          typeof window !== "undefined" ? window : undefined,
+          typeof navigator !== "undefined" ? navigator : undefined,
+        );
+  if (persistent) {
+    await handlePairingUri(pairingUri, manifest);
+  } else {
+    showPairGuard(pairingUri, manifest);
   }
 }
 
@@ -487,6 +636,9 @@ function applyPairingUi(state) {
 async function init() {
   ui.loading = $("view-loading");
   ui.pair = $("view-pair");
+  ui.pairGuard = $("view-pair-guard");
+  ui.guardOpenSafari = $("guard-open-safari");
+  ui.guardPairAnyway = $("guard-pair-anyway");
   ui.booting = $("view-booting");
   ui.error = $("view-error");
   ui.errorMessage = $("error-message");
@@ -545,9 +697,12 @@ async function init() {
   const hash = window.location.hash;
   if (hash) {
     const fragment = hash.startsWith("#") ? hash.slice(1) : hash;
+    // Clear the fragment BEFORE any await so the PSK-bearing URI can never leak
+    // into a later navigation/referrer. From here on the URI lives only in
+    // memory (the `fragment` local).
     history.replaceState(null, "", window.location.pathname + window.location.search);
     if (fragment.includes("tyde-pair://")) {
-      await handlePairingUri(fragment, manifest);
+      await routePairingFragment(fragment, manifest);
       return;
     }
   }

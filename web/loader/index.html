@@ -102,6 +102,29 @@
         </div>
       </section>
 
+      <!-- Safari-guard: shown when a pairing link is opened in a NON-persistent
+           context (e.g. iOS's in-app Camera preview / Safari View Controller),
+           where auto-pairing would be lost the moment the user dismisses the
+           sheet. The pairing link is kept in memory; the user chooses. -->
+      <section id="view-pair-guard" class="view" hidden>
+        <div class="card">
+          <div class="brand">
+            <span class="logo-mark" aria-hidden="true">T</span>
+            <span class="logo">Tyde</span>
+          </div>
+          <p id="guard-status" class="status">Finish pairing in Safari</p>
+          <p class="hint">
+            You opened this pairing link in an in-app browser. Pairing is most
+            reliable in Safari or after adding Tyde to your Home Screen — there
+            it won't be lost if this preview closes.
+          </p>
+          <a id="guard-open-safari" class="btn primary" href="#" rel="noopener">Open in Safari</a>
+          <button id="guard-pair-anyway" type="button" class="btn secondary">
+            Pair here anyway
+          </button>
+        </div>
+      </section>
+
       <section id="view-booting" class="view" hidden>
         <div class="card">
           <div class="brand">
@@ -130,6 +153,13 @@
          because the app does get_element_by_id("app-root") at boot. -->
     <div id="app-root"></div>
 
+    <!-- Bundled pure-JS QR decoder (jsQR, Apache-2.0). Loaded as a same-origin
+         classic <script> so it satisfies the strict CSP (script-src 'self'):
+         no inline code, no eval, no runtime network. It installs the global
+         `jsQR` that loader.js uses as the BarcodeDetector fallback (iOS Safari
+         and any browser without a native detector). Placed before the loader
+         module so the global exists by the time a scan starts. -->
+    <script src="./vendor/jsqr.js"></script>
     <script type="module" src="./loader.js"></script>
   </body>
 </html>

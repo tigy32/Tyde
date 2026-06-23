@@ -1,7 +1,10 @@
-// Tests for the capability-driven pairing-screen policy (pairing-ui.js). The
-// reported bug was Safari/iOS leading with a "Scan QR code" button that just
-// errors; these tests pin that scanning is offered ONLY when both the detector
-// and a camera exist, and that otherwise the paste flow becomes primary.
+// Tests for the capability-driven pairing-screen policy (pairing-ui.js).
+//
+// Scanning now requires only a camera (`getUserMedia`): the loader bundles the
+// pure-JS jsQR decoder, so a browser without the native `BarcodeDetector`
+// (notably iOS Safari) can still scan via the JS fallback. These tests pin that
+// scanning is offered whenever a camera exists, and that paste becomes the
+// primary flow only when there is no camera at all.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -10,14 +13,20 @@ import { detectScanCapability, pairingUiState } from "../pairing-ui.js";
 
 const withCamera = { mediaDevices: { getUserMedia: () => {} } };
 
-test("detectScanCapability requires BOTH BarcodeDetector and getUserMedia", () => {
+test("detectScanCapability offers scanning whenever a camera exists", () => {
+  // Native detector + camera: scan available, detector reported true.
   assert.deepEqual(
     detectScanCapability({ BarcodeDetector: function () {} }, withCamera),
     { hasDetector: true, hasCamera: true, scanAvailable: true },
   );
-  // Safari/iOS: camera present, no BarcodeDetector.
-  assert.equal(detectScanCapability({}, withCamera).scanAvailable, false);
-  // Detector present, but no camera API.
+  // Safari/iOS: camera present, NO BarcodeDetector — scanning is still
+  // available because the loader ships the jsQR fallback.
+  assert.deepEqual(detectScanCapability({}, withCamera), {
+    hasDetector: false,
+    hasCamera: true,
+    scanAvailable: true,
+  });
+  // Detector present, but no camera API → cannot scan (nothing to decode).
   assert.equal(
     detectScanCapability({ BarcodeDetector: function () {} }, {}).scanAvailable,
     false,
