@@ -405,10 +405,12 @@ mod wasm_tests {
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
             state.active_local_host_id.set(Some(host_for_mount.clone()));
-            state.connection_statuses.set(std::collections::HashMap::from([(
-                host_for_mount.clone(),
-                ConnectionStatus::Connected,
-            )]));
+            state
+                .connection_statuses
+                .set(std::collections::HashMap::from([(
+                    host_for_mount.clone(),
+                    ConnectionStatus::Connected,
+                )]));
             provide_context(state);
             view! { <SessionsView /> }
         });
