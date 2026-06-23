@@ -282,6 +282,14 @@ fn report_dispatch_error(
     );
 }
 
+pub(crate) fn should_auto_force_upgrade(
+    code: RejectCode,
+    is_managed: bool,
+    already_attempted: bool,
+) -> bool {
+    matches!(code, RejectCode::IncompatibleProtocol) && is_managed && !already_attempted
+}
+
 pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
     if let Err(error) = INBOUND_SEQ.with(|validator| {
         validator
@@ -445,9 +453,11 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 // fallback, no loop. Any other case (already attempted,
                 // non-managed host, or InvalidHandshake) keeps the existing
                 // terminal-error behavior.
-                let eligible = payload.code == RejectCode::IncompatibleProtocol
-                    && crate::app::is_managed_remote_host(state, host_id)
-                    && !state.upgrade_already_attempted(host_id);
+                let eligible = should_auto_force_upgrade(
+                    payload.code,
+                    crate::app::is_managed_remote_host(state, host_id),
+                    state.upgrade_already_attempted(host_id),
+                );
                 if eligible {
                     state.mark_upgrade_attempted(host_id);
                     // The connection is still being established as far as the
@@ -4531,6 +4541,42 @@ mod tests {
                 .find(|entry| entry.host_id == host_id && entry.project.id == *project_id)
                 .map(|entry| entry.project.name.clone())
         })
+    }
+
+    #[test]
+    fn auto_force_upgrade_allows_managed_incompatible_once() {
+        assert!(should_auto_force_upgrade(
+            RejectCode::IncompatibleProtocol,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn auto_force_upgrade_rejects_already_attempted() {
+        assert!(!should_auto_force_upgrade(
+            RejectCode::IncompatibleProtocol,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn auto_force_upgrade_rejects_non_managed_hosts() {
+        assert!(!should_auto_force_upgrade(
+            RejectCode::IncompatibleProtocol,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn auto_force_upgrade_rejects_invalid_handshake() {
+        assert!(!should_auto_force_upgrade(
+            RejectCode::InvalidHandshake,
+            true,
+            false,
+        ));
     }
 
     #[test]
