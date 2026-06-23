@@ -2,7 +2,7 @@ mod agents_view;
 mod bottom_nav;
 mod chat_input;
 mod chat_message;
-mod chat_view;
+pub mod chat_view;
 mod connection_banner;
 mod diff_viewer;
 mod error_banner;

@@ -446,6 +446,16 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
         }
     };
 
+    // Starting a genuinely-new turn ends the restore/replay phase: freeze the
+    // history window so the last restored message stays visible and this new
+    // exchange accumulates on screen instead of being swallowed by the
+    // windowing tail-tracking (see `AppState::push_chat_entry`).
+    if let Some(active) = state.active_agent.get_untracked() {
+        state.history_settling.update(|set| {
+            set.remove(&active.agent_id);
+        });
+    }
+
     state.chat_input.set(String::new());
     pending_images.set(Vec::new());
     let restore_state = state.clone();

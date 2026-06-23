@@ -3462,6 +3462,7 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.chat_message_rows.update(|map| {
         map.remove(&agent_id);
     });
+    state.forget_history_window(&agent_id);
     state.streaming_text.update(|map| {
         map.remove(&agent_id);
     });
@@ -3649,6 +3650,15 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                     map.remove(&agent_id);
                 }
             });
+            // A new turn starting means the restore/replay phase is over, so
+            // freeze the history floor: any rows from here on are genuinely
+            // new conversation and should accumulate visibly rather than be
+            // swallowed by the windowing tail-tracking.
+            if typing {
+                state.history_settling.update(|set| {
+                    set.remove(&agent_id);
+                });
+            }
         }
         ChatEvent::MessageAdded(message) => {
             log::trace!(
@@ -4137,6 +4147,18 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
     // the only place that runs the auto-tab / compaction side effects.
     let snapshot_ids: HashSet<AgentId> =
         payload.agents.iter().map(|p| p.agent_id.clone()).collect();
+    // Prune the history window for agents on this host the snapshot no longer
+    // knows about, so a dropped agent doesn't leave an orphaned floor behind.
+    let dropped_ids: Vec<AgentId> = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .filter(|agent| agent.host_id == host_id && !snapshot_ids.contains(&agent.agent_id))
+            .map(|agent| agent.agent_id.clone())
+            .collect()
+    });
+    for dropped in &dropped_ids {
+        state.forget_history_window(dropped);
+    }
     state.agents.update(|agents| {
         agents.retain(|agent| agent.host_id != host_id || snapshot_ids.contains(&agent.agent_id));
         for payload in payload.agents {
@@ -4217,6 +4239,7 @@ fn apply_agent_bootstrap(
     state.chat_message_rows.update(|map| {
         map.remove(&agent_id);
     });
+    state.forget_history_window(&agent_id);
     state.streaming_text.update(|map| {
         map.remove(&agent_id);
     });
@@ -4284,6 +4307,24 @@ fn apply_agent_bootstrap(
             }
         }
     }
+
+    // Window long restored histories: render only the last message, collapsing
+    // earlier ones behind a "Load previous conversation history" control. The
+    // floor is the absolute index of the first rendered row. We also mark the
+    // agent as "settling" so the floor keeps tracking the tail if the resumed
+    // backend trickles the rest of its transcript in as live events after this
+    // snapshot (see `AppState::push_chat_entry`). The AI still has the full
+    // conversation in context — this only changes what the view renders.
+    let total = state
+        .chat_rows
+        .with_untracked(|map| map.get(&agent_id).map(|v| v.len()).unwrap_or(0));
+    let floor = crate::components::chat_view::initial_history_floor(total);
+    state.history_floor.update(|map| {
+        map.insert(agent_id.clone(), floor);
+    });
+    state.history_settling.update(|set| {
+        set.insert(agent_id.clone());
+    });
 }
 
 fn apply_project_bootstrap(

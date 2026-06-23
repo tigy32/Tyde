@@ -198,6 +198,17 @@ pub fn ChatInput() -> impl IntoView {
                 None => None,
             };
 
+            // Starting a genuinely-new turn ends the restore/replay phase:
+            // freeze the history window so the last restored message stays
+            // visible and this new exchange accumulates on screen instead of
+            // being swallowed by the windowing tail-tracking.
+            if let Some((active, _)) = active_target.as_ref() {
+                let agent_ref = active.as_agent_ref();
+                state.history_settling.update(|set| {
+                    set.remove(&agent_ref);
+                });
+            }
+
             state.chat_input.set(String::new());
             if let Some(textarea) = textarea_ref.get_untracked() {
                 textarea.set_value("");

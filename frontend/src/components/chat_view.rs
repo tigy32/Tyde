@@ -42,6 +42,27 @@ const VIRT_OVERSCAN: usize = 5;
 /// in lockstep with the CSS rule.
 const ROW_GAP_PX: f64 = 6.0;
 
+/// How many trailing messages stay visible when a long history is collapsed
+/// on restore. Render only the very last message initially.
+const HISTORY_INITIAL_VISIBLE: usize = 1;
+/// Only collapse genuinely-long histories — short or actively-growing chats
+/// render in full, so a normal conversation or a live reconnect is never
+/// needlessly hidden behind the "Load previous" control.
+const HISTORY_COLLAPSE_THRESHOLD: usize = 20;
+
+/// First row index the chat view renders. Returns 0 (render everything)
+/// unless the transcript is longer than [`HISTORY_COLLAPSE_THRESHOLD`], in
+/// which case all but the last [`HISTORY_INITIAL_VISIBLE`] messages are
+/// hidden behind the "Load previous conversation history" control. The AI
+/// always keeps the full conversation in context; this only windows the view.
+pub fn initial_history_floor(total: usize) -> usize {
+    if total > HISTORY_COLLAPSE_THRESHOLD {
+        total.saturating_sub(HISTORY_INITIAL_VISIBLE)
+    } else {
+        0
+    }
+}
+
 fn tab_scroll_state_from_element(el: &web_sys::Element, user_scrolled_up: bool) -> TabScrollState {
     TabScrollState {
         scroll_top: el.scroll_top(),
@@ -148,6 +169,49 @@ pub fn ChatView(
         state
             .chat_rows
             .with(|m| m.get(&id).cloned().unwrap_or_default())
+    };
+
+    // Absolute index of the first row the view renders, clamped to the row
+    // count so a stale floor can never slice out of bounds. 0 means "render
+    // the whole history"; a positive value collapses everything before it
+    // behind the "Load previous conversation history" control.
+    let history_floor = move || -> usize {
+        let Some(id) = active_agent_id() else {
+            return 0;
+        };
+        let total = state
+            .chat_rows
+            .with(|m| m.get(&id).map(|v| v.len()).unwrap_or(0));
+        state
+            .history_floor
+            .with(|m| m.get(&id).copied().unwrap_or(0))
+            .min(total)
+    };
+
+    // The rows actually fed to the windowed `<For>`: the full history minus
+    // everything below the floor. Auto-scroll and `messages_len` deliberately
+    // stay on the full count so restoring still pins to the true bottom.
+    let revealed_handles = move || -> Vec<ChatRowHandle> {
+        let rows = row_handles();
+        let floor = history_floor().min(rows.len());
+        rows[floor..].to_vec()
+    };
+
+    // True when earlier messages are hidden behind the load-previous control.
+    let history_collapsed = move || history_floor() > 0;
+
+    // Reveal the collapsed history: drop the floor to 0 and stop tail-tracking
+    // so later messages don't re-collapse the view.
+    let reveal_history = move |_| {
+        let Some(id) = active_agent_id() else {
+            return;
+        };
+        state.history_floor.update(|m| {
+            m.insert(id.clone(), 0);
+        });
+        state.history_settling.update(|s| {
+            s.remove(&id);
+        });
     };
 
     // `.with` reads through the HashMap signals without cloning the
@@ -276,18 +340,29 @@ pub fn ChatView(
         if restored_initial_scroll_for_effect.get() {
             return;
         }
-        let Some(saved) = initial_scroll_state else {
-            return;
-        };
         let Some(el) = scroll_ref_for_restore.get() else {
             return;
         };
+        // A collapsed history (floor > 0) makes any saved full-history scroll
+        // offset meaningless: the rows it pointed at aren't rendered. Pin to
+        // the bottom (last message) and start in sticky-bottom mode instead.
+        let collapsed = history_floor() > 0;
+        let saved = initial_scroll_state;
+        if saved.is_none() && !collapsed {
+            return;
+        }
         restored_initial_scroll_for_effect.set(true);
-        let target_scroll_top = if saved.user_scrolled_up {
-            saved.scroll_top
+        let restore_user_scrolled_up =
+            saved.is_some_and(|scroll| scroll.user_scrolled_up) && !collapsed;
+        let target_scroll_top = if restore_user_scrolled_up {
+            saved.map(|scroll| scroll.scroll_top).unwrap_or(0)
         } else {
             el.scroll_height()
         };
+        if collapsed {
+            user_scrolled_up.set(false);
+            show_scroll_btn.set(false);
+        }
         let html_el: web_sys::HtmlElement = el.clone().unchecked_into();
         restore_scroll_top_without_animation(&html_el, target_scroll_top);
         scroll_top_sig.set(html_el.scroll_top() as f64);
@@ -297,7 +372,7 @@ pub fn ChatView(
                 scroll_top: html_el.scroll_top(),
                 scroll_height: html_el.scroll_height(),
                 client_height: html_el.client_height(),
-                user_scrolled_up: saved.user_scrolled_up,
+                user_scrolled_up: restore_user_scrolled_up,
             },
         );
     });
@@ -542,7 +617,7 @@ pub fn ChatView(
         let _ = heights_version.get();
         let st = scroll_top_sig.get();
         let vp = viewport_height_sig.get();
-        let rows = row_handles();
+        let rows = revealed_handles();
         let n = rows.len();
         if n == 0 {
             return VirtualWindow::EMPTY;
@@ -787,6 +862,19 @@ pub fn ChatView(
                         // post-layout height back into `row_heights`,
                         // which keeps the spacers honest as the user
                         // scrolls into previously-unmeasured regions.
+                        <Show when=history_collapsed>
+                            <div class="chat-history-collapsed">
+                                <button
+                                    class="chat-history-load-previous"
+                                    on:click=reveal_history
+                                >
+                                    "Load previous conversation history"
+                                </button>
+                                <p class="chat-history-collapsed-note">
+                                    "Earlier messages are hidden from view \u{2014} the AI still has the full conversation in context."
+                                </p>
+                            </div>
+                        </Show>
                         <div
                             class="virt-spacer virt-spacer-top"
                             style=move || {
@@ -797,7 +885,7 @@ pub fn ChatView(
                         <For
                             each=move || {
                                 let win = visible_window.get();
-                                let rows = row_handles();
+                                let rows = revealed_handles();
                                 let end = win.end.min(rows.len());
                                 let start = win.start.min(end);
                                 rows[start..end].to_vec()
@@ -1101,6 +1189,23 @@ fn ReviewChangesButton() -> impl IntoView {
                 <span class="chat-review-btn-label">"Review changes"</span>
             </button>
         </Show>
+    }
+}
+
+/// Pure logic tests that run under native `cargo test` (no DOM needed).
+#[cfg(test)]
+mod tests {
+    use super::initial_history_floor;
+
+    #[test]
+    fn initial_history_floor_only_collapses_long_histories() {
+        // Short / at-threshold histories render in full.
+        assert_eq!(initial_history_floor(0), 0);
+        assert_eq!(initial_history_floor(1), 0);
+        assert_eq!(initial_history_floor(20), 0);
+        // Just over the threshold: hide all but the last message.
+        assert_eq!(initial_history_floor(21), 20);
+        assert_eq!(initial_history_floor(1000), 999);
     }
 }
 
@@ -1428,6 +1533,111 @@ mod wasm_tests {
         assert!(
             height > 0.0,
             "bottom spacer must reserve geometry for unmounted rows; got {height}px"
+        );
+    }
+
+    /// A long restored history is windowed down to its last message behind a
+    /// "Load previous conversation history" control, and revealing it brings
+    /// the earlier messages back. Asserts on what the user perceives: the
+    /// rendered row count and the explanatory banner text.
+    #[wasm_bindgen_test]
+    async fn long_history_collapses_to_last_message_with_load_previous_control() {
+        ensure_styles_loaded();
+
+        let agent_id = AgentId("agent-collapse".to_owned());
+        let host_id = "host-collapse".to_owned();
+        let total = 25usize; // > HISTORY_COLLAPSE_THRESHOLD
+
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let setup_handle = state_handle.clone();
+
+        let container = make_container();
+        let agent_id_for_mount = agent_id.clone();
+        let host_id_for_mount = host_id.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let bound = ActiveAgentRef {
+                host_id: host_id_for_mount.clone(),
+                agent_id: agent_id_for_mount.clone(),
+            };
+            let rows: Vec<ChatRowHandle> = (0..total)
+                .map(|i| ChatRowHandle::new(mk_user_msg(&format!("msg {i}"))))
+                .collect();
+            state.chat_rows.update(|m| {
+                m.insert(agent_id_for_mount.clone(), rows);
+            });
+            state.history_floor.update(|m| {
+                m.insert(agent_id_for_mount.clone(), initial_history_floor(total));
+            });
+            *setup_handle.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            let agent_ref_signal = Signal::derive(move || Some(bound.clone()));
+            let is_active_signal: Signal<bool> = Signal::derive(|| true);
+            view! { <ChatView tab_id=TabId(10_007) agent_ref=agent_ref_signal is_active=is_active_signal /> }
+        });
+
+        next_tick().await;
+        next_tick().await;
+
+        // Collapsed: only the last message is mounted; the rest hide behind
+        // the load-previous control.
+        let collapsed_rows = message_rows(&container);
+        assert_eq!(
+            collapsed_rows.len(),
+            1,
+            "collapsed history should render exactly the last message, got {}",
+            collapsed_rows.len()
+        );
+        assert!(
+            collapsed_rows[0]
+                .text_content()
+                .unwrap_or_default()
+                .contains("msg 24"),
+            "the single visible row should be the last message"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Load previous conversation history"),
+            "collapsed history must offer the load-previous control: {text}"
+        );
+        assert!(
+            text.contains("the AI still has the full conversation in context"),
+            "collapsed history must reassure the AI retains full context: {text}"
+        );
+        // The control is a real button carrying that label.
+        let buttons = container.query_selector_all("button").unwrap();
+        let has_load_button = (0..buttons.length()).any(|i| {
+            buttons
+                .item(i)
+                .and_then(|node| node.text_content())
+                .is_some_and(|label| label.contains("Load previous conversation history"))
+        });
+        assert!(has_load_button, "load-previous control must be a button");
+
+        // Reveal: drop the floor and the earlier messages come back, banner gone.
+        let state = state_handle
+            .borrow()
+            .as_ref()
+            .cloned()
+            .expect("state captured");
+        state.history_floor.update(|m| {
+            m.insert(agent_id.clone(), 0);
+        });
+
+        next_tick().await;
+        next_tick().await;
+
+        let revealed_rows = message_rows(&container);
+        assert!(
+            revealed_rows.len() > 1,
+            "revealing history should mount more than the single collapsed row, got {}",
+            revealed_rows.len()
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("Load previous conversation history"),
+            "revealed history must not still show the load-previous control: {text}"
         );
     }
 

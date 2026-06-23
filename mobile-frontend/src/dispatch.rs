@@ -938,6 +938,7 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
     state.chat_message_index.update(|m| {
         m.remove(agent_ref);
     });
+    state.forget_history_window(agent_ref);
     state.streaming_text.update(|m| {
         m.remove(agent_ref);
     });
@@ -1262,6 +1263,15 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                     map.remove(&agent_ref);
                 }
             });
+            // A new turn starting means the restore/replay phase is over, so
+            // freeze the history floor: rows from here on are genuinely new
+            // conversation and should accumulate visibly rather than be
+            // swallowed by the windowing tail-tracking.
+            if typing {
+                state.history_settling.update(|set| {
+                    set.remove(&agent_ref);
+                });
+            }
         }
         ChatEvent::MessageAdded(message) => {
             let entry = ChatMessageEntry {
@@ -1570,6 +1580,18 @@ fn apply_host_bootstrap(state: &AppState, host: &LocalHostId, payload: HostBoots
 
     let snapshot_ids: HashSet<AgentId> =
         payload.agents.iter().map(|p| p.agent_id.clone()).collect();
+    // Prune the history window for agents on this host the snapshot no longer
+    // knows about, so a dropped agent doesn't leave an orphaned floor behind.
+    let dropped_refs: Vec<AgentRef> = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .filter(|a| a.local_host_id == *host && !snapshot_ids.contains(&a.agent_id))
+            .map(|a| a.agent_ref())
+            .collect()
+    });
+    for dropped in &dropped_refs {
+        state.forget_history_window(dropped);
+    }
     state.agents.update(|agents| {
         agents.retain(|a| a.local_host_id != *host || snapshot_ids.contains(&a.agent_id));
         for payload in payload.agents {
@@ -1646,6 +1668,7 @@ fn apply_agent_bootstrap(
     state.chat_message_index.update(|m| {
         m.remove(&agent_ref);
     });
+    state.forget_history_window(&agent_ref);
     state.streaming_text.update(|m| {
         m.remove(&agent_ref);
     });
@@ -1725,6 +1748,23 @@ fn apply_agent_bootstrap(
             }
         }
     }
+
+    // Window a long restored history: render only the last message, collapsing
+    // earlier ones behind a "Load previous conversation history" control. Mark
+    // the agent "settling" so the floor keeps tracking the tail if the resumed
+    // backend trickles the rest of its transcript in as live events after this
+    // snapshot (see `AppState::push_chat_message_entry`). The AI still has the
+    // full conversation in context — this only changes what the view renders.
+    let total = state
+        .chat_messages
+        .with_untracked(|m| m.get(&agent_ref).map(|v| v.len()).unwrap_or(0));
+    let floor = crate::components::chat_view::initial_history_floor(total);
+    state.history_floor.update(|m| {
+        m.insert(agent_ref.clone(), floor);
+    });
+    state.history_settling.update(|s| {
+        s.insert(agent_ref.clone());
+    });
 }
 
 fn apply_project_bootstrap(

@@ -54,6 +54,27 @@ fn back_swipe_triggered(start_x: f64, dx: f64, dy: f64, viewport_width: f64) -> 
     }
 }
 
+/// How many trailing messages stay visible when a long history is collapsed
+/// on restore. Render only the very last message initially.
+const HISTORY_INITIAL_VISIBLE: usize = 1;
+/// Only collapse genuinely-long histories — short or actively-growing chats
+/// render in full, so a normal conversation or a live reconnect is never
+/// needlessly hidden behind the "Load previous" control.
+const HISTORY_COLLAPSE_THRESHOLD: usize = 20;
+
+/// First message index the chat view renders. Returns 0 (render everything)
+/// unless the transcript is longer than [`HISTORY_COLLAPSE_THRESHOLD`], in
+/// which case all but the last [`HISTORY_INITIAL_VISIBLE`] messages are
+/// hidden behind the "Load previous conversation history" control. The AI
+/// always keeps the full conversation in context; this only windows the view.
+pub fn initial_history_floor(total: usize) -> usize {
+    if total > HISTORY_COLLAPSE_THRESHOLD {
+        total.saturating_sub(HISTORY_INITIAL_VISIBLE)
+    } else {
+        0
+    }
+}
+
 /// Conversation surface.
 ///
 /// Composition rules:
@@ -562,6 +583,26 @@ pub fn ChatView() -> impl IntoView {
                     let messages = s_body.chat_messages.with(|m| {
                         m.get(&key).cloned().unwrap_or_default()
                     });
+                    // Window a long restored history: render only the messages
+                    // from the floor onward, with the rest behind a "Load
+                    // previous" control. Read `history_floor` here so revealing
+                    // (floor -> 0) re-renders the transcript.
+                    let floor = s_body
+                        .history_floor
+                        .with(|m| m.get(&key).copied().unwrap_or(0))
+                        .min(messages.len());
+                    let history_collapsed = floor > 0;
+                    let shown = messages[floor..].to_vec();
+                    let reveal_state = s_body.clone();
+                    let reveal_key = key.clone();
+                    let on_load_previous = move |_| {
+                        reveal_state.history_floor.update(|m| {
+                            m.insert(reveal_key.clone(), 0);
+                        });
+                        reveal_state.history_settling.update(|s| {
+                            s.remove(&reveal_key);
+                        });
+                    };
                     let streaming = s_body.streaming_text.with(|m| m.get(&key).cloned());
                     let task_list = s_body.task_lists.with(|m| m.get(&key).cloned());
                     let transient = s_body.transient_events.with(|m| m.get(&key).cloned().unwrap_or_default());
@@ -607,6 +648,24 @@ pub fn ChatView() -> impl IntoView {
 
                     view! {
                         <div class="chat-transcript" data-mobile-test="chat-transcript">
+                            // Collapsed-history control: reveal earlier messages
+                            // hidden when a long session was restored.
+                            {history_collapsed.then(|| view! {
+                                <div class="chat-history-collapsed" data-mobile-test="chat-history-collapsed">
+                                    <button
+                                        type="button"
+                                        class="chat-history-load-previous"
+                                        data-mobile-test="chat-load-previous"
+                                        on:click=on_load_previous
+                                    >
+                                        "Load previous conversation history"
+                                    </button>
+                                    <p class="chat-history-collapsed-note">
+                                        "Earlier messages are hidden from view \u{2014} the AI still has the full conversation in context."
+                                    </p>
+                                </div>
+                            })}
+
                             // Task list
                             {task_list.map(|tl| {
                                 view! {
@@ -630,7 +689,7 @@ pub fn ChatView() -> impl IntoView {
                             })}
 
                             // Messages
-                            {messages.into_iter().map(|entry| {
+                            {shown.into_iter().map(|entry| {
                                 view! { <ChatMessageView entry=entry /> }
                             }).collect::<Vec<_>>()}
 
@@ -749,6 +808,21 @@ fn chat_is_near_bottom(el: &web_sys::HtmlElement) -> bool {
 
 fn scroll_chat_to_bottom(el: &web_sys::HtmlElement) {
     el.set_scroll_top(el.scroll_height());
+}
+
+/// Pure logic tests that run under native `cargo test` (no DOM needed).
+#[cfg(test)]
+mod tests {
+    use super::initial_history_floor;
+
+    #[test]
+    fn initial_history_floor_only_collapses_long_histories() {
+        assert_eq!(initial_history_floor(0), 0);
+        assert_eq!(initial_history_floor(1), 0);
+        assert_eq!(initial_history_floor(20), 0);
+        assert_eq!(initial_history_floor(21), 20);
+        assert_eq!(initial_history_floor(1000), 999);
+    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -969,6 +1043,82 @@ mod wasm_tests {
         assert!(
             distance_from_bottom(&scroller) > CHAT_STICKY_BOTTOM_THRESHOLD_PX,
             "user-scrolled chat should remain away from bottom"
+        );
+    }
+
+    /// A long restored history collapses to its last message behind a
+    /// "Load previous conversation history" control; revealing it brings the
+    /// earlier messages back. Asserts on what the user perceives: the rendered
+    /// message count and the explanatory banner text.
+    #[wasm_bindgen_test]
+    async fn long_history_collapses_to_last_message_with_load_previous_control() {
+        let container = make_container();
+        let state = mount_active_chat(container.clone());
+        next_tick().await;
+
+        let total = 25usize; // > HISTORY_COLLAPSE_THRESHOLD
+        fill_chat(&state, total);
+        let agent_ref = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent")
+            .as_agent_ref();
+        state.history_floor.update(|m| {
+            m.insert(agent_ref.clone(), initial_history_floor(total));
+        });
+        settle_autoscroll().await;
+
+        let collapsed_rows = container
+            .query_selector_all(".chat-transcript .chat-message")
+            .unwrap();
+        assert_eq!(
+            collapsed_rows.length(),
+            1,
+            "collapsed history should render exactly the last message, got {}",
+            collapsed_rows.length()
+        );
+        let banner = container
+            .query_selector("[data-mobile-test='chat-history-collapsed']")
+            .unwrap();
+        assert!(
+            banner.is_some(),
+            "collapsed history must show the load-previous banner"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Load previous conversation history"),
+            "banner must offer the load-previous control: {text}"
+        );
+        assert!(
+            text.contains("the AI still has the full conversation in context"),
+            "banner must reassure the AI retains full context: {text}"
+        );
+
+        // Reveal via the actual control the user taps.
+        let button: HtmlElement = container
+            .query_selector("[data-mobile-test='chat-load-previous']")
+            .unwrap()
+            .expect("load-previous button present")
+            .dyn_into()
+            .unwrap();
+        button.click();
+        settle_autoscroll().await;
+
+        let revealed_rows = container
+            .query_selector_all(".chat-transcript .chat-message")
+            .unwrap();
+        assert_eq!(
+            revealed_rows.length() as usize,
+            total,
+            "revealing history should render the full transcript, got {}",
+            revealed_rows.length()
+        );
+        let banner_after = container
+            .query_selector("[data-mobile-test='chat-history-collapsed']")
+            .unwrap();
+        assert!(
+            banner_after.is_none(),
+            "revealed history must not still show the load-previous banner"
         );
     }
 
