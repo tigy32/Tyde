@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+#
+# Tyde pre-push hook — enforce the release rules so the tooling catches a
+# mistake before it reaches the remote (instead of blaming a human afterward).
+#
+# It polices ONLY release-tag pushes (refs/tags/vX.Y.Z...). Ordinary branch and
+# non-release tag pushes pass straight through.
+#
+# For every release tag being pushed it REFUSES the push unless:
+#   1. The tagged commit is contained in `main` (releases are cut off main,
+#      100% of the time — see AGENTS.md "Release pushes").
+#   2. The tracked version files are in sync with the tag
+#      (tools/check_release_version.py vX.Y.Z passes).
+#
+# Install (per clone — core.hooksPath is local config, not tracked):
+#   git config core.hooksPath .githooks
+# or run tools/install-git-hooks.sh.
+#
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+zero="0000000000000000000000000000000000000000"
+fail=0
+
+# pre-push feeds "<local_ref> <local_sha> <remote_ref> <remote_sha>" on stdin,
+# one line per ref being pushed.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # Only police things that look like release tags: refs/tags/v<digit>...
+  case "$remote_ref" in
+    refs/tags/v[0-9]*) ;;
+    *) continue ;;
+  esac
+
+  # A deletion (local_sha all zeros) is allowed.
+  [ "$local_sha" = "$zero" ] && continue
+
+  tag="${remote_ref#refs/tags/}"
+
+  # 1) The tagged commit MUST be reachable from main.
+  if ! git merge-base --is-ancestor "$local_sha" refs/heads/main 2>/dev/null; then
+    echo "" >&2
+    echo "pre-push: ✗ REFUSED — release tag '$tag' is not on 'main'." >&2
+    echo "          commit ${local_sha:0:12} is not contained in refs/heads/main." >&2
+    echo "          Releases are cut off main 100% of the time. Merge the work into" >&2
+    echo "          main first, then tag the commit on main. (AGENTS.md §5)" >&2
+    echo "" >&2
+    fail=1
+    continue
+  fi
+
+  # 2) Version files must match the tag — checked against the TAGGED COMMIT's
+  #    content, not the working tree (so a dirty/unrelated tree can't make a
+  #    bad tag look in-sync, or a good tag look broken). We extract the tagged
+  #    tree into a temp dir and run the checker there.
+  if command -v python3 >/dev/null 2>&1 \
+     && git cat-file -e "$local_sha:tools/check_release_version.py" 2>/dev/null; then
+    tmp="$(mktemp -d)"
+    ref_bad=0
+    if git archive "$local_sha" | tar -x -C "$tmp" 2>/dev/null \
+       && ! python3 "$tmp/tools/check_release_version.py" "$tag" >/dev/null 2>&1; then
+      echo "" >&2
+      echo "pre-push: ✗ REFUSED — version files in commit ${local_sha:0:12} are not" >&2
+      echo "          in sync with tag '$tag':" >&2
+      python3 "$tmp/tools/check_release_version.py" "$tag" >&2 || true
+      echo "" >&2
+      fail=1
+      ref_bad=1
+    fi
+    rm -rf "$tmp"
+    [ "$ref_bad" -eq 1 ] && continue
+  else
+    echo "pre-push: ⚠ cannot verify version sync for '$tag' (no python3 or no" >&2
+    echo "          checker in the tagged commit) — proceeding on the main check only." >&2
+  fi
+
+  echo "pre-push: ✓ '$tag' is on main and version files are in sync." >&2
+done
+
+exit "$fail"
