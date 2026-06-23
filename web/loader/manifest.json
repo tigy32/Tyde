@@ -19,6 +19,22 @@
       "artifacts": {
         "/tyde/v0.8.19-beta.3/mobile-frontend-5bbff969dc35724d_bg.wasm": "sha384-jhI/CtdoM6JtCTnVduo1ipD8sXnbuZBvgijfnjIMjNw3fm7E/TB69dv3GL1+KT7K"
       }
+    },
+    "0.8.19-beta.5": {
+      "path": "/tyde/v0.8.19-beta.5/",
+      "entry": "/tyde/v0.8.19-beta.5/mobile-frontend-3c43836d091d1c3c.js",
+      "integrity": "sha384-lXJfNKeO3AffFYw/tijZ7f+8En25pP41XC6nXFHZv9FFwOm8nBpMfKPvMcGxGYLf",
+      "artifacts": {
+        "/tyde/v0.8.19-beta.5/mobile-frontend-3c43836d091d1c3c_bg.wasm": "sha384-If8QqpBKLZLKivDxSFFm5wyas9NeCdfcMpvXk053AvlDlH4LeaDQR9xiVK0S9Chv"
+      }
+    },
+    "0.8.19-beta.4": {
+      "path": "/tyde/v0.8.19-beta.4/",
+      "entry": "/tyde/v0.8.19-beta.4/mobile-frontend-5bbff969dc35724d.js",
+      "integrity": "sha384-zP/nBPwTzm3DD2O8g2Du8TZ03D8GQ9FNP80kr3a7lcxBw3KtV1aSnJYzQAuwInjx",
+      "artifacts": {
+        "/tyde/v0.8.19-beta.4/mobile-frontend-5bbff969dc35724d_bg.wasm": "sha384-jhI/CtdoM6JtCTnVduo1ipD8sXnbuZBvgijfnjIMjNw3fm7E/TB69dv3GL1+KT7K"
+      }
     }
   }
 }
