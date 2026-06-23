@@ -12,6 +12,7 @@ It builds on:
 - `07-project-stream.md`
 - `08-gui-shell-boundary.md`
 - `09-host-settings.md`
+- `24-remote-connect-upgrade.md` for managed remote connect/upgrade
 
 ---
 
@@ -456,6 +457,11 @@ still speak to it through SSH stdio:
 The remote bridge is **not** a second server protocol and **not** a backend
 shim. It should only shuttle bytes between SSH stdio and the UDS socket.
 
+For managed remotes, the shell executes the exact expected release binary at
+`~/.tyde/bin/<target>/tyde-server` for the bridge. It must not fall back to
+`~/.tyde/bin/current/tyde-server`, because a compatible connect can serve an
+already-running daemon without relaunching it or rewriting the `current` symlink.
+
 That preserves the rewrite boundary from `01-philosophy.md`:
 
 - server owns behavior
@@ -841,9 +847,11 @@ This document now assumes:
 - `tyde host --uds` starts the persistent host daemon
 - `tyde host --bridge-uds` is the SSH bridge command
 
-What remains open is whether the desktop product should later gain explicit UI
-for checking, starting, or supervising that remote daemon. This first design
-still assumes the daemon already exists or fails loudly when it does not.
+Managed remote lifecycle details are specified in
+`24-remote-connect-upgrade.md`. A compatible connect and a status probe never
+contact GitHub; they only probe the remote host over SSH. GitHub is contacted
+only when the shell must launch or upgrade a managed host and the exact target
+binary is not already installed on disk.
 
 ### 18.2 Auto-reconnect policy
 

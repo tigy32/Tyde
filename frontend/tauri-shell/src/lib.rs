@@ -421,6 +421,19 @@ async fn ensure_configured_host_ready(
 }
 
 #[tauri::command]
+async fn force_upgrade_managed_host(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ShellState>,
+    host_id: String,
+) -> Result<RemoteHostLifecycleSnapshot, String> {
+    let configured_host = state
+        .host_store
+        .get(&host_id)?
+        .ok_or_else(|| format!("configured host '{}' not found", host_id))?;
+    remote_bootstrap::force_upgrade_managed_host(app, configured_host).await
+}
+
+#[tauri::command]
 fn list_configured_hosts(
     state: tauri::State<'_, ShellState>,
 ) -> Result<ConfiguredHostStore, String> {
@@ -561,6 +574,7 @@ pub fn run() {
             send_host_line,
             probe_configured_host_lifecycle,
             ensure_configured_host_ready,
+            force_upgrade_managed_host,
             list_configured_hosts,
             upsert_configured_host,
             remove_configured_host,

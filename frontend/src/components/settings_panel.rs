@@ -914,7 +914,7 @@ fn HostsTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Configured Hosts"</label>
-            <p class="settings-description">"The embedded local host is always present. Managed SSH hosts install Tyde Server under ~/.tyde/bin/<version>/tyde-server and launch ~/.tyde/bin/current/tyde-server when needed."</p>
+            <p class="settings-description">"The embedded local host is always present. Managed SSH hosts install and launch the exact Tyde Server release matching this app at ~/.tyde/bin/<version>/tyde-server."</p>
             <div class="settings-host-list">
                 {move || state_for_configured_hosts.configured_hosts.get().into_iter().map(|host| {
                     let host_id = host.id.clone();
@@ -999,6 +999,12 @@ fn HostsTab() -> impl IntoView {
                                                             statuses.insert(host_id.clone(), crate::state::ConnectionStatus::Disconnected);
                                                         });
                                                         state.clear_host_runtime(&host_id);
+                                                        // Explicit user disconnect ends the connection
+                                                        // lifecycle, so release the one-shot forced-upgrade
+                                                        // guard: a later manual reconnect can attempt the
+                                                        // auto-upgrade once more. Only cleared here (not on
+                                                        // transport-drop) to preserve the no-loop invariant.
+                                                        state.clear_upgrade_attempted(&host_id);
                                                     });
                                                 }
                                             >

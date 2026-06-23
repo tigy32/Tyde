@@ -19,7 +19,7 @@ use protocol::{
     ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectPath,
     ProjectSearchCompletePayload, ProjectSearchResultsPayload, ProtocolValidator,
-    QueuedMessagesPayload, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
+    QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
     ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionId,
     SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload,
     SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
@@ -338,6 +338,11 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
             state.command_errors_by_host.update(|errors| {
                 errors.remove(host_id);
             });
+            // Handshake succeeded, so the connection lifecycle is healthy again:
+            // release the one-shot forced-upgrade guard so a future
+            // incompatibility (e.g. after the app itself updates) can trigger
+            // one fresh auto-upgrade attempt.
+            state.clear_upgrade_attempted(host_id);
             state.connection_statuses.update(|statuses| {
                 statuses.insert(host_id.to_string(), ConnectionStatus::Connected);
             });
@@ -429,12 +434,67 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     host_id,
                     payload.message
                 );
-                state.connection_statuses.update(|statuses| {
-                    statuses.insert(
-                        host_id.to_string(),
-                        ConnectionStatus::Error(payload.message),
-                    );
-                });
+                // Phase 2 safety net: a MANAGED remote that rejects with
+                // IncompatibleProtocol — after Phase 1's normal connect path
+                // already served/launched a release it judged compatible — gets
+                // exactly ONE forced upgrade-and-reconnect. The forced path
+                // (`force_upgrade_managed_host`) bypasses the "serve as-is"
+                // decision so it won't no-op when the running version matches but
+                // the protocol is still incompatible. The per-host
+                // `upgrade_attempted` guard makes this strictly one-shot: no
+                // fallback, no loop. Any other case (already attempted,
+                // non-managed host, or InvalidHandshake) keeps the existing
+                // terminal-error behavior.
+                let eligible = payload.code == RejectCode::IncompatibleProtocol
+                    && crate::app::is_managed_remote_host(state, host_id)
+                    && !state.upgrade_already_attempted(host_id);
+                if eligible {
+                    state.mark_upgrade_attempted(host_id);
+                    // The connection is still being established as far as the
+                    // user is concerned — keep it in Connecting while the forced
+                    // upgrade + reconnect runs.
+                    state.connection_statuses.update(|statuses| {
+                        statuses.insert(host_id.to_string(), ConnectionStatus::Connecting);
+                    });
+                    let state = state.clone();
+                    let host_id = host_id.to_string();
+                    let reject_message = payload.message;
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match crate::bridge::force_upgrade_managed_host(host_id.clone()).await {
+                            Ok(snapshot) => {
+                                state.host_lifecycle_statuses.update(|statuses| {
+                                    statuses.insert(
+                                        host_id.clone(),
+                                        crate::bridge::RemoteHostLifecycleStatus::Snapshot {
+                                            snapshot,
+                                        },
+                                    );
+                                });
+                                crate::app::connect_one_host(state, host_id).await;
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "forced upgrade after IncompatibleProtocol failed for host {host_id}: {error}"
+                                );
+                                state.connection_statuses.update(|statuses| {
+                                    statuses.insert(
+                                        host_id,
+                                        ConnectionStatus::Error(format!(
+                                            "incompatible protocol ({reject_message}); forced upgrade failed: {error}"
+                                        )),
+                                    );
+                                });
+                            }
+                        }
+                    });
+                } else {
+                    state.connection_statuses.update(|statuses| {
+                        statuses.insert(
+                            host_id.to_string(),
+                            ConnectionStatus::Error(payload.message),
+                        );
+                    });
+                }
             }
             Err(error) => {
                 report_dispatch_error(

@@ -869,7 +869,7 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
     log::info!("host.connect.done host={}", host_id);
 }
 
-fn is_managed_remote_host(state: &AppState, host_id: &str) -> bool {
+pub(crate) fn is_managed_remote_host(state: &AppState, host_id: &str) -> bool {
     state
         .configured_hosts
         .get_untracked()

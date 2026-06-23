@@ -119,6 +119,23 @@ pub async fn ensure_configured_host_ready(
     serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
 }
 
+/// Force a managed remote host through a stop + relaunch/upgrade of the exact
+/// target release, bypassing the normal "serve as-is" decision. Used by the
+/// Phase 2 safety net when a managed host rejects the handshake with
+/// `IncompatibleProtocol` despite a compatible-looking probe. Contacts GitHub
+/// only when the target binary is missing; surfaces errors verbatim (no
+/// fallback to an older release).
+pub async fn force_upgrade_managed_host(
+    host_id: String,
+) -> Result<RemoteHostLifecycleSnapshot, String> {
+    let args =
+        serde_wasm_bindgen::to_value(&HostIdRequest { host_id }).map_err(|e| e.to_string())?;
+    let value = tauri_invoke("force_upgrade_managed_host", args)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    serde_wasm_bindgen::from_value(value).map_err(|e| e.to_string())
+}
+
 pub async fn submit_feedback(feedback: String) -> Result<(), String> {
     #[derive(serde::Serialize)]
     struct Args {

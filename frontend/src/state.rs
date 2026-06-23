@@ -1352,6 +1352,17 @@ pub struct AppState {
     /// correlate the resulting `ProjectNotify::Upsert` and switch the active
     /// project to the freshly-created workbench. See `PendingWorkbenchCreate`.
     pub pending_workbench_creates: RwSignal<Vec<PendingWorkbenchCreate>>,
+    /// Managed remote hosts for which the Phase 2 safety net has already fired
+    /// its one forced upgrade-and-reconnect after a `Reject{IncompatibleProtocol}`.
+    /// This is ephemeral, frontend-owned *connect-control* state — a one-shot
+    /// guard scoped to the current connection lifecycle — NOT mirrored
+    /// server/business state. It guarantees "upgrade once, no loop": cleared on a
+    /// successful `Welcome` (so a later legitimate reconnect can retry once) and
+    /// intended to be cleared on an explicit user disconnect via
+    /// [`AppState::clear_upgrade_attempted`]. It is deliberately NOT cleared on a
+    /// transport-drop disconnect, since that would let a server that keeps
+    /// rejecting re-trigger the upgrade indefinitely.
+    pub upgrade_attempted: RwSignal<HashSet<String>>,
 }
 
 /// Snapshot of identifying fields captured for an agent at the moment
@@ -1527,7 +1538,34 @@ impl AppState {
             mobile_pairing_offer: RwSignal::new(HashMap::new()),
             mobile_pairing_start_pending: RwSignal::new(HashSet::new()),
             pending_workbench_creates: RwSignal::new(Vec::new()),
+            upgrade_attempted: RwSignal::new(HashSet::new()),
         }
+    }
+
+    /// Whether the Phase 2 safety net has already fired its one forced
+    /// upgrade-and-reconnect for `host_id` on the current connection lifecycle.
+    pub fn upgrade_already_attempted(&self, host_id: &str) -> bool {
+        self.upgrade_attempted
+            .with_untracked(|set| set.contains(host_id))
+    }
+
+    /// Record that the one-shot forced upgrade has fired for `host_id`. Blocks a
+    /// second auto-upgrade until the guard is cleared (on `Welcome` or explicit
+    /// disconnect), so the safety net can never loop.
+    pub fn mark_upgrade_attempted(&self, host_id: &str) {
+        self.upgrade_attempted.update(|set| {
+            set.insert(host_id.to_owned());
+        });
+    }
+
+    /// Clear the one-shot forced-upgrade guard for `host_id` so a later
+    /// legitimate reconnect can attempt the upgrade once more. Called on a
+    /// successful `Welcome`; should also be called from the explicit
+    /// user-initiated disconnect path.
+    pub fn clear_upgrade_attempted(&self, host_id: &str) {
+        self.upgrade_attempted.update(|set| {
+            set.remove(host_id);
+        });
     }
 
     /// Record that the user has fired a compaction for `(host_id,
@@ -3149,6 +3187,55 @@ mod tests {
             label: label.to_string(),
             closeable,
         }
+    }
+
+    #[test]
+    fn upgrade_guard_starts_absent_then_marks_and_clears() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = "managed-host";
+
+            assert!(!state.upgrade_already_attempted(host));
+            state.mark_upgrade_attempted(host);
+            assert!(state.upgrade_already_attempted(host));
+            state.clear_upgrade_attempted(host);
+            assert!(!state.upgrade_already_attempted(host));
+        });
+    }
+
+    #[test]
+    fn upgrade_guard_clear_of_absent_id_is_noop() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            // Clearing an id that was never marked must not panic or flip any
+            // other state — it is simply a no-op.
+            state.clear_upgrade_attempted("never-marked");
+            assert!(!state.upgrade_already_attempted("never-marked"));
+        });
+    }
+
+    #[test]
+    fn upgrade_guard_is_independent_per_host() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_a = "host-a";
+            let host_b = "host-b";
+
+            state.mark_upgrade_attempted(host_a);
+            assert!(state.upgrade_already_attempted(host_a));
+            assert!(!state.upgrade_already_attempted(host_b));
+
+            // Clearing one host leaves the other untouched.
+            state.clear_upgrade_attempted(host_a);
+            assert!(!state.upgrade_already_attempted(host_a));
+
+            state.mark_upgrade_attempted(host_b);
+            assert!(state.upgrade_already_attempted(host_b));
+            assert!(!state.upgrade_already_attempted(host_a));
+        });
     }
 
     #[test]

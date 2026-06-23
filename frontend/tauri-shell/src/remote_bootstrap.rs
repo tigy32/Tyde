@@ -19,7 +19,7 @@ use crate::bridge::HOST_LIFECYCLE_EVENT;
 const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/tigy32/Tyde/releases";
 const GITHUB_USER_AGENT: &str = "Tyde remote lifecycle";
 
-fn current_app_release_version() -> Result<TydeReleaseVersion, String> {
+pub(crate) fn current_app_release_version() -> Result<TydeReleaseVersion, String> {
     let tag = option_env!("TYDE_RELEASE_TAG").ok_or_else(|| {
         "this Tyde build does not include release metadata, so managed remote install is disabled; use an official release build or configure a manual remote command"
             .to_string()
@@ -43,56 +43,9 @@ pub async fn ensure_configured_host_ready(
     let managed = managed_ssh_host(&host)?;
     let target_version = current_app_release_version()?;
 
-    emit_running(&app, &host.id, RemoteHostLifecycleStep::ProbePlatform, None);
-    let platform = probe_platform(&managed.ssh_destination).await?;
-
-    emit_running(
-        &app,
-        &host.id,
-        RemoteHostLifecycleStep::ResolveRelease,
-        None,
-    );
-    let release = resolve_release(target_version).await?;
-
-    emit_running(
-        &app,
-        &host.id,
-        RemoteHostLifecycleStep::ProbeInstallation,
-        Some(release.version.clone()),
-    );
-    let mut snapshot =
-        probe_snapshot(&managed.ssh_destination, platform, release.version.clone()).await?;
-    emit_snapshot(&app, &host.id, snapshot.clone());
-
-    if !snapshot.installed_target {
-        emit_running(
-            &app,
-            &host.id,
-            RemoteHostLifecycleStep::DownloadAsset,
-            Some(snapshot.target_version.clone()),
-        );
-        let asset = select_release_asset(&release, snapshot.platform)?;
-        let archive = download_asset(&asset.download_url).await?;
-        let binary = extract_tyde_binary(&archive, asset.kind)?;
-
-        emit_running(
-            &app,
-            &host.id,
-            RemoteHostLifecycleStep::InstallBinary,
-            Some(snapshot.target_version.clone()),
-        );
-        install_binary(&managed.ssh_destination, &snapshot.target_version, &binary).await?;
-        snapshot = probe_snapshot(
-            &managed.ssh_destination,
-            snapshot.platform,
-            snapshot.target_version.clone(),
-        )
-        .await?;
-        emit_snapshot(&app, &host.id, snapshot.clone());
-    }
-
-    match snapshot.running.clone() {
-        RemoteTydeRunningState::Managed { version } if version == snapshot.target_version => {
+    let mut snapshot = probe_target_snapshot(&app, &host.id, &managed, target_version).await?;
+    match plan_lifecycle_action(&snapshot) {
+        LifecycleAction::ServeAsIs => {
             emit_running(
                 &app,
                 &host.id,
@@ -102,6 +55,72 @@ pub async fn ensure_configured_host_ready(
             emit_snapshot(&app, &host.id, snapshot.clone());
             Ok(snapshot)
         }
+        LifecycleAction::Launch { needs_install } => {
+            if needs_install {
+                snapshot =
+                    ensure_target_installed(&app, &host.id, &managed.ssh_destination, &snapshot)
+                        .await?;
+            }
+            launch_and_verify(
+                &app,
+                &host.id,
+                &managed.ssh_destination,
+                snapshot.target_version.clone(),
+            )
+            .await
+        }
+        LifecycleAction::Upgrade { needs_install } => {
+            if needs_install {
+                snapshot =
+                    ensure_target_installed(&app, &host.id, &managed.ssh_destination, &snapshot)
+                        .await?;
+            }
+            emit_running(
+                &app,
+                &host.id,
+                RemoteHostLifecycleStep::StopOldServer,
+                Some(snapshot.target_version.clone()),
+            );
+            stop_managed_server(&managed.ssh_destination).await?;
+            launch_and_verify(
+                &app,
+                &host.id,
+                &managed.ssh_destination,
+                snapshot.target_version.clone(),
+            )
+            .await
+        }
+        LifecycleAction::MissingTargetBinary => lifecycle_error(
+            &app,
+            &host.id,
+            missing_target_binary_message(&snapshot.target_version),
+        ),
+        LifecycleAction::UnknownSocket => {
+            let message = "remote Tyde socket exists, but it was not launched by Tyde's managed lifecycle; stop it manually or use a manual host configuration".to_string();
+            lifecycle_error(&app, &host.id, message)
+        }
+    }
+}
+
+pub async fn force_upgrade_managed_host(
+    app: AppHandle,
+    host: ConfiguredHost,
+) -> Result<RemoteHostLifecycleSnapshot, String> {
+    let managed = managed_ssh_host(&host)?;
+    let target_version = current_app_release_version()?;
+
+    let mut snapshot = probe_target_snapshot(&app, &host.id, &managed, target_version).await?;
+    if matches!(snapshot.running, RemoteTydeRunningState::UnknownSocket) {
+        let message = "remote Tyde socket exists, but it was not launched by Tyde's managed lifecycle; stop it manually or use a manual host configuration".to_string();
+        return lifecycle_error(&app, &host.id, message);
+    }
+
+    if !snapshot.installed_target {
+        snapshot =
+            ensure_target_installed(&app, &host.id, &managed.ssh_destination, &snapshot).await?;
+    }
+
+    match &snapshot.running {
         RemoteTydeRunningState::Managed { .. } => {
             emit_running(
                 &app,
@@ -129,9 +148,36 @@ pub async fn ensure_configured_host_ready(
         }
         RemoteTydeRunningState::UnknownSocket => {
             let message = "remote Tyde socket exists, but it was not launched by Tyde's managed lifecycle; stop it manually or use a manual host configuration".to_string();
-            emit_error(&app, &host.id, message.clone());
-            Err(message)
+            lifecycle_error(&app, &host.id, message)
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleAction {
+    ServeAsIs,
+    Launch { needs_install: bool },
+    Upgrade { needs_install: bool },
+    MissingTargetBinary,
+    UnknownSocket,
+}
+
+fn plan_lifecycle_action(snapshot: &RemoteHostLifecycleSnapshot) -> LifecycleAction {
+    match &snapshot.running {
+        RemoteTydeRunningState::Managed { version } if version == &snapshot.target_version => {
+            if snapshot.installed_target {
+                LifecycleAction::ServeAsIs
+            } else {
+                LifecycleAction::MissingTargetBinary
+            }
+        }
+        RemoteTydeRunningState::Managed { .. } => LifecycleAction::Upgrade {
+            needs_install: !snapshot.installed_target,
+        },
+        RemoteTydeRunningState::NotRunning => LifecycleAction::Launch {
+            needs_install: !snapshot.installed_target,
+        },
+        RemoteTydeRunningState::UnknownSocket => LifecycleAction::UnknownSocket,
     }
 }
 
@@ -180,22 +226,137 @@ async fn probe_managed_host(
     managed: &ManagedSshHost,
 ) -> Result<RemoteHostLifecycleSnapshot, String> {
     let target_version = current_app_release_version()?;
+    probe_target_snapshot(app, host_id, managed, target_version).await
+}
 
+async fn probe_target_snapshot(
+    app: &AppHandle,
+    host_id: &str,
+    managed: &ManagedSshHost,
+    target_version: TydeReleaseVersion,
+) -> Result<RemoteHostLifecycleSnapshot, String> {
     emit_running(app, host_id, RemoteHostLifecycleStep::ProbePlatform, None);
     let platform = probe_platform(&managed.ssh_destination).await?;
-
-    emit_running(app, host_id, RemoteHostLifecycleStep::ResolveRelease, None);
-    let release = resolve_release(target_version).await?;
 
     emit_running(
         app,
         host_id,
         RemoteHostLifecycleStep::ProbeInstallation,
-        Some(release.version.clone()),
+        Some(target_version.clone()),
     );
-    let snapshot = probe_snapshot(&managed.ssh_destination, platform, release.version).await?;
+    let snapshot = probe_snapshot(&managed.ssh_destination, platform, target_version).await?;
     emit_snapshot(app, host_id, snapshot.clone());
     Ok(snapshot)
+}
+
+async fn ensure_target_installed(
+    app: &AppHandle,
+    host_id: &str,
+    ssh_destination: &str,
+    snapshot: &RemoteHostLifecycleSnapshot,
+) -> Result<RemoteHostLifecycleSnapshot, String> {
+    if snapshot.installed_target {
+        return Ok(snapshot.clone());
+    }
+
+    let target_version = snapshot.target_version.clone();
+    emit_running(
+        app,
+        host_id,
+        RemoteHostLifecycleStep::ResolveRelease,
+        Some(target_version.clone()),
+    );
+    let release = match resolve_release(target_version.clone()).await {
+        Ok(release) => release,
+        Err(err) => {
+            return lifecycle_error(app, host_id, github_install_error(&target_version, err));
+        }
+    };
+
+    emit_running(
+        app,
+        host_id,
+        RemoteHostLifecycleStep::DownloadAsset,
+        Some(target_version.clone()),
+    );
+    let asset = match select_release_asset(&release, snapshot.platform) {
+        Ok(asset) => asset,
+        Err(err) => {
+            return lifecycle_error(
+                app,
+                host_id,
+                format!("failed to select Tyde {target_version} release asset: {err}"),
+            );
+        }
+    };
+    let archive = match download_asset(&asset.download_url).await {
+        Ok(archive) => archive,
+        Err(err) => {
+            return lifecycle_error(app, host_id, github_install_error(&target_version, err));
+        }
+    };
+    let binary = match extract_tyde_binary(&archive, asset.kind) {
+        Ok(binary) => binary,
+        Err(err) => {
+            return lifecycle_error(
+                app,
+                host_id,
+                format!("failed to extract Tyde {target_version} server binary: {err}"),
+            );
+        }
+    };
+
+    emit_running(
+        app,
+        host_id,
+        RemoteHostLifecycleStep::InstallBinary,
+        Some(target_version.clone()),
+    );
+    if let Err(err) = install_binary(ssh_destination, &target_version, &binary).await {
+        return lifecycle_error(
+            app,
+            host_id,
+            format!("failed to install Tyde {target_version} on the remote host: {err}"),
+        );
+    }
+
+    let snapshot =
+        match probe_snapshot(ssh_destination, snapshot.platform, target_version.clone()).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                return lifecycle_error(
+                    app,
+                    host_id,
+                    format!("failed to verify Tyde {target_version} after install: {err}"),
+                );
+            }
+        };
+    emit_snapshot(app, host_id, snapshot.clone());
+    if !snapshot.installed_target {
+        return lifecycle_error(
+            app,
+            host_id,
+            format!(
+                "installed Tyde {target_version}, but ~/.tyde/bin/{target_version}/tyde-server is still missing or not executable"
+            ),
+        );
+    }
+    Ok(snapshot)
+}
+
+fn missing_target_binary_message(target_version: &TydeReleaseVersion) -> String {
+    format!(
+        "managed Tyde server is already running expected release {target_version}, but ~/.tyde/bin/{target_version}/tyde-server is missing or not executable; refusing compatible connect because the managed SSH bridge must execute the exact target binary"
+    )
+}
+
+fn github_install_error(target_version: &TydeReleaseVersion, error: String) -> String {
+    format!("installing Tyde {target_version} requires GitHub, which is unavailable: {error}")
+}
+
+fn lifecycle_error<T>(app: &AppHandle, host_id: &str, message: String) -> Result<T, String> {
+    emit_error(app, host_id, message.clone());
+    Err(message)
 }
 
 async fn launch_and_verify(
@@ -529,7 +690,7 @@ fn parse_bool_field(parsed: &HashMap<String, String>, key: &str) -> Result<bool,
     }
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -812,6 +973,113 @@ mod tests {
 
     fn release(value: &str) -> TydeReleaseVersion {
         value.parse().unwrap()
+    }
+
+    fn platform() -> RemotePlatform {
+        RemotePlatform {
+            os: RemoteOperatingSystem::Linux,
+            arch: RemoteArchitecture::X86_64,
+        }
+    }
+
+    fn snapshot(
+        target_version: TydeReleaseVersion,
+        running: RemoteTydeRunningState,
+        installed_target: bool,
+    ) -> RemoteHostLifecycleSnapshot {
+        RemoteHostLifecycleSnapshot {
+            target_version,
+            installed_target,
+            current_link_version: None,
+            running,
+            platform: platform(),
+        }
+    }
+
+    #[test]
+    fn plans_lifecycle_actions_without_network() {
+        let target = release("0.8.0");
+        let other = release("0.8.1");
+        let cases = vec![
+            (
+                RemoteTydeRunningState::Managed {
+                    version: target.clone(),
+                },
+                true,
+                LifecycleAction::ServeAsIs,
+            ),
+            (
+                RemoteTydeRunningState::Managed {
+                    version: target.clone(),
+                },
+                false,
+                LifecycleAction::MissingTargetBinary,
+            ),
+            (
+                RemoteTydeRunningState::Managed {
+                    version: other.clone(),
+                },
+                true,
+                LifecycleAction::Upgrade {
+                    needs_install: false,
+                },
+            ),
+            (
+                RemoteTydeRunningState::Managed {
+                    version: other.clone(),
+                },
+                false,
+                LifecycleAction::Upgrade {
+                    needs_install: true,
+                },
+            ),
+            (
+                RemoteTydeRunningState::NotRunning,
+                true,
+                LifecycleAction::Launch {
+                    needs_install: false,
+                },
+            ),
+            (
+                RemoteTydeRunningState::NotRunning,
+                false,
+                LifecycleAction::Launch {
+                    needs_install: true,
+                },
+            ),
+            (
+                RemoteTydeRunningState::UnknownSocket,
+                true,
+                LifecycleAction::UnknownSocket,
+            ),
+            (
+                RemoteTydeRunningState::UnknownSocket,
+                false,
+                LifecycleAction::UnknownSocket,
+            ),
+        ];
+
+        for (running, installed_target, expected) in cases {
+            let snapshot = snapshot(target.clone(), running, installed_target);
+            let action = plan_lifecycle_action(&snapshot);
+            assert_eq!(action, expected);
+            let should_serve_as_is = matches!(
+                &snapshot.running,
+                RemoteTydeRunningState::Managed { version } if version == &snapshot.target_version
+            ) && snapshot.installed_target;
+            assert_eq!(
+                matches!(action, LifecycleAction::ServeAsIs),
+                should_serve_as_is
+            );
+            match action {
+                LifecycleAction::ServeAsIs => assert!(installed_target),
+                LifecycleAction::Launch { needs_install }
+                | LifecycleAction::Upgrade { needs_install } => {
+                    assert_eq!(needs_install, !installed_target);
+                }
+                LifecycleAction::MissingTargetBinary | LifecycleAction::UnknownSocket => {}
+            }
+        }
     }
 
     #[test]
