@@ -27,7 +27,11 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 serde.workspace = true
 tokio.workspace = true
 tokio-util = "0.7"
-tauri = { version = "2.10.3", features = [] }
+# `devtools` enables the WebView inspector (right-click -> Inspect Element,
+# console, network) in RELEASE builds — debug builds already have it. We ship
+# only beta/prerelease builds today, so this is on for all builds; when a stable
+# channel exists, gate it to prerelease tags in CI (--features) instead.
+tauri = { version = "2.10.3", features = ["devtools"] }
 tauri-plugin-dialog = "2"
 tracing.workspace = true
 tracing-appender = "0.2"
