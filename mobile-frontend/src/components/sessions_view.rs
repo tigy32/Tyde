@@ -1,7 +1,9 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::components::ui::{Button, ButtonSize, ButtonVariant, Card, EmptyState, Pill, PillTone};
+use crate::components::ui::{
+    Button, ButtonSize, ButtonVariant, Card, EmptyState, Pill, PillTone, Spinner,
+};
 use crate::state::{AppState, LocalHostId};
 
 /// Past-conversations browser. Filter-by-search (case-insensitive over
@@ -80,6 +82,21 @@ pub fn SessionsView() -> impl IntoView {
                     let sessions = filtered.get();
                     if sessions.is_empty() {
                         if search.get().trim().is_empty() {
+                            // Sessions arrive in the host snapshot; show a
+                            // spinner while it's still in flight instead of the
+                            // "No sessions yet" empty state, which would read as
+                            // a loaded-but-empty host.
+                            if state.host_snapshot_pending() {
+                                return view! {
+                                    <div class="view-loading" data-mobile-test="sessions-loading">
+                                        <Spinner
+                                            large=true
+                                            aria_label="Loading sessions".to_string()
+                                            data_mobile_test="sessions-loading-spinner"
+                                        />
+                                    </div>
+                                }.into_any();
+                            }
                             return view! {
                                 <EmptyState
                                     title="No sessions yet"
@@ -289,7 +306,7 @@ async fn delete_session(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{AppState, LocalHostId, SessionInfo};
+    use crate::state::{AppState, ConnectionStatus, LocalHostId, SessionInfo};
     use leptos::mount::mount_to;
     use protocol::{BackendKind, SessionId, SessionSummary};
     use wasm_bindgen::JsCast;
@@ -374,6 +391,41 @@ mod wasm_tests {
                 .query_selector("[data-mobile-test='sessions-empty']")
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// While the host snapshot (the source of the session list) is still in
+    /// flight, the view shows a loading spinner rather than the "No sessions
+    /// yet" empty state.
+    #[wasm_bindgen_test]
+    async fn sessions_loading_spinner_shows_before_host_snapshot() {
+        let host = LocalHostId("host-1".to_owned());
+        let container = make_container();
+        let host_for_mount = host.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.connection_statuses.set(std::collections::HashMap::from([(
+                host_for_mount.clone(),
+                ConnectionStatus::Connected,
+            )]));
+            provide_context(state);
+            view! { <SessionsView /> }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-loading']")
+                .unwrap()
+                .is_some(),
+            "loading spinner must show while the host snapshot is in flight"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-empty']")
+                .unwrap()
+                .is_none(),
+            "empty state must not show while the list is still loading"
         );
     }
 

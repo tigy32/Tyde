@@ -929,6 +929,9 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
     state.agent_load_requests.update(|m| {
         m.remove(agent_ref);
     });
+    state.agent_loaded.update(|m| {
+        m.remove(agent_ref);
+    });
     state.chat_messages.update(|m| {
         m.remove(agent_ref);
     });
@@ -1499,6 +1502,12 @@ fn apply_host_bootstrap(state: &AppState, host: &LocalHostId, payload: HostBoots
     state.agent_load_requests.update(|loads| {
         loads.retain(|agent_ref| agent_ref.local_host_id != *host);
     });
+    // A fresh host snapshot re-arms lazy loading, so drop the "bootstrap
+    // arrived" marker too; reopening a chat after reconnect shows a spinner
+    // until its transcript is re-fetched.
+    state.agent_loaded.update(|loaded| {
+        loaded.retain(|agent_ref| agent_ref.local_host_id != *host);
+    });
     state.mcp_servers_by_host.update(|outer| {
         let inner = outer.entry(host.clone()).or_default();
         inner.clear();
@@ -1624,6 +1633,9 @@ fn apply_agent_bootstrap(
         payload.events.len()
     );
     state.agent_load_requests.update(|m| {
+        m.insert(agent_ref.clone());
+    });
+    state.agent_loaded.update(|m| {
         m.insert(agent_ref.clone());
     });
     // Replace prior per-agent chat/stream/queue/task state so the bootstrap
