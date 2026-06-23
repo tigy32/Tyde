@@ -130,6 +130,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
     let welcome = BootstrapWelcome {
         protocol_version: PROTOCOL_VERSION,
         tyde_version: TYDE_VERSION,
+        release_version: None,
     };
     let bootstrap = BootstrapHostPayload {
         settings: BootstrapHostSettings {
@@ -2334,6 +2335,7 @@ mod wasm_tests {
                 &protocol::WelcomePayload {
                     protocol_version: protocol::PROTOCOL_VERSION,
                     tyde_version: protocol::TYDE_VERSION,
+                    release_version: None,
                 },
             ),
         );

@@ -22,6 +22,9 @@ enum CliMode {
 }
 
 fn main() {
+    // Record this binary's real release version so the mobile Welcome/Reject/QR
+    // payloads advertise the correct web/PWA bundle key.
+    server::set_host_release_version(env!("CARGO_PKG_VERSION"));
     match parse_cli_mode(std::env::args().skip(1)) {
         CliMode::HostStdio => exit_on_error(run_host_stdio()),
         CliMode::HostUds => exit_on_error(run_host_uds()),

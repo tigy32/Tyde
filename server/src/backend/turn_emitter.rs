@@ -827,6 +827,7 @@ mod tests {
                     minor: 0,
                     patch: 0,
                 },
+                release_version: None,
             },
         )
         .expect("serialize Welcome");

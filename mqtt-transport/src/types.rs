@@ -60,6 +60,11 @@ pub const MQTT_QOS_AT_LEAST_ONCE: u8 = 1;
 pub const MQTT_RETAIN: bool = false;
 pub const MQTT_CLEAN_START: bool = true;
 const PAIRING_URI_PREFIX: &str = "tyde-pair://v1?";
+/// Origin-root web loader that turns the host's pairing QR into a generic
+/// HTTPS link the native iOS/Android Camera can open. The PSK-bearing
+/// `tyde-pair://…` URI rides in the URL FRAGMENT (after `#`) so it is never
+/// sent to the S3/CloudFront origin; the loader clears the fragment on read.
+pub const MOBILE_PAIRING_WEB_BASE_URL: &str = "https://tycode.dev/tyde/";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BrokerEndpoint {
@@ -111,6 +116,11 @@ pub struct MobilePairingQrPayload {
     pub room: RoomId,
     pub psk: PreSharedKey,
     pub host_label: String,
+    /// Exact, prerelease-capable host build version used by the web/PWA loader
+    /// to select the matching versioned bundle. `Option` for backward
+    /// compatibility with QR codes from older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_version: Option<protocol::TydeReleaseVersion>,
 }
 
 impl MobilePairingQrPayload {
@@ -130,6 +140,9 @@ impl MobilePairingQrPayload {
             room,
             psk,
             host_label,
+            // Populated by the host from its real build version (see
+            // `server::host_release_version`); `new` leaves it unset.
+            release_version: None,
         }
     }
 
@@ -181,6 +194,32 @@ impl MobilePairingQrPayload {
                     message: err.to_string(),
                 })?;
         Self::decode_cbor(&cbor)
+    }
+
+    /// Builds the generic HTTPS pairing link encoded into the host's QR. The
+    /// PSK-bearing `tyde-pair://…` URI is placed in the URL FRAGMENT so the
+    /// native Camera opens the web loader at the origin without ever sending
+    /// the secret to the S3/CloudFront origin (fragments are not transmitted in
+    /// the HTTP request). The loader reads and clears the fragment on load.
+    pub fn to_pairing_url(&self) -> Result<String, TransportTypeError> {
+        Ok(format!("{MOBILE_PAIRING_WEB_BASE_URL}#{}", self.to_uri()?))
+    }
+
+    /// Accepts a scanned/pasted pairing value in any supported form:
+    /// the legacy raw `tyde-pair://…` URI, or the generic HTTPS link whose
+    /// fragment carries that URI. Falls back to `from_uri` on the raw input so
+    /// the canonical "must start with …" error is surfaced for junk.
+    pub fn from_any(input: &str) -> Result<Self, TransportTypeError> {
+        let trimmed = input.trim();
+        if trimmed.starts_with(PAIRING_URI_PREFIX) {
+            return Self::from_uri(trimmed);
+        }
+        if let Some((_, fragment)) = trimmed.split_once('#') {
+            if fragment.starts_with(PAIRING_URI_PREFIX) {
+                return Self::from_uri(fragment);
+            }
+        }
+        Self::from_uri(trimmed)
     }
 }
 
@@ -497,11 +536,11 @@ mod tests {
     use protocol::PROTOCOL_VERSION;
 
     #[test]
-    fn default_broker_endpoint_is_emqx_mqtts() {
+    fn default_broker_endpoint_is_emqx_wss() {
         let endpoint = default_mobile_broker_endpoint();
         assert_eq!(endpoint.url.as_str(), DEFAULT_MOBILE_MQTT_BROKER_URL);
-        assert_eq!(endpoint.url.as_str(), "mqtts://broker.emqx.io:8883");
-        assert_ne!(endpoint.url.as_str(), "wss://broker.tyde.dev/relay");
+        assert_eq!(endpoint.url.as_str(), "wss://broker.emqx.io:8084/mqtt");
+        assert_ne!(endpoint.url.as_str(), "mqtts://broker.emqx.io:8883");
         assert_eq!(endpoint.auth, BrokerAuth::Anonymous);
         validate_broker_url(&endpoint.url).expect("default broker URL is valid");
     }
@@ -526,6 +565,176 @@ mod tests {
         assert_eq!(decoded.policy, MqttTransportPolicy::default());
         assert_eq!(decoded.room, room);
         assert_eq!(decoded.psk, psk);
+    }
+
+    #[test]
+    fn pairing_qr_decodes_legacy_cbor_without_release_version() {
+        // A legacy host serializes a payload that has no `release_version` field
+        // at all; decoding must succeed with `release_version == None`.
+        #[derive(serde::Serialize)]
+        struct LegacyQr {
+            v: u32,
+            protocol_version: u32,
+            tyde_version: protocol::Version,
+            broker: BrokerEndpoint,
+            policy: MqttTransportPolicy,
+            room: RoomId,
+            psk: PreSharedKey,
+            host_label: String,
+        }
+
+        let endpoint = default_mobile_broker_endpoint();
+        let legacy = LegacyQr {
+            v: MOBILE_QR_VERSION,
+            protocol_version: PROTOCOL_VERSION,
+            tyde_version: TYDE_VERSION,
+            broker: endpoint.clone(),
+            policy: MqttTransportPolicy::default(),
+            room: RoomId([3_u8; ROOM_ID_LEN]),
+            psk: PreSharedKey::from_slice(&[4_u8; PRE_SHARED_KEY_LEN]).expect("psk"),
+            host_label: "Legacy Host".to_owned(),
+        };
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&legacy, &mut bytes).expect("encode legacy CBOR");
+        let decoded = MobilePairingQrPayload::decode_cbor(&bytes).expect("decode legacy CBOR");
+        assert_eq!(decoded.release_version, None);
+        assert_eq!(decoded.broker, endpoint);
+        assert_eq!(decoded.host_label, "Legacy Host");
+    }
+
+    #[test]
+    fn pairing_qr_round_trips_some_release_version_and_omits_none() {
+        let version = protocol::TydeReleaseVersion::parse("0.8.19-beta.2").expect("valid version");
+        let mut payload = MobilePairingQrPayload::new(
+            PROTOCOL_VERSION,
+            default_mobile_broker_endpoint(),
+            RoomId([5_u8; ROOM_ID_LEN]),
+            PreSharedKey::from_slice(&[6_u8; PRE_SHARED_KEY_LEN]).expect("psk"),
+            "Tyde Host".to_owned(),
+        );
+        payload.release_version = Some(version.clone());
+
+        let uri = payload.to_uri().expect("encode QR URI");
+        let decoded = MobilePairingQrPayload::from_uri(&uri).expect("decode QR URI");
+        assert_eq!(decoded.release_version, Some(version));
+
+        // `new()` leaves release_version None; skip_serializing_if must omit the
+        // key entirely so the bytes match a legacy producer's.
+        let none = MobilePairingQrPayload::new(
+            PROTOCOL_VERSION,
+            default_mobile_broker_endpoint(),
+            RoomId([7_u8; ROOM_ID_LEN]),
+            PreSharedKey::from_slice(&[8_u8; PRE_SHARED_KEY_LEN]).expect("psk"),
+            "Tyde Host".to_owned(),
+        );
+        let bytes = none.encode_cbor().expect("encode none");
+        let value: ciborium::value::Value =
+            ciborium::from_reader(bytes.as_slice()).expect("decode to CBOR value");
+        let ciborium::value::Value::Map(entries) = value else {
+            panic!("expected CBOR map");
+        };
+        assert!(
+            !entries.iter().any(|(key, _)| matches!(
+                key,
+                ciborium::value::Value::Text(name) if name == "release_version"
+            )),
+            "release_version must be omitted when None"
+        );
+    }
+
+    #[test]
+    fn pairing_url_round_trips_through_from_any() {
+        let endpoint = default_mobile_broker_endpoint();
+        let room = RoomId([11_u8; ROOM_ID_LEN]);
+        let psk = PreSharedKey::from_slice(&[13_u8; PRE_SHARED_KEY_LEN]).expect("psk");
+        let version = protocol::TydeReleaseVersion::parse("1.2.3-rc.1").expect("valid version");
+        let mut payload = MobilePairingQrPayload::new(
+            PROTOCOL_VERSION,
+            endpoint.clone(),
+            room,
+            psk.clone(),
+            "Tyde Host".to_owned(),
+        );
+        payload.release_version = Some(version.clone());
+
+        let url = payload.to_pairing_url().expect("encode pairing URL");
+        let decoded = MobilePairingQrPayload::from_any(&url).expect("decode pairing URL");
+
+        assert_eq!(decoded.broker, endpoint);
+        assert_eq!(decoded.room, room);
+        assert_eq!(decoded.psk, psk);
+        assert_eq!(decoded.release_version, Some(version));
+    }
+
+    #[test]
+    fn pairing_url_keeps_psk_only_in_fragment() {
+        // SECURITY: the PSK-bearing CBOR payload must ride in the URL FRAGMENT
+        // (after `#`) so it is never sent to the S3/CloudFront origin. Assert
+        // the part before `#` is EXACTLY the origin base, and that the base64
+        // payload appears ONLY after the `#`.
+        let psk = PreSharedKey::from_slice(&[42_u8; PRE_SHARED_KEY_LEN]).expect("psk");
+        let payload = MobilePairingQrPayload::new(
+            PROTOCOL_VERSION,
+            default_mobile_broker_endpoint(),
+            RoomId([21_u8; ROOM_ID_LEN]),
+            psk,
+            "Tyde Host".to_owned(),
+        );
+
+        let url = payload.to_pairing_url().expect("encode pairing URL");
+        let (before, fragment) = url.split_once('#').expect("URL must contain a fragment");
+
+        assert_eq!(
+            before, MOBILE_PAIRING_WEB_BASE_URL,
+            "everything before `#` must be exactly the origin base URL"
+        );
+
+        let uri = payload.to_uri().expect("encode URI");
+        let base64_payload = uri
+            .strip_prefix(PAIRING_URI_PREFIX)
+            .expect("URI has the pairing prefix");
+        assert!(
+            !base64_payload.is_empty(),
+            "sanity: payload must be non-empty"
+        );
+        assert!(
+            !before.contains(base64_payload),
+            "base64 PSK payload must never appear before the `#`"
+        );
+        assert!(
+            fragment.contains(base64_payload),
+            "base64 PSK payload must appear in the fragment"
+        );
+        assert_eq!(
+            fragment, uri,
+            "the fragment must be exactly the raw tyde-pair:// URI"
+        );
+    }
+
+    #[test]
+    fn from_any_accepts_legacy_and_https_forms() {
+        let payload = MobilePairingQrPayload::new(
+            PROTOCOL_VERSION,
+            default_mobile_broker_endpoint(),
+            RoomId([31_u8; ROOM_ID_LEN]),
+            PreSharedKey::from_slice(&[33_u8; PRE_SHARED_KEY_LEN]).expect("psk"),
+            "Tyde Host".to_owned(),
+        );
+
+        let legacy = payload.to_uri().expect("encode legacy URI");
+        let https = payload.to_pairing_url().expect("encode https URL");
+
+        let from_legacy = MobilePairingQrPayload::from_any(&legacy).expect("decode legacy form");
+        let from_https = MobilePairingQrPayload::from_any(&https).expect("decode https form");
+        assert_eq!(from_legacy, payload);
+        assert_eq!(from_https, payload);
+
+        // Junk surfaces the canonical "must start with" error.
+        assert!(matches!(
+            MobilePairingQrPayload::from_any("https://example.com/not-a-pair"),
+            Err(TransportTypeError::InvalidPairingUri { .. })
+        ));
     }
 
     #[test]

@@ -65,14 +65,34 @@ local machine.
 
 ### 5. Release pushes
 
+> **HARD RULE — releases are cut off `main`, 100% of the time, no exceptions.**
+> The release commit and tag **must** sit on the `main` branch. Never tag a
+> feature branch, a detached commit, or anything else. If the work you want to
+> release is on a feature branch, it is **not releasable** until it is merged
+> into `main`. There is no "just this once." Tagging off a non-`main` branch
+> is a release-breaking mistake — a release built that way silently omits
+> every fix that landed on `main` (or on other unmerged branches).
+>
+> **Definition of done:** a fix or feature is only "done" once it is **merged
+> into `main`**. Code sitting on an unmerged feature branch does not count as
+> done, is not in any release, and must not be assumed present. Before cutting
+> a release, confirm there is no un-merged work that belongs in it.
+
+This is enforced by tooling, not just discipline: a tracked `pre-push` hook
+(`.githooks/pre-push`) **refuses** to push any release tag whose commit is not
+contained in `main`, or whose tagged commit's version files are out of sync
+with the tag. Install it once per clone with `tools/install-git-hooks.sh`
+(sets `core.hooksPath` to `.githooks`).
+
 Only push a release after the user explicitly approves the release action and
 the exact target version, e.g. `vX.Y.Z`. Never force-push a release.
 
 After approval:
 
 1. Confirm the working tree is clean and you are on `main`:
-   `git status --short` and `git branch --show-current`. Stop if the tree is
-   dirty or the branch is not `main`.
+   `git status --short` and `git branch --show-current`. **Stop immediately if
+   the branch is not `main`** — do not tag, do not "temporarily" release off a
+   feature branch. Also stop if the tree is dirty.
 2. Confirm the release commit contains the target version before tagging.
    Bump the tracked release-version files to `X.Y.Z` (including lockfiles
    and consistency files) before creating any tag, then run

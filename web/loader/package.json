@@ -1,0 +1,11 @@
+{
+  "name": "tyde-web-loader",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Thin, stable loader shell for the Tyde web/PWA client.",
+  "scripts": {
+    "test": "node --test",
+    "serve": "python3 -m http.server 8088"
+  }
+}

@@ -5,6 +5,9 @@ pub mod validator;
 
 #[cfg(feature = "framing")]
 pub use framing::{FrameError, read_envelope, write_envelope};
+// Re-exported from host-config via types.rs; the bundle-key type for the
+// web/PWA client (see WelcomePayload::release_version).
+pub use types::TydeReleaseVersion;
 pub use types::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentControlAgentRef,
     AgentControlProgress, AgentControlProgressKind, AgentControlStatus, AgentErrorCode,

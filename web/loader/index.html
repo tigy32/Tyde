@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+
+    <!--
+      Strict Content Security Policy. The load-bearing directive is
+      `script-src 'self' 'wasm-unsafe-eval'`: only same-origin scripts may
+      execute, plus the WebAssembly compilation the Leptos/Trunk bundle needs
+      (`WebAssembly.instantiate`). We do NOT grant general `'unsafe-eval'`. The
+      versioned bundle is additionally pinned with Subresource Integrity — the
+      loader verifies every executable artifact (entry JS + wasm + chunks)
+      against the manifest hashes before it runs (see loader.js / integrity.js).
+      No third-party JS is ever allowed.
+
+      `connect-src 'self' wss:` is intentionally narrow: the WASM app reaches
+      the broker over `wss://` and fetches the manifest/bundle from same-origin
+      (`'self'`). `https:` is deliberately omitted — add it back only if a
+      future feature needs cross-origin HTTPS. `style-src` allows inline styles
+      because the injected Leptos app styles itself with inline <style>/style=
+      (not a script-execution vector). `frame-ancestors` cannot be set via
+      <meta>; the Phase 6 deploy MUST also send it (and ideally this whole
+      policy) as an HTTP response header. See web/README.md.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss:; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'"
+    />
+
+    <title>Tyde</title>
+
+    <!-- PWA -->
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <meta name="theme-color" content="#0b0f14" />
+
+    <!-- iOS "Add to Home Screen" -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Tyde" />
+    <link rel="apple-touch-icon" href="./icons/icon-180.png" />
+
+    <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./loader.css" />
+  </head>
+  <body>
+    <!--
+      The loader's own chrome (the four pairing/boot `.view` sections) lives in
+      `#loader-shell`. The booted Leptos app mounts into the SEPARATE, initially
+      empty `#app-root` below (mobile-frontend does
+      `mount_to(get_element_by_id("app-root"), App)`, appending children). They
+      MUST be distinct containers: when the app mounts, loader.js observes the
+      first child added to `#app-root` and hides `#loader-shell` so the styled
+      app replaces the loader spinner (the boot handoff). Previously both shared
+      `#app-root`, so the app mounted hidden behind the still-visible spinner.
+    -->
+    <main id="loader-shell">
+      <section id="view-loading" class="view">
+        <div class="card">
+          <div class="brand">
+            <span class="logo-mark" aria-hidden="true">T</span>
+            <span class="logo">Tyde</span>
+          </div>
+          <p class="status muted">Loading…</p>
+        </div>
+      </section>
+
+      <section id="view-pair" class="view" hidden>
+        <div class="card">
+          <div class="brand">
+            <span class="logo-mark" aria-hidden="true">T</span>
+            <span class="logo">Tyde</span>
+          </div>
+          <p id="pair-status" class="status">Connect to your Tyde host to begin.</p>
+
+          <!-- Scan is hidden by default and revealed by loader.js only when the
+               browser actually supports camera scanning, so Safari/iOS — which
+               cannot scan — never sees a button that just errors. -->
+          <button id="scan-button" type="button" class="btn secondary" hidden>
+            Scan QR code
+          </button>
+          <video id="scan-video" playsinline muted hidden></video>
+          <p id="scan-status" class="hint"></p>
+
+          <form id="paste-form" class="paste">
+            <label id="paste-label" for="paste-input">Paste the pairing code from your Tyde host</label>
+            <textarea
+              id="paste-input"
+              name="paste-input"
+              rows="3"
+              placeholder="tyde-pair://v1?…"
+              autocapitalize="off"
+              autocomplete="off"
+              autocorrect="off"
+              spellcheck="false"
+            ></textarea>
+            <button id="connect-button" type="submit" class="btn primary">Connect</button>
+          </form>
+        </div>
+      </section>
+
+      <section id="view-booting" class="view" hidden>
+        <div class="card">
+          <div class="brand">
+            <span class="logo-mark" aria-hidden="true">T</span>
+            <span class="logo">Tyde</span>
+          </div>
+          <p class="status muted">Starting client v<span id="booting-version"></span>…</p>
+          <div class="spinner" aria-hidden="true"></div>
+        </div>
+      </section>
+
+      <section id="view-error" class="view" hidden>
+        <div class="card">
+          <div class="brand">
+            <span class="logo-mark" aria-hidden="true">T</span>
+            <span class="logo">Tyde</span>
+          </div>
+          <p id="error-message" class="status error"></p>
+          <p id="error-detail" class="hint mono"></p>
+          <button id="retry-button" type="button" class="btn primary">Try again</button>
+        </div>
+      </section>
+    </main>
+
+    <!-- The booted WASM app mounts here. Kept in the DOM (empty) from the start
+         because the app does get_element_by_id("app-root") at boot. -->
+    <div id="app-root"></div>
+
+    <script type="module" src="./loader.js"></script>
+  </body>
+</html>

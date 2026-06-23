@@ -4,7 +4,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
 use crate::components::host_browser::HostBrowser;
-use crate::components::ui::{Button, ButtonSize, ButtonVariant, EmptyState};
+use crate::components::ui::{Button, ButtonSize, ButtonVariant, ConfirmModal, EmptyState};
 use crate::state::{AppState, PairedHostSummary, ToolOutputMode};
 
 const STORAGE_TOOL_OUTPUT_MODE: &str = "tyde-mobile-tool-output-mode";
@@ -336,9 +336,18 @@ fn PairedHostCard(host: PairedHostSummary) -> impl IntoView {
         });
     };
 
+    // Destructive forget is gated by an in-app confirmation modal (never
+    // `window.confirm`, which is a no-op in the Tauri webview and unstyled in
+    // the browser). The same modal serves both bridge backends.
+    let confirming_forget = RwSignal::new(false);
+    let on_request_forget = Callback::new(move |_: ()| confirming_forget.set(true));
+    let on_cancel_forget = Callback::new(move |_: ()| confirming_forget.set(false));
+
     let id_for_forget = local_host_id.clone();
     let state_for_forget = state.clone();
-    let on_forget = Callback::new(move |_: ()| {
+    let forget_host_label = host.host_label.clone();
+    let on_confirm_forget = Callback::new(move |_: ()| {
+        confirming_forget.set(false);
         let id = id_for_forget.clone();
         let state = state_for_forget.clone();
         spawn_local(async move {
@@ -387,12 +396,23 @@ fn PairedHostCard(host: PairedHostSummary) -> impl IntoView {
                     variant=ButtonVariant::Destructive
                     data_mobile_test="settings-forget-host"
                     aria_label="Forget paired host on this device".to_string()
-                    on_click=on_forget
+                    on_click=on_request_forget
                 />
                 <p class="settings-hint">
                     "Forget removes the pairing on this device only. To revoke server-side, use Settings → Mobile on the desktop."
                 </p>
             </div>
+            <ConfirmModal
+                open=confirming_forget
+                title="Forget host?"
+                message=format!("This removes the saved pairing for \"{forget_host_label}\" on this device. You can re-pair from the host's QR.")
+                confirm_label="Forget"
+                cancel_label="Cancel"
+                destructive=true
+                data_mobile_test="settings-forget-host-modal"
+                on_confirm=on_confirm_forget
+                on_cancel=on_cancel_forget
+            />
         </div>
     }
 }

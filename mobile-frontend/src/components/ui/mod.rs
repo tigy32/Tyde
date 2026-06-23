@@ -10,6 +10,7 @@
 //! semantic id rather than CSS class. CSS classes are styling-only.
 mod button;
 mod card;
+mod confirm_modal;
 mod empty_state;
 mod pill;
 mod safe_area;
@@ -19,6 +20,7 @@ mod status_dot;
 
 pub use button::{Button, ButtonSize, ButtonVariant};
 pub use card::Card;
+pub use confirm_modal::ConfirmModal;
 pub use empty_state::EmptyState;
 pub use pill::{Pill, PillTone};
 pub use safe_area::SafeArea;

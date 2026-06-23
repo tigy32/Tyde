@@ -2181,8 +2181,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi 0.11.1+wasi-snapshot-preview1",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2192,9 +2194,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3696,6 +3700,7 @@ dependencies = [
 name = "mobile-frontend"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "console_error_panic_hook",
  "console_log",
  "host-config",
@@ -3703,14 +3708,19 @@ dependencies = [
  "leptos",
  "log",
  "mobile-shell-types",
+ "mqtt-transport",
  "protocol",
  "pulldown-cmark",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
+ "wasmtimer",
  "web-sys",
 ]
 
@@ -3728,12 +3738,16 @@ name = "mqtt-transport"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "chacha20poly1305",
  "ciborium",
  "futures-channel",
  "futures-util",
+ "getrandom 0.2.17",
  "getrandom 0.3.4",
  "hkdf",
+ "js-sys",
+ "mqttbytes",
  "protocol",
  "rand 0.8.6",
  "rcgen",
@@ -3748,7 +3762,20 @@ dependencies = [
  "tokio-rustls 0.26.4",
  "tracing",
  "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasmtimer",
+ "web-sys",
  "webpki-roots",
+]
+
+[[package]]
+name = "mqttbytes"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7bd39d24e28e1544d74ff5746e322a477e52353c8ba7adcaa83d2e760752853"
+dependencies = [
+ "bytes",
 ]
 
 [[package]]
@@ -4805,6 +4832,7 @@ dependencies = [
 name = "protocol"
 version = "0.0.0"
 dependencies = [
+ "host-config",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -6841,7 +6869,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-shell"
-version = "0.8.19-beta.2"
+version = "0.8.19-beta.4"
 dependencies = [
  "core-foundation-sys",
  "devtools-protocol",
@@ -7506,7 +7534,7 @@ dependencies = [
 
 [[package]]
 name = "tyde-mobile-shell"
-version = "0.8.19-beta.2"
+version = "0.8.19-beta.4"
 dependencies = [
  "base64 0.22.1",
  "devtools-protocol",
@@ -7532,7 +7560,7 @@ dependencies = [
 
 [[package]]
 name = "tyde-server"
-version = "0.8.19-beta.2"
+version = "0.8.19-beta.4"
 dependencies = [
  "server",
  "tokio",
@@ -8000,6 +8028,20 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap 2.14.0",
  "semver",
+]
+
+[[package]]
+name = "wasmtimer"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c598d6b99ea013e35844697fc4670d08339d5cda15588f193c6beedd12f644b"
+dependencies = [
+ "futures",
+ "js-sys",
+ "parking_lot",
+ "pin-utils",
+ "slab",
+ "wasm-bindgen",
 ]
 
 [[package]]

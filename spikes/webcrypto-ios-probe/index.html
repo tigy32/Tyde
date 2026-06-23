@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<title>Tyde PSK WebCrypto/iOS probe</title>
+<style>
+  body { font: 15px -apple-system, system-ui, sans-serif; margin: 16px; background:#0b0f14; color:#e8edf3; }
+  button { font-size: 16px; padding: 10px 14px; margin: 6px 4px; border-radius: 8px; border:0; background:#1f6feb; color:#fff; }
+  pre { white-space: pre-wrap; word-break: break-all; background:#11161d; padding:12px; border-radius:8px; }
+  .ok { color:#3fb950; } .bad { color:#f85149; } .warn { color:#d29922; }
+</style>
+</head>
+<body>
+<h2>Tyde PSK storage probe</h2>
+<p>
+  PHASE-0 SPIKE. Open this on the <b>target iOS Safari</b> (and again after
+  "Add to Home Screen") to validate the hardened PSK-storage decision before the
+  async-HKDF refactor. It:
+</p>
+<ol>
+  <li>imports a <b>non-extractable</b> HKDF <code>CryptoKey</code> from 32 raw bytes,</li>
+  <li>derives 256 bits via <code>deriveBits</code> (HKDF-SHA256) using Tyde's real
+      salt/info strings, and checks the result is <b>byte-identical</b> across reloads,</li>
+  <li>persists the <code>CryptoKey</code> itself in <b>IndexedDB</b> (structured clone),</li>
+  <li>reloads it from IndexedDB and re-derives to prove the stored key still works,</li>
+  <li>verifies the stored key is still <b>non-extractable</b> (<code>exportKey</code> must throw),</li>
+  <li>reports <code>navigator.storage.persist()</code> / <code>persisted()</code> support.</li>
+</ol>
+<p>
+  The acceptance test for iOS: <b>run "Step 1" once, force-quit, reopen, run
+  "Step 2"</b> — the derived bits must match and the key must reload. Repeat from
+  the Home-Screen-installed PWA, and again after &gt;7 days to check ITP eviction.
+</p>
+
+<button onclick="step1()">Step 1 — import + store CryptoKey + derive (first run)</button>
+<button onclick="step2()">Step 2 — reload from IndexedDB + re-derive (after reopen)</button>
+<button onclick="checkPersist()">Check storage.persist()</button>
+<button onclick="clearDb()">Clear IndexedDB</button>
+<pre id="out">ready.</pre>
+
+<script>
+const OUT = document.getElementById('out');
+function log(msg, cls) {
+  const line = cls ? `<span class="${cls}">${msg}</span>` : msg;
+  OUT.innerHTML += "\n" + line;
+}
+function reset(msg) { OUT.innerHTML = msg; }
+
+// ---- Tyde constants (must match the Rust code verbatim) ----
+// session.rs:11   HKDF_INFO            = b"tyde-mqtt-v1"
+// rendezvous.rs:15 RENDEZVOUS_KEY_INFO = b"tyde-mqtt-rendezvous-v1"
+// rendezvous.rs:16 EPHEMERAL_KEY_INFO  = b"tyde-mqtt-ephemeral-data-v1"
+const enc = new TextEncoder();
+const INFO_SESSION = enc.encode("tyde-mqtt-v1");
+// Fixed test salt/IKM so results are reproducible across reloads/devices.
+const SALT = new Uint8Array(64).map((_, i) => (i * 7 + 1) & 0xff);   // host_salt||client_salt = 2*32 bytes
+const IKM  = new Uint8Array(32).map((_, i) => (i * 3 + 5) & 0xff);   // stand-in 32-byte PSK
+
+const DB_NAME = "tyde-psk-probe";
+const STORE = "keys";
+const KEY_ID = "host-1";
+
+function openDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbPut(db, key, value) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+function idbGet(db, key) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readonly");
+    const r = tx.objectStore(STORE).get(key);
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+
+const toHex = (buf) => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+
+async function deriveSessionBits(baseKey) {
+  // Mirrors derive_session_key (session.rs:153): HKDF-SHA256, salt + info -> 256 bits.
+  return crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: SALT, info: INFO_SESSION },
+    baseKey,
+    256
+  );
+}
+
+async function step1() {
+  reset("Step 1: import non-extractable HKDF key, store it, derive bits.");
+  try {
+    if (!(window.crypto && crypto.subtle)) { log("crypto.subtle UNAVAILABLE (needs HTTPS or localhost)", "bad"); return; }
+    const baseKey = await crypto.subtle.importKey(
+      "raw", IKM, "HKDF", /*extractable=*/ false, ["deriveBits"]
+    );
+    log("imported non-extractable HKDF CryptoKey  extractable=" + baseKey.extractable, "ok");
+
+    const bits = await deriveSessionBits(baseKey);
+    const hex = toHex(bits);
+    log("derived session bits = " + hex, "ok");
+    localStorage.setItem("tyde-probe-expected", hex);
+
+    const db = await openDb();
+    await idbPut(db, KEY_ID, baseKey);            // structured-clone a CryptoKey
+    log("stored CryptoKey in IndexedDB under '" + KEY_ID + "'", "ok");
+    log("\nNow FORCE-QUIT Safari (or the installed PWA), reopen, and run Step 2.", "warn");
+  } catch (e) {
+    log("FAILED: " + (e && e.message ? e.message : e), "bad");
+  }
+}
+
+async function step2() {
+  reset("Step 2: reload CryptoKey from IndexedDB and re-derive.");
+  try {
+    const db = await openDb();
+    const baseKey = await idbGet(db, KEY_ID);
+    if (!baseKey) { log("no stored key found — run Step 1 first (or eviction occurred).", "bad"); return; }
+    log("loaded CryptoKey from IndexedDB  type=" + (baseKey.type || "?") + " extractable=" + baseKey.extractable, "ok");
+
+    const bits = await deriveSessionBits(baseKey);
+    const hex = toHex(bits);
+    const expected = localStorage.getItem("tyde-probe-expected");
+    log("re-derived session bits = " + hex);
+    if (expected && expected === hex) log("MATCH across reload — persistence + derivation OK", "ok");
+    else if (expected) log("MISMATCH vs first run! expected " + expected, "bad");
+    else log("(no expected value saved; compare manually across runs)", "warn");
+
+    // Prove the reloaded key is still sealed.
+    try {
+      await crypto.subtle.exportKey("raw", baseKey);
+      log("exportKey SUCCEEDED — key is EXTRACTABLE (unexpected/bad)", "bad");
+    } catch (_) {
+      log("exportKey threw — key remains NON-EXTRACTABLE after reload (good)", "ok");
+    }
+  } catch (e) {
+    log("FAILED: " + (e && e.message ? e.message : e), "bad");
+  }
+}
+
+async function checkPersist() {
+  reset("Storage persistence support:");
+  try {
+    if (navigator.storage && navigator.storage.persisted) {
+      log("already persisted: " + (await navigator.storage.persisted()));
+    } else { log("navigator.storage.persisted: UNSUPPORTED", "warn"); }
+    if (navigator.storage && navigator.storage.persist) {
+      log("persist() granted: " + (await navigator.storage.persist()), "warn");
+    } else { log("navigator.storage.persist: UNSUPPORTED (Safari often lacks this — feature-detect, don't rely)", "warn"); }
+    if (navigator.storage && navigator.storage.estimate) {
+      const est = await navigator.storage.estimate();
+      log("estimate: usage=" + est.usage + " quota=" + est.quota);
+    }
+  } catch (e) { log("FAILED: " + e, "bad"); }
+}
+
+async function clearDb() {
+  reset("clearing...");
+  localStorage.removeItem("tyde-probe-expected");
+  await new Promise((res) => { const r = indexedDB.deleteDatabase(DB_NAME); r.onsuccess = r.onerror = r.onblocked = res; });
+  log("cleared.", "ok");
+}
+</script>
+</body>
+</html>

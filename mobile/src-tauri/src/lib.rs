@@ -486,7 +486,7 @@ fn emit_shell_error(app: &tauri::AppHandle, code: MobileAccessErrorCode, message
 }
 
 fn parse_qr_uri(qr_uri: &str) -> Result<MobilePairingQrPayload, MobileCommandError> {
-    MobilePairingQrPayload::from_uri(qr_uri).map_err(|error| {
+    MobilePairingQrPayload::from_any(qr_uri).map_err(|error| {
         MobileCommandError::new(
             MobileAccessErrorCode::InvalidPairingQr,
             format!("invalid mobile pairing URI: {error}"),

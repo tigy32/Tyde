@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Tyde">
+  <rect width="512" height="512" rx="112" fill="#0b0f14" />
+  <path
+    d="M96 300 C 160 240, 224 360, 288 300 S 416 240, 416 300"
+    fill="none"
+    stroke="#3b82f6"
+    stroke-width="28"
+    stroke-linecap="round"
+  />
+  <path
+    d="M96 360 C 160 300, 224 420, 288 360 S 416 300, 416 360"
+    fill="none"
+    stroke="#60a5fa"
+    stroke-width="20"
+    stroke-linecap="round"
+    opacity="0.6"
+  />
+  <text
+    x="256"
+    y="200"
+    text-anchor="middle"
+    font-family="-apple-system, Helvetica, Arial, sans-serif"
+    font-size="120"
+    font-weight="700"
+    fill="#e8edf3"
+  >T</text>
+</svg>

@@ -720,14 +720,17 @@ impl MobileAccessActor {
             created_at_ms,
             key_fingerprint,
         };
-        let qr_payload = MobilePairingQrPayload::new(
+        let mut qr_payload = MobilePairingQrPayload::new(
             PROTOCOL_VERSION,
             broker,
             credential.room,
             credential.psk.clone(),
             "Tyde Host".to_owned(),
         );
-        let qr_uri = match qr_payload.to_uri() {
+        // Advertise the host's real build version so the web/PWA loader can pick
+        // the matching versioned bundle.
+        qr_payload.release_version = crate::host_release_version();
+        let qr_uri = match qr_payload.to_pairing_url() {
             Ok(uri) => MobilePairingQrUri(uri),
             Err(err) => {
                 self.pairing = MobilePairingState::Failed {
@@ -1700,7 +1703,7 @@ mod tests {
         let offer = requester_rx.recv().await.expect("offer");
         assert_eq!(offer.kind, FrameKind::MobilePairingOffer);
         let payload: MobilePairingOfferPayload = offer.parse_payload().expect("offer payload");
-        let qr = MobilePairingQrPayload::from_uri(&payload.qr_uri.0).expect("QR payload");
+        let qr = MobilePairingQrPayload::from_any(&payload.qr_uri.0).expect("QR payload");
         assert_eq!(qr.broker.url.as_str(), "mqtts://127.0.0.1:9");
         assert_eq!(qr.policy, mqtt_transport::MqttTransportPolicy::default());
         assert_eq!(

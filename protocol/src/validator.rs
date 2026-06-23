@@ -1788,6 +1788,7 @@ mod tests {
             &crate::WelcomePayload {
                 protocol_version: crate::PROTOCOL_VERSION,
                 tyde_version: crate::TYDE_VERSION,
+                release_version: None,
             },
         )
         .expect("serialize Welcome");

@@ -1,0 +1,283 @@
+/* Tyde web loader — the first screen a user sees. Dependency-free (no external
+   fonts/CDNs, to stay within the strict CSP), mobile-first, safe-area aware.
+   Intentionally self-contained: this styles ONLY the thin pairing/boot shell;
+   the versioned app ships and injects its own stylesheet once booted. */
+
+:root {
+  color-scheme: dark;
+  --bg: #0b0f14;
+  --bg-elev: #121821;
+  --card: #141b25;
+  --border: #243040;
+  --fg: #e8edf3;
+  --muted: #8b95a5;
+  --accent: #3b82f6;
+  --accent-press: #2f6fd6;
+  --error: #f87171;
+  --radius: 16px;
+  --gap: 16px;
+  /* Safe-area insets (iOS notch / home indicator); 0 on browsers without them. */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+    "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* The loader's own chrome. Centers the active pairing/boot card. When the app
+   mounts into the separate #app-root, loader.js sets `hidden` here so only the
+   app shows (see #loader-shell[hidden] below). */
+#loader-shell {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  padding: calc(24px + var(--safe-top)) calc(20px + var(--safe-right))
+    calc(24px + var(--safe-bottom)) calc(20px + var(--safe-left));
+}
+
+/* `display: flex` would otherwise beat the UA `[hidden] { display: none }`, so
+   the boot handoff (hiding the shell once the app mounts) needs this explicit
+   override — load-bearing, not cosmetic. */
+#loader-shell[hidden] {
+  display: none;
+}
+
+/* The booted Leptos app mounts here. It ships and injects its own stylesheet
+   and lays itself out, so this stays a plain full-size container with no flex /
+   padding that could fight the app's CSS. */
+#app-root {
+  width: 100%;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+/* Each pairing/boot stage is a `.view`. Exactly one is shown at a time via the
+   `hidden` attribute. NOTE: `.view { display: flex }` would otherwise override
+   the UA `[hidden] { display: none }` rule and render every stage stacked at
+   once — this explicit override is load-bearing, not cosmetic. */
+.view {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+}
+
+.view[hidden] {
+  display: none;
+}
+
+/* Centered card. */
+.card {
+  width: 100%;
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 28px 24px;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset,
+    0 18px 50px -20px rgba(0, 0, 0, 0.65);
+}
+
+/* Brand lockup: a rounded "T" mark next to the wordmark. */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 11px;
+  background: linear-gradient(160deg, var(--accent), #6aa6ff);
+  color: #fff;
+  font-size: 22px;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.04em;
+  box-shadow: 0 6px 18px -8px rgba(59, 130, 246, 0.8);
+}
+
+.logo {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+.status {
+  color: var(--fg);
+  font-size: 16px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.status.muted {
+  color: var(--muted);
+}
+
+.status.error {
+  color: var(--error);
+  font-weight: 600;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.hint:empty {
+  display: none;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  word-break: break-word;
+}
+
+/* Buttons. `.primary` is the obvious action; `.secondary` is a calmer
+   alternative. Both are full-width and touch-comfortable (>=48px tall). */
+.btn {
+  appearance: none;
+  -webkit-appearance: none;
+  display: block;
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  font-size: 16px;
+  font-weight: 600;
+  padding: 14px 16px;
+  min-height: 50px;
+  cursor: pointer;
+  transition: background-color 0.12s ease, border-color 0.12s ease,
+    filter 0.12s ease;
+}
+
+.btn.primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn.primary:active {
+  background: var(--accent-press);
+}
+
+.btn.secondary {
+  background: transparent;
+  color: var(--fg);
+  border-color: var(--border);
+}
+
+.btn.secondary:active {
+  background: var(--bg-elev);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* `.btn { display: block }` would otherwise beat the UA `[hidden]` rule, so the
+   scan button must be hidden explicitly — load-bearing for the Safari/iOS path
+   where scanning is unsupported and the button is set hidden. */
+.btn[hidden] {
+  display: none;
+}
+
+/* Paste fallback. */
+.paste {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.paste label {
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.paste textarea {
+  width: 100%;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 12px 14px;
+  resize: vertical;
+  min-height: 84px;
+}
+
+.paste textarea::placeholder {
+  color: var(--muted);
+}
+
+.paste textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+}
+
+/* Live camera preview while scanning. */
+#scan-video {
+  width: 100%;
+  max-height: 320px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: #000;
+  object-fit: cover;
+}
+
+#scan-video[hidden] {
+  display: none;
+}
+
+/* Boot spinner. */
+.spinner {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+}
