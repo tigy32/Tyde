@@ -1528,7 +1528,7 @@ input, textarea, select {
     padding: var(--space-2) var(--space-3);
     background: var(--bg-surface-2);
     border: 1px solid var(--border-default);
-    border-radius: var(--radius-lg);
+    border-radius: var(--radius-button);
     resize: none;
     font-size: 15px;
     line-height: 1.4;
