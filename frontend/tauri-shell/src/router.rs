@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter};
@@ -48,6 +49,12 @@ struct Connection {
     /// SSH child process, owned here so teardown can reap it. `None` for the
     /// in-process embedded transport.
     child: Option<Child>,
+    /// Liveness flag shared with this connection's reader/stderr tasks. Cleared
+    /// (non-blocking, no lock) the instant the entry is removed or superseded,
+    /// so a stale reader/stderr task that is still draining stops emitting
+    /// instead of leaking late frames/errors into a newer connection that
+    /// reused the same host id.
+    live: Arc<AtomicBool>,
 }
 
 impl ProxyRouterHandle {
@@ -80,6 +87,7 @@ impl ProxyRouterHandle {
         };
         if let Some(existing) = existing {
             tracing::info!(host_id, "replacing existing host connection");
+            existing.live.store(false, Ordering::Relaxed);
             reap_child(existing.child).await;
         }
 
@@ -90,7 +98,10 @@ impl ProxyRouterHandle {
             id
         };
 
-        let setup = setup_connection_transport(&host_id, app.clone(), transport, host).await?;
+        let live = Arc::new(AtomicBool::new(true));
+        let setup =
+            setup_connection_transport(&host_id, app.clone(), transport, host, live.clone())
+                .await?;
 
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<String>();
 
@@ -104,6 +115,7 @@ impl ProxyRouterHandle {
                     connection_id,
                     outbound_tx,
                     child: setup.child,
+                    live: live.clone(),
                 },
             );
         }
@@ -114,6 +126,7 @@ impl ProxyRouterHandle {
             host_id.clone(),
             connection_id,
             setup.reader,
+            live.clone(),
         ));
         tokio::spawn(writer_task(
             self.state.clone(),
@@ -122,6 +135,7 @@ impl ProxyRouterHandle {
             connection_id,
             setup.writer,
             outbound_rx,
+            live,
         ));
 
         tracing::info!(host_id, "connected via duplex");
@@ -137,10 +151,13 @@ impl ProxyRouterHandle {
             return Err(format!("host {host_id} is not connected"));
         };
 
-        // Quiet teardown: dropping `connection` drops the outbound sender (the
-        // writer task ends), and reaping the child closes the reader via EOF.
-        // The reader's own teardown no-ops because the entry is already gone,
-        // so no `HOST_DISCONNECTED_EVENT` is emitted for an explicit disconnect.
+        // Quiet teardown: clearing `live` stops the reader/stderr tasks from
+        // emitting any late frames, dropping `connection` drops the outbound
+        // sender (the writer task ends), and reaping the child closes the
+        // reader via EOF. The reader's own teardown no-ops because the entry is
+        // already gone, so no `HOST_DISCONNECTED_EVENT` is emitted for an
+        // explicit disconnect.
+        connection.live.store(false, Ordering::Relaxed);
         reap_child(connection.child).await;
         Ok(())
     }
@@ -177,12 +194,20 @@ async fn reader_task(
     host_id: String,
     connection_id: u64,
     mut reader: Box<dyn AsyncBufRead + Unpin + Send>,
+    live: Arc<AtomicBool>,
 ) {
     loop {
         let mut incoming = String::new();
         match reader.read_line(&mut incoming).await {
             Ok(0) => break,
             Ok(_) => {
+                // Non-blocking liveness check (no lock, no await): if this
+                // connection was superseded/torn down while we were parked in
+                // read_line, stop so we never leak a late frame into a newer
+                // connection that reused this host id.
+                if !live.load(Ordering::Relaxed) {
+                    break;
+                }
                 let line = trim_line_ending(incoming);
                 tracing::info!(
                     host_id,
@@ -204,11 +229,13 @@ async fn reader_task(
                 }
             }
             Err(error) => {
-                let _ = emit_error(
-                    &app,
-                    &host_id,
-                    format!("failed to read from host connection: {error}"),
-                );
+                if live.load(Ordering::Relaxed) {
+                    let _ = emit_error(
+                        &app,
+                        &host_id,
+                        format!("failed to read from host connection: {error}"),
+                    );
+                }
                 break;
             }
         }
@@ -228,6 +255,7 @@ async fn writer_task(
     connection_id: u64,
     mut writer: Box<dyn AsyncWrite + Unpin + Send>,
     mut outbound_rx: mpsc::UnboundedReceiver<String>,
+    live: Arc<AtomicBool>,
 ) {
     while let Some(line) = outbound_rx.recv().await {
         if let Err(error) = write_line(&mut writer, line).await {
@@ -238,8 +266,13 @@ async fn writer_task(
                 "closing host connection after write failed"
             );
             // Surface the write failure and tear the connection down so a dead
-            // pipe becomes a visible error instead of silently swallowing sends.
-            let _ = emit_error(&app, &host_id, error);
+            // pipe becomes a visible error instead of silently swallowing sends
+            // — but only if we are still the live connection, so a write that
+            // failed because we were superseded doesn't raise a false error on
+            // the connection that replaced us.
+            if live.load(Ordering::Relaxed) {
+                let _ = emit_error(&app, &host_id, error);
+            }
             close_connection(&state, &app, &host_id, connection_id).await;
             return;
         }
@@ -269,6 +302,7 @@ async fn close_connection(
         return;
     };
 
+    connection.live.store(false, Ordering::Relaxed);
     reap_child(connection.child).await;
     tracing::info!(host_id, connection_id, "connection closed");
     let _ = app.emit(
@@ -340,6 +374,7 @@ async fn setup_connection_transport(
     app: AppHandle,
     transport: HostTransportConfig,
     host: server::HostHandle,
+    live: Arc<AtomicBool>,
 ) -> Result<ConnectionSetup, String> {
     match transport {
         HostTransportConfig::LocalEmbedded => {
@@ -407,13 +442,23 @@ async fn setup_connection_transport(
             if let Some(stderr) = child.stderr.take() {
                 let app = app.clone();
                 let host_id = host_id.to_string();
+                let live = live.clone();
                 tokio::spawn(async move {
                     let mut stderr = BufReader::new(stderr);
                     loop {
+                        // Stop emitting the moment this connection is superseded
+                        // so late stderr lines can't surface as errors on the
+                        // connection that replaced us (non-blocking, no lock).
+                        if !live.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let mut line = String::new();
                         match stderr.read_line(&mut line).await {
                             Ok(0) => break,
                             Ok(_) => {
+                                if !live.load(Ordering::Relaxed) {
+                                    break;
+                                }
                                 let line = trim_line_ending(line);
                                 if line.is_empty() {
                                     continue;
@@ -421,11 +466,13 @@ async fn setup_connection_transport(
                                 let _ = emit_error(&app, &host_id, format!("ssh: {line}"));
                             }
                             Err(error) => {
-                                let _ = emit_error(
-                                    &app,
-                                    &host_id,
-                                    format!("failed to read ssh stderr: {error}"),
-                                );
+                                if live.load(Ordering::Relaxed) {
+                                    let _ = emit_error(
+                                        &app,
+                                        &host_id,
+                                        format!("failed to read ssh stderr: {error}"),
+                                    );
+                                }
                                 break;
                             }
                         }
@@ -494,6 +541,7 @@ mod tests {
                 connection_id: 1,
                 outbound_tx: tx,
                 child: None,
+                live: Arc::new(AtomicBool::new(true)),
             },
         );
 
@@ -516,6 +564,7 @@ mod tests {
                 connection_id: 1,
                 outbound_tx: tx,
                 child: None,
+                live: Arc::new(AtomicBool::new(true)),
             },
         );
 
@@ -536,6 +585,7 @@ mod tests {
                 connection_id: 1,
                 outbound_tx: tx,
                 child: None,
+                live: Arc::new(AtomicBool::new(true)),
             },
         );
         // Simulate the writer task having exited: its receiver is dropped.
@@ -553,5 +603,26 @@ mod tests {
         let router = router();
         let err = router.disconnect("ghost".to_string()).await.unwrap_err();
         assert!(err.contains("not connected"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_clears_live_flag() {
+        let router = router();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let live = Arc::new(AtomicBool::new(true));
+        router.state.lock().unwrap().hosts.insert(
+            "host".to_string(),
+            Connection {
+                connection_id: 1,
+                outbound_tx: tx,
+                child: None,
+                live: live.clone(),
+            },
+        );
+
+        router.disconnect("host".to_string()).await.unwrap();
+        // A stale reader/stderr task holding this flag must observe the
+        // connection is no longer live and stop emitting.
+        assert!(!live.load(Ordering::Relaxed));
     }
 }
