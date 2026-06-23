@@ -1961,6 +1961,7 @@ mod wasm_tests {
                 1,
                 &ProjectFileContentsPayload {
                     path: path.clone(),
+                    version: protocol::ProjectFileVersion(1),
                     contents: Some("fn main() {}".to_owned()),
                     is_binary: false,
                 },

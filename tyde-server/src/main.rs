@@ -25,6 +25,7 @@ fn main() {
     // Record this binary's real release version so the mobile Welcome/Reject/QR
     // payloads advertise the correct web/PWA bundle key.
     server::set_host_release_version(env!("CARGO_PKG_VERSION"));
+    raise_fd_limit();
     match parse_cli_mode(std::env::args().skip(1)) {
         CliMode::HostStdio => exit_on_error(run_host_stdio()),
         CliMode::HostUds => exit_on_error(run_host_uds()),
@@ -41,6 +42,33 @@ fn main() {
         }
     }
 }
+
+/// Best-effort raise of the soft `RLIMIT_NOFILE` toward the hard limit.
+///
+/// Launchd hands the host a stingy soft limit of 256 file descriptors, which
+/// the many concurrent child-process stdio pipes quickly exhaust ("Too many
+/// open files (os error 24)"). This runs at the very top of `main`, before any
+/// dispatch, so it covers every CLI mode. Logging isn't initialized yet, so it
+/// reports via `eprintln!` and never panics/aborts startup on failure.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    const TARGET: u64 = 65536;
+    match rlimit::increase_nofile_limit(TARGET) {
+        // `increase_nofile_limit` clamps the soft limit to the hard limit, so a
+        // result below TARGET is a successful clamp, not a failure. Report the
+        // effective soft limit once, unconditionally, so the host log records
+        // what we actually got (e.g. 256 -> 61440).
+        Ok(limit) => {
+            eprintln!("tyde-server: RLIMIT_NOFILE soft limit set to {limit}");
+        }
+        Err(err) => {
+            eprintln!("tyde-server: warning: failed to raise RLIMIT_NOFILE limit: {err}");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() {}
 
 fn exit_on_error(result: Result<(), String>) {
     if let Err(err) = result {

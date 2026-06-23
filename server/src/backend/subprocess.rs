@@ -9,9 +9,86 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 
 use crate::process_env;
 use crate::remote::parse_remote_workspace_roots;
+
+/// Best-effort kill-and-reap of a grouped child that the caller already owns.
+///
+/// An `AsyncGroupChild` (unlike a bare tokio `Child`) is not registered with
+/// tokio's orphan reaper, so dropping it without `wait()` leaves a zombie in
+/// the OS process table. A synchronous `Drop` can't await, so when a tokio
+/// runtime is available we spawn a detached reaper that kills the process group
+/// and awaits it — reclaiming the process-table slot. With no runtime handle we
+/// fall back to a bounded blocking `start_kill` + `try_wait` loop. Never blocks
+/// the async runtime.
+///
+/// Note: the parent-side stdio read fds are NOT held by the child here — they
+/// were `.take()`n out at spawn and live in the reader tasks; those fds are
+/// released when the aborted reader tasks drop, not by this reap. This reap
+/// reclaims the process/zombie.
+pub(crate) fn reap_group_child(mut child: AsyncGroupChild) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            });
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            for _ in 0..20 {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                }
+            }
+        }
+    }
+}
+
+/// Take a grouped child out of a shared slot and reap it. Idempotent: a no-op
+/// when the slot is already empty, e.g. an explicit `shutdown()`/`kill()`
+/// already reaped it.
+///
+/// The locking is done INSIDE the spawned reaper with the async `Mutex` (never
+/// `try_lock`): a stdout-EOF reader task can momentarily hold this same `child`
+/// slot when the process exits, and a synchronous `try_lock` in `Drop` would
+/// lose that race, log, and return without reaping — re-leaking the zombie.
+/// Awaiting the lock on a detached task removes the race entirely. Only the
+/// no-runtime fallback uses `try_lock` (there is no place to await, and
+/// `blocking_lock` would panic on a runtime worker thread).
+pub(crate) fn reap_group_child_slot(child: &Arc<Mutex<Option<AsyncGroupChild>>>) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let slot = Arc::clone(child);
+            handle.spawn(async move {
+                if let Some(mut c) = slot.lock().await.take() {
+                    let _ = c.start_kill();
+                    let _ = c.wait().await;
+                }
+            });
+        }
+        Err(_) => {
+            let Ok(mut guard) = child.try_lock() else {
+                tracing::warn!(
+                    "reap_group_child_slot: could not acquire child lock without a runtime; child may be leaked"
+                );
+                return;
+            };
+            if let Some(mut c) = guard.take() {
+                let _ = c.start_kill();
+                for _ in 0..20 {
+                    match c.try_wait() {
+                        Ok(Some(_)) | Err(_) => break,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageAttachment {
@@ -25,6 +102,8 @@ pub struct SubprocessBridge {
     stdin: Arc<Mutex<ChildStdin>>,
     child: Arc<Mutex<Option<AsyncGroupChild>>>,
     shutting_down: Arc<AtomicBool>,
+    stdout_task: JoinHandle<()>,
+    stderr_task: JoinHandle<()>,
 }
 
 impl SubprocessBridge {
@@ -100,7 +179,7 @@ impl SubprocessBridge {
         let child_ref = child_for_reader.clone();
         let shutting_down = Arc::new(AtomicBool::new(false));
         let shutting_down_reader = Arc::clone(&shutting_down);
-        tokio::spawn(async move {
+        let stdout_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(value) = serde_json::from_str::<Value>(&line) else {
@@ -123,7 +202,7 @@ impl SubprocessBridge {
         });
 
         let stderr_tx = event_tx.clone();
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::debug!("subprocess stderr: {line}");
@@ -137,6 +216,8 @@ impl SubprocessBridge {
                 stdin: Arc::new(Mutex::new(stdin)),
                 child: child_for_reader.clone(),
                 shutting_down,
+                stdout_task,
+                stderr_task,
             },
             event_rx,
         ))
@@ -190,17 +271,13 @@ impl SubprocessBridge {
 }
 
 impl Drop for SubprocessBridge {
+    /// Safety net for disconnect/panic/teardown when `shutdown()` didn't run.
+    /// Aborts the reader tasks (closing the parent-side pipe fds they hold) and
+    /// reaps the child so it doesn't linger as a zombie. A no-op once the child
+    /// has already been taken by `shutdown()`.
     fn drop(&mut self) {
-        let Ok(mut guard) = self.child.try_lock() else {
-            tracing::warn!(
-                "SubprocessBridge::drop: could not acquire lock, child process may be leaked"
-            );
-            return;
-        };
-        if let Some(child) = guard.as_mut()
-            && let Err(err) = child.start_kill()
-        {
-            tracing::warn!("SubprocessBridge::drop: failed to kill child: {err}");
-        }
+        self.stdout_task.abort();
+        self.stderr_task.abort();
+        reap_group_child_slot(&self.child);
     }
 }

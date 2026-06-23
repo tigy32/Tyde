@@ -9,11 +9,12 @@ use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use protocol::{
     CommandErrorCode, CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project,
     ProjectDiffScope, ProjectEventPayload, ProjectFileContentsPayload, ProjectFileEntry,
-    ProjectFileKind, ProjectFileListPayload, ProjectGitChangeKind, ProjectGitDiffFile,
-    ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
-    ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
-    ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload, ReviewSummary, StreamPath,
+    ProjectFileKind, ProjectFileListPayload, ProjectFileVersion, ProjectGitChangeKind,
+    ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind,
+    ProjectGitDiffPayload, ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing,
+    ProjectRootPath, ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload,
+    ReviewSummary, StreamPath,
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -84,6 +85,18 @@ pub(crate) struct ProjectStreamSubscription {
     pub handle: ProjectStreamHandle,
 }
 
+/// A single advance of the centralized per-file version counter, broadcast to
+/// registered listeners (the code-intel services, §M4). This is an internal
+/// server type — it never appears on the wire. It tells a listener "the file at
+/// `path` is now at `version`", so a service that has this file subscribed can
+/// re-read it, push `textDocument/didChange`, and re-resolve the semantic model
+/// at the new version without waiting for the client to re-subscribe.
+#[derive(Debug, Clone)]
+pub(crate) struct FileVersionChange {
+    pub path: ProjectPath,
+    pub version: ProjectFileVersion,
+}
+
 #[derive(Clone)]
 pub(crate) struct ProjectStreamHandle {
     tx: mpsc::UnboundedSender<ProjectStreamCommand>,
@@ -111,6 +124,39 @@ enum ProjectStreamCommand {
     EmitProjectEvent {
         payload: ProjectEventPayload,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Read a file's contents, assigning it the next value of the centralized
+    /// per-file version counter. This is the single bump point for the *read*
+    /// source; watcher changes and agent writes bump the same counter.
+    ReadFile {
+        payload: ProjectReadFilePayload,
+        reply: oneshot::Sender<Result<ProjectFileContentsPayload, String>>,
+    },
+    /// Peek the current version of a file without bumping it. Used after a
+    /// code-intel service has already registered its version listener. Validates
+    /// the path/root against the project first (same check as the read path), so
+    /// a bad/unknown root never produces a version.
+    CurrentFileVersion {
+        path: ProjectPath,
+        reply: oneshot::Sender<Result<ProjectFileVersion, String>>,
+    },
+    /// Validate a path/root against the project, reusing the read path's
+    /// validation. Code-intel routing calls this before delegating to a
+    /// provider so a service is never spawned for a root that isn't a real
+    /// project root.
+    ValidatePath {
+        path: ProjectPath,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Register a listener for centralized per-file version bumps (§M4) and, in
+    /// the same serialized actor turn, return the current file version *after*
+    /// that listener is in the broadcast set. A watcher bump before this command
+    /// is reflected in the returned version; a bump after it is queued to the new
+    /// listener. There is no gap where a bump can be missed.
+    RegisterFileVersionListenerAndCurrentVersion {
+        path: ProjectPath,
+        listener: mpsc::UnboundedSender<FileVersionChange>,
+        reply: oneshot::Sender<Result<ProjectFileVersion, String>>,
     },
 }
 
@@ -199,6 +245,67 @@ impl ProjectStreamHandle {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(ProjectStreamCommand::EmitProjectEvent { payload, reply })
+            .map_err(|_| "project stream subscription stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?
+    }
+
+    pub(crate) async fn read_file(
+        &self,
+        payload: ProjectReadFilePayload,
+    ) -> Result<ProjectFileContentsPayload, String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(ProjectStreamCommand::ReadFile { payload, reply })
+            .map_err(|_| "project stream subscription stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?
+    }
+
+    pub(crate) async fn current_file_version(
+        &self,
+        path: ProjectPath,
+    ) -> Result<ProjectFileVersion, String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(ProjectStreamCommand::CurrentFileVersion { path, reply })
+            .map_err(|_| "project stream subscription stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?
+    }
+
+    pub(crate) async fn validate_path(&self, path: ProjectPath) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(ProjectStreamCommand::ValidatePath { path, reply })
+            .map_err(|_| "project stream subscription stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?
+    }
+
+    /// Register a listener for per-file version bumps (§M4) and return the
+    /// current file version after that registration has been serialized through
+    /// the project-stream actor. This is the only safe subscribe-time primitive:
+    /// a separate "peek current version" followed later by listener registration
+    /// can miss a watcher bump in between.
+    pub(crate) async fn register_file_version_listener_and_current_version(
+        &self,
+        path: ProjectPath,
+        listener: mpsc::UnboundedSender<FileVersionChange>,
+    ) -> Result<ProjectFileVersion, String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(
+                ProjectStreamCommand::RegisterFileVersionListenerAndCurrentVersion {
+                    path,
+                    listener,
+                    reply,
+                },
+            )
             .map_err(|_| "project stream subscription stopped".to_owned())?;
         response
             .await
@@ -316,6 +423,16 @@ async fn run_project_subscription(
     review_registry: ReviewRegistryHandle,
 ) {
     let mut subscribers = HashMap::<StreamPath, Stream>::new();
+    // Centralized per-file version counter. The single bump point
+    // (`bump_file_version`) is funneled here from every source: file reads,
+    // filesystem-watcher changes, and (transitively, via the watcher) agent
+    // writes. See `dev-docs/24-code-intelligence.md` §2.4.
+    let mut file_versions = HashMap::<ProjectPath, ProjectFileVersion>::new();
+    // Registered listeners for per-file version bumps (§M4). Each per-root
+    // code-intel service registers one on spawn; closed senders are pruned on
+    // broadcast. The project-stream actor is the single owner of the counter,
+    // so this is the one fan-out point for "a watched file's version changed."
+    let mut file_version_listeners = Vec::<mpsc::UnboundedSender<FileVersionChange>>::new();
     let mut pending_update = PendingProjectUpdate::default();
     let mut debounce_active = false;
     let mut debounce_sleep = Box::pin(sleep(Duration::from_secs(60 * 60 * 24 * 365)));
@@ -388,6 +505,35 @@ async fn run_project_subscription(
                         let result = broadcast_project_event(&mut subscribers, &payload).await;
                         let _ = reply.send(result);
                     }
+                    ProjectStreamCommand::ReadFile { payload, reply } => {
+                        let result = read_file(&project, payload).map(|mut contents| {
+                            contents.version =
+                                bump_file_version(&mut file_versions, &contents.path);
+                            contents
+                        });
+                        let _ = reply.send(result);
+                    }
+                    ProjectStreamCommand::CurrentFileVersion { path, reply } => {
+                        let result = current_file_version(&project, &path, &file_versions);
+                        let _ = reply.send(result);
+                    }
+                    ProjectStreamCommand::ValidatePath { path, reply } => {
+                        let _ = reply.send(validate_project_path(&project, &path));
+                    }
+                    ProjectStreamCommand::RegisterFileVersionListenerAndCurrentVersion {
+                        path,
+                        listener,
+                        reply,
+                    } => {
+                        let result = register_file_version_listener_and_current_version(
+                            &project,
+                            path,
+                            &file_versions,
+                            &mut file_version_listeners,
+                            listener,
+                        );
+                        let _ = reply.send(result);
+                    }
                 }
             }
             maybe_watcher = watcher_ready_rx.recv(), if watcher.is_none() => {
@@ -440,6 +586,22 @@ async fn run_project_subscription(
 
                 match event_result {
                     Ok(event) => {
+                        // Bump the centralized per-file version for each changed
+                        // file through the single bump point (`bump_file_version`),
+                        // the same one reads use. An external change, a branch
+                        // switch, or an agent write all land on disk and reach us
+                        // here via the watcher, so this one point advances the
+                        // version the code-intel service resolves against —
+                        // regardless of which source caused the change.
+                        //
+                        // §M4: each bumped (path, version) is then broadcast to
+                        // every registered code-intel service so it re-reads,
+                        // sends `didChange`, and re-pushes the semantic model at
+                        // the new version, superseding any stale in-flight
+                        // resolution. The counter stays single and authoritative;
+                        // there is no second counter and no double-bump.
+                        let changes = bump_watched_paths(&project, &event, &mut file_versions);
+                        notify_file_version_listeners(&mut file_version_listeners, &changes);
                         let refresh = classify_watch_event(&event);
                         if !refresh.is_empty() {
                             pending_update.merge(refresh);
@@ -638,6 +800,115 @@ fn ensure_watched_roots(
     *watcher = create_project_watcher(project, watch_tx)?;
     *watched_roots = roots;
     Ok(())
+}
+
+fn current_file_version(
+    project: &Project,
+    path: &ProjectPath,
+    versions: &HashMap<ProjectPath, ProjectFileVersion>,
+) -> Result<ProjectFileVersion, String> {
+    validate_project_path(project, path)
+        .map(|()| versions.get(path).copied().unwrap_or(ProjectFileVersion(0)))
+}
+
+trait FileVersionLookup {
+    fn version_for(&self, path: &ProjectPath) -> Option<ProjectFileVersion>;
+}
+
+impl FileVersionLookup for HashMap<ProjectPath, ProjectFileVersion> {
+    fn version_for(&self, path: &ProjectPath) -> Option<ProjectFileVersion> {
+        self.get(path).copied()
+    }
+}
+
+trait FileVersionListenerRegistry {
+    fn register(&mut self, listener: mpsc::UnboundedSender<FileVersionChange>);
+}
+
+impl FileVersionListenerRegistry for Vec<mpsc::UnboundedSender<FileVersionChange>> {
+    fn register(&mut self, listener: mpsc::UnboundedSender<FileVersionChange>) {
+        self.push(listener);
+    }
+}
+
+fn register_file_version_listener_and_current_version<V, L>(
+    project: &Project,
+    path: ProjectPath,
+    versions: &V,
+    listeners: &mut L,
+    listener: mpsc::UnboundedSender<FileVersionChange>,
+) -> Result<ProjectFileVersion, String>
+where
+    V: FileVersionLookup,
+    L: FileVersionListenerRegistry,
+{
+    validate_project_path(project, &path)?;
+    listeners.register(listener);
+    Ok(versions.version_for(&path).unwrap_or(ProjectFileVersion(0)))
+}
+
+/// The single bump point for the centralized per-file version counter. Every
+/// source (read, watcher change, agent write) funnels through here so a file's
+/// version increases monotonically regardless of which path advanced it.
+fn bump_file_version(
+    versions: &mut HashMap<ProjectPath, ProjectFileVersion>,
+    path: &ProjectPath,
+) -> ProjectFileVersion {
+    let slot = versions
+        .entry(path.clone())
+        .or_insert(ProjectFileVersion(0));
+    slot.0 += 1;
+    *slot
+}
+
+/// Map every changed path in a watch event back to a `ProjectPath` and bump its
+/// version through the single bump point. Paths inside `.git` are ignored — git
+/// bookkeeping is not a source file change. Returns one [`FileVersionChange`]
+/// per bumped file (in event order) so the caller can broadcast them to the
+/// code-intel services (§M4). A path that maps to several... no: each changed
+/// path bumps exactly once here, so a file that appears twice in one event
+/// (rare) advances twice and yields two changes — monotonic and harmless, the
+/// listener simply re-resolves at the latest.
+fn bump_watched_paths(
+    project: &Project,
+    event: &Event,
+    versions: &mut HashMap<ProjectPath, ProjectFileVersion>,
+) -> Vec<FileVersionChange> {
+    let mut changes = Vec::new();
+    for path in &event.paths {
+        if is_inside_git(path) {
+            continue;
+        }
+        let Some(absolute) = path.to_str() else {
+            continue;
+        };
+        if let Some(project_path) = project_path_from_absolute(project, absolute) {
+            let version = bump_file_version(versions, &project_path);
+            changes.push(FileVersionChange {
+                path: project_path,
+                version,
+            });
+        }
+    }
+    changes
+}
+
+/// Broadcast each per-file version bump to every registered listener (the
+/// code-intel services, §M4), pruning any whose receiver has been dropped. A
+/// listener that fails on any change is closed and removed — it is the service
+/// task having exited, so there is nothing left to notify.
+fn notify_file_version_listeners(
+    listeners: &mut Vec<mpsc::UnboundedSender<FileVersionChange>>,
+    changes: &[FileVersionChange],
+) {
+    if listeners.is_empty() || changes.is_empty() {
+        return;
+    }
+    listeners.retain(|listener| {
+        changes
+            .iter()
+            .all(|change| listener.send(change.clone()).is_ok())
+    });
 }
 
 fn classify_watch_event(event: &Event) -> PendingProjectUpdate {
@@ -1120,14 +1391,19 @@ pub(crate) fn read_file(
     let absolute = absolute_project_path(&path)?;
     let bytes = fs::read(&absolute)
         .map_err(|err| format!("Failed to read file '{}': {err}", absolute.display()))?;
+    // `version` is a placeholder here; the project-stream actor overwrites it
+    // with the centralized counter's next value (the single bump point) before
+    // the payload leaves the actor. See `ProjectStreamCommand::ReadFile`.
     match String::from_utf8(bytes) {
         Ok(contents) => Ok(ProjectFileContentsPayload {
             path,
+            version: ProjectFileVersion(0),
             contents: Some(contents),
             is_binary: false,
         }),
         Err(_) => Ok(ProjectFileContentsPayload {
             path,
+            version: ProjectFileVersion(0),
             contents: None,
             is_binary: true,
         }),
@@ -3142,5 +3418,199 @@ new mode 100755\n";
         .expect("search ok");
         assert!(summary.cancelled);
         assert_eq!(files.len(), 0);
+    }
+
+    // ── §M4: centralized version counter + watcher → code-intel notify ──────
+
+    fn watch_event(paths: Vec<PathBuf>) -> Event {
+        Event {
+            paths,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn watched_change_bumps_version_exactly_once_and_is_monotonic() {
+        // Each watcher event for a file advances the *single* counter by exactly
+        // one, and repeated changes keep climbing (never reset, never skip).
+        let project = test_project("/repo");
+        let mut versions = HashMap::new();
+        let file = PathBuf::from("/repo/src/main.rs");
+
+        let first = bump_watched_paths(&project, &watch_event(vec![file.clone()]), &mut versions);
+        assert_eq!(first.len(), 1, "exactly one change per changed file");
+        assert_eq!(first[0].path.relative_path, "src/main.rs");
+        assert_eq!(first[0].version, ProjectFileVersion(1));
+
+        let second = bump_watched_paths(&project, &watch_event(vec![file.clone()]), &mut versions);
+        assert_eq!(second[0].version, ProjectFileVersion(2), "monotonic");
+
+        // Only one counter entry for the file: no parallel/double counter.
+        let key = ProjectPath {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "src/main.rs".to_owned(),
+        };
+        assert_eq!(versions.get(&key), Some(&ProjectFileVersion(2)));
+        assert_eq!(versions.len(), 1);
+    }
+
+    #[test]
+    fn read_and_watcher_share_one_counter_no_double_bump() {
+        // A read bump and a watcher bump funnel through the *same* counter, so
+        // versions advance 1, 2, 3 across mixed sources — never two counters.
+        let project = test_project("/repo");
+        let mut versions = HashMap::new();
+        let key = ProjectPath {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "lib.rs".to_owned(),
+        };
+
+        // Read path (as `ProjectStreamCommand::ReadFile` does).
+        assert_eq!(
+            bump_file_version(&mut versions, &key),
+            ProjectFileVersion(1)
+        );
+        // Watcher path.
+        let changes = bump_watched_paths(
+            &project,
+            &watch_event(vec!["/repo/lib.rs".into()]),
+            &mut versions,
+        );
+        assert_eq!(changes[0].version, ProjectFileVersion(2));
+        // Read again.
+        assert_eq!(
+            bump_file_version(&mut versions, &key),
+            ProjectFileVersion(3)
+        );
+        assert_eq!(versions.len(), 1, "one authoritative counter per file");
+    }
+
+    #[test]
+    fn git_internal_changes_do_not_bump_or_notify() {
+        // `.git` bookkeeping is not a source-file change: no version bump, no
+        // code-intel notification.
+        let project = test_project("/repo");
+        let mut versions = HashMap::new();
+        let changes = bump_watched_paths(
+            &project,
+            &watch_event(vec!["/repo/.git/index".into()]),
+            &mut versions,
+        );
+        assert!(changes.is_empty());
+        assert!(versions.is_empty());
+    }
+
+    #[test]
+    fn register_listener_and_current_version_is_one_serialized_step() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Step {
+            RegisterListener,
+            ReadCurrentVersion,
+        }
+
+        struct RecordingVersions {
+            inner: HashMap<ProjectPath, ProjectFileVersion>,
+            steps: std::rc::Rc<std::cell::RefCell<Vec<Step>>>,
+        }
+
+        impl FileVersionLookup for RecordingVersions {
+            fn version_for(&self, path: &ProjectPath) -> Option<ProjectFileVersion> {
+                self.steps.borrow_mut().push(Step::ReadCurrentVersion);
+                self.inner.get(path).copied()
+            }
+        }
+
+        struct RecordingListeners {
+            inner: Vec<mpsc::UnboundedSender<FileVersionChange>>,
+            steps: std::rc::Rc<std::cell::RefCell<Vec<Step>>>,
+        }
+
+        impl FileVersionListenerRegistry for RecordingListeners {
+            fn register(&mut self, listener: mpsc::UnboundedSender<FileVersionChange>) {
+                self.steps.borrow_mut().push(Step::RegisterListener);
+                self.inner.push(listener);
+            }
+        }
+
+        let project = test_project("/repo");
+        let path = ProjectPath {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "src/main.rs".to_owned(),
+        };
+        let steps = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut versions = RecordingVersions {
+            inner: HashMap::new(),
+            steps: steps.clone(),
+        };
+        versions.inner.insert(path.clone(), ProjectFileVersion(3));
+        let mut listeners = RecordingListeners {
+            inner: Vec::new(),
+            steps: steps.clone(),
+        };
+        let (listener, mut rx) = mpsc::unbounded_channel();
+
+        let version = register_file_version_listener_and_current_version(
+            &project,
+            path.clone(),
+            &versions,
+            &mut listeners,
+            listener,
+        )
+        .expect("valid path registers listener and returns current version");
+
+        assert_eq!(
+            version,
+            ProjectFileVersion(3),
+            "the returned version is read after the listener is registered in the same actor turn"
+        );
+        assert_eq!(
+            steps.borrow().as_slice(),
+            &[Step::RegisterListener, Step::ReadCurrentVersion],
+            "the actor-turn helper must enqueue the listener before reading the current version"
+        );
+        assert_eq!(
+            listeners.inner.len(),
+            1,
+            "listener is registered before returning"
+        );
+
+        let next = bump_file_version(&mut versions.inner, &path);
+        notify_file_version_listeners(
+            &mut listeners.inner,
+            &[FileVersionChange {
+                path: path.clone(),
+                version: next,
+            }],
+        );
+        let received = rx
+            .try_recv()
+            .expect("registered listener receives later bump");
+        assert_eq!(received.path, path);
+        assert_eq!(received.version, ProjectFileVersion(4));
+    }
+
+    #[test]
+    fn notify_listeners_delivers_changes_and_prunes_closed() {
+        let mut listeners = Vec::new();
+        let (live_tx, mut live_rx) = mpsc::unbounded_channel();
+        let (dead_tx, dead_rx) = mpsc::unbounded_channel();
+        drop(dead_rx); // a service whose task has exited
+        listeners.push(live_tx);
+        listeners.push(dead_tx);
+
+        let changes = vec![FileVersionChange {
+            path: ProjectPath {
+                root: ProjectRootPath("/repo".to_owned()),
+                relative_path: "src/main.rs".to_owned(),
+            },
+            version: ProjectFileVersion(7),
+        }];
+        notify_file_version_listeners(&mut listeners, &changes);
+
+        // The live listener received the change; the dead one was pruned.
+        assert_eq!(listeners.len(), 1, "closed listener pruned on broadcast");
+        let received = live_rx.try_recv().expect("live listener got the change");
+        assert_eq!(received.version, ProjectFileVersion(7));
+        assert_eq!(received.path.relative_path, "src/main.rs");
     }
 }

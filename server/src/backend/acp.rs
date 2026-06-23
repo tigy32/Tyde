@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use protocol::BackendAccessMode;
 
@@ -805,6 +806,29 @@ struct AcpTerminal {
     exit_signal: Option<String>,
 }
 
+impl Drop for AcpTerminal {
+    /// Last-ditch net. The real reaping is done explicitly by `kill_terminal`
+    /// (kill + `wait()`), invoked from `terminal/release` and from
+    /// `AcpRpc`-owner shutdown via `terminate_terminal` — both of which set
+    /// `child = None` before the terminal is dropped, so this is normally a
+    /// no-op.
+    ///
+    /// Caveat from the lifecycle review: while the terminal command is still
+    /// running, both output-reader tasks hold `Arc<Mutex<AcpTerminal>>` and are
+    /// blocked on `read()`, so the terminal is pinned alive and this Drop
+    /// cannot fire for a *running* child on a hard panic that skips shutdown.
+    /// Once the child exits, the readers observe EOF, return, and release their
+    /// Arcs — but by then the normal release/shutdown path has typically
+    /// already reaped it. This Drop therefore only meaningfully covers a path
+    /// that removes the terminal from its map without going through
+    /// `kill_terminal` (none exists today); it is kept as a cheap backstop.
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            crate::backend::subprocess::reap_group_child(child);
+        }
+    }
+}
+
 async fn read_terminal_output<R>(mut reader: R, terminal: Arc<Mutex<AcpTerminal>>)
 where
     R: AsyncRead + Unpin,
@@ -1044,6 +1068,8 @@ struct AcpRpc {
     pending: PendingRpcMap,
     next_id: AtomicU64,
     child: Arc<Mutex<Option<AsyncGroupChild>>>,
+    stdout_task: JoinHandle<()>,
+    stderr_task: JoinHandle<()>,
 }
 
 impl AcpRpc {
@@ -1111,7 +1137,7 @@ impl AcpRpc {
         let stdout_pending = Arc::clone(&pending);
         let stdout_inbound = inbound_tx.clone();
         let stdout_child = Arc::clone(&child_ref);
-        tokio::spawn(async move {
+        let stdout_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let parsed = match serde_json::from_str::<Value>(&line) {
@@ -1203,7 +1229,7 @@ impl AcpRpc {
         });
 
         let stderr_inbound = inbound_tx.clone();
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let _ = stderr_inbound.send(AcpInbound::Stderr(line));
@@ -1216,6 +1242,8 @@ impl AcpRpc {
                 pending,
                 next_id: AtomicU64::new(1),
                 child: child_ref,
+                stdout_task,
+                stderr_task,
             },
             inbound_tx,
             inbound_rx,
@@ -1297,9 +1325,29 @@ impl AcpRpc {
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        if let Some(child) = self.child.lock().await.as_mut() {
+        let child = self.child.lock().await.take();
+        if let Some(mut child) = child {
             let _ = child.start_kill();
+            // Reap so the OS process slot and pipe fds are reclaimed; the bare
+            // start_kill() before never awaited, leaving a zombie.
+            let _ = child.wait().await;
         }
+        // child is taken (None) — Drop will be a no-op. Drop the readers so the
+        // parent-side stdio pipe fds are released even if EOF hasn't propagated.
+        self.stdout_task.abort();
+        self.stderr_task.abort();
+    }
+}
+
+impl Drop for AcpRpc {
+    /// Safety net for disconnect/panic/teardown when `shutdown()` didn't run.
+    /// Aborts the reader tasks (closing the parent-side pipe fds they hold) and
+    /// reaps the child so it doesn't linger as a zombie. A no-op once the child
+    /// has already been taken by `shutdown()`.
+    fn drop(&mut self) {
+        self.stdout_task.abort();
+        self.stderr_task.abort();
+        crate::backend::subprocess::reap_group_child_slot(&self.child);
     }
 }
 #[cfg(test)]

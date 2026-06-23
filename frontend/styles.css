@@ -568,7 +568,6 @@ details summary:focus:not(:focus-visible) {
     display: flex;
     flex-direction: column;
     gap: 3px;
-    margin-top: 3px;
 }
 
 /* When expanded, indent the children under a vertical guide line that ties
@@ -6061,6 +6060,102 @@ kbd {
     color: var(--text-primary);
     background: transparent;
     overflow-x: visible;
+}
+
+/* ===== Code-intel diagnostics ===== */
+
+/* Inline squiggles: a wavy underline under the diagnostic's byte range. The
+ * span only wraps text — the rendered characters are unchanged, so copying a
+ * line is unaffected. Colors follow severity. */
+.code-intel-squiggle {
+    text-decoration-line: underline;
+    text-decoration-style: wavy;
+    text-decoration-skip-ink: none;
+    /* Keep the wave tight so it reads as a squiggle, not a thick underline. */
+    text-underline-offset: 2px;
+}
+
+.code-intel-squiggle-error {
+    text-decoration-color: var(--danger, #f85149);
+}
+
+.code-intel-squiggle-warning {
+    text-decoration-color: var(--warning, #d29922);
+}
+
+.code-intel-squiggle-info {
+    text-decoration-color: var(--accent, #58a6ff);
+}
+
+.code-intel-squiggle-hint {
+    text-decoration-color: var(--text-tertiary, #8b949e);
+}
+
+/* Gutter severity dot: a CSS pseudo-element so it never enters the row's text
+ * content (selection/copy stay clean — same rationale as .file-line-num::before
+ * for line numbers). Positioned in the line-number gutter. */
+.file-line[class*="code-intel-gutter-"] .file-line-num {
+    position: relative;
+}
+
+.file-line[class*="code-intel-gutter-"] .file-line-num::after {
+    content: "";
+    position: absolute;
+    left: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+}
+
+.file-line.code-intel-gutter-error .file-line-num::after {
+    background: var(--danger, #f85149);
+}
+
+.file-line.code-intel-gutter-warning .file-line-num::after {
+    background: var(--warning, #d29922);
+}
+
+.file-line.code-intel-gutter-info .file-line-num::after {
+    background: var(--accent, #58a6ff);
+}
+
+.file-line.code-intel-gutter-hint .file-line-num::after {
+    background: var(--text-tertiary, #8b949e);
+}
+
+/* ===== Code-intel hover popover (M2) ===== */
+.code-intel-hover-popover {
+    z-index: 1000;
+    max-width: 520px;
+    max-height: 320px;
+    overflow: auto;
+    padding: 8px 10px;
+    border: 1px solid var(--border, #30363d);
+    border-radius: 6px;
+    background: var(--bg-elevated, #161b22);
+    color: var(--text-primary, #e6edf3);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+    font-size: 12px;
+    line-height: 1.45;
+    /* Markdown produces block elements; keep them tight in the popover. */
+    white-space: normal;
+    pointer-events: none;
+}
+
+.code-intel-hover-popover :first-child {
+    margin-top: 0;
+}
+
+.code-intel-hover-popover :last-child {
+    margin-bottom: 0;
+}
+
+.code-intel-hover-popover code,
+.code-intel-hover-popover pre {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
 }
 
 /* ===== Transient Notices (kept for backward compat but now rendered as cards) ===== */

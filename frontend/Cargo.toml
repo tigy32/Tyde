@@ -15,6 +15,7 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "Clipboard",
+    "CaretPosition",
     "CssStyleDeclaration",
     "DataTransfer",
     "Document",
@@ -31,10 +32,14 @@ web-sys = { version = "0.3", features = [
     "HtmlScriptElement",
     "HtmlStyleElement",
     "HtmlTextAreaElement",
+    "MouseEvent",
+    "MouseEventInit",
     "Navigator",
     "Node",
     "NodeList",
     "Performance",
+    "Range",
+    "Selection",
     "ProgressEvent",
     "Storage",
     "Window",
