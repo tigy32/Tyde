@@ -12,6 +12,8 @@ use crate::bridge::{
     HostErrorEvent, HostLineEvent,
 };
 use crate::host_store::{HostTransportConfig, RemoteHostLifecycleConfig};
+use crate::remote_bootstrap::{current_app_release_version, shell_quote};
+use host_config::TydeReleaseVersion;
 
 const DEFAULT_REMOTE_HOST_COMMAND: &str = "tyde host --bridge-uds";
 
@@ -413,10 +415,10 @@ async fn setup_connection_transport(
             }
             let command = match lifecycle {
                 RemoteHostLifecycleConfig::Manual => {
-                    remote_command.unwrap_or_else(|| DEFAULT_REMOTE_HOST_COMMAND.to_string())
+                    Ok(remote_command.unwrap_or_else(|| DEFAULT_REMOTE_HOST_COMMAND.to_string()))
                 }
                 RemoteHostLifecycleConfig::ManagedTyde => managed_remote_bridge_command(),
-            };
+            }?;
             let mut child = Command::new("ssh");
             child
                 .arg("-T")
@@ -489,18 +491,26 @@ async fn setup_connection_transport(
     }
 }
 
-fn managed_remote_bridge_command() -> String {
-    r#"set -eu
+fn managed_remote_bridge_command() -> Result<String, String> {
+    let target_version = current_app_release_version()?;
+    Ok(managed_remote_bridge_command_for_target(&target_version))
+}
+
+fn managed_remote_bridge_command_for_target(target_version: &TydeReleaseVersion) -> String {
+    let target_version_sh = shell_quote(target_version.as_str());
+    format!(
+        r#"set -eu
 mkdir -p "$HOME/.tyde/logs"
-bin="$HOME/.tyde/bin/current/tyde-server"
+target_version={target_version_sh}
+bin="$HOME/.tyde/bin/{target_version}/tyde-server"
 if [ ! -x "$bin" ]; then
-  echo "managed Tyde bridge binary is not executable: $bin" >&2
+  echo "managed Tyde bridge requires exact target Tyde $target_version, but its binary is not executable: $bin" >&2
   exit 1
 fi
 export TYDE_SOCKET_PATH="$HOME/.tyde/tyde.sock"
 exec "$bin" host --bridge-uds 2>> "$HOME/.tyde/logs/tyde-host-bridge-uds.log"
 "#
-    .to_string()
+    )
 }
 
 #[cfg(test)]
@@ -516,6 +526,17 @@ mod tests {
         assert_eq!(trim_line_ending("hello\r\n".to_string()), "hello");
         assert_eq!(trim_line_ending("hello\n".to_string()), "hello");
         assert_eq!(trim_line_ending("hello".to_string()), "hello");
+    }
+
+    #[test]
+    fn managed_bridge_uses_exact_target_binary_without_current_fallback() {
+        let target = "0.8.20-beta.1".parse::<TydeReleaseVersion>().unwrap();
+        let command = managed_remote_bridge_command_for_target(&target);
+
+        assert!(command.contains("target_version='0.8.20-beta.1'"));
+        assert!(command.contains("bin=\"$HOME/.tyde/bin/0.8.20-beta.1/tyde-server\""));
+        assert!(command.contains("managed Tyde bridge requires exact target Tyde $target_version"));
+        assert!(!command.contains("$HOME/.tyde/bin/current"));
     }
 
     #[tokio::test]
