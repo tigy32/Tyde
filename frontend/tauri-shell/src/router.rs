@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::bridge::{
     HOST_DISCONNECTED_EVENT, HOST_ERROR_EVENT, HOST_LINE_EVENT, HostDisconnectedEvent,
@@ -13,64 +15,56 @@ use crate::host_store::{HostTransportConfig, RemoteHostLifecycleConfig};
 
 const DEFAULT_REMOTE_HOST_COMMAND: &str = "tyde host --bridge-uds";
 
+/// Routes Tauri commands to per-connection writer tasks and tracks the live
+/// connections.
+///
+/// Each connection is driven by two fully independent tasks that share no
+/// channel and never coordinate across directions:
+///
+///   * a **reader task** that solely owns the transport's read half and emits
+///     every inbound line straight to the app, and
+///   * a **writer task** that solely owns the write half and drains an
+///     unbounded outbound channel.
+///
+/// The registry below only carries control-plane state (the outbound sender
+/// and the child handle used for teardown). It never sits in the inbound data
+/// path, so a stalled/backpressured writer can never stop the reader from
+/// draining the transport — which is what previously deadlocked the SSH proxy.
 #[derive(Clone)]
 pub struct ProxyRouterHandle {
-    tx: mpsc::Sender<RouterCommand>,
+    state: Arc<Mutex<RouterState>>,
 }
 
-struct ConnectedHost {
-    app: AppHandle,
+struct RouterState {
+    hosts: HashMap<String, Connection>,
+    next_connection_id: u64,
+}
+
+struct Connection {
     connection_id: u64,
-    tx: mpsc::Sender<ConnectionCommand>,
-}
-
-enum RouterCommand {
-    ConnectDuplex {
-        app: Box<AppHandle>,
-        host_id: String,
-        transport: HostTransportConfig,
-        host: server::HostHandle,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    Disconnect {
-        host_id: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    SendLine {
-        host_id: String,
-        line: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    ConnectionLine {
-        host_id: String,
-        connection_id: u64,
-        line: String,
-    },
-    ConnectionError {
-        host_id: String,
-        connection_id: u64,
-        message: String,
-    },
-    ConnectionClosed {
-        host_id: String,
-        connection_id: u64,
-    },
-}
-
-enum ConnectionCommand {
-    SendLine {
-        line: String,
-        reply: oneshot::Sender<Result<(), String>>,
-    },
-    Disconnect,
+    /// Outbound frames are enqueued here; the writer task owns the receiver.
+    /// Dropping every sender (i.e. removing this entry) makes the writer task
+    /// finish on its own.
+    outbound_tx: mpsc::UnboundedSender<String>,
+    /// SSH child process, owned here so teardown can reap it. `None` for the
+    /// in-process embedded transport.
+    child: Option<Child>,
+    /// Liveness flag shared with this connection's reader/stderr tasks. Cleared
+    /// (non-blocking, no lock) the instant the entry is removed or superseded,
+    /// so a stale reader/stderr task that is still draining stops emitting
+    /// instead of leaking late frames/errors into a newer connection that
+    /// reused the same host id.
+    live: Arc<AtomicBool>,
 }
 
 impl ProxyRouterHandle {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel(64);
-        let handle = Self { tx: tx.clone() };
-        tauri::async_runtime::spawn(router_actor(tx, rx));
-        handle
+        Self {
+            state: Arc::new(Mutex::new(RouterState {
+                hosts: HashMap::new(),
+                next_connection_id: 1,
+            })),
+        }
     }
 
     pub async fn connect_local(
@@ -80,169 +74,148 @@ impl ProxyRouterHandle {
         transport: HostTransportConfig,
         host: server::HostHandle,
     ) -> Result<(), String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(RouterCommand::ConnectDuplex {
-                app: Box::new(app),
-                host_id,
-                transport,
-                host,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| "proxy router is unavailable".to_owned())?;
-        reply_rx
-            .await
-            .map_err(|_| "proxy router dropped connect reply".to_owned())?
+        tracing::info!(host_id, "connect_duplex requested");
+
+        // Quietly tear down any existing connection for this host before
+        // establishing the new one. Removing the entry drops its outbound
+        // sender (stopping the old writer); reaping the child closes the old
+        // reader via EOF. The old reader's teardown will no-op because the new
+        // connection carries a different connection id.
+        let existing = {
+            let mut guard = self.state.lock().expect("router state poisoned");
+            guard.hosts.remove(&host_id)
+        };
+        if let Some(existing) = existing {
+            tracing::info!(host_id, "replacing existing host connection");
+            existing.live.store(false, Ordering::Relaxed);
+            reap_child(existing.child).await;
+        }
+
+        let connection_id = {
+            let mut guard = self.state.lock().expect("router state poisoned");
+            let id = guard.next_connection_id;
+            guard.next_connection_id += 1;
+            id
+        };
+
+        let live = Arc::new(AtomicBool::new(true));
+        let setup =
+            setup_connection_transport(&host_id, app.clone(), transport, host, live.clone())
+                .await?;
+
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<String>();
+
+        // Register before spawning so that an immediate reader EOF can find the
+        // entry (and thus reap the child / emit disconnect) instead of racing.
+        {
+            let mut guard = self.state.lock().expect("router state poisoned");
+            guard.hosts.insert(
+                host_id.clone(),
+                Connection {
+                    connection_id,
+                    outbound_tx,
+                    child: setup.child,
+                    live: live.clone(),
+                },
+            );
+        }
+
+        tokio::spawn(reader_task(
+            self.state.clone(),
+            app.clone(),
+            host_id.clone(),
+            connection_id,
+            setup.reader,
+            live.clone(),
+        ));
+        tokio::spawn(writer_task(
+            self.state.clone(),
+            app,
+            host_id.clone(),
+            connection_id,
+            setup.writer,
+            outbound_rx,
+            live,
+        ));
+
+        tracing::info!(host_id, "connected via duplex");
+        Ok(())
     }
 
     pub async fn disconnect(&self, host_id: String) -> Result<(), String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(RouterCommand::Disconnect {
-                host_id,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| "proxy router is unavailable".to_owned())?;
-        reply_rx
-            .await
-            .map_err(|_| "proxy router dropped disconnect reply".to_owned())?
+        let connection = {
+            let mut guard = self.state.lock().expect("router state poisoned");
+            guard.hosts.remove(&host_id)
+        };
+        let Some(connection) = connection else {
+            return Err(format!("host {host_id} is not connected"));
+        };
+
+        // Quiet teardown: clearing `live` stops the reader/stderr tasks from
+        // emitting any late frames, dropping `connection` drops the outbound
+        // sender (the writer task ends), and reaping the child closes the
+        // reader via EOF. The reader's own teardown no-ops because the entry is
+        // already gone, so no `HOST_DISCONNECTED_EVENT` is emitted for an
+        // explicit disconnect.
+        connection.live.store(false, Ordering::Relaxed);
+        reap_child(connection.child).await;
+        Ok(())
     }
 
     pub async fn send_line(&self, host_id: String, line: String) -> Result<(), String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(RouterCommand::SendLine {
-                host_id,
-                line,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| "proxy router is unavailable".to_owned())?;
-        reply_rx
-            .await
-            .map_err(|_| "proxy router dropped send reply".to_owned())?
+        if line.contains('\n') {
+            return Err("host line must not contain a newline".to_owned());
+        }
+
+        let outbound_tx = {
+            let guard = self.state.lock().expect("router state poisoned");
+            guard.hosts.get(&host_id).map(|c| c.outbound_tx.clone())
+        };
+        let Some(outbound_tx) = outbound_tx else {
+            return Err(format!("host {host_id} is not connected"));
+        };
+
+        // Enqueue and return immediately. The unbounded channel never applies
+        // backpressure, so this can't block on the writer. If the writer task
+        // has already exited (dead connection), the send fails and we surface
+        // an explicit error rather than silently dropping the frame.
+        outbound_tx
+            .send(line)
+            .map_err(|_| format!("host {host_id} connection is no longer available"))
     }
 }
 
-async fn router_actor(
-    router_tx: mpsc::Sender<RouterCommand>,
-    mut rx: mpsc::Receiver<RouterCommand>,
+/// Inbound half: solely owns the transport reader and pushes every line to the
+/// app. It never touches the registry on the hot path and never waits on
+/// anything the writer owns, so it always drains the transport.
+async fn reader_task(
+    state: Arc<Mutex<RouterState>>,
+    app: AppHandle,
+    host_id: String,
+    connection_id: u64,
+    mut reader: Box<dyn AsyncBufRead + Unpin + Send>,
+    live: Arc<AtomicBool>,
 ) {
-    let mut hosts: HashMap<String, ConnectedHost> = HashMap::new();
-    let mut next_connection_id = 1_u64;
-
-    while let Some(command) = rx.recv().await {
-        match command {
-            RouterCommand::ConnectDuplex {
-                app,
-                host_id,
-                transport,
-                host,
-                reply,
-            } => {
-                tracing::info!(host_id, "connect_duplex requested");
-                if let Some(existing) = hosts.remove(&host_id) {
-                    tracing::info!(host_id, "replacing existing host connection");
-                    let _ = existing.tx.send(ConnectionCommand::Disconnect).await;
+    loop {
+        let mut incoming = String::new();
+        match reader.read_line(&mut incoming).await {
+            Ok(0) => break,
+            Ok(_) => {
+                // Non-blocking liveness check (no lock, no await): if this
+                // connection was superseded/torn down while we were parked in
+                // read_line, stop so we never leak a late frame into a newer
+                // connection that reused this host id.
+                if !live.load(Ordering::Relaxed) {
+                    break;
                 }
-
-                let connection_id = next_connection_id;
-                next_connection_id += 1;
-
-                let setup = match setup_connection_transport(
-                    &host_id,
+                let line = trim_line_ending(incoming);
+                tracing::info!(
+                    host_id,
                     connection_id,
-                    router_tx.clone(),
-                    transport,
-                    host,
-                )
-                .await
-                {
-                    Ok(setup) => setup,
-                    Err(err) => {
-                        let _ = reply.send(Err(err));
-                        continue;
-                    }
-                };
-                let (connection_tx, connection_rx) = mpsc::channel(64);
-                tokio::spawn(connection_actor(
-                    ConnectionActorContext {
-                        host_id: host_id.clone(),
-                        connection_id,
-                        rx: connection_rx,
-                        router_tx: router_tx.clone(),
-                        cleanup: setup.cleanup,
-                    },
-                    setup.reader,
-                    setup.writer,
-                ));
-                hosts.insert(
-                    host_id.clone(),
-                    ConnectedHost {
-                        app: *app,
-                        connection_id,
-                        tx: connection_tx,
-                    },
+                    line_len = line.len(),
+                    "proxy router received line from host"
                 );
-                tracing::info!(host_id, "connected via duplex");
-                let _ = reply.send(Ok(()));
-            }
-            RouterCommand::Disconnect { host_id, reply } => {
-                let Some(connected) = hosts.remove(&host_id) else {
-                    let _ = reply.send(Err(format!("host {host_id} is not connected")));
-                    continue;
-                };
-
-                connected
-                    .tx
-                    .send(ConnectionCommand::Disconnect)
-                    .await
-                    .expect("connection task channel closed before disconnect was sent");
-                let _ = reply.send(Ok(()));
-            }
-            RouterCommand::SendLine {
-                host_id,
-                line,
-                reply,
-            } => {
-                let Some(connected) = hosts.get(&host_id) else {
-                    let _ = reply.send(Err(format!("host {host_id} is not connected")));
-                    continue;
-                };
-
-                // If the connection actor is gone, the SendError carries the
-                // command back (including the `reply` oneshot). Recover it and
-                // answer the caller with an explicit error rather than dropping
-                // the reply, which would otherwise surface as a confusing
-                // "dropped send reply" with no indication the host is dead.
-                if let Err(error) = connected
-                    .tx
-                    .send(ConnectionCommand::SendLine { line, reply })
-                    .await
-                    && let ConnectionCommand::SendLine { reply, .. } = error.0
-                {
-                    let _ = reply.send(Err(format!(
-                        "host {host_id} connection is no longer available"
-                    )));
-                }
-            }
-            RouterCommand::ConnectionLine {
-                host_id,
-                connection_id,
-                line,
-            } => {
-                let Some(connected) = current_connection(&hosts, &host_id, connection_id) else {
-                    tracing::debug!(
-                        host_id,
-                        connection_id,
-                        line_len = line.len(),
-                        "discarding line from stale host connection"
-                    );
-                    continue;
-                };
-                if let Err(error) = connected.app.emit(
+                if let Err(error) = app.emit(
                     HOST_LINE_EVENT,
                     HostLineEvent {
                         host_id: host_id.clone(),
@@ -251,217 +224,117 @@ async fn router_actor(
                         delivery_id: None,
                     },
                 ) {
+                    let _ =
+                        emit_error(&app, &host_id, format!("failed to emit host line: {error}"));
+                }
+            }
+            Err(error) => {
+                if live.load(Ordering::Relaxed) {
                     let _ = emit_error(
-                        &connected.app,
+                        &app,
                         &host_id,
-                        format!("failed to emit host line: {error}"),
+                        format!("failed to read from host connection: {error}"),
                     );
                 }
+                break;
             }
-            RouterCommand::ConnectionError {
+        }
+    }
+
+    close_connection(&state, &app, &host_id, connection_id).await;
+}
+
+/// Outbound half: solely owns the transport writer and drains the unbounded
+/// command channel. It never touches the reader. When every outbound sender is
+/// dropped (the connection was torn down elsewhere) `recv` returns `None` and
+/// the task ends quietly.
+async fn writer_task(
+    state: Arc<Mutex<RouterState>>,
+    app: AppHandle,
+    host_id: String,
+    connection_id: u64,
+    mut writer: Box<dyn AsyncWrite + Unpin + Send>,
+    mut outbound_rx: mpsc::UnboundedReceiver<String>,
+    live: Arc<AtomicBool>,
+) {
+    while let Some(line) = outbound_rx.recv().await {
+        if let Err(error) = write_line(&mut writer, line).await {
+            tracing::warn!(
                 host_id,
                 connection_id,
-                message,
-            } => {
-                let Some(connected) = current_connection(&hosts, &host_id, connection_id) else {
-                    tracing::debug!(
-                        host_id,
-                        connection_id,
-                        message,
-                        "discarding error from stale host connection"
-                    );
-                    continue;
-                };
-                tracing::warn!(host_id, connection_id, "{message}");
-                let _ = emit_error(&connected.app, &host_id, message);
+                %error,
+                "closing host connection after write failed"
+            );
+            // Surface the write failure and tear the connection down so a dead
+            // pipe becomes a visible error instead of silently swallowing sends
+            // — but only if we are still the live connection, so a write that
+            // failed because we were superseded doesn't raise a false error on
+            // the connection that replaced us.
+            if live.load(Ordering::Relaxed) {
+                let _ = emit_error(&app, &host_id, error);
             }
-            RouterCommand::ConnectionClosed {
-                host_id,
-                connection_id,
-            } => {
-                let should_remove = hosts
-                    .get(&host_id)
-                    .map(|connected| connected.connection_id == connection_id)
-                    .unwrap_or(false);
-                tracing::info!(host_id, connection_id, should_remove, "connection closed");
-                if should_remove && let Some(connected) = hosts.remove(&host_id) {
-                    let _ = connected.app.emit(
-                        HOST_DISCONNECTED_EVENT,
-                        HostDisconnectedEvent {
-                            host_id: host_id.clone(),
-                        },
-                    );
-                }
-            }
+            close_connection(&state, &app, &host_id, connection_id).await;
+            return;
         }
     }
 }
 
-fn current_connection<'a>(
-    hosts: &'a HashMap<String, ConnectedHost>,
+/// Drop a connection from the registry and notify the app. Idempotent and
+/// connection-id guarded: only the task that still matches the live entry wins
+/// the removal, so the disconnect event fires exactly once and a stale task can
+/// never tear down a newer connection that reused the same host id.
+async fn close_connection(
+    state: &Arc<Mutex<RouterState>>,
+    app: &AppHandle,
     host_id: &str,
     connection_id: u64,
-) -> Option<&'a ConnectedHost> {
-    hosts
-        .get(host_id)
-        .filter(|connected| connected.connection_id == connection_id)
+) {
+    let connection = {
+        let mut guard = state.lock().expect("router state poisoned");
+        match guard.hosts.get(host_id) {
+            Some(existing) if existing.connection_id == connection_id => {
+                guard.hosts.remove(host_id)
+            }
+            _ => None,
+        }
+    };
+    let Some(connection) = connection else {
+        return;
+    };
+
+    connection.live.store(false, Ordering::Relaxed);
+    reap_child(connection.child).await;
+    tracing::info!(host_id, connection_id, "connection closed");
+    let _ = app.emit(
+        HOST_DISCONNECTED_EVENT,
+        HostDisconnectedEvent {
+            host_id: host_id.to_owned(),
+        },
+    );
+}
+
+async fn reap_child(child: Option<Child>) {
+    let Some(mut child) = child else {
+        return;
+    };
+    let _ = child.kill().await;
+    match child.wait().await {
+        Ok(status) => {
+            tracing::info!(%status, "ssh transport exited");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to wait for ssh transport exit");
+        }
+    }
 }
 
 struct ConnectionSetup {
     reader: Box<dyn AsyncBufRead + Unpin + Send>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
-    cleanup: ConnectionCleanup,
-}
-
-struct ConnectionActorContext {
-    host_id: String,
-    connection_id: u64,
-    rx: mpsc::Receiver<ConnectionCommand>,
-    router_tx: mpsc::Sender<RouterCommand>,
-    cleanup: ConnectionCleanup,
-}
-
-enum ConnectionCleanup {
-    None,
-    Child(Child),
-}
-
-async fn connection_actor<R, W>(context: ConnectionActorContext, reader: R, mut writer: W)
-where
-    R: AsyncBufRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send,
-{
-    let ConnectionActorContext {
-        host_id,
-        connection_id,
-        mut rx,
-        router_tx,
-        mut cleanup,
-    } = context;
-
-    // The inbound read runs in its own task that solely owns the reader.
-    // `AsyncBufReadExt::read_line` is *not* cancellation-safe: if it were
-    // raced against the outbound `rx.recv()` branch in a single `select!`,
-    // an outbound send winning the race would drop the in-flight `read_line`
-    // future and discard the partially-consumed line, desyncing the newline
-    // framed JSON stream. Over SSH (where frames arrive fragmented across
-    // segments) `read_line` is frequently parked mid-line, so that race fired
-    // often enough to silently wedge the connection. Keeping the read on its
-    // own task means it is never cancelled by a send.
-    let reader_task = {
-        let host_id = host_id.clone();
-        let router_tx = router_tx.clone();
-        tokio::spawn(async move {
-            let mut reader = reader;
-            loop {
-                let mut incoming = String::new();
-                match reader.read_line(&mut incoming).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let line = trim_line_ending(incoming);
-                        tracing::info!(
-                            host_id,
-                            connection_id,
-                            line_len = line.len(),
-                            "proxy router received line from host"
-                        );
-                        if router_tx
-                            .send(RouterCommand::ConnectionLine {
-                                host_id: host_id.clone(),
-                                connection_id,
-                                line,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = router_tx
-                            .send(RouterCommand::ConnectionError {
-                                host_id: host_id.clone(),
-                                connection_id,
-                                message: format!("failed to read from host connection: {error}"),
-                            })
-                            .await;
-                        break;
-                    }
-                }
-            }
-        })
-    };
-
-    // Writer loop: owns the writer and processes outbound commands. It only
-    // races `rx.recv()` against the reader task *finishing* (EOF/error/teardown)
-    // — never against an in-flight read — so no inbound bytes can be lost here.
-    let mut reader_task = reader_task;
-    loop {
-        tokio::select! {
-            _ = &mut reader_task => break,
-            command = rx.recv() => {
-                match command {
-                    Some(ConnectionCommand::SendLine { line, reply }) => {
-                        match write_line(&mut writer, line).await {
-                            Ok(()) => {
-                                let _ = reply.send(Ok(()));
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    host_id,
-                                    connection_id,
-                                    %error,
-                                    "closing host connection after write failed"
-                                );
-                                let _ = reply.send(Err(error));
-                                break;
-                            }
-                        }
-                    }
-                    Some(ConnectionCommand::Disconnect) | None => break,
-                }
-            }
-        }
-    }
-
-    // If we exited because of a Disconnect (not because the reader finished),
-    // stop the reader task. Aborting only discards bytes for a connection we
-    // are already tearing down, so no live frame is lost.
-    reader_task.abort();
-
-    match &mut cleanup {
-        ConnectionCleanup::None => {}
-        ConnectionCleanup::Child(child) => {
-            let _ = child.kill().await;
-            match child.wait().await {
-                Ok(status) => {
-                    tracing::info!(host_id, connection_id, %status, "ssh transport exited");
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        host_id,
-                        connection_id,
-                        %error,
-                        "failed to wait for ssh transport exit"
-                    );
-                }
-            }
-        }
-    }
-
-    let _ = router_tx
-        .send(RouterCommand::ConnectionClosed {
-            host_id,
-            connection_id,
-        })
-        .await;
+    child: Option<Child>,
 }
 
 async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, line: String) -> Result<(), String> {
-    if line.contains('\n') {
-        return Err("host line must not contain a newline".to_owned());
-    }
-
     tracing::info!(line_len = line.len(), "proxy router sending line to host");
 
     writer
@@ -498,10 +371,10 @@ fn trim_line_ending(mut line: String) -> String {
 
 async fn setup_connection_transport(
     host_id: &str,
-    connection_id: u64,
-    router_tx: mpsc::Sender<RouterCommand>,
+    app: AppHandle,
     transport: HostTransportConfig,
     host: server::HostHandle,
+    live: Arc<AtomicBool>,
 ) -> Result<ConnectionSetup, String> {
     match transport {
         HostTransportConfig::LocalEmbedded => {
@@ -525,7 +398,7 @@ async fn setup_connection_transport(
             Ok(ConnectionSetup {
                 reader: Box::new(BufReader::new(read_half)),
                 writer: Box::new(write_half),
-                cleanup: ConnectionCleanup::None,
+                child: None,
             })
         }
         HostTransportConfig::SshStdio {
@@ -567,39 +440,39 @@ async fn setup_connection_transport(
                 .ok_or_else(|| format!("ssh transport for host {host_id} has no stdin"))?;
 
             if let Some(stderr) = child.stderr.take() {
-                let router_tx = router_tx.clone();
+                let app = app.clone();
                 let host_id = host_id.to_string();
+                let live = live.clone();
                 tokio::spawn(async move {
                     let mut stderr = BufReader::new(stderr);
                     loop {
+                        // Stop emitting the moment this connection is superseded
+                        // so late stderr lines can't surface as errors on the
+                        // connection that replaced us (non-blocking, no lock).
+                        if !live.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let mut line = String::new();
                         match stderr.read_line(&mut line).await {
                             Ok(0) => break,
                             Ok(_) => {
+                                if !live.load(Ordering::Relaxed) {
+                                    break;
+                                }
                                 let line = trim_line_ending(line);
                                 if line.is_empty() {
                                     continue;
                                 }
-                                if router_tx
-                                    .send(RouterCommand::ConnectionError {
-                                        host_id: host_id.clone(),
-                                        connection_id,
-                                        message: format!("ssh: {line}"),
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
+                                let _ = emit_error(&app, &host_id, format!("ssh: {line}"));
                             }
                             Err(error) => {
-                                let _ = router_tx
-                                    .send(RouterCommand::ConnectionError {
-                                        host_id: host_id.clone(),
-                                        connection_id,
-                                        message: format!("failed to read ssh stderr: {error}"),
-                                    })
-                                    .await;
+                                if live.load(Ordering::Relaxed) {
+                                    let _ = emit_error(
+                                        &app,
+                                        &host_id,
+                                        format!("failed to read ssh stderr: {error}"),
+                                    );
+                                }
                                 break;
                             }
                         }
@@ -610,7 +483,7 @@ async fn setup_connection_transport(
             Ok(ConnectionSetup {
                 reader: Box::new(BufReader::new(stdout)),
                 writer: Box::new(stdin),
-                cleanup: ConnectionCleanup::Child(child),
+                child: Some(child),
             })
         }
     }
@@ -628,4 +501,128 @@ export TYDE_SOCKET_PATH="$HOME/.tyde/tyde.sock"
 exec "$bin" host --bridge-uds 2>> "$HOME/.tyde/logs/tyde-host-bridge-uds.log"
 "#
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn router() -> ProxyRouterHandle {
+        ProxyRouterHandle::new()
+    }
+
+    #[test]
+    fn trim_line_ending_strips_crlf() {
+        assert_eq!(trim_line_ending("hello\r\n".to_string()), "hello");
+        assert_eq!(trim_line_ending("hello\n".to_string()), "hello");
+        assert_eq!(trim_line_ending("hello".to_string()), "hello");
+    }
+
+    #[tokio::test]
+    async fn send_line_to_unknown_host_errors() {
+        let router = router();
+        let err = router
+            .send_line("ghost".to_string(), "hi".to_string())
+            .await
+            .unwrap_err();
+        assert!(err.contains("ghost"));
+        assert!(err.contains("not connected"));
+    }
+
+    #[tokio::test]
+    async fn send_line_rejects_embedded_newline() {
+        let router = router();
+        // Register a live connection by hand so we exercise the newline guard
+        // rather than the "not connected" path.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        router.state.lock().unwrap().hosts.insert(
+            "host".to_string(),
+            Connection {
+                connection_id: 1,
+                outbound_tx: tx,
+                child: None,
+                live: Arc::new(AtomicBool::new(true)),
+            },
+        );
+
+        let err = router
+            .send_line("host".to_string(), "a\nb".to_string())
+            .await
+            .unwrap_err();
+        assert!(err.contains("must not contain a newline"));
+        // The bad frame must not have been enqueued.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn send_line_enqueues_to_writer_channel() {
+        let router = router();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        router.state.lock().unwrap().hosts.insert(
+            "host".to_string(),
+            Connection {
+                connection_id: 1,
+                outbound_tx: tx,
+                child: None,
+                live: Arc::new(AtomicBool::new(true)),
+            },
+        );
+
+        router
+            .send_line("host".to_string(), "frame".to_string())
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap(), "frame");
+    }
+
+    #[tokio::test]
+    async fn send_line_errors_when_writer_gone() {
+        let router = router();
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        router.state.lock().unwrap().hosts.insert(
+            "host".to_string(),
+            Connection {
+                connection_id: 1,
+                outbound_tx: tx,
+                child: None,
+                live: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        // Simulate the writer task having exited: its receiver is dropped.
+        drop(rx);
+
+        let err = router
+            .send_line("host".to_string(), "frame".to_string())
+            .await
+            .unwrap_err();
+        assert!(err.contains("no longer available"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_unknown_host_errors() {
+        let router = router();
+        let err = router.disconnect("ghost".to_string()).await.unwrap_err();
+        assert!(err.contains("not connected"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_clears_live_flag() {
+        let router = router();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let live = Arc::new(AtomicBool::new(true));
+        router.state.lock().unwrap().hosts.insert(
+            "host".to_string(),
+            Connection {
+                connection_id: 1,
+                outbound_tx: tx,
+                child: None,
+                live: live.clone(),
+            },
+        );
+
+        router.disconnect("host".to_string()).await.unwrap();
+        // A stale reader/stderr task holding this flag must observe the
+        // connection is no longer live and stop emitting.
+        assert!(!live.load(Ordering::Relaxed));
+    }
 }
