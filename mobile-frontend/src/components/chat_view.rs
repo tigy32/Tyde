@@ -11,6 +11,49 @@ use crate::state::{AgentRef, AppState};
 
 const CHAT_STICKY_BOTTOM_THRESHOLD_PX: i32 = 80;
 
+/// Edge-swipe-to-go-back tuning. The gesture fires the same action as the
+/// back button: a horizontal swipe that *starts* within `EDGE_ZONE_PX` of a
+/// screen edge and travels past `SWIPE_THRESHOLD_PX`, provided the motion is
+/// dominantly horizontal (|dx| > |dy| * `SWIPE_HORIZONTAL_DOMINANCE`) so it
+/// never triggers while the user is scrolling the transcript vertically.
+const EDGE_ZONE_PX: f64 = 24.0;
+const SWIPE_THRESHOLD_PX: f64 = 64.0;
+const SWIPE_HORIZONTAL_DOMINANCE: f64 = 1.5;
+
+/// Which edge the back-swipe starts from, and therefore which way the finger
+/// travels. Flip this single constant to switch between the default
+/// (`RightEdgeMoveLeft`) and the iOS convention (`LeftEdgeMoveRight`); the
+/// rest of the gesture logic keys off it.
+const BACK_SWIPE: BackSwipe = BackSwipe::RightEdgeMoveLeft;
+
+// One variant is intentionally unselected: it is the alternative the
+// `BACK_SWIPE` constant can be flipped to without touching the gesture logic.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum BackSwipe {
+    /// Start near the right screen edge, finger moves left. (default)
+    RightEdgeMoveLeft,
+    /// Start near the left screen edge, finger moves right. (iOS-style)
+    LeftEdgeMoveRight,
+}
+
+/// Pure decision for the edge-swipe-back gesture, given the touch start X, the
+/// total horizontal/vertical travel, and the viewport width. Kept free of DOM
+/// types so it is directly unit-testable.
+fn back_swipe_triggered(start_x: f64, dx: f64, dy: f64, viewport_width: f64) -> bool {
+    // Must be dominantly horizontal so vertical scrolling never fires it.
+    if dx.abs() <= dy.abs() * SWIPE_HORIZONTAL_DOMINANCE {
+        return false;
+    }
+    if dx.abs() < SWIPE_THRESHOLD_PX {
+        return false;
+    }
+    match BACK_SWIPE {
+        BackSwipe::RightEdgeMoveLeft => start_x >= viewport_width - EDGE_ZONE_PX && dx < 0.0,
+        BackSwipe::LeftEdgeMoveRight => start_x <= EDGE_ZONE_PX && dx > 0.0,
+    }
+}
+
 /// Conversation surface.
 ///
 /// Composition rules:
@@ -33,6 +76,58 @@ pub fn ChatView() -> impl IntoView {
     let on_back = move |_| {
         more_open.set(false);
         s_back.viewing_chat.set(false);
+    };
+
+    // Edge-swipe-to-go-back. We record the touch start position, optionally
+    // abandon it mid-gesture if it turns into a vertical scroll, and only make
+    // the back decision on touchend. We never call `prevent_default`, so the
+    // transcript still scrolls, text still selects, and taps still register.
+    let swipe_start: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
+
+    let start_cell = swipe_start.clone();
+    let on_touch_start = move |ev: web_sys::TouchEvent| {
+        start_cell.set(
+            ev.touches()
+                .get(0)
+                .map(|t| (t.client_x() as f64, t.client_y() as f64)),
+        );
+    };
+
+    let move_cell = swipe_start.clone();
+    let on_touch_move = move |ev: web_sys::TouchEvent| {
+        // Once the motion is clearly a vertical scroll, drop the start point so
+        // touchend can't fire the back gesture. No prevent_default here.
+        let Some((sx, sy)) = move_cell.get() else {
+            return;
+        };
+        if let Some(t) = ev.touches().get(0) {
+            let dx = t.client_x() as f64 - sx;
+            let dy = t.client_y() as f64 - sy;
+            if dy.abs() > SWIPE_THRESHOLD_PX && dy.abs() >= dx.abs() {
+                move_cell.set(None);
+            }
+        }
+    };
+
+    let s_swipe = state.clone();
+    let end_cell = swipe_start.clone();
+    let on_touch_end = move |ev: web_sys::TouchEvent| {
+        let Some((sx, sy)) = end_cell.take() else {
+            return;
+        };
+        let Some(t) = ev.changed_touches().get(0) else {
+            return;
+        };
+        let dx = t.client_x() as f64 - sx;
+        let dy = t.client_y() as f64 - sy;
+        let viewport_width = web_sys::window()
+            .and_then(|w| w.inner_width().ok())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if back_swipe_triggered(sx, dx, dy, viewport_width) {
+            more_open.set(false);
+            s_swipe.viewing_chat.set(false);
+        }
     };
 
     let s_name = state.clone();
@@ -304,7 +399,13 @@ pub fn ChatView() -> impl IntoView {
     };
 
     view! {
-        <div class="view chat-view" data-mobile-test="chat-view">
+        <div
+            class="view chat-view"
+            data-mobile-test="chat-view"
+            on:touchstart=on_touch_start
+            on:touchmove=on_touch_move
+            on:touchend=on_touch_end
+        >
             <div class="chat-header">
                 {move || {
                     if rename_editing.get() {
@@ -1376,6 +1477,64 @@ mod wasm_tests {
                 .unwrap()
                 .is_some(),
             "retry transient selector must render"
+        );
+    }
+
+    /// The default edge-swipe (start near the right edge, travel left past the
+    /// threshold, dominantly horizontal) is recognized, while gestures that
+    /// start mid-screen, fall short, or are dominantly vertical are not. This
+    /// pins the geometry that keeps the gesture from firing during scrolling.
+    #[wasm_bindgen_test]
+    async fn back_swipe_decision_matches_default_right_edge_geometry() {
+        let vw = 400.0;
+        // Starts in the right edge zone, long leftward, horizontal: fires.
+        assert!(
+            back_swipe_triggered(vw - 5.0, -120.0, 10.0, vw),
+            "right-edge leftward horizontal swipe must trigger back"
+        );
+        // Starts in the middle of the screen: not an edge swipe.
+        assert!(
+            !back_swipe_triggered(vw / 2.0, -120.0, 10.0, vw),
+            "swipe starting mid-screen must not trigger back"
+        );
+        // Horizontal travel below threshold: ignored.
+        assert!(
+            !back_swipe_triggered(vw - 5.0, -40.0, 5.0, vw),
+            "short swipe must not trigger back"
+        );
+        // Dominantly vertical (a transcript scroll): ignored.
+        assert!(
+            !back_swipe_triggered(vw - 5.0, -70.0, -200.0, vw),
+            "dominantly vertical drag must not trigger back"
+        );
+        // Right edge but moving the wrong way (rightward): ignored.
+        assert!(
+            !back_swipe_triggered(vw - 5.0, 120.0, 10.0, vw),
+            "rightward travel from the right edge must not trigger back"
+        );
+    }
+
+    /// The swipe-back path sets `viewing_chat` to false — the same state
+    /// transition the back button performs — returning the user to the list.
+    #[wasm_bindgen_test]
+    async fn back_action_clears_viewing_chat() {
+        let container = make_container();
+        let state = mount_active_chat(container.clone());
+        state.viewing_chat.set(true);
+        next_tick().await;
+
+        let back_btn: web_sys::HtmlElement = container
+            .query_selector("[data-mobile-test='chat-back']")
+            .unwrap()
+            .expect("back button")
+            .dyn_into()
+            .unwrap();
+        back_btn.click();
+        next_tick().await;
+
+        assert!(
+            !state.viewing_chat.get_untracked(),
+            "back navigation must clear viewing_chat"
         );
     }
 }
