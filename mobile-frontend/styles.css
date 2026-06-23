@@ -393,6 +393,14 @@ input, textarea, select {
     padding: var(--space-4);
 }
 
+.view-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 160px;
+    padding: var(--space-6);
+}
+
 /* ── Home View ──────────────────────────────────────────────────────── */
 
 .home-status-card {
@@ -1061,6 +1069,14 @@ input, textarea, select {
     display: flex;
     flex-direction: column;
     gap: 0;
+}
+
+.chat-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 160px;
+    padding: var(--space-6);
 }
 
 /* ── Chat Messages ──────────────────────────────────────────────────── */

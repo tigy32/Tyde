@@ -471,6 +471,29 @@ pub fn ChatView() -> impl IntoView {
                         && transient.is_empty();
 
                     if no_content {
+                        // Distinguish "still fetching the transcript" from
+                        // "loaded and genuinely empty". A load latches into
+                        // `agent_load_requests` the moment it's sent and only
+                        // lands in `agent_loaded` once the bootstrap snapshot
+                        // arrives; the gap is where a blank flash would
+                        // otherwise read as an empty conversation. On a load
+                        // send failure the request is cleared, so the spinner
+                        // falls back to the empty state rather than hanging.
+                        let load_pending = s_body
+                            .agent_load_requests
+                            .with(|loads| loads.contains(&key))
+                            && !s_body.agent_loaded.with(|loaded| loaded.contains(&key));
+                        if load_pending {
+                            return view! {
+                                <div class="chat-loading" data-mobile-test="chat-loading">
+                                    <Spinner
+                                        large=true
+                                        aria_label="Loading conversation".to_string()
+                                        data_mobile_test="chat-loading-spinner"
+                                    />
+                                </div>
+                            }.into_any();
+                        }
                         return view! {
                             <EmptyState
                                 title="Conversation is empty"
@@ -845,6 +868,96 @@ mod wasm_tests {
         assert!(
             distance_from_bottom(&scroller) > CHAT_STICKY_BOTTOM_THRESHOLD_PX,
             "user-scrolled chat should remain away from bottom"
+        );
+    }
+
+    /// A chat opened on a slow link shows a loading spinner — not the
+    /// "Conversation is empty" state — in the window after the load is
+    /// requested but before its bootstrap snapshot arrives.
+    #[wasm_bindgen_test]
+    async fn chat_shows_spinner_while_conversation_loads() {
+        let host = LocalHostId("host-1".to_owned());
+        let host_clone = host.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_clone.clone()));
+            state.agents.set(vec![make_agent(&host_clone, "Coder")]);
+            let agent_ref = AgentRef {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            };
+            state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            }));
+            // Load latched, but the bootstrap snapshot has not arrived yet.
+            state.agent_load_requests.update(|m| {
+                m.insert(agent_ref);
+            });
+            provide_context(state);
+            view! { <ChatView /> }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-loading']")
+                .unwrap()
+                .is_some(),
+            "spinner must show while the transcript is still loading"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-empty']")
+                .unwrap()
+                .is_none(),
+            "empty state must not show while the transcript is loading"
+        );
+    }
+
+    /// Once the bootstrap snapshot lands and the conversation is genuinely
+    /// empty, the spinner gives way to the "Conversation is empty" state.
+    #[wasm_bindgen_test]
+    async fn chat_swaps_spinner_for_empty_once_loaded() {
+        let host = LocalHostId("host-1".to_owned());
+        let host_clone = host.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_clone.clone()));
+            state.agents.set(vec![make_agent(&host_clone, "Coder")]);
+            let agent_ref = AgentRef {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            };
+            state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                local_host_id: host_clone.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            }));
+            state.agent_load_requests.update(|m| {
+                m.insert(agent_ref.clone());
+            });
+            // Bootstrap snapshot has now arrived with no messages.
+            state.agent_loaded.update(|m| {
+                m.insert(agent_ref);
+            });
+            provide_context(state);
+            view! { <ChatView /> }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-loading']")
+                .unwrap()
+                .is_none(),
+            "spinner must clear once the snapshot has arrived"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-empty']")
+                .unwrap()
+                .is_some(),
+            "loaded-but-empty conversation must show the empty state"
         );
     }
 

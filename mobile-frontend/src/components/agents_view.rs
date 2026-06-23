@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::components::teams_view::TeamsView;
 use crate::components::ui::{
-    Button, ButtonSize, ButtonVariant, Card, EmptyState, Pill, PillTone, StatusDot, StatusTone,
+    Button, ButtonSize, ButtonVariant, Card, EmptyState, Pill, PillTone, Spinner, StatusDot,
+    StatusTone,
 };
 use crate::state::{ActiveAgentRef, AgentInfo, AgentRef, AppState};
 use leptos::prelude::*;
@@ -208,6 +209,21 @@ fn render_agents_body(
                         .collect();
 
                     if agents.is_empty() {
+                        // The agent list arrives in the host snapshot. While the
+                        // host is connecting and that snapshot hasn't landed,
+                        // show a spinner rather than the "no agents" empty state
+                        // — which would otherwise flash as if nothing is running.
+                        if state.host_snapshot_pending() {
+                            return view! {
+                                <div class="view-loading" data-mobile-test="agents-loading">
+                                    <Spinner
+                                        large=true
+                                        aria_label="Loading agents".to_string()
+                                        data_mobile_test="agents-loading-spinner"
+                                    />
+                                </div>
+                            }.into_any();
+                        }
                         let s_empty = state.clone();
                         let on_cta = Callback::new(move |_: ()| {
                             s_empty.active_agent.set(None);
@@ -346,6 +362,20 @@ fn agent_row(
         "Stopped"
     };
 
+    // A bare colored dot makes the user pick the one state they're hunting
+    // for out of a column of near-identical glyphs. Pair it with a readable
+    // pill so every row spells its status out; Idle gets the Success tone so
+    // "which agents can I kick forward" pops on a scan.
+    let status_pill_tone = if has_error {
+        PillTone::Error
+    } else if turn_active {
+        PillTone::Accent
+    } else if is_active {
+        PillTone::Success
+    } else {
+        PillTone::Neutral
+    };
+
     let test_selector: &'static str = if has_error {
         "agent-row-error"
     } else if turn_active {
@@ -392,7 +422,12 @@ fn agent_row(
                         {name}
                     </div>
                     <div class="list-row-subtitle">
-                        {backend}
+                        <Pill
+                            label=status_label.to_string()
+                            tone=status_pill_tone
+                            data_mobile_test="agent-row-status-label"
+                        />
+                        <span style="margin-left: var(--space-2);">{backend}</span>
                         {(is_side_question || is_sub).then(|| {
                             let label = if is_side_question { "Aside" } else { "Sub-agent" };
                             view! {
@@ -459,7 +494,7 @@ fn agent_row(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{AgentInfo, AppState, LocalHostId};
+    use crate::state::{AgentInfo, AppState, ConnectionStatus, LocalHostId};
     use leptos::mount::mount_to;
     use protocol::{AgentId, AgentOrigin, BackendKind, StreamPath};
     use wasm_bindgen::JsCast;
@@ -558,6 +593,73 @@ mod wasm_tests {
         assert!(
             !text.contains("Sub-agent"),
             "side question must prefer Aside over the generic Sub-agent tag: {text}"
+        );
+    }
+
+    /// While the host is connected but its snapshot (the source of the
+    /// agent list) hasn't landed, a loading spinner shows instead of the
+    /// "no agents" empty state — which would otherwise read as "nothing is
+    /// running" during the connect handshake.
+    #[wasm_bindgen_test]
+    async fn agents_loading_spinner_shows_before_host_snapshot() {
+        let host = LocalHostId("host-1".to_owned());
+        let container = make_container();
+        let host_for_mount = host.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            // Connected, but HostSettings (written with the host snapshot)
+            // hasn't arrived, so the agent list is still loading.
+            state.connection_statuses.set(HashMap::from([(
+                host_for_mount.clone(),
+                ConnectionStatus::Connected,
+            )]));
+            provide_context(state);
+            view! { <AgentsView /> }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='agents-loading']")
+                .unwrap()
+                .is_some(),
+            "loading spinner must show while the host snapshot is in flight"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='agents-empty']")
+                .unwrap()
+                .is_none(),
+            "empty state must not show while the list is still loading"
+        );
+    }
+
+    /// Every agent row spells its status out in a visible pill — not just a
+    /// color dot. The state the user hunts for (Idle, ready to be kicked
+    /// forward) must be readable on a scan.
+    #[wasm_bindgen_test]
+    async fn agents_row_shows_visible_idle_status_label() {
+        let host = LocalHostId("host-1".to_owned());
+        let container = make_container();
+        let host_for_mount = host.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state
+                .agents
+                .set(vec![fixture(&host_for_mount, "a-1", "Idle agent", None)]);
+            provide_context(state);
+            view! { <AgentsView /> }
+        });
+        next_tick().await;
+        let pill = container
+            .query_selector("[data-mobile-test='agent-row-status-label']")
+            .unwrap()
+            .expect("every agent row must render a visible status label");
+        assert_eq!(
+            pill.text_content().unwrap_or_default().trim(),
+            "Idle",
+            "an idle agent must spell its status out, not just show a color dot"
         );
     }
 

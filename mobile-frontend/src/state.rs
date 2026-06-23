@@ -425,6 +425,12 @@ pub struct AppState {
     /// frontend connection. Mobile asks for bootstraps lazily when a chat is
     /// opened instead of replaying every transcript on startup.
     pub agent_load_requests: RwSignal<HashSet<AgentRef>>,
+    /// Agents whose `AgentBootstrap` snapshot has actually arrived. Distinct
+    /// from `agent_load_requests`, which latches as soon as a load is sent —
+    /// this only flips once the transcript snapshot lands, so a chat opened on
+    /// a slow link can show a loading spinner instead of a premature "empty"
+    /// state in the window between the request and its bootstrap reply.
+    pub agent_loaded: RwSignal<HashSet<AgentRef>>,
     pub chat_messages: RwSignal<HashMap<AgentRef, Vec<ChatMessageEntry>>>,
     /// Per-agent index from server-issued `ChatMessageId` to the position
     /// in `chat_messages[agent]` that carries it. Populated when a row is
@@ -515,6 +521,7 @@ impl AppState {
             agents: RwSignal::new(Vec::new()),
             active_agent: RwSignal::new(None),
             agent_load_requests: RwSignal::new(HashSet::new()),
+            agent_loaded: RwSignal::new(HashSet::new()),
             chat_messages: RwSignal::new(HashMap::new()),
             chat_message_index: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
@@ -660,6 +667,26 @@ impl AppState {
             .unwrap_or(ConnectionStatus::Disconnected)
     }
 
+    /// True while the active host is connecting/connected but its
+    /// `HostBootstrap` snapshot (the source of the agent + session lists)
+    /// hasn't been applied yet. `HostSettings` is written as part of the
+    /// bootstrap, so its presence is the same "snapshot landed" proxy
+    /// `home_view` uses. Returns false once the snapshot lands (even if the
+    /// lists are genuinely empty) and on a failed/disconnected host, so a
+    /// loading spinner never outlives a connection that won't deliver data.
+    pub fn host_snapshot_pending(&self) -> bool {
+        let Some(host) = self.active_local_host_id.get() else {
+            return false;
+        };
+        if self.host_settings_by_host.with(|m| m.contains_key(&host)) {
+            return false;
+        }
+        matches!(
+            self.active_host_connection_status(),
+            ConnectionStatus::Connecting | ConnectionStatus::Connected
+        )
+    }
+
     pub fn active_host_command_error(&self) -> Option<String> {
         let host = self.active_local_host_id.get()?;
         self.command_errors_by_host.get().get(&host).cloned()
@@ -735,6 +762,9 @@ impl AppState {
         self.agents
             .update(|agents| agents.retain(|a| a.local_host_id != *host));
         self.agent_load_requests.update(|m| {
+            m.retain(|k| k.local_host_id != *host);
+        });
+        self.agent_loaded.update(|m| {
             m.retain(|k| k.local_host_id != *host);
         });
         self.sessions
