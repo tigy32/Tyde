@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 
 use protocol::BackendAccessMode;
 
@@ -1309,6 +1310,10 @@ impl CodexInner {
             CodexInbound::Closed { exit_code } => {
                 self.complete_all_codex_subagents().await;
                 self.emitter.subprocess_exit(exit_code);
+                // The app-server exited on its own; reap it now rather than
+                // leaving a zombie until session teardown (CodexRpc::Drop won't
+                // fire while the forwarder still holds Arc<CodexInner>).
+                self.rpc.reap_after_exit().await;
             }
             CodexInbound::Notification { method, params } => {
                 if method.starts_with("codex/event/") {
@@ -4777,6 +4782,8 @@ struct CodexRpc {
     pending: PendingRpcMap,
     next_id: AtomicU64,
     child: Arc<Mutex<Option<AsyncGroupChild>>>,
+    stdout_task: JoinHandle<()>,
+    stderr_task: JoinHandle<()>,
 }
 
 impl CodexRpc {
@@ -4834,7 +4841,7 @@ impl CodexRpc {
         let stdout_pending = Arc::clone(&pending);
         let stdout_inbound = inbound_tx.clone();
         let stdout_child = Arc::clone(&child_ref);
-        tokio::spawn(async move {
+        let stdout_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let parsed = match serde_json::from_str::<Value>(&line) {
@@ -4899,7 +4906,7 @@ impl CodexRpc {
         });
 
         let stderr_inbound = inbound_tx.clone();
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let _ = stderr_inbound.send(CodexInbound::Stderr(line));
@@ -4912,6 +4919,8 @@ impl CodexRpc {
                 pending,
                 next_id: AtomicU64::new(1),
                 child: child_ref,
+                stdout_task,
+                stderr_task,
             },
             inbound_rx,
         ))
@@ -4974,6 +4983,47 @@ impl CodexRpc {
                 let _ = child.kill().await;
             }
         }
+        // child is taken (None) — Drop will be a no-op. Drop the readers so the
+        // parent-side stdio pipe fds are released even if EOF hasn't propagated.
+        self.stdout_task.abort();
+        self.stderr_task.abort();
+    }
+
+    /// Reap the app-server after it exited on its own (stdout EOF → `Closed`).
+    ///
+    /// Unlike claude (whose stdout reader calls `mark_process_exited`, which
+    /// removes the runtime from its slot so `Drop` fires), nothing takes the
+    /// `CodexRpc` out of `CodexInner` when the process exits mid-session — the
+    /// forwarder task still holds `Arc<CodexInner>`, so `Drop` won't run until
+    /// session teardown. Without this, an exited app-server lingers as a zombie
+    /// for the rest of the session (the dominant observed leak). The reader
+    /// tasks are already ending on EOF, so this only takes the child and
+    /// `wait()`s it. Idempotent with `shutdown()`/`Drop`.
+    async fn reap_after_exit(&self) {
+        let child = self.child.lock().await.take();
+        if let Some(mut child) = child {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+}
+
+impl Drop for CodexRpc {
+    /// Last-ditch net for panic/teardown. NOTE: because the forwarder task
+    /// holds `Arc<CodexInner>` (which owns this `CodexRpc`), this Drop does NOT
+    /// fire on mid-session process exit — the two real leak paths are covered
+    /// explicitly instead:
+    ///
+    /// - Process self-exit: `handle_inbound(Closed)` calls `reap_after_exit()`.
+    /// - Client disconnect / teardown: `shutdown()` reaps the running child.
+    ///
+    /// Drop then only runs at final `CodexInner` teardown and is normally a
+    /// no-op (child already taken); it remains as a backstop for any path that
+    /// drops a `CodexRpc` without calling either of the above.
+    fn drop(&mut self) {
+        self.stdout_task.abort();
+        self.stderr_task.abort();
+        crate::backend::subprocess::reap_group_child_slot(&self.child);
     }
 }
 
@@ -7837,11 +7887,21 @@ for line in sys.stdin:
             .stdin
             .take()
             .expect("capture test child stdin");
+        let stdout = child.inner().stdout.take();
+        let stderr = child.inner().stderr.take();
+        let stdout_task = tokio::spawn(async move {
+            drop(stdout);
+        });
+        let stderr_task = tokio::spawn(async move {
+            drop(stderr);
+        });
         let rpc = CodexRpc {
             stdin: Arc::new(Mutex::new(stdin)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             child: Arc::new(Mutex::new(Some(child))),
+            stdout_task,
+            stderr_task,
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(CodexInner {

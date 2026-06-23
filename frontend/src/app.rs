@@ -11,6 +11,7 @@ use crate::components::feedback_modal::FeedbackModal;
 use crate::components::header::Header;
 use crate::components::help_tour::HelpTour;
 use crate::components::host_browser::HostBrowser;
+use crate::components::hover_popover::HoverPopover;
 use crate::components::project_rail::ProjectRail;
 use crate::components::settings_panel::restore_appearance;
 use crate::components::workbench::Workbench;
@@ -148,6 +149,16 @@ fn install_keydown_listener(state: AppState) {
             "n" if ctrl_or_meta => {
                 ev.prevent_default();
                 crate::actions::begin_new_chat(&state, None);
+            }
+            "F12" if ev.shift_key() => {
+                // Find-references from the caret in the focused file view.
+                ev.prevent_default();
+                crate::components::file_view::find_references_from_current_selection(&state);
+            }
+            "F12" => {
+                // Go-to-definition from the caret in the focused file view.
+                ev.prevent_default();
+                crate::components::file_view::navigate_from_current_selection(&state);
             }
             "Escape" => {
                 if state.command_palette_open.get_untracked() {
@@ -623,6 +634,7 @@ pub fn App() -> impl IntoView {
             <FeedbackModal />
             <HostBrowser />
             <HelpTour />
+            <HoverPopover />
         </div>
     }
 }

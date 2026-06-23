@@ -1123,7 +1123,7 @@ pub(crate) fn spawn_agent_actor(
                         return;
                     };
                     let mut real_idle_transition = false;
-                    let mut synthesize_idle_after_recovery = false;
+                    let mut synthesize_idle_after_error = false;
                     match &event {
                         ChatEvent::MessageAdded(message) => {
                             if let Some(compaction) = active_compaction.as_mut() {
@@ -1150,7 +1150,7 @@ pub(crate) fn spawn_agent_actor(
                                         "backend error event ended active turn without idle marker"
                                     );
                                     real_idle_transition = true;
-                                    synthesize_idle_after_recovery = true;
+                                    synthesize_idle_after_error = true;
                                     in_turn = false;
                                     idle_transition_armed = false;
                                 }
@@ -1266,7 +1266,7 @@ pub(crate) fn spawn_agent_actor(
                                     "interrupted tool completion ended active turn without idle marker"
                                 );
                                 real_idle_transition = true;
-                                synthesize_idle_after_recovery = true;
+                                synthesize_idle_after_error = true;
                                 in_turn = false;
                                 idle_transition_armed = false;
                             }
@@ -1301,7 +1301,7 @@ pub(crate) fn spawn_agent_actor(
                         &event,
                     )
                     .await;
-                    if synthesize_idle_after_recovery {
+                    if synthesize_idle_after_error {
                         append_chat_event(
                             &canonical_stream,
                             &mut event_log,

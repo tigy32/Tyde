@@ -9,6 +9,9 @@ use crate::types::{
 use crate::{
     AgentClosedPayload, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload,
     CancelWorkflowPayload, ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload,
+    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
+    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
     CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
     CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind, HostBootstrapPayload,
     HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
@@ -753,6 +756,52 @@ impl ProtocolValidator {
                     "ProjectSearchComplete",
                 )
             }
+            FrameKind::CodeIntelStatus => parse_stream_payload::<CodeIntelStatusPayload>(
+                &self.recent,
+                envelope,
+                "CodeIntelStatus",
+            ),
+            FrameKind::CodeIntelFileModel => parse_stream_payload::<CodeIntelFileModelPayload>(
+                &self.recent,
+                envelope,
+                "CodeIntelFileModel",
+            ),
+            FrameKind::CodeIntelDiagnostics => parse_stream_payload::<CodeIntelDiagnosticsPayload>(
+                &self.recent,
+                envelope,
+                "CodeIntelDiagnostics",
+            ),
+            FrameKind::CodeIntelHoverResult => parse_stream_payload::<CodeIntelHoverResultPayload>(
+                &self.recent,
+                envelope,
+                "CodeIntelHoverResult",
+            ),
+            FrameKind::CodeIntelNavigateResult => {
+                parse_stream_payload::<CodeIntelNavigateResultPayload>(
+                    &self.recent,
+                    envelope,
+                    "CodeIntelNavigateResult",
+                )
+            }
+            FrameKind::CodeIntelReferencesResults => {
+                parse_stream_payload::<CodeIntelReferencesResultsPayload>(
+                    &self.recent,
+                    envelope,
+                    "CodeIntelReferencesResults",
+                )
+            }
+            FrameKind::CodeIntelReferencesComplete => {
+                parse_stream_payload::<CodeIntelReferencesCompletePayload>(
+                    &self.recent,
+                    envelope,
+                    "CodeIntelReferencesComplete",
+                )
+            }
+            FrameKind::CodeIntelError => parse_stream_payload::<CodeIntelErrorPayload>(
+                &self.recent,
+                envelope,
+                "CodeIntelError",
+            ),
             FrameKind::ProjectEvent => {
                 parse_stream_payload::<ProjectEventPayload>(&self.recent, envelope, "ProjectEvent")
             }

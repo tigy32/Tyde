@@ -33,6 +33,7 @@ serde_yaml = "0.9"
 tempfile = "3"
 tokio.workspace = true
 tokio-util = "0.7"
+url = "2"
 tracing.workspace = true
 uuid.workspace = true
 

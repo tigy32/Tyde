@@ -214,10 +214,10 @@ impl MobilePairingQrPayload {
         if trimmed.starts_with(PAIRING_URI_PREFIX) {
             return Self::from_uri(trimmed);
         }
-        if let Some((_, fragment)) = trimmed.split_once('#') {
-            if fragment.starts_with(PAIRING_URI_PREFIX) {
-                return Self::from_uri(fragment);
-            }
+        if let Some((_, fragment)) = trimmed.split_once('#')
+            && fragment.starts_with(PAIRING_URI_PREFIX)
+        {
+            return Self::from_uri(fragment);
         }
         Self::from_uri(trimmed)
     }
