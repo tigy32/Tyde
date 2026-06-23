@@ -21,19 +21,19 @@ const SWIPE_THRESHOLD_PX: f64 = 64.0;
 const SWIPE_HORIZONTAL_DOMINANCE: f64 = 1.5;
 
 /// Which edge the back-swipe starts from, and therefore which way the finger
-/// travels. Flip this single constant to switch between the default
-/// (`RightEdgeMoveLeft`) and the iOS convention (`LeftEdgeMoveRight`); the
-/// rest of the gesture logic keys off it.
-const BACK_SWIPE: BackSwipe = BackSwipe::RightEdgeMoveLeft;
+/// travels. Flip this single constant to switch between the iOS convention
+/// (`LeftEdgeMoveRight`) and `RightEdgeMoveLeft`; the rest of the gesture logic
+/// keys off it.
+const BACK_SWIPE: BackSwipe = BackSwipe::LeftEdgeMoveRight;
 
 // One variant is intentionally unselected: it is the alternative the
 // `BACK_SWIPE` constant can be flipped to without touching the gesture logic.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 enum BackSwipe {
-    /// Start near the right screen edge, finger moves left. (default)
+    /// Start near the right screen edge, finger moves left.
     RightEdgeMoveLeft,
-    /// Start near the left screen edge, finger moves right. (iOS-style)
+    /// Start near the left screen edge, finger moves right. (iOS-style, default)
     LeftEdgeMoveRight,
 }
 
@@ -1485,32 +1485,32 @@ mod wasm_tests {
     /// start mid-screen, fall short, or are dominantly vertical are not. This
     /// pins the geometry that keeps the gesture from firing during scrolling.
     #[wasm_bindgen_test]
-    async fn back_swipe_decision_matches_default_right_edge_geometry() {
+    async fn back_swipe_decision_matches_ios_left_edge_geometry() {
         let vw = 400.0;
-        // Starts in the right edge zone, long leftward, horizontal: fires.
+        // Starts in the left edge zone, long rightward, horizontal: fires.
         assert!(
-            back_swipe_triggered(vw - 5.0, -120.0, 10.0, vw),
-            "right-edge leftward horizontal swipe must trigger back"
+            back_swipe_triggered(5.0, 120.0, 10.0, vw),
+            "left-edge rightward horizontal swipe must trigger back"
         );
         // Starts in the middle of the screen: not an edge swipe.
         assert!(
-            !back_swipe_triggered(vw / 2.0, -120.0, 10.0, vw),
+            !back_swipe_triggered(vw / 2.0, 120.0, 10.0, vw),
             "swipe starting mid-screen must not trigger back"
         );
         // Horizontal travel below threshold: ignored.
         assert!(
-            !back_swipe_triggered(vw - 5.0, -40.0, 5.0, vw),
+            !back_swipe_triggered(5.0, 40.0, 5.0, vw),
             "short swipe must not trigger back"
         );
         // Dominantly vertical (a transcript scroll): ignored.
         assert!(
-            !back_swipe_triggered(vw - 5.0, -70.0, -200.0, vw),
+            !back_swipe_triggered(5.0, 70.0, -200.0, vw),
             "dominantly vertical drag must not trigger back"
         );
-        // Right edge but moving the wrong way (rightward): ignored.
+        // Left edge but moving the wrong way (leftward): ignored.
         assert!(
-            !back_swipe_triggered(vw - 5.0, 120.0, 10.0, vw),
-            "rightward travel from the right edge must not trigger back"
+            !back_swipe_triggered(5.0, -120.0, 10.0, vw),
+            "leftward travel from the left edge must not trigger back"
         );
     }
 
