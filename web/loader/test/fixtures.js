@@ -63,6 +63,72 @@ export function makePairingUri(entries) {
   return "tyde-pair://v1?" + b64;
 }
 
+// --- QR scan fixture --------------------------------------------------------
+//
+// A REAL QR code matrix encoding `SCAN_QR_VALUE`, generated offline with the
+// pure-JS `qrcode-generator` package and verified to decode with the vendored
+// jsQR (web/loader/vendor/jsqr.js). Stored as the raw module grid (each row a
+// string of "1"=dark/"0"=light) so the fixture is tiny; `qrMatrixToImageData`
+// expands it into the exact `ImageData`-shaped object jsQR consumes. This lets
+// the loader's jsQR fallback decode path be exercised end to end in `node --test`
+// without any QR-encoder dependency at test time.
+export const SCAN_QR_VALUE = "tyde-pair://v1?TESTPAYLOAD123";
+export const SCAN_QR_MATRIX = [
+  "1111111010111101001111111",
+  "1000001001100010101000001",
+  "1011101000111111001011101",
+  "1011101000000000101011101",
+  "1011101001001001101011101",
+  "1000001000111010101000001",
+  "1111111010101010101111111",
+  "0000000010111110100000000",
+  "1101101001100111001000001",
+  "1010110101011000010011100",
+  "0111101100110011110001001",
+  "0100100001111001010001101",
+  "0011101101010100011001010",
+  "1011000111011111000011010",
+  "1101011110101101010000111",
+  "1011100011000000110000101",
+  "1011001101111001111111101",
+  "0000000011110111100011000",
+  "1111111000110110101010101",
+  "1000001000101100100011011",
+  "1011101010001111111110010",
+  "1011101010100110001000111",
+  "1011101000010000010111011",
+  "1000001011000001000101111",
+  "1111111010001100100111001",
+];
+
+// Expands a QR module matrix into an `{ data, width, height }` object shaped
+// exactly like the browser `ImageData` jsQR reads: a white field with black
+// (dark) modules, each module scaled up and surrounded by a quiet zone so the
+// decoder's finder-pattern search succeeds.
+export function qrMatrixToImageData(matrix, { scale = 4, quiet = 4 } = {}) {
+  const count = matrix.length;
+  const dim = (count + quiet * 2) * scale;
+  const data = new Uint8ClampedArray(dim * dim * 4).fill(255);
+  for (let r = 0; r < count; r++) {
+    const row = matrix[r];
+    for (let c = 0; c < count; c++) {
+      if (row[c] !== "1") continue;
+      for (let dy = 0; dy < scale; dy++) {
+        for (let dx = 0; dx < scale; dx++) {
+          const x = (c + quiet) * scale + dx;
+          const y = (r + quiet) * scale + dy;
+          const i = (y * dim + x) * 4;
+          data[i] = 0;
+          data[i + 1] = 0;
+          data[i + 2] = 0;
+          data[i + 3] = 255;
+        }
+      }
+    }
+  }
+  return { data, width: dim, height: dim };
+}
+
 export const EXAMPLE_MANIFEST = {
   schemaVersion: 1,
   minSupported: "0.8.19-beta.1",

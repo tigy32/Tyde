@@ -2,23 +2,25 @@
 // UI decision is unit-testable under `node --test`.
 //
 // The loader pairing screen offers two ways to enter a pairing code: scan a QR
-// with the camera, or paste the code. Camera scanning needs BOTH the native
-// `BarcodeDetector` API and `getUserMedia`. Safari/iOS — the most common
-// first-touch browser for the web client — has neither, so leading with a "Scan
-// QR code" button there just produces a "not available on this browser" dead
-// end. This module decides, from the detected capability, whether to lead with
-// scanning or with the paste flow, and supplies the matching copy.
+// with the camera, or paste the code. Scanning needs a camera (`getUserMedia`);
+// the actual decode uses the native `BarcodeDetector` where present (fast path,
+// Chrome/Android) and otherwise falls back to the bundled pure-JS jsQR decoder.
+// Because jsQR is always shipped with the loader, a camera ALONE is now enough
+// to scan — including on iOS Safari, which has no `BarcodeDetector`. Only when
+// there is no camera at all do we hide scanning and make paste the primary flow.
 
 // Detects whether live QR scanning is possible from the given `window` /
-// `navigator`. Both the detector and a camera are required. Tolerates undefined
-// globals (Node) by reporting "unavailable".
+// `navigator`. A camera (`getUserMedia`) is required; the decoder is either the
+// native `BarcodeDetector` or the bundled jsQR fallback, so the detector is no
+// longer required for scanning to be available. Tolerates undefined globals
+// (Node) by reporting "unavailable".
 export function detectScanCapability(win, nav) {
   const hasDetector = !!win && "BarcodeDetector" in win;
   const hasCamera =
     !!nav &&
     !!nav.mediaDevices &&
     typeof nav.mediaDevices.getUserMedia === "function";
-  return { hasDetector, hasCamera, scanAvailable: hasDetector && hasCamera };
+  return { hasDetector, hasCamera, scanAvailable: hasCamera };
 }
 
 // Maps a capability to the concrete pairing-screen state the loader applies to

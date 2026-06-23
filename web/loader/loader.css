@@ -202,6 +202,14 @@ body {
   outline-offset: 2px;
 }
 
+/* The Safari-guard's "Open in Safari" affordance is an <a> styled as a button;
+   keep it visually identical to the <button> actions. */
+a.btn {
+  text-align: center;
+  text-decoration: none;
+  box-sizing: border-box;
+}
+
 /* `.btn { display: block }` would otherwise beat the UA `[hidden]` rule, so the
    scan button must be hidden explicitly — load-bearing for the Safari/iOS path
    where scanning is unsupported and the button is set hidden. */
