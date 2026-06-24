@@ -23,6 +23,16 @@ use tokio::sync::mpsc;
 use self::subprocess::ImageAttachment;
 use crate::agent::customization::ResolvedSpawnConfig;
 
+const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
+    "Backend access mode is read-only (best effort). Treat the workspace as ",
+    "read-only: do not create, edit, or delete files, and do not run commands ",
+    "that modify files, processes, or external state. You MAY freely inspect ",
+    "anything — read files, list directories, and run read-only shell commands ",
+    "such as `git status`/`log`/`diff`, `grep`/`rg`, `cat`, `ls`, and ",
+    "`find` — to investigate the code. Prefer read/inspection tools; do not ",
+    "use write/edit/apply-patch tools."
+);
+
 pub(crate) fn protocol_images_to_attachments(
     images: Option<Vec<ImageData>>,
 ) -> Option<Vec<ImageAttachment>> {
@@ -405,10 +415,7 @@ pub(crate) fn session_settings_to_json(values: &SessionSettingsValues) -> Value 
 pub(crate) fn render_combined_spawn_instructions(config: &ResolvedSpawnConfig) -> Option<String> {
     let mut sections = Vec::new();
     if config.access_mode == BackendAccessMode::ReadOnly {
-        sections.push(
-            "Backend access mode is read-only: do not edit or write files, run shell commands, or otherwise change state. Use only read-only file inspection and configured MCP tools."
-                .to_string(),
-        );
+        sections.push(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.to_string());
     }
     if let Some(instructions) = config
         .instructions
@@ -495,5 +502,40 @@ fn session_setting_value_to_json(value: &SessionSettingValue) -> Value {
         SessionSettingValue::Bool(value) => Value::Bool(*value),
         SessionSettingValue::Integer(value) => Value::Number((*value).into()),
         SessionSettingValue::Null => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use protocol::BackendAccessMode;
+
+    use super::{READ_ONLY_ACCESS_MODE_INSTRUCTIONS, render_combined_spawn_instructions};
+    use crate::agent::customization::ResolvedSpawnConfig;
+
+    #[test]
+    fn read_only_spawn_instructions_allow_inspection_and_forbid_mutation() {
+        let instructions = render_combined_spawn_instructions(&ResolvedSpawnConfig {
+            access_mode: BackendAccessMode::ReadOnly,
+            ..ResolvedSpawnConfig::default()
+        })
+        .expect("read-only instructions");
+
+        assert_eq!(instructions, READ_ONLY_ACCESS_MODE_INSTRUCTIONS);
+        assert!(instructions.contains("You MAY freely inspect anything"));
+        assert!(instructions.contains("read files"));
+        assert!(instructions.contains("list directories"));
+        assert!(instructions.contains("run read-only shell commands"));
+        assert!(instructions.contains("`git status`/`log`/`diff`"));
+        assert!(instructions.contains("`grep`/`rg`"));
+        assert!(instructions.contains("`cat`"));
+        assert!(instructions.contains("`ls`"));
+        assert!(instructions.contains("`find`"));
+        assert!(instructions.contains("do not create, edit, or delete files"));
+        assert!(
+            instructions
+                .contains("do not run commands that modify files, processes, or external state")
+        );
+        assert!(instructions.contains("do not use write/edit/apply-patch tools"));
+        assert!(!instructions.contains("do not run shell commands"));
     }
 }
