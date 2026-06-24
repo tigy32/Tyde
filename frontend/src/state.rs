@@ -17,8 +17,8 @@ use protocol::{
     SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, Team, TeamDraft,
     TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId,
     TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog,
-    TerminalId, ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowDiagnostic,
-    WorkflowRunId, WorkflowRunSnapshot, WorkflowSummary,
+    TerminalId, ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
+    WorkflowDiagnostic, WorkflowRunId, WorkflowRunSnapshot, WorkflowSummary,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1255,6 +1255,12 @@ pub struct AppState {
     pub workflow_summaries: RwSignal<HashMap<String, Vec<WorkflowSummary>>>,
     pub workflow_diagnostics: RwSignal<HashMap<String, Vec<WorkflowDiagnostic>>>,
     pub workflow_runs: RwSignal<HashMap<String, HashMap<WorkflowRunId, WorkflowRunSnapshot>>>,
+    /// Server-sent workflow catalog directories (global + per project root),
+    /// keyed by host_id. Seeded by `HostBootstrap` and replaced wholesale by
+    /// `WorkflowNotify`. The empty-state teaching copy and the authoring CTA
+    /// read the real paths from here instead of reconstructing `.tyde/workflows`
+    /// by string convention.
+    pub workflow_locations: RwSignal<HashMap<String, Vec<WorkflowCatalogLocation>>>,
     /// Host-scoped team records, keyed by host_id then TeamId. Populated from
     /// `TeamNotify::Upsert` and pruned by `TeamNotify::Delete`.
     pub teams: RwSignal<HashMap<String, HashMap<TeamId, Team>>>,
@@ -1535,6 +1541,7 @@ impl AppState {
             workflow_summaries: RwSignal::new(HashMap::new()),
             workflow_diagnostics: RwSignal::new(HashMap::new()),
             workflow_runs: RwSignal::new(HashMap::new()),
+            workflow_locations: RwSignal::new(HashMap::new()),
             teams: RwSignal::new(HashMap::new()),
             team_members: RwSignal::new(HashMap::new()),
             team_member_bindings: RwSignal::new(HashMap::new()),
@@ -2538,6 +2545,9 @@ impl AppState {
             map.remove(host_id);
         });
         self.workflow_runs.update(|map| {
+            map.remove(host_id);
+        });
+        self.workflow_locations.update(|map| {
             map.remove(host_id);
         });
         self.teams.update(|map| {

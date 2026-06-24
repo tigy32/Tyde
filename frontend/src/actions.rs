@@ -119,6 +119,44 @@ pub fn begin_new_chat_with(
     state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true);
 }
 
+/// Open a fresh new-chat tab in the given host/project context and pre-fill the
+/// composer with an editable `prompt`, in one state transition.
+///
+/// Used by the Workflows authoring CTA: the active draft (project context +
+/// default backend) and the prefilled `chat_input` must be set together so they
+/// can never drift apart. This deliberately reuses the ordinary new-chat draft
+/// path — no backend is chosen here and no agent is spawned until the user
+/// edits and sends. The prompt remains fully editable in the composer.
+pub fn open_new_chat_with_prefill(
+    state: &AppState,
+    host_id: String,
+    project_id: Option<ProjectId>,
+    prompt: String,
+) {
+    // Switch to the target project context (or global) so the new chat is
+    // created against the same host/project where the workflow file will be
+    // saved. A no-op when that context is already active.
+    let target_project = project_id.map(|pid| ActiveProjectRef {
+        host_id: host_id.clone(),
+        project_id: pid,
+    });
+    state.switch_active_project(target_project);
+
+    // Ordinary new-chat draft: no backend override, no custom agent, default
+    // session settings. Backend selection stays on the host/project default.
+    state.draft_backend_override.set(None);
+    state.draft_custom_agent_id.set(None);
+    state
+        .draft_session_settings
+        .set(SessionSettingsValues::default());
+
+    // Open (and activate) the new chat tab, then seed the composer. The composer
+    // mirrors `chat_input` into the textarea reactively, so the prefill appears
+    // immediately and the user can edit before sending.
+    state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true);
+    state.chat_input.set(prompt);
+}
+
 pub fn resolve_backend(state: &AppState, host_id: &str) -> Option<BackendKind> {
     let draft = state.draft_backend_override.get_untracked();
     draft.or_else(|| {

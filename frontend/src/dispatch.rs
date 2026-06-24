@@ -1928,6 +1928,9 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 state.workflow_diagnostics.update(|map| {
                     map.insert(host_id.to_string(), payload.diagnostics);
                 });
+                state.workflow_locations.update(|map| {
+                    map.insert(host_id.to_string(), payload.locations);
+                });
             }
             Err(error) => report_dispatch_error(
                 state,
@@ -4111,6 +4114,9 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
         for run in payload.workflow_runs {
             host_map.insert(run.id.clone(), run);
         }
+    });
+    state.workflow_locations.update(|map| {
+        map.insert(host_id.to_string(), payload.workflow_locations);
     });
     state.team_preset_catalogs.update(|map| {
         map.insert(host_id.to_string(), payload.team_preset_catalog);

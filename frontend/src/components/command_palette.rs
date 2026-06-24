@@ -237,19 +237,17 @@ pub fn CommandPalette() -> impl IntoView {
                 let active_project_id = active_project_ref
                     .as_ref()
                     .map(|active| active.project_id.clone());
-                let workflows = workflow_state
+                let summaries = workflow_state
                     .workflow_summaries
                     .with(|map| map.get(&host_id).cloned().unwrap_or_default());
+                // Run only the workflows effective for the active context: a
+                // project workflow shadows the same-id global in its project, so
+                // the palette never lists or triggers the wrong definition.
+                let workflows = crate::components::workflows_panel::effective_summaries(
+                    &summaries,
+                    active_project_id.as_ref(),
+                );
                 for workflow in workflows {
-                    let visible = match &workflow.source.scope {
-                        WorkflowSourceScope::Global => true,
-                        WorkflowSourceScope::Project { project_id, .. } => {
-                            active_project_id.as_ref() == Some(project_id)
-                        }
-                    };
-                    if !visible {
-                        continue;
-                    }
                     let label = format!("Run Workflow {}", workflow.name);
                     let Some(score) = (if query.is_empty() {
                         Some(0)

@@ -9975,3 +9975,126 @@ pre.tool-error-pre {
     color: var(--text-tertiary);
     font-size: 0.76rem;
 }
+
+/* ===== Workflows Phase 1: panel header, empty state, CTA ===== */
+
+/* Header blocks shared by the Workflows panel (and reusable by other panels). */
+.panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+}
+
+.panel-title {
+    font-weight: 650;
+    color: var(--text-primary);
+}
+
+.panel-subtitle {
+    color: var(--text-tertiary);
+    font-size: 0.82rem;
+    margin-top: 2px;
+}
+
+/* Generic empty-state block: centered, muted, comfortable padding. */
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    text-align: center;
+    padding: var(--space-4);
+    color: var(--text-tertiary);
+    font-size: 0.9rem;
+}
+
+.empty-state.small {
+    padding: var(--space-2);
+    font-size: 0.82rem;
+}
+
+/* Teaching empty state for the Workflows catalog. */
+.workflow-empty-state {
+    gap: var(--space-3);
+    border: 1px dashed var(--border-subtle, rgba(255, 255, 255, 0.12));
+    border-radius: 8px;
+    background: var(--surface-secondary, rgba(255, 255, 255, 0.03));
+}
+
+.empty-state-title {
+    font-weight: 650;
+    color: var(--text-primary);
+    font-size: 0.95rem;
+}
+
+.empty-state-body {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    line-height: 1.45;
+    max-width: 42ch;
+}
+
+.empty-state-paths {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    width: 100%;
+    text-align: left;
+}
+
+.empty-state-paths-label {
+    color: var(--text-tertiary);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.empty-state-path {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    font-size: 0.8rem;
+}
+
+.empty-state-path-scope {
+    color: var(--text-tertiary);
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    min-width: 3.5rem;
+}
+
+.empty-state-path-dir {
+    color: var(--text-secondary);
+    font-family: var(--font-mono, monospace);
+    word-break: break-all;
+}
+
+.empty-state-path-hint {
+    color: var(--text-tertiary);
+    font-size: 0.75rem;
+}
+
+/* Primary call-to-action button, mirroring the settings primary button. */
+.primary-button {
+    border: 1px solid var(--accent-primary);
+    border-radius: 6px;
+    background: var(--accent-primary);
+    color: var(--text-bright);
+    padding: var(--space-2) var(--space-3);
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.primary-button:hover:not(:disabled) {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+}
+
+.primary-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
