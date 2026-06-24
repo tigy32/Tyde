@@ -15,636 +15,347 @@ builds on:
 - `25-workflows.md`: the recent pattern for server-owned catalog state and
   bootstrap-backed frontend projection.
 
-The feature has two pillars:
+The feature now has two pillars:
 
-1. Persistent Agents-tab view settings.
-2. Server-owned agent folders and placements.
+1. **Pillar A: persistent Agents-view preferences.** This has landed and is the
+   substrate for all future organization work.
+2. **Pillar B: Smart Views + Tags + Pins.** This replaces the earlier manual
+   folder design.
 
-Both pillars are server-owned. The frontend may keep ephemeral interaction state
-such as a focused input or an in-progress drag gesture, but persistent view
-preferences, folder membership, folder order, and placement order are protocol
-state emitted by the server.
+The previous folder-based model is superseded. Do not implement
+`AgentFolder`, `AgentOrganizationContainer`, `AgentPlacement`,
+`AgentOrganizationSnapshot`, `AgentOrganizationNotify`, or drag-into-folder
+behavior from older drafts. Agents are ephemeral and attribute-rich; manually
+filing them into a durable hierarchy creates high upkeep and stale organization.
+Auto-organizing views, lightweight manual tags, and pins fit the data model
+better while keeping the server as the single source of truth.
 
 ---
 
 ## 1. Goals
 
-- Stop the Agents tab from flickering, changing order, or resetting filters when
-  a view remounts, a host reconnects, or the user switches workspaces.
-- Make the Agents Center at least as capable as the sidebar Agents panel.
-- Introduce a folder model that works consistently in both the Agents Center and
-  the sidebar.
-- Keep organization display-only: moving an agent into a folder must not mutate
-  the agent's `project_id` or session metadata other than organization
-  assignments.
-- Preserve the existing parent/child sub-agent nesting while adding folders as
-  the outer grouping.
-- Keep all durable organization state in server-owned stores and protocol
-  payloads.
+- Preserve the Phase 1a flicker fix: filters, sort, group, density,
+  hide-finished, and manual order are server-owned durable preferences replayed
+  by the primary local host.
+- Make the Agents Center at least as capable as the sidebar Agents panel while
+  keeping both surfaces projections of the same protocol state.
+- Add **Smart Views** for reusable saved queries over agents, using the same
+  `AgentsViewFilters`, `AgentSortMode`, `AgentGroupMode`, and
+  `hide_finished` fields that already drive the Agents Center.
+- Add **manual tags** for user-controlled labels and **system tags** derived by
+  the server from typed agent attributes such as origin, backend, workflow,
+  parentage, and project.
+- Add **pins** for important agents/sessions so they float above the current
+  projection without changing project/session/backend semantics.
+- Keep search ephemeral. Search narrows the current projection but is never
+  saved in preferences or Smart Views.
+- Keep all durable organization state in server-owned stores and typed protocol
+  payloads. The frontend may keep only ephemeral interaction state and
+  short-lived optimistic overlays.
+- Preserve existing parent/child sub-agent nesting as an inner display rule;
+  Smart Views, tags, and pins must not infer provenance from
+  `parent_agent_id` beyond server-emitted tags/grouping.
 
 ## 2. Non-goals
 
+- No manual folders, hierarchical filing, folder drag/drop, folder persistence,
+  or folder migration.
 - No remote push, PR, tag, or release behavior.
 - No change to backend-native project/session semantics.
-- No mutation of `agent.project_id` when moving agents between folders.
+- No mutation of `agent.project_id`, `SessionRecord.project_id`, backend
+  session metadata, or workflow metadata when tagging, pinning, or switching
+  views.
 - No frontend-only persistence in `localStorage`, indexed DB, or Tauri-only
   state.
-- No automatic deletion of agents or sessions as a side effect of deleting a
-  folder or cleaning organization state.
+- No frontend reconstruction of tag taxonomy or organization semantics. If the
+  UI needs a label, filter dimension, or grouping fact, add it to protocol state
+  and let the server emit it.
+- No automatic deletion of agents or sessions as a side effect of deleting a tag,
+  removing a pin, or cleaning transient organization state.
 - No real-AI tests for this work. The test plan uses client -> server -> mock
   backend flows.
 
 ---
 
-## 3. Current state
+## 3. Landed Phase 1a substrate
 
-### 3.1 The Agent Monitor owns ordering locally today
+Phase 1a has landed. Future work must build on it instead of redesigning it.
+The relevant source anchors are below.
 
-The center Agent Monitor is opened as a center tab from `center_zone.rs` and
-renders `AgentMonitorView` when a tab's content is `TabContent::AgentMonitor`
-(`frontend/src/components/center_zone.rs:617-624`,
-`frontend/src/components/center_zone.rs:420-447`).
+### 3.1 Protocol surface
 
-Its ordering is currently frontend-local:
+- `PROTOCOL_VERSION` is currently `15` (`protocol/src/types.rs:16`).
+- `FrameKind::SetAgentsViewPreferences` and
+  `FrameKind::AgentsViewPreferencesNotify` exist on the protocol enum
+  (`protocol/src/types.rs:487-489`, `protocol/src/types.rs:569-577`) and are
+  serialized as `set_agents_view_preferences` /
+  `agents_view_preferences_notify` (`protocol/src/types.rs:643-644`,
+  `protocol/src/types.rs:727-728`).
+- `HostBootstrapPayload.agents_view_preferences` is an optional,
+  serde-defaulted primary-host snapshot (`protocol/src/types.rs:1080-1107`).
+- `HostFilterId`, `AgentsViewPreferences`, `AgentsViewFilters`,
+  `AgentProjectFilter`, `AgentSortMode`, `AgentGroupMode`,
+  `AgentListDensity`, `AgentStatusFilter`, `AgentOrderKey`,
+  `AgentsViewPreferencesUpdate`, `SetAgentsViewPreferencesPayload`,
+  `AgentsViewPreferencesStoreError*`, `AgentsViewPreferencesSnapshot`, and
+  `AgentsViewPreferencesNotifyPayload` are canonical protocol types
+  (`protocol/src/types.rs:1109-1248`).
+- The landed `AgentGroupMode` variants are `Flat`, `Status`, `Backend`, and
+  `Project` (`protocol/src/types.rs:1167-1175`). `Tag` is a Phase 2b addition;
+  folder group modes are not present and should not be reintroduced.
 
-- `AppState` declares `agent_monitor_order` as "Session-local manual ordering"
-  and `agents_panel_filters` as another frontend map
-  (`frontend/src/state.rs:1288-1293`).
-- Those signals are initialized as empty in `AppState::new`
-  (`frontend/src/state.rs:1551-1553`).
-- Host runtime cleanup prunes those maps on disconnect/reset
-  (`frontend/src/state.rs:2475-2484`).
-- The Agent Monitor derives a default order from current agents, overlays the
-  local manual order, and stores changes back into `state.agent_monitor_order`
-  (`frontend/src/components/agent_monitor_view.rs:38-118`,
-  `frontend/src/components/agent_monitor_view.rs:196-210`,
-  `frontend/src/components/agent_monitor_view.rs:254-268`).
-- An effect prunes missing agents out of the local manual order
-  (`frontend/src/components/agent_monitor_view.rs:270-286`).
-- Reset simply clears the frontend-local order
-  (`frontend/src/components/agent_monitor_view.rs:330-339`).
+### 3.2 Store and host ownership
 
-The current drag-and-drop and keyboard reorder implementation is useful as a UI
-seam, but it mutates frontend state directly:
+- `AgentsViewPreferencesStore` loads defaults on missing files, records typed
+  load errors for corrupt/unsupported data, snapshots full state, applies typed
+  updates, and writes atomically (`server/src/store/agents_view_preferences.rs:21-80`,
+  `server/src/store/agents_view_preferences.rs:153-185`).
+- The store canonicalizes filters and validates manual order without silently
+  accepting empty or duplicate keys
+  (`server/src/store/agents_view_preferences.rs:197-240`,
+  `server/src/store/agents_view_preferences.rs:242-335`).
+- `HostRuntimeConfig.agents_view_preferences_primary` decides whether a host owns
+  the store; the default local host is primary
+  (`server/src/host.rs:147-177`).
+- `HostState` stores the preferences store as `Option<Arc<Mutex<_>>>`, so remote
+  or non-primary hosts have no competing store (`server/src/host.rs:240-247`).
+- Host bootstrap emits `Some(snapshot)` only when that optional store exists
+  (`server/src/host.rs:668-671`, `server/src/host.rs:723-745`).
+- `HostHandle::set_agents_view_preferences` rejects non-primary hosts, applies
+  the store mutation, and fans out a full notify from the single owner
+  (`server/src/host.rs:4415-4435`).
+- Manual order canonicalization rewrites live local transient keys to session
+  keys, drops unverifiable remote transient keys, and deduplicates deterministically
+  (`server/src/host.rs:4452-4508`).
+- Host startup wires the preferences path into normal and test store paths, and
+  only constructs the store when the runtime config marks the host primary
+  (`server/src/host.rs:8145-8170`, `server/src/host.rs:8229-8247`,
+  `server/src/host.rs:8287-8305`, `server/src/host.rs:8323-8325`,
+  `server/src/host.rs:8391-8398`).
+- Fanout follows the existing single-owner host-subscriber pattern and drops dead
+  streams (`server/src/host.rs:9614-9637`, `server/src/host.rs:9833-9842`).
 
-- HTML drag events set a local `dragged_key` and call `apply_manual_reorder`
-  on drop (`frontend/src/components/agent_monitor_view.rs:460-523`).
-- Up/down buttons and `Alt+ArrowUp` / `Alt+ArrowDown` call the same local
-  reorder helper (`frontend/src/components/agent_monitor_view.rs:530-617`).
+### 3.3 Frontend projection and optimistic overlay
 
-This is the root of the flicker/reset complaint. The rendered order is a product
-of current render inputs plus local state that is not replayed by the server.
-When the component remounts, the host reconnects, or the active workspace changes
-far enough to clear/prune local maps, the UI can re-derive a different order.
+- The frontend constant `PRIMARY_LOCAL_HOST_ID` is `local`, and comments make it
+  the only host allowed to own Agents-view preferences (`frontend/src/state.rs:108-112`).
+- `AgentsViewOverlay` is explicitly short-lived, non-persisted, layered over the
+  server snapshot, and reconciled by dropping it on any authoritative snapshot
+  (`frontend/src/state.rs:1033-1051`).
+- `AppState` holds the server snapshot, owning host id, pending overlay, and
+  overlay generation (`frontend/src/state.rs:1338-1355`), initialized to defaults
+  in `AppState::new` (`frontend/src/state.rs:1614-1620`).
+- `effective_agents_view_preferences()` derives the rendered preferences from
+  server snapshot + overlay (`frontend/src/state.rs:2029-2043`).
+- `apply_agents_view_snapshot()` ignores non-primary snapshots, installs the
+  authoritative snapshot, and clears the overlay wholesale
+  (`frontend/src/state.rs:2046-2075`).
+- `set_agents_view_overlay()` installs a local optimistic domain change and arms
+  the stale-overlay timeout; `agents_view_overlay_pending()` reports pending
+  state (`frontend/src/state.rs:2078-2135`).
+- Host runtime cleanup intentionally does not prune preferences or the overlay,
+  because pruning frontend-local state was the root flicker/reset bug
+  (`frontend/src/state.rs:2652-2658`).
+- `AgentMonitorView` maps live rows to durable `AgentOrderKey`s
+  (`frontend/src/components/agent_monitor_view.rs:47-81`), filters with the
+  protocol `AgentsViewFilters` plus ephemeral search
+  (`frontend/src/components/agent_monitor_view.rs:95-130`), sorts and groups from
+  protocol modes (`frontend/src/components/agent_monitor_view.rs:155-255`), sends
+  preference updates to the primary host (`frontend/src/components/agent_monitor_view.rs:489-525`),
+  and renders from the effective preference memo (`frontend/src/components/agent_monitor_view.rs:583-631`).
+- Existing wasm tests cover immediate optimistic UI, persistence across host
+  churn, and drop-on-notify reconciliation (`frontend/src/components/agent_monitor_view.rs:1846-1884`,
+  `frontend/src/components/agent_monitor_view.rs:1887-1924`,
+  `frontend/src/components/agent_monitor_view.rs:1926-1971`).
 
-### 3.2 The sidebar Agents panel owns filters locally today
+### 3.4 Testing constraints
 
-The right dock mounts `AgentsPanel` under the `Agents` tab
-(`frontend/src/components/dock_zone.rs:77-96`). The panel already has search,
-filters, status badges, backend badges, rename/compact/close actions, and
-parent/child sub-agent nesting:
-
-- `search` is a component-local `RwSignal` (`frontend/src/components/agents_panel.rs:150-154`).
-- `AgentsPanelFilters` contains `hide_sub_agents`, `hide_inactive`, and
-  `show_other_projects` (`frontend/src/state.rs:997-1016`).
-- The active filter set is looked up in `state.agents_panel_filters`, keyed by
-  `Option<ActiveProjectRef>`, with per-project defaults
-  (`frontend/src/components/agents_panel.rs:161-184`).
-- Filtering includes sub-agent, inactive, project, and name search checks
-  (`frontend/src/components/agents_panel.rs:16-49`).
-- Parent/child nesting is built from `parent_agent_id`
-  (`frontend/src/components/agents_panel.rs:220-265`).
-- Filter controls and the search input are rendered above the list
-  (`frontend/src/components/agents_panel.rs:290-324`).
-- Agent cards expose status, age, optional side-question/workflow/custom-agent
-  badges, backend badge, rename, compact, and close actions
-  (`frontend/src/components/agents_panel.rs:593-783`).
-
-Those controls are session-only and scoped to frontend active-project memory, not
-server-owned user preferences.
-
-### 3.3 The protocol and server already have the right patterns
-
-The current protocol already models the ingredients this feature should reuse:
-
-- `PROTOCOL_VERSION` is an explicit constant
-  (`protocol/src/types.rs:16`).
-- `BackendKind` and `AgentOrigin` are strong enums
-  (`protocol/src/types.rs:389-398`, `protocol/src/types.rs:423-440`).
-- `AgentStartPayload` and `NewAgentPayload` carry `origin`, `backend_kind`,
-  `project_id`, `parent_agent_id`, optional `session_id`, and creation time
-  (`protocol/src/types.rs:1764-1784`, `protocol/src/types.rs:1797-1818`).
-- `Project` has a durable `sort_order`
-  (`protocol/src/types.rs:2377-2384`).
-- `ProjectNotifyPayload` uses a tagged `Upsert` / `Delete` shape
-  (`protocol/src/types.rs:2472-2477`).
-- `HostBootstrapPayload` already carries host-scoped snapshots: settings,
-  sessions, projects, agents, workflow state, teams, and other inventories
-  (`protocol/src/types.rs:1075-1101`).
-- `HostSettings`, `SetSettingPayload`, `HostSettingValue`, and
-  `HostSettingsPayload` are the existing typed-settings pattern to mirror
-  (`protocol/src/types.rs:1162-1239`).
-
-The current frontend dispatcher follows that pattern:
-
-- `HostSettings` replaces the per-host settings signal
-  (`frontend/src/dispatch.rs:580-592`).
-- `ProjectNotify::Upsert` and `ProjectNotify::Delete` mutate the project signal
-  from server events (`frontend/src/dispatch.rs:1153-1220`).
-- `HostBootstrap` replaces host-keyed snapshots without opening tabs or stealing
-  focus (`frontend/src/dispatch.rs:4030-4195`).
-- `NewAgent` is the only live-event arm that performs new-agent side effects;
-  bootstrap only upserts snapshots (`frontend/src/dispatch.rs:729-943`,
-  `frontend/src/dispatch.rs:4152-4195`).
-- `AgentClosed` currently removes the live agent from frontend state
-  (`frontend/src/dispatch.rs:981-990`, `frontend/src/dispatch.rs:3434-3498`).
-
-The current server has matching store, bootstrap, route, and fanout patterns:
-
-- `HostState` owns store handles for projects, settings, sessions, and other
-  domains (`server/src/host.rs:220-245`).
-- Host registration loads settings, projects, sessions, current agent snapshots,
-  and then emits one `HostBootstrapPayload`
-  (`server/src/host.rs:532-568`, `server/src/host.rs:647-718`).
-- Project mutations write the project store and fan out `ProjectNotify`
-  (`server/src/host.rs:2721-2792`, `server/src/host.rs:2877-2943`).
-- `set_setting` applies a typed setting update, persists it, and fans out the
-  latest settings snapshot (`server/src/host.rs:4366-4385`).
-- Project and settings fanout both iterate host subscribers, drop dead streams,
-  and send typed frame payloads (`server/src/host.rs:9073-9092`,
-  `server/src/host.rs:9451-9469`, `server/src/host.rs:9576-9585`,
-  `server/src/host.rs:9653-9664`).
-- Router inputs for settings and project mutations arrive on the host stream
-  (`server/src/router.rs:41-52`, `server/src/router.rs:112-146`).
-- The protocol validator parses host-stream settings/project payloads and must be
-  extended for new organization frames (`protocol/src/validator.rs:249-320`,
-  `protocol/src/validator.rs:371-388`).
-
-Persistence patterns to mirror:
-
-- `HostSettingsStore` has a default path, missing-file defaults, an `apply`
-  method, validation, and atomic save (`server/src/store/settings.rs:37-57`,
-  `server/src/store/settings.rs:90-95`, `server/src/store/settings.rs:214-272`).
-- `ProjectStore` has a versioned file, ordered records, reorder validation, and
-  atomic save (`server/src/store/project.rs:12-18`,
-  `server/src/store/project.rs:103-125`,
-  `server/src/store/project.rs:194-248`,
-  `server/src/store/project.rs:472-590`).
-- `SessionStore` persists session records, clears project references on project
-  deletion, deletes sessions explicitly, and uses read-modify-write atomic saves
-  (`server/src/store/session.rs:20-58`, `server/src/store/session.rs:226-246`,
-  `server/src/store/session.rs:473-528`).
+Native tests for new organization behavior must follow `tests/TESTING.md`:
+client-level end-to-end tests exercise client -> server -> mock backend and
+assert observable protocol responses/events, not internals
+(`tests/TESTING.md:5-8`, `tests/TESTING.md:52-64`). The fixture pattern uses a
+real server with a mock backend (`tests/TESTING.md:14-29`), and tests should be
+comprehensive flows without fallbacks (`tests/TESTING.md:65-70`).
 
 ---
 
 ## 4. Decisions and rationale
 
-### 4.1 View preferences are client-global preferences owned by the primary local host
+### 4.1 The UI remains a pure projection
 
-Agents-tab view preferences are global across workspaces and projects for one
-Tyde client. They are not keyed by session, active project, current workspace
-root, center-tab instance, or remote host. Because each remote host runs its own
-server and has its own `~/.tyde` directory, "global across hosts" cannot mean
-"every host owns a competing copy." Instead, there is exactly one authoritative
-preference store: the primary local host for this client owns and emits the
-snapshot. Remote hosts contribute agents/projects to the projection, but they do
-not own or emit competing `AgentsViewPreferences` snapshots.
+`dev-docs/01-philosophy.md` requires one source of truth, server-owned behavior,
+state through events, explicit ownership, and protocol types end-to-end
+(`dev-docs/01-philosophy.md:13-64`). It also requires the UI to be a pure
+projection of signal state, with no hidden caches or stale snapshots
+(`dev-docs/01-philosophy.md:126-146`).
 
-The durable object is:
+Therefore Smart Views, tag definitions, tag assignments, computed system tags,
+and pins are server-owned typed state. The frontend can hold:
+
+- focused inputs,
+- open menus,
+- in-progress chip editing,
+- drag/hover gestures for row affordances,
+- and optimistic overlays that are dropped by the next authoritative snapshot.
+
+It must not hold durable Smart Views, tag assignments, pinned sets, or derived
+system-tag taxonomy as local storage or frontend-only maps.
+
+### 4.2 Pillar A is unchanged and remains the substrate
+
+`AgentsViewPreferences` stays the live active query for the Agents Center. It
+continues to own:
+
+- filters,
+- sort mode,
+- group mode,
+- density,
+- hide-finished,
+- manual order.
+
+Search stays out of this object. Smart Views save and restore only the reusable
+query fields: `filters`, `sort_mode`, `group_mode`, and `hide_finished`. Density
+and manual order remain global active-view preferences because they are display
+style and row-order state rather than named query semantics.
+
+### 4.3 Manual folders are superseded
+
+The older design tried to make durable folders and placements an outer hierarchy.
+That is no longer the chosen model.
+
+Reasons:
+
+- Live agents are often short-lived, restarted, resumed, or replaced by multiple
+  live views of the same session.
+- Useful organization dimensions already exist as typed attributes: host,
+  project, backend, origin, workflow, team/custom-agent metadata, parentage,
+  status, and session id.
+- Manual hierarchy makes the user keep stale folders clean as agents close,
+  sessions resolve, projects disappear, or workflows complete.
+- Query/tag/pin models are lower-upkeep: automatic views follow attributes,
+  manual tags capture durable user intent, and pins highlight exceptional rows
+  without changing ownership.
+
+### 4.4 Smart Views are saved queries over the landed preferences
+
+A Smart View is a named reusable query:
 
 ```rust
-pub struct AgentsViewPreferences {
+pub struct SmartView {
+    pub id: SmartViewId,
+    pub name: String,
     pub filters: AgentsViewFilters,
     pub sort_mode: AgentSortMode,
     pub group_mode: AgentGroupMode,
-    pub density: AgentListDensity,
     pub hide_finished: bool,
-    pub manual_order: Vec<AgentOrderKey>,
 }
-
-pub struct AgentsViewFilters {
-    pub host_ids: Vec<HostFilterId>,
-    pub project_ids: Vec<AgentProjectFilter>,
-    pub statuses: Vec<AgentStatusFilter>,
-    pub backends: Vec<BackendKind>,
-    pub origins: Vec<AgentOrigin>,
-}
-
-pub struct AgentProjectFilter {
-    pub host_id: HostFilterId,
-    pub project_id: ProjectId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct HostFilterId(pub String);
 
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AgentOrderKey {
-    Session { session_id: SessionId },
-    TransientAgent { host_id: HostFilterId, agent_id: AgentId },
+pub enum SmartViewId {
+    BuiltIn { id: BuiltInSmartViewId },
+    User { id: UserSmartViewId },
 }
+
+#[serde(rename_all = "snake_case")]
+pub enum BuiltInSmartViewId {
+    All,
+    Active,
+    FailedTerminated,
+}
+
+#[serde(transparent)]
+pub struct UserSmartViewId(pub String);
 ```
 
-`HostFilterId` is a typed wrapper around the stable configured-connection id for
-the host. It must not wrap a `/host/<uuid>` stream path, an agent stream path, or
-any per-connection instance id. Persisted filters and transient agent order keys
-must survive reconnects, so they reference the durable configured-host identity
-that the bridge/host registry already uses for configured hosts.
+Rules:
 
-Manual ordering is session-keyed whenever a `SessionId` is known. The
-`TransientAgent` variant is only for live agents that have not resolved a session
-id yet. When the server/client learns the session id, the durable preference is
-rewritten from `TransientAgent` to `Session` and the transient key is pruned on
-that mutation.
+- Built-in views are emitted by the server, non-deletable, and ordered before
+  user views.
+- User views are persisted in the primary-local-host store in user-defined order.
+- The active Smart View id is persisted by the same owner.
+- Selecting a Smart View updates active `AgentsViewPreferences` by copying the
+  view's `filters`, `sort_mode`, `group_mode`, and `hide_finished` into the
+  active preference snapshot. It does not copy search, density, or manual order.
+- The frontend uses the existing optimistic-overlay path for the copied
+  preference domains, then drops the overlay when the server emits the full
+  authoritative snapshot.
+- Search remains ephemeral and is never saved into a Smart View.
 
-`search` is deliberately not persisted. Persistent search makes agents disappear
-after restart and is surprising. The search input remains an ephemeral UI input
-that narrows the current projection only. If a future design wants search to
-survive remounts, it should be added as server-emitted transient view state, not
-folded into the durable preference object.
+Recommended built-ins for Phase 2a:
 
-**Rationale:** the user's pain is settings that "flicker around" and reset. A
-single durable primary-host preference removes the frontend-local sources of
-truth that currently re-derive order and filters, while still applying to agents
-from every connected host in the client projection.
+- **All**: empty filters, `ManualThenActivity`, `Flat`, `hide_finished = false`.
+- **Active**: statuses for initializing/thinking/compacting/idle, no terminated
+  rows, default sort/group.
+- **Failed/terminated**: terminated status, `hide_finished = false` so the view
+  can show the rows it is explicitly asking for.
 
-### 4.2 View preferences use a dedicated store
+The exact label/copy can change, but the ids must be stable protocol values.
 
-Use a dedicated store rather than extending `HostSettings`.
+### 4.5 Tags are two-tier: manual persisted, system derived
 
-Default path:
+Tags have two origins:
 
-```text
-~/.tyde/agents_view_preferences.json
-```
+1. **Manual tags** are created by the user and persisted by the primary local
+   host. Assignments are session-keyed whenever possible and transient-agent-keyed
+   only while a live agent has no session id.
+2. **System tags** are computed by the server and not written to the tag store.
+   They are derived from typed agent/project/workflow/backend/origin state, for
+   example `workflow`, `codex`, `sub-agent`, or the project name.
 
-Override:
+Manual and system tags are displayed distinctly. Manual tags are editable;
+system tags are read-only facts emitted by the server.
 
-```text
-TYDE_AGENTS_VIEW_PREFERENCES_STORE_PATH
-```
+Because the store is client-global and the projection can include remote hosts,
+every per-agent organization key is scoped by stable `HostFilterId`:
 
-Store shape:
-
-```json
-{
-  "version": 1,
-  "preferences": {
-    "filters": {
-      "host_ids": [],
-      "project_ids": [],
-      "statuses": [],
-      "backends": [],
-      "origins": []
+```rust
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentAnnotationTarget {
+    Session {
+        host_id: HostFilterId,
+        session_id: SessionId,
     },
-    "sort_mode": "manual_then_activity",
-    "group_mode": "flat",
-    "density": "comfortable",
-    "hide_finished": false,
-    "manual_order": []
-  }
+    TransientAgent {
+        host_id: HostFilterId,
+        agent_id: AgentId,
+    },
 }
 ```
 
-Missing file means default preferences with no error. A corrupt file is different:
-it must produce a typed preference-store error, fall back to defaults for this
-preference store only, and keep host registration/connectivity alive. A UI
-preference file must not panic the host or block remote connectivity. The next
-valid preference mutation, including Reset, writes a fresh valid file and clears
-the load error.
+The durable part is still session-keyed: once a session id exists, manual tag and
+pin state must be rewritten to the `Session` target and the transient target must
+be pruned. The `host_id` prevents collisions across host inventories and keeps
+`HostFilterId` stability from Phase 1a.
 
-Validation still matters on writes: invalid enum values, duplicate manual-order
-keys, empty ids, impossible filter values, and unsupported versions are rejected
-with typed errors instead of being silently repaired.
+### 4.6 Tags become a filter and group dimension
 
-**Rationale:** these are user-interface preferences, not backend host settings.
-A separate store keeps the settings domain small while mirroring the settings
-store's apply/save/fanout pattern, but it is intentionally less fatal on corrupt
-load than core host settings.
-
-### 4.3 View preference protocol is full-snapshot notify with a pending overlay
-
-Add host-stream frames on the primary local host stream:
+Phase 2b extends `AgentsViewFilters` additively:
 
 ```rust
-FrameKind::SetAgentsViewPreferences
-FrameKind::AgentsViewPreferencesNotify
-```
-
-Payloads:
-
-```rust
-pub struct SetAgentsViewPreferencesPayload {
-    pub update: AgentsViewPreferencesUpdate,
+pub struct AgentsViewFilters {
+    // landed fields...
+    #[serde(default)]
+    pub tags: Vec<AgentTagRef>,
 }
 
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AgentsViewPreferencesUpdate {
-    SetFilters { filters: AgentsViewFilters },
-    SetSortMode { sort_mode: AgentSortMode },
-    SetGroupMode { group_mode: AgentGroupMode },
-    SetDensity { density: AgentListDensity },
-    SetHideFinished { hide_finished: bool },
-    SetManualOrder { manual_order: Vec<AgentOrderKey> },
-    Reset,
+pub enum AgentTagRef {
+    Manual { tag_id: AgentManualTagId },
+    System { tag_id: AgentSystemTagId },
 }
 
-#[serde(rename_all = "snake_case")]
-pub enum AgentsViewPreferencesStoreErrorKind {
-    Corrupt,
-    UnsupportedVersion,
-    Io,
-}
-
-pub struct AgentsViewPreferencesStoreError {
-    pub kind: AgentsViewPreferencesStoreErrorKind,
-    pub message: String,
-}
-
-pub struct AgentsViewPreferencesSnapshot {
-    pub preferences: AgentsViewPreferences,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub load_error: Option<AgentsViewPreferencesStoreError>,
-}
-
-pub struct AgentsViewPreferencesNotifyPayload {
-    pub snapshot: AgentsViewPreferencesSnapshot,
-}
-```
-
-Add this to bootstrap:
-
-```rust
-pub struct HostBootstrapPayload {
-    // existing fields...
-    #[serde(default)]
-    pub agents_view_preferences: Option<AgentsViewPreferencesSnapshot>,
-}
-```
-
-Only the primary local host emits `Some(snapshot)` and accepts
-`SetAgentsViewPreferences`. Remote host bootstraps use the serde default `None`;
-they do not overwrite the client-global preference signal.
-
-Durable truth remains server-owned, but the frontend is allowed to render from:
-
-```text
-server snapshot base + short-lived pending overlay
-```
-
-The overlay is local, non-persisted, and keyed to the in-flight semantic mutation
-(e.g. `SetManualOrder`, `SetFilters`, or `SetDensity`). It is dropped when a
-notify/bootstrap snapshot either contains the expected value or supersedes that
-same preference domain with a different server value. No request id is added to
-the wire protocol; matching is by the updated preference domain and expected
-value. If the server value differs, the server wins and the overlay is discarded
-with an inline error/toast when an error was emitted.
-
-Use the overlay for interactions where pure server-wait would visibly rubber-band
-or feel laggy, especially drag reorder and remote/SSH hosts. Without it, a drop
-would snap back until the notify returns, and local writes would still wait on a
-synchronous durable store write. Low-frequency local discrete toggles may wait
-for the server snapshot without an overlay.
-
-**Why this kills flicker:** the durable base comes from a server snapshot, not an
-init-empty frontend vector/map. The pending overlay is never persisted and is
-cleared on notify, reconnect, or host cleanup. It cannot become the new source of
-truth and cannot be replayed as stale state, but it gives instant feedback while
-the server persists and re-emits the canonical snapshot.
-
-### 4.4 Agent organization is per host
-
-Folders and placements are per host. A host owns its live agent registry, project
-store, session store, and organization store. The organization model must not
-cross host boundaries.
-
-Protocol model:
-
-```rust
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct AgentFolderId(pub String);
+pub struct AgentManualTagId(pub String);
 
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AgentOrganizationContainer {
-    HostRoot,
-    Project { project_id: ProjectId },
-    NoProject,
-    Folder { folder_id: AgentFolderId },
-}
-
-pub struct AgentFolder {
-    pub id: AgentFolderId,
-    pub name: String,
-    pub parent: AgentOrganizationContainer,
-    pub sort_order: u64,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-}
-
-#[serde(rename_all = "snake_case")]
-pub enum AgentPlacementSource {
-    Default,
-    SessionAssignment,
-    TransientAssignment,
-}
-
-pub struct AgentPlacement {
-    pub agent_id: AgentId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<SessionId>,
-    pub container: AgentOrganizationContainer,
-    pub sort_order: u64,
-    pub source: AgentPlacementSource,
-}
-
-pub struct AgentOrganizationSnapshot {
-    #[serde(default)]
-    pub folders: Vec<AgentFolder>,
-    #[serde(default)]
-    pub placements: Vec<AgentPlacement>,
-}
+#[serde(transparent)]
+pub struct AgentSystemTagId(pub String);
 ```
 
-Add this to bootstrap:
+An empty tag filter means no tag constraint. A non-empty tag filter means the
+agent must have at least one selected tag unless a later UX explicitly adds
+"match all" semantics as a typed filter mode.
 
-```rust
-pub struct HostBootstrapPayload {
-    // existing fields...
-    #[serde(default)]
-    pub agent_organization: AgentOrganizationSnapshot,
-}
-```
-
-**Rationale:** this follows the existing project shape: typed ids, explicit
-parent/container fields, durable sort order, bootstrap snapshot, and live notify
-frames.
-
-### 4.5 Default groups are virtual and server-emitted
-
-The server emits default placements for every organizable live agent:
-
-- `Project { project_id }` if the agent has a valid project id on that host.
-- `NoProject` otherwise.
-
-`HostRoot`, `Project { .. }`, and `NoProject` are virtual containers. They are
-not stored as `AgentFolder` records. Custom folders may be parented under
-`HostRoot`, a virtual project container, `NoProject`, or another custom folder.
-
-A default placement is display-only. It never mutates `AgentStartPayload.project_id`,
-`NewAgentPayload.project_id`, `SessionRecord.project_id`, or project store data.
-
-**Rationale:** projects already have domain meaning. Folders are an organization
-view over agents, not a new project/session ownership model.
-
-### 4.6 Placement precedence is explicit
-
-For each live agent, placement is resolved in this order:
-
-1. Persisted session assignment keyed by `SessionId`: `SessionAssignment`.
-2. Live pre-session move keyed by `AgentId`: `TransientAssignment`.
-3. Computed default from the agent's current project: `Default`.
-
-When an agent that has a transient assignment later resolves a `SessionId`, the
-host promotes that assignment to a persisted session assignment and emits a
-placement notify. The transient assignment is removed.
-
-When multiple live agents share one `SessionId`, the session assignment applies
-to all of them unless a live agent has a transient assignment. This is the Phase 2
-rule, not an open question. Current host state maps `AgentId -> SessionId` and
-has no reverse-uniqueness invariant (`server/src/host.rs:231`,
-`server/src/host.rs:5727-5730`), so session-keyed organization intentionally
-means "all live views of this session move together." A future per-live-agent
-exception would require a new placement key, not a silent reinterpretation of
-`SessionAssignment`.
-
-### 4.7 Terminated, closed, and helper agents
-
-Phase 1a scopes "Hide finished" to state that exists today: live agents whose
-visible derived state is terminated because `fatal_error` is set. `AgentClosed`
-removes the live agent from the frontend (`frontend/src/dispatch.rs:981-990`,
-`frontend/src/dispatch.rs:3434-3498`), so a closed-but-successfully-finished
-agent is not currently available to grey out in the Agents tab.
-
-Rules for existing state:
-
-- Live fatal/terminated agents stay in their current container and may render
-  greyed out. The "Hide finished" filter hides those rows but does not move them.
-- Closing an agent drops the live placement from the current snapshot, matching
-  the current `AgentClosed` live-agent removal path. If the placement had been
-  promoted to a session assignment, the assignment remains in the organization
-  store and is used if the session is resumed later.
-- Sessionless transient assignments vanish when the live agent closes.
-- Internal/ephemeral helper agents are not organizable. They must not appear in
-  `AgentOrganizationSnapshot`, and organization mutation frames that reference
-  them fail with a typed command error.
-
-A richer typed lifecycle field is required before Tyde can show true
-successfully-finished-but-visible history rows. That is deferred beyond Phase 1a/1b;
-do not infer it in the frontend from missing streams or idle status.
-
-### 4.8 Project deletion reparents custom folders
-
-When a project is deleted:
-
-- The virtual `Project { project_id }` group disappears because it is computed.
-- Custom folders whose parent is `Project { project_id }` are reparented to
-  `NoProject`, preserving relative `sort_order` where possible.
-- Placements inside those folders remain in those folders.
-- Agents and sessions are never deleted by organization cleanup.
-
-This mirrors the existing project delete principle: project deletion detaches
-metadata instead of deleting sessions (`server/src/host.rs:2915-2920`) and then
-removes the project (`server/src/host.rs:2927-2943`). Reparenting preserves user
-organization data better than deleting folder subtrees.
-
----
-
-## 5. Pillar A: persistent Agents-tab view settings
-
-### 5.1 Server model
-
-Add `server/src/store/agents_view_preferences.rs` with the same write lifecycle
-shape as `HostSettingsStore`, but with non-fatal corrupt-load behavior:
-
-- `load(path) -> Self` records either a healthy store or a typed load error.
-- `default_path()` returns `TYDE_AGENTS_VIEW_PREFERENCES_STORE_PATH` when set,
-  otherwise `~/.tyde/agents_view_preferences.json` on the primary local host.
-- `snapshot() -> AgentsViewPreferencesSnapshot` returns defaults plus
-  `load_error: Some(...)` when the file is corrupt, and defaults with no error
-  when the file is missing.
-- `apply(update) -> Result<AgentsViewPreferencesSnapshot, String>`
-  read-modify-writes the file atomically and returns the full snapshot. If the
-  current file was corrupt, a valid mutation overwrites it with a fresh valid
-  store and clears the load error.
-
-Validation rules:
-
-- Enum lists are canonicalized in enum order where order is not meaningful.
-- Manual order has no duplicate keys.
-- `AgentOrderKey::TransientAgent` requires non-empty stable `HostFilterId` and
-  non-empty `AgentId`.
-- `AgentOrderKey::Session` requires non-empty `SessionId`.
-- `TransientAgent` keys are allowed only when no `SessionId` is known for that
-  live agent.
-- Host/project filters must reference typed stable configured-connection ids, not
-  labels, stream paths, or stream instances.
-- Unsupported store versions are reported as typed load errors and defaulted at
-  bootstrap; unsupported write input is rejected.
-- Missing file returns defaults with no error.
-
-Add an `agents_view_preferences_store` field to the primary local `HostState`,
-load it in `spawn_host_inner`, include `Some(snapshot)` in that host's
-`HostBootstrapPayload`, and fan out `AgentsViewPreferencesNotify` after every
-successful update. Remote hosts should either omit the field (`None`) or ignore
-it if older code still fills defaults; they must not replace the client-global
-preference signal.
-
-### 5.2 Frontend model
-
-Replace frontend-owned durable preference signals with a server snapshot plus a
-non-persisted pending overlay:
-
-- Remove `agent_monitor_order` as a durable local source of truth.
-- Replace `agents_panel_filters` with the primary-host server snapshot for
-  persisted filters.
-- Keep search as ephemeral component input only.
-- Add one `agents_view_preferences` snapshot signal owned by primary-host
-  bootstrap/notify.
-- Add a short-lived `pending_agents_view_overlay` signal for in-flight
-  preference mutations that need instant feedback.
-- Update both `AgentsPanel` and `AgentMonitorView` to render from
-  `effective_preferences = server_snapshot.preferences + pending_overlay`.
-- On user changes, send `SetAgentsViewPreferences`. For drag/manual reorder and
-  remote-host interactions, install a pending overlay immediately. For local
-  low-frequency toggles, either install the overlay or wait for notify; both are
-  valid as long as durable state is not mutated locally.
-- Drop/reconcile the overlay when `AgentsViewPreferencesNotify` or a new primary
-  bootstrap snapshot arrives for the same preference domain.
-
-The same effective preference controls must drive both the center and sidebar
-surfaces so that "Hide finished" or backend/origin/status filters do not differ
-by surface. The sidebar may use a compact subset of controls, but it reads and
-writes the same server preference object.
-
-### 5.3 Sort/group/density semantics
-
-Sort modes:
-
-```rust
-pub enum AgentSortMode {
-    ManualThenActivity,
-    NewestFirst,
-    OldestFirst,
-    NameAsc,
-    Status,
-    Backend,
-    Project,
-}
-```
-
-Group modes:
+Phase 2b also adds:
 
 ```rust
 pub enum AgentGroupMode {
@@ -652,308 +363,295 @@ pub enum AgentGroupMode {
     Status,
     Backend,
     Project,
-    Folders,
-    FoldersThenStatus,
-    FoldersThenBackend,
-    FoldersThenProject,
+    Tag,
 }
 ```
 
-Density:
+`Tag` grouping is server-defined in terms of emitted tag assignments. Agents with
+multiple tags appear under each matching tag group in grouped display; untagged
+agents appear in an explicit `Untagged` group. Pins remain an outer section above
+tag grouping.
 
-```rust
-pub enum AgentListDensity {
-    Comfortable,
-    Compact,
-}
-```
+### 4.7 Pins are lightweight per-agent emphasis
 
-Phase 1a supports the non-folder group modes (`Flat`, `Status`, `Backend`, and
-`Project`) and can persist folder modes without rendering them if a staged client
-already knows them. Phase 1b enables `Folders` and `FoldersThen*` once the server
-emits `AgentOrganizationSnapshot`. When folder modes are active, folders are the
-outer grouping; the suffix chooses the secondary grouping inside each folder.
-Sort is applied within the innermost group. Manual order is applied only where it
-can be unambiguous: inside the resolved container/group after filters are
-applied.
+Pins are a set of `AgentAnnotationTarget`s owned by the primary local host.
+Pinned agents float above the current projection without changing their project,
+session, tag, or backend state.
 
-### 5.4 Manual order semantics
+Display rule:
 
-Manual order in preferences is stored by session id whenever possible. A live
-agent id is only a transient key while that agent has no known session id. That
-matches organization placement precedence and avoids losing order when a session
-is resumed.
+- Render a top **Pinned** section before the normal projection.
+- Inside the pinned section, apply the active filters first; a pinned row that
+  does not match the current Smart View/filter/search is not forced visible.
+- Within pinned and unpinned sections, preserve the active sort/group rules.
 
-When a manual order update references visible live agents, the frontend sends the
-visible order as `Vec<AgentOrderKey>` using `Session` for agents with a known
-session id and `TransientAgent` only for unresolved agents. The primary host
-stores the canonical list and emits the full preference snapshot.
+Persistence and cleanup use the same session-keyed/transient-target rules as
+manual tags.
 
-Stale-key cleanup is deterministic and happens on every successful manual-order
-mutation:
+### 4.8 Full snapshots reconcile optimistic overlays
 
-1. Drop duplicate keys after the first occurrence.
-2. Drop `TransientAgent` keys whose stable host id or live agent id is no longer
-   known to the current client projection.
-3. Rewrite a `TransientAgent` key to `Session` when that live agent's session id
-   is known at mutation time.
-4. Keep `Session` keys even when no live agent currently references the session,
-   so resumed sessions retain their order.
+Future Smart View, tag, and pin overlays must follow the Phase 1a discipline:
 
-This rule replaces any vague migration window. The stored order after each
-mutation is canonical and reproducible.
+- install local overlay only for immediate feedback,
+- send a typed host-stream frame to the primary local host,
+- drop the overlay on any authoritative snapshot for that domain,
+- show server errors explicitly,
+- never persist overlays or use them as durable local truth.
 
-### 5.5 Why this fixes flicker
-
-Today the center order is recomputed from live signals and a local vector. The
-sidebar filters are per-project frontend maps. Both are initialized empty and can
-be pruned on host cleanup. That creates observable resets.
-
-After Pillar A:
-
-1. The primary host bootstrap carries the durable preference snapshot.
-2. Live preference mutations return the same full snapshot shape.
-3. The frontend renders from one server-fed base signal plus an optional
-   non-persisted pending overlay.
-4. Remounts and workspace switches re-read the same server base instead of
-   creating a new local map/vector.
-5. The overlay is cleared on notify, bootstrap, disconnect, or semantic
-   supersession; it is never stored and cannot become stale startup state.
-6. New agents are inserted by server-defined sort/manual-order rules, not by
-   component construction order.
-
-There is no durable second source of truth left to flicker, while drag reorder
-and remote-host interactions still get immediate visual feedback.
+The drop-on-any-authoritative-snapshot rule is already implemented for
+preferences in `AppState` (`frontend/src/state.rs:2046-2075`). New overlays should
+match that behavior rather than adding request ids or equality-only reconcile.
 
 ---
 
-## 6. Pillar B: agent folders
+## 5. Pillar A: landed persistent Agents-view preferences
 
-### 6.1 Store model
+Pillar A is not being redesigned. It remains the base query and display state for
+all Agents Center projections.
 
-Add `server/src/store/agent_organization.rs`.
+### 5.1 Server model
 
-Default path:
+The existing `AgentsViewPreferencesStore` remains the primary-local-host-owned
+store at `~/.tyde/agents_view_preferences.json`, with
+`TYDE_AGENTS_VIEW_PREFERENCES_STORE_PATH` as the override
+(`server/src/store/agents_view_preferences.rs:44-55`). Missing files return
+healthy defaults; corrupt files report typed load errors but do not prevent host
+registration (`server/src/store/agents_view_preferences.rs:83-151`). Valid
+mutations rewrite the file atomically and clear load errors
+(`server/src/store/agents_view_preferences.rs:64-80`,
+`server/src/store/agents_view_preferences.rs:153-185`).
+
+Keep these rules:
+
+- Primary local host owns and emits preferences.
+- Remote hosts emit `None` for `agents_view_preferences` and reject mutations.
+- `HostFilterId` is the stable configured-host id, not a stream path.
+- Manual order uses `SessionId` whenever possible and transient agent keys only
+  before session resolution.
+- Store validation rejects empty ids and duplicate manual-order keys.
+- Corrupt preference data is surfaced as typed `load_error`; it must not panic or
+  block host connectivity.
+
+### 5.2 Frontend model
+
+The frontend continues rendering from:
 
 ```text
-~/.tyde/agent_organization.json
+server snapshot base + non-persisted optimistic overlay
 ```
 
-Override:
+The effective preference object is produced by
+`effective_agents_view_preferences()` (`frontend/src/state.rs:2029-2043`). The
+server snapshot is replaced only from primary-local-host bootstrap/notify; any
+non-primary snapshot is ignored (`frontend/src/state.rs:2057-2065`). A new
+snapshot drops the entire overlay (`frontend/src/state.rs:2066-2075`).
 
-```text
-TYDE_AGENT_ORGANIZATION_STORE_PATH
-```
+Future work must not reintroduce durable `agent_monitor_order`,
+`agents_panel_filters`, `localStorage`, or Tauri-only caches for this state.
 
-Store shape:
+### 5.3 Active preference semantics
 
-```json
-{
-  "version": 1,
-  "folders": {
-    "<folder-id>": {
-      "id": "<folder-id>",
-      "name": "Research",
-      "parent": { "kind": "project", "project_id": "..." },
-      "sort_order": 0,
-      "created_at_ms": 1760000000000,
-      "updated_at_ms": 1760000000000
-    }
-  },
-  "session_assignments": {
-    "<session-id>": {
-      "session_id": "<session-id>",
-      "container": { "kind": "folder", "folder_id": "..." },
-      "sort_order": 0,
-      "updated_at_ms": 1760000000000
-    }
-  }
-}
-```
+Current landed modes:
 
-Transient assignments are host-runtime state only, keyed by `AgentId`. They are
-not written to disk. They are promoted to `session_assignments` when the server
-learns the session id.
+- Sort: `ManualThenActivity`, `NewestFirst`, `OldestFirst`, `NameAsc`, `Status`,
+  `Backend`, `Project` (`protocol/src/types.rs:1154-1165`).
+- Group: `Flat`, `Status`, `Backend`, `Project`
+  (`protocol/src/types.rs:1167-1175`).
+- Density: `Comfortable`, `Compact` (`protocol/src/types.rs:1177-1183`).
+- Status filters: `Initializing`, `Thinking`, `Compacting`, `Idle`,
+  `Terminated` (`protocol/src/types.rs:1185-1193`).
 
-Validation rules:
+Phase 2a Smart Views use exactly these modes. Phase 2b adds tag filters and
+`AgentGroupMode::Tag`.
 
-- Folder names must be non-empty after trim.
-- Folder ids and referenced project/session ids must be non-empty.
-- Folder parent graph must be acyclic.
-- A folder cannot parent itself directly or indirectly.
-- A folder parented under `Project { id }` must reference an existing project at
-  load/mutation time. Project deletion reparenting is the cleanup hook.
-- `sort_order` is durable and rewritten on reorder.
-- Missing file means empty custom folders and no session assignments, so all
-  agents fall back to computed defaults.
-- Unknown store versions or cyclic graphs fail loudly.
+---
 
-### 6.2 Host state and bootstrap
+## 6. Pillar B: Smart Views + Tags + Pins
 
-Add `agent_organization_store: Arc<Mutex<AgentOrganizationStore>>` to
-`HostState`. Add an in-memory `transient_agent_assignments` map keyed by
-`AgentId`.
+Pillar B is server-owned user organization state layered on top of Pillar A.
+The primary local host owns all durable Pillar B state, because the view is
+client-global across the connected host projection and remote hosts must not emit
+competing snapshots.
 
-During host registration, build `AgentOrganizationSnapshot` after projects,
-sessions, and live agent snapshots are known:
+### 6.1 Snapshot shape
 
-1. Load custom folders from the organization store.
-2. Build persisted session assignments from the store.
-3. For each organizable live agent, resolve placement by precedence.
-4. Emit default placements for agents without an assignment.
-5. Exclude internal/ephemeral helpers.
-6. Include the snapshot in `HostBootstrapPayload`.
-
-The frontend never reconstructs default containers on its own. It may derive a
-render tree from `AgentOrganizationSnapshot`, `projects`, and `agents`, but the
-container and placement facts are server facts.
-
-### 6.3 Mutation frames
-
-Add host-stream input frames:
+Recommended clean protocol shape: extend the existing
+`AgentsViewPreferencesSnapshot` and reuse `AgentsViewPreferencesNotify` as the
+full authoritative snapshot for Pillar A and Pillar B.
 
 ```rust
-FrameKind::AgentFolderCreate
-FrameKind::AgentFolderRename
-FrameKind::AgentFolderDelete
-FrameKind::AgentFolderReorder
-FrameKind::AgentMoveToFolder
-```
-
-Payloads:
-
-```rust
-pub struct AgentFolderCreatePayload {
-    pub name: String,
-    pub parent: AgentOrganizationContainer,
-}
-
-pub struct AgentFolderRenamePayload {
-    pub folder_id: AgentFolderId,
-    pub name: String,
-}
-
-pub struct AgentFolderDeletePayload {
-    pub folder_id: AgentFolderId,
-    pub delete_children: bool,
-}
-
-pub struct AgentFolderReorderPayload {
-    pub parent: AgentOrganizationContainer,
-    pub folder_ids: Vec<AgentFolderId>,
-}
-
-pub struct AgentMoveToFolderPayload {
-    pub agent_id: AgentId,
+pub struct AgentsViewPreferencesSnapshot {
+    pub preferences: AgentsViewPreferences,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<SessionId>,
-    pub container: AgentOrganizationContainer,
-    pub sort_order: u64,
+    pub load_error: Option<AgentsViewPreferencesStoreError>,
+    #[serde(default)]
+    pub smart_views: AgentsSmartViewsSnapshot,
+    #[serde(default)]
+    pub tags: AgentTagsSnapshot,
+    #[serde(default)]
+    pub pins: AgentPinsSnapshot,
 }
 ```
 
-`AgentMoveToFolderPayload.container` may be `Project`, `NoProject`, or `Folder`.
-Moving to `HostRoot` is invalid for an agent placement because `HostRoot` is only
-the root of folders/default groups.
+Rationale: Smart Views, tags, and pins all affect the same Agents Center
+projection and share the same owner, bootstrap field, no-panic store rules, and
+optimistic-overlay reconciliation. Reusing the existing notify avoids parallel
+frontend sources of truth and keeps bootstrap/live updates isomorphic.
 
-`AgentFolderDeletePayload` should default in UI to "move children and placements
-to the deleted folder's parent". `delete_children = true` deletes only custom
-folder records recursively; it still reparents placements to the nearest
-surviving parent. Agents/sessions are never deleted.
+`AgentsViewPreferencesNotify` remains a full snapshot. Any mutation in
+preferences, Smart Views, tags, or pins emits the full updated snapshot.
 
-### 6.4 Notify frame
-
-Add host-stream output frame:
+### 6.2 Smart View snapshot
 
 ```rust
-FrameKind::AgentOrganizationNotify
+pub struct AgentsSmartViewsSnapshot {
+    #[serde(default)]
+    pub built_in_views: Vec<SmartView>,
+    #[serde(default)]
+    pub user_views: Vec<SmartView>,
+    pub active_view_id: SmartViewId,
+}
 ```
 
-Use an Upsert/Delete record shape that mirrors `ProjectNotify` while supporting
-both folders and placements:
+Built-ins are generated by the server for every snapshot and are not stored as
+user records. User views and `active_view_id` are persisted by the primary local
+host.
+
+### 6.3 Tag snapshot
 
 ```rust
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AgentOrganizationRecord {
-    Folder { folder: AgentFolder },
-    Placement { placement: AgentPlacement },
+pub struct AgentTagsSnapshot {
+    #[serde(default)]
+    pub descriptors: Vec<AgentTagDescriptor>,
+    #[serde(default)]
+    pub manual_assignments: Vec<AgentManualTagAssignment>,
+    #[serde(default)]
+    pub system_assignments: Vec<AgentSystemTagAssignment>,
 }
 
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum AgentOrganizationNotifyPayload {
-    Upsert { record: AgentOrganizationRecord },
-    Delete { record: AgentOrganizationRecord },
+pub struct AgentTagDescriptor {
+    pub tag: AgentTagRef,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<AgentTagColor>,
+    pub origin: AgentTagOrigin,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum AgentTagOrigin {
+    Manual,
+    System,
+}
+
+#[serde(transparent)]
+pub struct AgentTagColor(pub String);
+
+pub struct AgentManualTagAssignment {
+    pub target: AgentAnnotationTarget,
+    pub tag_ids: Vec<AgentManualTagId>,
+}
+
+pub struct AgentSystemTagAssignment {
+    pub target: AgentAnnotationTarget,
+    pub tag_ids: Vec<AgentSystemTagId>,
 }
 ```
 
-Deletes carry the full deleted record for the same reason project deletes carry
-the deleted project: the frontend should not have to look elsewhere for the last
-known payload.
+Only manual descriptors and manual assignments are stored. System descriptors and
+assignments are computed from current server state for each snapshot/notify.
+Manual tag colors should be validated as a constrained color string, for example
+hex RGB/RGBA, before persisting.
 
-Use repeated `Upsert` events for reorder operations. Use `Delete` for a removed
-custom folder record or a removed explicit placement. If a placement delete
-reveals a computed default, follow it with an `Upsert` for the default placement
-or include the default in the next snapshot. Prefer the explicit follow-up
-`Upsert` so live UIs converge without a rescan.
+### 6.4 Pin snapshot
 
-### 6.5 Cleanup hooks
+```rust
+pub struct AgentPinsSnapshot {
+    #[serde(default)]
+    pub pinned: Vec<AgentAnnotationTarget>,
+}
+```
 
-Session deletion:
+The server canonicalizes pinned targets on every mutation:
 
-- Remove the session assignment for the deleted `SessionId`.
-- Fan out `AgentOrganizationNotify::Delete` for the removed placement if it
-  existed.
-- Do not delete folders.
+1. Drop duplicates after the first occurrence.
+2. Rewrite transient targets to session targets when the session id is known.
+3. Drop transient targets for closed sessionless agents.
+4. Retain session targets across agent close/resume.
 
-Project deletion:
+### 6.5 Store strategy
 
-- Before or immediately after `ProjectNotify::Delete`, ask `AgentOrganizationStore`
-  to reparent custom folders under `Project { deleted }` to `NoProject`.
-- Remove or rewrite explicit placements that reference the deleted virtual
-  project directly. Session assignments in custom folders survive.
-- Emit folder/placement notifies for every rewritten record.
-- Never delete agents or sessions.
+Phase 2a may extend `AgentsViewPreferencesStore` directly with Smart Views, or
+split the persisted file into an internal versioned record that still emits the
+same `AgentsViewPreferencesSnapshot`. Phase 2b may continue that store extension
+or introduce a sibling primary-local-host store. Either implementation is valid
+only if it preserves these externally visible rules:
 
-Agent close:
+- one primary-local-host owner,
+- no competing remote snapshots,
+- missing-file defaults,
+- corrupt/unsupported file reported as a typed load error without panic,
+- atomic writes,
+- full snapshot on bootstrap and notify,
+- validation before persistence,
+- no durable frontend-local fallback.
 
-- Remove transient assignment keyed by the live `AgentId`.
-- Emit placement delete for the live placement if it was transient or default.
-- Keep persisted session assignment intact.
+If a sibling store is introduced for tags/pins, merge its load errors into the
+snapshot as typed domain errors rather than panicking. Do not use `HostSettings`
+for this state.
 
-Session resolve:
+### 6.6 Cleanup hooks
 
-- If the agent has a transient assignment, promote it to a session assignment,
-  delete the transient placement, and emit the new `SessionAssignment` placement.
+Manual tag and pin cleanup is keyed by `AgentAnnotationTarget`:
+
+- **Session resolution:** promote any matching `TransientAgent` tag assignments
+  or pins to `Session` and emit one full snapshot.
+- **Agent close before session resolution:** remove transient assignments and
+  transient pins for that agent and emit a full snapshot.
+- **Session delete:** remove manual tag assignments and pins for that session and
+  emit a full snapshot. Do not delete tag definitions unless the user deletes the
+  tag.
+- **Project delete/rename:** system project tags are recomputed from project
+  state. Manual tags and pins do not move or change.
+- **Tag delete:** remove the manual tag definition and strip that tag id from all
+  manual assignments. Agents and sessions are not deleted.
 
 ---
 
 ## 7. UX design
 
-### 7.1 Improved Agents Center
+### 7.1 Agents Center layout
 
-The Agents Center becomes the primary management surface for live agents. It must
-match or beat the sidebar, which already has search and filter toggles.
+The Agents Center is the primary management surface for live agents.
 
 Layout:
 
 1. Header: title, agent count, current host/project scope summary.
-2. Toolbar:
-   - search input (ephemeral, not persisted),
+2. Smart View switcher: built-in views plus user views. Tabs are acceptable for
+   a small set; a dropdown is acceptable when user views exceed the available
+   width.
+3. Toolbar:
+   - search input (ephemeral, never persisted),
+   - "Save current view as…",
    - host filter,
    - project filter,
    - status filter,
    - backend filter,
    - origin filter,
+   - tag filter after Phase 2b,
    - "Hide finished",
    - sort selector,
    - group selector,
    - density selector,
-   - reset preferences action.
-3. Folder tree/list area:
-   - virtual Host/Project/No Project groups,
-   - custom folders,
-   - empty folder states,
-   - drag/drop targets and keyboard move affordances.
+   - reset active preferences action.
+4. Manage Smart Views menu:
+   - rename user view,
+   - update user view from current preferences,
+   - delete user view,
+   - reorder user views.
+5. Agent list:
+   - pinned section first after Phase 2b,
+   - current grouping (`Flat`, `Status`, `Backend`, `Project`, later `Tag`),
+   - rows/cards with tag chips and pin toggles after Phase 2b.
 
 Each row/card shows:
 
@@ -966,545 +664,533 @@ Each row/card shows:
 - age / created time,
 - optional custom-agent/team/workflow/side-question badges where already
   available,
-- actions: Open, Rename, Compact when eligible, Close, Move to folder.
+- manual and system tag chips after Phase 2b,
+- pin toggle after Phase 2b,
+- actions: Open, Rename, Compact when eligible, Close.
 
-In Phase 1a/1b, "Hide finished" means "hide live fatal/terminated rows" because
-that is the only present-but-done lifecycle signal currently available. Those
-rows render greyed out with their folder unchanged when visible. True
-successfully-finished-but-visible history rows require a later typed lifecycle
-field.
+### 7.2 Smart View UX
 
-### 7.2 Folder UX in both surfaces
+- Selecting a built-in or user view immediately overlays its query fields into
+  the active preferences and sends the Smart View set-active frame.
+- "Save current view as…" opens a name input. The saved view captures current
+  `filters`, `sort_mode`, `group_mode`, and `hide_finished`; it omits search,
+  density, and manual order.
+- "Update view" overwrites the selected user view's query fields from current
+  effective preferences.
+- Built-ins can be selected but not renamed, updated, deleted, or reordered.
+- If the active user view is deleted, the server selects `All` and copies the
+  `All` query into active preferences in the same authoritative snapshot.
 
-Both the Agents Center and sidebar render the same organization model:
+### 7.3 Tags UX
 
-- Virtual groups:
-  - Host root.
-  - One project group per project that has agents/folders or is explicitly
-    expanded by user action.
-  - `NoProject` for unprojected agents/folders.
-- Custom folders:
-  - create under Host root, Project, No Project, or another folder,
-  - rename inline or via context menu,
-  - delete with confirmation,
-  - show empty states,
-  - keep collapsed/expanded UI state local and ephemeral unless a later design
-    adds server-owned expansion preferences.
+- Manual tags render as editable chips. System tags render as read-only chips
+  with distinct visual treatment.
+- Row affordances allow adding/removing manual tags. Creating a tag can be an
+  inline "Create tag" action in the tag picker.
+- Tag filter chips live with other filter chips. A selected tag filter matches
+  agents with that manual or system tag.
+- `Group by tag` appears only when the client/server protocol supports
+  `AgentGroupMode::Tag`.
+- Tag management allows create, rename, color change, and delete. Delete copy
+  must say that agents and sessions are not deleted.
 
-Folder delete copy must be explicit: deleting a folder removes only the folder
-record. Agents and sessions are not deleted.
+### 7.4 Pins UX
 
-### 7.3 Sidebar nesting rule
+- A pin toggle appears on each row/card.
+- Pinned rows appear in a top `Pinned` section if they also match the current
+  Smart View/filter/search.
+- Pin/unpin uses the same optimistic-overlay discipline: immediate UI feedback,
+  then server snapshot reconciliation.
 
-The sidebar uses folders as the outer tree and existing parent/child sub-agent
-nesting as the inner tree:
+### 7.5 Sidebar parity
 
-```text
-Project: Tyde
-  Folder: Release work
-    Parent agent
-      Child sub-agent
-      Child sub-agent
-    Standalone agent
-  Folder: Research
-No Project
-  Agent
+The sidebar may keep a reduced toolbar, but it must read the same server-owned
+preferences, Smart View active query, tag assignments, and pins. It must not keep
+an independent durable filter map or pinned/tagged state. Parent/child sub-agent
+nesting remains an inner display rule within whatever projection the server
+state produces.
+
+---
+
+## 8. Phase 1a status and retired Phase 1b
+
+### 8.1 Phase 1a is landed
+
+Phase 1a delivered persistent Agents-view preferences and the flicker fix. Future
+work starts from the landed protocol/store/host/frontend model cited in §3.
+
+No Phase 1a redesign is in scope for Smart Views, tags, or pins. Only additive
+changes are allowed.
+
+### 8.2 The old Phase 1b is retired
+
+The previous Phase 1b plan for virtual default groups and
+`AgentOrganizationSnapshot` is retired with the folder design. Do not add
+folder containers, virtual folder/project placement records, folder group modes,
+or folder drag/drop seams.
+
+Project and no-project grouping already exists as `AgentGroupMode::Project` in
+Pillar A. Future project/system organization should be represented through
+Smart View filters and system tags, not through placement snapshots.
+
+---
+
+## 9. Phase 2a: Smart Views
+
+Phase 2a is the highest-priority follow-up because it is closest to the landed
+preferences model. It is independently shippable and does not require tags or
+pins.
+
+### 9.1 Phase 2a protocol additions
+
+Extend the existing snapshot and notify:
+
+```rust
+pub struct AgentsViewPreferencesSnapshot {
+    pub preferences: AgentsViewPreferences,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<AgentsViewPreferencesStoreError>,
+    #[serde(default)]
+    pub smart_views: AgentsSmartViewsSnapshot,
+}
+
+pub struct AgentsSmartViewsSnapshot {
+    #[serde(default)]
+    pub built_in_views: Vec<SmartView>,
+    #[serde(default)]
+    pub user_views: Vec<SmartView>,
+    pub active_view_id: SmartViewId,
+}
 ```
 
-This preserves the current sidebar behavior that builds child buckets from
-`parent_agent_id` and keeps collapsible parent rows. Folder collapse and
-parent-agent collapse are separate states.
+Add one input frame that mirrors `SetAgentsViewPreferences` rather than one frame
+per operation:
 
-### 7.4 Drag-and-drop and keyboard fallback
+```rust
+FrameKind::SetAgentsSmartViews
 
-Use the existing Leptos/DOM drag seam in the Agent Monitor as the starting point,
-but change the mutation boundary:
+pub struct SetAgentsSmartViewsPayload {
+    pub update: AgentsSmartViewsUpdate,
+}
 
-- Drag state (`dragged_agent`, hovered target, pointer placement) remains
-  ephemeral component state.
-- Drop sends a protocol mutation and installs a non-persisted pending overlay for
-  immediate visual feedback.
-- Durable frontend state is not rewritten. The overlay is reconciled when
-  `AgentOrganizationNotify`, `AgentsViewPreferencesNotify`, or bootstrap updates
-  the relevant server snapshot.
-- If the server rejects or supersedes the mutation, discard the overlay and show
-  the error; the server snapshot wins.
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentsSmartViewsUpdate {
+    SaveCurrent {
+        name: String,
+        view: SmartViewQuery,
+        set_active: bool,
+    },
+    Rename {
+        id: UserSmartViewId,
+        name: String,
+    },
+    Update {
+        id: UserSmartViewId,
+        view: SmartViewQuery,
+    },
+    Delete {
+        id: UserSmartViewId,
+    },
+    Reorder {
+        user_view_ids: Vec<UserSmartViewId>,
+    },
+    SetActive {
+        id: SmartViewId,
+    },
+}
 
-Drop targets:
+pub struct SmartViewQuery {
+    pub filters: AgentsViewFilters,
+    pub sort_mode: AgentSortMode,
+    pub group_mode: AgentGroupMode,
+    pub hide_finished: bool,
+}
+```
 
-- folder header: move agent into folder at end,
-- empty folder body: move agent into folder at order 0,
-- between rows: move agent into the target row's container before/after target,
-- virtual Project / No Project group header: move to the virtual container,
-- folder header between siblings: reorder folders via `AgentFolderReorder`.
+`SetActive` is a server-side compound mutation: set the active view id and copy
+that view's query into active `AgentsViewPreferences`. The emitted
+`AgentsViewPreferencesNotify` contains the updated active preferences and the
+updated Smart View snapshot.
 
-Mutations:
+Protocol version handling:
 
-- Agent drop into a container sends `AgentMoveToFolder`.
-- Agent row reorder within the same container sends `AgentMoveToFolder` with the
-  same container and new `sort_order` / relative target calculation.
-- Folder reorder sends `AgentFolderReorder`.
-- Phase 1a manual row reorder, before folders exist, sends
-  `SetAgentsViewPreferences::SetManualOrder` and uses the same pending-overlay
-  projection to avoid rubber-banding.
+- Additive snapshot fields must use `#[serde(default)]` for synthetic test
+  builders and staged implementation.
+- `FrameKind::SetAgentsSmartViews` requires a `PROTOCOL_VERSION` bump if Phase
+  2a ships separately from later work.
+- Keep `HostBootstrapPayload.agents_view_preferences` as the one optional
+  primary-local-host bootstrap field. Remote hosts still emit `None`.
 
-Visual feedback:
+### 9.2 Phase 2a server changes
 
-- highlight valid folder drop targets,
-- show before/after insertion bars,
-- mark invalid targets with a not-allowed cursor,
-- use an `aria-live` region for "Moving X to Y" while the overlay is pending and
-  "Moved X to Y" after notify reconciles,
-- show a pending state if a mutation has been sent and the notify has not arrived.
+- Extend `AgentsViewPreferencesStore` or a same-owner sibling store to persist:
+  - ordered user Smart Views,
+  - active Smart View id,
+  - existing active `AgentsViewPreferences`.
+- Generate built-in Smart Views for every snapshot; do not persist built-ins.
+- Validate user Smart View names as non-empty after trim.
+- Validate user view ids are unique and stable.
+- Validate `Reorder` contains every user view id exactly once and no built-in ids.
+- Reject rename/update/delete/reorder operations against built-ins.
+- On `SetActive`, copy only query fields into active preferences and emit one
+  full snapshot.
+- Preserve the Phase 1a no-panic corrupt-store behavior: host registration
+  succeeds with defaults plus typed load error, and the next valid mutation
+  rewrites a clean store.
+- Fan out the existing `AgentsViewPreferencesNotify` from the primary local host
+  only, using the single-owner subscriber pattern already used by Phase 1a.
+- Add router and validator cases for `SetAgentsSmartViews` on the host stream.
 
-Keyboard fallback:
+### 9.3 Phase 2a frontend changes
 
-- focused row has "Move" action that opens a folder picker,
-- `Alt+ArrowUp` / `Alt+ArrowDown` reorders within the current container,
-- `Alt+Shift+ArrowLeft` moves to parent container when valid,
-- `Alt+Shift+ArrowRight` opens the folder picker or moves into the next folder
-  when focus is on a folder header,
-- all actions send the same protocol frames as drag/drop and use the same pending
-  overlay.
+- Generate bindings for `SmartView*`, `AgentsSmartViewsSnapshot`, and
+  `SetAgentsSmartViewsPayload` from protocol.
+- Extend `AppState` to hold the server-emitted Smart View snapshot as part of
+  the existing `agents_view_preferences` snapshot, plus a non-persisted Smart
+  View overlay if needed for instant view switching/manage actions.
+- Reuse the existing preference overlay when selecting a Smart View: overlay
+  `filters`, `sort_mode`, `group_mode`, and `hide_finished` immediately, send
+  `SetAgentsSmartViews::SetActive`, then drop overlays on the next full snapshot.
+- Add a view switcher above the Agents Center toolbar.
+- Add "Save current view as…". It must capture effective preferences but never
+  include search, density, or manual order.
+- Add manage actions for rename/update/delete/reorder user views.
+- Render built-ins as non-editable and non-deletable.
+- Keep the UI reactive: keyed rows/switcher entries pass stable ids and look up
+  current records from signals rather than snapshotting records in closures.
+- Do not create any durable frontend-local Smart View source of truth.
 
-### 7.5 CSS work
+### 9.4 Phase 2a testing
 
-Current CSS covers existing Agent Monitor rows and agent cards only
-(`frontend/styles.css:4442-4664`, `frontend/styles.css:4664-4864`). Folder UX
-needs new classes, at minimum:
+Native client-level tests must use the public client against a real server with
+mock backend and assert observable protocol events/responses.
 
-- `.agent-folder-tree`
-- `.agent-folder-section`
-- `.agent-folder-header`
-- `.agent-folder-name`
-- `.agent-folder-actions`
-- `.agent-folder-empty`
-- `.agent-folder-drop-target`
-- `.agent-folder-drop-invalid`
-- `.agent-row-finished`
-- `.agents-density-compact`
-- `.agents-density-comfortable`
-- `.agent-folder-create-button`
-- `.agent-folder-rename-input`
+Add or extend tests for:
 
-### 7.6 Filter and group edge cases
-
-Filtering is layered inside the server-owned organization projection:
-
-- Virtual project groups and `NoProject` are hidden when they have no visible
-  agents, visible folders, or visible descendant folders after filters/search.
-- Custom folders with no agents are visible in the unfiltered view and show an
-  empty-folder state.
-- When filters/search are active, a custom folder remains visible if it contains
-  at least one visible agent, contains a visible descendant folder, or the folder
-  name itself matches the search query. A visible folder with zero matching agent
-  rows shows a muted "No matching agents" state instead of disappearing.
-- A filtered-out parent agent must not hide a child that independently matches
-  the filters/search. Keep the child in its resolved folder/container and promote
-  it to that container's top-level rows with a subtle "Parent hidden by filters"
-  badge. This preserves the existing orphan behavior in the sidebar grouping
-  logic while making the reason explicit.
-- If `hide_sub_agents` is active, child agents are filtered out before the orphan
-  rule runs.
-- Search matches agent name, visible badges/labels, and folder name. It does not
-  persist and does not change server organization state.
-
----
-
-## 8. Phase 1a: persistent preferences and the flicker fix
-
-Phase 1a is independently shippable and fully fixes the current flicker/reset
-pain without introducing `AgentOrganizationSnapshot` or folders. It persists the
-Agents-tab view preferences, rewrites the center/sidebar to render from the
-primary-host server snapshot, and adds the non-persisted pending overlay for
-instant reorder feedback.
-
-### 8.1 Phase 1a protocol additions
-
-Add:
-
-- `HostFilterId` wrapping the stable configured-connection id.
-- `AgentsViewPreferences` and supporting enums.
-- `AgentOrderKey::{Session, TransientAgent}`.
-- `AgentsViewPreferencesStoreErrorKind`.
-- `AgentsViewPreferencesStoreError`.
-- `AgentsViewPreferencesSnapshot`.
-- `SetAgentsViewPreferencesPayload`.
-- `AgentsViewPreferencesNotifyPayload`.
-- `FrameKind::SetAgentsViewPreferences`.
-- `FrameKind::AgentsViewPreferencesNotify`.
-- `HostBootstrapPayload.agents_view_preferences:
-  Option<AgentsViewPreferencesSnapshot>` with `#[serde(default)]`.
-
-Only the primary local host emits a non-`None` bootstrap field and accepts the
-set frame. Remote hosts do not own a competing copy.
-
-Bump `PROTOCOL_VERSION` because new frame kinds are added. Keep the new bootstrap
-field serde-defaulted so tests and staged clients can construct minimal bootstrap
-payloads during the transition.
-
-### 8.2 Phase 1a server changes
-
-- Add `AgentsViewPreferencesStore` on the primary local host.
-- Add store path wiring to `HostStorePaths`, `spawn_host`, and test spawn helpers
-  for the primary/local host path.
-- Load the preference store in `spawn_host_inner` without panicking on corrupt
-  preference data.
-- Include `Some(snapshot)` in the primary host bootstrap; include `None` or omit
-  the field on remote hosts.
-- Implement `HostHandle::set_agents_view_preferences`:
-  1. validate update,
-  2. deterministically prune/rewrite manual-order keys,
-  3. apply to store atomically,
-  4. fan out `AgentsViewPreferencesNotify` to primary-host subscribers.
-- Add host-stream router and validator cases on `/host/<uuid>` for the primary
-  host route.
-- On corrupt preference file load, emit defaults plus typed `load_error`; never
-  block host registration.
-
-### 8.3 Phase 1a frontend changes
-
-- Add frontend generated bindings for the new preference protocol types.
-- Add one `agents_view_preferences` snapshot signal populated only from the
-  primary local host bootstrap/notify.
-- Add `pending_agents_view_overlay` for in-flight preference updates.
-- Resolve every host filter/order reference through stable `HostFilterId` values,
-  not stream paths or connection instance ids.
-- Rewrite `AgentMonitorView` to:
-  - read persisted filters/sort/group/density/hide-finished from
-    `effective_preferences`,
-  - support non-folder grouping (`Flat`, `Status`, `Backend`, `Project`),
-  - keep search ephemeral,
-  - send typed preference updates,
-  - use the pending overlay for manual drag/keyboard reorder,
-  - no longer mutate `agent_monitor_order` locally.
-- Update `AgentsPanel` to read the same effective preference filters. If the
-  sidebar keeps a reduced toolbar, its toggles still write the same preference
-  object.
-- Scope Phase 1a `hide_finished` to existing fatal/terminated rows only.
-
-### 8.4 Phase 1a testing
-
-Native tests follow `tests/TESTING.md`: drive the public client through a real
-server with a mock backend and assert observable events, not internals
-(`tests/TESTING.md:5-8`, `tests/TESTING.md:52-64`).
-
-Add or extend client-level tests for:
-
-1. Preference update flow:
+1. Bootstrap:
    - connect to the primary host,
-   - send `SetAgentsViewPreferences`,
+   - assert `HostBootstrap.agents_view_preferences.smart_views` contains the
+     built-ins and active `All`,
+   - assert a non-primary/remote host emits `None` and cannot mutate Smart Views.
+2. Save current view:
+   - set non-default filters/sort/group/hide-finished,
+   - send `SetAgentsSmartViews::SaveCurrent`,
    - observe `AgentsViewPreferencesNotify`,
-   - reconnect,
-   - assert `HostBootstrap` carries the updated preference snapshot.
-2. Corrupt preference file:
-   - write invalid preference JSON,
-   - connect,
-   - assert host registration succeeds,
-   - assert bootstrap contains defaults plus typed load error,
-   - send Reset or another valid mutation,
-   - assert the load error clears after a valid notify.
-3. Stable host ids:
-   - save a host filter using `HostFilterId`,
-   - reconnect the host with a new stream path,
-   - assert the filter still applies.
-4. Manual order canonicalization:
-   - send duplicate/stale/transient manual keys,
-   - assert the notify contains deterministic pruned/reordered keys.
-5. Pending overlay behavior:
-   - perform a manual reorder,
-   - assert the rendered order changes immediately from the overlay,
-   - apply the notify,
-   - assert the overlay clears and the server snapshot remains.
+   - reconnect and assert the user view persists.
+3. Set active:
+   - create a user view,
+   - send `SetActive`,
+   - assert the notify updates both active id and active preferences in one
+     snapshot.
+4. Manage lifecycle:
+   - rename, update, reorder, and delete a user view,
+   - assert each notify has the expected ordered user view list.
+5. Validation errors:
+   - reject empty names,
+   - reject built-in rename/delete/reorder,
+   - reject reorder with missing/duplicate ids,
+   - surface errors as observable protocol/command errors.
+6. Corrupt store:
+   - write invalid Smart View store data,
+   - connect successfully,
+   - assert defaults plus typed load error,
+   - send a valid mutation and assert the load error clears.
 
 Wasm/component tests:
 
-- Agents Center renders server preferences after bootstrap.
-- Toggling a filter sends a preference update; local toggles may wait for notify,
-  while manual reorder uses the pending overlay.
-- Search input filters current rows but is not present in the persisted
-  preference payload.
-- Density classes switch from effective preference state.
-- `hide_finished` hides only existing fatal/terminated rows in Phase 1a.
-- Existing keyboard reorder tests should assert the pending-overlay mutation seam
-  rather than local durable vector mutation.
+- View switcher renders built-ins and user views from server snapshot.
+- Selecting a view updates rows immediately via the preference overlay and emits
+  the correct typed frame.
+- Search text is not included in a saved Smart View payload.
+- Rename/delete/reorder user views update only via overlays and server snapshots;
+  no durable local view list is mutated.
+- A server notify with canonicalized/different query values drops the overlay and
+  the DOM reflects the server snapshot.
 
 ---
 
-## 9. Phase 1b: virtual default groups
+## 10. Phase 2b: Tags and Pins
 
-Phase 1b is independently shippable after Phase 1a. It adds server-emitted
-virtual organization state for `Project { id }` and `NoProject` groups, but still
-has no custom folders or durable folder placement store.
+Phase 2b is independently shippable after Phase 2a. It adds manual tags,
+server-derived system tags, tag filtering/grouping, and pins.
 
-### 9.1 Phase 1b protocol additions
+### 10.1 Phase 2b protocol additions
 
-Add:
+Extend filters and grouping:
 
-- `AgentOrganizationContainer`.
-- `AgentPlacementSource`.
-- `AgentPlacement`.
-- `AgentOrganizationSnapshot`.
-- `AgentOrganizationRecord`.
-- `AgentOrganizationNotifyPayload`.
-- `FrameKind::AgentOrganizationNotify`.
-- `HostBootstrapPayload.agent_organization` with `#[serde(default)]`.
+```rust
+pub struct AgentsViewFilters {
+    // existing fields...
+    #[serde(default)]
+    pub tags: Vec<AgentTagRef>,
+}
 
-Phase 1b may define `AgentFolderId` and `AgentFolder` even if the server emits an
-empty `folders` list. That avoids another generated-type churn in Phase 2.
+pub enum AgentGroupMode {
+    Flat,
+    Status,
+    Backend,
+    Project,
+    Tag,
+}
+```
 
-Bump `PROTOCOL_VERSION` if Phase 1b ships separately from Phase 1a.
+Extend the full snapshot:
 
-### 9.2 Phase 1b server changes
+```rust
+pub struct AgentsViewPreferencesSnapshot {
+    pub preferences: AgentsViewPreferences,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<AgentsViewPreferencesStoreError>,
+    #[serde(default)]
+    pub smart_views: AgentsSmartViewsSnapshot,
+    #[serde(default)]
+    pub tags: AgentTagsSnapshot,
+    #[serde(default)]
+    pub pins: AgentPinsSnapshot,
+}
+```
 
-- Build a virtual-only `AgentOrganizationSnapshot` from current live agents:
-  - no custom folders,
-  - one default placement per organizable live agent,
-  - `Project { id }` for a valid project id,
-  - `NoProject` otherwise,
-  - `source: Default`.
-- Include the snapshot in every host bootstrap because organization is per host.
-- Emit organization placement upserts when new agents appear, session ids resolve,
-  or project associations change enough to alter default placement.
-- Exclude internal/ephemeral helper agents.
-- Add host-stream validator parsing for `AgentOrganizationNotify`.
+Add one input frame for tags:
 
-### 9.3 Phase 1b frontend changes
+```rust
+FrameKind::SetAgentTags
 
-- Add per-host `agent_organization` snapshot signals.
-- Dispatch `HostBootstrapPayload.agent_organization` and
-  `AgentOrganizationNotify` into organization state.
-- Render folder-first virtual groups in the Agents Center using the same
-  effective preferences from Phase 1a.
-- Enable the `Folders` and `FoldersThen*` group modes now that organization
-  snapshots exist.
-- Keep the sidebar behavior unchanged or minimally grouped until Phase 2 if that
-  is needed to ship Phase 1b cleanly; center virtual grouping is the required
-  surface for this phase.
-- Apply the filter/group edge cases from §7.6.
+pub struct SetAgentTagsPayload {
+    pub update: AgentTagsUpdate,
+}
 
-### 9.4 Phase 1b testing
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentTagsUpdate {
+    CreateTag {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<AgentTagColor>,
+    },
+    RenameTag {
+        tag_id: AgentManualTagId,
+        name: String,
+    },
+    SetTagColor {
+        tag_id: AgentManualTagId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<AgentTagColor>,
+    },
+    DeleteTag {
+        tag_id: AgentManualTagId,
+    },
+    AssignTag {
+        target: AgentAnnotationTarget,
+        tag_id: AgentManualTagId,
+    },
+    RemoveTag {
+        target: AgentAnnotationTarget,
+        tag_id: AgentManualTagId,
+    },
+}
+```
+
+Add one input frame for pins:
+
+```rust
+FrameKind::SetAgentPins
+
+pub struct SetAgentPinsPayload {
+    pub update: AgentPinsUpdate,
+}
+
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentPinsUpdate {
+    Pin { target: AgentAnnotationTarget },
+    Unpin { target: AgentAnnotationTarget },
+}
+```
+
+Protocol version handling:
+
+- `AgentsViewFilters.tags`, `AgentsViewPreferencesSnapshot.tags`, and
+  `AgentsViewPreferencesSnapshot.pins` must be serde-defaulted.
+- `AgentGroupMode::Tag` is a new enum variant and the tag/pin input frames are
+  new frame kinds, so Phase 2b requires a `PROTOCOL_VERSION` bump if it ships
+  after Phase 2a.
+- If Phase 2a and 2b land in one implementation branch, one protocol bump is
+  sufficient, but all additive fields still need defaults.
+
+### 10.2 Phase 2b server changes
+
+- Extend the primary-local-host store or add a sibling same-owner store for:
+  - manual tag definitions,
+  - manual tag assignments,
+  - pinned targets.
+- Compute system tag descriptors and assignments from server state on every
+  snapshot. Do not persist system tags.
+- Use `HostFilterId` + `SessionId` for durable assignments/pins and
+  `HostFilterId` + `AgentId` only as transient pre-session state.
+- Promote transient manual tag assignments and pins when a session id resolves.
+- Remove transient assignments/pins when a sessionless live agent closes.
+- Remove session assignments/pins when a session is deleted.
+- Delete-tag must strip the tag from all assignments and emit a full snapshot;
+  agents/sessions remain untouched.
+- Project/workflow/backend/origin changes recompute system tags and emit a full
+  snapshot when visible tags change.
+- Validate:
+  - non-empty tag names,
+  - unique manual tag names if the UX requires uniqueness,
+  - valid color strings,
+  - known manual tag ids for assign/remove/rename/delete,
+  - non-empty target ids,
+  - no manual mutation of system tags,
+  - primary-local-host ownership.
+- Canonicalize filters including the new tag filter dimension in the same store
+  path that already canonicalizes hosts/projects/statuses/backends/origins.
+- Fan out the existing full `AgentsViewPreferencesNotify` after every successful
+  tag or pin mutation/cleanup.
+- Add router and validator cases for `SetAgentTags` and `SetAgentPins`.
+
+### 10.3 Phase 2b frontend changes
+
+- Generate protocol bindings for tag/pin types and the extended filters/grouping.
+- Extend effective preferences to include `filters.tags` and `AgentGroupMode::Tag`.
+- Add a tag/pin optimistic overlay, or extend the existing overlay, but keep it
+  non-persisted and drop it on any full authoritative snapshot.
+- Render manual and system tag chips on rows with distinct classes.
+- Add a tag picker for assigning/removing manual tags.
+- Add tag management UI for create/rename/color/delete.
+- Add tag filter chips and `Group by tag` controls.
+- Add pin toggles on rows and a top `Pinned` section.
+- Ensure pinned rows and tag groups are deterministic functions of server
+  snapshot + overlay + ephemeral search; no local durable maps.
+- Update sidebar rendering to show tag chips and pin state from the same server
+  snapshot. The sidebar may omit management controls if the Agents Center owns
+  the full management UX.
+
+### 10.4 Phase 2b testing
 
 Native client-level tests:
 
-1. Virtual organization defaults:
-   - create a project,
-   - spawn one project agent and one no-project agent,
-   - assert bootstrap/notify exposes `Project { id }` and `NoProject`
-     placements.
-2. Project delete default behavior:
-   - delete the project,
-   - assert default placements for still-live affected agents become `NoProject`
-     or disappear if the live agent was closed; agents/sessions are not deleted.
-3. Protocol validation:
-   - invalid organization notify payloads fail validator parsing.
+1. Manual tag lifecycle:
+   - create a tag,
+   - observe full `AgentsViewPreferencesNotify`,
+   - rename and recolor it,
+   - delete it and assert assignments are stripped without deleting sessions.
+2. Session-keyed assignment:
+   - spawn an agent through the mock backend until a session id is known,
+   - assign a manual tag,
+   - close and resume/list the session,
+   - assert the assignment persists by session target.
+3. Pre-session transient promotion:
+   - assign a tag before session id resolution,
+   - resolve the session,
+   - assert the notify promotes the assignment to the session target and removes
+     the transient target.
+4. Sessionless close cleanup:
+   - assign a tag or pin to a sessionless live agent,
+   - close before session resolution,
+   - assert transient state disappears and no persisted assignment remains.
+5. System tags:
+   - create agents with backend/origin/workflow/project attributes,
+   - assert bootstrap/notify includes the expected system tag descriptors and
+     assignments,
+   - assert no system tag records are written as manual definitions.
+6. Tag filter and group:
+   - set `AgentsViewFilters.tags`,
+   - observe filtered rows through public client events or component-visible
+     state,
+   - set `AgentGroupMode::Tag` and assert grouped projection behavior.
+7. Pins:
+   - pin/unpin a session-backed agent,
+   - reconnect/resume and assert the pin persists,
+   - assert pins float to the top while still respecting active filters/search.
+8. Validation errors:
+   - unknown tag id,
+   - system tag mutation,
+   - duplicate/empty invalid reorder-like payloads if added later,
+   - non-primary host mutation,
+   - invalid target ids.
 
 Wasm/component tests:
 
-- Virtual Project and No Project groups render from organization state.
-- Empty virtual groups hide according to §7.6.
-- A filtered-out parent with a visible child renders the child as an orphan row
-  with the explanatory badge.
-
----
-
-## 10. Phase 2: custom folders, drag/drop, persistence, sidebar parity
-
-Phase 2 is independently shippable on top of Phase 1b. It adds user-created
-folders, durable placements, drag/drop, keyboard move commands, cleanup hooks,
-and full sidebar parity.
-
-### 10.1 Phase 2 protocol additions
-
-Add:
-
-- `AgentFolderCreatePayload`.
-- `AgentFolderRenamePayload`.
-- `AgentFolderDeletePayload`.
-- `AgentFolderReorderPayload`.
-- `AgentMoveToFolderPayload`.
-- `FrameKind::AgentFolderCreate`.
-- `FrameKind::AgentFolderRename`.
-- `FrameKind::AgentFolderDelete`.
-- `FrameKind::AgentFolderReorder`.
-- `FrameKind::AgentMoveToFolder`.
-
-`AgentOrganizationNotify` and its record payload are already present from Phase
-1b; Phase 2 starts emitting folder upsert/delete records in addition to placement
-records.
-
-Bump `PROTOCOL_VERSION` again if Phase 2 ships separately from Phase 1b. If
-Phase 1a, Phase 1b, and Phase 2 land in one implementation branch, a single
-protocol bump is sufficient, but every new bootstrap field still needs serde
-defaults.
-
-### 10.2 Phase 2 server changes
-
-- Add `AgentOrganizationStore` with versioned file, validation, atomic writes,
-  and missing-file empty defaults.
-- Add store path wiring to normal and test host startup.
-- Add in-memory transient placement map to `HostState`.
-- Implement folder create/rename/delete/reorder methods on `HostHandle`.
-- Implement `move_agent_to_folder` with placement precedence:
-  - if payload has a valid `session_id`, persist session assignment,
-  - else if live agent has a known session id, persist session assignment,
-  - else create/update transient assignment keyed by `AgentId`.
-- Promote transient assignments when session registration completes.
-- Remove transient assignment on agent close.
-- Remove session assignment on session delete.
-- Reparent project-scoped folders and rewrite affected placements on project
-  delete.
-- Fan out `AgentOrganizationNotify` records after each mutation or cleanup.
-- Validate router inputs and protocol validator payload parsing on `/host/<uuid>`.
-- Reject organization mutations for unknown agents, unknown folders, invalid
-  containers, cyclic folder moves, duplicate reorder ids, deleted projects, and
-  internal/ephemeral helpers.
-
-### 10.3 Phase 2 frontend changes
-
-- Render custom folder tree in the Agents Center.
-- Add folder create, rename, delete, and empty-state affordances.
-- Add drag/drop for agents and folders.
-- Add keyboard fallback for all drag/drop mutations.
-- Update sidebar to folder-outer / sub-agent-inner rendering.
-- Preserve existing parent collapse behavior inside folders.
-- Add CSS listed in §7.5.
-- Remove any remaining local durable order/filter state.
-- Surface command errors near the relevant folder/row when mutations fail.
-
-### 10.4 Phase 2 testing
-
-Native client-level tests:
-
-1. Folder lifecycle:
-   - create folder,
-   - observe `AgentOrganizationNotify::Upsert`,
-   - reconnect and assert bootstrap includes it,
-   - rename and reorder,
-   - delete and assert delete notify.
-2. Moving a resolved-session agent:
-   - spawn through mock backend until session id is known,
-   - move to folder,
-   - close agent,
-   - resume session,
-   - assert placement persists.
-3. Moving one of multiple live agents sharing a session:
-   - arrange two live agents with the same `SessionId`,
-   - move one to a folder,
-   - assert both live views render in the session-assigned container.
-4. Moving a pre-session live agent:
-   - move before session id resolves,
-   - assert transient placement notify,
-   - resolve session,
-   - assert promotion to session assignment.
-5. Sessionless close:
-   - move sessionless agent,
-   - close before session id,
-   - assert transient placement disappears and no persisted assignment remains.
-6. Project deletion cleanup:
-   - create project-scoped folder,
-   - move agent/session there,
-   - delete project,
-   - assert folder is reparented to `NoProject`, agent/session are not deleted,
-     and session project metadata follows existing detach behavior.
-7. Invalid mutations:
-   - cyclic folder parent,
-   - duplicate reorder ids,
-   - unknown agent/folder,
-   - move to `HostRoot`,
-   - internal helper agent.
-   Each should produce an observable protocol error/command error.
-
-Wasm/component tests:
-
-- Center renders custom folders, virtual groups, and empty-folder states.
-- Sidebar renders folder-outer / parent-child-inner nesting.
-- Fatal/terminated rows are greyed and hidden only when `hide_finished` is true;
-  richer finished history waits for a lifecycle field.
-- Drag/drop seam builds the correct `AgentMoveToFolder` and
-  `AgentFolderReorder` payloads.
-- Keyboard move/folder picker sends the same mutations as drag/drop.
-- Delete-folder confirmation copy makes clear that agents are not deleted.
+- Manual and system tag chips render with distinct styles from server snapshot.
+- Tag picker assign/remove emits `SetAgentTags` and updates immediately via
+  overlay without mutating durable local state.
+- Tag filters and `Group by tag` react to effective preferences.
+- Search remains ephemeral and does not alter persisted tag filters.
+- Pin toggle emits `SetAgentPins`, immediately floats/unfloats the row via
+  overlay, and reconciles on full notify.
+- A notify whose server value differs from the optimistic tag/pin overlay drops
+  the overlay and renders the server value.
+- Sidebar rows show the same tag/pin state as the Agents Center.
 
 ---
 
 ## 11. Protocol and compatibility notes
 
-- New frame kinds require a `PROTOCOL_VERSION` bump. The current constant is in
+- New frame kinds require a `PROTOCOL_VERSION` bump. The current constant is
   `protocol/src/types.rs:16`.
-- New bootstrap fields should use `#[serde(default)]` even when protocol version
-  bumps, because this repository has synthetic bootstrap builders in tests and
-  phased implementation work often constructs partial payloads.
-- Do not reuse `SetSetting` / `HostSettings` for Agents view preferences. That
-  would blur host runtime settings with client-global view preferences.
-- Do not send organization mutations over agent streams. Folders are host-owned
-  organization state, so frames route on `/host/<uuid>` like projects.
-- Validator additions are required for every new host-stream frame. Current
-  host-frame parsing already lives in `protocol/src/validator.rs` near settings
-  and project handling (`protocol/src/validator.rs:249-320`,
-  `protocol/src/validator.rs:371-388`).
-- Frontend dispatch should treat preference and organization notifies like
-  project/settings notifies for the server-owned base: replace or upsert protocol
-  state, then let reactive views render the base plus any pending overlay. Do not
-  add a refresh button as a stale-state workaround.
+- Additive bootstrap/snapshot fields must use `#[serde(default)]`, even with a
+  protocol bump, because tests and staged implementation frequently construct
+  partial payloads.
+- Do not reuse `SetSetting` / `HostSettings` for Agents view preferences,
+  Smart Views, tags, or pins. This is client-global Agents-view state, not host
+  runtime settings.
+- Do not send Smart View, tag, or pin mutations over agent streams. They are
+  primary-local-host-owned view/organization state, so frames route on the host
+  stream like `SetAgentsViewPreferences`.
+- Validator additions are required for every new host-stream frame.
+- Frontend dispatch should treat `AgentsViewPreferencesNotify` as the full
+  authoritative snapshot for preferences, Smart Views, tags, and pins. Apply it
+  to state, drop overlays, and let reactive views render.
 - Pending overlays are frontend interaction state, not protocol state. They must
   be non-persistent, domain-scoped, and reconciled by server notifies/bootstrap.
+- Search is never persisted and must not appear in Smart View, tag, pin, or
+  preference payloads.
 
 ---
 
 ## 12. Open risks
 
-### 12.1 Primary-host preference ownership
+### 12.1 Auto-derived tag taxonomy
 
-The preference ownership rule is decided for Phase 1a: one primary local host owns
-the client-global Agents view preference store. Remote hosts do not emit
-competing snapshots and do not accept `SetAgentsViewPreferences`. The remaining
-implementation risk is plumbing: startup must identify the primary local host
-before remote bootstraps can arrive, and dispatch must ignore/diagnose accidental
-remote preference snapshots instead of replacing the global signal.
+The first system-tag set needs product decisions: exact ids, labels, colors, and
+sources for backend, origin, workflow, sub-agent, team/custom-agent, and project
+tags. These ids must be stable enough to persist in `AgentsViewFilters.tags`.
 
-### 12.2 Stable configured-host identity
+### 12.2 Built-in Smart View semantics
 
-Host filters and transient `AgentOrderKey::TransientAgent` keys must use
-`HostFilterId`, a protocol newtype wrapping the stable configured-connection id.
-Current frontend agent keys include `host_id: String`
-(`frontend/src/state.rs:52-60`, `frontend/src/state.rs:72-88`), but persisted
-preferences must not use stream paths or per-connection ids. Phase 1a is not
-shippable until the bridge/host-registry path can provide the durable configured
-id to preference rendering and mutation payloads.
+The built-in labels are clear, but exact query semantics may need user approval:
+which statuses count as `Active`, whether terminated includes all fatal rows, and
+whether built-ins should use `Flat` or preserve the user's current group mode.
 
-### 12.3 Finished-agent semantics
+### 12.3 Tags and pins for agents that never get a session id
 
-Current frontend status is derived from `started`, `fatal_error`, streaming maps,
-turn-active maps, and compaction maps. There is no explicit server-emitted
-"finished but still visible" lifecycle state. If the UX needs greyed finished
-agents beyond fatal/terminated rows, add a typed lifecycle field instead of
-encoding it as frontend inference.
+The decided rule is transient-by-agent until session resolution, then
+session-keyed persistence. Agents that close without a session id lose transient
+tag/pin state. That is consistent, but the UX should avoid implying such state
+survives restart before a session exists.
 
-### 12.4 Project deletion reparenting
+### 12.4 Active Smart View and optimistic overlays
 
-Reparenting project-scoped folders to `NoProject` preserves user organization but
-may surprise users who expected project folders to disappear with the project.
-The delete confirmation and release notes should state this clearly.
+`SetActive` changes both active view id and active preferences. The frontend must
+avoid two independent overlays fighting each other. Preferred behavior is one
+view-selection overlay that sets the copied preference domains and pending active
+view id, then drops both on the full snapshot.
 
-### 12.5 Drag/drop accessibility and mobile behavior
+### 12.5 Remote host target stability
 
-HTML drag/drop is already used in the Agent Monitor, but it is weak on touch
-surfaces and inaccessible without keyboard alternatives. Phase 2 is not done
-until keyboard and screen-reader flows are tested.
+Phase 1a drops unverifiable remote transient manual-order keys
+(`server/src/host.rs:4487-4492`). Tags and pins should avoid the same ambiguity by
+including `HostFilterId` in both session and transient targets. The remaining
+risk is ensuring every connected host has a stable configured id before tag/pin
+mutations are enabled.
 
-### 12.6 Multiple live agents sharing a session
+### 12.6 Store boundaries and load errors
 
-The Phase 2 rule is decided: durable placement is keyed by `SessionId`, so all
-live agents that share a session move together. This matches the absence of a
-reverse-uniqueness invariant in current host state and keeps the persistence
-model simple. Phase 2 must add a client-level test for this shared-move behavior.
-If users later need per-live-agent divergence for duplicated session views, that
-requires a new explicit placement key and migration plan.
+Smart Views can cleanly extend `AgentsViewPreferencesStore`. Tags and pins may be
+large enough to justify a sibling store. If split, the protocol still needs one
+merged full snapshot and typed per-domain load errors. The implementation must
+not panic or silently discard one store's corrupt state.
 
-### 12.7 Notify ordering during session promotion
+### 12.7 Tag grouping duplication
 
-A move can happen before `AgentStart` supplies a session id. Promotion from
-transient assignment to session assignment must not briefly render the agent in
-its default group. The server should emit delete/upsert notifies in one serialized
-host-state path, and the frontend should apply them in sequence.
+Agents can have multiple manual and system tags. `Group by tag` duplicates rows
+under multiple groups unless the UX chooses a primary-tag rule. Duplication is
+more transparent, but it may surprise users and should be validated in UI tests.
