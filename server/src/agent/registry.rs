@@ -34,8 +34,14 @@ pub(crate) struct AgentStatus {
     pub terminated: bool,
     pub is_thinking: bool,
     pub turn_completed: bool,
+    pub pending_user_response: Option<PendingUserResponseKind>,
     pub last_error: Option<String>,
     pub activity_counter: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingUserResponseKind {
+    PlanApproval,
 }
 
 impl AgentStatus {
@@ -43,9 +49,15 @@ impl AgentStatus {
         !self.terminated && (!self.started || self.is_thinking || !self.turn_completed)
     }
 
+    pub fn is_plan_approval_pending(&self) -> bool {
+        self.pending_user_response.is_some()
+    }
+
     pub fn status(&self) -> AgentControlStatus {
         if self.terminated && self.last_error.is_some() {
             AgentControlStatus::Failed
+        } else if self.is_plan_approval_pending() {
+            AgentControlStatus::Idle
         } else if self.is_active() {
             AgentControlStatus::Thinking
         } else {

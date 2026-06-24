@@ -1024,10 +1024,10 @@ async fn await_result_from_snapshot(
             agent_id: agent_id.0.clone(),
             status: status.status(),
         };
-        if status.is_active() {
-            still_thinking.push(entry);
-        } else {
+        if status.is_plan_approval_pending() || !status.is_active() {
             ready.push(entry);
+        } else {
+            still_thinking.push(entry);
         }
     }
 

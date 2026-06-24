@@ -1231,20 +1231,26 @@ pub(crate) fn spawn_agent_actor(
                                 compaction.error = Some("compaction summary turn was cancelled".to_owned());
                             }
                             status_handle.update(|s| {
+                                s.pending_user_response = None;
                                 s.turn_completed = true;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
                         ChatEvent::ToolRequest(request) => {
-                            if matches!(
+                            let waiting_for_plan_approval = matches!(
                                 &request.tool_type,
                                 protocol::ToolRequestType::ExitPlanMode { .. }
-                            ) {
+                            );
+                            if waiting_for_plan_approval {
                                 pending_tool_response_ids.insert(request.tool_call_id.clone());
                                 in_turn = true;
                                 idle_transition_armed = false;
                             }
                             status_handle.update(|s| {
+                                if waiting_for_plan_approval {
+                                    s.pending_user_response =
+                                        Some(registry::PendingUserResponseKind::PlanApproval);
+                                }
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
@@ -1271,6 +1277,11 @@ pub(crate) fn spawn_agent_actor(
                                 idle_transition_armed = false;
                             }
                             status_handle.update(|s| {
+                                if completed_pending_response && pending_tool_response_ids.is_empty() {
+                                    s.pending_user_response = None;
+                                    s.turn_completed = false;
+                                    s.is_thinking = true;
+                                }
                                 if interrupted_tool_ends_turn {
                                     s.turn_completed = true;
                                     s.is_thinking = false;
@@ -1496,6 +1507,15 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::User) | None => None,
                                     };
                                     let is_tool_response = msg.tool_response.is_some();
+                                    let plan_response = match msg.tool_response.as_ref() {
+                                        Some(protocol::SendMessageToolResponse::ExitPlanMode {
+                                            tool_call_id,
+                                            ..
+                                        }) if pending_tool_response_ids.contains(tool_call_id) => {
+                                            Some(pending_tool_response_ids.len() == 1)
+                                        }
+                                        _ => None,
+                                    };
                                     if in_turn && !is_tool_response {
                                         let queued_message_id =
                                             QueuedMessageId(Uuid::new_v4().to_string());
@@ -1594,6 +1614,19 @@ pub(crate) fn spawn_agent_actor(
                                             )
                                             .await;
                                             return;
+                                        }
+                                        if let Some(clear_pending_response) = plan_response {
+                                            status_handle
+                                                .update(|s| {
+                                                    if clear_pending_response {
+                                                        s.pending_user_response = None;
+                                                    }
+                                                    s.turn_completed = false;
+                                                    s.is_thinking = true;
+                                                    s.activity_counter =
+                                                        s.activity_counter.saturating_add(1);
+                                                })
+                                                .await;
                                         }
                                         if let Some(review_id) = review_origin {
                                             tracing::debug!(
@@ -2087,7 +2120,11 @@ pub(crate) fn spawn_agent_actor(
                                 )
                                 .await;
                             }
-                            if !in_turn {
+                            let waiting_for_user_response = !pending_tool_response_ids.is_empty();
+                            if waiting_for_user_response {
+                                pending_tool_response_ids.clear();
+                            }
+                            if !in_turn || waiting_for_user_response {
                                 let reply = close_reply
                                     .take()
                                     .expect("close requested without pending close reply");
@@ -2145,6 +2182,7 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut current_start = start;
         let mut pending_alias = None;
         let mut in_turn = false;
+        let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
 
@@ -2181,6 +2219,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             s.terminated = true;
                             s.is_thinking = false;
                             s.turn_completed = true;
+                            s.pending_user_response = None;
                             s.activity_counter = s.activity_counter.saturating_add(1);
                         }).await;
                         // The subagent's backend event stream is done, but the
@@ -2246,8 +2285,38 @@ pub(crate) fn spawn_relay_agent_actor(
                             }).await;
                         }
                         ChatEvent::OperationCancelled(_) => {
+                            pending_tool_response_ids.clear();
                             status_handle.update(|s| {
+                                s.pending_user_response = None;
                                 s.turn_completed = true;
+                                s.activity_counter = s.activity_counter.saturating_add(1);
+                            }).await;
+                        }
+                        ChatEvent::ToolRequest(request) => {
+                            let waiting_for_plan_approval = matches!(
+                                &request.tool_type,
+                                protocol::ToolRequestType::ExitPlanMode { .. }
+                            );
+                            if waiting_for_plan_approval {
+                                pending_tool_response_ids.insert(request.tool_call_id.clone());
+                            }
+                            status_handle.update(|s| {
+                                if waiting_for_plan_approval {
+                                    s.pending_user_response =
+                                        Some(registry::PendingUserResponseKind::PlanApproval);
+                                }
+                                s.activity_counter = s.activity_counter.saturating_add(1);
+                            }).await;
+                        }
+                        ChatEvent::ToolExecutionCompleted(completion) => {
+                            let completed_pending_response =
+                                pending_tool_response_ids.remove(&completion.tool_call_id);
+                            status_handle.update(|s| {
+                                if completed_pending_response && pending_tool_response_ids.is_empty() {
+                                    s.pending_user_response = None;
+                                    s.turn_completed = false;
+                                    s.is_thinking = true;
+                                }
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
@@ -2348,7 +2417,11 @@ pub(crate) fn spawn_relay_agent_actor(
                             }
                             lifecycle = ActorLifecycle::Closing;
                             close_reply = Some(reply);
-                            if !in_turn {
+                            let waiting_for_user_response = !pending_tool_response_ids.is_empty();
+                            if waiting_for_user_response {
+                                pending_tool_response_ids.clear();
+                            }
+                            if !in_turn || waiting_for_user_response {
                                 let reply = close_reply
                                     .take()
                                     .expect("close requested without pending close reply");
@@ -2408,6 +2481,7 @@ async fn finish_actor_close(
             s.terminated = true;
             s.is_thinking = false;
             s.turn_completed = true;
+            s.pending_user_response = None;
             s.activity_counter = s.activity_counter.saturating_add(1);
         })
         .await;
@@ -2488,6 +2562,7 @@ async fn enter_terminal_failure(context: TerminalFailureContext<'_>, payload: &A
             s.terminated = true;
             s.is_thinking = false;
             s.turn_completed = true;
+            s.pending_user_response = None;
             s.last_error = Some(payload.message.clone());
             s.activity_counter = s.activity_counter.saturating_add(1);
         })

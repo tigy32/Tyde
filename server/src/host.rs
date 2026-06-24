@@ -971,7 +971,7 @@ impl HostHandle {
                     format!("team member {} agent {agent_id} is terminated", member.id),
                 ));
             }
-            if status.is_active() {
+            if status.is_active() || status.is_plan_approval_pending() {
                 return Err(AppError::conflict(
                     OPERATION,
                     format!("team member {} agent {agent_id} is not idle", member.id),
@@ -3870,7 +3870,7 @@ impl HostHandle {
         let queued = self
             .agent_status_snapshot(&agent_id)
             .await
-            .map(|status| status.is_active())
+            .map(|status| status.is_active() || status.is_plan_approval_pending())
             .unwrap_or(false);
         let events = registry
             .record_member_activity(plan.member.id.clone(), AgentControlStatus::Thinking)
@@ -3947,6 +3947,10 @@ impl HostHandle {
                 if let Some(status) = self.agent_status_snapshot(&agent_id).await {
                     let events = if status.terminated {
                         registry.clear_binding_by_agent(agent_id.clone()).await?
+                    } else if status.is_plan_approval_pending() {
+                        registry
+                            .record_agent_activity(agent_id.clone(), AgentControlStatus::Thinking)
+                            .await?
                     } else {
                         registry
                             .record_agent_activity(agent_id.clone(), status.status())
@@ -8166,6 +8170,10 @@ fn spawn_host_team_status_task(host: HostHandle) {
                 let registry = { host.state.lock().await.team_registry.clone() };
                 let result = if status.terminated {
                     registry.clear_binding_by_agent(agent_id.clone()).await
+                } else if status.is_plan_approval_pending() {
+                    registry
+                        .record_agent_activity(agent_id.clone(), AgentControlStatus::Thinking)
+                        .await
                 } else {
                     registry
                         .record_agent_activity(agent_id.clone(), status.status())

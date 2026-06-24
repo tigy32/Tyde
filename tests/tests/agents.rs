@@ -8,8 +8,9 @@ use protocol::{
     ClientErrorCode, ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope,
     FrameKind, HostBootstrapPayload, ListSessionsPayload, MessageSender, NewAgentPayload, Project,
     ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectId,
-    ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SessionListPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath, write_envelope,
+    ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SendMessagePayload,
+    SendMessageToolResponse, SessionListPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    ToolRequest, write_envelope,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -382,6 +383,74 @@ async fn mcp_spawn_agent(url: &str, prompt: &str, name: &str) -> protocol::Agent
     protocol::AgentId(agent_id.to_string())
 }
 
+async fn mcp_await_agent(url: &str, agent_id: &protocol::AgentId) -> Value {
+    let response = post_json(
+        url,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "tyde_await_agents",
+                "arguments": {
+                    "agent_ids": [agent_id.0.clone()]
+                }
+            }
+        }),
+    )
+    .await;
+    let result = response
+        .get("result")
+        .unwrap_or_else(|| panic!("MCP response missing result: {response}"));
+    let is_error = result
+        .get("isError")
+        .or_else(|| result.get("is_error"))
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| panic!("MCP result missing isError: {response}"));
+    assert!(!is_error, "MCP tool call failed: {response}");
+    let text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|entry| entry.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("MCP response missing content text: {response}"));
+    serde_json::from_str(text).expect("parse MCP tool payload JSON")
+}
+
+async fn mcp_list_agents(url: &str) -> Value {
+    let response = post_json(
+        url,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "tyde_list_agents",
+                "arguments": {}
+            }
+        }),
+    )
+    .await;
+    let result = response
+        .get("result")
+        .unwrap_or_else(|| panic!("MCP response missing result: {response}"));
+    let is_error = result
+        .get("isError")
+        .or_else(|| result.get("is_error"))
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| panic!("MCP result missing isError: {response}"));
+    assert!(!is_error, "MCP tool call failed: {response}");
+    let text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|entry| entry.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("MCP response missing content text: {response}"));
+    serde_json::from_str(text).expect("parse MCP tool payload JSON")
+}
+
 async fn expect_project_notify(
     client: &mut client::Connection,
     context: &str,
@@ -394,6 +463,64 @@ async fn expect_project_notify(
 
 fn assert_awaited_agent_idle(result: &tyde_dev_driver::agent_control::AwaitAgentStatus) {
     assert_eq!(result.status, AgentControlStatus::Idle);
+}
+
+fn assert_await_result_ready(body: &Value, agent_id: &protocol::AgentId) {
+    let ready = body
+        .get("ready")
+        .and_then(Value::as_array)
+        .expect("await result missing ready array");
+    let still_thinking = body
+        .get("still_thinking")
+        .and_then(Value::as_array)
+        .expect("await result missing still_thinking array");
+    assert!(
+        still_thinking.is_empty(),
+        "plan-pending await should not report still_thinking: {body}"
+    );
+    assert_eq!(
+        ready.len(),
+        1,
+        "await result should contain one ready agent"
+    );
+    assert_eq!(
+        ready[0].get("agent_id").and_then(Value::as_str),
+        Some(agent_id.0.as_str())
+    );
+    assert_eq!(ready[0].get("status").and_then(Value::as_str), Some("idle"));
+}
+
+async fn wait_for_agent_control_status(
+    url: &str,
+    agent_id: &protocol::AgentId,
+    expected_status: &str,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let agents = mcp_list_agents(url).await;
+        let matching = agents
+            .as_array()
+            .unwrap_or_else(|| panic!("list agents result was not an array: {agents}"))
+            .iter()
+            .find(|agent| {
+                agent.get("agent_id").and_then(Value::as_str) == Some(agent_id.0.as_str())
+            })
+            .unwrap_or_else(|| panic!("agent {} missing from list result: {agents}", agent_id.0));
+        let status = matching
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("agent status missing from list result: {agents}"));
+        if status == expected_status {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for agent {} status {expected_status}; last status: {status}",
+            agent_id.0,
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 struct ProgressRecorder {
@@ -605,6 +732,33 @@ async fn expect_chat_event_on_stream(
         let env = expect_chat_event(client, context).await;
         if env.kind == FrameKind::ChatEvent && env.stream == *stream {
             return env;
+        }
+    }
+}
+
+async fn wait_for_exit_plan_mode_pause_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+) -> ToolRequest {
+    let mut tool_request = None;
+    let mut saw_pause = false;
+    loop {
+        let env = expect_chat_event_on_stream(client, stream, "ExitPlanMode pause").await;
+        let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+        match event {
+            ChatEvent::ToolRequest(request) => {
+                assert_eq!(request.tool_name, "ExitPlanMode");
+                assert!(matches!(
+                    &request.tool_type,
+                    protocol::ToolRequestType::ExitPlanMode { .. }
+                ));
+                tool_request = Some(request);
+            }
+            ChatEvent::TypingStatusChanged(false) => saw_pause = true,
+            _ => {}
+        }
+        if saw_pause && let Some(request) = tool_request {
+            return request;
         }
     }
 }
@@ -1478,6 +1632,278 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
     let listed_after_follow_up = control.list_agents().await;
     assert_eq!(listed_after_follow_up.len(), 1);
     assert_eq!(listed_after_follow_up[0].status, AgentControlStatus::Idle);
+}
+
+#[tokio::test]
+async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("await-exit-plan-mode".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/await-exit-plan-mode".to_owned()],
+                prompt: "__mock_exit_plan_mode__".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn ExitPlanMode agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "ExitPlanMode NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse ExitPlanMode NewAgent");
+
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "ExitPlanMode AgentStart",
+    )
+    .await;
+    assert_eq!(start.agent_id, new_agent.agent_id);
+
+    let request =
+        wait_for_exit_plan_mode_pause_on_stream(&mut fixture.client, &new_agent.instance_stream)
+            .await;
+
+    let base_url = fixture.agent_control_http_url().await;
+    let pending_await = tokio::time::timeout(
+        Duration::from_secs(2),
+        mcp_await_agent(&base_url, &new_agent.agent_id),
+    )
+    .await
+    .expect("tyde_await_agents must return while plan approval is pending");
+    assert_await_result_ready(&pending_await, &new_agent.agent_id);
+
+    fixture
+        .client
+        .send_message_payload(
+            &new_agent.instance_stream,
+            SendMessagePayload {
+                message: String::new(),
+                images: None,
+                origin: None,
+                tool_response: Some(SendMessageToolResponse::ExitPlanMode {
+                    tool_call_id: request.tool_call_id,
+                    decision: protocol::ExitPlanModeDecision::Approve,
+                    feedback: None,
+                }),
+            },
+        )
+        .await
+        .expect("send ExitPlanMode approval");
+
+    let resumed_await = tokio::time::timeout(
+        Duration::from_secs(5),
+        mcp_await_agent(&base_url, &new_agent.agent_id),
+    )
+    .await
+    .expect("tyde_await_agents must return after plan approval resumes the turn");
+    assert_await_result_ready(&resumed_await, &new_agent.agent_id);
+
+    let mut saw_completion = false;
+    let mut saw_approval = false;
+    let mut saw_final_idle = false;
+    loop {
+        let env = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &new_agent.instance_stream,
+            "ExitPlanMode approval completion",
+        )
+        .await;
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        match event {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_name == "ExitPlanMode" =>
+            {
+                assert!(completion.success);
+                saw_completion = true;
+            }
+            ChatEvent::StreamEnd(end)
+                if end.message.content.contains("mock ExitPlanMode approved") =>
+            {
+                saw_approval = true;
+            }
+            ChatEvent::TypingStatusChanged(false) if saw_approval => {
+                saw_final_idle = true;
+            }
+            _ => {}
+        }
+        if saw_completion && saw_approval && saw_final_idle {
+            break;
+        }
+    }
+
+    fixture
+        .client
+        .send_message(&new_agent.instance_stream, "after plan approval".to_owned())
+        .await
+        .expect("send follow-up after plan approval");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "mock backend response to: after plan approval",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("await-exit-plan-mode-resume".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/await-exit-plan-mode-resume".to_owned()],
+                prompt: "__mock_exit_plan_mode_stream_end_first__".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn stream-end-first ExitPlanMode agent failed");
+
+    let env = expect_next_event(
+        &mut fixture.client,
+        "stream-end-first ExitPlanMode NewAgent",
+    )
+    .await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env
+        .parse_payload()
+        .expect("parse stream-end-first NewAgent");
+
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "stream-end-first ExitPlanMode AgentStart",
+    )
+    .await;
+    assert_eq!(start.agent_id, new_agent.agent_id);
+
+    let request =
+        wait_for_exit_plan_mode_pause_on_stream(&mut fixture.client, &new_agent.instance_stream)
+            .await;
+
+    let base_url = fixture.agent_control_http_url().await;
+    let pending_await = tokio::time::timeout(
+        Duration::from_secs(2),
+        mcp_await_agent(&base_url, &new_agent.agent_id),
+    )
+    .await
+    .expect("tyde_await_agents must return while stream-end-first plan approval is pending");
+    assert_await_result_ready(&pending_await, &new_agent.agent_id);
+
+    fixture
+        .client
+        .send_message_payload(
+            &new_agent.instance_stream,
+            SendMessagePayload {
+                message: String::new(),
+                images: None,
+                origin: None,
+                tool_response: Some(SendMessageToolResponse::ExitPlanMode {
+                    tool_call_id: request.tool_call_id,
+                    decision: protocol::ExitPlanModeDecision::Approve,
+                    feedback: None,
+                }),
+            },
+        )
+        .await
+        .expect("send stream-end-first ExitPlanMode approval");
+
+    wait_for_agent_control_status(
+        &base_url,
+        &new_agent.agent_id,
+        "thinking",
+        Duration::from_millis(500),
+    )
+    .await;
+
+    let mut saw_completion = false;
+    while !saw_completion {
+        let env = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &new_agent.instance_stream,
+            "stream-end-first ExitPlanMode completion",
+        )
+        .await;
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        if let ChatEvent::ToolExecutionCompleted(completion) = event
+            && completion.tool_name == "ExitPlanMode"
+        {
+            assert!(completion.success);
+            saw_completion = true;
+        }
+    }
+
+    wait_for_agent_control_status(
+        &base_url,
+        &new_agent.agent_id,
+        "thinking",
+        Duration::from_millis(500),
+    )
+    .await;
+
+    let await_while_resuming = tokio::time::timeout(
+        Duration::from_millis(150),
+        mcp_await_agent(&base_url, &new_agent.agent_id),
+    )
+    .await;
+    assert!(
+        await_while_resuming.is_err(),
+        "tyde_await_agents must not report ready between plan approval completion and resumed turn finish"
+    );
+
+    let mut saw_approval = false;
+    let mut saw_final_idle = false;
+    loop {
+        let env = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &new_agent.instance_stream,
+            "stream-end-first resumed turn finish",
+        )
+        .await;
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        match event {
+            ChatEvent::StreamEnd(end)
+                if end.message.content.contains("mock ExitPlanMode approved") =>
+            {
+                saw_approval = true;
+            }
+            ChatEvent::TypingStatusChanged(false) if saw_approval => {
+                saw_final_idle = true;
+            }
+            _ => {}
+        }
+        if saw_approval && saw_final_idle {
+            break;
+        }
+    }
+
+    let finished_await = tokio::time::timeout(
+        Duration::from_secs(2),
+        mcp_await_agent(&base_url, &new_agent.agent_id),
+    )
+    .await
+    .expect("tyde_await_agents must return after stream-end-first resumed turn finishes");
+    assert_await_result_ready(&finished_await, &new_agent.agent_id);
 }
 
 #[tokio::test]

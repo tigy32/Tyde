@@ -47,6 +47,8 @@ pub(crate) const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_
 pub(crate) const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str =
     "__mock_tool_failure_without_idle__";
 const MOCK_EXIT_PLAN_MODE_SENTINEL: &str = "__mock_exit_plan_mode__";
+const MOCK_EXIT_PLAN_MODE_STREAM_END_FIRST_SENTINEL: &str =
+    "__mock_exit_plan_mode_stream_end_first__";
 const MOCK_HISTORY_SENTINEL: &str = "__mock_history__";
 const MOCK_FAILED_TOOL_CALL_ID: &str = "mock-failed-tool";
 const MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID: &str = "mock-exit-plan-tool";
@@ -63,6 +65,13 @@ const MOCK_EXIT_PLAN_MODE_PLAN_PATH: &str = "/tmp/mock/.claude/plans/mock-plan.m
 const MOCK_SLOW_SLEEP_MS: u64 = 4_000;
 /// Sleep for __mock_die_after_busy__ — just enough for tests to queue messages.
 const MOCK_DIE_SLEEP_MS: u64 = 300;
+const MOCK_EXIT_PLAN_MODE_RESUME_DELAY_MS: u64 = 1_000;
+
+struct PendingExitPlanMode {
+    tool_call_id: String,
+    delay_before_completion: Duration,
+    delay_after_completion: Duration,
+}
 
 #[derive(Debug, Clone)]
 struct MockSessionRecord {
@@ -387,11 +396,30 @@ fn start_mock_command_loop(
                     return;
                 }
                 holding_until_interrupt = true;
-            } else if initial_message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL) {
-                if emit_exit_plan_mode_request(&events_tx).await.is_none() {
+            } else if initial_message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL)
+                || initial_message.contains(MOCK_EXIT_PLAN_MODE_STREAM_END_FIRST_SENTINEL)
+            {
+                let stream_end_before_request =
+                    initial_message.contains(MOCK_EXIT_PLAN_MODE_STREAM_END_FIRST_SENTINEL);
+                if emit_exit_plan_mode_request(&events_tx, stream_end_before_request)
+                    .await
+                    .is_none()
+                {
                     return;
                 }
-                pending_exit_plan_mode = Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
+                pending_exit_plan_mode = Some(PendingExitPlanMode {
+                    tool_call_id: MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned(),
+                    delay_before_completion: if stream_end_before_request {
+                        Duration::from_millis(MOCK_EXIT_PLAN_MODE_RESUME_DELAY_MS)
+                    } else {
+                        Duration::ZERO
+                    },
+                    delay_after_completion: if stream_end_before_request {
+                        Duration::from_millis(MOCK_EXIT_PLAN_MODE_RESUME_DELAY_MS)
+                    } else {
+                        Duration::ZERO
+                    },
+                });
             } else if initial_message.contains(MOCK_ERROR_WITHOUT_IDLE_SENTINEL) {
                 emit_mock_error(&events_tx, "mock backend emitted error without idle");
             } else if initial_message.contains(MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL) {
@@ -444,11 +472,33 @@ fn start_mock_command_loop(
                         continue;
                     }
                     record_prompt(&session_id_for_task, &payload.message);
-                    if payload.message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL) {
-                        if emit_exit_plan_mode_request(&events_tx).await.is_none() {
+                    if payload.message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL)
+                        || payload
+                            .message
+                            .contains(MOCK_EXIT_PLAN_MODE_STREAM_END_FIRST_SENTINEL)
+                    {
+                        let stream_end_before_request = payload
+                            .message
+                            .contains(MOCK_EXIT_PLAN_MODE_STREAM_END_FIRST_SENTINEL);
+                        if emit_exit_plan_mode_request(&events_tx, stream_end_before_request)
+                            .await
+                            .is_none()
+                        {
                             return;
                         }
-                        pending_exit_plan_mode = Some(MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned());
+                        pending_exit_plan_mode = Some(PendingExitPlanMode {
+                            tool_call_id: MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID.to_owned(),
+                            delay_before_completion: if stream_end_before_request {
+                                Duration::from_millis(MOCK_EXIT_PLAN_MODE_RESUME_DELAY_MS)
+                            } else {
+                                Duration::ZERO
+                            },
+                            delay_after_completion: if stream_end_before_request {
+                                Duration::from_millis(MOCK_EXIT_PLAN_MODE_RESUME_DELAY_MS)
+                            } else {
+                                Duration::ZERO
+                            },
+                        });
                     } else if payload.message.contains(MOCK_ERROR_WITHOUT_IDLE_SENTINEL) {
                         emit_mock_error(&events_tx, "mock backend emitted error without idle");
                     } else if payload
@@ -729,28 +779,74 @@ async fn emit_turn(
 
 async fn emit_exit_plan_mode_request(
     events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    stream_end_before_request: bool,
 ) -> Option<String> {
-    let message_id = Some(Uuid::new_v4().to_string());
     if events_tx
         .send(ChatEvent::TypingStatusChanged(true))
         .is_err()
     {
         return None;
     }
-    if events_tx
-        .send(ChatEvent::StreamStart(StreamStartData {
-            message_id: message_id.clone(),
-            agent: "mock".to_owned(),
-            model: Some(MOCK_MODEL.to_owned()),
-        }))
-        .is_err()
-    {
-        return None;
-    }
-    if events_tx
-        .send(ChatEvent::StreamDelta(StreamTextDeltaData {
-            message_id: message_id.clone(),
-            text: "mock ExitPlanMode waiting for approval".to_owned(),
+    if stream_end_before_request {
+        let message_id = Some(Uuid::new_v4().to_string());
+        if events_tx
+            .send(ChatEvent::StreamStart(StreamStartData {
+                message_id: message_id.clone(),
+                agent: "mock".to_owned(),
+                model: Some(MOCK_MODEL.to_owned()),
+            }))
+            .is_err()
+        {
+            return None;
+        }
+        if events_tx
+            .send(ChatEvent::StreamDelta(StreamTextDeltaData {
+                message_id: message_id.clone(),
+                text: "mock ExitPlanMode waiting for approval".to_owned(),
+            }))
+            .is_err()
+        {
+            return None;
+        }
+        if events_tx
+            .send(ChatEvent::StreamEnd(StreamEndData {
+                message: ChatMessage {
+                    message_id: message_id.map(protocol::ChatMessageId),
+                    timestamp: now_ms(),
+                    sender: MessageSender::Assistant {
+                        agent: "mock".to_owned(),
+                    },
+                    content: "mock ExitPlanMode waiting for approval".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: Some(ModelInfo {
+                        model: MOCK_MODEL.to_owned(),
+                    }),
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+            }))
+            .is_err()
+        {
+            return None;
+        }
+    } else if events_tx
+        .send(ChatEvent::MessageAdded(ChatMessage {
+            message_id: Some(protocol::ChatMessageId(Uuid::new_v4().to_string())),
+            timestamp: now_ms(),
+            sender: MessageSender::Assistant {
+                agent: "mock".to_owned(),
+            },
+            content: "mock ExitPlanMode waiting for approval".to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: Some(ModelInfo {
+                model: MOCK_MODEL.to_owned(),
+            }),
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
         }))
         .is_err()
     {
@@ -771,29 +867,6 @@ async fn emit_exit_plan_mode_request(
         return None;
     }
     if events_tx
-        .send(ChatEvent::StreamEnd(StreamEndData {
-            message: ChatMessage {
-                message_id: message_id.map(protocol::ChatMessageId),
-                timestamp: now_ms(),
-                sender: MessageSender::Assistant {
-                    agent: "mock".to_owned(),
-                },
-                content: "mock ExitPlanMode waiting for approval".to_owned(),
-                reasoning: None,
-                tool_calls: Vec::new(),
-                model_info: Some(ModelInfo {
-                    model: MOCK_MODEL.to_owned(),
-                }),
-                token_usage: None,
-                context_breakdown: None,
-                images: None,
-            },
-        }))
-        .is_err()
-    {
-        return None;
-    }
-    if events_tx
         .send(ChatEvent::TypingStatusChanged(false))
         .is_err()
     {
@@ -805,7 +878,7 @@ async fn emit_exit_plan_mode_request(
 async fn handle_exit_plan_mode_tool_response(
     events_tx: &mpsc::UnboundedSender<ChatEvent>,
     session_id: &SessionId,
-    pending_exit_plan_mode: &mut Option<String>,
+    pending_exit_plan_mode: &mut Option<PendingExitPlanMode>,
     tool_response: protocol::SendMessageToolResponse,
 ) {
     let protocol::SendMessageToolResponse::ExitPlanMode {
@@ -813,25 +886,39 @@ async fn handle_exit_plan_mode_tool_response(
         decision,
         feedback,
     } = tool_response;
-    let Some(pending_tool_call_id) = pending_exit_plan_mode.as_deref() else {
+    let Some(pending) = pending_exit_plan_mode.as_ref() else {
         emit_mock_error(
             events_tx,
             "No matching pending tool request is waiting for that response.",
         );
         return;
     };
-    if pending_tool_call_id != tool_call_id {
+    if pending.tool_call_id != tool_call_id {
         emit_mock_error(
             events_tx,
             &format!(
-                "ExitPlanMode response targeted stale tool_call_id {tool_call_id}; pending tool_call_id is {pending_tool_call_id}."
+                "ExitPlanMode response targeted stale tool_call_id {tool_call_id}; pending tool_call_id is {}.",
+                pending.tool_call_id
             ),
         );
         return;
     }
 
-    *pending_exit_plan_mode = None;
-    emit_exit_plan_mode_completion(events_tx, session_id, &tool_call_id, decision, feedback).await;
+    let pending = pending_exit_plan_mode
+        .take()
+        .expect("pending ExitPlanMode response disappeared after validation");
+    if !pending.delay_before_completion.is_zero() {
+        sleep(pending.delay_before_completion).await;
+    }
+    emit_exit_plan_mode_completion(
+        events_tx,
+        session_id,
+        &tool_call_id,
+        decision,
+        feedback,
+        pending.delay_after_completion,
+    )
+    .await;
 }
 
 async fn emit_exit_plan_mode_completion(
@@ -840,6 +927,7 @@ async fn emit_exit_plan_mode_completion(
     tool_call_id: &str,
     decision: protocol::ExitPlanModeDecision,
     feedback: Option<String>,
+    delay_after_completion: Duration,
 ) -> bool {
     let approved = decision == protocol::ExitPlanModeDecision::Approve;
     let decision_label = if approved { "approved" } else { "rejected" };
@@ -870,6 +958,9 @@ async fn emit_exit_plan_mode_completion(
         .is_err()
     {
         return false;
+    }
+    if !delay_after_completion.is_zero() {
+        sleep(delay_after_completion).await;
     }
     emit_turn(events_tx, session_id, &message, false).await
 }
