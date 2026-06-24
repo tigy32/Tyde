@@ -30,6 +30,8 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
+use crate::process_env;
+
 pub const DEBUG_REPO_ROOT_HEADER: &str = "x-tyde-debug-repo-root";
 const MOBILE_PAIRINGS_STORE_PATH_ENV: &str = "TYDE_MOBILE_PAIRINGS_STORE_PATH";
 const START_TIMEOUT: Duration = Duration::from_secs(105);
@@ -614,6 +616,9 @@ fn tauri_dev_command(repo_root: &Path, config_path: &Path) -> Result<Command, St
         command
     };
     command.arg("--config").arg(config_path).arg("--no-watch");
+    if let Some(path) = process_env::resolved_child_process_path() {
+        command.env("PATH", path);
+    }
     Ok(command)
 }
 
@@ -730,6 +735,36 @@ mod tests {
             rendered.contains("--no-watch"),
             "expected tauri dev command to disable watch, got {rendered}"
         );
+    }
+
+    #[test]
+    fn tauri_dev_command_sets_resolved_path() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .to_path_buf();
+        let config_path = repo_root.join("frontend/tauri-shell/tauri.conf.json");
+        let command = tauri_dev_command(&repo_root, &config_path).expect("tauri dev command");
+        let command_path = command
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| (key == "PATH").then_some(value))
+            .flatten()
+            .expect("tauri dev command should set PATH");
+        let resolved_path = process_env::resolved_child_process_path()
+            .expect("resolved child process PATH should be available");
+
+        assert_eq!(command_path, resolved_path);
+
+        if let Some(home) = std::env::var_os("HOME") {
+            let cargo_bin = PathBuf::from(home).join(".cargo").join("bin");
+            assert!(
+                std::env::split_paths(command_path).any(|path| path == cargo_bin),
+                "expected resolved PATH to include {}, got {:?}",
+                cargo_bin.display(),
+                command_path
+            );
+        }
     }
 
     #[test]
