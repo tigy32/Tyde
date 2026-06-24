@@ -172,6 +172,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
         workflow_summaries: Vec::new(),
         workflow_diagnostics: Vec::new(),
         workflow_runs: Vec::new(),
+        workflow_locations: Vec::new(),
     };
 
     let welcome_env = Envelope::from_payload(host_stream.clone(), FrameKind::Welcome, 0, &welcome)
@@ -2610,6 +2611,7 @@ mod wasm_tests {
             workflow_summaries: Vec::new(),
             workflow_diagnostics: Vec::new(),
             workflow_runs: Vec::new(),
+            workflow_locations: Vec::new(),
         };
         dispatch_envelope(
             &state,

@@ -8012,6 +8012,7 @@ for line in sys.stdin:
                 workflow_summaries: vec![],
                 workflow_diagnostics: vec![],
                 workflow_runs: vec![],
+                workflow_locations: vec![],
             },
         )
         .expect("serialize HostBootstrap");

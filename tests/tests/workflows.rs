@@ -1,19 +1,66 @@
 mod fixture;
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentId, AgentOrigin, BackendKind, CancelWorkflowPayload, Envelope, FrameKind, NewAgentPayload,
-    Project, ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath, TriggerWorkflowPayload,
-    WorkflowId, WorkflowNotifyPayload, WorkflowRunId, WorkflowRunNotifyPayload,
-    WorkflowRunSnapshot, WorkflowRunSnapshotStatus, WorkflowStepRunSnapshotStatus,
+    AgentId, AgentOrigin, BackendAccessMode, BackendKind, CancelWorkflowPayload, Envelope,
+    FrameKind, HostBootstrapPayload, NewAgentPayload, Project, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeleteRootPayload, ProjectNotifyPayload, ProjectRootPath,
+    SpawnAgentParams, SpawnAgentPayload, TriggerWorkflowPayload, WorkflowId, WorkflowNotifyPayload,
+    WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus,
+    WorkflowSaveResponse, WorkflowStepRunSnapshotStatus, WorkflowTargetsResponse,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
 use rmcp::transport::StreamableHttpClientTransport;
 use serde_json::{Value, json};
+
+static GLOBAL_WORKFLOWS_ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+struct GlobalWorkflowsEnv {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+    previous: Option<String>,
+    dir: tempfile::TempDir,
+}
+
+impl GlobalWorkflowsEnv {
+    async fn new() -> Self {
+        let guard = GLOBAL_WORKFLOWS_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let previous = std::env::var("TYDE_GLOBAL_WORKFLOWS_DIR").ok();
+        let dir = tempfile::tempdir().expect("create global workflows tempdir");
+        unsafe {
+            std::env::set_var("TYDE_GLOBAL_WORKFLOWS_DIR", dir.path());
+        }
+        Self {
+            _guard: guard,
+            previous,
+            dir,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for GlobalWorkflowsEnv {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var("TYDE_GLOBAL_WORKFLOWS_DIR", previous);
+            } else {
+                std::env::remove_var("TYDE_GLOBAL_WORKFLOWS_DIR");
+            }
+        }
+    }
+}
 
 async fn next_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
@@ -68,12 +115,20 @@ fn write_workflow(root: &std::path::Path, access_mode: &str) {
     std::fs::create_dir_all(&dir).expect("create workflow dir");
     std::fs::write(
         dir.join("build.md"),
-        format!(
-            "---\nid: build\nname: Build Project\ndescription: Compile and test\ncoordinator:\n  backend: codex\n  access_mode: {access_mode}\ndeclared_backends: [codex]\ntriggers: [global]\n---\nRun the build.\n"
-        ),
+        workflow_markdown_with_access("build", "Build Project", "Run the build.", access_mode),
     )
     .expect("write workflow");
     std::fs::write(dir.join("bad.md"), "---\nid: bad\n").expect("write bad workflow");
+}
+
+fn workflow_markdown(id: &str, name: &str, body: &str) -> String {
+    workflow_markdown_with_access(id, name, body, "read_only")
+}
+
+fn workflow_markdown_with_access(id: &str, name: &str, body: &str, access_mode: &str) -> String {
+    format!(
+        "---\nid: {id}\nname: {name}\ndescription: Compile and test\ncoordinator:\n  backend: codex\n  access_mode: {access_mode}\ndeclared_backends: [codex]\ntriggers: [global]\n---\n{body}\n"
+    )
 }
 
 async fn wait_for_workflow_catalog(client: &mut client::Connection) {
@@ -83,6 +138,27 @@ async fn wait_for_workflow_catalog(client: &mut client::Connection) {
             break;
         }
     }
+}
+
+async fn wait_for_workflow_notify<F>(
+    client: &mut client::Connection,
+    context: &str,
+    mut predicate: F,
+) -> WorkflowNotifyPayload
+where
+    F: FnMut(&WorkflowNotifyPayload) -> bool,
+{
+    for _ in 0..30 {
+        let env = next_event(client, context).await;
+        if env.kind != FrameKind::WorkflowNotify {
+            continue;
+        }
+        let payload: WorkflowNotifyPayload = env.parse_payload().expect("WorkflowNotify");
+        if predicate(&payload) {
+            return payload;
+        }
+    }
+    panic!("timed out waiting for matching WorkflowNotify: {context}");
 }
 
 async fn trigger_workflow_and_wait_for_coordinator(
@@ -136,8 +212,21 @@ async fn call_mcp_tool(
     name: &str,
     arguments: Value,
 ) -> (bool, String) {
-    let separator = if base_url.contains('?') { '&' } else { '?' };
-    let url = format!("{base_url}{separator}agent_id={}", caller_agent_id.0);
+    call_mcp_tool_optional_caller(base_url, Some(caller_agent_id), name, arguments).await
+}
+
+async fn call_mcp_tool_optional_caller(
+    base_url: &str,
+    caller_agent_id: Option<&AgentId>,
+    name: &str,
+    arguments: Value,
+) -> (bool, String) {
+    let url = if let Some(caller_agent_id) = caller_agent_id {
+        let separator = if base_url.contains('?') { '&' } else { '?' };
+        format!("{base_url}{separator}agent_id={}", caller_agent_id.0)
+    } else {
+        base_url.to_owned()
+    };
     let transport = StreamableHttpClientTransport::from_uri(url);
     let service = ().serve(transport).await.expect("connect to MCP");
     let arguments = arguments
@@ -180,8 +269,59 @@ async fn call_mcp_json_tool(
     serde_json::from_str(&body).unwrap_or_else(|err| panic!("parse {name} JSON result: {err}"))
 }
 
+async fn call_agent_control_json<T: serde::de::DeserializeOwned>(
+    base_url: &str,
+    caller_agent_id: &AgentId,
+    name: &str,
+    arguments: Value,
+) -> T {
+    let (is_error, body) = call_mcp_tool(base_url, caller_agent_id, name, arguments).await;
+    assert!(!is_error, "MCP tool {name} returned error: {body}");
+    serde_json::from_str(&body)
+        .unwrap_or_else(|err| panic!("parse {name} JSON result: {err}: {body}"))
+}
+
+async fn spawn_test_agent(
+    client: &mut client::Connection,
+    root: &Path,
+    project_id: Option<protocol::ProjectId>,
+    access_mode: BackendAccessMode,
+    name: &str,
+) -> NewAgentPayload {
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![root.display().to_string()],
+                prompt: "workflow author".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                cost_hint: None,
+                access_mode,
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn_agent failed");
+
+    loop {
+        let env = next_event(client, "spawn test agent").await;
+        if env.kind != FrameKind::NewAgent {
+            continue;
+        }
+        let payload: NewAgentPayload = env.parse_payload().expect("NewAgent");
+        if payload.name == name {
+            return payload;
+        }
+    }
+}
+
 #[tokio::test]
 async fn workflow_refresh_reports_catalog_and_diagnostics() {
+    let _global = GlobalWorkflowsEnv::new().await;
     let tmp = tempfile::tempdir().expect("create tempdir");
     write_workflow(tmp.path(), "read_only");
     let mut fixture = Fixture::new().await;
@@ -212,6 +352,7 @@ async fn workflow_refresh_reports_catalog_and_diagnostics() {
 
 #[tokio::test]
 async fn trigger_workflow_spawns_workflow_origin_coordinator() {
+    let _global = GlobalWorkflowsEnv::new().await;
     let tmp = tempfile::tempdir().expect("create tempdir");
     write_workflow(tmp.path(), "read_only");
     let mut fixture = Fixture::new().await;
@@ -232,6 +373,7 @@ async fn trigger_workflow_spawns_workflow_origin_coordinator() {
 
 #[tokio::test]
 async fn workflow_progress_finish_and_reconnect_replay_run() {
+    let _global = GlobalWorkflowsEnv::new().await;
     let tmp = tempfile::tempdir().expect("create tempdir");
     write_workflow(tmp.path(), "read_only");
     let mut fixture = Fixture::new().await;
@@ -302,6 +444,7 @@ async fn workflow_progress_finish_and_reconnect_replay_run() {
 
 #[tokio::test]
 async fn workflow_cancel_marks_run_cancelled_and_replays_agent() {
+    let _global = GlobalWorkflowsEnv::new().await;
     let tmp = tempfile::tempdir().expect("create tempdir");
     write_workflow(tmp.path(), "read_only");
     let mut fixture = Fixture::new().await;
@@ -347,6 +490,7 @@ async fn workflow_cancel_marks_run_cancelled_and_replays_agent() {
 
 #[tokio::test]
 async fn late_workflow_finish_after_cancel_cannot_resurrect_run() {
+    let _global = GlobalWorkflowsEnv::new().await;
     let tmp = tempfile::tempdir().expect("create tempdir");
     write_workflow(tmp.path(), "read_only");
     let mut fixture = Fixture::new().await;
@@ -408,6 +552,7 @@ async fn late_workflow_finish_after_cancel_cannot_resurrect_run() {
 
 #[tokio::test]
 async fn workflow_child_agents_inherit_context_and_backend_allowlist() {
+    let _global = GlobalWorkflowsEnv::new().await;
     let tmp = tempfile::tempdir().expect("create tempdir");
     write_workflow(tmp.path(), "unrestricted");
     let mut fixture = Fixture::new().await;
@@ -482,4 +627,722 @@ async fn workflow_child_agents_inherit_context_and_backend_allowlist() {
         assert_eq!(metadata.workflow_run_id, run_id);
         break;
     }
+}
+
+#[tokio::test]
+async fn workflow_save_mcp_notifies_and_triggers_without_refresh() {
+    let _global = GlobalWorkflowsEnv::new().await;
+    let project_root = tempfile::tempdir().expect("create project root");
+    let mut fixture = Fixture::new().await;
+    let project = create_project(
+        &mut fixture.client,
+        &project_root.path().display().to_string(),
+    )
+    .await;
+    let author = spawn_test_agent(
+        &mut fixture.client,
+        project_root.path(),
+        Some(project.id.clone()),
+        BackendAccessMode::Unrestricted,
+        "workflow-author",
+    )
+    .await;
+    let agent_control_url = fixture.agent_control_http_url().await;
+
+    let targets: WorkflowTargetsResponse = call_agent_control_json(
+        &agent_control_url,
+        &author.agent_id,
+        "tyde_workflow_targets",
+        json!({}),
+    )
+    .await;
+    assert!(targets.targets.iter().any(|target| {
+        matches!(&target.target, protocol::WorkflowSaveTarget::Global)
+            && target.location.directory == _global.path().display().to_string()
+    }));
+    assert!(targets.targets.iter().any(|target| {
+        matches!(
+            &target.target,
+            protocol::WorkflowSaveTarget::Project { project_id, root }
+                if project_id == &project.id && root.0 == project_root.path().display().to_string()
+        )
+    }));
+
+    let save: WorkflowSaveResponse = call_agent_control_json(
+        &agent_control_url,
+        &author.agent_id,
+        "tyde_workflow_save",
+        json!({
+            "target": {
+                "kind": "project",
+                "project_id": project.id.0.clone(),
+                "root": project_root.path().display().to_string()
+            },
+            "mode": { "mode": "create" },
+            "filename": "agent-build.md",
+            "markdown": workflow_markdown("agent-build", "Agent Build", "Run agent-authored build.")
+        }),
+    )
+    .await;
+    assert!(save.created);
+    assert_eq!(save.summary.id, WorkflowId("agent-build".to_owned()));
+    assert!(save.path.ends_with("agent-build.md"));
+    assert!(std::path::Path::new(&save.path).is_file());
+
+    let notify =
+        wait_for_workflow_notify(&mut fixture.client, "saved workflow notify", |payload| {
+            payload
+                .summaries
+                .iter()
+                .any(|summary| summary.id == WorkflowId("agent-build".to_owned()))
+        })
+        .await;
+    assert!(!notify.locations.is_empty());
+
+    fixture
+        .client
+        .trigger_workflow(TriggerWorkflowPayload {
+            workflow_id: WorkflowId("agent-build".to_owned()),
+            project_id: Some(project.id.clone()),
+            inputs: HashMap::new(),
+        })
+        .await
+        .expect("trigger_workflow failed");
+
+    let mut saw_run = false;
+    let mut saw_coordinator = false;
+    for _ in 0..20 {
+        let env = next_event(&mut fixture.client, "saved workflow trigger").await;
+        match env.kind {
+            FrameKind::WorkflowRunNotify => {
+                let payload: WorkflowRunNotifyPayload =
+                    env.parse_payload().expect("WorkflowRunNotify");
+                saw_run |= payload.run.workflow_id == WorkflowId("agent-build".to_owned());
+            }
+            FrameKind::NewAgent => {
+                let payload: NewAgentPayload = env.parse_payload().expect("NewAgent");
+                saw_coordinator |= payload.origin == AgentOrigin::Workflow
+                    && payload.name == "Workflow: Agent Build";
+            }
+            _ => {}
+        }
+        if saw_run && saw_coordinator {
+            return;
+        }
+    }
+    panic!("saved workflow did not spawn a workflow-origin coordinator");
+}
+
+#[tokio::test]
+async fn workflow_save_rejects_read_only_without_catalog_change() {
+    let _global = GlobalWorkflowsEnv::new().await;
+    let project_root = tempfile::tempdir().expect("create project root");
+    let mut fixture = Fixture::new().await;
+    let readonly = spawn_test_agent(
+        &mut fixture.client,
+        project_root.path(),
+        None,
+        BackendAccessMode::ReadOnly,
+        "readonly-author",
+    )
+    .await;
+    let agent_control_url = fixture.agent_control_http_url().await;
+    let target_file = _global.path().join("readonly.md");
+
+    let (is_error, body) = call_mcp_tool(
+        &agent_control_url,
+        &readonly.agent_id,
+        "tyde_workflow_save",
+        json!({
+            "target": { "kind": "global" },
+            "mode": { "mode": "create" },
+            "filename": "readonly.md",
+            "markdown": workflow_markdown("readonly", "Readonly", "Should not save.")
+        }),
+    )
+    .await;
+    assert!(is_error, "read-only save should fail: {body}");
+    assert!(
+        body.contains("BackendAccessMode::ReadOnly rejects mutating MCP tool 'tyde_workflow_save'"),
+        "unexpected read-only error: {body}"
+    );
+    assert!(!target_file.exists(), "read-only save wrote a file");
+
+    let (_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        !bootstrap
+            .workflow_summaries
+            .iter()
+            .any(|summary| summary.id == WorkflowId("readonly".to_owned())),
+        "read-only rejection changed the workflow catalog"
+    );
+}
+
+#[tokio::test]
+async fn workflow_save_create_replace_collision_semantics() {
+    let _global = GlobalWorkflowsEnv::new().await;
+    let project_root = tempfile::tempdir().expect("create project root");
+    let mut fixture = Fixture::new().await;
+    let project = create_project(
+        &mut fixture.client,
+        &project_root.path().display().to_string(),
+    )
+    .await;
+    let author = spawn_test_agent(
+        &mut fixture.client,
+        project_root.path(),
+        Some(project.id.clone()),
+        BackendAccessMode::Unrestricted,
+        "collision-author",
+    )
+    .await;
+    let agent_control_url = fixture.agent_control_http_url().await;
+
+    let global_save: WorkflowSaveResponse = call_agent_control_json(
+        &agent_control_url,
+        &author.agent_id,
+        "tyde_workflow_save",
+        json!({
+            "target": { "kind": "global" },
+            "mode": { "mode": "create" },
+            "filename": "collision.md",
+            "markdown": workflow_markdown("collision", "Global Collision", "Global body.")
+        }),
+    )
+    .await;
+    assert!(global_save.created);
+
+    let (is_error, body) = call_mcp_tool(
+        &agent_control_url,
+        &author.agent_id,
+        "tyde_workflow_save",
+        json!({
+            "target": { "kind": "global" },
+            "mode": { "mode": "create" },
+            "filename": "collision.md",
+            "markdown": workflow_markdown("other-id", "Other", "Other body.")
+        }),
+    )
+    .await;
+    assert!(
+        is_error && body.contains("already exists"),
+        "unexpected filename collision: {body}"
+    );
+
+    let (is_error, body) = call_mcp_tool(
+        &agent_control_url,
+        &author.agent_id,
+        "tyde_workflow_save",
+        json!({
+            "target": { "kind": "global" },
+            "mode": { "mode": "create" },
+            "filename": "collision-copy.md",
+            "markdown": workflow_markdown("collision", "Duplicate", "Duplicate body.")
+        }),
+    )
+    .await;
+    assert!(
+        is_error && body.contains("same scope"),
+        "unexpected id collision: {body}"
+    );
+
+    let project_shadow: WorkflowSaveResponse = call_agent_control_json(
+        &agent_control_url,
+        &author.agent_id,
+        "tyde_workflow_save",
+        json!({
+            "target": {
+                "kind": "project",
+                "project_id": project.id.0.clone(),
+                "root": project_root.path().display().to_string()
+            },
+            "mode": { "mode": "create" },
+            "filename": "collision.md",
+            "markdown": workflow_markdown("collision", "Project Collision", "Project body.")
+        }),
+    )
+    .await;
+    assert!(project_shadow.created);
+    assert!(
+        project_shadow
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("shadows")),
+        "project shadow save should return a warning diagnostic"
+    );
+
+    let (is_error, body) = call_mcp_tool(
+        &agent_control_url,
+        &author.agent_id,
+        "tyde_workflow_save",
+        json!({
+            "target": { "kind": "global" },
+            "mode": {
+                "mode": "replace",
+                "existing_path": "/not/the/computed/path.md",
+                "existing_id": "collision"
+            },
+            "filename": "collision.md",
+            "markdown": workflow_markdown("collision", "Global Collision", "Updated body.")
+        }),
+    )
+    .await;
+    assert!(
+        is_error && body.contains("does not match target path"),
+        "unexpected path mismatch: {body}"
+    );
+
+    let (is_error, body) = call_mcp_tool(
+        &agent_control_url,
+        &author.agent_id,
+        "tyde_workflow_save",
+        json!({
+            "target": { "kind": "global" },
+            "mode": {
+                "mode": "replace",
+                "existing_path": global_save.path,
+                "existing_id": "not-current"
+            },
+            "filename": "collision.md",
+            "markdown": workflow_markdown("not-current", "Wrong", "Wrong body.")
+        }),
+    )
+    .await;
+    assert!(
+        is_error && body.contains("does not match current workflow id"),
+        "unexpected id mismatch: {body}"
+    );
+
+    let (is_error, body) = call_mcp_tool(
+        &agent_control_url,
+        &author.agent_id,
+        "tyde_workflow_save",
+        json!({
+            "target": { "kind": "global" },
+            "mode": {
+                "mode": "replace",
+                "existing_path": _global.path().join("collision.md").display().to_string(),
+                "existing_id": "collision"
+            },
+            "filename": "collision.md",
+            "markdown": workflow_markdown("renamed", "Renamed", "Renamed body.")
+        }),
+    )
+    .await;
+    assert!(
+        is_error && body.contains("cannot change workflow id"),
+        "unexpected rename rejection: {body}"
+    );
+
+    let replaced: WorkflowSaveResponse = call_agent_control_json(
+        &agent_control_url,
+        &author.agent_id,
+        "tyde_workflow_save",
+        json!({
+            "target": { "kind": "global" },
+            "mode": {
+                "mode": "replace",
+                "existing_path": _global.path().join("collision.md").display().to_string(),
+                "existing_id": "collision"
+            },
+            "filename": "collision.md",
+            "markdown": workflow_markdown("collision", "Global Collision Updated", "Updated body.")
+        }),
+    )
+    .await;
+    assert!(!replaced.created);
+    assert_eq!(replaced.summary.name, "Global Collision Updated");
+}
+
+#[tokio::test]
+async fn workflow_watcher_auto_updates_direct_markdown_changes() {
+    let _global = GlobalWorkflowsEnv::new().await;
+    let project_root = tempfile::tempdir().expect("create project root");
+    let mut fixture = Fixture::new().await;
+    let project = create_project(
+        &mut fixture.client,
+        &project_root.path().display().to_string(),
+    )
+    .await;
+    let dir = project_root.path().join(".tyde/workflows");
+    std::fs::create_dir_all(&dir).expect("create workflow dir");
+    let path = dir.join("watched.md");
+    std::fs::write(
+        &path,
+        workflow_markdown("watched", "Watched One", "First body."),
+    )
+    .expect("write watched workflow");
+
+    wait_for_workflow_notify(&mut fixture.client, "watcher create", |payload| {
+        payload.summaries.iter().any(|summary| {
+            summary.id == WorkflowId("watched".to_owned()) && summary.name == "Watched One"
+        })
+    })
+    .await;
+
+    std::fs::write(
+        &path,
+        workflow_markdown("watched", "Watched Two", "Second body."),
+    )
+    .expect("modify watched workflow");
+    wait_for_workflow_notify(&mut fixture.client, "watcher modify", |payload| {
+        payload.summaries.iter().any(|summary| {
+            summary.id == WorkflowId("watched".to_owned()) && summary.name == "Watched Two"
+        })
+    })
+    .await;
+
+    std::fs::remove_file(&path).expect("remove watched workflow");
+    let removed = wait_for_workflow_notify(&mut fixture.client, "watcher remove", |payload| {
+        !payload
+            .summaries
+            .iter()
+            .any(|summary| summary.id == WorkflowId("watched".to_owned()))
+    })
+    .await;
+    assert!(removed.summaries.iter().all(|summary| {
+        !matches!(
+            &summary.source.scope,
+            protocol::WorkflowSourceScope::Project { project_id, .. } if project_id == &project.id
+        ) || summary.id != WorkflowId("watched".to_owned())
+    }));
+}
+
+#[tokio::test]
+async fn workflow_project_shadowing_is_scoped_per_project() {
+    let global = GlobalWorkflowsEnv::new().await;
+    std::fs::write(
+        global.path().join("build.md"),
+        workflow_markdown("build", "Global Build", "Global body."),
+    )
+    .expect("write global workflow");
+    let root_a = tempfile::tempdir().expect("create project A root");
+    let root_b = tempfile::tempdir().expect("create project B root");
+    let mut fixture = Fixture::new().await;
+    let project_a = create_project(&mut fixture.client, &root_a.path().display().to_string()).await;
+    let project_b = create_project(&mut fixture.client, &root_b.path().display().to_string()).await;
+    let dir_a = root_a.path().join(".tyde/workflows");
+    std::fs::create_dir_all(&dir_a).expect("create project A workflow dir");
+    std::fs::write(
+        dir_a.join("build.md"),
+        workflow_markdown("build", "Project A Build", "Project A body."),
+    )
+    .expect("write project A workflow");
+
+    let notify = wait_for_workflow_notify(&mut fixture.client, "shadowing notify", |payload| {
+        payload
+            .summaries
+            .iter()
+            .any(|summary| summary.name == "Global Build")
+            && payload
+                .summaries
+                .iter()
+                .any(|summary| summary.name == "Project A Build")
+            && payload
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("shadows"))
+    })
+    .await;
+    assert_eq!(
+        notify
+            .summaries
+            .iter()
+            .filter(|summary| summary.id == WorkflowId("build".to_owned()))
+            .count(),
+        2
+    );
+
+    fixture
+        .client
+        .trigger_workflow(TriggerWorkflowPayload {
+            workflow_id: WorkflowId("build".to_owned()),
+            project_id: Some(project_a.id.clone()),
+            inputs: HashMap::new(),
+        })
+        .await
+        .expect("trigger project A workflow");
+    wait_for_workflow_coordinator_name(&mut fixture.client, "Workflow: Project A Build").await;
+
+    fixture
+        .client
+        .trigger_workflow(TriggerWorkflowPayload {
+            workflow_id: WorkflowId("build".to_owned()),
+            project_id: Some(project_b.id.clone()),
+            inputs: HashMap::new(),
+        })
+        .await
+        .expect("trigger project B workflow");
+    wait_for_workflow_coordinator_name(&mut fixture.client, "Workflow: Global Build").await;
+
+    fixture
+        .client
+        .trigger_workflow(TriggerWorkflowPayload {
+            workflow_id: WorkflowId("build".to_owned()),
+            project_id: None,
+            inputs: HashMap::new(),
+        })
+        .await
+        .expect("trigger global workflow");
+    wait_for_workflow_coordinator_name(&mut fixture.client, "Workflow: Global Build").await;
+}
+
+async fn wait_for_workflow_coordinator_name(client: &mut client::Connection, expected_name: &str) {
+    for _ in 0..20 {
+        let env = next_event(client, expected_name).await;
+        if env.kind != FrameKind::NewAgent {
+            continue;
+        }
+        let payload: NewAgentPayload = env.parse_payload().expect("NewAgent");
+        if payload.origin == AgentOrigin::Workflow && payload.name == expected_name {
+            return;
+        }
+    }
+    panic!("missing workflow coordinator named {expected_name}");
+}
+
+#[tokio::test]
+async fn workflow_strict_validator_and_legacy_diagnostics_are_visible() {
+    let global = GlobalWorkflowsEnv::new().await;
+    let project_root = tempfile::tempdir().expect("create project root");
+    let mut fixture = Fixture::new().await;
+    let author = spawn_test_agent(
+        &mut fixture.client,
+        project_root.path(),
+        None,
+        BackendAccessMode::Unrestricted,
+        "validator-author",
+    )
+    .await;
+    let agent_control_url = fixture.agent_control_http_url().await;
+
+    let invalid_cases = [
+        (
+            "bad-yaml.md",
+            "---\nid: bad-yaml\nname: Bad\ncoordinator: [\n---\nBody\n".to_owned(),
+            "front matter",
+        ),
+        (
+            "bad-slug.md",
+            workflow_markdown("BadSlug", "Bad Slug", "Body."),
+            "must match",
+        ),
+        (
+            "empty-body.md",
+            "---\nid: empty-body\nname: Empty Body\ncoordinator:\n  backend: codex\n---\n   \n".to_owned(),
+            "body must not be empty",
+        ),
+        (
+            "bad-trigger.md",
+            "---\nid: bad-trigger\nname: Bad Trigger\ncoordinator:\n  backend: codex\ntriggers: [made_up]\n---\nBody\n".to_owned(),
+            "unknown trigger",
+        ),
+        (
+            "bad-input-kind.md",
+            "---\nid: bad-input-kind\nname: Bad Input Kind\ncoordinator:\n  backend: codex\ninputs:\n  - id: target\n    input_type: mystery\n---\nBody\n".to_owned(),
+            "unknown workflow input kind",
+        ),
+        (
+            "duplicate-input.md",
+            "---\nid: duplicate-input\nname: Duplicate Input\ncoordinator:\n  backend: codex\ninputs:\n  - id: target\n  - id: target\n---\nBody\n".to_owned(),
+            "duplicate workflow input id",
+        ),
+        (
+            "default-mismatch.md",
+            "---\nid: default-mismatch\nname: Default Mismatch\ncoordinator:\n  backend: codex\ninputs:\n  - id: enabled\n    input_type: boolean\n    default: nope\n---\nBody\n".to_owned(),
+            "must be a boolean",
+        ),
+    ];
+
+    for (filename, markdown, expected) in invalid_cases {
+        let (is_error, body) = call_mcp_tool(
+            &agent_control_url,
+            &author.agent_id,
+            "tyde_workflow_save",
+            json!({
+                "target": { "kind": "global" },
+                "mode": { "mode": "create" },
+                "filename": filename,
+                "markdown": markdown
+            }),
+        )
+        .await;
+        assert!(
+            is_error,
+            "invalid workflow {filename} unexpectedly saved: {body}"
+        );
+        assert!(
+            body.contains(expected),
+            "invalid workflow {filename} error {body:?} did not contain {expected:?}"
+        );
+    }
+
+    std::fs::write(
+        global.path().join("legacy.md"),
+        workflow_markdown("Legacy", "Legacy", "Legacy body."),
+    )
+    .expect("write legacy workflow");
+    fixture
+        .client
+        .workflow_refresh(protocol::WorkflowRefreshPayload::default())
+        .await
+        .expect("workflow_refresh failed");
+    let notify = wait_for_workflow_notify(&mut fixture.client, "legacy diagnostic", |payload| {
+        payload.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .source
+                .as_ref()
+                .is_some_and(|source| source.path.ends_with("legacy.md"))
+                && diagnostic.message.contains("must match")
+                && diagnostic.severity == protocol::WorkflowDiagnosticSeverity::Warning
+        })
+    })
+    .await;
+    assert!(
+        !notify
+            .summaries
+            .iter()
+            .any(|summary| summary.id == WorkflowId("Legacy".to_owned())),
+        "legacy invalid workflow should be skipped"
+    );
+}
+
+#[tokio::test]
+async fn workflow_bootstrap_includes_catalog_locations() {
+    let global = GlobalWorkflowsEnv::new().await;
+    std::fs::create_dir_all(global.path()).expect("create global dir");
+    let project_root = tempfile::tempdir().expect("create project root");
+    let mut fixture = Fixture::new().await;
+    let project = create_project(
+        &mut fixture.client,
+        &project_root.path().display().to_string(),
+    )
+    .await;
+    std::fs::create_dir_all(project_root.path().join(".tyde/workflows"))
+        .expect("create project workflow dir");
+    fixture
+        .client
+        .workflow_refresh(protocol::WorkflowRefreshPayload::default())
+        .await
+        .expect("workflow_refresh failed");
+    wait_for_workflow_notify(&mut fixture.client, "location refresh", |payload| {
+        payload.locations.iter().any(|location| {
+            matches!(
+                &location.scope,
+                protocol::WorkflowSourceScope::Project { project_id, root }
+                    if project_id == &project.id
+                        && root.0 == project_root.path().display().to_string()
+            ) && location.exists
+        })
+    })
+    .await;
+
+    let (_client, bootstrap): (client::Connection, HostBootstrapPayload) =
+        fixture.connect_with_bootstrap().await;
+    assert!(bootstrap.workflow_locations.iter().any(|location| {
+        matches!(location.scope, protocol::WorkflowSourceScope::Global)
+            && location.directory == global.path().display().to_string()
+            && location.exists
+    }));
+    assert!(bootstrap.workflow_locations.iter().any(|location| {
+        matches!(
+            &location.scope,
+            protocol::WorkflowSourceScope::Project { project_id, root }
+                if project_id == &project.id
+                    && root.0 == project_root.path().display().to_string()
+        ) && location.exists
+    }));
+}
+
+#[tokio::test]
+async fn workflow_project_root_updates_refresh_watcher_targets() {
+    let _global = GlobalWorkflowsEnv::new().await;
+    let root_one = tempfile::tempdir().expect("create root one");
+    let root_two = tempfile::tempdir().expect("create root two");
+    let root_two_workflows = root_two.path().join(".tyde/workflows");
+    std::fs::create_dir_all(&root_two_workflows).expect("create root two workflow dir");
+    std::fs::write(
+        root_two_workflows.join("added-root.md"),
+        workflow_markdown("added-root", "Added Root", "Added root body."),
+    )
+    .expect("write added-root workflow");
+
+    let mut fixture = Fixture::new().await;
+    let project = create_project(&mut fixture.client, &root_one.path().display().to_string()).await;
+    fixture
+        .client
+        .project_add_root(ProjectAddRootPayload {
+            id: project.id.clone(),
+            root: ProjectRootPath(root_two.path().display().to_string()),
+        })
+        .await
+        .expect("project_add_root failed");
+
+    wait_for_workflow_notify(&mut fixture.client, "added root workflow", |payload| {
+        payload
+            .summaries
+            .iter()
+            .any(|summary| summary.id == WorkflowId("added-root".to_owned()))
+    })
+    .await;
+
+    fixture
+        .client
+        .project_delete_root(ProjectDeleteRootPayload {
+            id: project.id,
+            root: ProjectRootPath(root_two.path().display().to_string()),
+        })
+        .await
+        .expect("project_delete_root failed");
+
+    wait_for_workflow_notify(&mut fixture.client, "deleted root workflow", |payload| {
+        !payload
+            .summaries
+            .iter()
+            .any(|summary| summary.id == WorkflowId("added-root".to_owned()))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn workflow_save_rejects_stale_disk_duplicate_id_before_reload() {
+    let global = GlobalWorkflowsEnv::new().await;
+    let project_root = tempfile::tempdir().expect("create project root");
+    let mut fixture = Fixture::new().await;
+    let author = spawn_test_agent(
+        &mut fixture.client,
+        project_root.path(),
+        None,
+        BackendAccessMode::Unrestricted,
+        "stale-duplicate-author",
+    )
+    .await;
+    std::fs::write(
+        global.path().join("stale-dupe.md"),
+        workflow_markdown("stale-dupe", "Stale Dupe", "Already on disk."),
+    )
+    .expect("write stale duplicate workflow");
+
+    let agent_control_url = fixture.agent_control_http_url().await;
+    let (is_error, body) = call_mcp_tool(
+        &agent_control_url,
+        &author.agent_id,
+        "tyde_workflow_save",
+        json!({
+            "target": { "kind": "global" },
+            "mode": { "mode": "create" },
+            "filename": "stale-dupe-copy.md",
+            "markdown": workflow_markdown("stale-dupe", "Stale Dupe Copy", "Should not save.")
+        }),
+    )
+    .await;
+    assert!(is_error, "stale duplicate save should fail: {body}");
+    assert!(
+        body.contains("already exists in the same scope"),
+        "unexpected stale duplicate error: {body}"
+    );
+    assert!(
+        !global.path().join("stale-dupe-copy.md").exists(),
+        "duplicate save wrote a second same-scope id"
+    );
 }

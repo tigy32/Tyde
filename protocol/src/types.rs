@@ -236,7 +236,7 @@ impl fmt::Display for ReviewSuggestionId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct ProjectId(pub String);
 
@@ -266,7 +266,7 @@ impl fmt::Display for TeamId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct WorkflowId(pub String);
 
@@ -387,7 +387,7 @@ impl fmt::Display for McpServerId {
 }
 
 /// Which coding agent backend to use. Enum, not string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Tycode,
@@ -406,7 +406,7 @@ impl BackendKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendAccessMode {
     #[default]
@@ -834,14 +834,14 @@ pub struct WelcomePayload {
     pub release_version: Option<TydeReleaseVersion>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowCoordinatorSpec {
     pub backend: BackendKind,
     #[serde(default)]
     pub access_mode: BackendAccessMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowInputSpec {
     pub id: String,
     #[serde(default)]
@@ -856,7 +856,7 @@ pub struct WorkflowInputSpec {
     pub default: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TriggerSurface {
     GitPanel,
@@ -866,7 +866,7 @@ pub enum TriggerSurface {
     Global,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkflowSourceScope {
     Global,
@@ -876,20 +876,66 @@ pub enum WorkflowSourceScope {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowSource {
     pub scope: WorkflowSourceScope,
     pub path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowCatalogLocation {
+    pub scope: WorkflowSourceScope,
+    pub directory: String,
+    pub exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkflowSaveTarget {
+    Global,
+    Project {
+        project_id: ProjectId,
+        root: ProjectRootPath,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum WorkflowSaveMode {
+    Create,
+    Replace {
+        existing_path: String,
+        existing_id: WorkflowId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowTargetDirectory {
+    pub target: WorkflowSaveTarget,
+    pub location: WorkflowCatalogLocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowTargetsResponse {
+    pub targets: Vec<WorkflowTargetDirectory>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowSaveRequest {
+    pub target: WorkflowSaveTarget,
+    pub mode: WorkflowSaveMode,
+    pub filename: String,
+    pub markdown: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowDiagnosticSeverity {
     Error,
     Warning,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowDiagnostic {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<WorkflowId>,
@@ -899,7 +945,7 @@ pub struct WorkflowDiagnostic {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowSummary {
     pub id: WorkflowId,
     pub name: String,
@@ -915,6 +961,15 @@ pub struct WorkflowSummary {
     #[serde(default)]
     pub tags: Vec<String>,
     pub source: WorkflowSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowSaveResponse {
+    pub summary: WorkflowSummary,
+    pub source: WorkflowSource,
+    pub path: String,
+    pub created: bool,
+    pub diagnostics: Vec<WorkflowDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -991,6 +1046,8 @@ pub struct WorkflowRunSnapshot {
 pub struct WorkflowNotifyPayload {
     pub summaries: Vec<WorkflowSummary>,
     pub diagnostics: Vec<WorkflowDiagnostic>,
+    #[serde(default)]
+    pub locations: Vec<WorkflowCatalogLocation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1039,6 +1096,8 @@ pub struct HostBootstrapPayload {
     pub workflow_diagnostics: Vec<WorkflowDiagnostic>,
     #[serde(default)]
     pub workflow_runs: Vec<WorkflowRunSnapshot>,
+    #[serde(default)]
+    pub workflow_locations: Vec<WorkflowCatalogLocation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

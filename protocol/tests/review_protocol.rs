@@ -718,6 +718,7 @@ fn bootstrap_payloads_round_trip() {
         workflow_summaries: vec![],
         workflow_diagnostics: vec![],
         workflow_runs: vec![],
+        workflow_locations: vec![],
     });
 
     round_trip_json_without_eq(&AgentBootstrapPayload {

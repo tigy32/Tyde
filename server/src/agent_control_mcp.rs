@@ -6,6 +6,7 @@ use protocol::{
     AgentControlStatus, AgentId, AgentInput, AgentOrigin, BackendAccessMode, BackendKind,
     CustomAgentId, Envelope, ImageData, ProjectId, SendMessagePayload, SpawnAgentParams,
     SpawnAgentPayload, SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload, TeamMemberId,
+    WorkflowSaveRequest, WorkflowSaveResponse, WorkflowTargetsResponse,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -487,6 +488,49 @@ impl TydeAgentControlMcpServer {
         }
     }
 
+    #[tool(description = "Return valid Tyde workflow target directories for this caller context.")]
+    async fn tyde_workflow_targets(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let request_agent_id = match request_agent_id_from_parts(&parts) {
+            Ok(agent_id) => agent_id,
+            Err(err) => return Ok(err_text(err)),
+        };
+        match do_workflow_targets(&self.host, request_agent_id.as_ref()).await {
+            Ok(result) => ok_json(result),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Validate and save one Tyde workflow Markdown file, then reload the catalog."
+    )]
+    async fn tyde_workflow_save(
+        &self,
+        Parameters(input): Parameters<WorkflowSaveRequest>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let request_agent_id = match request_agent_id_from_parts(&parts) {
+            Ok(agent_id) => agent_id,
+            Err(err) => return Ok(err_text(err)),
+        };
+        if let Err(err) = reject_mutating_tool_for_read_only_caller(
+            &self.host,
+            request_agent_id.as_ref(),
+            "tyde_workflow_save",
+        )
+        .await
+        {
+            return Ok(err_text(err));
+        }
+        match do_workflow_save(&self.host, input).await {
+            Ok(result) => ok_json(result),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
     #[tool(description = "List all agents currently known to this Tyde host.")]
     async fn tyde_list_agents(
         &self,
@@ -503,7 +547,7 @@ impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Tools for orchestrating Tyde2 coding agents. Spawn agents with tyde_spawn_agent, wait for them with tyde_await_agents, send follow-ups with tyde_send_agent_message, read output only with tyde_read_agent, and use tyde_team_describe/tyde_team_message_member when running as an agent-team member."
+                "Tools for orchestrating Tyde2 coding agents. Spawn agents with tyde_spawn_agent, wait for them with tyde_await_agents, send follow-ups with tyde_send_agent_message, read output only with tyde_read_agent, use tyde_workflow_targets/tyde_workflow_save to author Tyde workflow files, and use tyde_team_describe/tyde_team_message_member when running as an agent-team member."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -898,6 +942,20 @@ async fn do_team_message_member(
         agent_id: outcome.agent_id.0,
         queued: outcome.queued,
     })
+}
+
+async fn do_workflow_targets(
+    host: &HostHandle,
+    caller_agent_id: Option<&AgentId>,
+) -> Result<WorkflowTargetsResponse, String> {
+    host.workflow_targets_for_agent(caller_agent_id).await
+}
+
+async fn do_workflow_save(
+    host: &HostHandle,
+    input: WorkflowSaveRequest,
+) -> Result<WorkflowSaveResponse, String> {
+    host.workflow_save_from_agent(input).await
 }
 
 async fn do_list_agents(host: &HostHandle) -> Result<Vec<AgentOverview>, String> {

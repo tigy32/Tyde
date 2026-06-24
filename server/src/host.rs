@@ -42,9 +42,12 @@ use protocol::{
     TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
     TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
     TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowNotifyPayload,
-    WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus,
-    WorkflowStepRunId, WorkflowStepRunSnapshot,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowCatalogLocation,
+    WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowNotifyPayload, WorkflowRunId,
+    WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus, WorkflowSaveMode,
+    WorkflowSaveRequest, WorkflowSaveResponse, WorkflowSaveTarget, WorkflowSource,
+    WorkflowSourceScope, WorkflowStepRunId, WorkflowStepRunSnapshot, WorkflowTargetDirectory,
+    WorkflowTargetsResponse,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -116,8 +119,12 @@ use crate::workflows::mcp::{
     WORKFLOW_PROGRESS_MCP_SERVER_NAME, WorkflowFinishToolInput, WorkflowMcpHandle,
     WorkflowReportStepToolInput,
 };
-use crate::workflows::registry::WorkflowCatalog;
+use crate::workflows::registry::{
+    WorkflowCatalog, global_workflows_dir, parse_workflow_content, parse_workflow_file,
+    project_workflows_dir, workflow_catalog_locations, workflow_watch_dirs,
+};
 use crate::workflows::store::WorkflowRunStore;
+use crate::workflows::watch::{WorkflowCatalogSignal, WorkflowWatcherHandle};
 
 struct HostSubscriber {
     stream: Stream,
@@ -229,7 +236,9 @@ pub(crate) struct HostState {
     pub config_mcp: ConfigMcpHandle,
     pub review_mcp: ReviewMcpHandle,
     pub workflow_mcp: WorkflowMcpHandle,
+    pub workflow_watcher: WorkflowWatcherHandle,
     pub workflow_catalog: WorkflowCatalog,
+    pub workflow_locations: Vec<WorkflowCatalogLocation>,
     pub workflow_run_store: WorkflowRunStore,
     pub mobile_access: MobileAccessHandle,
     kiro_session_schema: KiroSessionSchemaState,
@@ -265,6 +274,7 @@ impl Drop for HostState {
 #[derive(Clone)]
 pub struct HostHandle {
     state: Arc<Mutex<HostState>>,
+    workflow_save_lock: Arc<Mutex<()>>,
 }
 
 #[cfg(test)]
@@ -632,6 +642,7 @@ impl HostHandle {
         let workflow_summaries = state.workflow_catalog.summaries();
         let workflow_diagnostics = state.workflow_catalog.diagnostics();
         let workflow_runs = state.workflow_run_store.list();
+        let workflow_locations = state.workflow_locations.clone();
 
         let agent_ids = state.registry.agent_ids();
         let mut agents = Vec::new();
@@ -703,6 +714,7 @@ impl HostHandle {
             workflow_summaries,
             workflow_diagnostics,
             workflow_runs,
+            workflow_locations,
         };
 
         let payload = serde_json::to_value(&bootstrap)
@@ -2747,6 +2759,9 @@ impl HostHandle {
                 );
             }
         }
+        drop(state);
+        self.update_workflow_watcher_targets_and_reload("project_create")
+            .await?;
         Ok(())
     }
 
@@ -2812,6 +2827,8 @@ impl HostHandle {
                 "failed to refresh project actor after adding project root"
             );
         }
+        self.update_workflow_watcher_targets_and_reload("project_add_root")
+            .await?;
         Ok(())
     }
 
@@ -2852,6 +2869,8 @@ impl HostHandle {
                 "failed to refresh project actor after deleting project root"
             );
         }
+        self.update_workflow_watcher_targets_and_reload("project_delete_root")
+            .await?;
         Ok(())
     }
 
@@ -2923,6 +2942,9 @@ impl HostHandle {
         if !detached_session_ids.is_empty() {
             fan_out_session_lists(&mut state).await;
         }
+        drop(state);
+        self.update_workflow_watcher_targets_and_reload("project_delete")
+            .await?;
         Ok(())
     }
 
@@ -3042,7 +3064,9 @@ impl HostHandle {
                 );
             }
         }
-
+        drop(state);
+        self.update_workflow_watcher_targets_and_reload("workbench_create")
+            .await?;
         Ok(())
     }
 
@@ -3162,6 +3186,9 @@ impl HostHandle {
             ProjectNotifyPayload::Delete { project: deleted },
         )
         .await;
+        drop(state);
+        self.update_workflow_watcher_targets_and_reload("workbench_remove")
+            .await?;
         Ok(())
     }
 
@@ -4989,24 +5016,239 @@ impl HostHandle {
     }
 
     pub(crate) async fn refresh_workflows(&self) -> AppResult<()> {
-        let payload = {
-            let mut state = self.state.lock().await;
+        self.reload_workflows_and_notify("workflow_refresh").await
+    }
+
+    async fn reload_workflows_and_notify(&self, reason: &'static str) -> AppResult<()> {
+        self.reload_workflows_and_notify_inner(reason, None).await
+    }
+
+    async fn reload_workflows_and_notify_inner(
+        &self,
+        reason: &'static str,
+        extra_diagnostic: Option<WorkflowDiagnostic>,
+    ) -> AppResult<()> {
+        let mut state = self.state.lock().await;
+        let projects = state.project_store.lock().await.list().map_err(|error| {
+            AppError::internal_message(reason, error.to_string(), anyhow!(error.to_string()))
+        })?;
+        let mut catalog = WorkflowCatalog::discover(&projects);
+        if let Some(diagnostic) = extra_diagnostic {
+            catalog.push_diagnostic(diagnostic);
+        }
+        let locations = workflow_catalog_locations(&projects);
+        let payload = WorkflowNotifyPayload {
+            summaries: catalog.summaries(),
+            diagnostics: catalog.diagnostics(),
+            locations: locations.clone(),
+        };
+        state.workflow_catalog = catalog;
+        state.workflow_locations = locations;
+        fan_out_workflow_notify(&mut state, payload).await;
+        Ok(())
+    }
+
+    async fn update_workflow_watcher_targets(&self) -> AppResult<()> {
+        let (watcher, targets) = {
+            let state = self.state.lock().await;
             let projects = state.project_store.lock().await.list().map_err(|error| {
                 AppError::internal_message(
-                    "workflow_refresh",
+                    "workflow_watch_targets",
                     error.to_string(),
                     anyhow!(error.to_string()),
                 )
             })?;
-            state.workflow_catalog = WorkflowCatalog::discover(&projects);
-            WorkflowNotifyPayload {
-                summaries: state.workflow_catalog.summaries(),
-                diagnostics: state.workflow_catalog.diagnostics(),
+            (
+                state.workflow_watcher.clone(),
+                workflow_watch_dirs(&projects),
+            )
+        };
+        watcher.set_targets(targets).await.map_err(|error| {
+            AppError::internal_message("workflow_watch_targets", error.clone(), anyhow!(error))
+        })
+    }
+
+    async fn update_workflow_watcher_targets_and_reload(
+        &self,
+        reason: &'static str,
+    ) -> AppResult<()> {
+        self.update_workflow_watcher_targets().await?;
+        self.reload_workflows_and_notify(reason).await
+    }
+
+    pub(crate) async fn workflow_targets_for_agent(
+        &self,
+        caller_agent_id: Option<&AgentId>,
+    ) -> Result<WorkflowTargetsResponse, String> {
+        let state = self.state.lock().await;
+        let projects = state.project_store.lock().await.list()?;
+        let mut target_projects = Vec::new();
+        match caller_agent_id {
+            Some(agent_id) => {
+                let handle = state
+                    .registry
+                    .agent_handle(agent_id)
+                    .ok_or_else(|| format!("unknown caller agent_id {agent_id}"))?;
+                if let Some(project_id) = handle.snapshot().project_id {
+                    let project = projects
+                        .iter()
+                        .find(|project| project.id == project_id)
+                        .ok_or_else(|| format!("caller project {project_id} no longer exists"))?;
+                    target_projects.push(project.clone());
+                }
+            }
+            None => target_projects.extend(projects.clone()),
+        }
+        drop(state);
+
+        let mut targets = vec![WorkflowTargetDirectory {
+            target: WorkflowSaveTarget::Global,
+            location: workflow_location_for_scope(WorkflowSourceScope::Global),
+        }];
+        for project in target_projects {
+            for root in project.root_paths() {
+                let scope = WorkflowSourceScope::Project {
+                    project_id: project.id.clone(),
+                    root: root.clone(),
+                };
+                targets.push(WorkflowTargetDirectory {
+                    target: WorkflowSaveTarget::Project {
+                        project_id: project.id.clone(),
+                        root,
+                    },
+                    location: workflow_location_for_scope(scope),
+                });
+            }
+        }
+        Ok(WorkflowTargetsResponse { targets })
+    }
+
+    pub(crate) async fn workflow_save_from_agent(
+        &self,
+        request: WorkflowSaveRequest,
+    ) -> Result<WorkflowSaveResponse, String> {
+        let save_guard = self.workflow_save_lock.lock().await;
+        let (target_dir, scope) = self.resolve_workflow_save_target(&request.target).await?;
+        let filename = validate_workflow_filename(&request.filename)?;
+        let path = target_dir.join(filename);
+        let path_string = path.display().to_string();
+        let source = WorkflowSource {
+            scope: scope.clone(),
+            path: path_string.clone(),
+        };
+        let replacement = parse_workflow_content(&request.markdown, source.clone())
+            .map_err(|error| error.message().to_owned())?;
+
+        let created = match &request.mode {
+            WorkflowSaveMode::Create => {
+                if path.exists() {
+                    return Err(format!("workflow file already exists: {path_string}"));
+                }
+                let fresh_catalog = self.fresh_workflow_catalog_for_save().await?;
+                if fresh_catalog.has_same_scope_id(&scope, &replacement.summary.id) {
+                    return Err(format!(
+                        "workflow id {} already exists in the same scope",
+                        replacement.summary.id
+                    ));
+                }
+                true
+            }
+            WorkflowSaveMode::Replace {
+                existing_path,
+                existing_id,
+            } => {
+                if !path.exists() {
+                    return Err(format!("workflow file does not exist: {path_string}"));
+                }
+                if existing_path != &path_string {
+                    return Err(format!(
+                        "replace existing_path {existing_path:?} does not match target path {path_string:?}"
+                    ));
+                }
+                let current = parse_workflow_file(&path, source.clone())
+                    .map_err(|error| error.message().to_owned())?;
+                if &current.summary.id != existing_id {
+                    return Err(format!(
+                        "replace existing_id {} does not match current workflow id {}",
+                        existing_id, current.summary.id
+                    ));
+                }
+                if replacement.summary.id != *existing_id {
+                    return Err(
+                        "replace cannot change workflow id; create a new workflow instead"
+                            .to_owned(),
+                    );
+                }
+                false
             }
         };
-        let mut state = self.state.lock().await;
-        fan_out_workflow_notify(&mut state, payload).await;
-        Ok(())
+
+        atomic_write_workflow(&path, request.markdown.as_bytes(), !created)?;
+        self.update_workflow_watcher_targets()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.reload_workflows_and_notify("workflow_save")
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let state = self.state.lock().await;
+        let summary = state
+            .workflow_catalog
+            .summary_for_path(&path_string)
+            .ok_or_else(|| {
+                format!("saved workflow {path_string} was not present after workflow reload")
+            })?;
+        let diagnostics = state.workflow_catalog.diagnostics_for_path(&path_string);
+        let response = WorkflowSaveResponse {
+            source: summary.source.clone(),
+            summary,
+            path: path_string,
+            created,
+            diagnostics,
+        };
+        drop(save_guard);
+        Ok(response)
+    }
+
+    async fn fresh_workflow_catalog_for_save(&self) -> Result<WorkflowCatalog, String> {
+        let state = self.state.lock().await;
+        let projects = state.project_store.lock().await.list()?;
+        Ok(WorkflowCatalog::discover(&projects))
+    }
+
+    async fn resolve_workflow_save_target(
+        &self,
+        target: &WorkflowSaveTarget,
+    ) -> Result<(PathBuf, WorkflowSourceScope), String> {
+        match target {
+            WorkflowSaveTarget::Global => Ok((global_workflows_dir(), WorkflowSourceScope::Global)),
+            WorkflowSaveTarget::Project { project_id, root } => {
+                let state = self.state.lock().await;
+                let project = state
+                    .project_store
+                    .lock()
+                    .await
+                    .get(project_id)
+                    .ok_or_else(|| format!("unknown project_id {project_id}"))?;
+                if !project
+                    .root_paths()
+                    .iter()
+                    .any(|candidate| candidate == root)
+                {
+                    return Err(format!(
+                        "root {} does not belong to project {}",
+                        root, project_id
+                    ));
+                }
+                Ok((
+                    project_workflows_dir(root),
+                    WorkflowSourceScope::Project {
+                        project_id: project_id.clone(),
+                        root: root.clone(),
+                    },
+                ))
+            }
+        }
     }
 
     pub(crate) async fn trigger_workflow(&self, payload: TriggerWorkflowPayload) -> AppResult<()> {
@@ -7934,7 +8176,10 @@ fn spawn_host_inner(
     let (session_store, purged_gemini_session_ids) =
         SessionStore::load_with_migration(paths.session)?;
     let project_store = ProjectStore::load(paths.project)?;
-    let workflow_catalog = WorkflowCatalog::discover(&project_store.list()?);
+    let initial_projects = project_store.list()?;
+    let workflow_catalog = WorkflowCatalog::discover(&initial_projects);
+    let workflow_locations = workflow_catalog_locations(&initial_projects);
+    let workflow_watch_targets = workflow_watch_dirs(&initial_projects);
     let workflow_run_store = WorkflowRunStore::load(paths.workflow_runs)?;
     let review_store = ReviewStore::load(paths.review)?;
     let settings_store = HostSettingsStore::load(paths.settings)?;
@@ -7949,10 +8194,9 @@ fn spawn_host_inner(
             .into_iter()
             .map(|custom_agent| custom_agent.id)
             .collect(),
-        project_ids: project_store
-            .list()?
-            .into_iter()
-            .map(|project| project.id)
+        project_ids: initial_projects
+            .iter()
+            .map(|project| project.id.clone())
             .collect(),
         enabled_backend_kinds: host_settings.enabled_backends.iter().copied().collect(),
         role_preset_ids,
@@ -7999,6 +8243,10 @@ fn spawn_host_inner(
     let config_mcp_placeholder = ConfigMcpHandle { url: String::new() };
     let review_mcp_placeholder = ReviewMcpHandle { url: String::new() };
     let workflow_mcp_placeholder = WorkflowMcpHandle { url: String::new() };
+    let (workflow_signal_tx, workflow_signal_rx) =
+        mpsc::channel::<WorkflowCatalogSignal>(crate::workflows::watch::workflow_signal_capacity());
+    let workflow_watcher =
+        crate::workflows::watch::spawn_workflow_watcher(workflow_watch_targets, workflow_signal_tx);
     let host = HostHandle {
         state: Arc::new(Mutex::new(HostState {
             registry: AgentRegistry::new(),
@@ -8019,7 +8267,9 @@ fn spawn_host_inner(
             config_mcp: config_mcp_placeholder,
             review_mcp: review_mcp_placeholder,
             workflow_mcp: workflow_mcp_placeholder,
+            workflow_watcher,
             workflow_catalog,
+            workflow_locations,
             workflow_run_store,
             mobile_access: mobile_access.clone(),
             kiro_session_schema: KiroSessionSchemaState::Pending,
@@ -8034,6 +8284,7 @@ fn spawn_host_inner(
             code_intel_routers: HashMap::new(),
             removing_projects: HashSet::new(),
         })),
+        workflow_save_lock: Arc::new(Mutex::new(())),
     };
 
     spawn_mobile_access_actor(
@@ -8128,6 +8379,7 @@ fn spawn_host_inner(
     spawn_host_review_delivery_task(host.clone(), review_delivery_rx);
     spawn_host_review_ai_task(host.clone(), review_ai_spawn_rx);
     spawn_host_review_project_update_task(host.clone(), review_project_update_rx);
+    spawn_host_workflow_catalog_task(host.clone(), workflow_signal_rx);
     spawn_host_team_status_task(host.clone());
 
     Ok(host)
@@ -8353,6 +8605,58 @@ fn spawn_host_review_project_update_task(
         .expect("failed to spawn review project update worker thread");
 }
 
+fn spawn_host_workflow_catalog_task(
+    host: HostHandle,
+    mut rx: mpsc::Receiver<WorkflowCatalogSignal>,
+) {
+    let worker = async move {
+        while let Some(signal) = rx.recv().await {
+            let result = match signal {
+                WorkflowCatalogSignal::Rescan { reason } => {
+                    let reason: &'static str = match reason.as_str() {
+                        "workflow_fs_watch" => "workflow_fs_watch",
+                        "workflow_watch_target_created" => "workflow_watch_target_created",
+                        _ => "workflow_catalog_signal",
+                    };
+                    host.reload_workflows_and_notify(reason).await
+                }
+                WorkflowCatalogSignal::WatcherError { message } => {
+                    let diagnostic = WorkflowDiagnostic {
+                        workflow_id: None,
+                        source: None,
+                        severity: WorkflowDiagnosticSeverity::Error,
+                        message,
+                    };
+                    host.reload_workflows_and_notify_inner("workflow_fs_watch", Some(diagnostic))
+                        .await
+                }
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    error = %error,
+                    "failed to reload workflows after workflow catalog signal"
+                );
+            }
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    std::thread::Builder::new()
+        .name("tyde-workflow-catalog".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build workflow catalog runtime");
+            runtime.block_on(worker);
+        })
+        .expect("failed to spawn workflow catalog worker thread");
+}
+
 pub(crate) fn startup_mcp_servers_for_settings(
     settings: &protocol::HostSettings,
     workspace_roots: &[String],
@@ -8523,6 +8827,116 @@ fn is_workflow_terminal(status: WorkflowRunSnapshotStatus) -> bool {
             | WorkflowRunSnapshotStatus::Failed
             | WorkflowRunSnapshotStatus::Cancelled
     )
+}
+
+fn workflow_location_for_scope(scope: WorkflowSourceScope) -> WorkflowCatalogLocation {
+    let directory = match &scope {
+        WorkflowSourceScope::Global => global_workflows_dir(),
+        WorkflowSourceScope::Project { root, .. } => project_workflows_dir(root),
+    };
+    WorkflowCatalogLocation {
+        scope,
+        directory: directory.display().to_string(),
+        exists: directory.is_dir(),
+    }
+}
+
+fn validate_workflow_filename(filename: &str) -> Result<&str, String> {
+    let trimmed = filename.trim();
+    if trimmed.is_empty() {
+        return Err("filename must not be empty".to_owned());
+    }
+    if trimmed != filename {
+        return Err("filename must not contain surrounding whitespace".to_owned());
+    }
+    if !filename.ends_with(".md") {
+        return Err("filename must end with .md".to_owned());
+    }
+    if filename.contains('/') || filename.contains('\\') {
+        return Err("filename must be a basename, not a path".to_owned());
+    }
+    let mut components = Path::new(filename).components();
+    let Some(Component::Normal(component)) = components.next() else {
+        return Err("filename must be a normal basename".to_owned());
+    };
+    if components.next().is_some() || component.to_string_lossy() != filename {
+        return Err("filename must be a normal basename".to_owned());
+    }
+    if filename == ".." {
+        return Err("filename must not contain .. components".to_owned());
+    }
+    Ok(filename)
+}
+
+fn atomic_write_workflow(path: &Path, bytes: &[u8], replace: bool) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("workflow path {} has no parent", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        format!(
+            "failed to create workflow directory '{}': {error}",
+            parent.display()
+        )
+    })?;
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("workflow path {} has no filename", path.display()))?;
+    let temp_path = parent.join(format!(".{filename}.{}.tmp", Uuid::new_v4()));
+    let write_result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| {
+                format!(
+                    "failed to create temporary workflow file '{}': {error}",
+                    temp_path.display()
+                )
+            })?;
+        use std::io::Write;
+        file.write_all(bytes).map_err(|error| {
+            format!(
+                "failed to write temporary workflow file '{}': {error}",
+                temp_path.display()
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            format!(
+                "failed to flush temporary workflow file '{}': {error}",
+                temp_path.display()
+            )
+        })?;
+        if replace {
+            std::fs::rename(&temp_path, path).map_err(|error| {
+                format!(
+                    "failed to replace workflow file '{}' with '{}': {error}",
+                    path.display(),
+                    temp_path.display()
+                )
+            })
+        } else {
+            std::fs::hard_link(&temp_path, path).map_err(|error| {
+                format!(
+                    "failed to create workflow file '{}' from '{}': {error}",
+                    path.display(),
+                    temp_path.display()
+                )
+            })?;
+            if let Err(error) = std::fs::remove_file(&temp_path) {
+                tracing::warn!(
+                    path = %temp_path.display(),
+                    error = %error,
+                    "failed to remove temporary workflow file after create"
+                );
+            }
+            Ok(())
+        }
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result
 }
 
 fn workflow_status_label(status: WorkflowRunSnapshotStatus) -> &'static str {

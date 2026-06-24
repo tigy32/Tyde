@@ -4041,6 +4041,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                 workflow_summaries: vec![],
                 workflow_diagnostics: vec![],
                 workflow_runs: vec![],
+                workflow_locations: vec![],
             },
         )
         .expect("serialize HostBootstrap");

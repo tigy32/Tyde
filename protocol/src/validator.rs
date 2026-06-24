@@ -1681,6 +1681,7 @@ mod tests {
                 workflow_summaries: vec![],
                 workflow_diagnostics: vec![],
                 workflow_runs: vec![],
+                workflow_locations: vec![],
             },
         )
         .expect("serialize HostBootstrap")

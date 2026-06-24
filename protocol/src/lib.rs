@@ -90,10 +90,12 @@ pub use types::{
     ToolExecutionResult, ToolPolicy, ToolProgressData, ToolProgressUpdate, ToolRequest,
     ToolRequestType, ToolUseData, TriggerSurface, TriggerWorkflowPayload, Version, WelcomePayload,
     WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowAgentState,
-    WorkflowAgentStatus, WorkflowCoordinatorSpec, WorkflowDiagnostic, WorkflowDiagnosticSeverity,
-    WorkflowId, WorkflowInputSpec, WorkflowNotifyPayload, WorkflowRefreshPayload, WorkflowRunId,
-    WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus, WorkflowRunState,
-    WorkflowRunStatus, WorkflowSource, WorkflowSourceScope, WorkflowStepRunId,
-    WorkflowStepRunSnapshot, WorkflowStepRunSnapshotStatus, WorkflowSummary,
+    WorkflowAgentStatus, WorkflowCatalogLocation, WorkflowCoordinatorSpec, WorkflowDiagnostic,
+    WorkflowDiagnosticSeverity, WorkflowId, WorkflowInputSpec, WorkflowNotifyPayload,
+    WorkflowRefreshPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
+    WorkflowRunSnapshotStatus, WorkflowRunState, WorkflowRunStatus, WorkflowSaveMode,
+    WorkflowSaveRequest, WorkflowSaveResponse, WorkflowSaveTarget, WorkflowSource,
+    WorkflowSourceScope, WorkflowStepRunId, WorkflowStepRunSnapshot, WorkflowStepRunSnapshotStatus,
+    WorkflowSummary, WorkflowTargetDirectory, WorkflowTargetsResponse,
 };
 pub use validator::{ObservedFrame, ProtocolValidator, ProtocolViolation};
