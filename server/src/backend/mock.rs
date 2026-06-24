@@ -8,6 +8,9 @@ use protocol::{
     TokenUsage, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequest,
     ToolRequestType,
 };
+use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
@@ -15,7 +18,7 @@ use uuid::Uuid;
 use super::empty_session_settings_schema;
 use super::{
     Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
-    StartupMcpTransport,
+    StartupMcpServer, StartupMcpTransport,
 };
 use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
 
@@ -49,6 +52,7 @@ pub(crate) const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str =
 const MOCK_EXIT_PLAN_MODE_SENTINEL: &str = "__mock_exit_plan_mode__";
 const MOCK_EXIT_PLAN_MODE_STREAM_END_FIRST_SENTINEL: &str =
     "__mock_exit_plan_mode_stream_end_first__";
+const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
 const MOCK_HISTORY_SENTINEL: &str = "__mock_history__";
 const MOCK_FAILED_TOOL_CALL_ID: &str = "mock-failed-tool";
 const MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID: &str = "mock-exit-plan-tool";
@@ -92,6 +96,16 @@ fn session_store() -> &'static Mutex<HashMap<String, MockSessionRecord>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn agent_control_mcp_url(startup_mcp_servers: &[StartupMcpServer]) -> Option<String> {
+    startup_mcp_servers
+        .iter()
+        .find(|server| server.name == "tyde-agent-control")
+        .and_then(|server| match &server.transport {
+            StartupMcpTransport::Http { url, .. } => Some(url.clone()),
+            StartupMcpTransport::Stdio { .. } => None,
+        })
+}
+
 pub struct MockBackend {
     command_tx: mpsc::UnboundedSender<MockCommand>,
     session_id: SessionId,
@@ -101,6 +115,13 @@ pub struct MockBackend {
 enum MockCommand {
     Input(AgentInput),
     Interrupt,
+}
+
+struct MockLoopConfig {
+    initial_message: Option<String>,
+    slow_initial_turn: bool,
+    hold_initial_turn: bool,
+    agent_control_mcp_url: Option<String>,
 }
 
 impl MockBackend {
@@ -123,6 +144,7 @@ impl Backend for MockBackend {
         if initial_message.contains(FORCE_SPAWN_FAILURE_SENTINEL) {
             return Err("mock backend forced spawn failure".to_string());
         }
+        let agent_control_mcp_url = agent_control_mcp_url(&config.startup_mcp_servers);
         let startup_mcp_servers = config
             .startup_mcp_servers
             .iter()
@@ -179,9 +201,12 @@ impl Backend for MockBackend {
             command_rx,
             events_tx,
             subagent_emitter_rx,
-            Some(initial_message),
-            slow_initial_turn,
-            hold_initial_turn,
+            MockLoopConfig {
+                initial_message: Some(initial_message),
+                slow_initial_turn,
+                hold_initial_turn,
+                agent_control_mcp_url,
+            },
         );
 
         Ok((
@@ -199,6 +224,7 @@ impl Backend for MockBackend {
         config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
+        let agent_control_mcp_url = agent_control_mcp_url(&config.startup_mcp_servers);
         let startup_mcp_servers = config
             .startup_mcp_servers
             .iter()
@@ -240,9 +266,12 @@ impl Backend for MockBackend {
             command_rx,
             events_tx,
             subagent_emitter_rx,
-            None,
-            false,
-            false,
+            MockLoopConfig {
+                initial_message: None,
+                slow_initial_turn: false,
+                hold_initial_turn: false,
+                agent_control_mcp_url,
+            },
         );
 
         Ok((
@@ -262,6 +291,7 @@ impl Backend for MockBackend {
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), BackendStartupError> {
         let initial_message = initial_input.message;
+        let agent_control_mcp_url = agent_control_mcp_url(&config.startup_mcp_servers);
         let startup_mcp_servers = config
             .startup_mcp_servers
             .iter()
@@ -315,9 +345,12 @@ impl Backend for MockBackend {
             command_rx,
             events_tx,
             subagent_emitter_rx,
-            Some(initial_message),
-            false,
-            false,
+            MockLoopConfig {
+                initial_message: Some(initial_message),
+                slow_initial_turn: false,
+                hold_initial_turn: false,
+                agent_control_mcp_url,
+            },
         );
 
         Ok((
@@ -373,10 +406,14 @@ fn start_mock_command_loop(
     mut command_rx: mpsc::UnboundedReceiver<MockCommand>,
     events_tx: mpsc::UnboundedSender<ChatEvent>,
     mut subagent_emitter_rx: watch::Receiver<Option<Arc<dyn SubAgentEmitter>>>,
-    initial_message: Option<String>,
-    slow_initial_turn: bool,
-    hold_initial_turn: bool,
+    config: MockLoopConfig,
 ) {
+    let MockLoopConfig {
+        initial_message,
+        slow_initial_turn,
+        hold_initial_turn,
+        agent_control_mcp_url,
+    } = config;
     tokio::spawn(async move {
         let mut active_subagents = Vec::new();
         let mut pending_exit_plan_mode = None;
@@ -396,6 +433,16 @@ fn start_mock_command_loop(
                     return;
                 }
                 holding_until_interrupt = true;
+            } else if let Some(agent_ids) = parse_mock_agent_control_await(&initial_message) {
+                if !emit_mock_agent_control_await(
+                    &events_tx,
+                    agent_control_mcp_url.as_deref(),
+                    agent_ids,
+                )
+                .await
+                {
+                    return;
+                }
             } else if initial_message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL)
                 || initial_message.contains(MOCK_EXIT_PLAN_MODE_STREAM_END_FIRST_SENTINEL)
             {
@@ -472,7 +519,17 @@ fn start_mock_command_loop(
                         continue;
                     }
                     record_prompt(&session_id_for_task, &payload.message);
-                    if payload.message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL)
+                    if let Some(agent_ids) = parse_mock_agent_control_await(&payload.message) {
+                        if !emit_mock_agent_control_await(
+                            &events_tx,
+                            agent_control_mcp_url.as_deref(),
+                            agent_ids,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    } else if payload.message.contains(MOCK_EXIT_PLAN_MODE_SENTINEL)
                         || payload
                             .message
                             .contains(MOCK_EXIT_PLAN_MODE_STREAM_END_FIRST_SENTINEL)
@@ -775,6 +832,227 @@ async fn emit_turn(
     }
 
     true
+}
+
+fn parse_mock_agent_control_await(message: &str) -> Option<Vec<String>> {
+    let (_, after_sentinel) = message.split_once(MOCK_AGENT_CONTROL_AWAIT_SENTINEL)?;
+    let agent_ids = after_sentinel
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    (!agent_ids.is_empty()).then_some(agent_ids)
+}
+
+async fn emit_mock_agent_control_await(
+    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    agent_control_mcp_url: Option<&str>,
+    agent_ids: Vec<String>,
+) -> bool {
+    let message_id = Some(Uuid::new_v4().to_string());
+    let tool_call_id = format!("mock-agent-control-await-{}", Uuid::new_v4());
+    let tool_name = "tyde_await_agents";
+
+    if events_tx
+        .send(ChatEvent::TypingStatusChanged(true))
+        .is_err()
+    {
+        return false;
+    }
+    if events_tx
+        .send(ChatEvent::StreamStart(StreamStartData {
+            message_id: message_id.clone(),
+            agent: "mock".to_owned(),
+            model: Some(MOCK_MODEL.to_owned()),
+        }))
+        .is_err()
+    {
+        return false;
+    }
+    if events_tx
+        .send(ChatEvent::ToolRequest(ToolRequest {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.to_owned(),
+            tool_type: ToolRequestType::Other {
+                args: json!({
+                    "agent_ids": agent_ids.clone(),
+                }),
+            },
+        }))
+        .is_err()
+    {
+        return false;
+    }
+
+    let result = match agent_control_mcp_url {
+        Some(url) => call_agent_control_await_mcp(url, &agent_ids).await,
+        None => Err("mock backend has no tyde-agent-control MCP server".to_owned()),
+    };
+    let (success, tool_result, error, response_text) = match result {
+        Ok(body) => (
+            true,
+            ToolExecutionResult::Other {
+                result: body.clone(),
+            },
+            None,
+            format!("mock agent-control await completed: {body}"),
+        ),
+        Err(error) => (
+            false,
+            ToolExecutionResult::Error {
+                short_message: "tyde_await_agents failed".to_owned(),
+                detailed_message: error.clone(),
+            },
+            Some(error.clone()),
+            format!("mock agent-control await failed: {error}"),
+        ),
+    };
+
+    if events_tx
+        .send(ChatEvent::ToolExecutionCompleted(
+            ToolExecutionCompletedData {
+                tool_call_id,
+                tool_name: tool_name.to_owned(),
+                tool_result,
+                success,
+                error,
+            },
+        ))
+        .is_err()
+    {
+        return false;
+    }
+    if events_tx
+        .send(ChatEvent::StreamDelta(StreamTextDeltaData {
+            message_id: message_id.clone(),
+            text: response_text.clone(),
+        }))
+        .is_err()
+    {
+        return false;
+    }
+    if events_tx
+        .send(ChatEvent::StreamEnd(StreamEndData {
+            message: ChatMessage {
+                message_id: message_id.map(protocol::ChatMessageId),
+                timestamp: now_ms(),
+                sender: MessageSender::Assistant {
+                    agent: "mock".to_owned(),
+                },
+                content: response_text,
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: Some(ModelInfo {
+                    model: MOCK_MODEL.to_owned(),
+                }),
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+        }))
+        .is_err()
+    {
+        return false;
+    }
+    events_tx
+        .send(ChatEvent::TypingStatusChanged(false))
+        .is_ok()
+}
+
+async fn call_agent_control_await_mcp(url: &str, agent_ids: &[String]) -> Result<Value, String> {
+    let response = post_mcp_json(
+        url,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "mock-agent-control-await",
+            "method": "tools/call",
+            "params": {
+                "name": "tyde_await_agents",
+                "arguments": {
+                    "agent_ids": agent_ids,
+                }
+            }
+        }),
+    )
+    .await?;
+    let result = response
+        .get("result")
+        .ok_or_else(|| format!("MCP response missing result: {response}"))?;
+    let is_error = result
+        .get("isError")
+        .or_else(|| result.get("is_error"))
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("MCP result missing isError: {response}"))?;
+    if is_error {
+        return Err(format!("MCP tool call failed: {response}"));
+    }
+    let text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|entry| entry.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("MCP response missing content text: {response}"))?;
+    serde_json::from_str(text).map_err(|err| format!("failed to parse MCP result JSON: {err}"))
+}
+
+async fn post_mcp_json(url: &str, body: &Value) -> Result<Value, String> {
+    let (addr, target) = parse_http_url(url)?;
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .map_err(|err| format!("connect {addr} failed: {err}"))?;
+    let body_bytes =
+        serde_json::to_vec(body).map_err(|err| format!("serialize MCP request failed: {err}"))?;
+    let request = format!(
+        "POST {target} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|err| format!("write MCP HTTP headers failed: {err}"))?;
+    stream
+        .write_all(&body_bytes)
+        .await
+        .map_err(|err| format!("write MCP HTTP body failed: {err}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|err| format!("flush MCP HTTP request failed: {err}"))?;
+
+    let mut response_bytes = Vec::new();
+    stream
+        .read_to_end(&mut response_bytes)
+        .await
+        .map_err(|err| format!("read MCP HTTP response failed: {err}"))?;
+    let header_end = response_bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "MCP HTTP response missing header terminator".to_owned())?;
+    let header = std::str::from_utf8(&response_bytes[..header_end])
+        .map_err(|err| format!("MCP HTTP response header was not UTF-8: {err}"))?;
+    if !header.starts_with("HTTP/1.1 200") {
+        return Err(format!("unexpected MCP HTTP response header: {header}"));
+    }
+    let response_body = std::str::from_utf8(&response_bytes[header_end + 4..])
+        .map_err(|err| format!("MCP HTTP response body was not UTF-8: {err}"))?;
+    let json_str = response_body
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .ok_or_else(|| format!("no SSE data line in MCP response body: {response_body}"))?;
+    serde_json::from_str(json_str)
+        .map_err(|err| format!("failed to parse MCP SSE JSON response: {err}"))
+}
+
+fn parse_http_url(url: &str) -> Result<(&str, &str), String> {
+    let without_scheme = url
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("expected http:// URL, got {url}"))?;
+    let slash = without_scheme
+        .find('/')
+        .ok_or_else(|| format!("expected path in URL {url}"))?;
+    Ok((&without_scheme[..slash], &without_scheme[slash..]))
 }
 
 async fn emit_exit_plan_mode_request(

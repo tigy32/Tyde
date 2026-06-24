@@ -10,7 +10,7 @@ use protocol::{
     ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectId,
     ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SendMessagePayload,
     SendMessageToolResponse, SessionListPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
-    ToolRequest, write_envelope,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -58,6 +58,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList
+                | FrameKind::WorkflowNotify
         ) {
             continue;
         }
@@ -162,6 +163,7 @@ async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: 
                 | FrameKind::SessionSchemas
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
+                | FrameKind::WorkflowNotify
         ) {
             continue;
         }
@@ -274,6 +276,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionList
                             | FrameKind::HostSettings
+                            | FrameKind::WorkflowNotify
                     ) =>
             {
                 continue;
@@ -578,6 +581,7 @@ const MOCK_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_native_child__";
 const MOCK_NATIVE_CHILD_AND_DROP_SENTINEL: &str = "__mock_spawn_native_child_and_drop__";
 const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
 const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str = "__mock_tool_failure_without_idle__";
+const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
 
 async fn expect_turn_on_stream(
     client: &mut client::Connection,
@@ -660,6 +664,58 @@ async fn expect_failed_tool_completion_on_stream(
             assert!(
                 error.contains(expected_error),
                 "unexpected tool completion error on {stream}: {error}"
+            );
+            return;
+        }
+    }
+}
+
+async fn expect_tool_request_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_tool_name: &str,
+) -> ToolRequest {
+    loop {
+        let env = expect_chat_event_on_stream(client, stream, expected_tool_name).await;
+        let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+        if let ChatEvent::ToolRequest(request) = event
+            && request.tool_name == expected_tool_name
+        {
+            return request;
+        }
+    }
+}
+
+async fn expect_tool_completion_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_tool_call_id: &str,
+) -> ToolExecutionCompletedData {
+    loop {
+        let env = expect_chat_event_on_stream(client, stream, "ToolExecutionCompleted").await;
+        let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+        if let ChatEvent::ToolExecutionCompleted(completion) = event
+            && completion.tool_call_id == expected_tool_call_id
+        {
+            return completion;
+        }
+    }
+}
+
+async fn expect_stream_end_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_text: &str,
+) {
+    loop {
+        let env = expect_chat_event_on_stream(client, stream, "StreamEnd").await;
+        let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+        if let ChatEvent::StreamEnd(end) = event {
+            assert!(
+                end.message.content.contains(expected_text),
+                "unexpected StreamEnd text on {}: {}",
+                stream,
+                end.message.content
             );
             return;
         }
@@ -866,6 +922,7 @@ async fn expect_no_agent_error_message(
                             | FrameKind::BackendSetup
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionList
+                            | FrameKind::WorkflowNotify
                     ) =>
             {
                 continue;
@@ -2159,6 +2216,186 @@ async fn agent_control_http_await_emits_progress_notifications() {
     );
 
     service.cancel().await.expect("cancel MCP client");
+}
+
+#[tokio::test]
+async fn agent_control_await_tool_call_emits_correlated_completion_when_child_becomes_ready() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("await-tool-parent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/await-tool-parent".to_owned()],
+                prompt: "parent ready".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn parent failed");
+
+    let env = expect_next_event(&mut fixture.client, "await-tool parent NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let parent_new: NewAgentPayload = env.parse_payload().expect("parse parent NewAgent");
+
+    let parent_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "await-tool parent AgentStart",
+    )
+    .await;
+    assert_eq!(parent_start.agent_id, parent_new.agent_id);
+
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "mock backend response to: parent ready",
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("await-tool-child".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(parent_new.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/await-tool-child".to_owned()],
+                prompt: "__mock_hold_until_interrupt__ child awaited".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn child failed");
+
+    let env = expect_next_event(&mut fixture.client, "await-tool child NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let child_new: NewAgentPayload = env.parse_payload().expect("parse child NewAgent");
+    assert_eq!(
+        child_new.parent_agent_id.as_ref(),
+        Some(&parent_new.agent_id)
+    );
+
+    let child_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "await-tool child AgentStart",
+    )
+    .await;
+    assert_eq!(child_start.agent_id, child_new.agent_id);
+    assert_eq!(
+        child_start.parent_agent_id.as_ref(),
+        Some(&parent_new.agent_id)
+    );
+
+    expect_stream_end_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "mock backend held response to: __mock_hold_until_interrupt__ child awaited",
+    )
+    .await;
+
+    let base_url = fixture.agent_control_http_url().await;
+    wait_for_agent_control_status(
+        &base_url,
+        &child_new.agent_id,
+        "thinking",
+        Duration::from_secs(1),
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message(
+            &parent_new.instance_stream,
+            format!(
+                "{} {}",
+                MOCK_AGENT_CONTROL_AWAIT_SENTINEL, child_new.agent_id.0
+            ),
+        )
+        .await
+        .expect("send parent await tool prompt");
+
+    let await_request = expect_tool_request_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "tyde_await_agents",
+    )
+    .await;
+    let ToolRequest {
+        tool_call_id,
+        tool_name,
+        tool_type,
+    } = await_request;
+    assert_eq!(tool_name, "tyde_await_agents");
+    let ToolRequestType::Other { args } = tool_type else {
+        panic!("expected tyde_await_agents ToolRequest to use Other args");
+    };
+    assert_eq!(
+        args.get("agent_ids")
+            .and_then(Value::as_array)
+            .and_then(|agent_ids| agent_ids.first())
+            .and_then(Value::as_str),
+        Some(child_new.agent_id.0.as_str())
+    );
+
+    fixture
+        .client
+        .interrupt(&child_new.instance_stream)
+        .await
+        .expect("interrupt held child");
+    expect_operation_cancelled_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "mock backend interrupted held turn",
+    )
+    .await;
+
+    wait_for_agent_control_status(
+        &base_url,
+        &child_new.agent_id,
+        "idle",
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let completion = expect_tool_completion_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        &tool_call_id,
+    )
+    .await;
+    assert_eq!(completion.tool_call_id, tool_call_id);
+    assert_eq!(completion.tool_name, "tyde_await_agents");
+    assert!(
+        completion.success,
+        "await completion failed: {completion:?}"
+    );
+    let ToolExecutionResult::Other { result } = completion.tool_result else {
+        panic!("expected await completion to carry MCP result JSON");
+    };
+    assert_await_result_ready(&result, &child_new.agent_id);
+
+    expect_stream_end_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "mock agent-control await completed",
+    )
+    .await;
+    expect_typing_false_on_stream(&mut fixture.client, &parent_new.instance_stream).await;
 }
 
 #[tokio::test]
