@@ -3050,6 +3050,12 @@ pub enum CodeIntelErrorContext {
 pub struct CodeIntelErrorPayload {
     pub code: CodeIntelErrorCode,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
     pub context: CodeIntelErrorContext,
     pub fatal: bool,
 }
@@ -4704,6 +4710,9 @@ mod code_intel_serde_tests {
                 let payload = CodeIntelErrorPayload {
                     code: *code,
                     message: "boom".to_owned(),
+                    hint: Some("rustup component add rust-analyzer".to_owned()),
+                    exit_status: Some("exit status: 1".to_owned()),
+                    stderr: Some("language server stderr".to_owned()),
                     context: context.clone(),
                     fatal: true,
                 };

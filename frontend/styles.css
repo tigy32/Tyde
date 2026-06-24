@@ -5563,6 +5563,17 @@ kbd {
     white-space: nowrap;
 }
 
+.file-view-code-intel-status {
+    max-width: min(42vw, 56ch);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-tertiary);
+    font-size: 0.769rem;
+    flex-shrink: 1;
+}
+
 .file-view-close {
     width: 24px;
     height: 24px;
@@ -9503,6 +9514,46 @@ pre.tool-error-pre {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    color: var(--text-primary);
+}
+
+/* ── Find-references panel header ──────────────────────────────────── */
+
+.references-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px;
+    border-bottom: 1px solid var(--border-primary);
+    flex-shrink: 0;
+}
+
+.references-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+    font-size: 0.808rem;
+    font-weight: 600;
+}
+
+.references-clear {
+    flex-shrink: 0;
+    height: 24px;
+    padding: 0 8px;
+    background: var(--surface-0);
+    border: 1px solid var(--border-primary);
+    color: var(--text-secondary);
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.769rem;
+    line-height: 1;
+}
+
+.references-clear:hover {
+    background: var(--surface-2);
     color: var(--text-primary);
 }
 

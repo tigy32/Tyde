@@ -192,7 +192,8 @@ LSP `didChange` path. That is future work (§9). Do not build it now.
 No bundled binary, no managed download in v1. Discovery order:
 
 1. `find_executable_in_path("rust-analyzer")`
-2. else `rustup which --toolchain stable rust-analyzer`
+2. else `rustup which rust-analyzer` in the workspace root, so rustup respects
+   the workspace/default toolchain
 3. else emit `CodeIntelStatus` with `state: Unavailable` and the hint
    `rustup component add rust-analyzer`
 
@@ -542,6 +543,12 @@ pub enum CodeIntelErrorContext {
 pub struct CodeIntelErrorPayload {
     pub code: CodeIntelErrorCode,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
     pub context: CodeIntelErrorContext,
     pub fatal: bool,
 }

@@ -16,7 +16,7 @@
 //! [`CodeIntelLanguageId`] / [`CodeIntelProviderId`] string newtypes, which the
 //! frontend renders as opaque labels).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use protocol::{CodeIntelLanguageId, CodeIntelProviderId};
 use serde_json::Value;
@@ -32,9 +32,26 @@ pub(crate) enum ServerDiscovery {
     /// A usable server binary plus the args that put it in stdio LSP mode
     /// (empty for rust-analyzer, `["--stdio"]` for pyright-langserver).
     Found { binary: PathBuf, args: Vec<String> },
-    /// No binary found; `hint` is a human-readable install instruction surfaced
-    /// as a typed `CodeIntelStatus { Unavailable }` (never a silent empty model).
-    Absent { hint: String },
+    /// No usable binary found; `message` is surfaced to the user, `hint` is the
+    /// install instruction, and any probe details explain why a discovered
+    /// candidate was rejected.
+    Absent {
+        message: String,
+        hint: String,
+        exit_status: Option<String>,
+        stderr: Option<String>,
+    },
+}
+
+impl ServerDiscovery {
+    pub(crate) fn absent_install(provider: &str, hint: &str) -> Self {
+        Self::Absent {
+            message: format!("{provider} not installed — run `{hint}`"),
+            hint: hint.to_owned(),
+            exit_status: None,
+            stderr: None,
+        }
+    }
 }
 
 /// Everything a language contributes to the generic LSP-backed provider.
@@ -59,8 +76,9 @@ pub(crate) struct LanguageServerConfig {
     /// `Unsupported` rather than spinning up a server.
     pub workspace_markers: &'static [&'static str],
     /// Binary discovery (PATH → language-specific fallback). May shell out, so
-    /// the actor runs it via `spawn_blocking`.
-    pub discover: fn() -> ServerDiscovery,
+    /// the actor runs it via `spawn_blocking`. The workspace root lets rustup
+    /// respect a project-local/default toolchain instead of hard-coding one.
+    pub discover: fn(&Path) -> ServerDiscovery,
     /// `initializationOptions` for the LSP `initialize` request.
     pub initialization_options: fn() -> Value,
 }

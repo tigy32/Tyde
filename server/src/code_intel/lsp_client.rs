@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -44,7 +44,9 @@ use crate::backend::subprocess::reap_group_child_slot;
 #[cfg(not(test))]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
-const REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+const SERVER_EXIT_WAIT: Duration = Duration::from_millis(250);
+const STDERR_CAPTURE_LIMIT: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LspErrorKind {
@@ -60,6 +62,8 @@ pub(crate) struct LspError {
     kind: LspErrorKind,
     pub code: Option<i64>,
     pub message: String,
+    pub exit_status: Option<String>,
+    pub stderr: Option<String>,
 }
 
 impl LspError {
@@ -68,6 +72,18 @@ impl LspError {
             kind: LspErrorKind::Transport,
             code: None,
             message: message.into(),
+            exit_status: None,
+            stderr: None,
+        }
+    }
+
+    fn transport_from_exit(exit: &LspServerExit) -> Self {
+        Self {
+            kind: LspErrorKind::Transport,
+            code: None,
+            message: "LSP connection closed".to_owned(),
+            exit_status: exit.exit_status.clone(),
+            stderr: exit.stderr.clone(),
         }
     }
 
@@ -76,6 +92,8 @@ impl LspError {
             kind: LspErrorKind::Timeout,
             code: None,
             message: format!("LSP request {id} timed out after {REQUEST_TIMEOUT:?}"),
+            exit_status: None,
+            stderr: None,
         }
     }
 
@@ -110,6 +128,51 @@ pub(crate) enum LspEvent {
     /// The codec rejected bytes from the server (bad framing, oversize message,
     /// invalid JSON). Carries a human-readable description.
     ProtocolError(String),
+    /// The server's stdout closed. Carries the child exit status/stderr when
+    /// there was a subprocess behind this client.
+    ServerExited(LspServerExit),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LspServerExit {
+    pub exit_status: Option<String>,
+    pub stderr: Option<String>,
+}
+
+struct LspProcessDiagnostics {
+    child: Arc<Mutex<Option<AsyncGroupChild>>>,
+    stderr: Arc<Mutex<StderrCapture>>,
+    stderr_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+struct StderrCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl StderrCapture {
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+        if self.bytes.len() > STDERR_CAPTURE_LIMIT {
+            let excess = self.bytes.len() - STDERR_CAPTURE_LIMIT;
+            self.bytes.drain(..excess);
+            self.truncated = true;
+        }
+    }
+
+    fn captured(&self) -> Option<String> {
+        let output = String::from_utf8_lossy(&self.bytes);
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let mut captured = trimmed.to_owned();
+        if self.truncated {
+            captured.insert(0, '…');
+        }
+        Some(captured)
+    }
 }
 
 /// Commands processed by the client actor. `Incoming` and `ReaderClosed` are
@@ -280,16 +343,40 @@ impl LspClient {
             .take()
             .ok_or("failed to capture stderr")?;
 
-        // Drain stderr to the log so a misbehaving server is diagnosable.
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!(target: "code_intel::lsp", "rust-analyzer stderr: {line}");
+        let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let stderr_capture_for_task = stderr_capture.clone();
+        // Drain stderr to the log and retain the tail so a crashed server's
+        // real failure reason can be surfaced in the typed error payload.
+        let stderr_task = tokio::spawn(async move {
+            let mut stderr = stderr;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stderr.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        tracing::debug!(
+                            target: "code_intel::lsp",
+                            "language server stderr: {}",
+                            String::from_utf8_lossy(&chunk[..n]).trim_end()
+                        );
+                        stderr_capture_for_task.lock().await.push_bytes(&chunk[..n]);
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "language server stderr read error");
+                        break;
+                    }
+                }
             }
         });
 
         let child_slot = Arc::new(Mutex::new(Some(child)));
-        let (client, notifications) = Self::from_io(stdin, stdout, Some(child_slot));
+        let process = LspProcessDiagnostics {
+            child: child_slot.clone(),
+            stderr: stderr_capture,
+            stderr_task: Mutex::new(Some(stderr_task)),
+        };
+        let (client, notifications) =
+            Self::from_io_inner(stdin, stdout, Some(child_slot), Some(process));
         Ok((client, notifications))
     }
 
@@ -297,10 +384,24 @@ impl LspClient {
     /// and by tests with in-memory `tokio::io::duplex` pipes (a fake LSP
     /// server on the other end). `child` is `Some` only when there is a
     /// subprocess to reap.
+    #[cfg(test)]
     pub(crate) fn from_io<W, R>(
         writer: W,
         reader: R,
         child: Option<Arc<Mutex<Option<AsyncGroupChild>>>>,
+    ) -> (Self, mpsc::UnboundedReceiver<LspEvent>)
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        Self::from_io_inner(writer, reader, child, None)
+    }
+
+    fn from_io_inner<W, R>(
+        writer: W,
+        reader: R,
+        child: Option<Arc<Mutex<Option<AsyncGroupChild>>>>,
+        process: Option<LspProcessDiagnostics>,
     ) -> (Self, mpsc::UnboundedReceiver<LspEvent>)
     where
         W: AsyncWrite + Unpin + Send + 'static,
@@ -311,7 +412,7 @@ impl LspClient {
 
         let reader_cmd_tx = cmd_tx.clone();
         let reader_task = tokio::spawn(read_loop(reader, reader_cmd_tx, event_tx.clone()));
-        let actor_task = tokio::spawn(actor_loop(writer, cmd_rx, event_tx));
+        let actor_task = tokio::spawn(actor_loop(writer, cmd_rx, event_tx, process));
 
         (
             Self {
@@ -448,6 +549,7 @@ async fn actor_loop<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut cmd_rx: mpsc::UnboundedReceiver<LspCommand>,
     event_tx: mpsc::UnboundedSender<LspEvent>,
+    process: Option<LspProcessDiagnostics>,
 ) {
     let mut next_id: i64 = 1;
     let mut pending: HashMap<i64, oneshot::Sender<Result<Value, LspError>>> = HashMap::new();
@@ -514,9 +616,12 @@ async fn actor_loop<W: AsyncWrite + Unpin>(
                 handle_incoming(value, &mut writer, &mut pending, &event_tx).await;
             }
             LspCommand::ReaderClosed => {
+                let exit = collect_server_exit(process.as_ref()).await;
+                let error = LspError::transport_from_exit(&exit);
                 for (_, reply) in pending.drain() {
-                    let _ = reply.send(Err(LspError::transport("LSP connection closed")));
+                    let _ = reply.send(Err(error.clone()));
                 }
+                let _ = event_tx.send(LspEvent::ServerExited(exit));
                 break;
             }
         }
@@ -525,6 +630,52 @@ async fn actor_loop<W: AsyncWrite + Unpin>(
     // Final sweep: fail anything still outstanding so callers never hang.
     for (_, reply) in pending.drain() {
         let _ = reply.send(Err(LspError::transport("LSP client stopped")));
+    }
+}
+
+async fn collect_server_exit(process: Option<&LspProcessDiagnostics>) -> LspServerExit {
+    let Some(process) = process else {
+        return LspServerExit::default();
+    };
+
+    let exit_status = collect_exit_status(process).await;
+    await_stderr_task(process).await;
+    let stderr = process.stderr.lock().await.captured();
+    LspServerExit {
+        exit_status,
+        stderr,
+    }
+}
+
+async fn collect_exit_status(process: &LspProcessDiagnostics) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + SERVER_EXIT_WAIT;
+    loop {
+        let status = {
+            let mut guard = process.child.lock().await;
+            match guard.as_mut() {
+                Some(child) => child.inner().try_wait(),
+                None => return None,
+            }
+        };
+        match status {
+            Ok(Some(status)) => return Some(status.to_string()),
+            Ok(None) if tokio::time::Instant::now() >= deadline => return None,
+            Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Err(error) => return Some(format!("failed to query process status: {error}")),
+        }
+    }
+}
+
+async fn await_stderr_task(process: &LspProcessDiagnostics) {
+    let Some(mut task) = process.stderr_task.lock().await.take() else {
+        return;
+    };
+    tokio::select! {
+        _ = &mut task => {}
+        _ = tokio::time::sleep(SERVER_EXIT_WAIT) => {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -583,6 +734,8 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
             kind: LspErrorKind::JsonRpc,
             code,
             message,
+            exit_status: None,
+            stderr: None,
         }));
     } else {
         let result = value.get("result").cloned().unwrap_or(Value::Null);
@@ -709,6 +862,7 @@ mod tests {
                 assert_eq!(note.method, "textDocument/publishDiagnostics");
             }
             LspEvent::ProtocolError(error) => panic!("unexpected protocol error: {error}"),
+            LspEvent::ServerExited(exit) => panic!("unexpected server exit: {exit:?}"),
         }
     }
 
@@ -862,5 +1016,169 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(reaped, "child slot was not reaped after drop — zombie/leak");
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 {pid} 2>/dev/null"))
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[tokio::test]
+    async fn exited_child_surfaces_late_stderr_and_status() {
+        let Some(shell) = crate::process_env::find_executable_in_path("sh") else {
+            eprintln!("SKIP exited_child_surfaces_late_stderr_and_status: `sh` not found on PATH");
+            return;
+        };
+        let cwd = tempfile::tempdir().expect("temp dir");
+        let (client, mut events) = LspClient::spawn(
+            &shell,
+            &[
+                "-c".to_owned(),
+                "exec 1>&-; sleep 0.05; printf 'fatal language-server startup' >&2; exit 7"
+                    .to_owned(),
+            ],
+            cwd.path(),
+            None,
+        )
+        .await
+        .expect("spawn shell");
+
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("server exit event within timeout")
+            .expect("event channel open");
+        match event {
+            LspEvent::ServerExited(exit) => {
+                assert!(
+                    exit.exit_status
+                        .as_deref()
+                        .is_some_and(|status| status.contains('7')),
+                    "exit status should name the child failure, got {exit:?}"
+                );
+                assert_eq!(
+                    exit.stderr.as_deref(),
+                    Some("fatal language-server startup")
+                );
+            }
+            other => panic!("expected ServerExited, got {other:?}"),
+        }
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn stderr_tail_is_bounded_for_newline_less_output() {
+        let Some(shell) = crate::process_env::find_executable_in_path("sh") else {
+            eprintln!(
+                "SKIP stderr_tail_is_bounded_for_newline_less_output: `sh` not found on PATH"
+            );
+            return;
+        };
+        let cwd = tempfile::tempdir().expect("temp dir");
+        let giant = "x".repeat(STDERR_CAPTURE_LIMIT + 4096);
+        let script = format!("printf '{giant}' >&2; exit 9");
+        let (client, mut events) =
+            LspClient::spawn(&shell, &["-c".to_owned(), script], cwd.path(), None)
+                .await
+                .expect("spawn shell");
+
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("server exit event within timeout")
+            .expect("event channel open");
+        match event {
+            LspEvent::ServerExited(exit) => {
+                let stderr = exit.stderr.expect("bounded stderr captured");
+                assert!(
+                    stderr.len() <= STDERR_CAPTURE_LIMIT + "…".len(),
+                    "stderr capture should retain only the bounded tail, len={}",
+                    stderr.len()
+                );
+                assert!(
+                    stderr.starts_with('…'),
+                    "truncated stderr should be marked as a tail"
+                );
+                assert!(
+                    stderr.chars().skip(1).all(|ch| ch == 'x'),
+                    "stderr tail should contain the fake server's output"
+                );
+            }
+            other => panic!("expected ServerExited, got {other:?}"),
+        }
+        drop(client);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drop_after_server_exit_reaps_lingering_process_group_child() {
+        let Some(shell) = crate::process_env::find_executable_in_path("sh") else {
+            eprintln!(
+                "SKIP drop_after_server_exit_reaps_lingering_process_group_child: `sh` not found on PATH"
+            );
+            return;
+        };
+        let Some(sleep_bin) = crate::process_env::find_executable_in_path("sleep") else {
+            eprintln!(
+                "SKIP drop_after_server_exit_reaps_lingering_process_group_child: `sleep` not found on PATH"
+            );
+            return;
+        };
+        let cwd = tempfile::tempdir().expect("temp dir");
+        let pid_file = cwd.path().join("grandchild.pid");
+        let script = format!(
+            "('{}' 30) >/dev/null 2>/dev/null & echo $! > '{}'; printf 'server crashed' >&2; exit 7",
+            sleep_bin.display(),
+            pid_file.display()
+        );
+        let (client, mut events) =
+            LspClient::spawn(&shell, &["-c".to_owned(), script], cwd.path(), None)
+                .await
+                .expect("spawn shell");
+        let slot = client.child_slot().expect("real child has a slot");
+
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("server exit event within timeout")
+            .expect("event channel open");
+        assert!(
+            matches!(event, LspEvent::ServerExited(_)),
+            "expected ServerExited, got {event:?}"
+        );
+
+        let pid = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(&pid_file).await {
+                    let pid = contents.trim().parse::<u32>().expect("child pid");
+                    break pid;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "fake server did not write child pid"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        assert!(
+            process_exists(pid),
+            "fake server's child should still be alive before drop"
+        );
+
+        drop(client);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if slot.lock().await.is_none() && !process_exists(pid) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "process-group reaper did not kill and reap lingering child {pid}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }

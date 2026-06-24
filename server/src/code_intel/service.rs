@@ -159,6 +159,9 @@ impl CodeIntelService {
                         "failed to resolve subscribe-time file version for {}: {error}",
                         path.relative_path
                     ),
+                    hint: None,
+                    exit_status: None,
+                    stderr: None,
                     context: CodeIntelErrorContext::Subscribe { path: path.clone() },
                     fatal: false,
                 };

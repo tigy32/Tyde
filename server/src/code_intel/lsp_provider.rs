@@ -52,7 +52,7 @@ use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
 use super::language_server::{LanguageServerConfig, ServerDiscovery};
-use super::lsp_client::{LspClient, LspError, LspEvent, LspRequester};
+use super::lsp_client::{LspClient, LspError, LspEvent, LspRequester, LspServerExit};
 use super::lsp_position::LineIndex;
 use super::provider::CodeIntelProvider;
 use super::{absolute_path, emit};
@@ -359,6 +359,14 @@ enum QueryContextError {
     StaleVersion { actual: ProjectFileVersion },
 }
 
+struct StartFailure {
+    code: CodeIntelErrorCode,
+    message: String,
+    hint: Option<String>,
+    exit_status: Option<String>,
+    stderr: Option<String>,
+}
+
 /// One subscribed file's tracked state.
 struct SubscribedFile {
     version: ProjectFileVersion,
@@ -494,7 +502,7 @@ impl RaActor {
                             // polling the dead channel and surface the failure.
                             if self.notifications.is_some() {
                                 self.notifications = None;
-                                self.on_client_closed();
+                                self.on_client_closed(LspServerExit::default());
                             }
                         }
                     }
@@ -546,15 +554,16 @@ impl RaActor {
                     }
                 };
                 match self.phase {
-                    Phase::Cold => {
-                        if self.start().await {
+                    Phase::Cold => match self.start().await {
+                        Ok(()) => {
                             let paths: Vec<ProjectPath> = self.files.keys().cloned().collect();
                             for path in paths {
                                 self.open_file(path).await;
                             }
                             self.ensure_file_models();
                         }
-                    }
+                        Err(failure) => self.emit_start_failure(failure, true),
+                    },
                     Phase::Unavailable | Phase::Failed => {
                         // Re-emit the terminal status so the new file's chip is
                         // honest (no provider will come up for it).
@@ -684,15 +693,22 @@ impl RaActor {
         self.opened.clear();
         self.active_progress.clear();
         self.resolutions.clear();
-        if self.start().await {
-            let paths: Vec<ProjectPath> = self.files.keys().cloned().collect();
-            for path in paths {
-                self.open_file(path).await;
+        match self.start().await {
+            Ok(()) => {
+                let paths: Vec<ProjectPath> = self.files.keys().cloned().collect();
+                for path in paths {
+                    self.open_file(path).await;
+                }
+                self.ensure_file_models();
             }
-            self.ensure_file_models();
-        } else if self.phase == Phase::Failed && !self.schedule_restart() {
-            // Out of restart budget after repeated transient failures.
-            self.emit_provider_crashed(true);
+            Err(failure) => {
+                let fatal = if failure.code == CodeIntelErrorCode::ProviderUnavailable {
+                    true
+                } else {
+                    !self.schedule_restart()
+                };
+                self.emit_start_failure(failure, fatal);
+            }
         }
         // `Unavailable` (the binary is genuinely gone) is terminal — retrying a
         // missing binary would just spin, so we leave the honest status up.
@@ -1048,36 +1064,60 @@ impl RaActor {
     }
 
     /// Cold → running: discover, spawn, handshake. Returns whether the provider
-    /// is usable (and files should be opened).
-    async fn start(&mut self) -> bool {
+    /// is usable (and files should be opened), leaving error emission to the
+    /// caller so restart attempts can mark failures fatal only after the bounded
+    /// retry budget is exhausted.
+    async fn start(&mut self) -> Result<(), StartFailure> {
         self.set_phase(Phase::Starting, None);
 
         let discover = self.config.discover;
-        let discovery = match tokio::task::spawn_blocking(discover).await {
+        let cwd = PathBuf::from(&self.root.0);
+        let discover_cwd = cwd.clone();
+        let discovery = match tokio::task::spawn_blocking(move || discover(&discover_cwd)).await {
             Ok(discovery) => discovery,
             Err(error) => {
-                self.set_phase(
-                    Phase::Failed,
-                    Some(format!("language-server discovery task failed: {error}")),
-                );
-                return false;
+                let message = format!("language-server discovery task failed: {error}");
+                self.set_phase(Phase::Failed, Some(message.clone()));
+                return Err(StartFailure {
+                    code: CodeIntelErrorCode::Internal,
+                    message,
+                    hint: None,
+                    exit_status: None,
+                    stderr: None,
+                });
             }
         };
         let (binary, args) = match discovery {
             ServerDiscovery::Found { binary, args } => (binary, args),
-            ServerDiscovery::Absent { hint } => {
-                self.set_phase(Phase::Unavailable, Some(hint));
-                return false;
+            ServerDiscovery::Absent {
+                message,
+                hint,
+                exit_status,
+                stderr,
+            } => {
+                self.set_phase(Phase::Unavailable, Some(message.clone()));
+                return Err(StartFailure {
+                    code: CodeIntelErrorCode::ProviderUnavailable,
+                    message,
+                    hint: Some(hint),
+                    exit_status,
+                    stderr,
+                });
             }
         };
 
         let env_path = process_env::resolved_child_process_path();
-        let cwd = PathBuf::from(&self.root.0);
         let (client, notifications) = match LspClient::spawn(&binary, &args, &cwd, env_path).await {
             Ok(pair) => pair,
             Err(error) => {
-                self.set_phase(Phase::Failed, Some(error));
-                return false;
+                self.set_phase(Phase::Failed, Some(error.clone()));
+                return Err(StartFailure {
+                    code: CodeIntelErrorCode::ProviderCrashed,
+                    message: error,
+                    hint: None,
+                    exit_status: None,
+                    stderr: None,
+                });
             }
         };
         self.client = Some(client);
@@ -1091,8 +1131,23 @@ impl RaActor {
         let init_value = match init_result {
             Ok(value) => value,
             Err(error) => {
-                self.set_phase(Phase::Failed, Some(format!("initialize failed: {error}")));
-                return false;
+                let code = if error.is_timeout() {
+                    CodeIntelErrorCode::Timeout
+                } else {
+                    CodeIntelErrorCode::ProviderCrashed
+                };
+                let message = format!("initialize failed: {error}");
+                self.set_phase(Phase::Failed, Some(message.clone()));
+                let failure = StartFailure {
+                    code,
+                    message,
+                    hint: None,
+                    exit_status: error.exit_status,
+                    stderr: error.stderr,
+                };
+                self.client = None;
+                self.notifications = None;
+                return Err(failure);
             }
         };
         // Capture the server's semantic-token legend so M3 can decode the
@@ -1103,7 +1158,7 @@ impl RaActor {
         }
         // Handshake done; rust-analyzer now begins indexing.
         self.set_phase(Phase::Indexing, None);
-        true
+        Ok(())
     }
 
     async fn open_file(&mut self, path: ProjectPath) {
@@ -1264,6 +1319,10 @@ impl RaActor {
                 _ => {}
             },
             LspEvent::ProtocolError(message) => self.on_protocol_error(message),
+            LspEvent::ServerExited(exit) => {
+                self.notifications = None;
+                self.on_client_closed(exit);
+            }
         }
     }
 
@@ -1365,6 +1424,9 @@ impl RaActor {
         let payload = CodeIntelErrorPayload {
             code: CodeIntelErrorCode::ProtocolError,
             message: message.clone(),
+            hint: None,
+            exit_status: None,
+            stderr: None,
             context: CodeIntelErrorContext::Provider {
                 language: self.config.language.clone(),
             },
@@ -1382,7 +1444,7 @@ impl RaActor {
     /// restart budget allows, schedule a bounded backed-off restart (spec §M7).
     /// The error is `fatal: false` while a restart is pending (the scope will
     /// recover) and `fatal: true` once the budget is exhausted.
-    fn on_client_closed(&mut self) {
+    fn on_client_closed(&mut self, exit: LspServerExit) {
         self.client = None;
         // The dead child has nothing open; drop in-flight resolution so the
         // restart re-pushes against a fresh process rather than leaking tasks.
@@ -1390,23 +1452,57 @@ impl RaActor {
         self.resolutions.clear();
         self.active_progress.clear();
         let scheduled = self.schedule_restart();
-        self.set_phase(
-            Phase::Failed,
-            Some("language server exited unexpectedly".to_owned()),
-        );
-        self.emit_provider_crashed(!scheduled);
+        let message = language_server_exit_message();
+        self.set_phase(Phase::Failed, Some(message.clone()));
+        self.emit_provider_crashed(!scheduled, message, exit.exit_status, exit.stderr);
     }
 
     /// Emit a typed `ProviderCrashed` error to every subscribed file's stream.
     /// Pairs with the `Failed` status from [`on_client_closed`] so a crash is
     /// always visible, never a silent empty model (spec §4.4).
-    fn emit_provider_crashed(&self, fatal: bool) {
+    fn emit_provider_crashed(
+        &self,
+        fatal: bool,
+        message: String,
+        exit_status: Option<String>,
+        stderr: Option<String>,
+    ) {
+        self.emit_provider_error(
+            CodeIntelErrorCode::ProviderCrashed,
+            message,
+            fatal,
+            None,
+            exit_status,
+            stderr,
+        );
+    }
+
+    fn emit_start_failure(&self, failure: StartFailure, fatal: bool) {
+        self.emit_provider_error(
+            failure.code,
+            failure.message,
+            fatal,
+            failure.hint,
+            failure.exit_status,
+            failure.stderr,
+        );
+    }
+
+    fn emit_provider_error(
+        &self,
+        code: CodeIntelErrorCode,
+        message: String,
+        fatal: bool,
+        hint: Option<String>,
+        exit_status: Option<String>,
+        stderr: Option<String>,
+    ) {
         let payload = CodeIntelErrorPayload {
-            code: CodeIntelErrorCode::ProviderCrashed,
-            message: self
-                .message
-                .clone()
-                .unwrap_or_else(|| "language server crashed".to_owned()),
+            code,
+            message,
+            hint,
+            exit_status,
+            stderr,
             context: CodeIntelErrorContext::Provider {
                 language: self.config.language.clone(),
             },
@@ -1473,6 +1569,9 @@ fn emit_query_error(
     let payload = CodeIntelErrorPayload {
         code,
         message,
+        hint: None,
+        exit_status: None,
+        stderr: None,
         context,
         fatal: false,
     };
@@ -1501,6 +1600,10 @@ fn version_mismatch(
     (actual != expected).then_some(actual)
 }
 
+fn language_server_exit_message() -> String {
+    "language server exited unexpectedly".to_owned()
+}
+
 /// Await the next LSP event, or pend forever when there is no client yet.
 async fn recv_event(
     notifications: &mut Option<mpsc::UnboundedReceiver<LspEvent>>,
@@ -1514,9 +1617,15 @@ async fn recv_event(
 /// Backoff before the Nth bounded restart attempt (spec §M7): exponential from
 /// 500ms, capped at 8s, so a crash loop is spaced out rather than hammering a
 /// broken server.
+#[cfg(not(test))]
 fn restart_backoff(attempt: u32) -> Duration {
     let factor = 1u64 << attempt.min(5);
     Duration::from_millis((500u64.saturating_mul(factor)).min(8000))
+}
+
+#[cfg(test)]
+fn restart_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(u64::from(attempt.max(1)))
 }
 
 /// Build the `initialize` params: advertise `publishDiagnostics` + semantic
@@ -1964,6 +2073,9 @@ impl ModelJob {
         let error = CodeIntelErrorPayload {
             code,
             message: message.clone(),
+            hint: None,
+            exit_status: None,
+            stderr: None,
             context: CodeIntelErrorContext::Subscribe {
                 path: self.path.clone(),
             },
@@ -2634,11 +2746,50 @@ mod tests {
             lsp_language_id: "rust",
             extensions: &["rs"],
             workspace_markers: &["Cargo.toml"],
-            discover: || ServerDiscovery::Absent {
-                hint: "test: no binary".to_owned(),
-            },
+            discover: |_| ServerDiscovery::absent_install("rust-analyzer", "test: no binary"),
             initialization_options: || json!({}),
         }
+    }
+
+    #[cfg(unix)]
+    static TEST_CRASHING_LSP: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+    #[cfg(unix)]
+    fn discover_test_crashing_lsp(_: &Path) -> ServerDiscovery {
+        let binary = TEST_CRASHING_LSP
+            .lock()
+            .expect("test crashing LSP mutex poisoned")
+            .clone()
+            .expect("test crashing LSP path set");
+        ServerDiscovery::Found {
+            binary,
+            args: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn crashing_test_config() -> LanguageServerConfig {
+        LanguageServerConfig {
+            language: CodeIntelLanguageId("rust".to_owned()),
+            provider_id: CodeIntelProviderId("rust-analyzer".to_owned()),
+            lsp_language_id: "rust",
+            extensions: &["rs"],
+            workspace_markers: &["Cargo.toml"],
+            discover: discover_test_crashing_lsp,
+            initialization_options: || json!({}),
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, body).expect("write executable");
+        let mut permissions = std::fs::metadata(path)
+            .expect("stat executable")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("chmod executable");
     }
 
     /// An actor over [`test_config`] with a throwaway self-sender (the restart
@@ -3378,7 +3529,10 @@ mod tests {
             ready_actor_with_fake_lsp(&root, &path, "fn main() {}", HashMap::new());
 
         // First crash → Failed + a *non-fatal* ProviderCrashed, restart pending.
-        actor.on_client_closed();
+        actor.on_client_closed(LspServerExit {
+            exit_status: Some("exit status: 1".to_owned()),
+            stderr: Some("error: Unknown binary 'rust-analyzer'".to_owned()),
+        });
         assert_eq!(actor.phase, Phase::Failed);
         assert_eq!(actor.restart_attempts, 1);
         assert!(
@@ -3388,9 +3542,20 @@ mod tests {
         assert!(actor.resolutions.is_empty());
 
         let (status, error) = drain_status_and_error(&mut rx);
-        assert_eq!(status.expect("status frame").state, CodeIntelState::Failed);
+        let status = status.expect("status frame");
+        assert_eq!(status.state, CodeIntelState::Failed);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("language server exited unexpectedly")
+        );
         let error = error.expect("a ProviderCrashed error frame");
         assert_eq!(error.code, CodeIntelErrorCode::ProviderCrashed);
+        assert_eq!(error.message, "language server exited unexpectedly");
+        assert_eq!(error.exit_status.as_deref(), Some("exit status: 1"));
+        assert_eq!(
+            error.stderr.as_deref(),
+            Some("error: Unknown binary 'rust-analyzer'")
+        );
         assert!(!error.fatal, "recoverable while a restart is pending");
         assert!(matches!(
             error.context,
@@ -3398,12 +3563,12 @@ mod tests {
         ));
 
         // Bounded: repeated crashes exhaust the budget; the budget caps at MAX.
-        actor.on_client_closed(); // attempt 2
-        actor.on_client_closed(); // attempt 3 (== MAX)
+        actor.on_client_closed(LspServerExit::default()); // attempt 2
+        actor.on_client_closed(LspServerExit::default()); // attempt 3 (== MAX)
         assert_eq!(actor.restart_attempts, MAX_RESTART_ATTEMPTS);
         let _ = drain_status_and_error(&mut rx);
 
-        actor.on_client_closed(); // budget spent → fatal, no further attempt
+        actor.on_client_closed(LspServerExit::default()); // budget spent → fatal, no further attempt
         let (_s, error) = drain_status_and_error(&mut rx);
         assert!(
             error.expect("fatal crash error").fatal,
@@ -3413,6 +3578,191 @@ mod tests {
             actor.restart_attempts, MAX_RESTART_ATTEMPTS,
             "restart attempts are capped — no crash-loop"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_subprocess_crash_emits_observable_restart_fatality() {
+        let Some(python) = crate::process_env::find_executable_in_path("python3") else {
+            eprintln!(
+                "SKIP provider_subprocess_crash_emits_observable_restart_fatality: `python3` not found on PATH"
+            );
+            return;
+        };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let counter = dir.path().join("invocations");
+        let fake_lsp = dir.path().join("fake-lsp.py");
+        let script = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+COUNTER = r'''__COUNTER__'''
+
+def invocation():
+    try:
+        with open(COUNTER, "r", encoding="utf-8") as fh:
+            count = int(fh.read().strip() or "0")
+    except FileNotFoundError:
+        count = 0
+    with open(COUNTER, "w", encoding="utf-8") as fh:
+        fh.write(str(count + 1))
+    return count
+
+def read_message():
+    header = b""
+    while b"\r\n\r\n" not in header:
+        byte = sys.stdin.buffer.read(1)
+        if not byte:
+            return None
+        header += byte
+    raw_header, rest = header.split(b"\r\n\r\n", 1)
+    length = None
+    for line in raw_header.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1].strip())
+            break
+    if length is None:
+        return None
+    body = rest + sys.stdin.buffer.read(length - len(rest))
+    return json.loads(body.decode("utf-8"))
+
+def write_message(message):
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+if invocation() > 0:
+    sys.stderr.write("fake restart startup crash")
+    sys.stderr.flush()
+    sys.exit(7)
+
+while True:
+    message = read_message()
+    if message is None:
+        sys.exit(0)
+    method = message.get("method")
+    if method == "initialize":
+        write_message({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {"capabilities": {}},
+        })
+        write_message({
+            "jsonrpc": "2.0",
+            "method": "$/progress",
+            "params": {"token": "init", "value": {"kind": "end"}},
+        })
+    elif method == "textDocument/didOpen":
+        uri = message["params"]["textDocument"]["uri"]
+        write_message({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {"uri": uri, "diagnostics": []},
+        })
+        sys.stderr.write("fake lsp runtime crash")
+        sys.stderr.flush()
+        time.sleep(0.01)
+        sys.exit(7)
+"#
+        .replace("#!/usr/bin/env python3", &format!("#!{}", python.display()))
+        .replace("__COUNTER__", &counter.to_string_lossy());
+        write_executable(&fake_lsp, &script);
+
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"ci_crash\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").expect("write main.rs");
+
+        *TEST_CRASHING_LSP
+            .lock()
+            .expect("test crashing LSP mutex poisoned") = Some(fake_lsp);
+
+        let root = ProjectRootPath(dir.path().to_string_lossy().into_owned());
+        let path = ProjectPath {
+            root: root.clone(),
+            relative_path: "src/main.rs".to_owned(),
+        };
+        let mut provider = LspProvider::new(
+            crashing_test_config(),
+            root.clone(),
+            CodeIntelResourceMode::Full,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let stream = Stream::new(StreamPath("/project/p".to_owned()), tx);
+        provider.subscribe(path, ProjectFileVersion(1), stream);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_failed = false;
+        let mut nonfatal_errors = 0;
+        let fatal_error = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "provider did not emit fatal crash after bounded restart attempts"
+            );
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let envelope = tokio::time::timeout(remaining, rx.recv())
+                .await
+                .expect("frame before deadline")
+                .expect("stream open");
+            match envelope.kind {
+                FrameKind::CodeIntelStatus => {
+                    let status: CodeIntelStatusPayload =
+                        serde_json::from_value(envelope.payload).expect("status payload");
+                    saw_failed |= status.state == CodeIntelState::Failed;
+                }
+                FrameKind::CodeIntelError => {
+                    let error: CodeIntelErrorPayload =
+                        serde_json::from_value(envelope.payload).expect("error payload");
+                    if !matches!(error.context, CodeIntelErrorContext::Provider { .. })
+                        || !matches!(
+                            error.code,
+                            CodeIntelErrorCode::ProviderCrashed | CodeIntelErrorCode::Timeout
+                        )
+                    {
+                        continue;
+                    }
+                    assert!(
+                        !error.message.contains("fake lsp runtime crash")
+                            && !error.message.contains("fake restart startup crash"),
+                        "stderr must stay in the typed stderr field, not in message: {error:?}"
+                    );
+                    if error.fatal {
+                        break error;
+                    }
+                    nonfatal_errors += 1;
+                }
+                _ => {}
+            }
+        };
+
+        assert!(saw_failed, "crash path should emit Failed status");
+        assert_eq!(
+            nonfatal_errors, MAX_RESTART_ATTEMPTS as usize,
+            "restart failures should be recoverable until the budget is exhausted; fatal={fatal_error:?}"
+        );
+        assert!(
+            fatal_error
+                .stderr
+                .as_deref()
+                .is_some_and(|stderr| stderr.contains("fake restart startup crash")),
+            "fatal error should retain bounded stderr details: {fatal_error:?}"
+        );
+        assert!(
+            fatal_error.exit_status.is_some(),
+            "fatal error should carry the subprocess exit status: {fatal_error:?}"
+        );
+
+        drop(provider);
+        *TEST_CRASHING_LSP
+            .lock()
+            .expect("test crashing LSP mutex poisoned") = None;
     }
 
     #[tokio::test]

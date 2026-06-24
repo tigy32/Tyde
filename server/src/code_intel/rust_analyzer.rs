@@ -70,8 +70,10 @@ mod tests {
     /// silent pass, never a hard failure on a machine without RA.
     #[tokio::test]
     async fn rust_analyzer_emits_diagnostics_for_broken_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
         if matches!(
-            bootstrap::discover_rust_analyzer(),
+            bootstrap::discover_rust_analyzer(root),
             ServerDiscovery::Absent { .. }
         ) {
             eprintln!(
@@ -80,8 +82,6 @@ mod tests {
             return;
         }
 
-        let dir = tempfile::tempdir().expect("temp dir");
-        let root = dir.path();
         std::fs::write(
             root.join("Cargo.toml"),
             "[package]\nname = \"tyde_ci_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",

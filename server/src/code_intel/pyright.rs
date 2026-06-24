@@ -13,7 +13,7 @@
 //! Discovery is **detect-and-hint only** (spec §2.6): a managed pyright download
 //! and remote/SSH spawning are deferred (§9).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use protocol::{CodeIntelLanguageId, CodeIntelProviderId};
 use serde_json::json;
@@ -50,7 +50,7 @@ pub(crate) fn pyright_config() -> LanguageServerConfig {
 ///    `npm install -g pyright`.
 ///
 /// Both candidates are launched with `--stdio` to put them in LSP mode.
-pub(crate) fn discover_pyright() -> ServerDiscovery {
+pub(crate) fn discover_pyright(_workspace_root: &Path) -> ServerDiscovery {
     discover_with(process_env::find_executable_in_path)
 }
 
@@ -65,9 +65,7 @@ fn discover_with(mut find_in_path: impl FnMut(&str) -> Option<PathBuf>) -> Serve
             };
         }
     }
-    ServerDiscovery::Absent {
-        hint: INSTALL_HINT.to_owned(),
-    }
+    ServerDiscovery::absent_install("pyright", INSTALL_HINT)
 }
 
 #[cfg(test)]
@@ -134,9 +132,7 @@ mod tests {
         let result = discover_with(|_| None);
         assert_eq!(
             result,
-            ServerDiscovery::Absent {
-                hint: INSTALL_HINT.to_owned(),
-            }
+            ServerDiscovery::absent_install("pyright", INSTALL_HINT)
         );
         assert_eq!(INSTALL_HINT, "npm install -g pyright");
     }
@@ -147,13 +143,12 @@ mod tests {
     /// installed — never a silent pass, never a hard failure without pyright.
     #[tokio::test]
     async fn pyright_emits_diagnostics_for_broken_file() {
-        if matches!(discover_pyright(), ServerDiscovery::Absent { .. }) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        if matches!(discover_pyright(root), ServerDiscovery::Absent { .. }) {
             eprintln!("SKIP pyright_emits_diagnostics_for_broken_file: pyright not found");
             return;
         }
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let root = dir.path();
         // A minimal Python project marker so detection + pyright agree on a root.
         std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"probe\"\n")
             .expect("write pyproject.toml");

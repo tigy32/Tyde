@@ -4974,6 +4974,9 @@ mod tests {
             let payload = protocol::CodeIntelErrorPayload {
                 code: protocol::CodeIntelErrorCode::Internal,
                 message: "semanticTokens/full failed".to_owned(),
+                hint: None,
+                exit_status: None,
+                stderr: None,
                 context: protocol::CodeIntelErrorContext::Subscribe { path },
                 fatal: false,
             };

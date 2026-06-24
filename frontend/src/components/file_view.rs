@@ -12,7 +12,8 @@ use crate::state::{AppState, CodeIntelKey, TabContent, TabId, TabScrollState};
 use crate::syntax_highlight::{LineHighlighter, LineTokens, color_to_css, syntax_for_path};
 
 use protocol::{
-    CodeIntelDiagnostic, CodeIntelSeverity, CodeIntelState, ProjectFileVersion, ProjectPath,
+    CodeIntelDiagnostic, CodeIntelErrorPayload, CodeIntelSeverity, CodeIntelState,
+    ProjectFileVersion, ProjectPath,
 };
 
 /// Honest, user-facing label for a file's code-intelligence state. Mirrors the
@@ -27,6 +28,32 @@ fn code_intel_state_label(state: CodeIntelState) -> &'static str {
         CodeIntelState::Ready => "Ready",
         CodeIntelState::Failed => "Failed",
     }
+}
+
+fn code_intel_error_label(error: &CodeIntelErrorPayload) -> String {
+    let mut label = format!("Error: {}", error.message);
+    if let Some(hint) = error.hint.as_deref()
+        && !label.contains(hint)
+    {
+        label.push_str(" — ");
+        label.push_str(hint);
+    }
+    if let Some(status) = error.exit_status.as_deref() {
+        let status = status.trim();
+        if !status.is_empty() {
+            label.push_str(" (");
+            label.push_str(status);
+            label.push(')');
+        }
+    }
+    if let Some(stderr) = error.stderr.as_deref() {
+        let stderr = stderr.trim();
+        if !stderr.is_empty() {
+            label.push_str(": ");
+            label.push_str(stderr);
+        }
+    }
+    label
 }
 
 /// Below this line count we render every line up-front — no spacers, no
@@ -751,7 +778,7 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
                                             file.applied().and_then(|data| {
                                                 data.error
                                                     .as_ref()
-                                                    .map(|error| format!("Error: {}", error.message))
+                                                    .map(code_intel_error_label)
                                                     .or_else(|| {
                                                         data.status.as_ref().map(|status| {
                                                             code_intel_state_label(status.state).to_owned()
@@ -759,8 +786,9 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
                                                     })
                                             })
                                         })?;
+                                        let title = label.clone();
                                         Some(view! {
-                                            <span class="file-view-code-intel-status">{label}</span>
+                                            <span class="file-view-code-intel-status" title=title>{label}</span>
                                         })
                                     }
                                 }
@@ -1884,7 +1912,8 @@ mod wasm_tests {
     async fn code_intel_error_renders_in_file_header() {
         use crate::state::{ActiveProjectRef, CodeIntelKey};
         use protocol::{
-            CodeIntelErrorCode, CodeIntelErrorContext, CodeIntelErrorPayload, ProjectId,
+            CodeIntelErrorCode, CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelLanguageId,
+            ProjectId,
         };
 
         ensure_styles_loaded();
@@ -1926,10 +1955,13 @@ mod wasm_tests {
                 entry.set_rendered_version(ProjectFileVersion(1));
                 entry.merge_versioned(ProjectFileVersion(1), |data| {
                     data.error = Some(CodeIntelErrorPayload {
-                        code: CodeIntelErrorCode::Internal,
-                        message: "semanticTokens/full failed".to_owned(),
-                        context: CodeIntelErrorContext::Subscribe {
-                            path: file_path.clone(),
+                        code: CodeIntelErrorCode::ProviderCrashed,
+                        message: "language server exited unexpectedly".to_owned(),
+                        hint: None,
+                        exit_status: Some("exit status: 1".to_owned()),
+                        stderr: Some("rust-analyzer panic: proc macro server crashed".to_owned()),
+                        context: CodeIntelErrorContext::Provider {
+                            language: CodeIntelLanguageId("rust".to_owned()),
                         },
                         fatal: false,
                     });
@@ -1940,14 +1972,30 @@ mod wasm_tests {
         });
 
         next_tick().await;
-        let header = container
-            .query_selector(".file-view-header")
+        let status = container
+            .query_selector(".file-view-code-intel-status")
             .unwrap()
-            .expect("file header");
-        let text = header.text_content().unwrap_or_default();
-        assert!(
-            text.contains("semanticTokens/full failed"),
-            "code-intel errors must be visible in the file header; header was {text:?}"
+            .expect("code-intel status element");
+        let text = status.text_content().unwrap_or_default();
+        let expected = "Error: language server exited unexpectedly (exit status: 1): rust-analyzer panic: proc macro server crashed";
+        assert_eq!(
+            text, expected,
+            "code-intel crash details must be visible exactly once"
+        );
+        assert_eq!(
+            text.matches("exit status: 1").count(),
+            1,
+            "exit status should not be duplicated in the visible error"
+        );
+        assert_eq!(
+            text.matches("rust-analyzer panic").count(),
+            1,
+            "stderr should not be duplicated in the visible error"
+        );
+        assert_eq!(
+            status.get_attribute("title").as_deref(),
+            Some(expected),
+            "full code-intel error should be available in the tooltip"
         );
     }
 
