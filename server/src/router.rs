@@ -19,16 +19,17 @@ use protocol::{
     ProjectSearchPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
     ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewId,
     ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
-    SendQueuedMessageNowPayload, SetAgentNamePayload, SetAgentsViewPreferencesPayload,
-    SetSessionSettingsPayload, SetSettingPayload, SkillRefreshPayload, SpawnAgentParams,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringUpsertPayload, StreamPath,
-    TeamCompactPayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberShufflePayload,
-    TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload, TerminalClosePayload,
-    TerminalCreatePayload, TerminalId, TerminalResizePayload, TerminalSendPayload,
-    TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowRefreshPayload,
+    SendQueuedMessageNowPayload, SetAgentNamePayload, SetAgentsSmartViewsPayload,
+    SetAgentsViewPreferencesPayload, SetSessionSettingsPayload, SetSettingPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringUpsertPayload, StreamPath, TeamCompactPayload, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload,
+    TerminalClosePayload, TerminalCreatePayload, TerminalId, TerminalResizePayload,
+    TerminalSendPayload, TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    WorkflowRefreshPayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -54,6 +55,11 @@ pub(crate) async fn route_client_envelope(
                 let payload: SetAgentsViewPreferencesPayload =
                     parse_payload(&envelope, "set_agents_view_preferences")?;
                 host.set_agents_view_preferences(payload).await?;
+            }
+            FrameKind::SetAgentsSmartViews => {
+                let payload: SetAgentsSmartViewsPayload =
+                    parse_payload(&envelope, "set_agents_smart_views")?;
+                host.set_agents_smart_views(payload).await?;
             }
             FrameKind::MobilePairingStart => {
                 let _: MobilePairingStartPayload =

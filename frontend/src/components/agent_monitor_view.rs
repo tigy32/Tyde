@@ -1782,6 +1782,7 @@ mod wasm_tests {
         AgentsViewPreferencesSnapshot {
             preferences: prefs,
             load_error: None,
+            smart_views: Default::default(),
         }
     }
 

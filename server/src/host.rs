@@ -34,10 +34,10 @@ use protocol::{
     ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection,
     ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload, SessionId,
     SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema,
-    SessionSummary, SetAgentsViewPreferencesPayload, SetSettingPayload, Skill, SkillNotifyPayload,
-    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TeamCreatePayload,
-    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    SessionSummary, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, SetSettingPayload,
+    Skill, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
+    SteeringDeletePayload, SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
+    TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
     TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
     TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
     TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId,
@@ -4430,6 +4430,27 @@ impl HostHandle {
             .lock()
             .await
             .apply(update)
+            .map_err(|error| AppError::invalid(OPERATION, error))?;
+        fan_out_agents_view_preferences(&mut state, snapshot).await;
+        Ok(())
+    }
+
+    pub(crate) async fn set_agents_smart_views(
+        &self,
+        payload: SetAgentsSmartViewsPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "set_agents_smart_views";
+        let mut state = self.state.lock().await;
+        let Some(store) = state.agents_view_preferences_store.clone() else {
+            return Err(AppError::invalid(
+                OPERATION,
+                "agents view preferences are owned by the primary local host",
+            ));
+        };
+        let snapshot = store
+            .lock()
+            .await
+            .apply_smart_views(payload.update)
             .map_err(|error| AppError::invalid(OPERATION, error))?;
         fan_out_agents_view_preferences(&mut state, snapshot).await;
         Ok(())

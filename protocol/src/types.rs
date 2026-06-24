@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -487,6 +487,7 @@ pub enum FrameKind {
     // Input events (client -> server)
     SetSetting,
     SetAgentsViewPreferences,
+    SetAgentsSmartViews,
     SpawnAgent,
     LoadAgent,
     ListSessions,
@@ -642,6 +643,7 @@ impl fmt::Display for FrameKind {
             Self::Reject => f.write_str("reject"),
             Self::SetSetting => f.write_str("set_setting"),
             Self::SetAgentsViewPreferences => f.write_str("set_agents_view_preferences"),
+            Self::SetAgentsSmartViews => f.write_str("set_agents_smart_views"),
             Self::SpawnAgent => f.write_str("spawn_agent"),
             Self::LoadAgent => f.write_str("load_agent"),
             Self::ListSessions => f.write_str("list_sessions"),
@@ -1221,6 +1223,70 @@ pub struct SetAgentsViewPreferencesPayload {
     pub update: AgentsViewPreferencesUpdate,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SmartView {
+    pub id: SmartViewId,
+    pub name: String,
+    pub filters: AgentsViewFilters,
+    #[serde(default)]
+    pub sort_mode: AgentSortMode,
+    #[serde(default)]
+    pub group_mode: AgentGroupMode,
+    #[serde(default)]
+    pub hide_finished: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum SmartViewId {
+    BuiltIn(BuiltInSmartViewId),
+    User(UserSmartViewId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltInSmartViewId {
+    All,
+    Active,
+    FailedTerminated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UserSmartViewId(pub String);
+
+impl fmt::Display for UserSmartViewId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentsSmartViewsSnapshot {
+    #[serde(default)]
+    pub built_in: Vec<SmartView>,
+    #[serde(default)]
+    pub user: Vec<SmartView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_view_id: Option<SmartViewId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentsSmartViewsUpdate {
+    SaveCurrent { name: String },
+    Rename { id: SmartViewId, name: String },
+    Update { id: SmartViewId },
+    Delete { id: SmartViewId },
+    Reorder { user_ids: Vec<SmartViewId> },
+    SetActive { id: SmartViewId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetAgentsSmartViewsPayload {
+    pub update: AgentsSmartViewsUpdate,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentsViewPreferencesStoreErrorKind {
@@ -1235,11 +1301,13 @@ pub struct AgentsViewPreferencesStoreError {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentsViewPreferencesSnapshot {
     pub preferences: AgentsViewPreferences,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_error: Option<AgentsViewPreferencesStoreError>,
+    #[serde(default)]
+    pub smart_views: AgentsSmartViewsSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4479,8 +4547,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_fifteen() {
-        assert_eq!(PROTOCOL_VERSION, 15);
+    fn protocol_version_is_sixteen() {
+        assert_eq!(PROTOCOL_VERSION, 16);
     }
 
     #[test]
