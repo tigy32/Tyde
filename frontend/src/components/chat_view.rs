@@ -1555,7 +1555,7 @@ mod wasm_tests {
         let container = make_container();
         let agent_id_for_mount = agent_id.clone();
         let host_id_for_mount = host_id.clone();
-        let _handle = mount_to(container.clone(), move || {
+        let handle = mount_to(container.clone(), move || {
             let state = AppState::new();
             let bound = ActiveAgentRef {
                 host_id: host_id_for_mount.clone(),
@@ -1639,6 +1639,15 @@ mod wasm_tests {
             !text.contains("Load previous conversation history"),
             "revealed history must not still show the load-previous control: {text}"
         );
+
+        // Tear the view down inside this test: unmount (runs ChatView's
+        // `on_cleanup`, disconnecting its ResizeObservers and clearing the
+        // `view_mounted` flag), detach the container, and flush a tick so any
+        // `set_timeout` ChatView scheduled fires against the now-unmounted view
+        // instead of leaking into a later test in the shared wasm instance.
+        drop(handle);
+        container.remove();
+        next_tick().await;
     }
 
     #[wasm_bindgen_test]

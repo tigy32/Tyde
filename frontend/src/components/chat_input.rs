@@ -446,16 +446,6 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
         }
     };
 
-    // Starting a genuinely-new turn ends the restore/replay phase: freeze the
-    // history window so the last restored message stays visible and this new
-    // exchange accumulates on screen instead of being swallowed by the
-    // windowing tail-tracking (see `AppState::push_chat_entry`).
-    if let Some(active) = state.active_agent.get_untracked() {
-        state.history_settling.update(|set| {
-            set.remove(&active.agent_id);
-        });
-    }
-
     state.chat_input.set(String::new());
     pending_images.set(Vec::new());
     let restore_state = state.clone();
@@ -1358,10 +1348,42 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
+    /// Install a minimal `window.__TAURI__.core.invoke` stub so the bridge's
+    /// `send_host_line` resolves in the headless test environment, which has no
+    /// Tauri host. Without it, `submit_chat_input` performs its synchronous
+    /// optimistic clear and then asynchronously *reverts* it via
+    /// `restore_submitted_input` when the real send fails — and whether that
+    /// async revert lands before or after a test's `next_tick().await` depends
+    /// on total event-loop load, so the "draft cleared" assertion passes in
+    /// isolation but races under the full suite. A succeeding send keeps the
+    /// draft cleared, matching production. Only `send_host_line` is resolved;
+    /// every other command keeps the default "no host" rejection so unrelated
+    /// behaviour is unchanged.
+    fn stub_send_host_line() {
+        use wasm_bindgen::closure::Closure;
+        let window = web_sys::window().unwrap();
+        let invoke = Closure::<dyn Fn(JsValue, JsValue) -> js_sys::Promise>::new(
+            |cmd: JsValue, _args: JsValue| {
+                if cmd.as_string().as_deref() == Some("send_host_line") {
+                    js_sys::Promise::resolve(&JsValue::NULL)
+                } else {
+                    js_sys::Promise::reject(&JsValue::from_str("no tauri host in test"))
+                }
+            },
+        );
+        let core = js_sys::Object::new();
+        js_sys::Reflect::set(&core, &"invoke".into(), invoke.as_ref()).unwrap();
+        let tauri = js_sys::Object::new();
+        js_sys::Reflect::set(&tauri, &"core".into(), &core).unwrap();
+        js_sys::Reflect::set(&window, &"__TAURI__".into(), &tauri).unwrap();
+        invoke.forget();
+    }
+
     /// Connect the active chat tab to a single live agent and optionally seed a
     /// draft / running turn / forkable session, mirroring how the dispatcher
     /// populates state when a chat is open.
     fn configure(state: &AppState, session: bool, running: bool, input: &str) {
+        stub_send_host_line();
         let agent_id = AgentId(AGENT.to_owned());
         state.agents.set(vec![AgentInfo {
             host_id: HOST.to_owned(),

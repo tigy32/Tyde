@@ -451,9 +451,10 @@ pub struct AppState {
     /// Agents whose restored history is still trickling in (a resumed backend
     /// re-streams its whole transcript as live events, so a bootstrap snapshot
     /// may carry only a prefix). While an agent is in this set the floor is
-    /// re-derived as messages arrive so it keeps tracking the tail. Cleared on
-    /// the first genuinely-new turn (local send / typing) or when the user
-    /// reveals the history, and anywhere `chat_messages` is cleared.
+    /// re-derived as messages arrive so it keeps tracking the tail. Cleared
+    /// when the agent's first new turn begins (a `TypingStatusChanged` going
+    /// active) or when the user reveals the history, and anywhere
+    /// `chat_messages` is cleared.
     pub history_settling: RwSignal<HashSet<AgentRef>>,
     pub streaming_text: RwSignal<HashMap<AgentRef, StreamingState>>,
     pub chat_input: RwSignal<String>,

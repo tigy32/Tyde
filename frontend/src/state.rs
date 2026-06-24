@@ -1133,8 +1133,9 @@ pub struct AppState {
     /// re-streams its whole transcript as live events, so the bootstrap
     /// snapshot may carry only a prefix). While an agent is in this set the
     /// floor is re-derived as rows arrive so it keeps tracking the tail.
-    /// Cleared on the first genuinely-new turn (local send / typing) or when
-    /// the user reveals the history, and anywhere `chat_rows` is cleared.
+    /// Cleared when the agent's first new turn begins (a `TypingStatusChanged`
+    /// going active) or when the user reveals the history, and anywhere
+    /// `chat_rows` is cleared.
     pub history_settling: RwSignal<std::collections::HashSet<AgentId>>,
     pub streaming_text: RwSignal<HashMap<AgentId, StreamingState>>,
     /// Latest `ToolProgress` snapshot per tool call, keyed by the owning
