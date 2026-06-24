@@ -938,6 +938,7 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
     state.chat_message_index.update(|m| {
         m.remove(agent_ref);
     });
+    state.forget_history_window(agent_ref);
     state.streaming_text.update(|m| {
         m.remove(agent_ref);
     });
@@ -1262,6 +1263,15 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                     map.remove(&agent_ref);
                 }
             });
+            // A new turn starting means the restore/replay phase is over, so
+            // freeze the history floor: rows from here on are genuinely new
+            // conversation and should accumulate visibly rather than be
+            // swallowed by the windowing tail-tracking.
+            if typing {
+                state.history_settling.update(|set| {
+                    set.remove(&agent_ref);
+                });
+            }
         }
         ChatEvent::MessageAdded(message) => {
             let entry = ChatMessageEntry {
@@ -1570,6 +1580,18 @@ fn apply_host_bootstrap(state: &AppState, host: &LocalHostId, payload: HostBoots
 
     let snapshot_ids: HashSet<AgentId> =
         payload.agents.iter().map(|p| p.agent_id.clone()).collect();
+    // Prune the history window for agents on this host the snapshot no longer
+    // knows about, so a dropped agent doesn't leave an orphaned floor behind.
+    let dropped_refs: Vec<AgentRef> = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .filter(|a| a.local_host_id == *host && !snapshot_ids.contains(&a.agent_id))
+            .map(|a| a.agent_ref())
+            .collect()
+    });
+    for dropped in &dropped_refs {
+        state.forget_history_window(dropped);
+    }
     state.agents.update(|agents| {
         agents.retain(|a| a.local_host_id != *host || snapshot_ids.contains(&a.agent_id));
         for payload in payload.agents {
@@ -1646,6 +1668,7 @@ fn apply_agent_bootstrap(
     state.chat_message_index.update(|m| {
         m.remove(&agent_ref);
     });
+    state.forget_history_window(&agent_ref);
     state.streaming_text.update(|m| {
         m.remove(&agent_ref);
     });
@@ -1724,6 +1747,32 @@ fn apply_agent_bootstrap(
                 apply_chat_event(state, &agent_ref, event);
             }
         }
+    }
+
+    // Window a long restored history: render only the last message, collapsing
+    // earlier ones behind a "Load previous conversation history" control. If
+    // the restored agent is idle, mark it as "settling" so the floor keeps
+    // tracking the tail if the resumed backend trickles the rest of its
+    // transcript in as live events after this snapshot (see
+    // `AppState::push_chat_message_entry`). The AI still has the full
+    // conversation in context — this only changes what the view renders.
+    let total = state
+        .chat_messages
+        .with_untracked(|m| m.get(&agent_ref).map(|v| v.len()).unwrap_or(0));
+    let floor = crate::components::chat_view::initial_history_floor(total);
+    state.history_floor.update(|m| {
+        m.insert(agent_ref.clone(), floor);
+    });
+    let turn_active = state
+        .agent_turn_active
+        .with_untracked(|m| m.get(&agent_ref).copied().unwrap_or(false));
+    let stream_active = state
+        .streaming_text
+        .with_untracked(|m| m.contains_key(&agent_ref));
+    if !turn_active && !stream_active {
+        state.history_settling.update(|s| {
+            s.insert(agent_ref.clone());
+        });
     }
 }
 
@@ -1838,6 +1887,133 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
         ChatEvent::TaskUpdate(_) => "TaskUpdate",
         ChatEvent::OperationCancelled(_) => "OperationCancelled",
         ChatEvent::RetryAttempt(_) => "RetryAttempt",
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_bootstrap_mid_turn_keeps_live_stream_end_visible() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host = LocalHostId("midturn-host".to_owned());
+            let agent_id = AgentId("a-midturn".to_owned());
+            let agent_ref = AgentRef {
+                local_host_id: host.clone(),
+                agent_id: agent_id.clone(),
+            };
+            let stream = StreamPath("/agent/a-midturn/inst".to_owned());
+
+            state.agents.update(|agents| {
+                agents.push(AgentInfo {
+                    local_host_id: host.clone(),
+                    agent_id: agent_id.clone(),
+                    name: "Midturn Agent".to_owned(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: protocol::BackendKind::Codex,
+                    workspace_roots: Vec::new(),
+                    project_id: None,
+                    parent_agent_id: None,
+                    session_id: None,
+                    custom_agent_id: None,
+                    created_at_ms: 0,
+                    instance_stream: stream.clone(),
+                    started: true,
+                    fatal_error: None,
+                });
+            });
+
+            let message =
+                |content: String, sender: protocol::MessageSender| protocol::ChatMessage {
+                    message_id: None,
+                    timestamp: 0,
+                    sender,
+                    content,
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                };
+            let mut events = (0..20)
+                .map(|index| {
+                    AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message(
+                        format!("history {index}"),
+                        protocol::MessageSender::User,
+                    )))
+                })
+                .collect::<Vec<_>>();
+            events.push(AgentBootstrapEvent::ChatEvent(
+                ChatEvent::TypingStatusChanged(true),
+            ));
+            events.push(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(
+                protocol::StreamStartData {
+                    message_id: Some("midturn-message".to_owned()),
+                    agent: "Midturn Agent".to_owned(),
+                    model: Some("model".to_owned()),
+                },
+            )));
+            events.push(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamDelta(
+                protocol::StreamTextDeltaData {
+                    message_id: Some("midturn-message".to_owned()),
+                    text: "partial".to_owned(),
+                },
+            )));
+
+            apply_agent_bootstrap(&state, &host, &stream, AgentBootstrapPayload { events });
+
+            assert!(
+                state
+                    .agent_turn_active
+                    .with_untracked(|map| map.get(&agent_ref).copied().unwrap_or(false)),
+                "bootstrap should leave the restored agent mid-turn"
+            );
+            assert!(
+                !state
+                    .history_settling
+                    .with_untracked(|set| set.contains(&agent_ref)),
+                "mid-turn restore must not keep tail-tracking history"
+            );
+            assert_eq!(
+                state
+                    .streaming_text
+                    .with_untracked(|map| map.get(&agent_ref).map(|s| s.text.get_untracked())),
+                Some("partial".to_owned()),
+                "active stream delta should be restored"
+            );
+
+            apply_chat_event(
+                &state,
+                &agent_ref,
+                ChatEvent::StreamEnd(protocol::StreamEndData {
+                    message: message(
+                        "finished".to_owned(),
+                        protocol::MessageSender::Assistant {
+                            agent: "Midturn Agent".to_owned(),
+                        },
+                    ),
+                }),
+            );
+
+            assert_eq!(
+                state
+                    .chat_messages
+                    .with_untracked(|map| map.get(&agent_ref).map(Vec::len)),
+                Some(21),
+                "live StreamEnd should append to the restored transcript"
+            );
+            assert_eq!(
+                state
+                    .history_floor
+                    .with_untracked(|map| map.get(&agent_ref).copied().unwrap_or(0)),
+                0,
+                "live StreamEnd must accumulate instead of collapsing behind the history window"
+            );
+        });
     }
 }
 
