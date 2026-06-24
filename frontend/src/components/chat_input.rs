@@ -67,6 +67,7 @@ fn QueuedMessageRow(id: QueuedMessageId) -> impl IntoView {
         let host_id = agent.host_id.clone();
         let stream = agent.instance_stream.clone();
         let id = id_for_send.clone();
+        state_send.stop_history_settling(&active.agent_id);
         spawn_local(async move {
             if let Err(error) = send_frame(
                 &host_id,
@@ -433,10 +434,12 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
         return;
     }
 
-    let host_id = match state.active_agent.get_untracked() {
-        Some(active_agent) => active_agent.host_id,
+    let active_agent = match state.active_agent.get_untracked() {
+        Some(active_agent) => active_agent,
         None => return,
     };
+    let host_id = active_agent.host_id.clone();
+    let agent_id = active_agent.agent_id;
 
     let instance_stream = match active_instance_stream(state) {
         Some(stream) => stream,
@@ -448,6 +451,7 @@ fn submit_chat_input(state: &AppState, pending_images: RwSignal<Vec<PendingImage
 
     state.chat_input.set(String::new());
     pending_images.set(Vec::new());
+    state.stop_history_settling(&agent_id);
     let restore_state = state.clone();
     let restore_draft = draft.clone();
     let restore_images = images.clone();
@@ -1319,7 +1323,9 @@ pub fn ChatInput() -> impl IntoView {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{ActiveAgentRef, AgentInfo, AppState, ConnectionStatus, Tab, TabContent};
+    use crate::state::{
+        ActiveAgentRef, AgentInfo, AppState, ChatMessageEntry, ConnectionStatus, Tab, TabContent,
+    };
     use leptos::mount::mount_to;
     use protocol::{AgentId, AgentOrigin, BackendKind, SessionId, StreamPath};
     use wasm_bindgen::JsCast;
@@ -1819,6 +1825,77 @@ mod wasm_tests {
             state.chat_input.get_untracked(),
             "",
             "Cmd+Enter must submit and clear the draft"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn local_send_keeps_settling_history_from_swallowing_user_echo() {
+        let state = AppState::new();
+        configure(&state, false, false, "hello");
+        let agent_id = AgentId(AGENT.to_owned());
+        for index in 0..20 {
+            state.push_chat_entry(
+                agent_id.clone(),
+                ChatMessageEntry {
+                    message: protocol::ChatMessage {
+                        message_id: None,
+                        timestamp: 0,
+                        sender: protocol::MessageSender::User,
+                        content: format!("history {index}"),
+                        reasoning: None,
+                        tool_calls: Vec::new(),
+                        model_info: None,
+                        token_usage: None,
+                        context_breakdown: None,
+                        images: None,
+                    },
+                    tool_requests: Vec::new(),
+                },
+            );
+        }
+        state.history_settling.update(|set| {
+            set.insert(agent_id.clone());
+        });
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        dispatch_keydown(&textarea(&container), "Enter", true, false);
+        next_tick().await;
+        crate::dispatch::apply_chat_event(
+            &state,
+            HOST,
+            &agent_id,
+            protocol::ChatEvent::MessageAdded(protocol::ChatMessage {
+                message_id: None,
+                timestamp: 1,
+                sender: protocol::MessageSender::User,
+                content: "hello".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            }),
+        );
+
+        assert!(
+            !state
+                .history_settling
+                .with_untracked(|set| set.contains(&agent_id)),
+            "local submit should stop restored-history tail tracking before the user echo"
+        );
+        assert_eq!(
+            state
+                .history_floor
+                .with_untracked(|map| map.get(&agent_id).copied().unwrap_or(0)),
+            0,
+            "user echo after local submit must stay visible instead of being collapsed"
         );
     }
 

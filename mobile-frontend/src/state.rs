@@ -453,8 +453,8 @@ pub struct AppState {
     /// may carry only a prefix). While an agent is in this set the floor is
     /// re-derived as messages arrive so it keeps tracking the tail. Cleared
     /// when the agent's first new turn begins (a `TypingStatusChanged` going
-    /// active) or when the user reveals the history, and anywhere
-    /// `chat_messages` is cleared.
+    /// active or a local submit starts a turn) or when the user reveals the
+    /// history, and anywhere `chat_messages` is cleared.
     pub history_settling: RwSignal<HashSet<AgentRef>>,
     pub streaming_text: RwSignal<HashMap<AgentRef, StreamingState>>,
     pub chat_input: RwSignal<String>,
@@ -596,6 +596,12 @@ impl AppState {
         });
     }
 
+    pub fn stop_history_settling(&self, agent_ref: &AgentRef) {
+        self.history_settling.update(|set| {
+            set.remove(agent_ref);
+        });
+    }
+
     pub fn push_chat_message_entry(&self, agent_ref: &AgentRef, entry: ChatMessageEntry) {
         let message_id = entry.message.message_id.clone();
         let new_len = self.chat_messages.try_update(|messages| {
@@ -606,8 +612,7 @@ impl AppState {
         // While a resumed agent is still replaying its restored history, keep
         // the render floor tracking the tail so trickled-in old messages stay
         // hidden behind the "Load previous" control. Genuinely-new turns clear
-        // the settling flag first (see dispatch), so live conversation
-        // accumulates visibly.
+        // the settling flag first, so live conversation accumulates visibly.
         if let Some(new_len) = new_len
             && self
                 .history_settling

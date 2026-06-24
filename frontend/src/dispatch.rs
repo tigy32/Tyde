@@ -4310,11 +4310,12 @@ fn apply_agent_bootstrap(
 
     // Window long restored histories: render only the last message, collapsing
     // earlier ones behind a "Load previous conversation history" control. The
-    // floor is the absolute index of the first rendered row. We also mark the
-    // agent as "settling" so the floor keeps tracking the tail if the resumed
-    // backend trickles the rest of its transcript in as live events after this
-    // snapshot (see `AppState::push_chat_entry`). The AI still has the full
-    // conversation in context — this only changes what the view renders.
+    // floor is the absolute index of the first rendered row. If the restored
+    // agent is idle, mark it as "settling" so the floor keeps tracking the tail
+    // if the resumed backend trickles the rest of its transcript in as live
+    // events after this snapshot (see `AppState::push_chat_entry`). The AI
+    // still has the full conversation in context — this only changes what the
+    // view renders.
     let total = state
         .chat_rows
         .with_untracked(|map| map.get(&agent_id).map(|v| v.len()).unwrap_or(0));
@@ -4322,9 +4323,17 @@ fn apply_agent_bootstrap(
     state.history_floor.update(|map| {
         map.insert(agent_id.clone(), floor);
     });
-    state.history_settling.update(|set| {
-        set.insert(agent_id.clone());
-    });
+    let turn_active = state
+        .agent_turn_active
+        .with_untracked(|map| map.get(&agent_id).copied().unwrap_or(false));
+    let stream_active = state
+        .streaming_text
+        .with_untracked(|map| map.contains_key(&agent_id));
+    if !turn_active && !stream_active {
+        state.history_settling.update(|set| {
+            set.insert(agent_id.clone());
+        });
+    }
 }
 
 fn apply_project_bootstrap(
@@ -4798,6 +4807,126 @@ mod tests {
                     .as_ref()
                     .is_some_and(|t| t.total_tokens == 10),
                 "token_usage patched"
+            );
+        });
+    }
+
+    #[test]
+    fn agent_bootstrap_mid_turn_keeps_live_stream_end_visible() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "midturn-host";
+            let agent_id = AgentId("a-midturn".to_owned());
+            let stream = StreamPath("/agent/a-midturn/inst".to_owned());
+
+            state.agents.update(|agents| {
+                agents.push(AgentInfo {
+                    host_id: host_id.to_owned(),
+                    agent_id: agent_id.clone(),
+                    name: "Midturn Agent".to_owned(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: protocol::BackendKind::Codex,
+                    workspace_roots: Vec::new(),
+                    project_id: None,
+                    parent_agent_id: None,
+                    session_id: None,
+                    custom_agent_id: None,
+                    workflow: None,
+                    created_at_ms: 0,
+                    instance_stream: stream.clone(),
+                    started: true,
+                    fatal_error: None,
+                });
+            });
+
+            let message =
+                |content: String, sender: protocol::MessageSender| protocol::ChatMessage {
+                    message_id: None,
+                    timestamp: 0,
+                    sender,
+                    content,
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                };
+            let mut events = (0..20)
+                .map(|index| {
+                    AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message(
+                        format!("history {index}"),
+                        protocol::MessageSender::User,
+                    )))
+                })
+                .collect::<Vec<_>>();
+            events.push(AgentBootstrapEvent::ChatEvent(
+                ChatEvent::TypingStatusChanged(true),
+            ));
+            events.push(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(
+                protocol::StreamStartData {
+                    message_id: Some("midturn-message".to_owned()),
+                    agent: "Midturn Agent".to_owned(),
+                    model: Some("model".to_owned()),
+                },
+            )));
+            events.push(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamDelta(
+                protocol::StreamTextDeltaData {
+                    message_id: Some("midturn-message".to_owned()),
+                    text: "partial".to_owned(),
+                },
+            )));
+
+            apply_agent_bootstrap(&state, host_id, &stream, AgentBootstrapPayload { events });
+
+            assert!(
+                state
+                    .agent_turn_active
+                    .with_untracked(|map| map.get(&agent_id).copied().unwrap_or(false)),
+                "bootstrap should leave the restored agent mid-turn"
+            );
+            assert!(
+                !state
+                    .history_settling
+                    .with_untracked(|set| set.contains(&agent_id)),
+                "mid-turn restore must not keep tail-tracking history"
+            );
+            assert_eq!(
+                state
+                    .streaming_text
+                    .with_untracked(|map| map.get(&agent_id).map(|s| s.text.get_untracked())),
+                Some("partial".to_owned()),
+                "active stream delta should be restored"
+            );
+
+            apply_chat_event(
+                &state,
+                host_id,
+                &agent_id,
+                ChatEvent::StreamEnd(protocol::StreamEndData {
+                    message: message(
+                        "finished".to_owned(),
+                        protocol::MessageSender::Assistant {
+                            agent: "Midturn Agent".to_owned(),
+                        },
+                    ),
+                }),
+            );
+
+            assert_eq!(
+                state
+                    .chat_rows
+                    .with_untracked(|map| map.get(&agent_id).map(Vec::len)),
+                Some(21),
+                "live StreamEnd should append to the restored transcript"
+            );
+            assert_eq!(
+                state
+                    .history_floor
+                    .with_untracked(|map| map.get(&agent_id).copied().unwrap_or(0)),
+                0,
+                "live StreamEnd must accumulate instead of collapsing behind the history window"
             );
         });
     }

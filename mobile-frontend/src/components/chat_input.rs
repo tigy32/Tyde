@@ -203,6 +203,9 @@ pub fn ChatInput() -> impl IntoView {
                 textarea.set_value("");
                 resize_chat_input(&textarea);
             }
+            if let Some((active, _)) = active_target.as_ref() {
+                state.stop_history_settling(&active.as_agent_ref());
+            }
 
             spawn_local(async move {
                 if let Some((ar, stream)) = active_target {
@@ -598,7 +601,7 @@ fn report_send_error(state: &AppState, message: String) {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{AgentInfo, AgentRef, AppState, LocalHostId};
+    use crate::state::{AgentInfo, AgentRef, AppState, ChatMessageEntry, LocalHostId};
     use leptos::mount::mount_to;
     use protocol::{
         AgentId, AgentOrigin, BackendKind, QueuedMessageEntry, QueuedMessageId, SessionId,
@@ -990,6 +993,104 @@ mod wasm_tests {
                 .unwrap()
                 .is_none(),
             "Fork + send must stay hidden when the active agent has no session id"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn local_send_keeps_settling_history_from_swallowing_user_echo() {
+        let host = LocalHostId("host-1".to_owned());
+        let agent_id = AgentId("agent-1".to_owned());
+        let agent_ref = AgentRef {
+            local_host_id: host.clone(),
+            agent_id: agent_id.clone(),
+        };
+        let state = AppState::new();
+        state.agents.set(vec![AgentInfo {
+            local_host_id: host.clone(),
+            agent_id: agent_id.clone(),
+            name: "Agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
+            started: true,
+            fatal_error: None,
+        }]);
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: host.clone(),
+            agent_id: agent_id.clone(),
+        }));
+        for index in 0..20 {
+            state.push_chat_message_entry(
+                &agent_ref,
+                ChatMessageEntry {
+                    message: protocol::ChatMessage {
+                        message_id: None,
+                        timestamp: 0,
+                        sender: protocol::MessageSender::User,
+                        content: format!("history {index}"),
+                        reasoning: None,
+                        tool_calls: Vec::new(),
+                        model_info: None,
+                        token_usage: None,
+                        context_breakdown: None,
+                        images: None,
+                    },
+                    tool_requests: Vec::new(),
+                },
+            );
+        }
+        state.history_settling.update(|set| {
+            set.insert(agent_ref.clone());
+        });
+
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+        type_text(&container, "hello");
+        next_tick().await;
+
+        let send: HtmlElement = primary(&container).dyn_into().unwrap();
+        send.click();
+        next_tick().await;
+        crate::dispatch::apply_chat_event(
+            &state,
+            &agent_ref,
+            protocol::ChatEvent::MessageAdded(protocol::ChatMessage {
+                message_id: None,
+                timestamp: 1,
+                sender: protocol::MessageSender::User,
+                content: "hello".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            }),
+        );
+
+        assert!(
+            !state
+                .history_settling
+                .with_untracked(|set| set.contains(&agent_ref)),
+            "local submit should stop restored-history tail tracking before the user echo"
+        );
+        assert_eq!(
+            state
+                .history_floor
+                .with_untracked(|map| map.get(&agent_ref).copied().unwrap_or(0)),
+            0,
+            "user echo after local submit must stay visible instead of being collapsed"
         );
     }
 

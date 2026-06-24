@@ -269,6 +269,7 @@ pub async fn send_queued_message_now(
     id: protocol::QueuedMessageId,
 ) -> Result<(), String> {
     let stream = agent_instance_stream(state, agent_ref).ok_or("agent not found")?;
+    state.stop_history_settling(agent_ref);
     send_frame(
         &agent_ref.local_host_id,
         stream,

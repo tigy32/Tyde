@@ -1134,8 +1134,8 @@ pub struct AppState {
     /// snapshot may carry only a prefix). While an agent is in this set the
     /// floor is re-derived as rows arrive so it keeps tracking the tail.
     /// Cleared when the agent's first new turn begins (a `TypingStatusChanged`
-    /// going active) or when the user reveals the history, and anywhere
-    /// `chat_rows` is cleared.
+    /// going active or a local submit starts a turn) or when the user reveals
+    /// the history, and anywhere `chat_rows` is cleared.
     pub history_settling: RwSignal<std::collections::HashSet<AgentId>>,
     pub streaming_text: RwSignal<HashMap<AgentId, StreamingState>>,
     /// Latest `ToolProgress` snapshot per tool call, keyed by the owning
@@ -1796,6 +1796,12 @@ impl AppState {
         });
     }
 
+    pub fn stop_history_settling(&self, agent_id: &AgentId) {
+        self.history_settling.update(|set| {
+            set.remove(agent_id);
+        });
+    }
+
     fn finalize_compaction_close(&self, host_id: &str, agent_id: &AgentId) {
         self.agents.update(|agents| {
             agents.retain(|agent| !(agent.host_id == host_id && agent.agent_id == *agent_id));
@@ -1967,8 +1973,8 @@ impl AppState {
         // While a resumed agent is still replaying its restored history, keep
         // the render floor tracking the tail so trickled-in old messages stay
         // hidden behind the "Load previous" control instead of appearing one
-        // by one. Genuinely-new turns clear the settling flag first (see
-        // dispatch), so live conversation accumulates visibly.
+        // by one. Genuinely-new turns clear the settling flag first, so live
+        // conversation accumulates visibly.
         if let Some(new_len) = new_len
             && self
                 .history_settling
