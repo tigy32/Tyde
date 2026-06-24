@@ -245,7 +245,7 @@ async fn emit_paired_hosts_changed() {
 }
 
 fn parse_and_validate(qr_uri: &str) -> Result<MobilePairingQrPayload, String> {
-    let payload = MobilePairingQrPayload::from_uri(qr_uri)
+    let payload = MobilePairingQrPayload::from_any(qr_uri)
         .map_err(|error| format!("invalid mobile pairing URI: {error}"))?;
     if payload.v != MOBILE_QR_VERSION {
         return Err(format!(
@@ -303,6 +303,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_and_validate_accepts_https_fragment_pairing_uri() {
+        let uri = valid_uri();
+        let wrapped = format!("https://tycode.dev/tyde/#{uri}");
+        assert!(
+            MobilePairingQrPayload::from_uri(&wrapped).is_err(),
+            "the raw URI parser must reject the HTTPS wrapper"
+        );
+        let payload = parse_and_validate(&wrapped).expect("https fragment pairing uri");
+        assert_eq!(payload.host_label, "Living Room");
+        assert_eq!(payload.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
     fn parse_and_validate_rejects_non_pairing_uri() {
         let error = parse_and_validate("https://example.com/not-a-pairing-uri")
             .expect_err("must reject non tyde-pair uris");
@@ -322,5 +335,37 @@ mod tests {
         let uri = payload.to_uri().expect("encode");
         let error = parse_and_validate(&uri).expect_err("protocol mismatch must be rejected");
         assert!(error.contains("protocol version"), "{error}");
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use mqtt_transport::{PreSharedKey, RoomId, default_mobile_broker_endpoint};
+    use wasm_bindgen_test::*;
+
+    use super::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn valid_uri() -> String {
+        MobilePairingQrPayload::new(
+            PROTOCOL_VERSION,
+            default_mobile_broker_endpoint(),
+            RoomId([3_u8; 16]),
+            PreSharedKey::from_slice(&[4_u8; 32]).expect("psk"),
+            "Living Room".to_owned(),
+        )
+        .to_uri()
+        .expect("encode pairing uri")
+    }
+
+    #[wasm_bindgen_test]
+    fn parse_and_validate_accepts_https_fragment_qr_value() {
+        let uri = valid_uri();
+        let wrapped = format!("https://tycode.dev/tyde/#{uri}");
+        assert!(MobilePairingQrPayload::from_uri(&wrapped).is_err());
+        let payload = parse_and_validate(&wrapped).expect("https fragment pairing uri");
+        assert_eq!(payload.host_label, "Living Room");
+        assert_eq!(payload.protocol_version, PROTOCOL_VERSION);
     }
 }

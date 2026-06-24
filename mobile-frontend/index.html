@@ -8,6 +8,7 @@
     <title>Tyde Mobile</title>
     <link data-trunk rel="rust" href="Cargo.toml" data-wasm-opt="z" />
     <link data-trunk rel="css" href="styles.css" />
+    <link data-trunk rel="copy-file" href="vendor/jsqr.js" />
     <style>
         html, body {
             margin: 0;
@@ -333,5 +334,9 @@
         installTauriEventListenerLoop().then(markReadyLoop);
     })();
     </script>
+    <!-- Keep vendor/jsqr.js byte-for-byte identical to web/loader/vendor/jsqr.js.
+         The loader copy is the source of truth; this classic script installs
+         window.jsQR before the WASM scanner can request a camera. -->
+    <script src="jsqr.js"></script>
 </body>
 </html>
