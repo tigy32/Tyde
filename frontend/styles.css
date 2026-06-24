@@ -570,6 +570,12 @@ details summary:focus:not(:focus-visible) {
     gap: 3px;
 }
 
+/* A project with no workbenches still renders an empty children container;
+   collapse it so the group's gap doesn't reserve phantom space below the row. */
+.rail-workbench-children:empty {
+    display: none;
+}
+
 /* When expanded, indent the children under a vertical guide line that ties
    them visually to their parent project. */
 .project-rail.expanded .rail-workbench-children {
