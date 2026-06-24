@@ -4,20 +4,22 @@ use std::collections::{HashMap, HashSet};
 use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
 use protocol::{
-    AgentId, AgentOrigin, AgentWorkflowMetadata, BackendKind, BackendSetupInfo, ChatMessage,
-    ChatMessageId, CodeIntelDiagnostic, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelLocation, CodeIntelOccurrence, CodeIntelReferencesFileResult, CodeIntelStatusPayload,
-    CustomAgent, CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry,
-    HostBrowseErrorPayload, HostPlatform, HostSettings, McpServerConfig, McpServerId,
-    MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload, Project,
-    ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId,
-    ProjectPath, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
-    ProjectSearchFileResult, QueuedMessageEntry, Review, ReviewCommentId, ReviewId,
-    ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry, SessionSettingsValues,
-    SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, Team, TeamDraft,
-    TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId,
-    TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog,
-    TerminalId, ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
+    AgentGroupMode, AgentId, AgentListDensity, AgentOrderKey, AgentOrigin, AgentSortMode,
+    AgentWorkflowMetadata, AgentsViewFilters, AgentsViewPreferences, AgentsViewPreferencesSnapshot,
+    BackendKind, BackendSetupInfo, ChatMessage, ChatMessageId, CodeIntelDiagnostic,
+    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelLocation, CodeIntelOccurrence,
+    CodeIntelReferencesFileResult, CodeIntelStatusPayload, CustomAgent, CustomAgentId,
+    DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload,
+    HostPlatform, HostSettings, McpServerConfig, McpServerId, MessageMetadataUpdateData,
+    MobileAccessStatePayload, MobilePairingOfferPayload, Project, ProjectDiffScope,
+    ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath,
+    ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, ProjectSearchFileResult,
+    QueuedMessageEntry, Review, ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary,
+    SessionId, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId, Steering,
+    SteeringId, StreamPath, TaskList, Team, TeamDraft, TeamDraftId, TeamId, TeamMember,
+    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
+    ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
     WorkflowDiagnostic, WorkflowRunId, WorkflowRunSnapshot, WorkflowSummary,
 };
 
@@ -102,6 +104,19 @@ pub const TAB_LRU_CAPACITY: usize = 2;
 /// no explicit agent, so pickers that already offer a "Default agent" row
 /// hide this record to avoid a duplicate entry.
 pub const DEFAULT_CUSTOM_AGENT_ID: &str = "tyde-default";
+
+/// Configured-connection id of the primary local host. It is the only host
+/// that owns and emits Agents-view preferences (dev-docs/26 §12.1); a `Some`
+/// snapshot from any other host is ignored so a stray remote payload cannot
+/// hijack the client-global preference signal or its owner pointer.
+pub const PRIMARY_LOCAL_HOST_ID: &str = "local";
+
+/// Safety backstop: if an optimistic Agents-view overlay is not reconciled by
+/// an authoritative server snapshot within this window (e.g. the
+/// `SetAgentsViewPreferences` send was dropped and no notify ever arrives), it
+/// is dropped so a failed mutation can never freeze the view.
+#[cfg(target_arch = "wasm32")]
+const OVERLAY_RECONCILE_TIMEOUT_MS: i32 = 4000;
 
 thread_local! {
     static NEXT_TAB_ID: Cell<u64> = const { Cell::new(0) };
@@ -1015,6 +1030,41 @@ impl AgentsPanelFilters {
     }
 }
 
+/// Short-lived, non-persisted optimistic overlay for in-flight Agents-view
+/// preference mutations. Each field is `Some` only while a change to that
+/// preference domain has been sent to the server and the confirming
+/// `AgentsViewPreferencesNotify` (or a fresh bootstrap snapshot) has not yet
+/// arrived. The overlay is layered on top of the server snapshot so the UI
+/// reacts instantly, but it is never written to disk and can never become a
+/// durable second source of truth — which is precisely what kept the Agents
+/// tab from flickering before this design.
+///
+/// Reconciliation is **drop-on-any-authoritative-snapshot**: an
+/// `AgentsViewPreferencesNotify` (or a primary-host bootstrap) is a *full*
+/// snapshot, so once one arrives the whole overlay is discarded — the server
+/// value wins even when it differs from the optimistic one (the server
+/// canonicalizes filter enum order and keeps historical session keys in manual
+/// order, so an exact-equality check would never match and the overlay would
+/// stick, masking later server changes). A safety timeout
+/// (`OVERLAY_RECONCILE_TIMEOUT_MS`) drops a stale overlay if a send is dropped
+/// and no snapshot ever arrives. See `dev-docs/26-agent-organization.md`
+/// §4.3 / §7.4 / §12.1.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgentsViewOverlay {
+    pub filters: Option<AgentsViewFilters>,
+    pub sort_mode: Option<AgentSortMode>,
+    pub group_mode: Option<AgentGroupMode>,
+    pub density: Option<AgentListDensity>,
+    pub hide_finished: Option<bool>,
+    pub manual_order: Option<Vec<AgentOrderKey>>,
+}
+
+impl AgentsViewOverlay {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Per-project filter state for the Sessions/History panel. Stored per
 /// active project (keyed by `Option<ActiveProjectRef>`, where `None`
 /// represents the Home project) so user toggles persist across project
@@ -1285,11 +1335,24 @@ pub struct AppState {
     /// (never replayed on host attach).
     pub team_member_shuffle_suggestions:
         RwSignal<HashMap<String, HashMap<TeamId, TeamMemberShuffleSuggestionEntry>>>,
-    /// Session-local manual ordering for the Agent Monitor center view.
-    /// Empty means "use the derived default sort"; once the user reorders,
-    /// known rows stay in this order until Reset.
-    pub agent_monitor_order: RwSignal<Vec<AgentMonitorKey>>,
-    pub agents_panel_filters: RwSignal<HashMap<Option<ActiveProjectRef>, AgentsPanelFilters>>,
+    /// Durable Agents-tab view preferences (filters, sort, group, density,
+    /// hide-finished, manual order). The server is the single source of truth:
+    /// the primary local host emits a `Some` snapshot in its bootstrap and via
+    /// `AgentsViewPreferencesNotify`. This signal is *not* pruned on host
+    /// cleanup, so a remount/reconnect re-reads the same server-fed base rather
+    /// than re-deriving a fresh local map — the root fix for the Agents-tab
+    /// flicker. See `dev-docs/26-agent-organization.md` §5.2 / §8.
+    pub agents_view_preferences: RwSignal<AgentsViewPreferencesSnapshot>,
+    /// Configured-host id of the primary local host that owns
+    /// `agents_view_preferences`. Set when a bootstrap/notify carries a `Some`
+    /// snapshot; preference mutations are routed back to this host's stream.
+    pub agents_view_preferences_host: RwSignal<Option<String>>,
+    /// Non-persisted optimistic overlay for in-flight preference mutations.
+    pub pending_agents_view_overlay: RwSignal<AgentsViewOverlay>,
+    /// Monotonic generation bumped on every overlay mutation. The safety
+    /// timeout captures the generation it armed for and only drops the overlay
+    /// if no newer mutation has since superseded it.
+    pub agents_view_overlay_generation: RwSignal<u64>,
     pub sessions_panel_filters: RwSignal<HashMap<Option<ActiveProjectRef>, SessionsPanelFilters>>,
     /// Per-review full state. Server is the source of truth: a `ReviewView`
     /// subscribes to `/review/<id>` and dispatch applies `ReviewEvent`
@@ -1548,8 +1611,13 @@ impl AppState {
             team_preset_catalogs: RwSignal::new(HashMap::new()),
             team_drafts: RwSignal::new(HashMap::new()),
             team_member_shuffle_suggestions: RwSignal::new(HashMap::new()),
-            agent_monitor_order: RwSignal::new(Vec::new()),
-            agents_panel_filters: RwSignal::new(HashMap::new()),
+            agents_view_preferences: RwSignal::new(AgentsViewPreferencesSnapshot {
+                preferences: AgentsViewPreferences::default(),
+                load_error: None,
+            }),
+            agents_view_preferences_host: RwSignal::new(None),
+            pending_agents_view_overlay: RwSignal::new(AgentsViewOverlay::default()),
+            agents_view_overlay_generation: RwSignal::new(0),
             sessions_panel_filters: RwSignal::new(HashMap::new()),
             reviews: RwSignal::new(HashMap::new()),
             review_summaries: RwSignal::new(HashMap::new()),
@@ -1956,6 +2024,115 @@ impl AppState {
         let host_id = self.selected_host_id.get_untracked()?;
         let stream = self.host_stream_untracked(&host_id)?;
         Some((host_id, stream))
+    }
+
+    /// Reactively resolve the effective Agents-view preferences: the durable
+    /// server snapshot with the non-persisted optimistic overlay layered on top
+    /// per preference domain. Reads both signals, so callers inside a reactive
+    /// closure re-run when either the server snapshot or the overlay changes.
+    pub fn effective_agents_view_preferences(&self) -> AgentsViewPreferences {
+        let base = self.agents_view_preferences.get().preferences;
+        let overlay = self.pending_agents_view_overlay.get();
+        AgentsViewPreferences {
+            filters: overlay.filters.unwrap_or(base.filters),
+            sort_mode: overlay.sort_mode.unwrap_or(base.sort_mode),
+            group_mode: overlay.group_mode.unwrap_or(base.group_mode),
+            density: overlay.density.unwrap_or(base.density),
+            hide_finished: overlay.hide_finished.unwrap_or(base.hide_finished),
+            manual_order: overlay.manual_order.unwrap_or(base.manual_order),
+        }
+    }
+
+    /// Apply a server-emitted Agents-view preference snapshot. Only the primary
+    /// local host owns these preferences (dev-docs/26 §12.1): a `Some` snapshot
+    /// from any other host is ignored so a stray remote payload cannot hijack
+    /// the client-global signal or its owner pointer.
+    ///
+    /// The snapshot is authoritative and full, so the optimistic overlay is
+    /// dropped wholesale — the server wins even when its canonicalized value
+    /// differs from the optimistic one (sorted filter enums, retained historical
+    /// session keys). Matching the optimistic value exactly is impossible after
+    /// canonicalization, so an equality-only reconcile would leave the overlay
+    /// stuck and mask future server changes to that domain.
+    pub fn apply_agents_view_snapshot(
+        &self,
+        host_id: &str,
+        snapshot: AgentsViewPreferencesSnapshot,
+    ) {
+        if host_id != PRIMARY_LOCAL_HOST_ID {
+            log::warn!("ignoring agents-view preferences snapshot from non-primary host {host_id}");
+            return;
+        }
+        self.agents_view_preferences.set(snapshot);
+        self.agents_view_preferences_host
+            .set(Some(host_id.to_owned()));
+        // A new authoritative snapshot supersedes every in-flight domain. Bump
+        // the generation so any pending safety-timeout for the old overlay
+        // becomes a no-op.
+        self.agents_view_overlay_generation
+            .update(|generation| *generation = generation.wrapping_add(1));
+        self.pending_agents_view_overlay
+            .set(AgentsViewOverlay::default());
+    }
+
+    /// Install an optimistic overlay update for an in-flight preference domain
+    /// and run `mutate` on the overlay. Used right before a
+    /// `SetAgentsViewPreferences` frame is sent so the UI reacts immediately.
+    /// Arms a safety timeout so a dropped/failed send cannot freeze the view.
+    pub fn set_agents_view_overlay(&self, mutate: impl FnOnce(&mut AgentsViewOverlay)) {
+        self.pending_agents_view_overlay
+            .update(|overlay| mutate(overlay));
+        let generation = self
+            .agents_view_overlay_generation
+            .try_update(|generation| {
+                *generation = generation.wrapping_add(1);
+                *generation
+            })
+            .unwrap_or_default();
+        self.arm_overlay_reconcile_timeout(generation);
+    }
+
+    /// Schedule the safety backstop: after `OVERLAY_RECONCILE_TIMEOUT_MS`, if no
+    /// newer overlay mutation or authoritative snapshot has bumped the
+    /// generation and the overlay is still pending, drop it. Uses `try_*`
+    /// accessors so a timer that fires after the owning scope is disposed (e.g.
+    /// across test boundaries) is a harmless no-op. No-op off wasm.
+    #[cfg(target_arch = "wasm32")]
+    fn arm_overlay_reconcile_timeout(&self, generation: u64) {
+        use wasm_bindgen::JsCast;
+        use wasm_bindgen::closure::Closure;
+
+        let state = self.clone();
+        let callback = Closure::once_into_js(move || {
+            let still_current = state
+                .agents_view_overlay_generation
+                .try_get_untracked()
+                .map(|current| current == generation)
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+            let _ = state.pending_agents_view_overlay.try_update(|overlay| {
+                if !overlay.is_empty() {
+                    log::warn!("agents-view overlay timed out without server reconcile; dropping");
+                    *overlay = AgentsViewOverlay::default();
+                }
+            });
+        });
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                callback.unchecked_ref(),
+                OVERLAY_RECONCILE_TIMEOUT_MS,
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn arm_overlay_reconcile_timeout(&self, _generation: u64) {}
+
+    /// True while any preference mutation is awaiting server confirmation.
+    pub fn agents_view_overlay_pending(&self) -> bool {
+        !self.pending_agents_view_overlay.get().is_empty()
     }
 
     pub fn push_chat_entry(&self, agent_id: AgentId, entry: ChatMessageEntry) -> ChatRowHandle {
@@ -2472,16 +2649,13 @@ impl AppState {
         self.review_create_pending.update(|map| {
             map.retain(|(host, _), _| host != host_id);
         });
-        self.agent_monitor_order.update(|order| {
-            order.retain(|key| key.host_id != host_id);
-        });
-        self.agents_panel_filters.update(|map| {
-            map.retain(|active, _| {
-                active
-                    .as_ref()
-                    .is_none_or(|active| active.host_id != host_id)
-            });
-        });
+        // NOTE: Agents-view preferences (manual order + filters) are
+        // intentionally NOT pruned here. They are server-owned durable state
+        // replayed on the next bootstrap; pruning them on host cleanup is
+        // exactly the behavior that produced the Agents-tab flicker/reset. The
+        // non-persisted optimistic overlay is likewise left untouched — it is
+        // reconciled by the next server notify/bootstrap, never by host
+        // teardown. See `dev-docs/26-agent-organization.md` §5.5.
         self.sessions_panel_filters.update(|map| {
             map.retain(|active, _| {
                 active
@@ -4292,20 +4466,11 @@ mod tests {
                     },
                 );
             });
-            state.agents_panel_filters.update(|map| {
-                map.insert(Some(active_a.clone()), AgentsPanelFilters::default());
-                map.insert(Some(active_b.clone()), AgentsPanelFilters::default());
-                map.insert(None, AgentsPanelFilters::default());
-            });
             state.sessions_panel_filters.update(|map| {
                 map.insert(Some(active_a.clone()), SessionsPanelFilters::default());
                 map.insert(Some(active_b.clone()), SessionsPanelFilters::default());
                 map.insert(None, SessionsPanelFilters::default());
             });
-            state.agent_monitor_order.set(vec![
-                AgentMonitorKey::new(host_a, AgentId("agent-a".to_owned())),
-                AgentMonitorKey::new(host_b, AgentId("agent-b".to_owned())),
-            ]);
             state.switch_active_project(Some(active_a.clone()));
 
             state.clear_host_runtime(host_a);
@@ -4421,13 +4586,6 @@ mod tests {
                         && memory.diff_contents.keys().any(|key| key.host_id == host_b)
                 })
             }));
-            assert!(!state.agents_panel_filters.with_untracked(|m| {
-                m.keys()
-                    .any(|key| key.as_ref().is_some_and(|key| key.host_id == host_a))
-            }));
-            assert!(state.agents_panel_filters.with_untracked(|m| {
-                m.contains_key(&Some(active_b.clone())) && m.contains_key(&None)
-            }));
             assert!(!state.sessions_panel_filters.with_untracked(|m| {
                 m.keys()
                     .any(|key| key.as_ref().is_some_and(|key| key.host_id == host_a))
@@ -4435,12 +4593,11 @@ mod tests {
             assert!(state.sessions_panel_filters.with_untracked(|m| {
                 m.contains_key(&Some(active_b.clone())) && m.contains_key(&None)
             }));
-            assert_eq!(
-                state
-                    .agent_monitor_order
-                    .with_untracked(|order| order.clone()),
-                vec![AgentMonitorKey::new(host_b, AgentId("agent-b".to_owned()))]
-            );
+            // Agents-view preferences (the former `agents_panel_filters` /
+            // `agent_monitor_order` local signals) are deliberately no longer
+            // pruned on host cleanup. They are server-owned durable state — the
+            // old per-host pruning was the flicker source this work removes — so
+            // there is nothing host-scoped left here to assert.
         });
     }
 

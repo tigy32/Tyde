@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use protocol::{AgentId, FrameKind, SetAgentNamePayload};
+use protocol::{AgentId, AgentsViewPreferencesUpdate, FrameKind, SetAgentNamePayload};
 
-use crate::send::{close_agent, compact_agent, send_frame};
+use crate::send::{close_agent, compact_agent, send_frame, set_agents_view_preferences};
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, CompactionOldInfo,
     ConnectionStatus, StreamingState, TabContent,
@@ -158,30 +158,77 @@ pub fn AgentsPanel() -> impl IntoView {
     let editing_agent: RwSignal<Option<protocol::AgentId>> = RwSignal::new(None);
     let edit_value: RwSignal<String> = RwSignal::new(String::new());
 
-    // Current filter values for the active project. Falls back to
-    // context-aware defaults when the user hasn't toggled anything yet for
-    // this project.
+    // Sidebar-only view toggles (hide sub-agents / inactive / other projects)
+    // are ephemeral interaction state, like the search box — they have no
+    // server-owned representation. This per-project override map is
+    // component-local: it is created fresh on every mount and is never stored
+    // in `AppState` or pruned on host cleanup, so unlike the removed durable
+    // `agents_panel_filters` signal it cannot be a flicker source. It exists
+    // only to restore per-project reactivity — `current_filters` re-derives
+    // through `active_project`, so switching projects re-applies that project's
+    // defaults while remembering in-session overrides. "Hide finished" is the
+    // one shared, server-owned preference and is read from / written to the
+    // Agents-view preferences object so it stays consistent with the Agents
+    // Center. See `dev-docs/26-agent-organization.md` §5.2.
+    let local_filters: RwSignal<HashMap<Option<ActiveProjectRef>, AgentsPanelFilters>> =
+        RwSignal::new(HashMap::new());
     let filters_state = state.clone();
     let current_filters = Memo::new(move |_| {
         let active = filters_state.active_project.get();
-        let overrides = filters_state.agents_panel_filters.get();
-        overrides
+        local_filters
+            .get()
             .get(&active)
             .cloned()
             .unwrap_or_else(|| AgentsPanelFilters::defaults_for(active.as_ref()))
     });
 
-    let update_filters = {
-        let state = state.clone();
-        move |mutate: Box<dyn FnOnce(&mut AgentsPanelFilters)>| {
-            let active = state.active_project.get_untracked();
-            state.agents_panel_filters.update(|map| {
-                let entry = map
-                    .entry(active.clone())
-                    .or_insert_with(|| AgentsPanelFilters::defaults_for(active.as_ref()));
-                mutate(entry);
-            });
-        }
+    let hide_finished_state = state.clone();
+    let hide_finished = Memo::new(move |_| {
+        hide_finished_state
+            .effective_agents_view_preferences()
+            .hide_finished
+    });
+
+    let update_state = state.clone();
+    let update_filters = move |mutate: Box<dyn FnOnce(&mut AgentsPanelFilters)>| {
+        let active = update_state.active_project.get_untracked();
+        local_filters.update(|map| {
+            let entry = map
+                .entry(active.clone())
+                .or_insert_with(|| AgentsPanelFilters::defaults_for(active.as_ref()));
+            mutate(entry);
+        });
+    };
+
+    let hide_finished_toggle_state = state.clone();
+    let toggle_hide_finished = move |_| {
+        let next = !hide_finished_toggle_state
+            .effective_agents_view_preferences()
+            .hide_finished;
+        hide_finished_toggle_state
+            .set_agents_view_overlay(|overlay| overlay.hide_finished = Some(next));
+        let Some(host_id) = hide_finished_toggle_state
+            .agents_view_preferences_host
+            .get_untracked()
+        else {
+            return;
+        };
+        let Some(stream) = hide_finished_toggle_state.host_stream_untracked(&host_id) else {
+            return;
+        };
+        spawn_local(async move {
+            if let Err(error) = set_agents_view_preferences(
+                &host_id,
+                stream,
+                AgentsViewPreferencesUpdate::SetHideFinished {
+                    hide_finished: next,
+                },
+            )
+            .await
+            {
+                log::error!("failed to send hide-finished preference: {error}");
+            }
+        });
     };
 
     let filter_state = state.clone();
@@ -189,6 +236,7 @@ pub fn AgentsPanel() -> impl IntoView {
         let active_project = filter_state.active_project.get();
         let query = search.get().to_lowercase();
         let filters = current_filters.get();
+        let hide_finished = hide_finished.get();
 
         // Read the noisy maps in place via `with` rather than cloning
         // them up-front. The Memo re-runs on every keystroke in the
@@ -197,21 +245,33 @@ pub fn AgentsPanel() -> impl IntoView {
         // dominant per-keystroke cost in the audit.
         filter_state.streaming_text.with(|streaming_map| {
             filter_state.agent_turn_active.with(|turn_active_map| {
-                filter_state.agents.with(|agents| {
-                    agents
-                        .iter()
-                        .filter(|a| {
-                            agent_passes_filters(
-                                a,
-                                &filters,
-                                active_project.as_ref(),
-                                streaming_map,
-                                turn_active_map,
-                                &query,
-                            )
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>()
+                filter_state.compaction_in_progress.with(|compaction_map| {
+                    filter_state.agents.with(|agents| {
+                        agents
+                            .iter()
+                            .filter(|a| {
+                                if hide_finished
+                                    && derive_agent_state(
+                                        a,
+                                        streaming_map,
+                                        turn_active_map,
+                                        compaction_map,
+                                    ) == DerivedAgentState::Terminated
+                                {
+                                    return false;
+                                }
+                                agent_passes_filters(
+                                    a,
+                                    &filters,
+                                    active_project.as_ref(),
+                                    streaming_map,
+                                    turn_active_map,
+                                    &query,
+                                )
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
                 })
             })
         })
@@ -320,6 +380,13 @@ pub fn AgentsPanel() -> impl IntoView {
                     on:click=toggle_other_projects
                 >
                     "Show other projects"
+                </button>
+                <button
+                    class=move || if hide_finished.get() { "filter-toggle active" } else { "filter-toggle" }
+                    data-test="agents-panel-hide-finished"
+                    on:click=toggle_hide_finished
+                >
+                    "Hide finished"
                 </button>
             </div>
             <div class="panel-content">

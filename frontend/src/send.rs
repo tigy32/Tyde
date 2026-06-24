@@ -3,16 +3,16 @@ use std::collections::HashMap;
 
 use protocol::types::{AgentCompactPayload, TeamCompactPayload};
 use protocol::{
-    CancelWorkflowPayload, CloseAgentPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
-    CustomAgentUpsertPayload, Envelope, FrameKind, ImageData, McpServerConfig,
-    McpServerDeletePayload, McpServerId, McpServerUpsertPayload, MobileDeviceId,
-    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferId,
-    MobilePairingStartPayload, ProjectId, SkillRefreshPayload, Steering, SteeringDeletePayload,
-    SteeringId, SteeringUpsertPayload, StreamPath, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftId, TeamDraftMemberEdit, TeamDraftMemberId,
-    TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload, TeamId,
-    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
+    AgentsViewPreferencesUpdate, CancelWorkflowPayload, CloseAgentPayload, CustomAgent,
+    CustomAgentDeletePayload, CustomAgentId, CustomAgentUpsertPayload, Envelope, FrameKind,
+    ImageData, McpServerConfig, McpServerDeletePayload, McpServerId, McpServerUpsertPayload,
+    MobileDeviceId, MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferId,
+    MobilePairingStartPayload, ProjectId, SetAgentsViewPreferencesPayload, SkillRefreshPayload,
+    Steering, SteeringDeletePayload, SteeringId, SteeringUpsertPayload, StreamPath,
+    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftId, TeamDraftMemberEdit,
+    TeamDraftMemberId, TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload,
+    TeamId, TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
     TeamMemberDeletePayload, TeamMemberId, TeamMemberShufflePayload, TeamMemberUpdatePayload,
     TeamSetManagerPayload, TeamTemplateId, TriggerWorkflowPayload, WorkflowId,
     WorkflowRefreshPayload, WorkflowRunId,
@@ -82,6 +82,24 @@ pub async fn send_frame<T: Serialize>(
             Err(e)
         }
     }
+}
+
+/// Send an Agents-view preference mutation to the primary local host. The
+/// server persists it and fans out a full `AgentsViewPreferencesNotify`
+/// snapshot, which reconciles the optimistic overlay installed by the caller.
+/// Routed on the host stream like settings/project mutations.
+pub async fn set_agents_view_preferences(
+    host_id: &str,
+    host_stream: StreamPath,
+    update: AgentsViewPreferencesUpdate,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::SetAgentsViewPreferences,
+        &SetAgentsViewPreferencesPayload { update },
+    )
+    .await
 }
 
 pub async fn close_agent(host_id: &str, agent_stream: StreamPath) -> Result<(), String> {

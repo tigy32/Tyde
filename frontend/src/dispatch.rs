@@ -5,8 +5,8 @@ use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId,
-    AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload,
-    BrowseBootstrapListing, BrowseBootstrapPayload, ByteRange, ChatEvent,
+    AgentOrigin, AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
+    BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ByteRange, ChatEvent,
     CodeIntelDiagnosticsPayload, CodeIntelErrorContext, CodeIntelErrorPayload,
     CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelLocation,
     CodeIntelNavigateResultPayload, CodeIntelReferenceLine, CodeIntelReferencesCompletePayload,
@@ -600,6 +600,25 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse host_settings payload: {error}"),
             ),
         },
+        FrameKind::AgentsViewPreferencesNotify => {
+            match envelope.parse_payload::<AgentsViewPreferencesNotifyPayload>() {
+                Ok(payload) => {
+                    log::info!(
+                        "dispatch agents_view_preferences_notify host={} load_error={}",
+                        host_id,
+                        payload.snapshot.load_error.is_some()
+                    );
+                    state.apply_agents_view_snapshot(host_id, payload.snapshot);
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse agents_view_preferences_notify payload: {error}"),
+                ),
+            }
+        }
         FrameKind::MobileAccessState => {
             match envelope.parse_payload::<MobileAccessStatePayload>() {
                 Ok(payload) => apply_mobile_access_state(state, host_id, payload),
@@ -4042,6 +4061,11 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
     state.host_settings_by_host.update(|map| {
         map.insert(host_id.to_string(), payload.settings);
     });
+    // Only the primary local host emits `Some` Agents-view preferences. Remote
+    // hosts send `None` and must not clobber the client-global snapshot.
+    if let Some(snapshot) = payload.agents_view_preferences {
+        state.apply_agents_view_snapshot(host_id, snapshot);
+    }
     // Route mobile access through the shared reconciler so a stale
     // pairing offer from a previous connection is dropped when the
     // bootstrap's pairing state no longer matches.
