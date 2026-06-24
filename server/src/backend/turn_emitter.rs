@@ -877,6 +877,7 @@ mod tests {
                 workflow_diagnostics: vec![],
                 workflow_runs: vec![],
                 workflow_locations: vec![],
+                agents_view_preferences: None,
             },
         )
         .expect("serialize HostBootstrap");

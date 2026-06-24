@@ -20,7 +20,10 @@ pub fn run() -> Result<(), String> {
             server::store::session::SessionStore::default_path()?,
             server::store::project::ProjectStore::default_path()?,
             server::store::settings::HostSettingsStore::default_path()?,
-            server::HostRuntimeConfig::default(),
+            server::HostRuntimeConfig {
+                agents_view_preferences_primary: false,
+                ..server::HostRuntimeConfig::default()
+            },
         )?;
 
         let transport = StdioTransport::new();

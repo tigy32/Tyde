@@ -5,15 +5,16 @@ pub mod validator;
 
 #[cfg(feature = "framing")]
 pub use framing::{FrameError, read_envelope, write_envelope};
-// Re-exported from host-config via types.rs; the bundle-key type for the
-// web/PWA client (see WelcomePayload::release_version).
-pub use types::TydeReleaseVersion;
 pub use types::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentControlAgentRef,
     AgentControlProgress, AgentControlProgressKind, AgentControlStatus, AgentErrorCode,
-    AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
-    AgentWorkflowMetadata, AskUserQuestion, AskUserQuestionOption, BackendAccessMode, BackendKind,
-    BackendSetupAction, BackendSetupCommand, BackendSetupInfo, BackendSetupPayload,
+    AgentErrorPayload, AgentGroupMode, AgentId, AgentInput, AgentListDensity, AgentOrderKey,
+    AgentOrigin, AgentProjectFilter, AgentRenamedPayload, AgentSortMode, AgentStartPayload,
+    AgentStatusFilter, AgentWorkflowMetadata, AgentsViewFilters, AgentsViewPreferences,
+    AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesSnapshot,
+    AgentsViewPreferencesStoreError, AgentsViewPreferencesStoreErrorKind,
+    AgentsViewPreferencesUpdate, AskUserQuestion, AskUserQuestionOption, BackendAccessMode,
+    BackendKind, BackendSetupAction, BackendSetupCommand, BackendSetupInfo, BackendSetupPayload,
     BackendSetupStatus, BackendTierConfig, BrokerUrl, BrowseBootstrapListing,
     BrowseBootstrapPayload, ByteRange, CancelQueuedMessagePayload, CancelWorkflowPayload,
     ChatEvent, ChatMessage, ChatMessageId, ClientErrorCode, ClientErrorPayload, CloseAgentPayload,
@@ -33,9 +34,9 @@ pub use types::{
     FileInfo, FrameKind, GitBranchName, HelloPayload, HostAbsPath, HostBootstrapPayload,
     HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseEntry, HostBrowseEntryError,
     HostBrowseErrorCode, HostBrowseErrorPayload, HostBrowseInitial, HostBrowseListPayload,
-    HostBrowseOpenedPayload, HostBrowseStartPayload, HostPlatform, HostSettingValue, HostSettings,
-    HostSettingsPayload, ImageData, InterruptPayload, ListSessionsPayload, LoadAgentPayload,
-    McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
+    HostBrowseOpenedPayload, HostBrowseStartPayload, HostFilterId, HostPlatform, HostSettingValue,
+    HostSettings, HostSettingsPayload, ImageData, InterruptPayload, ListSessionsPayload,
+    LoadAgentPayload, McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
     McpServerUpsertPayload, McpTransportConfig, MessageMetadataUpdateData, MessageOrigin,
     MessageSender, MobileAccessErrorCode, MobileAccessStatePayload, MobileBrokerStatus,
     MobileDeviceId, MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobileDeviceState,
@@ -65,13 +66,13 @@ pub use types::{
     SendMessageToolResponse, SendQueuedMessageNowPayload, SeqMismatch, SeqValidator, SessionId,
     SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingField,
     SessionSettingFieldType, SessionSettingValue, SessionSettingsPayload, SessionSettingsSchema,
-    SessionSettingsValues, SessionSummary, SetAgentNamePayload, SetSessionSettingsPayload,
-    SetSettingPayload, Skill, SkillId, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams,
-    SpawnAgentPayload, SpawnCostHint, Steering, SteeringDeletePayload, SteeringId,
-    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamEndData, StreamPath,
-    StreamStartData, StreamTextDeltaData, SubAgentProgress, TYDE_VERSION, Task, TaskList,
-    TaskStatus, Team, TeamCompactNotifyPayload, TeamCompactPayload, TeamCompactStatus,
-    TeamCreateFromDraftPayload, TeamCreatePayload, TeamDeletePayload, TeamDraft,
+    SessionSettingsValues, SessionSummary, SetAgentNamePayload, SetAgentsViewPreferencesPayload,
+    SetSessionSettingsPayload, SetSettingPayload, Skill, SkillId, SkillNotifyPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Steering,
+    SteeringDeletePayload, SteeringId, SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload,
+    StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, SubAgentProgress,
+    TYDE_VERSION, Task, TaskList, TaskStatus, Team, TeamCompactNotifyPayload, TeamCompactPayload,
+    TeamCompactStatus, TeamCreateFromDraftPayload, TeamCreatePayload, TeamDeletePayload, TeamDraft,
     TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
     TeamDraftDiscardPayload, TeamDraftId, TeamDraftMember, TeamDraftMemberEdit, TeamDraftMemberId,
     TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload,
@@ -98,4 +99,7 @@ pub use types::{
     WorkflowSourceScope, WorkflowStepRunId, WorkflowStepRunSnapshot, WorkflowStepRunSnapshotStatus,
     WorkflowSummary, WorkflowTargetDirectory, WorkflowTargetsResponse,
 };
+// Re-exported from host-config via types.rs; the bundle-key type for the
+// web/PWA client (see WelcomePayload::release_version).
+pub use types::{LOCAL_HOST_ID, TydeReleaseVersion};
 pub use validator::{ObservedFrame, ProtocolValidator, ProtocolViolation};

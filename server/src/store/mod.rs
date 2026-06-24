@@ -1,4 +1,5 @@
 pub mod agent_teams;
+pub mod agents_view_preferences;
 pub mod custom_agents;
 pub mod mcp_servers;
 pub mod mobile_pairings;

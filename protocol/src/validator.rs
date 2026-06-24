@@ -7,10 +7,10 @@ use crate::types::{
     ReviewBootstrapPayload, TeamCompactNotifyPayload, TeamCompactPayload, TerminalBootstrapPayload,
 };
 use crate::{
-    AgentClosedPayload, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload,
-    CancelWorkflowPayload, ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload,
-    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
+    AgentClosedPayload, AgentOrigin, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
+    BackendKind, BackendSetupPayload, CancelWorkflowPayload, ChatEvent, ChatMessage, ChatMessageId,
+    ClientErrorPayload, CodeIntelDiagnosticsPayload, CodeIntelErrorPayload,
+    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
     CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
     CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
     CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind, HostBootstrapPayload,
@@ -24,15 +24,16 @@ use crate::{
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
     ProjectSearchCompletePayload, ProjectSearchResultsPayload, ReviewEventPayload,
-    RunBackendSetupPayload, SessionListPayload, SessionSchemasPayload, SetSettingPayload,
-    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringNotifyPayload, SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
-    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
-    TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload,
-    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    RunBackendSetupPayload, SessionListPayload, SessionSchemasPayload,
+    SetAgentsViewPreferencesPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
+    StreamPath, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
+    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
+    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload, WelcomePayload,
     WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
@@ -249,6 +250,13 @@ impl ProtocolValidator {
             FrameKind::HostSettings => {
                 parse_host_payload::<HostSettingsPayload>(self, envelope, "HostSettings")
             }
+            FrameKind::AgentsViewPreferencesNotify => {
+                parse_host_payload::<AgentsViewPreferencesNotifyPayload>(
+                    self,
+                    envelope,
+                    "AgentsViewPreferencesNotify",
+                )
+            }
             FrameKind::MobileAccessState => {
                 parse_host_payload::<MobileAccessStatePayload>(self, envelope, "MobileAccessState")
             }
@@ -319,6 +327,11 @@ impl ProtocolValidator {
             FrameKind::SetSetting => {
                 parse_host_payload::<SetSettingPayload>(self, envelope, "SetSetting")
             }
+            FrameKind::SetAgentsViewPreferences => parse_host_payload::<
+                SetAgentsViewPreferencesPayload,
+            >(
+                self, envelope, "SetAgentsViewPreferences"
+            ),
             FrameKind::MobilePairingStart => parse_host_payload::<MobilePairingStartPayload>(
                 self,
                 envelope,
@@ -1682,6 +1695,7 @@ mod tests {
                 workflow_diagnostics: vec![],
                 workflow_runs: vec![],
                 workflow_locations: vec![],
+                agents_view_preferences: None,
             },
         )
         .expect("serialize HostBootstrap")

@@ -11,9 +11,9 @@ use serde_json::Value;
 /// bundle key for the web/PWA client. Single source of truth lives in
 /// `host-config`; re-exported here so wire payloads and downstream crates use
 /// `protocol::TydeReleaseVersion`.
-pub use host_config::TydeReleaseVersion;
+pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -486,6 +486,7 @@ pub enum FrameKind {
 
     // Input events (client -> server)
     SetSetting,
+    SetAgentsViewPreferences,
     SpawnAgent,
     LoadAgent,
     ListSessions,
@@ -573,6 +574,7 @@ pub enum FrameKind {
     BrowseBootstrap,
     TerminalBootstrap,
     HostSettings,
+    AgentsViewPreferencesNotify,
     BackendSetup,
     NewAgent,
     AgentStart,
@@ -639,6 +641,7 @@ impl fmt::Display for FrameKind {
             Self::Welcome => f.write_str("welcome"),
             Self::Reject => f.write_str("reject"),
             Self::SetSetting => f.write_str("set_setting"),
+            Self::SetAgentsViewPreferences => f.write_str("set_agents_view_preferences"),
             Self::SpawnAgent => f.write_str("spawn_agent"),
             Self::LoadAgent => f.write_str("load_agent"),
             Self::ListSessions => f.write_str("list_sessions"),
@@ -722,6 +725,7 @@ impl fmt::Display for FrameKind {
             Self::BrowseBootstrap => f.write_str("browse_bootstrap"),
             Self::TerminalBootstrap => f.write_str("terminal_bootstrap"),
             Self::HostSettings => f.write_str("host_settings"),
+            Self::AgentsViewPreferencesNotify => f.write_str("agents_view_preferences_notify"),
             Self::BackendSetup => f.write_str("backend_setup"),
             Self::NewAgent => f.write_str("new_agent"),
             Self::AgentStart => f.write_str("agent_start"),
@@ -1098,6 +1102,149 @@ pub struct HostBootstrapPayload {
     pub workflow_runs: Vec<WorkflowRunSnapshot>,
     #[serde(default)]
     pub workflow_locations: Vec<WorkflowCatalogLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents_view_preferences: Option<AgentsViewPreferencesSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HostFilterId(pub String);
+
+impl fmt::Display for HostFilterId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentsViewPreferences {
+    pub filters: AgentsViewFilters,
+    #[serde(default)]
+    pub sort_mode: AgentSortMode,
+    #[serde(default)]
+    pub group_mode: AgentGroupMode,
+    #[serde(default)]
+    pub density: AgentListDensity,
+    #[serde(default)]
+    pub hide_finished: bool,
+    #[serde(default)]
+    pub manual_order: Vec<AgentOrderKey>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentsViewFilters {
+    #[serde(default)]
+    pub host_ids: Vec<HostFilterId>,
+    #[serde(default)]
+    pub project_ids: Vec<AgentProjectFilter>,
+    #[serde(default)]
+    pub statuses: Vec<AgentStatusFilter>,
+    #[serde(default)]
+    pub backends: Vec<BackendKind>,
+    #[serde(default)]
+    pub origins: Vec<AgentOrigin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AgentProjectFilter {
+    pub host_id: HostFilterId,
+    pub project_id: ProjectId,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSortMode {
+    #[default]
+    ManualThenActivity,
+    NewestFirst,
+    OldestFirst,
+    NameAsc,
+    Status,
+    Backend,
+    Project,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentGroupMode {
+    #[default]
+    Flat,
+    Status,
+    Backend,
+    Project,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentListDensity {
+    #[default]
+    Comfortable,
+    Compact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatusFilter {
+    Initializing,
+    Thinking,
+    Compacting,
+    Idle,
+    Terminated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentOrderKey {
+    Session {
+        session_id: SessionId,
+    },
+    TransientAgent {
+        host_id: HostFilterId,
+        agent_id: AgentId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentsViewPreferencesUpdate {
+    SetFilters { filters: AgentsViewFilters },
+    SetSortMode { sort_mode: AgentSortMode },
+    SetGroupMode { group_mode: AgentGroupMode },
+    SetDensity { density: AgentListDensity },
+    SetHideFinished { hide_finished: bool },
+    SetManualOrder { manual_order: Vec<AgentOrderKey> },
+    Reset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetAgentsViewPreferencesPayload {
+    pub update: AgentsViewPreferencesUpdate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentsViewPreferencesStoreErrorKind {
+    Corrupt,
+    UnsupportedVersion,
+    Io,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentsViewPreferencesStoreError {
+    pub kind: AgentsViewPreferencesStoreErrorKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentsViewPreferencesSnapshot {
+    pub preferences: AgentsViewPreferences,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<AgentsViewPreferencesStoreError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentsViewPreferencesNotifyPayload {
+    pub snapshot: AgentsViewPreferencesSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4332,8 +4479,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_fourteen() {
-        assert_eq!(PROTOCOL_VERSION, 14);
+    fn protocol_version_is_fifteen() {
+        assert_eq!(PROTOCOL_VERSION, 15);
     }
 
     #[test]

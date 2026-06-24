@@ -12,26 +12,29 @@ use protocol::types::{
     TeamCompactNotifyPayload, TeamCompactPayload, TeamCompactStatus,
 };
 use protocol::{
-    AgentControlStatus, AgentId, AgentInput, AgentOrigin, AgentStartPayload, AgentWorkflowMetadata,
-    BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, CancelWorkflowPayload,
-    CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
-    CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
+    AgentControlStatus, AgentId, AgentInput, AgentOrderKey, AgentOrigin, AgentStartPayload,
+    AgentWorkflowMetadata, AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesSnapshot,
+    AgentsViewPreferencesUpdate, BackendSetupPayload, BrowseBootstrapListing,
+    BrowseBootstrapPayload, CancelWorkflowPayload, CodeIntelCancelReferencesPayload,
+    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
+    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, GitBranchName, HostAbsPath,
     HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
-    HostSettingsPayload, ImageData, McpServerConfig, McpServerDeletePayload, McpServerId,
-    McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
-    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
-    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
-    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
-    ProjectSearchCancelPayload, ProjectSearchCompletePayload, ProjectSearchFileResult,
-    ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
-    ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
-    ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
-    SessionId, SessionListPayload, SessionSchemaEntry, SessionSchemasPayload,
-    SessionSettingsSchema, SessionSummary, SetSettingPayload, Skill, SkillNotifyPayload,
+    HostSettingsPayload, ImageData, LOCAL_HOST_ID, McpServerConfig, McpServerDeletePayload,
+    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig,
+    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
+    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload,
+    ProjectGitCommitResultPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
+    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectRootPath, ProjectSearchCancelPayload,
+    ProjectSearchCompletePayload, ProjectSearchFileResult, ProjectSearchPayload,
+    ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection,
+    ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload, SessionId,
+    SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema,
+    SessionSummary, SetAgentsViewPreferencesPayload, SetSettingPayload, Skill, SkillNotifyPayload,
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
     SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TeamCreatePayload,
     TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
@@ -96,6 +99,7 @@ use crate::review::{
 };
 use crate::review_mcp::{REVIEW_FEEDBACK_MCP_SERVER_NAME, ReviewMcpHandle};
 use crate::store::agent_teams::{AgentTeamValidationRefs, AgentTeamsStore};
+use crate::store::agents_view_preferences::AgentsViewPreferencesStore;
 use crate::store::custom_agents::CustomAgentStore;
 use crate::store::mcp_servers::{McpServerStore, RESERVED_MCP_SERVER_NAMES};
 use crate::store::mobile_pairings::MobilePairingsStore;
@@ -140,7 +144,7 @@ pub(crate) enum AgentReplayMode {
     Lazy,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct HostRuntimeConfig {
     pub debug_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
@@ -156,6 +160,22 @@ pub struct HostRuntimeConfig {
     /// `collect_backend_setup` returns an empty stub instantly. Defaults to
     /// `false` so production startup is unaffected.
     pub skip_real_backend_probe: bool,
+    pub agents_view_preferences_primary: bool,
+}
+
+impl Default for HostRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            debug_mcp_bind_addr: None,
+            agent_control_mcp_bind_addr: None,
+            review_mcp_bind_addr: None,
+            workflow_mcp_bind_addr: None,
+            kiro_probe_program: None,
+            mobile_pairing_ttl: None,
+            skip_real_backend_probe: false,
+            agents_view_preferences_primary: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +243,7 @@ pub(crate) struct HostState {
     pub team_registry: TeamRegistryHandle,
     pub project_store: Arc<Mutex<ProjectStore>>,
     pub settings_store: Arc<Mutex<HostSettingsStore>>,
+    pub agents_view_preferences_store: Option<Arc<Mutex<AgentsViewPreferencesStore>>>,
     pub session_store: Arc<Mutex<SessionStore>>,
     pub custom_agent_store: Arc<Mutex<CustomAgentStore>>,
     pub mcp_server_store: Arc<Mutex<McpServerStore>>,
@@ -389,6 +410,7 @@ struct HostStorePaths {
     agent_team: PathBuf,
     review: PathBuf,
     settings: PathBuf,
+    agents_view_preferences: PathBuf,
     custom_agent: PathBuf,
     mcp_server: PathBuf,
     steering: PathBuf,
@@ -643,6 +665,10 @@ impl HostHandle {
         let workflow_diagnostics = state.workflow_catalog.diagnostics();
         let workflow_runs = state.workflow_run_store.list();
         let workflow_locations = state.workflow_locations.clone();
+        let agents_view_preferences = match state.agents_view_preferences_store.as_ref() {
+            Some(store) => Some(store.lock().await.snapshot()),
+            None => None,
+        };
 
         let agent_ids = state.registry.agent_ids();
         let mut agents = Vec::new();
@@ -715,6 +741,7 @@ impl HostHandle {
             workflow_diagnostics,
             workflow_runs,
             workflow_locations,
+            agents_view_preferences,
         };
 
         let payload = serde_json::to_value(&bootstrap)
@@ -4385,6 +4412,109 @@ impl HostHandle {
         Ok(())
     }
 
+    pub(crate) async fn set_agents_view_preferences(
+        &self,
+        payload: SetAgentsViewPreferencesPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "set_agents_view_preferences";
+        let mut state = self.state.lock().await;
+        let Some(store) = state.agents_view_preferences_store.clone() else {
+            return Err(AppError::invalid(
+                OPERATION,
+                "agents view preferences are owned by the primary local host",
+            ));
+        };
+        let update = Self::canonicalize_agents_view_preferences_update(&state, payload.update)
+            .map_err(|error| AppError::invalid(OPERATION, error))?;
+        let snapshot = store
+            .lock()
+            .await
+            .apply(update)
+            .map_err(|error| AppError::invalid(OPERATION, error))?;
+        fan_out_agents_view_preferences(&mut state, snapshot).await;
+        Ok(())
+    }
+
+    fn canonicalize_agents_view_preferences_update(
+        state: &HostState,
+        update: AgentsViewPreferencesUpdate,
+    ) -> Result<AgentsViewPreferencesUpdate, String> {
+        match update {
+            AgentsViewPreferencesUpdate::SetManualOrder { manual_order } => {
+                Ok(AgentsViewPreferencesUpdate::SetManualOrder {
+                    manual_order: Self::canonicalize_agent_manual_order(state, manual_order)?,
+                })
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn canonicalize_agent_manual_order(
+        state: &HostState,
+        manual_order: Vec<AgentOrderKey>,
+    ) -> Result<Vec<AgentOrderKey>, String> {
+        let mut live_sessions = HashMap::<AgentId, Option<SessionId>>::new();
+        for agent_id in state.registry.agent_ids() {
+            let session_id = state.agent_sessions.get(&agent_id).cloned().or_else(|| {
+                state
+                    .registry
+                    .agent_handle(&agent_id)
+                    .and_then(|agent| agent.snapshot().session_id)
+            });
+            live_sessions.insert(agent_id, session_id);
+        }
+
+        let mut seen = HashSet::new();
+        let mut canonical = Vec::new();
+        for key in manual_order {
+            let key = match key {
+                AgentOrderKey::Session { session_id } => {
+                    Self::ensure_non_empty_agent_order_field(
+                        "manual_order.session_id",
+                        session_id.0.as_str(),
+                    )?;
+                    AgentOrderKey::Session { session_id }
+                }
+                AgentOrderKey::TransientAgent { host_id, agent_id } => {
+                    Self::ensure_non_empty_agent_order_field(
+                        "manual_order.host_id",
+                        host_id.0.as_str(),
+                    )?;
+                    Self::ensure_non_empty_agent_order_field(
+                        "manual_order.agent_id",
+                        agent_id.0.as_str(),
+                    )?;
+                    if host_id.0 != LOCAL_HOST_ID {
+                        // The primary-local preferences store cannot verify or
+                        // rewrite remote live-agent ids; only session-keyed
+                        // order is durable across host boundaries.
+                        continue;
+                    }
+                    let Some(session_id) = live_sessions.get(&agent_id) else {
+                        continue;
+                    };
+                    match session_id {
+                        Some(session_id) => AgentOrderKey::Session {
+                            session_id: session_id.clone(),
+                        },
+                        None => AgentOrderKey::TransientAgent { host_id, agent_id },
+                    }
+                }
+            };
+            if seen.insert(key.clone()) {
+                canonical.push(key);
+            }
+        }
+        Ok(canonical)
+    }
+
+    fn ensure_non_empty_agent_order_field(field: &str, value: &str) -> Result<(), String> {
+        if value.trim().is_empty() {
+            return Err(format!("{field} must not be empty"));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn start_mobile_pairing(&self, requester: StreamPath) -> AppResult<()> {
         let mobile_access = self.state.lock().await.mobile_access.clone();
         mobile_access.start_pairing(requester)
@@ -8012,6 +8142,10 @@ pub fn spawn_host() -> HostHandle {
         .unwrap_or_else(|err| panic!("failed to resolve default review store path: {err}"));
     let settings_path = HostSettingsStore::default_path()
         .unwrap_or_else(|err| panic!("failed to resolve default settings store path: {err}"));
+    let agents_view_preferences_path =
+        AgentsViewPreferencesStore::default_path().unwrap_or_else(|err| {
+            panic!("failed to resolve default agents view preferences store path: {err}")
+        });
     let custom_agent_path = CustomAgentStore::default_path()
         .unwrap_or_else(|err| panic!("failed to resolve default custom agent store path: {err}"));
     let mcp_server_path = McpServerStore::default_path()
@@ -8032,6 +8166,7 @@ pub fn spawn_host() -> HostHandle {
             agent_team: agent_team_path,
             review: review_path,
             settings: settings_path,
+            agents_view_preferences: agents_view_preferences_path,
             custom_agent: custom_agent_path,
             mcp_server: mcp_server_path,
             steering: steering_path,
@@ -8098,6 +8233,7 @@ pub fn spawn_host_with_store_paths_and_runtime_config(
             agent_team: parent.join("agent_teams.json"),
             review: parent.join("reviews.json"),
             settings: settings_path,
+            agents_view_preferences: parent.join("agents_view_preferences.json"),
             custom_agent: parent.join("custom_agents.json"),
             mcp_server: parent.join("mcp_servers.json"),
             steering: parent.join("steering.json"),
@@ -8155,6 +8291,7 @@ pub fn spawn_host_with_mock_backend_and_runtime_config(
             agent_team: parent.join("agent_teams.json"),
             review: parent.join("reviews.json"),
             settings: settings_path,
+            agents_view_preferences: parent.join("agents_view_preferences.json"),
             custom_agent: parent.join("custom_agents.json"),
             mcp_server: parent.join("mcp_servers.json"),
             steering: parent.join("steering.json"),
@@ -8183,6 +8320,9 @@ fn spawn_host_inner(
     let workflow_run_store = WorkflowRunStore::load(paths.workflow_runs)?;
     let review_store = ReviewStore::load(paths.review)?;
     let settings_store = HostSettingsStore::load(paths.settings)?;
+    let agents_view_preferences_store = runtime_config
+        .agents_view_preferences_primary
+        .then(|| AgentsViewPreferencesStore::load(paths.agents_view_preferences));
     let host_settings = settings_store.get()?;
     let initial_mobile_settings = host_settings.clone();
     let mobile_pairings_store = MobilePairingsStore::load(paths.mobile_pairings)?;
@@ -8254,6 +8394,8 @@ fn spawn_host_inner(
             team_registry: TeamRegistryHandle::spawn(team_store),
             project_store,
             settings_store: Arc::new(Mutex::new(settings_store)),
+            agents_view_preferences_store: agents_view_preferences_store
+                .map(|store| Arc::new(Mutex::new(store))),
             session_store: Arc::new(Mutex::new(session_store)),
             custom_agent_store: Arc::new(Mutex::new(custom_agent_store)),
             mcp_server_store: Arc::new(Mutex::new(mcp_server_store)),
@@ -9469,6 +9611,31 @@ async fn fan_out_host_settings(state: &mut HostState, settings: protocol::HostSe
     }
 }
 
+async fn fan_out_agents_view_preferences(
+    state: &mut HostState,
+    snapshot: AgentsViewPreferencesSnapshot,
+) {
+    let payload = AgentsViewPreferencesNotifyPayload { snapshot };
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_agents_view_preferences_for_subscriber(&payload, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
 async fn fan_out_session_schemas(state: &mut HostState) {
     let enabled_backends = state
         .settings_store
@@ -9661,6 +9828,17 @@ async fn emit_host_settings_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::HostSettings, payload)
+}
+
+async fn emit_agents_view_preferences_for_subscriber(
+    payload: &AgentsViewPreferencesNotifyPayload,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(payload)
+        .expect("failed to serialize AgentsViewPreferencesNotify payload for host stream fanout");
+    subscriber
+        .stream
+        .send_value(FrameKind::AgentsViewPreferencesNotify, payload)
 }
 
 async fn emit_backend_setup_for_subscriber(
