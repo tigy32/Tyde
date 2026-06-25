@@ -6578,6 +6578,13 @@ kbd {
     background: var(--text-tertiary, #8b949e);
 }
 
+/* Cmd/Ctrl-hover go-to-definition affordance. The span is emitted only for the
+ * single navigable occurrence under the cursor while the modifier is held. */
+.code-intel-cmd-link {
+    cursor: pointer;
+    box-shadow: inset 0 -1px 0 var(--accent-primary);
+}
+
 /* ===== Code-intel hover popover (M2) ===== */
 .code-intel-hover-popover {
     z-index: 1000;

@@ -58,7 +58,12 @@ pub fn HoverPopover() -> impl IntoView {
                 };
 
             Some(view! {
-                <div class="code-intel-hover-popover" style=style inner_html=html></div>
+                <div
+                    class="code-intel-hover-popover"
+                    data-code-intel-hover-popover="true"
+                    style=style
+                    inner_html=html
+                ></div>
             })
         })
     }

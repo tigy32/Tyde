@@ -459,14 +459,10 @@ fn try_local_definition_jump(
         if file.rendered_version != Some(version) {
             return None;
         }
-        let model = file.applied()?.model.as_ref()?;
-        let occurrence = model
-            .occurrences
-            .iter()
-            .find(|occ| occ.range.start <= offset && offset < occ.range.end)?;
         // Multiple targets (overloads / trait impls) take the first for now,
         // matching the M2 on-demand result handling.
-        occurrence.definition.first().cloned()
+        file.resolved_definition_at(version, offset)
+            .map(|(_, location)| location)
     });
     match target {
         Some(location) => {

@@ -7,10 +7,10 @@ use protocol::FrameKind;
 use protocol::{
     AgentActivitySummaryState, AgentGroupMode, AgentId, AgentListDensity, AgentOrderKey,
     AgentOrigin, AgentSortMode, AgentWorkflowMetadata, AgentsViewFilters, AgentsViewPreferences,
-    AgentsViewPreferencesSnapshot, BackendKind, BackendSetupInfo, ChatMessage, ChatMessageId,
-    CodeIntelDiagnostic, CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelLocation,
-    CodeIntelOccurrence, CodeIntelReferencesFileResult, CodeIntelStatusPayload, CustomAgent,
-    CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry,
+    AgentsViewPreferencesSnapshot, BackendKind, BackendSetupInfo, ByteRange, ChatMessage,
+    ChatMessageId, CodeIntelDiagnostic, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelLocation, CodeIntelOccurrence, CodeIntelReferencesFileResult, CodeIntelStatusPayload,
+    CustomAgent, CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry,
     HostBrowseErrorPayload, HostPlatform, HostSettings, McpServerConfig, McpServerId,
     MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload, Project,
     ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId,
@@ -685,6 +685,32 @@ impl CodeIntelFileState {
     pub fn applied(&self) -> Option<&CodeIntelData> {
         self.by_version.get(&self.rendered_version?)
     }
+
+    pub fn resolved_definition_at(
+        &self,
+        version: ProjectFileVersion,
+        offset: u32,
+    ) -> Option<(ByteRange, CodeIntelLocation)> {
+        if self.rendered_version != Some(version) {
+            return None;
+        }
+        let model = self.applied()?.model.as_ref()?;
+        let occurrence = model
+            .occurrences
+            .iter()
+            .find(|occ| occ.range.start <= offset && offset < occ.range.end)?;
+        let location = occurrence.definition.first()?.clone();
+        Some((occurrence.range, location))
+    }
+
+    pub fn navigable_range_at(
+        &self,
+        version: ProjectFileVersion,
+        offset: u32,
+    ) -> Option<ByteRange> {
+        self.resolved_definition_at(version, offset)
+            .map(|(range, _)| range)
+    }
 }
 
 /// Context for the most recent on-demand go-to-definition request (M2), stored
@@ -1310,6 +1336,9 @@ pub struct AppState {
     /// The current hover popover, or `None` when nothing is hovered. The
     /// `HoverPopover` component renders from this signal (no `window.*`).
     pub code_intel_hover: RwSignal<Option<HoverPopover>>,
+    /// True while the go-to-definition modifier is held. Mirrors the existing
+    /// Cmd/Ctrl-click convention and is cleared on blur/visibility changes.
+    pub cmd_held: RwSignal<bool>,
     /// The file (and rendered version) the user most recently interacted with in
     /// a file view, so the F12 keybinding (which has no file context of its own)
     /// can navigate from the current caret in that file.
@@ -1624,6 +1653,7 @@ impl AppState {
             code_intel_navigate_ctx: RwSignal::new(None),
             code_intel_active_hover: RwSignal::new(0),
             code_intel_hover: RwSignal::new(None),
+            cmd_held: RwSignal::new(false),
             code_intel_focus: RwSignal::new(None),
             host_settings_by_host: RwSignal::new(HashMap::new()),
             backend_setup_by_host: RwSignal::new(HashMap::new()),

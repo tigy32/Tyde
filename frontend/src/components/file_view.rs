@@ -12,7 +12,7 @@ use crate::state::{AppState, CodeIntelKey, TabContent, TabId, TabScrollState};
 use crate::syntax_highlight::{LineHighlighter, LineTokens, color_to_css, syntax_for_path};
 
 use protocol::{
-    CodeIntelDiagnostic, CodeIntelErrorPayload, CodeIntelSeverity, CodeIntelState,
+    ByteRange, CodeIntelDiagnostic, CodeIntelErrorPayload, CodeIntelSeverity, CodeIntelState,
     ProjectFileVersion, ProjectPath,
 };
 
@@ -570,9 +570,11 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
     // can cancel a pending request, not just the popover.
     let hover_timer: TimeoutClosureSlot = StoredValue::new_local(None);
     on_cleanup(move || clear_timeout_timer(hover_timer));
+    let hovered_offset: RwSignal<Option<u32>> = RwSignal::new(None);
 
     let state_for_scroll = state.clone();
     let scroll_hover_timer = hover_timer;
+    let scroll_hovered_offset = hovered_offset;
     let on_scroll = move |_: web_sys::Event| {
         if let Some(el) = pre_ref.get_untracked() {
             scroll_top.set(el.scroll_top() as f64);
@@ -582,6 +584,7 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
         // A scroll moves the hovered span: cancel a pending hover and dismiss
         // (superseding the hover id so a late result is dropped).
         clear_timeout_timer(scroll_hover_timer);
+        scroll_hovered_offset.set(None);
         crate::actions::dismiss_hover(&state_for_scroll);
     };
 
@@ -622,6 +625,7 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
     let hover_path = f.path.clone();
     let hover_version = f.version;
     let move_hover_timer = hover_timer;
+    let move_hovered_offset = hovered_offset;
     let on_content_mousemove = move |ev: web_sys::MouseEvent| {
         let Some(window) = web_sys::window() else {
             return;
@@ -629,6 +633,9 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
         clear_timeout_timer(move_hover_timer);
         let client_x = ev.client_x() as f64;
         let client_y = ev.client_y() as f64;
+        move_hovered_offset.set(
+            hover_target_at_point(&lines_for_hover, client_x, client_y).map(|target| target.offset),
+        );
         let lines = lines_for_hover.clone();
         let state = state_for_hover.clone();
         let path = hover_path.clone();
@@ -649,8 +656,10 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
 
     let state_for_leave = state.clone();
     let leave_hover_timer = hover_timer;
+    let leave_hovered_offset = hovered_offset;
     let on_content_mouseleave = move |_: web_sys::MouseEvent| {
         clear_timeout_timer(leave_hover_timer);
+        leave_hovered_offset.set(None);
         crate::actions::dismiss_hover(&state_for_leave);
     };
 
@@ -725,34 +734,52 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
         });
     }
 
-    // Per-line diagnostic decorations derived from the code-intel signal. Kept
-    // in a `Memo` (not folded into `Token`) so decoration logic stays off the
-    // per-row text path the wasm test guards. Honors the
-    // version-equals-rendered rule: only diagnostics whose `ProjectFileVersion`
-    // matches the rendered file version contribute, so v4 squiggles never paint
-    // over v5 text.
+    let cmd_link_range: Memo<Option<ByteRange>> = {
+        let key = code_intel_key.clone();
+        let version = code_intel_version;
+        let cmd_held = state.cmd_held;
+        Memo::new(move |_| {
+            if !cmd_held.get() {
+                return None;
+            }
+            let offset = hovered_offset.get()?;
+            let key = key.clone()?;
+            code_intel_signal.with(|map| map.get(&key)?.navigable_range_at(version, offset))
+        })
+    };
+
+    // Per-line diagnostic/link decorations derived from the code-intel signal.
+    // Kept in a `Memo` (not folded into `Token`) so decoration logic stays off
+    // the per-row text path the wasm test guards. Honors the
+    // version-equals-rendered rule: only diagnostics and cmd-link ranges from a
+    // `ProjectFileVersion` matching the rendered file version contribute.
     let decorations: Memo<HashMap<usize, LineDecorations>> = {
         let key = code_intel_key.clone();
         let lines = lines.clone();
         let version = code_intel_version;
         Memo::new(move |_| {
-            let Some(key) = key.clone() else {
-                return HashMap::new();
-            };
-            code_intel_signal.with(|map| {
-                let Some(file) = map.get(&key) else {
-                    return HashMap::new();
-                };
-                if file.rendered_version != Some(version) {
-                    return HashMap::new();
-                }
-                match file.applied() {
-                    Some(data) if !data.diagnostics.is_empty() => {
-                        build_line_decorations(&lines, &data.diagnostics)
+            let mut map = if let Some(key) = key.clone() {
+                code_intel_signal.with(|code_intel| {
+                    let Some(file) = code_intel.get(&key) else {
+                        return HashMap::new();
+                    };
+                    if file.rendered_version != Some(version) {
+                        return HashMap::new();
                     }
-                    _ => HashMap::new(),
-                }
-            })
+                    match file.applied() {
+                        Some(data) if !data.diagnostics.is_empty() => {
+                            build_line_decorations(&lines, &data.diagnostics)
+                        }
+                        _ => HashMap::new(),
+                    }
+                })
+            } else {
+                HashMap::new()
+            };
+            if let Some(range) = cmd_link_range.get() {
+                add_cmd_link_decoration(&mut map, &lines, range);
+            }
+            map
         })
     };
 
@@ -1007,7 +1034,7 @@ fn file_line_class_with_diagnostics(
 }
 
 /// Per-line diagnostic decorations: a gutter dot severity and the squiggle
-/// spans (byte ranges relative to the line start).
+/// spans/link spans (byte ranges relative to the line start).
 #[derive(Clone, Debug, Default, PartialEq)]
 struct LineDecorations {
     /// Highest-severity diagnostic touching this line → the gutter dot.
@@ -1015,6 +1042,10 @@ struct LineDecorations {
     /// `(start_byte, end_byte, severity)` spans relative to the line start.
     /// Half-open and non-empty.
     spans: Vec<(u32, u32, CodeIntelSeverity)>,
+    /// Cmd-hover go-to-definition affordance span. At most one symbol is
+    /// highlighted at a time, but this stays a vec so multi-line ranges still
+    /// render without special cases.
+    cmd_links: Vec<(u32, u32)>,
 }
 
 fn severity_rank(severity: CodeIntelSeverity) -> u8 {
@@ -1096,6 +1127,34 @@ fn build_line_decorations(
     map
 }
 
+fn add_cmd_link_decoration(
+    map: &mut HashMap<usize, LineDecorations>,
+    lines: &FileLines,
+    range: ByteRange,
+) {
+    let line_count = lines.len();
+    if line_count == 0 || range.end <= range.start {
+        return;
+    }
+    let start_line = lines.line_for_byte(range.start);
+    let end_line = lines.line_for_byte(range.end.saturating_sub(1));
+    for line_idx in start_line..=end_line {
+        if line_idx >= line_count {
+            break;
+        }
+        let line_start = lines.line_start(line_idx);
+        let line_end = lines.line_content_end(line_idx);
+        let seg_start = range.start.max(line_start);
+        let seg_end = range.end.min(line_end);
+        if seg_end > seg_start {
+            map.entry(line_idx)
+                .or_default()
+                .cmd_links
+                .push((seg_start - line_start, seg_end - line_start));
+        }
+    }
+}
+
 /// The most severe squiggle covering byte position `pos` (relative to the line
 /// start), if any.
 fn squiggle_severity_at(
@@ -1109,6 +1168,10 @@ fn squiggle_severity_at(
         }
     }
     best
+}
+
+fn cmd_link_active_at(pos: u32, spans: &[(u32, u32)]) -> bool {
+    spans.iter().any(|(start, end)| *start <= pos && pos < *end)
 }
 
 /// Render a file line's text inside the row. Emits a `<code>` element so
@@ -1126,9 +1189,13 @@ fn render_file_line_content(
         .as_ref()
         .map(|d| d.spans.as_slice())
         .unwrap_or(&[]);
+    let cmd_links: &[(u32, u32)] = decorations
+        .as_ref()
+        .map(|d| d.cmd_links.as_slice())
+        .unwrap_or(&[]);
     match tokens {
         Some(toks) if !toks.is_empty() => {
-            if squiggles.is_empty() {
+            if squiggles.is_empty() && cmd_links.is_empty() {
                 // Unchanged fast path: one styled span per token.
                 let spans: Vec<AnyView> = toks
                     .into_iter()
@@ -1139,15 +1206,15 @@ fn render_file_line_content(
                     .collect();
                 view! { <code class="file-line-code">{spans}</code> }.into_any()
             } else {
-                let spans = decorate_tokens(toks, squiggles);
+                let spans = decorate_tokens(toks, squiggles, cmd_links);
                 view! { <code class="file-line-code">{spans}</code> }.into_any()
             }
         }
         _ => {
-            if squiggles.is_empty() {
+            if squiggles.is_empty() && cmd_links.is_empty() {
                 view! { <code class="file-line-code">{text}</code> }.into_any()
             } else {
-                let spans = decorate_plain(&text, squiggles);
+                let spans = decorate_plain(&text, squiggles, cmd_links);
                 view! { <code class="file-line-code">{spans}</code> }.into_any()
             }
         }
@@ -1158,21 +1225,33 @@ fn render_file_line_content(
 fn decorate_tokens(
     tokens: LineTokens,
     squiggles: &[(u32, u32, CodeIntelSeverity)],
+    cmd_links: &[(u32, u32)],
 ) -> Vec<AnyView> {
     let mut out = Vec::new();
     let mut offset: u32 = 0;
     for token in tokens {
         let color = color_to_css(token.fg);
-        push_decorated_segment(&token.text, offset, Some(&color), squiggles, &mut out);
+        push_decorated_segment(
+            &token.text,
+            offset,
+            Some(&color),
+            squiggles,
+            cmd_links,
+            &mut out,
+        );
         offset += token.text.len() as u32;
     }
     out
 }
 
 /// Split a single plain-text line at squiggle boundaries (no syntax color).
-fn decorate_plain(text: &str, squiggles: &[(u32, u32, CodeIntelSeverity)]) -> Vec<AnyView> {
+fn decorate_plain(
+    text: &str,
+    squiggles: &[(u32, u32, CodeIntelSeverity)],
+    cmd_links: &[(u32, u32)],
+) -> Vec<AnyView> {
     let mut out = Vec::new();
-    push_decorated_segment(text, 0, None, squiggles, &mut out);
+    push_decorated_segment(text, 0, None, squiggles, cmd_links, &mut out);
     out
 }
 
@@ -1186,11 +1265,22 @@ fn push_decorated_segment(
     seg_start: u32,
     color: Option<&str>,
     squiggles: &[(u32, u32, CodeIntelSeverity)],
+    cmd_links: &[(u32, u32)],
     out: &mut Vec<AnyView>,
 ) {
     let seg_end = seg_start + seg_text.len() as u32;
     let mut cuts: Vec<u32> = vec![seg_start, seg_end];
     for (start, end, _) in squiggles {
+        for edge in [*start, *end] {
+            if edge > seg_start && edge < seg_end {
+                let rel = (edge - seg_start) as usize;
+                if seg_text.is_char_boundary(rel) {
+                    cuts.push(edge);
+                }
+            }
+        }
+    }
+    for (start, end) in cmd_links {
         for edge in [*start, *end] {
             if edge > seg_start && edge < seg_end {
                 let rel = (edge - seg_start) as usize;
@@ -1213,7 +1303,8 @@ fn push_decorated_segment(
             continue;
         }
         let severity = squiggle_severity_at(p, squiggles);
-        out.push(make_line_span(piece, color, severity));
+        let cmd_link = cmd_link_active_at(p, cmd_links);
+        out.push(make_line_span(piece, color, severity, cmd_link, p, q));
     }
 }
 
@@ -1344,6 +1435,15 @@ struct CaretHit {
     rect: Option<web_sys::DomRect>,
 }
 
+struct HoverTarget {
+    offset: u32,
+    line_idx: usize,
+    line_byte: u32,
+    anchor_left: f64,
+    anchor_top: f64,
+    anchor_bottom: f64,
+}
+
 /// Whether `document` exposes a callable method `name` (walks the prototype
 /// chain). Used to feature-detect the caret API so we never call a method that
 /// doesn't exist (which would throw in WKWebView).
@@ -1383,6 +1483,25 @@ fn caret_at_point(client_x: f64, client_y: f64) -> Option<CaretHit> {
 fn byte_offset_at_point(lines: &FileLines, client_x: f64, client_y: f64) -> Option<u32> {
     let hit = caret_at_point(client_x, client_y)?;
     byte_offset_from_caret(lines, &hit.node, hit.offset)
+}
+
+fn hover_target_at_point(lines: &FileLines, client_x: f64, client_y: f64) -> Option<HoverTarget> {
+    let caret = caret_at_point(client_x, client_y)?;
+    let offset = byte_offset_from_caret(lines, &caret.node, caret.offset)?;
+    let line_idx = lines.line_for_byte(offset);
+    let line_byte = offset - lines.line_start(line_idx);
+    let (anchor_left, anchor_top, anchor_bottom) = match caret.rect {
+        Some(rect) => (rect.left(), rect.top(), rect.bottom()),
+        None => (client_x, client_y, client_y + 16.0),
+    };
+    Some(HoverTarget {
+        offset,
+        line_idx,
+        line_byte,
+        anchor_left,
+        anchor_top,
+        anchor_bottom,
+    })
 }
 
 /// Whether the byte at `offset` in the file begins an identifier-ish char
@@ -1500,43 +1619,66 @@ fn maybe_request_hover(
     client_x: f64,
     client_y: f64,
 ) {
-    let Some(caret) = caret_at_point(client_x, client_y) else {
+    let Some(target) = hover_target_at_point(lines, client_x, client_y) else {
         crate::actions::dismiss_hover(state);
         return;
     };
-    let Some(offset) = byte_offset_from_caret(lines, &caret.node, caret.offset) else {
-        crate::actions::dismiss_hover(state);
-        return;
-    };
-    let line_idx = lines.line_for_byte(offset);
-    let line_byte = offset - lines.line_start(line_idx);
-    if !is_identifier_byte(lines, line_idx, line_byte) {
+    if !is_identifier_byte(lines, target.line_idx, target.line_byte) {
         crate::actions::dismiss_hover(state);
         return;
     }
     // Already showing/awaiting a hover for this exact identifier: leave it.
     if state
         .code_intel_hover
-        .with_untracked(|h| h.as_ref().map(|p| p.offset) == Some(offset))
+        .with_untracked(|h| h.as_ref().map(|p| p.offset) == Some(target.offset))
     {
         return;
     }
-    let (left, top, bottom) = match caret.rect {
-        Some(rect) => (rect.left(), rect.top(), rect.bottom()),
-        None => (client_x, client_y, client_y + 16.0),
-    };
-    crate::actions::request_hover(state, path, version, offset, left, top, bottom);
+    crate::actions::request_hover(
+        state,
+        path,
+        version,
+        target.offset,
+        target.anchor_left,
+        target.anchor_top,
+        target.anchor_bottom,
+    );
 }
 
-fn make_line_span(text: &str, color: Option<&str>, severity: Option<CodeIntelSeverity>) -> AnyView {
+fn make_line_span(
+    text: &str,
+    color: Option<&str>,
+    severity: Option<CodeIntelSeverity>,
+    cmd_link: bool,
+    start: u32,
+    end: u32,
+) -> AnyView {
     let style = color.map(|c| format!("color:{c}"));
-    let class = severity.map(|s| {
-        format!(
+    let class = match (severity, cmd_link) {
+        (Some(s), true) => Some(format!(
+            "code-intel-squiggle code-intel-squiggle-{} code-intel-cmd-link",
+            severity_token(s)
+        )),
+        (Some(s), false) => Some(format!(
             "code-intel-squiggle code-intel-squiggle-{}",
             severity_token(s)
-        )
-    });
-    view! { <span class=class style=style>{text.to_owned()}</span> }.into_any()
+        )),
+        (None, true) => Some("code-intel-cmd-link".to_owned()),
+        (None, false) => None,
+    };
+    let data_cmd_link = cmd_link.then_some("true");
+    let data_range = cmd_link.then(|| format!("{start}:{end}"));
+    view! {
+        <span
+            class=class
+            style=style
+            data-code-intel-cmd-link=data_cmd_link
+            data-code-intel-range=data_range
+        >
+            {text.to_owned()}
+        </span>
+    }
+    .into_any()
 }
 
 /// Render-layer tests for `FileView`.
@@ -1672,6 +1814,51 @@ mod wasm_tests {
         code.dispatch_event(&event).unwrap();
     }
 
+    fn code_point_for_utf16_col(container: &HtmlElement, utf16_col: u32) -> (i32, i32) {
+        let code = container
+            .query_selector(".file-line-code")
+            .unwrap()
+            .expect("code element present");
+        let code_node: &web_sys::Node = code.unchecked_ref();
+        let document = web_sys::window().unwrap().document().unwrap();
+        let mut remaining = utf16_col;
+        for text_node in super::descendant_text_nodes(code_node) {
+            let text = text_node.text_content().unwrap_or_default();
+            let len = text.encode_utf16().count() as u32;
+            if remaining < len {
+                let range = document.create_range().unwrap();
+                range.set_start(&text_node, remaining).unwrap();
+                range.set_end(&text_node, remaining + 1).unwrap();
+                let rect = range.get_bounding_client_rect();
+                return (
+                    (rect.left() + rect.width() / 2.0) as i32,
+                    (rect.top() + rect.height() / 2.0) as i32,
+                );
+            }
+            remaining -= len;
+        }
+        let rect = code.get_bounding_client_rect();
+        (
+            (rect.left() + 1.0) as i32,
+            (rect.top() + rect.height() / 2.0) as i32,
+        )
+    }
+
+    fn mousemove_code_utf16_col(container: &HtmlElement, utf16_col: u32) {
+        let code = container
+            .query_selector(".file-line-code")
+            .unwrap()
+            .expect("code element present");
+        let (x, y) = code_point_for_utf16_col(container, utf16_col);
+        let init = web_sys::MouseEventInit::new();
+        init.set_bubbles(true);
+        init.set_client_x(x);
+        init.set_client_y(y);
+        let event =
+            web_sys::MouseEvent::new_with_mouse_event_init_dict("mousemove", &init).unwrap();
+        code.dispatch_event(&event).unwrap();
+    }
+
     /// Whether a `code_intel_navigate` frame was put on the wire via the
     /// `install_send_stub` capture buffer.
     fn navigate_frame_was_sent() -> bool {
@@ -1722,6 +1909,16 @@ mod wasm_tests {
             web_sys::window()
                 .unwrap()
                 .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    async fn wait_ms(ms: i32) {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms)
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
@@ -2880,6 +3077,273 @@ mod wasm_tests {
         );
     }
 
+    #[wasm_bindgen_test]
+    async fn cmd_hover_underlines_only_the_navigable_symbol() {
+        use crate::state::{ActiveProjectRef, CodeIntelKey};
+        use protocol::{
+            ByteRange, CodeIntelCompleteness, CodeIntelFileModelPayload, CodeIntelLanguageId,
+            CodeIntelLocation, CodeIntelModelRange, CodeIntelOccurrence, CodeIntelProviderId,
+            CodeIntelRole, ProjectId,
+        };
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "main.rs".to_owned(),
+        };
+        let target = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "lib.rs".to_owned(),
+        };
+        let content = "fn main() {}";
+
+        let container = make_container();
+        let mount_path = path.clone();
+        let target_for_mount = target.clone();
+        let captured: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
+        let cap = captured.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let file_path = mount_path.clone();
+            state.open_files.update(|files| {
+                files.insert(
+                    file_path.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some(content.to_owned()),
+                        is_binary: false,
+                    },
+                );
+            });
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "h".to_owned(),
+                project_id: ProjectId("p".to_owned()),
+            }));
+            let model = CodeIntelFileModelPayload {
+                path: file_path.clone(),
+                version: ProjectFileVersion(1),
+                provider: CodeIntelProviderId("rust-analyzer".to_owned()),
+                language: CodeIntelLanguageId("rust".to_owned()),
+                model_range: CodeIntelModelRange::FullFile,
+                completeness: CodeIntelCompleteness::Complete,
+                occurrences: vec![CodeIntelOccurrence {
+                    range: ByteRange { start: 3, end: 7 },
+                    role: CodeIntelRole::Reference,
+                    display: "main".to_owned(),
+                    definition: vec![CodeIntelLocation {
+                        path: target_for_mount.clone(),
+                        range: ByteRange { start: 42, end: 46 },
+                    }],
+                }],
+            };
+            state.code_intel.update(|map| {
+                let file = map
+                    .entry(CodeIntelKey {
+                        host_id: "h".to_owned(),
+                        project_id: ProjectId("p".to_owned()),
+                        path: file_path.clone(),
+                    })
+                    .or_default();
+                file.set_rendered_version(ProjectFileVersion(1));
+                file.merge_versioned(ProjectFileVersion(1), |data| data.merge_model(model));
+            });
+            *cap.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <FileView tab_id=TabId(20_033) path=mount_path.clone() /> }
+        });
+
+        next_tick().await;
+        let state = captured.borrow().clone().unwrap();
+
+        mousemove_code_utf16_col(&container, 3);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-code-intel-cmd-link=\"true\"]")
+                .unwrap()
+                .is_none(),
+            "without Cmd/Ctrl held, the navigable symbol should not show a link affordance"
+        );
+
+        state.cmd_held.set(true);
+        next_tick().await;
+        let link = container
+            .query_selector("[data-code-intel-cmd-link=\"true\"]")
+            .unwrap()
+            .expect("Cmd/Ctrl-hover should underline the navigable symbol");
+        assert_eq!(
+            link.text_content().unwrap_or_default(),
+            "main",
+            "only the hovered navigable symbol should receive the link affordance"
+        );
+        assert_eq!(
+            link.get_attribute("data-code-intel-range").as_deref(),
+            Some("3:7"),
+            "the affordance should cover exactly the pushed occurrence range"
+        );
+        let computed = web_sys::window()
+            .unwrap()
+            .get_computed_style(&link)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            computed.get_property_value("cursor").unwrap_or_default(),
+            "pointer",
+            "the hovered navigable symbol should use a pointer cursor"
+        );
+        assert_ne!(
+            computed
+                .get_property_value("box-shadow")
+                .unwrap_or_default(),
+            "none",
+            "the hovered navigable symbol should be visually underlined"
+        );
+
+        state.cmd_held.set(false);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-code-intel-cmd-link=\"true\"]")
+                .unwrap()
+                .is_none(),
+            "releasing Cmd/Ctrl should remove the link affordance"
+        );
+
+        state.cmd_held.set(true);
+        mousemove_code_utf16_col(&container, 0);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-code-intel-cmd-link=\"true\"]")
+                .unwrap()
+                .is_none(),
+            "Cmd/Ctrl-hover on a non-navigable identifier should not show the link affordance"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn cmd_hover_peek_reuses_hover_popover_contents() {
+        use crate::components::hover_popover::HoverPopover;
+        use crate::state::{ActiveProjectRef, CodeIntelKey};
+        use protocol::{
+            ByteRange, CodeIntelCompleteness, CodeIntelFileModelPayload, CodeIntelLanguageId,
+            CodeIntelLocation, CodeIntelModelRange, CodeIntelOccurrence, CodeIntelProviderId,
+            CodeIntelRole, ProjectId,
+        };
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "main.rs".to_owned(),
+        };
+        let target = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "lib.rs".to_owned(),
+        };
+        let content = "fn main() {}";
+
+        let container = make_container();
+        let mount_path = path.clone();
+        let target_for_mount = target.clone();
+        let captured: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
+        let cap = captured.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let file_path = mount_path.clone();
+            state.open_files.update(|files| {
+                files.insert(
+                    file_path.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some(content.to_owned()),
+                        is_binary: false,
+                    },
+                );
+            });
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "h".to_owned(),
+                project_id: ProjectId("p".to_owned()),
+            }));
+            let model = CodeIntelFileModelPayload {
+                path: file_path.clone(),
+                version: ProjectFileVersion(1),
+                provider: CodeIntelProviderId("rust-analyzer".to_owned()),
+                language: CodeIntelLanguageId("rust".to_owned()),
+                model_range: CodeIntelModelRange::FullFile,
+                completeness: CodeIntelCompleteness::Complete,
+                occurrences: vec![CodeIntelOccurrence {
+                    range: ByteRange { start: 3, end: 7 },
+                    role: CodeIntelRole::Reference,
+                    display: "main".to_owned(),
+                    definition: vec![CodeIntelLocation {
+                        path: target_for_mount.clone(),
+                        range: ByteRange { start: 42, end: 46 },
+                    }],
+                }],
+            };
+            state.code_intel.update(|map| {
+                let file = map
+                    .entry(CodeIntelKey {
+                        host_id: "h".to_owned(),
+                        project_id: ProjectId("p".to_owned()),
+                        path: file_path.clone(),
+                    })
+                    .or_default();
+                file.set_rendered_version(ProjectFileVersion(1));
+                file.merge_versioned(ProjectFileVersion(1), |data| data.merge_model(model));
+            });
+            state.cmd_held.set(true);
+            *cap.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <div>
+                    <FileView tab_id=TabId(20_034) path=mount_path.clone() />
+                    <HoverPopover />
+                </div>
+            }
+        });
+
+        next_tick().await;
+        let state = captured.borrow().clone().unwrap();
+        mousemove_code_utf16_col(&container, 3);
+        wait_ms(HOVER_DEBOUNCE_MS + 50).await;
+        next_tick().await;
+
+        let hover_id = state
+            .code_intel_hover
+            .get_untracked()
+            .expect("Cmd/Ctrl-hover should seed a hover popover request")
+            .hover_id;
+        state.code_intel_hover.update(|hover| {
+            let popover = hover
+                .as_mut()
+                .expect("hover request should still be active");
+            assert_eq!(popover.hover_id, hover_id);
+            popover.contents = Some("**Type**: `fn main() -> i32`".to_owned());
+        });
+        next_tick().await;
+
+        let popover = container
+            .query_selector("[data-code-intel-hover-popover=\"true\"]")
+            .unwrap()
+            .expect("Cmd/Ctrl-hover peek should render the hover popover");
+        let text = popover.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Type") && text.contains("fn main() -> i32"),
+            "peek should show the hover/type fixture contents; got {text:?}"
+        );
+    }
+
     /// M3: a Cmd/Ctrl+click on an occurrence whose definition has **not** been
     /// pushed yet falls back to the on-demand `code_intel_navigate` miss-fill.
     #[wasm_bindgen_test]
@@ -3279,7 +3743,7 @@ mod wasm_tests {
         next_tick().await;
 
         let popover = container
-            .query_selector(".code-intel-hover-popover")
+            .query_selector("[data-code-intel-hover-popover=\"true\"]")
             .unwrap()
             .expect("hover popover should render when contents are present");
         let text = popover.text_content().unwrap_or_default();
@@ -3300,7 +3764,7 @@ mod wasm_tests {
         next_tick().await;
         assert!(
             container
-                .query_selector(".code-intel-hover-popover")
+                .query_selector("[data-code-intel-hover-popover=\"true\"]")
                 .unwrap()
                 .is_none(),
             "dismiss should remove the popover"

@@ -58,12 +58,30 @@ impl EventListenerHandle {
     }
 }
 
+struct DocumentEventListenerHandle {
+    document: web_sys::Document,
+    event: &'static str,
+    callback: wasm_bindgen::closure::Closure<dyn Fn(web_sys::Event)>,
+}
+
+impl DocumentEventListenerHandle {
+    fn remove(self) {
+        let _ = self.document.remove_event_listener_with_callback(
+            self.event,
+            self.callback.as_ref().unchecked_ref(),
+        );
+    }
+}
+
 thread_local! {
     static APP_LISTENERS_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static APP_LISTENER_TOKEN: Cell<u64> = const { Cell::new(0) };
     static HOST_LISTENER_HANDLES: RefCell<Vec<bridge::UnlistenHandle>> = const { RefCell::new(Vec::new()) };
     static DEVTOOLS_LISTENER_HANDLE: RefCell<Option<bridge::UnlistenHandle>> = const { RefCell::new(None) };
     static KEYDOWN_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
+    static KEYUP_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
+    static BLUR_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
+    static VISIBILITY_LISTENER_HANDLE: RefCell<Option<DocumentEventListenerHandle>> = const { RefCell::new(None) };
     static CLICK_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
     static FILE_DROP_LISTENER_HANDLES: RefCell<Vec<EventListenerHandle>> = const { RefCell::new(Vec::new()) };
 }
@@ -106,6 +124,21 @@ fn clear_app_listeners() {
             handle.remove();
         }
     });
+    KEYUP_LISTENER_HANDLE.with(|handle| {
+        if let Some(handle) = handle.borrow_mut().take() {
+            handle.remove();
+        }
+    });
+    BLUR_LISTENER_HANDLE.with(|handle| {
+        if let Some(handle) = handle.borrow_mut().take() {
+            handle.remove();
+        }
+    });
+    VISIBILITY_LISTENER_HANDLE.with(|handle| {
+        if let Some(handle) = handle.borrow_mut().take() {
+            handle.remove();
+        }
+    });
     CLICK_LISTENER_HANDLE.with(|handle| {
         if let Some(handle) = handle.borrow_mut().take() {
             handle.remove();
@@ -116,6 +149,10 @@ fn clear_app_listeners() {
             handle.remove();
         }
     });
+}
+
+fn keyboard_event_is_cmd_modifier(ev: &web_sys::KeyboardEvent) -> bool {
+    ev.ctrl_key() || ev.meta_key() || matches!(ev.key().as_str(), "Control" | "Meta")
 }
 
 fn install_keydown_listener(state: AppState) {
@@ -130,6 +167,9 @@ fn install_keydown_listener(state: AppState) {
             return;
         };
         let ctrl_or_meta = ev.ctrl_key() || ev.meta_key();
+        if keyboard_event_is_cmd_modifier(&ev) {
+            state.cmd_held.set(true);
+        }
         match ev.key().as_str() {
             key if ctrl_or_meta && ev.shift_key() && key.eq_ignore_ascii_case("f") => {
                 ev.prevent_default();
@@ -180,6 +220,79 @@ fn install_keydown_listener(state: AppState) {
             window,
             event: "keydown",
             callback,
+        });
+    });
+}
+
+fn install_keyup_listener(state: AppState) {
+    KEYUP_LISTENER_HANDLE.with(|slot| {
+        if let Some(existing) = slot.borrow_mut().take() {
+            existing.remove();
+        }
+    });
+
+    let callback = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
+        let Ok(ev) = ev.dyn_into::<web_sys::KeyboardEvent>() else {
+            return;
+        };
+        if keyboard_event_is_cmd_modifier(&ev) {
+            state.cmd_held.set(ev.ctrl_key() || ev.meta_key());
+        }
+    });
+    let window = web_sys::window().unwrap();
+    let _ = window.add_event_listener_with_callback("keyup", callback.as_ref().unchecked_ref());
+    KEYUP_LISTENER_HANDLE.with(|slot| {
+        slot.borrow_mut().replace(EventListenerHandle {
+            window,
+            event: "keyup",
+            callback,
+        });
+    });
+}
+
+fn install_cmd_stuck_clear_listeners(state: AppState) {
+    BLUR_LISTENER_HANDLE.with(|slot| {
+        if let Some(existing) = slot.borrow_mut().take() {
+            existing.remove();
+        }
+    });
+    VISIBILITY_LISTENER_HANDLE.with(|slot| {
+        if let Some(existing) = slot.borrow_mut().take() {
+            existing.remove();
+        }
+    });
+
+    let blur_state = state.clone();
+    let blur_callback = Closure::<dyn Fn(web_sys::Event)>::new(move |_| {
+        blur_state.cmd_held.set(false);
+    });
+    let window = web_sys::window().unwrap();
+    let _ = window.add_event_listener_with_callback("blur", blur_callback.as_ref().unchecked_ref());
+    BLUR_LISTENER_HANDLE.with(|slot| {
+        slot.borrow_mut().replace(EventListenerHandle {
+            window,
+            event: "blur",
+            callback: blur_callback,
+        });
+    });
+
+    let document = web_sys::window().unwrap().document().unwrap();
+    let visibility_state = state;
+    let document_for_callback = document.clone();
+    let visibility_callback = Closure::<dyn Fn(web_sys::Event)>::new(move |_| {
+        if document_for_callback.hidden() {
+            visibility_state.cmd_held.set(false);
+        }
+    });
+    let _ = document.add_event_listener_with_callback(
+        "visibilitychange",
+        visibility_callback.as_ref().unchecked_ref(),
+    );
+    VISIBILITY_LISTENER_HANDLE.with(|slot| {
+        slot.borrow_mut().replace(DocumentEventListenerHandle {
+            document,
+            event: "visibilitychange",
+            callback: visibility_callback,
         });
     });
 }
@@ -601,9 +714,17 @@ pub fn App() -> impl IntoView {
     });
 
     let state_for_keys = state.clone();
+    let state_for_keyup = state.clone();
+    let state_for_cmd_clear = state.clone();
     let state_for_clicks = state.clone();
     Effect::new(move |_| {
         install_keydown_listener(state_for_keys.clone());
+    });
+    Effect::new(move |_| {
+        install_keyup_listener(state_for_keyup.clone());
+    });
+    Effect::new(move |_| {
+        install_cmd_stuck_clear_listeners(state_for_cmd_clear.clone());
     });
     Effect::new(move |_| {
         install_click_listener(state_for_clicks.clone());
