@@ -35,6 +35,15 @@
       "artifacts": {
         "/tyde/v0.8.19-beta.4/mobile-frontend-5bbff969dc35724d_bg.wasm": "sha384-jhI/CtdoM6JtCTnVduo1ipD8sXnbuZBvgijfnjIMjNw3fm7E/TB69dv3GL1+KT7K"
       }
+    },
+    "0.8.19-beta.8": {
+      "path": "/tyde/v0.8.19-beta.8/",
+      "entry": "/tyde/v0.8.19-beta.8/mobile-frontend-c8a7afffa5e1c358.js",
+      "integrity": "sha384-3Scs2zhmAxlUE6GdEmegxuQvlKuS9hBqhXVrE6jIEplPbYAgzYA+HBs4RgNBk+Jf",
+      "artifacts": {
+        "/tyde/v0.8.19-beta.8/jsqr.js": "sha384-kC2JVA7KncijmOKRk+ao2V3muRVast5JI6fE178PlqEYddkPUu9c2q1pcFckPatx",
+        "/tyde/v0.8.19-beta.8/mobile-frontend-c8a7afffa5e1c358_bg.wasm": "sha384-qFrWXiDQ/Ntrvr1/Wm967d9MRytEXVvixhY79dFlnks2rBhboPEkfJ/QdbEdm52g"
+      }
     }
   }
 }
