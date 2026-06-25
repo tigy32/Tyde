@@ -3,13 +3,14 @@ use std::collections::HashMap;
 
 use protocol::types::{AgentCompactPayload, TeamCompactPayload};
 use protocol::{
-    AgentsSmartViewsUpdate, AgentsViewPreferencesUpdate, CancelWorkflowPayload, CloseAgentPayload,
-    CustomAgent, CustomAgentDeletePayload, CustomAgentId, CustomAgentUpsertPayload, Envelope,
-    FrameKind, ImageData, McpServerConfig, McpServerDeletePayload, McpServerId,
-    McpServerUpsertPayload, MobileDeviceId, MobileDeviceRevokePayload, MobilePairingCancelPayload,
-    MobilePairingOfferId, MobilePairingStartPayload, ProjectId, SetAgentsSmartViewsPayload,
-    SetAgentsViewPreferencesPayload, SkillRefreshPayload, Steering, SteeringDeletePayload,
-    SteeringId, SteeringUpsertPayload, StreamPath, TeamDeletePayload,
+    AgentPinsUpdate, AgentTagsUpdate, AgentsSmartViewsUpdate, AgentsViewPreferencesUpdate,
+    CancelWorkflowPayload, CloseAgentPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
+    CustomAgentUpsertPayload, Envelope, FrameKind, ImageData, McpServerConfig,
+    McpServerDeletePayload, McpServerId, McpServerUpsertPayload, MobileDeviceId,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferId,
+    MobilePairingStartPayload, ProjectId, SetAgentPinsPayload, SetAgentTagsPayload,
+    SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, SkillRefreshPayload, Steering,
+    SteeringDeletePayload, SteeringId, SteeringUpsertPayload, StreamPath, TeamDeletePayload,
     TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
     TeamDraftDiscardPayload, TeamDraftId, TeamDraftMemberEdit, TeamDraftMemberId,
     TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload, TeamId,
@@ -120,6 +121,43 @@ pub async fn set_agents_smart_views(
         host_stream,
         FrameKind::SetAgentsSmartViews,
         &SetAgentsSmartViewsPayload { update },
+    )
+    .await
+}
+
+/// Send a manual-tag mutation to the primary local host. Like the preference
+/// and Smart View frames, the server persists it and fans out a full
+/// `AgentsViewPreferencesNotify` snapshot (which carries the updated `tags`),
+/// so tag chips and the tag picker re-render purely from the new snapshot.
+/// Routed on the host stream like the other Agents-view mutations.
+pub async fn set_agent_tags(
+    host_id: &str,
+    host_stream: StreamPath,
+    update: AgentTagsUpdate,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::SetAgentTags,
+        &SetAgentTagsPayload { update },
+    )
+    .await
+}
+
+/// Send a pin/unpin mutation to the primary local host. The server canonicalizes
+/// pinned targets (session-keyed where possible) and fans out a full
+/// `AgentsViewPreferencesNotify` snapshot carrying the updated `pins`, which the
+/// Pinned section renders from. Routed on the host stream.
+pub async fn set_agent_pins(
+    host_id: &str,
+    host_stream: StreamPath,
+    update: AgentPinsUpdate,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::SetAgentPins,
+        &SetAgentPinsPayload { update },
     )
     .await
 }

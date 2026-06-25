@@ -1,12 +1,13 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::*;
 use protocol::{
-    AgentGroupMode, AgentListDensity, AgentOrderKey, AgentOrigin, AgentProjectFilter,
-    AgentSortMode, AgentStatusFilter, AgentsSmartViewsSnapshot, AgentsSmartViewsUpdate,
-    AgentsViewFilters, AgentsViewPreferencesUpdate, BackendKind, HostFilterId, ProjectId,
-    SmartView, SmartViewId,
+    AgentAnnotationTarget, AgentGroupMode, AgentListDensity, AgentManualTagId, AgentOrderKey,
+    AgentOrigin, AgentPinsUpdate, AgentProjectFilter, AgentSortMode, AgentStatusFilter,
+    AgentTagColor, AgentTagRef, AgentTagsSnapshot, AgentTagsUpdate, AgentsSmartViewsSnapshot,
+    AgentsSmartViewsUpdate, AgentsViewFilters, AgentsViewPreferencesUpdate, BackendKind,
+    HostFilterId, ProjectId, SmartView, SmartViewId,
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
@@ -49,9 +50,23 @@ enum SmartViewPrompt {
 
 #[derive(Clone, Debug, PartialEq)]
 struct AgentMonitorGroup {
+    /// Stable, unique `<For>` key. For non-tag group modes this equals the
+    /// display label; for `Tag` grouping it is origin+id qualified so two tags
+    /// that happen to share a display name still render as separate groups.
+    key: String,
     /// `None` renders a flat list with no header (group mode `Flat`).
     label: Option<String>,
     rows: Vec<AgentMonitorRow>,
+}
+
+/// The Agents Center body splits into an outer Pinned section (rendered above
+/// the normal projection) and the normal grouped list. Pinned rows still pass
+/// the active filters/search, so a filtered-out pinned agent is simply absent
+/// from `pinned` — it is never force-shown (dev-docs/26 §4.7).
+#[derive(Clone, Debug, PartialEq)]
+struct AgentMonitorSections {
+    pinned: Vec<AgentMonitorRow>,
+    groups: Vec<AgentMonitorGroup>,
 }
 
 // ── Manual-order key mapping ────────────────────────────────────────────
@@ -88,6 +103,64 @@ pub(crate) fn manual_rank(agent: &AgentInfo, manual_order: &[AgentOrderKey]) -> 
     manual_order
         .iter()
         .position(|key| agent_matches_order_key(agent, key))
+}
+
+// ── Annotation targets (tags + pins) ────────────────────────────────────
+//
+// Manual tags and pins are keyed server-side by `AgentAnnotationTarget`,
+// scoped by the stable `HostFilterId`. The durable key is `Session` once the
+// agent has a session id; before that it is a `TransientAgent` key by agent id,
+// which the server promotes to the session key when the session resolves
+// (dev-docs/26 §4.5). The frontend computes the same target so its lookups line
+// up with the server's canonical assignments/pins.
+
+pub(crate) fn agent_annotation_target(agent: &AgentInfo) -> AgentAnnotationTarget {
+    match &agent.session_id {
+        Some(session_id) => AgentAnnotationTarget::Session {
+            host_id: HostFilterId(agent.host_id.clone()),
+            session_id: session_id.clone(),
+        },
+        None => AgentAnnotationTarget::TransientAgent {
+            host_id: HostFilterId(agent.host_id.clone()),
+            agent_id: agent.agent_id.clone(),
+        },
+    }
+}
+
+/// Manual tag ids assigned to `target`, in the snapshot's stored order.
+fn manual_tag_ids_for(
+    target: &AgentAnnotationTarget,
+    tags: &AgentTagsSnapshot,
+) -> Vec<AgentManualTagId> {
+    tags.manual_assignments
+        .iter()
+        .find(|assignment| &assignment.target == target)
+        .map(|assignment| assignment.tag_ids.clone())
+        .unwrap_or_default()
+}
+
+/// All tag refs (manual then system) assigned to `target`. Used for the tag
+/// filter (OR semantics) and `Group by tag`.
+fn agent_tag_refs(target: &AgentAnnotationTarget, tags: &AgentTagsSnapshot) -> Vec<AgentTagRef> {
+    let mut refs: Vec<AgentTagRef> = manual_tag_ids_for(target, tags)
+        .into_iter()
+        .map(AgentTagRef::Manual)
+        .collect();
+    if let Some(assignment) = tags
+        .system_assignments
+        .iter()
+        .find(|assignment| &assignment.target == target)
+    {
+        refs.extend(assignment.tag_ids.iter().cloned().map(AgentTagRef::System));
+    }
+    refs
+}
+
+/// Tag-filter predicate. An empty filter is no constraint; a non-empty filter
+/// matches when the agent carries at least one selected tag (manual or system),
+/// matching the backend's OR semantics (dev-docs/26 §4.6).
+pub(crate) fn agent_passes_tag_filter(tag_refs: &[AgentTagRef], filter: &[AgentTagRef]) -> bool {
+    filter.is_empty() || filter.iter().any(|wanted| tag_refs.contains(wanted))
 }
 
 // ── Filtering ───────────────────────────────────────────────────────────
@@ -254,7 +327,11 @@ fn build_groups(
 ) -> Vec<AgentMonitorGroup> {
     sort_rows(&mut rows, sort_mode, manual_order);
     if matches!(group_mode, AgentGroupMode::Flat) {
-        return vec![AgentMonitorGroup { label: None, rows }];
+        return vec![AgentMonitorGroup {
+            key: String::new(),
+            label: None,
+            rows,
+        }];
     }
     let mut order: Vec<String> = Vec::new();
     let mut buckets: HashMap<String, Vec<AgentMonitorRow>> = HashMap::new();
@@ -268,10 +345,75 @@ fn build_groups(
     order
         .into_iter()
         .map(|label| AgentMonitorGroup {
+            key: label.clone(),
             rows: buckets.remove(&label).unwrap_or_default(),
             label: Some(label),
         })
         .collect()
+}
+
+/// Build display groups for `Group by tag`. Each manual and system tag becomes
+/// its own group (in descriptor order); an agent with several tags appears under
+/// each one (dev-docs/26 §4.6/§12.7). Agents with no tags land in an explicit
+/// "Untagged" group, always rendered last. Rows are sorted by the active sort
+/// mode within every group.
+fn build_tag_groups(
+    mut rows: Vec<AgentMonitorRow>,
+    sort_mode: AgentSortMode,
+    manual_order: &[AgentOrderKey],
+    tags: &AgentTagsSnapshot,
+) -> Vec<AgentMonitorGroup> {
+    sort_rows(&mut rows, sort_mode, manual_order);
+
+    let mut groups: Vec<AgentMonitorGroup> = Vec::new();
+    for descriptor in &tags.manual {
+        let wanted = AgentTagRef::Manual(descriptor.id.clone());
+        let matched: Vec<AgentMonitorRow> = rows
+            .iter()
+            .filter(|row| {
+                agent_tag_refs(&agent_annotation_target(&row.agent), tags).contains(&wanted)
+            })
+            .cloned()
+            .collect();
+        if !matched.is_empty() {
+            groups.push(AgentMonitorGroup {
+                key: format!("manual:{}", descriptor.id.0),
+                label: Some(descriptor.name.clone()),
+                rows: matched,
+            });
+        }
+    }
+    for descriptor in &tags.system {
+        let wanted = AgentTagRef::System(descriptor.id.clone());
+        let matched: Vec<AgentMonitorRow> = rows
+            .iter()
+            .filter(|row| {
+                agent_tag_refs(&agent_annotation_target(&row.agent), tags).contains(&wanted)
+            })
+            .cloned()
+            .collect();
+        if !matched.is_empty() {
+            groups.push(AgentMonitorGroup {
+                key: format!("system:{}", descriptor.id.0),
+                label: Some(descriptor.name.clone()),
+                rows: matched,
+            });
+        }
+    }
+
+    let untagged: Vec<AgentMonitorRow> = rows
+        .iter()
+        .filter(|row| agent_tag_refs(&agent_annotation_target(&row.agent), tags).is_empty())
+        .cloned()
+        .collect();
+    if !untagged.is_empty() {
+        groups.push(AgentMonitorGroup {
+            key: "untagged".to_owned(),
+            label: Some("Untagged".to_owned()),
+            rows: untagged,
+        });
+    }
+    groups
 }
 
 // ── Flat key reordering (drag / keyboard) ───────────────────────────────
@@ -413,11 +555,12 @@ const SORT_MODES: [AgentSortMode; 7] = [
     AgentSortMode::Project,
 ];
 
-const GROUP_MODES: [AgentGroupMode; 4] = [
+const GROUP_MODES: [AgentGroupMode; 5] = [
     AgentGroupMode::Flat,
     AgentGroupMode::Status,
     AgentGroupMode::Backend,
     AgentGroupMode::Project,
+    AgentGroupMode::Tag,
 ];
 
 const STATUS_FILTERS: [AgentStatusFilter; 5] = [
@@ -537,6 +680,84 @@ fn send_smart_view_update(state: &AppState, update: AgentsSmartViewsUpdate) {
             log::error!("failed to send smart-view update: {error}");
         }
     });
+}
+
+/// Send a manual-tag mutation to the primary local host. Tag chips and the tag
+/// picker render purely from the server snapshot (no durable local state), so
+/// this only handles the wire send; the confirming full snapshot re-renders the
+/// affected rows (dev-docs/26 §4.5/§10.3).
+fn send_tags_update(state: &AppState, update: AgentTagsUpdate) {
+    let Some(host_id) = state.agents_view_preferences_host.get_untracked() else {
+        log::warn!("tag change with no primary host; ignored");
+        return;
+    };
+    let Some(stream) = state.host_stream_untracked(&host_id) else {
+        log::warn!("primary host {host_id} has no stream; tag change ignored");
+        return;
+    };
+    spawn_local(async move {
+        if let Err(error) = crate::send::set_agent_tags(&host_id, stream, update).await {
+            log::error!("failed to send tag update: {error}");
+        }
+    });
+}
+
+/// Send a pin/unpin mutation to the primary local host. The Pinned section is a
+/// pure projection of the server snapshot's pins, so this only sends the frame;
+/// the confirming snapshot floats/unfloats the row (dev-docs/26 §4.7).
+fn send_pins_update(state: &AppState, update: AgentPinsUpdate) {
+    let Some(host_id) = state.agents_view_preferences_host.get_untracked() else {
+        log::warn!("pin change with no primary host; ignored");
+        return;
+    };
+    let Some(stream) = state.host_stream_untracked(&host_id) else {
+        log::warn!("primary host {host_id} has no stream; pin change ignored");
+        return;
+    };
+    spawn_local(async move {
+        if let Err(error) = crate::send::set_agent_pins(&host_id, stream, update).await {
+            log::error!("failed to send pin update: {error}");
+        }
+    });
+}
+
+/// Confirm with a native async dialog, then delete a manual tag. Uses the
+/// `confirm_dialog` bridge helper rather than `window.confirm`, which is a no-op
+/// in the Tauri webview (CLAUDE.md). Deleting a tag strips it from every
+/// assignment server-side but never touches agents or sessions.
+fn delete_manual_tag(state: &AppState, tag_id: AgentManualTagId, name: String) {
+    let state = state.clone();
+    spawn_local(async move {
+        let message = format!(
+            "Delete the \"{name}\" tag? It will be removed from every agent it is \
+             assigned to. Your agents and sessions are not affected."
+        );
+        if crate::bridge::confirm_dialog("Delete tag", &message).await {
+            send_tags_update(&state, AgentTagsUpdate::DeleteTag { tag_id });
+        }
+    });
+}
+
+/// Toggle a tag in the active tag filter and send `SetFilters`. Mirrors the
+/// other filter chips: installs the optimistic overlay (including the
+/// active-view-id recompute so the Smart View highlight tracks divergence) then
+/// sends the typed frame. OR semantics match the backend (dev-docs/26 §4.6).
+fn toggle_tag_filter(state: &AppState, tag: &AgentTagRef) {
+    let prefs = state.effective_agents_view_preferences();
+    let mut filters = prefs.filters.clone();
+    filters.tags = toggle_in_vec(&filters.tags, tag);
+    let active = active_view_after_query_edit(
+        state,
+        &filters,
+        prefs.sort_mode,
+        prefs.group_mode,
+        prefs.hide_finished,
+    );
+    state.set_agents_view_overlay(|overlay| {
+        overlay.filters = Some(filters.clone());
+        overlay.active_view_id = Some(active);
+    });
+    send_pref_update(state, AgentsViewPreferencesUpdate::SetFilters { filters });
 }
 
 /// Optimistically reflect a Smart View selection then send `SetActive`. Copies
@@ -731,11 +952,17 @@ pub fn AgentMonitorView() -> impl IntoView {
     let prefs = Memo::new(move |_| prefs_state.effective_agents_view_preferences());
 
     let rows_state = state.clone();
-    let groups: Memo<Vec<AgentMonitorGroup>> = Memo::new(move |_| {
+    let sections: Memo<AgentMonitorSections> = Memo::new(move |_| {
         let preferences = prefs.get();
         let query = search.get().to_lowercase();
         let agents = rows_state.agents.get();
         let projects = rows_state.projects.get();
+        // Tags + pins are projected purely from the authoritative server
+        // snapshot (no durable local state); reading the snapshot here makes the
+        // sections recompute when a tag/pin mutation's notify lands.
+        let snapshot = rows_state.agents_view_preferences.get();
+        let tags = snapshot.tags;
+        let pinned_targets = snapshot.pins.pinned;
         let host_labels: HashMap<String, String> = rows_state
             .configured_hosts
             .get()
@@ -746,47 +973,87 @@ pub fn AgentMonitorView() -> impl IntoView {
         rows_state.streaming_text.with(|streaming| {
             rows_state.agent_turn_active.with(|turn_active| {
                 rows_state.compaction_in_progress.with(|compaction| {
-                    let rows: Vec<AgentMonitorRow> = agents
-                        .iter()
-                        .filter_map(|agent| {
-                            let status =
-                                derive_agent_state(agent, streaming, turn_active, compaction);
-                            if !agent_passes_view_filters(
-                                agent,
-                                status,
-                                &preferences.filters,
-                                preferences.hide_finished,
-                                &query,
-                            ) {
-                                return None;
-                            }
-                            Some(AgentMonitorRow {
-                                key: AgentMonitorKey::from_agent(agent),
-                                status,
-                                host_label: host_label(&host_labels, &agent.host_id),
-                                project_label: project_label(&projects, agent),
-                                agent: agent.clone(),
-                            })
-                        })
-                        .collect();
-                    build_groups(
-                        rows,
+                    let mut pinned_rows: Vec<AgentMonitorRow> = Vec::new();
+                    let mut normal_rows: Vec<AgentMonitorRow> = Vec::new();
+                    for agent in agents.iter() {
+                        let status = derive_agent_state(agent, streaming, turn_active, compaction);
+                        if !agent_passes_view_filters(
+                            agent,
+                            status,
+                            &preferences.filters,
+                            preferences.hide_finished,
+                            &query,
+                        ) {
+                            continue;
+                        }
+                        let target = agent_annotation_target(agent);
+                        let tag_refs = agent_tag_refs(&target, &tags);
+                        if !agent_passes_tag_filter(&tag_refs, &preferences.filters.tags) {
+                            continue;
+                        }
+                        let row = AgentMonitorRow {
+                            key: AgentMonitorKey::from_agent(agent),
+                            status,
+                            host_label: host_label(&host_labels, &agent.host_id),
+                            project_label: project_label(&projects, agent),
+                            agent: agent.clone(),
+                        };
+                        // Pinned rows still passed the active filters/search
+                        // above; a filtered-out pin is never force-shown.
+                        if pinned_targets.contains(&target) {
+                            pinned_rows.push(row);
+                        } else {
+                            normal_rows.push(row);
+                        }
+                    }
+                    // The Pinned section is a flat list ordered by the active
+                    // sort; the normal projection keeps the active grouping.
+                    sort_rows(
+                        &mut pinned_rows,
                         preferences.sort_mode,
-                        preferences.group_mode,
                         &preferences.manual_order,
-                    )
+                    );
+                    let groups = if matches!(preferences.group_mode, AgentGroupMode::Tag) {
+                        build_tag_groups(
+                            normal_rows,
+                            preferences.sort_mode,
+                            &preferences.manual_order,
+                            &tags,
+                        )
+                    } else {
+                        build_groups(
+                            normal_rows,
+                            preferences.sort_mode,
+                            preferences.group_mode,
+                            &preferences.manual_order,
+                        )
+                    };
+                    AgentMonitorSections {
+                        pinned: pinned_rows,
+                        groups,
+                    }
                 })
             })
         })
     });
 
-    // Flat key order across all groups, for drag / keyboard reorder.
+    // Flat key order across the pinned section and all groups, for drag /
+    // keyboard reorder and the agent count. Deduplicated because `Group by tag`
+    // renders an agent under each of its tags.
     let visible_keys: Memo<Vec<AgentMonitorKey>> = Memo::new(move |_| {
-        groups
-            .get()
-            .into_iter()
-            .flat_map(|group| group.rows.into_iter().map(|row| row.key))
-            .collect()
+        let current = sections.get();
+        let mut seen: HashSet<AgentMonitorKey> = HashSet::new();
+        let mut keys: Vec<AgentMonitorKey> = Vec::new();
+        for row in current
+            .pinned
+            .iter()
+            .chain(current.groups.iter().flat_map(|group| group.rows.iter()))
+        {
+            if seen.insert(row.key.clone()) {
+                keys.push(row.key.clone());
+            }
+        }
+        keys
     });
 
     let total_rows = move || visible_keys.get().len();
@@ -1146,6 +1413,7 @@ pub fn AgentMonitorView() -> impl IntoView {
                         .collect_view()}
                 </div>
                 <HostProjectFilters />
+                <TagControls />
             </div>
 
             <div class="agent-monitor-live" aria-live="polite">
@@ -1154,9 +1422,10 @@ pub fn AgentMonitorView() -> impl IntoView {
 
             <div class="agent-monitor-body">
                 {move || {
-                    let current = groups.get();
-                    let row_count = current.iter().map(|group| group.rows.len()).sum::<usize>();
-                    if row_count == 0 {
+                    let current = sections.get();
+                    let total = current.pinned.len()
+                        + current.groups.iter().map(|group| group.rows.len()).sum::<usize>();
+                    if total == 0 {
                         view! { <div class="agent-monitor-empty">"No agents match the current view"</div> }
                             .into_any()
                     } else {
@@ -1164,11 +1433,40 @@ pub fn AgentMonitorView() -> impl IntoView {
                             prefs_for_controls.get().sort_mode,
                             AgentSortMode::ManualThenActivity
                         ) && matches!(prefs_for_controls.get().group_mode, AgentGroupMode::Flat);
+                        let has_pinned = !current.pinned.is_empty();
                         view! {
                             <div class=list_class>
+                                // Outer Pinned section above the normal projection
+                                // (dev-docs/26 §4.7). Pinned rows are never
+                                // drag-reorderable, so reorderable=false here.
+                                {has_pinned
+                                    .then(|| {
+                                        view! {
+                                            <div
+                                                class="agent-monitor-group-header agent-monitor-pinned-header"
+                                                data-test="agent-monitor-pinned-header"
+                                            >
+                                                "Pinned"
+                                            </div>
+                                            <For
+                                                each=move || sections.get().pinned
+                                                key=|row| row.key.clone()
+                                                let:row
+                                            >
+                                                <AgentMonitorRowView
+                                                    row=row
+                                                    reorderable=false
+                                                    visible_keys=visible_keys
+                                                    dragged_key=dragged_key
+                                                    drop_target=drop_target
+                                                    announcement=announcement
+                                                />
+                                            </For>
+                                        }
+                                    })}
                                 <For
-                                    each=move || groups.get()
-                                    key=|group| group.label.clone().unwrap_or_default()
+                                    each=move || sections.get().groups
+                                    key=|group| group.key.clone()
                                     let:group
                                 >
                                     {group
@@ -1657,6 +1955,240 @@ fn HostProjectFilters() -> impl IntoView {
     }
 }
 
+/// Default color for a freshly created manual tag and the seed value of the
+/// `<input type="color">` controls (which cannot represent "no color").
+const DEFAULT_TAG_COLOR: &str = "#4f8cff";
+
+/// Tag filter chips plus the manual-tag management panel (create / rename /
+/// recolor / delete). Manual and system tags both act as OR filters; only
+/// manual tags are editable (system tags are server-derived, read-only).
+#[component]
+fn TagControls() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let prefs_state = state.clone();
+    let prefs = Memo::new(move |_| prefs_state.effective_agents_view_preferences());
+    let tags_state = state.clone();
+    let tags = Memo::new(move |_| tags_state.agents_view_preferences.get().tags);
+
+    let manage_open = RwSignal::new(false);
+    let new_name = RwSignal::new(String::new());
+    let new_color = RwSignal::new(DEFAULT_TAG_COLOR.to_owned());
+
+    // Filter chips: manual (colored, editable origin) then system (muted).
+    let filter_state = state.clone();
+    let filter_chips = move || {
+        let snapshot = tags.get();
+        let active = prefs.get().filters.tags;
+        let mut chips: Vec<AnyView> = Vec::new();
+        for descriptor in snapshot.manual.iter().cloned() {
+            let tag = AgentTagRef::Manual(descriptor.id.clone());
+            let class = if active.contains(&tag) {
+                "filter-toggle agent-tag-filter active"
+            } else {
+                "filter-toggle agent-tag-filter"
+            };
+            let chip_state = filter_state.clone();
+            let click_tag = tag.clone();
+            let dot_style = descriptor
+                .color
+                .as_ref()
+                .map(|c| format!("background-color:{}", c.0))
+                .unwrap_or_default();
+            chips.push(
+                view! {
+                    <button
+                        type="button"
+                        class=class
+                        data-test="agent-tag-filter"
+                        on:click=move |_| toggle_tag_filter(&chip_state, &click_tag)
+                    >
+                        <span class="agent-tag-dot" style=dot_style aria-hidden="true"></span>
+                        {descriptor.name.clone()}
+                    </button>
+                }
+                .into_any(),
+            );
+        }
+        for descriptor in snapshot.system.iter().cloned() {
+            let tag = AgentTagRef::System(descriptor.id.clone());
+            let class = if active.contains(&tag) {
+                "filter-toggle agent-tag-filter agent-tag-filter-system active"
+            } else {
+                "filter-toggle agent-tag-filter agent-tag-filter-system"
+            };
+            let chip_state = filter_state.clone();
+            let click_tag = tag.clone();
+            chips.push(
+                view! {
+                    <button
+                        type="button"
+                        class=class
+                        data-test="agent-tag-filter-system"
+                        title="System tag (read-only, derived by the server)"
+                        on:click=move |_| toggle_tag_filter(&chip_state, &click_tag)
+                    >
+                        {descriptor.name.clone()}
+                    </button>
+                }
+                .into_any(),
+            );
+        }
+        chips.into_iter().collect_view()
+    };
+
+    let toggle_manage = move |_| manage_open.update(|open| *open = !*open);
+
+    let create_state = state.clone();
+    let on_create = move |_ev: web_sys::MouseEvent| {
+        let name = new_name.get_untracked().trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        let color = Some(AgentTagColor(new_color.get_untracked()));
+        send_tags_update(&create_state, AgentTagsUpdate::CreateTag { name, color });
+        new_name.set(String::new());
+    };
+
+    let list_state = state.clone();
+    let manage_list = move || {
+        tags.get()
+            .manual
+            .into_iter()
+            .map(|descriptor| {
+                let rename_state = list_state.clone();
+                let rename_id = descriptor.id.clone();
+                let on_rename = move |ev: leptos::ev::Event| {
+                    let name = event_target_value(&ev).trim().to_owned();
+                    if name.is_empty() {
+                        return;
+                    }
+                    send_tags_update(
+                        &rename_state,
+                        AgentTagsUpdate::RenameTag {
+                            tag_id: rename_id.clone(),
+                            name,
+                        },
+                    );
+                };
+                let color_state = list_state.clone();
+                let color_id = descriptor.id.clone();
+                let on_color = move |ev: leptos::ev::Event| {
+                    send_tags_update(
+                        &color_state,
+                        AgentTagsUpdate::SetTagColor {
+                            tag_id: color_id.clone(),
+                            color: Some(AgentTagColor(event_target_value(&ev))),
+                        },
+                    );
+                };
+                let delete_state = list_state.clone();
+                let delete_id = descriptor.id.clone();
+                let delete_name = descriptor.name.clone();
+                let on_delete = move |_ev: web_sys::MouseEvent| {
+                    delete_manual_tag(&delete_state, delete_id.clone(), delete_name.clone());
+                };
+                let color_value = descriptor
+                    .color
+                    .clone()
+                    .map(|c| c.0)
+                    .unwrap_or_else(|| DEFAULT_TAG_COLOR.to_owned());
+                view! {
+                    <div class="agent-tag-manage-row" data-test="agent-tag-manage-row">
+                        <input
+                            type="color"
+                            class="agent-tag-color-input"
+                            data-test="agent-tag-color-input"
+                            prop:value=color_value
+                            on:change=on_color
+                        />
+                        <input
+                            type="text"
+                            class="panel-search-input agent-tag-rename-input"
+                            data-test="agent-tag-rename-input"
+                            prop:value=descriptor.name.clone()
+                            on:change=on_rename
+                            spellcheck="false"
+                            autocapitalize="none"
+                            autocomplete="off"
+                        />
+                        <button
+                            type="button"
+                            class="filter-toggle agent-tag-delete-btn"
+                            data-test="agent-tag-delete-btn"
+                            on:click=on_delete
+                        >
+                            "Delete"
+                        </button>
+                    </div>
+                }
+            })
+            .collect_view()
+    };
+
+    view! {
+        <div
+            class="agent-monitor-filter-group agent-monitor-tag-filters"
+            data-test="agent-monitor-tag-filters"
+        >
+            {filter_chips}
+            <button
+                type="button"
+                class=move || {
+                    if manage_open.get() {
+                        "filter-toggle agent-tag-manage-toggle active"
+                    } else {
+                        "filter-toggle agent-tag-manage-toggle"
+                    }
+                }
+                data-test="agent-tag-manage-toggle"
+                on:click=toggle_manage
+            >
+                "Manage tags"
+            </button>
+        </div>
+        {move || {
+            if !manage_open.get() {
+                return None;
+            }
+            let on_create = on_create.clone();
+            let manage_list = manage_list.clone();
+            Some(view! {
+                <div class="agent-tag-manage" data-test="agent-tag-manage">
+                    <div class="agent-tag-manage-create">
+                        <input
+                            type="color"
+                            class="agent-tag-color-input"
+                            data-test="agent-tag-new-color"
+                            prop:value=move || new_color.get()
+                            on:input=move |ev| new_color.set(event_target_value(&ev))
+                        />
+                        <input
+                            type="text"
+                            class="panel-search-input agent-tag-create-input"
+                            data-test="agent-tag-new-name"
+                            placeholder="New tag name…"
+                            prop:value=new_name
+                            on:input=move |ev| new_name.set(event_target_value(&ev))
+                            spellcheck="false"
+                            autocapitalize="none"
+                            autocomplete="off"
+                        />
+                        <button
+                            type="button"
+                            class="filter-toggle agent-tag-new-create"
+                            data-test="agent-tag-new-create"
+                            on:click=on_create
+                        >
+                            "Create tag"
+                        </button>
+                    </div>
+                    <div class="agent-tag-manage-list">{manage_list}</div>
+                </div>
+            })
+        }}
+    }
+}
+
 #[component]
 fn AgentMonitorRowView(
     row: AgentMonitorRow,
@@ -1870,6 +2402,238 @@ fn AgentMonitorRowView(
     let stop_click = |ev: web_sys::MouseEvent| ev.stop_propagation();
     let stop_keydown = |ev: web_sys::KeyboardEvent| ev.stop_propagation();
 
+    // ── Tags + pins ──────────────────────────────────────────────────────
+    // All tag/pin display is a pure projection of the server snapshot: the
+    // row computes its annotation target once (stable) and looks the rest up
+    // reactively, so a tag/pin notify re-renders the affected rows without any
+    // durable frontend-local state (dev-docs/26 §4.1/§10.3).
+    let target = agent_annotation_target(&row.agent);
+
+    let manual_chip_state = state.clone();
+    let manual_chip_target = target.clone();
+    let manual_chips = move || {
+        let tags = manual_chip_state.agents_view_preferences.get().tags;
+        let descriptors: Vec<_> = manual_tag_ids_for(&manual_chip_target, &tags)
+            .into_iter()
+            .filter_map(|id| tags.manual.iter().find(|d| d.id == id).cloned())
+            .collect();
+        descriptors
+            .into_iter()
+            .map(|d| {
+                let style = d
+                    .color
+                    .as_ref()
+                    .map(|c| format!("background-color:{0};border-color:{0};", c.0))
+                    .unwrap_or_default();
+                view! {
+                    <span
+                        class="agent-tag-chip agent-tag-chip-manual"
+                        data-test="agent-tag-chip-manual"
+                        style=style
+                    >
+                        {d.name}
+                    </span>
+                }
+            })
+            .collect_view()
+    };
+
+    let system_chip_state = state.clone();
+    let system_chip_target = target.clone();
+    let system_chips = move || {
+        let tags = system_chip_state.agents_view_preferences.get().tags;
+        let ids = tags
+            .system_assignments
+            .iter()
+            .find(|assignment| assignment.target == system_chip_target)
+            .map(|assignment| assignment.tag_ids.clone())
+            .unwrap_or_default();
+        let descriptors: Vec<_> = ids
+            .into_iter()
+            .filter_map(|id| tags.system.iter().find(|d| d.id == id).cloned())
+            .collect();
+        descriptors
+            .into_iter()
+            .map(|d| {
+                view! {
+                    <span
+                        class="agent-tag-chip agent-tag-chip-system"
+                        data-test="agent-tag-chip-system"
+                        title="System tag (read-only, derived by the server)"
+                    >
+                        {d.name}
+                    </span>
+                }
+            })
+            .collect_view()
+    };
+
+    let pin_lookup_state = state.clone();
+    let pin_lookup_target = target.clone();
+    let is_pinned = Memo::new(move |_| {
+        pin_lookup_state
+            .agents_view_preferences
+            .get()
+            .pins
+            .pinned
+            .contains(&pin_lookup_target)
+    });
+    let pin_click_state = state.clone();
+    let pin_click_target = target.clone();
+    let toggle_pin = move |ev: web_sys::MouseEvent| {
+        ev.stop_propagation();
+        let pinned = pin_click_state
+            .agents_view_preferences
+            .get_untracked()
+            .pins
+            .pinned
+            .iter()
+            .any(|pinned| pinned == &pin_click_target);
+        let update = if pinned {
+            AgentPinsUpdate::Unpin {
+                target: pin_click_target.clone(),
+            }
+        } else {
+            AgentPinsUpdate::Pin {
+                target: pin_click_target.clone(),
+            }
+        };
+        send_pins_update(&pin_click_state, update);
+    };
+
+    // Per-row tag picker: assign/remove existing manual tags or create one.
+    let picker_open = RwSignal::new(false);
+    let picker_new_name = RwSignal::new(String::new());
+    let picker_toggle = move |ev: web_sys::MouseEvent| {
+        ev.stop_propagation();
+        picker_open.update(|open| *open = !*open);
+    };
+    let picker_state = state.clone();
+    let picker_target = target.clone();
+    let picker_menu = move || {
+        if !picker_open.get() {
+            return None;
+        }
+        let tags = picker_state.agents_view_preferences.get().tags;
+        let assigned = manual_tag_ids_for(&picker_target, &tags);
+        let items = tags
+            .manual
+            .iter()
+            .map(|d| {
+                let checked = assigned.contains(&d.id);
+                let item_state = picker_state.clone();
+                let item_target = picker_target.clone();
+                let item_id = d.id.clone();
+                let dot_style = d
+                    .color
+                    .as_ref()
+                    .map(|c| format!("background-color:{}", c.0))
+                    .unwrap_or_default();
+                let on_toggle = move |ev: web_sys::MouseEvent| {
+                    ev.stop_propagation();
+                    let update = if checked {
+                        AgentTagsUpdate::RemoveTag {
+                            target: item_target.clone(),
+                            tag_id: item_id.clone(),
+                        }
+                    } else {
+                        AgentTagsUpdate::AssignTag {
+                            target: item_target.clone(),
+                            tag_id: item_id.clone(),
+                        }
+                    };
+                    send_tags_update(&item_state, update);
+                };
+                view! {
+                    <button
+                        type="button"
+                        class="agent-tag-menu-item"
+                        data-test="agent-tag-menu-item"
+                        aria-pressed=if checked { "true" } else { "false" }
+                        on:click=on_toggle
+                        on:keydown=stop_keydown
+                    >
+                        <span class="agent-tag-check" aria-hidden="true">
+                            {if checked { "✓" } else { "" }}
+                        </span>
+                        <span class="agent-tag-dot" style=dot_style aria-hidden="true"></span>
+                        <span class="agent-tag-menu-label">{d.name.clone()}</span>
+                    </button>
+                }
+            })
+            .collect_view();
+
+        let create_state = picker_state.clone();
+        let on_create = move |_ev: web_sys::MouseEvent| {
+            let name = picker_new_name.get_untracked().trim().to_owned();
+            if name.is_empty() {
+                return;
+            }
+            send_tags_update(
+                &create_state,
+                AgentTagsUpdate::CreateTag { name, color: None },
+            );
+            picker_new_name.set(String::new());
+        };
+        let create_keydown_state = picker_state.clone();
+        let on_create_keydown = move |ev: web_sys::KeyboardEvent| {
+            ev.stop_propagation();
+            if ev.key() == "Enter" {
+                ev.prevent_default();
+                let name = picker_new_name.get_untracked().trim().to_owned();
+                if name.is_empty() {
+                    return;
+                }
+                send_tags_update(
+                    &create_keydown_state,
+                    AgentTagsUpdate::CreateTag { name, color: None },
+                );
+                picker_new_name.set(String::new());
+            }
+        };
+
+        Some(view! {
+            <div
+                class="agent-tag-menu-backdrop"
+                on:click=move |ev: web_sys::MouseEvent| {
+                    ev.stop_propagation();
+                    picker_open.set(false);
+                }
+            ></div>
+            <div
+                class="agent-tag-menu"
+                data-test="agent-tag-menu"
+                on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+            >
+                {items}
+                <div class="agent-tag-create">
+                    <input
+                        type="text"
+                        class="panel-search-input agent-tag-create-input"
+                        data-test="agent-tag-create-input"
+                        placeholder="New tag…"
+                        prop:value=picker_new_name
+                        on:input=move |ev| picker_new_name.set(event_target_value(&ev))
+                        on:keydown=on_create_keydown
+                        on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+                        spellcheck="false"
+                        autocapitalize="none"
+                        autocomplete="off"
+                    />
+                    <button
+                        type="button"
+                        class="filter-toggle agent-tag-create-btn"
+                        data-test="agent-tag-create-btn"
+                        on:click=on_create
+                        on:keydown=stop_keydown
+                    >
+                        "Create"
+                    </button>
+                </div>
+            </div>
+        })
+    };
+
     view! {
         <div
             class=row_class
@@ -1921,9 +2685,43 @@ fn AgentMonitorRowView(
                     <span aria-hidden="true">"•"</span>
                     <span>{relative_time(created)}</span>
                 </div>
+                <div class="agent-monitor-tags" data-test="agent-monitor-tags">
+                    {manual_chips}
+                    {system_chips}
+                </div>
             </div>
 
             <div class="agent-monitor-actions">
+                <button
+                    type="button"
+                    class=move || {
+                        if is_pinned.get() {
+                            "agent-monitor-pin-btn pinned"
+                        } else {
+                            "agent-monitor-pin-btn"
+                        }
+                    }
+                    data-test="agent-monitor-pin-btn"
+                    aria-pressed=move || if is_pinned.get() { "true" } else { "false" }
+                    title=move || if is_pinned.get() { "Unpin agent" } else { "Pin agent" }
+                    on:click=toggle_pin
+                    on:keydown=stop_keydown
+                >
+                    "📌"
+                </button>
+                <span class="agent-tag-picker">
+                    <button
+                        type="button"
+                        class="agent-monitor-tag-btn"
+                        data-test="agent-monitor-tag-btn"
+                        title="Add or remove tags"
+                        on:click=picker_toggle
+                        on:keydown=stop_keydown
+                    >
+                        "🏷"
+                    </button>
+                    {picker_menu}
+                </span>
                 {reorderable
                     .then(|| {
                         view! {
@@ -2246,7 +3044,9 @@ mod wasm_tests {
     use crate::state::AppState;
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, AgentSortMode, AgentStatusFilter, AgentsSmartViewsSnapshot, AgentsViewPreferences,
+        AgentId, AgentManualTagAssignment, AgentManualTagDescriptor, AgentPinsSnapshot,
+        AgentSortMode, AgentStatusFilter, AgentSystemTagAssignment, AgentSystemTagDescriptor,
+        AgentSystemTagId, AgentsSmartViewsSnapshot, AgentsViewPreferences,
         AgentsViewPreferencesSnapshot, BuiltInSmartViewId, SmartView, SmartViewId, StreamPath,
         UserSmartViewId,
     };
@@ -3011,5 +3811,450 @@ mod wasm_tests {
         // Query now diverges from "All" → no tab highlighted.
         assert!(state.agents_view_overlay_pending());
         assert!(active_tab_names(&container).is_empty());
+    }
+
+    // ── Tags + pins (Phase 2b) ──────────────────────────────────────────────
+
+    /// Transient annotation target for a test agent (these fixtures have no
+    /// session id), matching `agent_annotation_target`.
+    fn target(name: &str) -> AgentAnnotationTarget {
+        AgentAnnotationTarget::TransientAgent {
+            host_id: HostFilterId(HOST.to_owned()),
+            agent_id: AgentId(format!("agent-{name}")),
+        }
+    }
+
+    fn manual_descriptor(id: &str, name: &str) -> AgentManualTagDescriptor {
+        AgentManualTagDescriptor {
+            id: AgentManualTagId(id.to_owned()),
+            name: name.to_owned(),
+            color: None,
+        }
+    }
+
+    fn system_descriptor(id: &str, name: &str) -> AgentSystemTagDescriptor {
+        AgentSystemTagDescriptor {
+            id: AgentSystemTagId(id.to_owned()),
+            name: name.to_owned(),
+            color: None,
+        }
+    }
+
+    fn snapshot_full(
+        prefs: AgentsViewPreferences,
+        tags: AgentTagsSnapshot,
+        pins: AgentPinsSnapshot,
+    ) -> AgentsViewPreferencesSnapshot {
+        AgentsViewPreferencesSnapshot {
+            preferences: prefs,
+            load_error: None,
+            smart_views: Default::default(),
+            tags,
+            pins,
+        }
+    }
+
+    fn primed_state_full(
+        agents: Vec<AgentInfo>,
+        prefs: AgentsViewPreferences,
+        tags: AgentTagsSnapshot,
+        pins: AgentPinsSnapshot,
+    ) -> AppState {
+        let state = AppState::new();
+        state.agents.set(agents);
+        state.host_streams.update(|streams| {
+            streams.insert(HOST.to_owned(), StreamPath("/host/local".to_owned()));
+        });
+        state.apply_agents_view_snapshot(HOST, snapshot_full(prefs, tags, pins));
+        state
+    }
+
+    fn chip_texts(container: &HtmlElement, selector: &str) -> Vec<String> {
+        let nodes = container.query_selector_all(selector).unwrap();
+        (0..nodes.length())
+            .filter_map(|i| nodes.item(i))
+            .filter_map(|node| node.text_content())
+            .collect()
+    }
+
+    fn group_headers(container: &HtmlElement) -> Vec<String> {
+        chip_texts(container, ".agent-monitor-group-header")
+    }
+
+    /// JSON of the last `set_agent_tags` update on the wire (empty if none).
+    fn last_tags_update_json() -> String {
+        js_sys::eval(
+            r#"
+            (function() {
+                let out = "";
+                for (const [cmd, args] of (window.__test_send_calls || [])) {
+                    if (cmd !== "send_host_line") continue;
+                    const env = JSON.parse(JSON.parse(args).line);
+                    if (env.kind === "set_agent_tags") {
+                        out = JSON.stringify(env.payload.update);
+                    }
+                }
+                return out;
+            })()
+            "#,
+        )
+        .expect("probe tag sends")
+        .as_string()
+        .unwrap_or_default()
+    }
+
+    /// JSON of the last `set_agent_pins` update on the wire (empty if none).
+    fn last_pins_update_json() -> String {
+        js_sys::eval(
+            r#"
+            (function() {
+                let out = "";
+                for (const [cmd, args] of (window.__test_send_calls || [])) {
+                    if (cmd !== "send_host_line") continue;
+                    const env = JSON.parse(JSON.parse(args).line);
+                    if (env.kind === "set_agent_pins") {
+                        out = JSON.stringify(env.payload.update);
+                    }
+                }
+                return out;
+            })()
+            "#,
+        )
+        .expect("probe pin sends")
+        .as_string()
+        .unwrap_or_default()
+    }
+
+    /// JSON of the last `set_agents_view_preferences` update on the wire, so a
+    /// test can confirm the `tags` field of a `SetFilters` payload.
+    fn last_pref_update_json() -> String {
+        js_sys::eval(
+            r#"
+            (function() {
+                let out = "";
+                for (const [cmd, args] of (window.__test_send_calls || [])) {
+                    if (cmd !== "send_host_line") continue;
+                    const env = JSON.parse(JSON.parse(args).line);
+                    if (env.kind === "set_agents_view_preferences") {
+                        out = JSON.stringify(env.payload.update);
+                    }
+                }
+                return out;
+            })()
+            "#,
+        )
+        .expect("probe pref sends")
+        .as_string()
+        .unwrap_or_default()
+    }
+
+    // (a) A row renders its manual chips (with the tag name) AND its system
+    // chips, both projected from the snapshot's descriptors + assignments.
+    #[wasm_bindgen_test]
+    async fn row_renders_manual_and_system_tag_chips() {
+        let tags = AgentTagsSnapshot {
+            manual: vec![manual_descriptor("work", "Work")],
+            system: vec![system_descriptor("codex", "codex")],
+            manual_assignments: vec![AgentManualTagAssignment {
+                target: target("x"),
+                tag_ids: vec![AgentManualTagId("work".to_owned())],
+            }],
+            system_assignments: vec![AgentSystemTagAssignment {
+                target: target("x"),
+                tag_ids: vec![AgentSystemTagId("codex".to_owned())],
+            }],
+        };
+        let state = primed_state_full(
+            vec![agent("x", 100, false)],
+            AgentsViewPreferences::default(),
+            tags,
+            AgentPinsSnapshot::default(),
+        );
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <AgentMonitorView /> }
+        });
+        next_tick().await;
+
+        assert_eq!(
+            chip_texts(&container, "[data-test='agent-tag-chip-manual']"),
+            vec!["Work"]
+        );
+        assert_eq!(
+            chip_texts(&container, "[data-test='agent-tag-chip-system']"),
+            vec!["codex"]
+        );
+    }
+
+    // (b) Assigning a tag through the per-row picker emits a SetAgentTags
+    // AssignTag frame carrying the agent's target and the tag id.
+    #[wasm_bindgen_test]
+    async fn assigning_tag_emits_assign_tag_frame() {
+        install_send_stub();
+        let tags = AgentTagsSnapshot {
+            manual: vec![manual_descriptor("work", "Work")],
+            ..Default::default()
+        };
+        let state = primed_state_full(
+            vec![agent("x", 100, false)],
+            AgentsViewPreferences::default(),
+            tags,
+            AgentPinsSnapshot::default(),
+        );
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <AgentMonitorView /> }
+        });
+        next_tick().await;
+
+        // Open the row's tag picker, then toggle the (unassigned) "Work" tag on.
+        let tag_btn: HtmlElement = container
+            .query_selector("[data-test='agent-monitor-tag-btn']")
+            .unwrap()
+            .expect("tag button present")
+            .dyn_into()
+            .unwrap();
+        tag_btn.click();
+        next_tick().await;
+
+        let item: HtmlElement = container
+            .query_selector("[data-test='agent-tag-menu-item']")
+            .unwrap()
+            .expect("tag menu item present")
+            .dyn_into()
+            .unwrap();
+        item.click();
+        next_tick().await;
+
+        let update = last_tags_update_json();
+        assert!(
+            update.contains("\"kind\":\"assign_tag\""),
+            "update was {update}"
+        );
+        assert!(
+            update.contains("\"tag_id\":\"work\""),
+            "update was {update}"
+        );
+        // Target is the agent's transient annotation target (no session id yet).
+        assert!(
+            update.contains("\"kind\":\"transient_agent\""),
+            "update was {update}"
+        );
+        assert!(
+            update.contains("\"agent_id\":\"agent-x\""),
+            "update was {update}"
+        );
+    }
+
+    // (c) The tag filter narrows the visible rows (OR semantics) and emits a
+    // SetFilters frame whose filters carry the selected tag.
+    #[wasm_bindgen_test]
+    async fn tag_filter_filters_rows_and_emits_set_filters() {
+        install_send_stub();
+        let tags = AgentTagsSnapshot {
+            manual: vec![manual_descriptor("work", "Work")],
+            manual_assignments: vec![AgentManualTagAssignment {
+                target: target("x"),
+                tag_ids: vec![AgentManualTagId("work".to_owned())],
+            }],
+            ..Default::default()
+        };
+        // "x" is tagged Work; "y" is untagged.
+        let agents = vec![agent("x", 100, false), agent("y", 200, false)];
+        let state = primed_state_full(
+            agents,
+            AgentsViewPreferences::default(),
+            tags,
+            AgentPinsSnapshot::default(),
+        );
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <AgentMonitorView /> }
+        });
+        next_tick().await;
+
+        // Both rows visible before filtering.
+        assert_eq!(rendered_names(&container).len(), 2);
+
+        let filter: HtmlElement = container
+            .query_selector("[data-test='agent-tag-filter']")
+            .unwrap()
+            .expect("tag filter chip present")
+            .dyn_into()
+            .unwrap();
+        filter.click();
+        next_tick().await;
+
+        // Only the Work-tagged "x" remains, via the optimistic overlay.
+        assert_eq!(rendered_names(&container), vec!["x"]);
+
+        let update = last_pref_update_json();
+        assert!(
+            update.contains("\"kind\":\"set_filters\""),
+            "update was {update}"
+        );
+        // The tag ref rides in filters.tags as a manual tag id.
+        assert!(
+            update.contains("\"kind\":\"manual\""),
+            "update was {update}"
+        );
+        assert!(
+            update.contains("\"tag_id\":\"work\""),
+            "update was {update}"
+        );
+    }
+
+    // (d) Group-by-tag renders one group per tag (manual then system) plus an
+    // explicit Untagged group, with agents bucketed under their tags.
+    #[wasm_bindgen_test]
+    async fn group_by_tag_renders_per_tag_and_untagged_groups() {
+        let tags = AgentTagsSnapshot {
+            manual: vec![
+                manual_descriptor("work", "Work"),
+                manual_descriptor("play", "Play"),
+            ],
+            manual_assignments: vec![
+                AgentManualTagAssignment {
+                    target: target("x"),
+                    tag_ids: vec![AgentManualTagId("work".to_owned())],
+                },
+                AgentManualTagAssignment {
+                    target: target("y"),
+                    tag_ids: vec![AgentManualTagId("play".to_owned())],
+                },
+            ],
+            ..Default::default()
+        };
+        let prefs = AgentsViewPreferences {
+            group_mode: AgentGroupMode::Tag,
+            ..AgentsViewPreferences::default()
+        };
+        // "x" → Work, "y" → Play, "z" → untagged.
+        let agents = vec![
+            agent("x", 100, false),
+            agent("y", 200, false),
+            agent("z", 300, false),
+        ];
+        let state = primed_state_full(agents, prefs, tags, AgentPinsSnapshot::default());
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <AgentMonitorView /> }
+        });
+        next_tick().await;
+
+        let headers = group_headers(&container);
+        assert!(headers.contains(&"Work".to_owned()), "headers: {headers:?}");
+        assert!(headers.contains(&"Play".to_owned()), "headers: {headers:?}");
+        assert!(
+            headers.contains(&"Untagged".to_owned()),
+            "headers: {headers:?}"
+        );
+    }
+
+    // (e) The pin toggle emits SetAgentPins::Pin, and a snapshot that lists the
+    // agent as pinned floats it into a top Pinned section.
+    #[wasm_bindgen_test]
+    async fn pin_toggle_emits_pin_and_renders_pinned_section() {
+        install_send_stub();
+        let state = primed_state_full(
+            vec![agent("x", 100, false)],
+            AgentsViewPreferences::default(),
+            AgentTagsSnapshot::default(),
+            AgentPinsSnapshot::default(),
+        );
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <AgentMonitorView /> }
+        });
+        next_tick().await;
+
+        // No Pinned section yet.
+        assert!(
+            container
+                .query_selector("[data-test='agent-monitor-pinned-header']")
+                .unwrap()
+                .is_none()
+        );
+
+        let pin_btn: HtmlElement = container
+            .query_selector("[data-test='agent-monitor-pin-btn']")
+            .unwrap()
+            .expect("pin button present")
+            .dyn_into()
+            .unwrap();
+        pin_btn.click();
+        next_tick().await;
+
+        let update = last_pins_update_json();
+        assert!(update.contains("\"kind\":\"pin\""), "update was {update}");
+        assert!(
+            update.contains("\"agent_id\":\"agent-x\""),
+            "update was {update}"
+        );
+
+        // The authoritative snapshot now lists "x" as pinned → Pinned section.
+        state.apply_agents_view_snapshot(
+            HOST,
+            snapshot_full(
+                AgentsViewPreferences::default(),
+                AgentTagsSnapshot::default(),
+                AgentPinsSnapshot {
+                    pinned: vec![target("x")],
+                },
+            ),
+        );
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-test='agent-monitor-pinned-header']")
+                .unwrap()
+                .is_some(),
+            "expected a Pinned section header"
+        );
+        assert_eq!(rendered_names(&container), vec!["x"]);
+    }
+
+    // (f) A pinned agent that the active filter excludes is NOT force-shown:
+    // pins respect the active filters/search (dev-docs/26 §4.7).
+    #[wasm_bindgen_test]
+    async fn filtered_out_pinned_agent_is_hidden() {
+        // "y" is terminated AND pinned; hide_finished must still drop it.
+        let prefs = AgentsViewPreferences {
+            hide_finished: true,
+            ..AgentsViewPreferences::default()
+        };
+        let agents = vec![agent("x", 100, false), agent("y", 200, true)];
+        let pins = AgentPinsSnapshot {
+            pinned: vec![target("y")],
+        };
+        let state = primed_state_full(agents, prefs, AgentTagsSnapshot::default(), pins);
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <AgentMonitorView /> }
+        });
+        next_tick().await;
+
+        // Pinned-but-filtered "y" is absent; only "x" shows; no Pinned section.
+        assert_eq!(rendered_names(&container), vec!["x"]);
+        assert!(
+            container
+                .query_selector("[data-test='agent-monitor-pinned-header']")
+                .unwrap()
+                .is_none(),
+            "filtered-out pin must not create a Pinned section"
+        );
     }
 }

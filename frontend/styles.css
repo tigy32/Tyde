@@ -4848,6 +4848,221 @@ kbd {
     cursor: not-allowed;
 }
 
+/* ===== Agent tags + pins (Phase 2b) ===== */
+.agent-monitor-tags {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1);
+    margin-top: var(--space-1);
+}
+
+.agent-monitor-tags:empty {
+    display: none;
+}
+
+/* Manual tag chip: colored via inline style (the tag's own color), falling
+   back to the accent-subtle treatment when no color is set. */
+.agent-tag-chip {
+    display: inline-flex;
+    align-items: center;
+    max-width: 160px;
+    overflow: hidden;
+    padding: 1px var(--space-2);
+    border-radius: 10px;
+    font-size: 0.692rem;
+    font-weight: 600;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.agent-tag-chip-manual {
+    color: var(--text-bright);
+    background: var(--accent-subtle);
+    border: 1px solid var(--accent-primary);
+}
+
+/* System tags are read-only facts: muted, no border emphasis, no pointer. */
+.agent-tag-chip-system {
+    color: var(--text-tertiary);
+    background: var(--surface-1);
+    border: 1px dashed var(--border-secondary);
+    font-weight: 500;
+    text-transform: lowercase;
+}
+
+.agent-tag-dot {
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    margin-right: 4px;
+    border-radius: 50%;
+    background: var(--accent-primary);
+}
+
+/* Pin toggle + tag-picker button live in the row action cell. */
+.agent-monitor-pin-btn,
+.agent-monitor-tag-btn {
+    font-size: 0.769rem;
+    line-height: 1;
+    color: var(--text-tertiary);
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    padding: 3px 6px;
+    transition: background 0.15s, color 0.15s, border-color 0.15s, opacity 0.15s;
+    opacity: 0.65;
+}
+
+.agent-monitor-pin-btn:hover,
+.agent-monitor-tag-btn:hover {
+    opacity: 1;
+    color: var(--text-bright);
+    background: var(--surface-2);
+    border-color: var(--border-secondary);
+}
+
+.agent-monitor-pin-btn.pinned {
+    opacity: 1;
+    color: var(--text-bright);
+    background: var(--accent-primary);
+    border-color: var(--accent-primary);
+}
+
+.agent-monitor-pinned-header {
+    color: var(--accent-link);
+}
+
+/* Per-row tag picker popover. */
+.agent-tag-picker {
+    position: relative;
+    display: inline-flex;
+}
+
+.agent-tag-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 15;
+}
+
+.agent-tag-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    min-width: 180px;
+    max-height: 280px;
+    overflow-y: auto;
+    padding: 4px;
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+.agent-tag-menu-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    background: transparent;
+    color: var(--text-primary);
+    border: none;
+    border-radius: 4px;
+    padding: 6px var(--space-2);
+    text-align: left;
+    font-size: 0.846rem;
+    cursor: pointer;
+}
+
+.agent-tag-menu-item:hover {
+    background: var(--accent-subtle);
+}
+
+.agent-tag-check {
+    flex-shrink: 0;
+    width: 14px;
+    color: var(--accent-link);
+    font-weight: 700;
+}
+
+.agent-tag-menu-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.agent-tag-create {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-top: 4px;
+    padding-top: 4px;
+    border-top: 1px solid var(--border-primary);
+}
+
+.agent-tag-create-input {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+/* Tag filter chips: a manual chip's color dot precedes its name. */
+.agent-tag-filter .agent-tag-dot {
+    margin-right: var(--space-1);
+}
+
+.agent-tag-filter-system {
+    font-style: italic;
+}
+
+/* Tag management panel (create / rename / recolor / delete). Spans the full
+   width of the wrapping filter row. */
+.agent-tag-manage {
+    flex-basis: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
+    padding: var(--space-3);
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+}
+
+.agent-tag-manage-create,
+.agent-tag-manage-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.agent-tag-manage-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.agent-tag-rename-input {
+    flex: 1 1 200px;
+    min-width: 120px;
+}
+
+.agent-tag-color-input {
+    flex-shrink: 0;
+    width: 28px;
+    height: 24px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.agent-tag-delete-btn {
+    color: var(--error);
+}
+
 /* ===== Agent Cards ===== */
 .agent-card-list {
     display: flex;
