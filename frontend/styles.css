@@ -4491,6 +4491,122 @@ kbd {
     white-space: nowrap;
 }
 
+.agent-monitor-smart-views {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.smart-view-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+}
+
+.smart-view-tab-group {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+}
+
+.smart-view-tab {
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    padding: 4px 10px;
+    font-size: 0.846rem;
+    cursor: pointer;
+}
+
+.smart-view-tab:hover {
+    border-color: var(--accent-primary);
+    color: var(--text-primary);
+}
+
+.smart-view-tab.active {
+    background: var(--accent-subtle);
+    border-color: var(--accent-primary);
+    color: var(--accent-link);
+    font-weight: 600;
+}
+
+.smart-view-menu-toggle {
+    background: transparent;
+    color: var(--text-secondary);
+    border: none;
+    border-radius: var(--radius-sm);
+    padding: 2px 4px;
+    margin-left: 2px;
+    cursor: pointer;
+    line-height: 1;
+}
+
+.smart-view-menu-toggle:hover {
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+}
+
+.smart-view-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 15;
+}
+
+.smart-view-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    min-width: 160px;
+    padding: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+
+.smart-view-menu-item {
+    background: transparent;
+    color: var(--text-primary);
+    border: none;
+    border-radius: var(--radius-sm);
+    padding: 6px 8px;
+    text-align: left;
+    font-size: 0.846rem;
+    cursor: pointer;
+}
+
+.smart-view-menu-item:hover:not(:disabled) {
+    background: var(--accent-subtle);
+}
+
+.smart-view-menu-item:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.smart-view-menu-item.smart-view-delete {
+    color: var(--error);
+}
+
+.smart-view-prompt {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.smart-view-name-input {
+    flex: 0 1 200px;
+    min-width: 140px;
+}
+
 .agent-monitor-toolbar {
     display: flex;
     flex-wrap: wrap;

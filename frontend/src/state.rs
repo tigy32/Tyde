@@ -15,9 +15,9 @@ use protocol::{
     ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath,
     ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, ProjectSearchFileResult,
     QueuedMessageEntry, Review, ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary,
-    SessionId, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId, Steering,
-    SteeringId, StreamPath, TaskList, Team, TeamDraft, TeamDraftId, TeamId, TeamMember,
-    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
+    SessionId, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId,
+    SmartViewId, Steering, SteeringId, StreamPath, TaskList, Team, TeamDraft, TeamDraftId, TeamId,
+    TeamMember, TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
     TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
     ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
     WorkflowDiagnostic, WorkflowRunId, WorkflowRunSnapshot, WorkflowSummary,
@@ -1057,6 +1057,14 @@ pub struct AgentsViewOverlay {
     pub density: Option<AgentListDensity>,
     pub hide_finished: Option<bool>,
     pub manual_order: Option<Vec<AgentOrderKey>>,
+    /// Optimistic override for the active Smart View id (dev-docs/26 §12.4):
+    /// selecting a view sets the inner value to `Some(id)` so the switcher
+    /// highlights instantly, while editing the query directly sets it to `None`
+    /// so the highlight clears (the query no longer matches a named view). The
+    /// outer `Option` follows the same domain-overlay convention as the other
+    /// fields: `None` means "no override, read the server snapshot". Dropped
+    /// wholesale on the next authoritative snapshot like every other domain.
+    pub active_view_id: Option<Option<SmartViewId>>,
 }
 
 impl AgentsViewOverlay {
@@ -2041,6 +2049,24 @@ impl AppState {
             density: overlay.density.unwrap_or(base.density),
             hide_finished: overlay.hide_finished.unwrap_or(base.hide_finished),
             manual_order: overlay.manual_order.unwrap_or(base.manual_order),
+        }
+    }
+
+    /// Reactively resolve the active Smart View id: the optimistic overlay
+    /// value when a view selection (or a divergent query edit) is in flight,
+    /// otherwise the server snapshot's `active_view_id`. `None` means no view
+    /// is highlighted — either the server reports a custom/divergent query or
+    /// an in-flight edit cleared the highlight. Reads both signals so callers
+    /// inside a reactive closure re-run on either change.
+    pub fn effective_active_smart_view_id(&self) -> Option<SmartViewId> {
+        match self.pending_agents_view_overlay.get().active_view_id {
+            Some(active) => active,
+            None => {
+                self.agents_view_preferences
+                    .get()
+                    .smart_views
+                    .active_view_id
+            }
         }
     }
 

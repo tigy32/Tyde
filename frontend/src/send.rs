@@ -3,16 +3,17 @@ use std::collections::HashMap;
 
 use protocol::types::{AgentCompactPayload, TeamCompactPayload};
 use protocol::{
-    AgentsViewPreferencesUpdate, CancelWorkflowPayload, CloseAgentPayload, CustomAgent,
-    CustomAgentDeletePayload, CustomAgentId, CustomAgentUpsertPayload, Envelope, FrameKind,
-    ImageData, McpServerConfig, McpServerDeletePayload, McpServerId, McpServerUpsertPayload,
-    MobileDeviceId, MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferId,
-    MobilePairingStartPayload, ProjectId, SetAgentsViewPreferencesPayload, SkillRefreshPayload,
-    Steering, SteeringDeletePayload, SteeringId, SteeringUpsertPayload, StreamPath,
-    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
-    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftId, TeamDraftMemberEdit,
-    TeamDraftMemberId, TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload,
-    TeamId, TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
+    AgentsSmartViewsUpdate, AgentsViewPreferencesUpdate, CancelWorkflowPayload, CloseAgentPayload,
+    CustomAgent, CustomAgentDeletePayload, CustomAgentId, CustomAgentUpsertPayload, Envelope,
+    FrameKind, ImageData, McpServerConfig, McpServerDeletePayload, McpServerId,
+    McpServerUpsertPayload, MobileDeviceId, MobileDeviceRevokePayload, MobilePairingCancelPayload,
+    MobilePairingOfferId, MobilePairingStartPayload, ProjectId, SetAgentsSmartViewsPayload,
+    SetAgentsViewPreferencesPayload, SkillRefreshPayload, Steering, SteeringDeletePayload,
+    SteeringId, SteeringUpsertPayload, StreamPath, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftId, TeamDraftMemberEdit, TeamDraftMemberId,
+    TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload, TeamId,
+    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
     TeamMemberDeletePayload, TeamMemberId, TeamMemberShufflePayload, TeamMemberUpdatePayload,
     TeamSetManagerPayload, TeamTemplateId, TriggerWorkflowPayload, WorkflowId,
     WorkflowRefreshPayload, WorkflowRunId,
@@ -98,6 +99,27 @@ pub async fn set_agents_view_preferences(
         host_stream,
         FrameKind::SetAgentsViewPreferences,
         &SetAgentsViewPreferencesPayload { update },
+    )
+    .await
+}
+
+/// Send a Smart View mutation to the primary local host. Like
+/// `set_agents_view_preferences`, the server persists it and fans out a full
+/// `AgentsViewPreferencesNotify` snapshot (which now carries `smart_views`),
+/// reconciling any optimistic overlay installed by the caller. `SetActive` is a
+/// server-side compound mutation: it sets the active view id and copies that
+/// view's query into the active preferences, all in one authoritative snapshot.
+/// Routed on the host stream like the preference mutations.
+pub async fn set_agents_smart_views(
+    host_id: &str,
+    host_stream: StreamPath,
+    update: AgentsSmartViewsUpdate,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::SetAgentsSmartViews,
+        &SetAgentsSmartViewsPayload { update },
     )
     .await
 }
