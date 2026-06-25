@@ -48,11 +48,11 @@ use protocol::{
     TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
     TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload,
     WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowCatalogLocation,
-    WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowNotifyPayload, WorkflowRunId,
-    WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus, WorkflowSaveMode,
-    WorkflowSaveRequest, WorkflowSaveResponse, WorkflowSaveTarget, WorkflowSource,
-    WorkflowSourceScope, WorkflowStepRunId, WorkflowStepRunSnapshot, WorkflowTargetDirectory,
-    WorkflowTargetsResponse,
+    WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowInputControl, WorkflowInputSpec,
+    WorkflowNotifyPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
+    WorkflowRunSnapshotStatus, WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse,
+    WorkflowSaveTarget, WorkflowSource, WorkflowSourceScope, WorkflowStepRunId,
+    WorkflowStepRunSnapshot, WorkflowTargetDirectory, WorkflowTargetsResponse,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
@@ -5493,7 +5493,6 @@ impl HostHandle {
         const OPERATION: &str = "trigger_workflow";
         let workflow_id = payload.workflow_id;
         let project_id = payload.project_id;
-        let inputs = payload.inputs;
         let (definition, workspace_roots, workflow_mcp, settings, use_mock_backend) = {
             let state = self.state.lock().await;
             let definition = state
@@ -5530,6 +5529,12 @@ impl HostHandle {
                 state.use_mock_backend,
             )
         };
+        let inputs = validate_workflow_trigger_inputs(
+            OPERATION,
+            &definition.summary.inputs,
+            payload.inputs,
+            &workflow_id,
+        )?;
 
         let now = crate::agent::now_ms();
         let run_id = WorkflowRunId(Uuid::new_v4().to_string());
@@ -9087,6 +9092,88 @@ pub(crate) fn mcp_url_for_agent(base_url: &str, agent_id: &AgentId) -> String {
         "{base_url}{separator}agent_id={}",
         percent_encode_query_component(&agent_id.0)
     )
+}
+
+fn validate_workflow_trigger_inputs(
+    operation: &'static str,
+    specs: &[WorkflowInputSpec],
+    mut provided: HashMap<String, serde_json::Value>,
+    workflow_id: &protocol::WorkflowId,
+) -> AppResult<HashMap<String, serde_json::Value>> {
+    let declared = specs
+        .iter()
+        .map(|input| input.id.as_str())
+        .collect::<HashSet<_>>();
+    for key in provided.keys() {
+        if !declared.contains(key.as_str()) {
+            return Err(AppError::invalid(
+                operation,
+                format!("unknown input {key:?} for workflow {workflow_id}"),
+            ));
+        }
+    }
+
+    let mut effective = HashMap::new();
+    for spec in specs {
+        let value = provided.remove(&spec.id).or_else(|| spec.default.clone());
+        let Some(value) = value else {
+            if spec.required {
+                return Err(AppError::invalid(
+                    operation,
+                    format!(
+                        "missing required input {:?} for workflow {workflow_id}",
+                        spec.id
+                    ),
+                ));
+            }
+            continue;
+        };
+        if !workflow_input_value_matches(spec, &value) {
+            return Err(AppError::invalid(
+                operation,
+                format!(
+                    "input {:?} for workflow {workflow_id} must be {}",
+                    spec.id,
+                    workflow_input_expected_value(spec)
+                ),
+            ));
+        }
+        effective.insert(spec.id.clone(), value);
+    }
+
+    Ok(effective)
+}
+
+fn workflow_input_value_matches(spec: &WorkflowInputSpec, value: &serde_json::Value) -> bool {
+    match spec.control {
+        WorkflowInputControl::Text
+        | WorkflowInputControl::MultilineText
+        | WorkflowInputControl::FilePath => value.is_string(),
+        WorkflowInputControl::Boolean => value.is_boolean(),
+        WorkflowInputControl::Number => value.is_number(),
+        WorkflowInputControl::Select => value
+            .as_str()
+            .is_some_and(|selected| spec.options.iter().any(|option| option.value == selected)),
+    }
+}
+
+fn workflow_input_expected_value(spec: &WorkflowInputSpec) -> String {
+    match spec.control {
+        WorkflowInputControl::Text => "a string".to_owned(),
+        WorkflowInputControl::MultilineText => "a string".to_owned(),
+        WorkflowInputControl::FilePath => "a string".to_owned(),
+        WorkflowInputControl::Boolean => "a boolean".to_owned(),
+        WorkflowInputControl::Number => "a number".to_owned(),
+        WorkflowInputControl::Select => {
+            let options = spec
+                .options
+                .iter()
+                .map(|option| format!("{:?}", option.value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("one of the select option values: {options}")
+        }
+    }
 }
 
 fn is_workflow_terminal(status: WorkflowRunSnapshotStatus) -> bool {

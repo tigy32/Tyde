@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -851,6 +851,25 @@ pub struct WorkflowCoordinatorSpec {
     pub access_mode: BackendAccessMode,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowInputControl {
+    #[default]
+    Text,
+    MultilineText,
+    Boolean,
+    Number,
+    Select,
+    FilePath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowInputOption {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowInputSpec {
     pub id: String,
@@ -861,7 +880,9 @@ pub struct WorkflowInputSpec {
     #[serde(default)]
     pub required: bool,
     #[serde(default)]
-    pub input_type: Option<String>,
+    pub control: WorkflowInputControl,
+    #[serde(default)]
+    pub options: Vec<WorkflowInputOption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Value>,
 }
@@ -4699,8 +4720,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_seventeen() {
-        assert_eq!(PROTOCOL_VERSION, 17);
+    fn protocol_version_is_eighteen() {
+        assert_eq!(PROTOCOL_VERSION, 18);
     }
 
     #[test]

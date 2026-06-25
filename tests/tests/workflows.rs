@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentId, AgentOrigin, BackendAccessMode, BackendKind, CancelWorkflowPayload, Envelope,
-    FrameKind, HostBootstrapPayload, NewAgentPayload, Project, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeleteRootPayload, ProjectNotifyPayload, ProjectRootPath,
-    SpawnAgentParams, SpawnAgentPayload, TriggerWorkflowPayload, WorkflowId, WorkflowNotifyPayload,
+    AgentId, AgentOrigin, BackendAccessMode, BackendKind, CancelWorkflowPayload, ChatEvent,
+    CommandErrorCode, CommandErrorPayload, Envelope, FrameKind, HostBootstrapPayload,
+    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeleteRootPayload, ProjectNotifyPayload, ProjectRootPath, SpawnAgentParams,
+    SpawnAgentPayload, StreamPath, TriggerWorkflowPayload, WorkflowId, WorkflowNotifyPayload,
     WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus,
     WorkflowSaveResponse, WorkflowStepRunSnapshotStatus, WorkflowTargetsResponse,
 };
@@ -75,6 +76,7 @@ async fn next_event(client: &mut client::Connection, context: &str) -> Envelope 
                 env.kind,
                 FrameKind::SessionSchemas
                     | FrameKind::BackendSetup
+                    | FrameKind::AgentsViewPreferencesNotify
                     | FrameKind::TeamPresetCatalogNotify
                     | FrameKind::SkillNotify
                     | FrameKind::CustomAgentNotify
@@ -131,6 +133,12 @@ fn workflow_markdown_with_access(id: &str, name: &str, body: &str, access_mode: 
     )
 }
 
+fn workflow_markdown_with_inputs(id: &str, name: &str) -> String {
+    format!(
+        "---\nid: {id}\nname: {name}\ndescription: Run with typed inputs\ncoordinator:\n  backend: codex\n  access_mode: read_only\ndeclared_backends: [codex]\ntriggers: [global]\ninputs:\n  - id: target\n    name: Target\n    required: true\n    control: text\n  - id: notes\n    control: multiline_text\n    default: \"Use defaults\"\n  - id: enabled\n    control: boolean\n    default: true\n  - id: retries\n    control: number\n    default: 3\n  - id: mode\n    control: select\n    options:\n      - value: fast\n        label: Fast\n      - value: safe\n        label: Safe\n    default: safe\n  - id: config_path\n    control: file_path\n---\nValidate the supplied inputs.\n"
+    )
+}
+
 async fn wait_for_workflow_catalog(client: &mut client::Connection) {
     loop {
         let env = next_event(client, "workflow catalog").await;
@@ -159,6 +167,55 @@ where
         }
     }
     panic!("timed out waiting for matching WorkflowNotify: {context}");
+}
+
+async fn wait_for_workflow_command_error(
+    client: &mut client::Connection,
+    context: &str,
+) -> CommandErrorPayload {
+    for _ in 0..20 {
+        let env = next_event(client, context).await;
+        match env.kind {
+            FrameKind::CommandError => {
+                return env.parse_payload().expect("CommandErrorPayload");
+            }
+            FrameKind::WorkflowRunNotify => {
+                let payload: WorkflowRunNotifyPayload =
+                    env.parse_payload().expect("WorkflowRunNotify");
+                if payload.run.status == WorkflowRunSnapshotStatus::Running {
+                    panic!(
+                        "workflow run was created before expected command error {context}: {:?}",
+                        payload.run
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("timed out waiting for workflow command error: {context}");
+}
+
+async fn collect_turn_delta_text(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    context: &str,
+) -> String {
+    let mut text = String::new();
+    let mut saw_turn = false;
+    loop {
+        let env = next_event(client, context).await;
+        if env.stream != *stream || env.kind != FrameKind::ChatEvent {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("ChatEvent");
+        match event {
+            ChatEvent::TypingStatusChanged(true) => saw_turn = true,
+            ChatEvent::StreamDelta(delta) => text.push_str(&delta.text),
+            ChatEvent::StreamEnd(end) => text.push_str(&end.message.content),
+            ChatEvent::TypingStatusChanged(false) if saw_turn => return text,
+            _ => {}
+        }
+    }
 }
 
 async fn trigger_workflow_and_wait_for_coordinator(
@@ -369,6 +426,208 @@ async fn trigger_workflow_spawns_workflow_origin_coordinator() {
     let metadata = coordinator.workflow.expect("workflow metadata missing");
     assert_eq!(metadata.workflow_id, WorkflowId("build".to_owned()));
     assert_eq!(metadata.workflow_run_id, run_id);
+}
+
+#[tokio::test]
+async fn workflow_trigger_input_validation_rejects_bad_runs() {
+    let global = GlobalWorkflowsEnv::new().await;
+    std::fs::write(
+        global.path().join("input-flow.md"),
+        workflow_markdown_with_inputs("input-flow", "Input Flow"),
+    )
+    .expect("write input workflow");
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .workflow_refresh(protocol::WorkflowRefreshPayload::default())
+        .await
+        .expect("workflow_refresh failed");
+    wait_for_workflow_notify(&mut fixture.client, "input workflow catalog", |payload| {
+        payload
+            .summaries
+            .iter()
+            .any(|summary| summary.id == WorkflowId("input-flow".to_owned()))
+    })
+    .await;
+
+    fixture
+        .client
+        .trigger_workflow(TriggerWorkflowPayload {
+            workflow_id: WorkflowId("input-flow".to_owned()),
+            project_id: None,
+            inputs: HashMap::new(),
+        })
+        .await
+        .expect("send missing required trigger");
+    let error = wait_for_workflow_command_error(&mut fixture.client, "missing input").await;
+    assert_eq!(error.request_kind, FrameKind::TriggerWorkflow);
+    assert_eq!(error.operation, "trigger_workflow");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(
+        error.message.contains("missing required input \"target\""),
+        "unexpected missing-input message: {}",
+        error.message
+    );
+
+    fixture
+        .client
+        .trigger_workflow(TriggerWorkflowPayload {
+            workflow_id: WorkflowId("input-flow".to_owned()),
+            project_id: None,
+            inputs: HashMap::from([
+                ("target".to_owned(), json!("src/lib.rs")),
+                ("unexpected".to_owned(), json!("nope")),
+            ]),
+        })
+        .await
+        .expect("send unknown input trigger");
+    let error = wait_for_workflow_command_error(&mut fixture.client, "unknown input").await;
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(
+        error.message.contains("unknown input \"unexpected\""),
+        "unexpected unknown-input message: {}",
+        error.message
+    );
+
+    fixture
+        .client
+        .trigger_workflow(TriggerWorkflowPayload {
+            workflow_id: WorkflowId("input-flow".to_owned()),
+            project_id: None,
+            inputs: HashMap::from([
+                ("target".to_owned(), json!("src/lib.rs")),
+                ("enabled".to_owned(), json!("yes")),
+            ]),
+        })
+        .await
+        .expect("send type mismatch trigger");
+    let error = wait_for_workflow_command_error(&mut fixture.client, "type mismatch").await;
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(
+        error.message.contains("input \"enabled\"") && error.message.contains("must be a boolean"),
+        "unexpected type-mismatch message: {}",
+        error.message
+    );
+
+    fixture
+        .client
+        .trigger_workflow(TriggerWorkflowPayload {
+            workflow_id: WorkflowId("input-flow".to_owned()),
+            project_id: None,
+            inputs: HashMap::from([
+                ("target".to_owned(), json!("src/lib.rs")),
+                ("mode".to_owned(), json!("turbo")),
+            ]),
+        })
+        .await
+        .expect("send invalid select trigger");
+    let error = wait_for_workflow_command_error(&mut fixture.client, "invalid select").await;
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(
+        error.message.contains("input \"mode\"") && error.message.contains("select option values"),
+        "unexpected select message: {}",
+        error.message
+    );
+
+    let (_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        bootstrap.workflow_runs.is_empty(),
+        "invalid triggers should not create workflow runs"
+    );
+}
+
+#[tokio::test]
+async fn workflow_trigger_applies_defaults_and_spawns_coordinator() {
+    let global = GlobalWorkflowsEnv::new().await;
+    std::fs::write(
+        global.path().join("input-flow.md"),
+        workflow_markdown_with_inputs("input-flow", "Input Flow"),
+    )
+    .expect("write input workflow");
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .workflow_refresh(protocol::WorkflowRefreshPayload::default())
+        .await
+        .expect("workflow_refresh failed");
+    wait_for_workflow_notify(&mut fixture.client, "input workflow catalog", |payload| {
+        payload
+            .summaries
+            .iter()
+            .any(|summary| summary.id == WorkflowId("input-flow".to_owned()))
+    })
+    .await;
+
+    fixture
+        .client
+        .trigger_workflow(TriggerWorkflowPayload {
+            workflow_id: WorkflowId("input-flow".to_owned()),
+            project_id: None,
+            inputs: HashMap::from([
+                ("target".to_owned(), json!("src/lib.rs")),
+                ("config_path".to_owned(), json!("/tmp/config.toml")),
+            ]),
+        })
+        .await
+        .expect("trigger workflow with valid inputs");
+
+    let mut run = None;
+    let mut coordinator = None;
+    for _ in 0..30 {
+        let env = next_event(&mut fixture.client, "valid input workflow").await;
+        match env.kind {
+            FrameKind::WorkflowRunNotify => {
+                let payload: WorkflowRunNotifyPayload =
+                    env.parse_payload().expect("WorkflowRunNotify");
+                if payload.run.workflow_id == WorkflowId("input-flow".to_owned())
+                    && payload.run.status == WorkflowRunSnapshotStatus::Running
+                {
+                    run = Some(payload.run);
+                }
+            }
+            FrameKind::NewAgent => {
+                let payload: NewAgentPayload = env.parse_payload().expect("NewAgent");
+                if payload.origin == AgentOrigin::Workflow && payload.name == "Workflow: Input Flow"
+                {
+                    coordinator = Some(payload);
+                }
+            }
+            _ => {}
+        }
+        if run.is_some() && coordinator.is_some() {
+            break;
+        }
+    }
+    let run = run.expect("workflow run notify missing");
+    assert_eq!(run.inputs.get("target"), Some(&json!("src/lib.rs")));
+    assert_eq!(
+        run.inputs.get("config_path"),
+        Some(&json!("/tmp/config.toml"))
+    );
+    assert_eq!(run.inputs.get("notes"), Some(&json!("Use defaults")));
+    assert_eq!(run.inputs.get("enabled"), Some(&json!(true)));
+    assert_eq!(run.inputs.get("retries"), Some(&json!(3)));
+    assert_eq!(run.inputs.get("mode"), Some(&json!("safe")));
+
+    let coordinator = coordinator.expect("workflow coordinator missing");
+    let response = collect_turn_delta_text(
+        &mut fixture.client,
+        &coordinator.instance_stream,
+        "coordinator prompt with inputs",
+    )
+    .await;
+    assert!(
+        response.contains("\"target\": \"src/lib.rs\""),
+        "coordinator prompt did not include supplied target: {response}"
+    );
+    assert!(
+        response.contains("\"mode\": \"safe\""),
+        "coordinator prompt did not include defaulted select: {response}"
+    );
+    assert!(
+        response.contains("\"enabled\": true"),
+        "coordinator prompt did not include defaulted boolean: {response}"
+    );
 }
 
 #[tokio::test]
@@ -1139,8 +1398,8 @@ async fn workflow_strict_validator_and_legacy_diagnostics_are_visible() {
         ),
         (
             "bad-input-kind.md",
-            "---\nid: bad-input-kind\nname: Bad Input Kind\ncoordinator:\n  backend: codex\ninputs:\n  - id: target\n    input_type: mystery\n---\nBody\n".to_owned(),
-            "unknown workflow input kind",
+            "---\nid: bad-input-kind\nname: Bad Input Kind\ncoordinator:\n  backend: codex\ninputs:\n  - id: target\n    control: mystery\n---\nBody\n".to_owned(),
+            "unknown workflow input control kind",
         ),
         (
             "duplicate-input.md",
@@ -1149,7 +1408,7 @@ async fn workflow_strict_validator_and_legacy_diagnostics_are_visible() {
         ),
         (
             "default-mismatch.md",
-            "---\nid: default-mismatch\nname: Default Mismatch\ncoordinator:\n  backend: codex\ninputs:\n  - id: enabled\n    input_type: boolean\n    default: nope\n---\nBody\n".to_owned(),
+            "---\nid: default-mismatch\nname: Default Mismatch\ncoordinator:\n  backend: codex\ninputs:\n  - id: enabled\n    control: boolean\n    default: nope\n---\nBody\n".to_owned(),
             "must be a boolean",
         ),
     ];
@@ -1182,20 +1441,36 @@ async fn workflow_strict_validator_and_legacy_diagnostics_are_visible() {
         workflow_markdown("Legacy", "Legacy", "Legacy body."),
     )
     .expect("write legacy workflow");
+    std::fs::write(
+        global.path().join("unknown-control.md"),
+        "---\nid: unknown-control\nname: Unknown Control\ncoordinator:\n  backend: codex\ninputs:\n  - id: target\n    control: mystery\n---\nBody\n",
+    )
+    .expect("write unknown-control workflow");
     fixture
         .client
         .workflow_refresh(protocol::WorkflowRefreshPayload::default())
         .await
         .expect("workflow_refresh failed");
     let notify = wait_for_workflow_notify(&mut fixture.client, "legacy diagnostic", |payload| {
-        payload.diagnostics.iter().any(|diagnostic| {
+        let has_legacy = payload.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .source
                 .as_ref()
                 .is_some_and(|source| source.path.ends_with("legacy.md"))
                 && diagnostic.message.contains("must match")
                 && diagnostic.severity == protocol::WorkflowDiagnosticSeverity::Warning
-        })
+        });
+        let has_unknown_control = payload.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .source
+                .as_ref()
+                .is_some_and(|source| source.path.ends_with("unknown-control.md"))
+                && diagnostic
+                    .message
+                    .contains("unknown workflow input control kind")
+                && diagnostic.severity == protocol::WorkflowDiagnosticSeverity::Warning
+        });
+        has_legacy && has_unknown_control
     })
     .await;
     assert!(
@@ -1204,6 +1479,26 @@ async fn workflow_strict_validator_and_legacy_diagnostics_are_visible() {
             .iter()
             .any(|summary| summary.id == WorkflowId("Legacy".to_owned())),
         "legacy invalid workflow should be skipped"
+    );
+    assert!(
+        notify.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .source
+                .as_ref()
+                .is_some_and(|source| source.path.ends_with("unknown-control.md"))
+                && diagnostic
+                    .message
+                    .contains("unknown workflow input control kind")
+                && diagnostic.severity == protocol::WorkflowDiagnosticSeverity::Warning
+        }),
+        "unknown control kind should produce a warning diagnostic"
+    );
+    assert!(
+        !notify
+            .summaries
+            .iter()
+            .any(|summary| summary.id == WorkflowId("unknown-control".to_owned())),
+        "unknown-control workflow should be skipped"
     );
 }
 

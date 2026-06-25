@@ -20,6 +20,7 @@ use protocol::{
     WorkflowRefreshPayload, WorkflowRunId,
 };
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::bridge;
 
@@ -364,6 +365,7 @@ pub async fn trigger_workflow(
     host_stream: StreamPath,
     workflow_id: WorkflowId,
     project_id: Option<ProjectId>,
+    inputs: HashMap<String, Value>,
 ) -> Result<(), String> {
     send_frame(
         host_id,
@@ -372,7 +374,7 @@ pub async fn trigger_workflow(
         &TriggerWorkflowPayload {
             workflow_id,
             project_id,
-            inputs: HashMap::new(),
+            inputs,
         },
     )
     .await

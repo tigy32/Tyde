@@ -9,11 +9,12 @@ mod runtime;
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentBootstrapPayload, AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
-    BackendSetupPayload, BrowseBootstrapPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
-    CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
-    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameError, FrameKind, HelloPayload,
-    HostBootstrapPayload, HostBrowseStartPayload, HostSettingsPayload, InterruptPayload,
-    ListSessionsPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
+    AgentsViewPreferencesNotifyPayload, BackendSetupPayload, BrowseBootstrapPayload,
+    CancelQueuedMessagePayload, CancelWorkflowPayload, CommandErrorPayload,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, Envelope, FrameError, FrameKind, HelloPayload, HostBootstrapPayload,
+    HostBrowseStartPayload, HostSettingsPayload, InterruptPayload, ListSessionsPayload,
+    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
     MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
     PROTOCOL_VERSION, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
     ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
@@ -880,6 +881,10 @@ impl Connection {
                 }
                 FrameKind::TeamMemberShuffleSuggestionNotify => {
                     let _: protocol::TeamMemberShuffleSuggestionNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::AgentsViewPreferencesNotify => {
+                    let _: AgentsViewPreferencesNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::HostSettings => {

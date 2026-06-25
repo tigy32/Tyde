@@ -6,7 +6,9 @@ use crate::actions::begin_new_chat;
 use crate::send;
 use crate::state::{AppState, DockVisibility, RightTab, TabContent, root_display_name};
 
-use protocol::{ProjectFileKind, ProjectId, ProjectPath, WorkflowId, WorkflowSourceScope};
+use protocol::{
+    ProjectFileKind, ProjectId, ProjectPath, WorkflowId, WorkflowInputSpec, WorkflowSourceScope,
+};
 
 #[derive(Clone, Debug)]
 struct CommandEntry {
@@ -79,6 +81,7 @@ enum PaletteResult {
         workflow_id: WorkflowId,
         project_id: Option<ProjectId>,
         name: String,
+        inputs: Vec<WorkflowInputSpec>,
     },
 }
 
@@ -175,22 +178,45 @@ fn do_select(results: Memo<Vec<PaletteResult>>, idx: usize) {
             host_id,
             workflow_id,
             project_id,
-            ..
+            name,
+            inputs,
         } => {
-            let host_stream = state
-                .host_streams
-                .with_untracked(|streams| streams.get(host_id).cloned());
-            if let Some(host_stream) = host_stream {
-                let host_id = host_id.clone();
-                let workflow_id = workflow_id.clone();
-                let project_id = project_id.clone();
-                spawn_local(async move {
-                    if let Err(error) =
-                        send::trigger_workflow(&host_id, host_stream, workflow_id, project_id).await
-                    {
-                        log::error!("failed to trigger workflow from palette: {error}");
-                    }
-                });
+            // A workflow that declares inputs must collect them first: route it
+            // through the same global inputs modal the panel uses, instead of
+            // firing the trigger with an empty input map. Inputless workflows
+            // run in one step.
+            if inputs.is_empty() {
+                let host_stream = state
+                    .host_streams
+                    .with_untracked(|streams| streams.get(host_id).cloned());
+                if let Some(host_stream) = host_stream {
+                    let host_id = host_id.clone();
+                    let workflow_id = workflow_id.clone();
+                    let project_id = project_id.clone();
+                    spawn_local(async move {
+                        if let Err(error) = send::trigger_workflow(
+                            &host_id,
+                            host_stream,
+                            workflow_id,
+                            project_id,
+                            std::collections::HashMap::new(),
+                        )
+                        .await
+                        {
+                            log::error!("failed to trigger workflow from palette: {error}");
+                        }
+                    });
+                }
+            } else {
+                state
+                    .workflow_run_request
+                    .set(Some(crate::state::WorkflowRunRequest {
+                        host_id: host_id.clone(),
+                        workflow_id: workflow_id.clone(),
+                        project_id: project_id.clone(),
+                        name: name.clone(),
+                        inputs: inputs.clone(),
+                    }));
             }
         }
     }
@@ -266,6 +292,7 @@ pub fn CommandPalette() -> impl IntoView {
                             workflow_id: workflow.id,
                             project_id,
                             name: workflow.name,
+                            inputs: workflow.inputs,
                         },
                         score,
                     ));

@@ -15,6 +15,7 @@ use crate::components::hover_popover::HoverPopover;
 use crate::components::project_rail::ProjectRail;
 use crate::components::settings_panel::restore_appearance;
 use crate::components::workbench::Workbench;
+use crate::components::workflows_panel::WorkflowRunModal;
 use crate::devtools;
 use crate::dispatch::dispatch_envelope;
 use crate::send::send_frame;
@@ -631,6 +632,7 @@ pub fn App() -> impl IntoView {
                 "Send feedback"
             </button>
             <CommandPalette />
+            <WorkflowRunModal />
             <FeedbackModal />
             <HostBrowser />
             <HelpTour />

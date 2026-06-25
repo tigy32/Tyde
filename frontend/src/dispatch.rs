@@ -34,8 +34,8 @@ use crate::state::{
     ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry, CodeIntelKey,
     ConnectionStatus, OpenFile, ProjectInfo, ProjectReferencesMode, ProjectReferencesUiState,
     ReviewActionTarget, SessionInfo, StreamingState, StreamingToolRequest, TabContent,
-    TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent, reduce_diff_response,
-    root_display_name, sort_project_infos,
+    TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent, WorkflowPanelError,
+    reduce_diff_response, root_display_name, sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -565,6 +565,26 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         {
                             entry.error = Some(payload.message.clone());
                         }
+                    });
+                }
+                // Surface workflow command failures inline in the Workflows
+                // panel instead of only logging them. `CommandErrorPayload`
+                // carries no `workflow_id`, so this is a panel-level banner; it
+                // clears on the next successful notify for the failed operation.
+                if matches!(
+                    payload.request_kind,
+                    FrameKind::WorkflowRefresh
+                        | FrameKind::TriggerWorkflow
+                        | FrameKind::CancelWorkflow
+                ) {
+                    state.workflow_command_errors.update(|errors| {
+                        errors.insert(
+                            host_id.to_string(),
+                            WorkflowPanelError {
+                                request_kind: payload.request_kind,
+                                message: payload.message.clone(),
+                            },
+                        );
                     });
                 }
             }
@@ -1951,6 +1971,8 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 state.workflow_locations.update(|map| {
                     map.insert(host_id.to_string(), payload.locations);
                 });
+                // A successful catalog notify clears a prior refresh failure.
+                clear_workflow_error_for_kinds(state, host_id, &[FrameKind::WorkflowRefresh]);
             }
             Err(error) => report_dispatch_error(
                 state,
@@ -1967,6 +1989,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         let host_map = map.entry(host_id.to_string()).or_default();
                         host_map.insert(payload.run.id.clone(), payload.run);
                     });
+                    // A successful run notify clears a prior trigger/cancel
+                    // failure for this host.
+                    clear_workflow_error_for_kinds(
+                        state,
+                        host_id,
+                        &[FrameKind::TriggerWorkflow, FrameKind::CancelWorkflow],
+                    );
                 }
                 Err(error) => report_dispatch_error(
                     state,
@@ -3207,6 +3236,21 @@ fn resolve_project_id(stream: &StreamPath) -> Option<ProjectId> {
         return None;
     }
     Some(ProjectId(suffix.to_string()))
+}
+
+/// Clear a host's inline workflow command error when a successful notify makes
+/// it stale. Only clears when the stored error originated from one of `kinds`,
+/// so a successful refresh notify does not erase a still-relevant trigger error
+/// and vice versa.
+fn clear_workflow_error_for_kinds(state: &AppState, host_id: &str, kinds: &[FrameKind]) {
+    state.workflow_command_errors.update(|errors| {
+        if errors
+            .get(host_id)
+            .is_some_and(|error| kinds.contains(&error.request_kind))
+        {
+            errors.remove(host_id);
+        }
+    });
 }
 
 /// Drop the optimistic-gate state any pending review-shaped command

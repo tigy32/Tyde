@@ -98,12 +98,13 @@ pub use types::{
     TriggerWorkflowPayload, UserSmartViewId, Version, WelcomePayload, WorkbenchCreatePayload,
     WorkbenchRemovePayload, WorkbenchRoot, WorkflowAgentState, WorkflowAgentStatus,
     WorkflowCatalogLocation, WorkflowCoordinatorSpec, WorkflowDiagnostic,
-    WorkflowDiagnosticSeverity, WorkflowId, WorkflowInputSpec, WorkflowNotifyPayload,
-    WorkflowRefreshPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
-    WorkflowRunSnapshotStatus, WorkflowRunState, WorkflowRunStatus, WorkflowSaveMode,
-    WorkflowSaveRequest, WorkflowSaveResponse, WorkflowSaveTarget, WorkflowSource,
-    WorkflowSourceScope, WorkflowStepRunId, WorkflowStepRunSnapshot, WorkflowStepRunSnapshotStatus,
-    WorkflowSummary, WorkflowTargetDirectory, WorkflowTargetsResponse,
+    WorkflowDiagnosticSeverity, WorkflowId, WorkflowInputControl, WorkflowInputOption,
+    WorkflowInputSpec, WorkflowNotifyPayload, WorkflowRefreshPayload, WorkflowRunId,
+    WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus, WorkflowRunState,
+    WorkflowRunStatus, WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse,
+    WorkflowSaveTarget, WorkflowSource, WorkflowSourceScope, WorkflowStepRunId,
+    WorkflowStepRunSnapshot, WorkflowStepRunSnapshotStatus, WorkflowSummary,
+    WorkflowTargetDirectory, WorkflowTargetsResponse,
 };
 // Re-exported from host-config via types.rs; the bundle-key type for the
 // web/PWA client (see WelcomePayload::release_version).

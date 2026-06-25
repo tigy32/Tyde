@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use protocol::{
     BackendKind, Project, ProjectId, TriggerSurface, WorkflowCatalogLocation,
     WorkflowCoordinatorSpec, WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowId,
-    WorkflowInputSpec, WorkflowSource, WorkflowSourceScope, WorkflowSummary,
+    WorkflowInputControl, WorkflowInputOption, WorkflowInputSpec, WorkflowSource,
+    WorkflowSourceScope, WorkflowSummary,
 };
 use serde::Deserialize;
 
@@ -42,12 +43,29 @@ struct RawWorkflowFrontMatter {
     #[serde(default)]
     triggers: Vec<serde_yaml::Value>,
     #[serde(default)]
-    inputs: Vec<WorkflowInputSpec>,
+    inputs: Vec<RawWorkflowInputSpec>,
     coordinator: WorkflowCoordinatorSpec,
     #[serde(default)]
     declared_backends: Vec<BackendKind>,
     #[serde(default)]
     tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawWorkflowInputSpec {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    required: bool,
+    #[serde(default, alias = "input_type")]
+    control: Option<String>,
+    #[serde(default)]
+    options: Vec<WorkflowInputOption>,
+    #[serde(default)]
+    default: Option<serde_json::Value>,
 }
 
 impl WorkflowParseError {
@@ -439,11 +457,11 @@ fn valid_workflow_id(id: &str) -> bool {
 }
 
 fn validate_inputs(
-    inputs: Vec<WorkflowInputSpec>,
+    inputs: Vec<RawWorkflowInputSpec>,
 ) -> Result<Vec<WorkflowInputSpec>, WorkflowParseError> {
     let mut seen = HashSet::new();
     let mut validated = Vec::with_capacity(inputs.len());
-    for mut input in inputs {
+    for input in inputs {
         let id = input.id.trim();
         if id.is_empty() {
             return Err(WorkflowParseError::warning(
@@ -455,28 +473,54 @@ fn validate_inputs(
                 "duplicate workflow input id {id:?}"
             )));
         }
-        input.id = id.to_owned();
-        if let Some(input_type) = input.input_type.take() {
-            let trimmed = input_type.trim();
-            if trimmed.is_empty() {
-                input.input_type = None;
-            } else {
-                validate_input_kind(trimmed)?;
-                input.input_type = Some(trimmed.to_owned());
-            }
-        }
+        let control = parse_input_control(input.control.as_deref())?;
+        let input = WorkflowInputSpec {
+            id: id.to_owned(),
+            name: input.name,
+            description: input.description,
+            required: input.required,
+            control,
+            options: input.options,
+            default: input.default,
+        };
+        validate_input_options(&input)?;
         validate_input_default(&input)?;
         validated.push(input);
     }
     Ok(validated)
 }
 
-fn validate_input_kind(kind: &str) -> Result<(), WorkflowParseError> {
-    match kind {
-        "text" | "multiline_text" | "boolean" | "number" | "select" | "file_path" => Ok(()),
+fn parse_input_control(control: Option<&str>) -> Result<WorkflowInputControl, WorkflowParseError> {
+    let Some(control) = control else {
+        return Ok(WorkflowInputControl::Text);
+    };
+    match control.trim() {
+        "" | "text" => Ok(WorkflowInputControl::Text),
+        "multiline_text" => Ok(WorkflowInputControl::MultilineText),
+        "boolean" => Ok(WorkflowInputControl::Boolean),
+        "number" => Ok(WorkflowInputControl::Number),
+        "select" => Ok(WorkflowInputControl::Select),
+        "file_path" => Ok(WorkflowInputControl::FilePath),
         other => Err(WorkflowParseError::warning(format!(
-            "unknown workflow input kind {other:?}"
+            "unknown workflow input control kind {other:?}"
         ))),
+    }
+}
+
+fn validate_input_options(input: &WorkflowInputSpec) -> Result<(), WorkflowParseError> {
+    match input.control {
+        WorkflowInputControl::Select if input.options.is_empty() => {
+            Err(WorkflowParseError::warning(format!(
+                "select workflow input {:?} must declare at least one option",
+                input.id
+            )))
+        }
+        WorkflowInputControl::Select => Ok(()),
+        WorkflowInputControl::Text
+        | WorkflowInputControl::MultilineText
+        | WorkflowInputControl::Boolean
+        | WorkflowInputControl::Number
+        | WorkflowInputControl::FilePath => Ok(()),
     }
 }
 
@@ -484,12 +528,15 @@ fn validate_input_default(input: &WorkflowInputSpec) -> Result<(), WorkflowParse
     let Some(default) = input.default.as_ref() else {
         return Ok(());
     };
-    let kind = input.input_type.as_deref().unwrap_or("text");
-    let valid = match kind {
-        "text" | "multiline_text" | "file_path" | "select" => default.is_string(),
-        "boolean" => default.is_boolean(),
-        "number" => default.is_number(),
-        _ => false,
+    let valid = match input.control {
+        WorkflowInputControl::Text
+        | WorkflowInputControl::MultilineText
+        | WorkflowInputControl::FilePath => default.is_string(),
+        WorkflowInputControl::Boolean => default.is_boolean(),
+        WorkflowInputControl::Number => default.is_number(),
+        WorkflowInputControl::Select => default
+            .as_str()
+            .is_some_and(|value| input.options.iter().any(|option| option.value == value)),
     };
     if valid {
         return Ok(());
@@ -497,16 +544,18 @@ fn validate_input_default(input: &WorkflowInputSpec) -> Result<(), WorkflowParse
     Err(WorkflowParseError::warning(format!(
         "default for workflow input {:?} must be {}",
         input.id,
-        expected_default_type(kind)
+        expected_default_type(input.control)
     )))
 }
 
-fn expected_default_type(kind: &str) -> &'static str {
-    match kind {
-        "boolean" => "a boolean",
-        "number" => "a number",
-        "text" | "multiline_text" | "file_path" | "select" => "a string",
-        _ => "a supported JSON value",
+fn expected_default_type(control: WorkflowInputControl) -> &'static str {
+    match control {
+        WorkflowInputControl::Boolean => "a boolean",
+        WorkflowInputControl::Number => "a number",
+        WorkflowInputControl::Text
+        | WorkflowInputControl::MultilineText
+        | WorkflowInputControl::FilePath => "a string",
+        WorkflowInputControl::Select => "one of its select option values",
     }
 }
 
@@ -579,7 +628,44 @@ fn trigger_from_name(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{BackendAccessMode, ProjectSource};
+    use protocol::{BackendAccessMode, ProjectSource, WorkflowInputControl};
+    use std::sync::{Mutex, OnceLock};
+
+    static GLOBAL_WORKFLOWS_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct GlobalWorkflowsEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl GlobalWorkflowsEnv {
+        fn set(path: &Path) -> Self {
+            let guard = GLOBAL_WORKFLOWS_ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap();
+            let previous = std::env::var("TYDE_GLOBAL_WORKFLOWS_DIR").ok();
+            unsafe {
+                std::env::set_var("TYDE_GLOBAL_WORKFLOWS_DIR", path);
+            }
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for GlobalWorkflowsEnv {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var("TYDE_GLOBAL_WORKFLOWS_DIR", previous);
+                } else {
+                    std::env::remove_var("TYDE_GLOBAL_WORKFLOWS_DIR");
+                }
+            }
+        }
+    }
 
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -590,6 +676,90 @@ mod tests {
         format!(
             "---\nid: {id}\nname: {name}\ncoordinator:\n  backend: codex\n  access_mode: read_only\ndeclared_backends: [codex]\n---\n{body}\n"
         )
+    }
+
+    fn source(path: &str) -> WorkflowSource {
+        WorkflowSource {
+            scope: WorkflowSourceScope::Global,
+            path: path.to_owned(),
+        }
+    }
+
+    #[test]
+    fn select_control_requires_options() {
+        let markdown = "---\nid: select-empty\nname: Select Empty\ncoordinator:\n  backend: codex\ninputs:\n  - id: mode\n    control: select\n---\nBody\n";
+
+        let error = parse_workflow_content(markdown, source("select-empty.md"))
+            .expect_err("select without options should fail");
+
+        assert_eq!(error.severity, WorkflowDiagnosticSeverity::Warning);
+        assert!(
+            error
+                .message()
+                .contains("select workflow input \"mode\" must declare at least one option"),
+            "unexpected select options error: {}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn select_default_must_match_options_and_valid_default_parses() {
+        let invalid = "---\nid: select-default-bad\nname: Select Default Bad\ncoordinator:\n  backend: codex\ninputs:\n  - id: mode\n    control: select\n    options:\n      - value: fast\n      - value: safe\n    default: turbo\n---\nBody\n";
+
+        let error = parse_workflow_content(invalid, source("select-default-bad.md"))
+            .expect_err("select default outside options should fail");
+        assert_eq!(error.severity, WorkflowDiagnosticSeverity::Warning);
+        assert!(
+            error.message().contains(
+                "default for workflow input \"mode\" must be one of its select option values"
+            ),
+            "unexpected select default error: {}",
+            error.message()
+        );
+
+        let valid = "---\nid: select-default-ok\nname: Select Default Ok\ncoordinator:\n  backend: codex\ninputs:\n  - id: mode\n    control: select\n    options:\n      - value: fast\n      - value: safe\n    default: safe\n---\nBody\n";
+        let definition = parse_workflow_content(valid, source("select-default-ok.md"))
+            .expect("select default in options should parse");
+        let input = definition
+            .summary
+            .inputs
+            .first()
+            .expect("select input should be preserved");
+        assert_eq!(input.control, WorkflowInputControl::Select);
+        assert_eq!(input.default.as_ref(), Some(&serde_json::json!("safe")));
+    }
+
+    #[test]
+    fn legacy_input_type_alias_migrates_known_and_warns_on_unknown() {
+        let known = "---\nid: legacy-input-type\nname: Legacy Input Type\ncoordinator:\n  backend: codex\ninputs:\n  - id: target\n    input_type: text\n---\nBody\n";
+        let definition = parse_workflow_content(known, source("legacy-input-type.md"))
+            .expect("known legacy input_type should parse");
+        assert_eq!(
+            definition.summary.inputs[0].control,
+            WorkflowInputControl::Text
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        write(
+            &global.join("unknown-input-type.md"),
+            "---\nid: unknown-input-type\nname: Unknown Input Type\ncoordinator:\n  backend: codex\ninputs:\n  - id: target\n    input_type: mystery\n---\nBody\n",
+        );
+        let _env = GlobalWorkflowsEnv::set(&global);
+
+        let catalog = WorkflowCatalog::discover(&[]);
+
+        assert!(catalog.summaries().is_empty());
+        assert!(catalog.diagnostics().iter().any(|diagnostic| {
+            diagnostic.severity == WorkflowDiagnosticSeverity::Warning
+                && diagnostic
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.path.ends_with("unknown-input-type.md"))
+                && diagnostic
+                    .message
+                    .contains("unknown workflow input control kind \"mystery\"")
+        }));
     }
 
     #[test]
@@ -609,9 +779,7 @@ mod tests {
             &project_root.join(".tyde/workflows/bad.md"),
             "---\nid: bad\n",
         );
-        unsafe {
-            std::env::set_var("TYDE_GLOBAL_WORKFLOWS_DIR", &global);
-        }
+        let _env = GlobalWorkflowsEnv::set(&global);
         let project = Project {
             id: ProjectId("p1".to_owned()),
             name: "Repo".to_owned(),
@@ -668,8 +836,5 @@ mod tests {
                 .trim(),
             "global"
         );
-        unsafe {
-            std::env::remove_var("TYDE_GLOBAL_WORKFLOWS_DIR");
-        }
     }
 }

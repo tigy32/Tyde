@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
+use protocol::FrameKind;
 use protocol::{
     AgentGroupMode, AgentId, AgentListDensity, AgentOrderKey, AgentOrigin, AgentSortMode,
     AgentWorkflowMetadata, AgentsViewFilters, AgentsViewPreferences, AgentsViewPreferencesSnapshot,
@@ -20,7 +21,8 @@ use protocol::{
     TeamMember, TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
     TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
     ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
-    WorkflowDiagnostic, WorkflowRunId, WorkflowRunSnapshot, WorkflowSummary,
+    WorkflowDiagnostic, WorkflowId, WorkflowInputSpec, WorkflowRunId, WorkflowRunSnapshot,
+    WorkflowSummary,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1150,6 +1152,30 @@ pub fn now_ms() -> u64 {
     }
 }
 
+/// A pending request to run a workflow that declares inputs. The Workflows
+/// panel Run button and the command palette both populate this; a global modal
+/// renders one field per declared input and triggers the run on submit. A
+/// workflow with no declared inputs never produces one of these — it runs in a
+/// single click without a modal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowRunRequest {
+    pub host_id: String,
+    pub workflow_id: WorkflowId,
+    pub project_id: Option<ProjectId>,
+    pub name: String,
+    pub inputs: Vec<WorkflowInputSpec>,
+}
+
+/// A workflow command failure surfaced inline in the Workflows panel. Keyed by
+/// host. `request_kind` is the originating frame (`WorkflowRefresh`,
+/// `TriggerWorkflow`, or `CancelWorkflow`) so the panel clears it on the next
+/// successful notify for that operation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkflowPanelError {
+    pub request_kind: FrameKind,
+    pub message: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub configured_hosts: RwSignal<Vec<ConfiguredHost>>,
@@ -1319,6 +1345,13 @@ pub struct AppState {
     /// read the real paths from here instead of reconstructing `.tyde/workflows`
     /// by string convention.
     pub workflow_locations: RwSignal<HashMap<String, Vec<WorkflowCatalogLocation>>>,
+    /// Pending run-with-inputs request driving the global workflow inputs modal.
+    /// `Some` while the modal is open; cleared on submit or cancel.
+    pub workflow_run_request: RwSignal<Option<WorkflowRunRequest>>,
+    /// Inline workflow command failures, keyed by host_id. Written by the
+    /// `CommandError` dispatch path for workflow request kinds and cleared on the
+    /// next successful workflow notify for the failed operation.
+    pub workflow_command_errors: RwSignal<HashMap<String, WorkflowPanelError>>,
     /// Host-scoped team records, keyed by host_id then TeamId. Populated from
     /// `TeamNotify::Upsert` and pruned by `TeamNotify::Delete`.
     pub teams: RwSignal<HashMap<String, HashMap<TeamId, Team>>>,
@@ -1613,6 +1646,8 @@ impl AppState {
             workflow_diagnostics: RwSignal::new(HashMap::new()),
             workflow_runs: RwSignal::new(HashMap::new()),
             workflow_locations: RwSignal::new(HashMap::new()),
+            workflow_run_request: RwSignal::new(None),
+            workflow_command_errors: RwSignal::new(HashMap::new()),
             teams: RwSignal::new(HashMap::new()),
             team_members: RwSignal::new(HashMap::new()),
             team_member_bindings: RwSignal::new(HashMap::new()),
