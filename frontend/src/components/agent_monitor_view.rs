@@ -239,6 +239,7 @@ fn group_label_for(row: &AgentMonitorRow, group_mode: AgentGroupMode) -> Option<
         AgentGroupMode::Status => Some(status_label(&row.status).to_owned()),
         AgentGroupMode::Backend => Some(backend_label(row.agent.backend_kind).to_owned()),
         AgentGroupMode::Project => Some(row.project_label.clone()),
+        AgentGroupMode::Tag => None,
     }
 }
 
@@ -377,6 +378,7 @@ fn group_mode_value(mode: AgentGroupMode) -> &'static str {
         AgentGroupMode::Status => "status",
         AgentGroupMode::Backend => "backend",
         AgentGroupMode::Project => "project",
+        AgentGroupMode::Tag => "tag",
     }
 }
 
@@ -386,6 +388,7 @@ fn group_mode_from_value(value: &str) -> Option<AgentGroupMode> {
         "status" => AgentGroupMode::Status,
         "backend" => AgentGroupMode::Backend,
         "project" => AgentGroupMode::Project,
+        "tag" => AgentGroupMode::Tag,
         _ => return None,
     })
 }
@@ -396,6 +399,7 @@ fn group_mode_label(mode: AgentGroupMode) -> &'static str {
         AgentGroupMode::Status => "Group by status",
         AgentGroupMode::Backend => "Group by backend",
         AgentGroupMode::Project => "Group by project",
+        AgentGroupMode::Tag => "Group by tag",
     }
 }
 
@@ -2347,6 +2351,8 @@ mod wasm_tests {
             preferences: prefs,
             load_error: None,
             smart_views: Default::default(),
+            tags: Default::default(),
+            pins: Default::default(),
         }
     }
 
@@ -2670,6 +2676,8 @@ mod wasm_tests {
             preferences: prefs,
             load_error: None,
             smart_views: views,
+            tags: Default::default(),
+            pins: Default::default(),
         }
     }
 

@@ -12,30 +12,32 @@ use protocol::types::{
     TeamCompactNotifyPayload, TeamCompactPayload, TeamCompactStatus,
 };
 use protocol::{
-    AgentControlStatus, AgentId, AgentInput, AgentOrderKey, AgentOrigin, AgentStartPayload,
-    AgentWorkflowMetadata, AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesSnapshot,
-    AgentsViewPreferencesUpdate, BackendSetupPayload, BrowseBootstrapListing,
-    BrowseBootstrapPayload, CancelWorkflowPayload, CodeIntelCancelReferencesPayload,
-    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
-    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
-    CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, GitBranchName, HostAbsPath,
-    HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
-    HostSettingsPayload, ImageData, LOCAL_HOST_ID, McpServerConfig, McpServerDeletePayload,
-    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig,
-    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
-    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload,
-    ProjectGitCommitResultPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
-    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectRootPath, ProjectSearchCancelPayload,
-    ProjectSearchCompletePayload, ProjectSearchFileResult, ProjectSearchPayload,
-    ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload, ProjectStageHunkPayload,
-    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection,
-    ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload, SessionId,
-    SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema,
-    SessionSummary, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, SetSettingPayload,
-    Skill, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
+    AgentAnnotationTarget, AgentControlStatus, AgentId, AgentInput, AgentOrderKey, AgentOrigin,
+    AgentPinsUpdate, AgentStartPayload, AgentSystemTagAssignment, AgentSystemTagDescriptor,
+    AgentSystemTagId, AgentTagsSnapshot, AgentTagsUpdate, AgentWorkflowMetadata,
+    AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate,
+    BackendKind, BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload,
+    CancelWorkflowPayload, CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload,
+    CodeIntelHoverPayload, CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload,
+    CodeIntelSubscribeFilePayload, CodeIntelUnsubscribeFilePayload, CustomAgent,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind,
+    GitBranchName, HostAbsPath, HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload,
+    HostBrowseStartPayload, HostFilterId, HostSettingsPayload, ImageData, LOCAL_HOST_ID,
+    McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
+    McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
+    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
+    ProjectSearchCancelPayload, ProjectSearchCompletePayload, ProjectSearchFileResult,
+    ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
+    ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
+    ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
+    SessionId, SessionListPayload, SessionSchemaEntry, SessionSchemasPayload,
+    SessionSettingsSchema, SessionSummary, SetAgentPinsPayload, SetAgentTagsPayload,
+    SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, SetSettingPayload, Skill,
+    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
     SteeringDeletePayload, SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
     TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
     TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
@@ -666,7 +668,11 @@ impl HostHandle {
         let workflow_runs = state.workflow_run_store.list();
         let workflow_locations = state.workflow_locations.clone();
         let agents_view_preferences = match state.agents_view_preferences_store.as_ref() {
-            Some(store) => Some(store.lock().await.snapshot()),
+            Some(store) => {
+                let mut snapshot = store.lock().await.snapshot();
+                complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
+                Some(snapshot)
+            }
             None => None,
         };
 
@@ -2586,6 +2592,10 @@ impl HostHandle {
                 state.host_streams.remove(&path);
             }
         }
+        {
+            let mut state = self.state.lock().await;
+            fan_out_current_agents_view_preferences(&mut state).await;
+        }
 
         let agent_id = start.agent_id.clone();
         self.schedule_agent_session_registration(agent_id.clone(), startup_rx);
@@ -2802,6 +2812,7 @@ impl HostHandle {
                 .map_err(|error| project_store_error(OPERATION, error))?
         };
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
+        fan_out_current_agents_view_preferences(&mut state).await;
         Ok(())
     }
 
@@ -2966,6 +2977,7 @@ impl HostHandle {
         }
         fan_out_team_registry_events(&mut state, team_events).await;
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Delete { project }).await;
+        fan_out_current_agents_view_preferences(&mut state).await;
         if !detached_session_ids.is_empty() {
             fan_out_session_lists(&mut state).await;
         }
@@ -4372,16 +4384,28 @@ impl HostHandle {
 
     pub(crate) async fn delete_session(&self, session_id: SessionId) -> AppResult<()> {
         const OPERATION: &str = "delete_session";
-        let session_store = {
+        let (session_store, annotations_store) = {
             let state = self.state.lock().await;
-            Arc::clone(&state.session_store)
+            (
+                Arc::clone(&state.session_store),
+                state.agents_view_preferences_store.clone(),
+            )
         };
         session_store
             .lock()
             .await
             .delete(&session_id)
             .map_err(|error| session_store_error(OPERATION, error))?;
+        if let Some(store) = annotations_store {
+            store
+                .lock()
+                .await
+                .remove_session(HostFilterId(LOCAL_HOST_ID.to_owned()), session_id.clone())
+                .map_err(|error| AppError::invalid(OPERATION, error))?;
+        }
         self.fan_out_session_lists().await;
+        let mut state = self.state.lock().await;
+        fan_out_current_agents_view_preferences(&mut state).await;
         Ok(())
     }
 
@@ -4426,11 +4450,12 @@ impl HostHandle {
         };
         let update = Self::canonicalize_agents_view_preferences_update(&state, payload.update)
             .map_err(|error| AppError::invalid(OPERATION, error))?;
-        let snapshot = store
+        let mut snapshot = store
             .lock()
             .await
             .apply(update)
             .map_err(|error| AppError::invalid(OPERATION, error))?;
+        complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
         fan_out_agents_view_preferences(&mut state, snapshot).await;
         Ok(())
     }
@@ -4447,11 +4472,56 @@ impl HostHandle {
                 "agents view preferences are owned by the primary local host",
             ));
         };
-        let snapshot = store
+        let mut snapshot = store
             .lock()
             .await
             .apply_smart_views(payload.update)
             .map_err(|error| AppError::invalid(OPERATION, error))?;
+        complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
+        fan_out_agents_view_preferences(&mut state, snapshot).await;
+        Ok(())
+    }
+
+    pub(crate) async fn set_agent_tags(&self, payload: SetAgentTagsPayload) -> AppResult<()> {
+        const OPERATION: &str = "set_agent_tags";
+        let mut state = self.state.lock().await;
+        let Some(store) = state.agents_view_preferences_store.clone() else {
+            return Err(AppError::invalid(
+                OPERATION,
+                "agents view preferences are owned by the primary local host",
+            ));
+        };
+        let resolver = AnnotationTargetResolver::new(&state);
+        let update = canonicalize_agent_tags_update(payload.update, &resolver)
+            .map_err(|error| AppError::invalid(OPERATION, error))?;
+        let mut snapshot = store
+            .lock()
+            .await
+            .apply_tags(update, |target| resolver.canonicalize(target))
+            .map_err(|error| AppError::invalid(OPERATION, error))?;
+        complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
+        fan_out_agents_view_preferences(&mut state, snapshot).await;
+        Ok(())
+    }
+
+    pub(crate) async fn set_agent_pins(&self, payload: SetAgentPinsPayload) -> AppResult<()> {
+        const OPERATION: &str = "set_agent_pins";
+        let mut state = self.state.lock().await;
+        let Some(store) = state.agents_view_preferences_store.clone() else {
+            return Err(AppError::invalid(
+                OPERATION,
+                "agents view preferences are owned by the primary local host",
+            ));
+        };
+        let resolver = AnnotationTargetResolver::new(&state);
+        let update = canonicalize_agent_pins_update(payload.update, &resolver)
+            .map_err(|error| AppError::invalid(OPERATION, error))?;
+        let mut snapshot = store
+            .lock()
+            .await
+            .apply_pins(update, |target| resolver.canonicalize(target))
+            .map_err(|error| AppError::invalid(OPERATION, error))?;
+        complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
         fan_out_agents_view_preferences(&mut state, snapshot).await;
         Ok(())
     }
@@ -4976,7 +5046,23 @@ impl HostHandle {
                 continue;
             }
 
-            state.agent_sessions.remove(&closed_agent_id);
+            let removed_session_id = state.agent_sessions.remove(&closed_agent_id);
+            let snapshot_session_id = removed
+                .as_ref()
+                .and_then(|agent| agent.snapshot().session_id);
+            if removed_session_id.or(snapshot_session_id).is_none()
+                && let Some(store) = state.agents_view_preferences_store.clone()
+                && let Err(error) = store.lock().await.remove_transient_agent(
+                    HostFilterId(LOCAL_HOST_ID.to_owned()),
+                    closed_agent_id.clone(),
+                )
+            {
+                tracing::warn!(
+                    agent_id = %closed_agent_id,
+                    error = %error,
+                    "failed to remove transient agent annotations during close cleanup"
+                );
+            }
             match state
                 .team_registry
                 .clear_binding_by_agent(closed_agent_id.clone())
@@ -4993,6 +5079,7 @@ impl HostHandle {
             }
         }
         fan_out_session_lists(&mut state).await;
+        fan_out_current_agents_view_preferences(&mut state).await;
 
         true
     }
@@ -5879,6 +5966,21 @@ impl HostHandle {
                         state
                             .agent_sessions
                             .insert(agent_id.clone(), session_id.clone());
+                        if let Some(store) = state.agents_view_preferences_store.clone()
+                            && let Err(error) = store.lock().await.promote_transient_agent(
+                                HostFilterId(LOCAL_HOST_ID.to_owned()),
+                                agent_id.clone(),
+                                session_id.clone(),
+                            )
+                        {
+                            tracing::warn!(
+                                agent_id = %agent_id,
+                                session_id = %session_id,
+                                error = %error,
+                                "failed to promote agent annotations after session registration"
+                            );
+                        }
+                        fan_out_current_agents_view_preferences(&mut state).await;
                     }
                     host.fan_out_session_lists().await;
                     host.deliver_submitted_reviews_for_session(session_id).await;
@@ -6080,6 +6182,10 @@ impl HostHandle {
             for path in dead_paths {
                 state.host_streams.remove(&path);
             }
+        }
+        {
+            let mut state = self.state.lock().await;
+            fan_out_current_agents_view_preferences(&mut state).await;
         }
 
         self.fan_out_session_lists().await;
@@ -9135,6 +9241,321 @@ fn percent_encode_query_component(value: &str) -> String {
     encoded
 }
 
+struct AnnotationTargetResolver {
+    live_sessions: HashMap<AgentId, Option<SessionId>>,
+}
+
+impl AnnotationTargetResolver {
+    fn new(state: &HostState) -> Self {
+        let mut live_sessions = HashMap::new();
+        for agent_id in state.registry.agent_ids() {
+            let session_id = state.agent_sessions.get(&agent_id).cloned().or_else(|| {
+                state
+                    .registry
+                    .agent_handle(&agent_id)
+                    .and_then(|agent| agent.snapshot().session_id)
+            });
+            live_sessions.insert(agent_id, session_id);
+        }
+        Self { live_sessions }
+    }
+
+    fn canonicalize(
+        &self,
+        target: AgentAnnotationTarget,
+    ) -> Result<Option<AgentAnnotationTarget>, String> {
+        match target {
+            AgentAnnotationTarget::Session {
+                host_id,
+                session_id,
+            } => {
+                ensure_non_empty_annotation_field(
+                    "agent annotation target host_id",
+                    host_id.0.as_str(),
+                )?;
+                ensure_non_empty_annotation_field(
+                    "agent annotation target session_id",
+                    session_id.0.as_str(),
+                )?;
+                Ok(Some(AgentAnnotationTarget::Session {
+                    host_id,
+                    session_id,
+                }))
+            }
+            AgentAnnotationTarget::TransientAgent { host_id, agent_id } => {
+                ensure_non_empty_annotation_field(
+                    "agent annotation target host_id",
+                    host_id.0.as_str(),
+                )?;
+                ensure_non_empty_annotation_field(
+                    "agent annotation target agent_id",
+                    agent_id.0.as_str(),
+                )?;
+                if host_id.0 != LOCAL_HOST_ID {
+                    return Ok(None);
+                }
+                let Some(session_id) = self.live_sessions.get(&agent_id) else {
+                    return Ok(None);
+                };
+                match session_id {
+                    Some(session_id) => Ok(Some(AgentAnnotationTarget::Session {
+                        host_id,
+                        session_id: session_id.clone(),
+                    })),
+                    None => Ok(Some(AgentAnnotationTarget::TransientAgent {
+                        host_id,
+                        agent_id,
+                    })),
+                }
+            }
+        }
+    }
+}
+
+fn ensure_non_empty_annotation_field(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    Ok(())
+}
+
+fn canonicalize_agent_tags_update(
+    update: AgentTagsUpdate,
+    resolver: &AnnotationTargetResolver,
+) -> Result<AgentTagsUpdate, String> {
+    match update {
+        AgentTagsUpdate::AssignTag { target, tag_id } => {
+            let original = target.clone();
+            let target = resolver.canonicalize(target)?.unwrap_or(original);
+            Ok(AgentTagsUpdate::AssignTag { target, tag_id })
+        }
+        AgentTagsUpdate::RemoveTag { target, tag_id } => {
+            let original = target.clone();
+            let target = resolver.canonicalize(target)?.unwrap_or(original);
+            Ok(AgentTagsUpdate::RemoveTag { target, tag_id })
+        }
+        other => Ok(other),
+    }
+}
+
+fn canonicalize_agent_pins_update(
+    update: AgentPinsUpdate,
+    resolver: &AnnotationTargetResolver,
+) -> Result<AgentPinsUpdate, String> {
+    match update {
+        AgentPinsUpdate::Pin { target } => {
+            let original = target.clone();
+            let target = resolver.canonicalize(target)?.unwrap_or(original);
+            Ok(AgentPinsUpdate::Pin { target })
+        }
+        AgentPinsUpdate::Unpin { target } => {
+            let original = target.clone();
+            let target = resolver.canonicalize(target)?.unwrap_or(original);
+            Ok(AgentPinsUpdate::Unpin { target })
+        }
+    }
+}
+
+async fn complete_agents_view_preferences_snapshot(
+    state: &HostState,
+    snapshot: &mut AgentsViewPreferencesSnapshot,
+) {
+    let system_tags = compute_system_tags_snapshot(state).await;
+    snapshot.tags.system = system_tags.system;
+    snapshot.tags.system_assignments = system_tags.system_assignments;
+}
+
+async fn compute_system_tags_snapshot(state: &HostState) -> AgentTagsSnapshot {
+    let projects = state
+        .project_store
+        .lock()
+        .await
+        .list()
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                error = %error,
+                "failed to list projects while computing system agent tags"
+            );
+            Vec::new()
+        });
+    let project_names = projects
+        .into_iter()
+        .map(|project| (project.id, project.name))
+        .collect::<HashMap<_, _>>();
+
+    let mut descriptors = HashMap::<AgentSystemTagId, AgentSystemTagDescriptor>::new();
+    let mut assignments = HashMap::<AgentAnnotationTarget, HashSet<AgentSystemTagId>>::new();
+
+    for agent_id in state.registry.agent_ids() {
+        let Some(agent) = state.registry.agent_handle(&agent_id) else {
+            continue;
+        };
+        let start = agent.snapshot();
+        let target = agent_annotation_target_for_start(state, &start);
+        let mut tag_ids = Vec::new();
+
+        let (origin_id, origin_label) = origin_system_tag(start.origin);
+        descriptors
+            .entry(origin_id.clone())
+            .or_insert_with(|| system_tag_descriptor(origin_id.clone(), origin_label));
+        tag_ids.push(origin_id);
+
+        let (backend_id, backend_label) = backend_system_tag(start.backend_kind);
+        descriptors
+            .entry(backend_id.clone())
+            .or_insert_with(|| system_tag_descriptor(backend_id.clone(), backend_label));
+        tag_ids.push(backend_id);
+
+        if let Some(project_id) = start.project_id.as_ref() {
+            let (project_id_tag, project_label) =
+                project_system_tag(project_id, project_names.get(project_id));
+            descriptors
+                .entry(project_id_tag.clone())
+                .or_insert_with(|| system_tag_descriptor(project_id_tag.clone(), project_label));
+            tag_ids.push(project_id_tag);
+        }
+
+        assignments.entry(target).or_default().extend(tag_ids);
+    }
+
+    let mut system = descriptors.into_values().collect::<Vec<_>>();
+    system.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+
+    let mut system_assignments = assignments
+        .into_iter()
+        .map(|(target, tag_ids)| {
+            let mut tag_ids = tag_ids.into_iter().collect::<Vec<_>>();
+            tag_ids.sort_by(|left, right| left.0.cmp(&right.0));
+            AgentSystemTagAssignment { target, tag_ids }
+        })
+        .collect::<Vec<_>>();
+    system_assignments
+        .sort_by(|left, right| compare_annotation_targets(&left.target, &right.target));
+
+    AgentTagsSnapshot {
+        manual: Vec::new(),
+        system,
+        manual_assignments: Vec::new(),
+        system_assignments,
+    }
+}
+
+fn agent_annotation_target_for_start(
+    state: &HostState,
+    start: &AgentStartPayload,
+) -> AgentAnnotationTarget {
+    let host_id = HostFilterId(LOCAL_HOST_ID.to_owned());
+    if let Some(session_id) = state
+        .agent_sessions
+        .get(&start.agent_id)
+        .cloned()
+        .or_else(|| start.session_id.clone())
+    {
+        AgentAnnotationTarget::Session {
+            host_id,
+            session_id,
+        }
+    } else {
+        AgentAnnotationTarget::TransientAgent {
+            host_id,
+            agent_id: start.agent_id.clone(),
+        }
+    }
+}
+
+fn system_tag_descriptor(id: AgentSystemTagId, name: String) -> AgentSystemTagDescriptor {
+    AgentSystemTagDescriptor {
+        id,
+        name,
+        color: None,
+    }
+}
+
+fn origin_system_tag(origin: AgentOrigin) -> (AgentSystemTagId, String) {
+    match origin {
+        AgentOrigin::User => (
+            AgentSystemTagId("system:origin:user".to_owned()),
+            "User".to_owned(),
+        ),
+        AgentOrigin::AgentControl => (
+            AgentSystemTagId("system:origin:agent-control".to_owned()),
+            "Agent control".to_owned(),
+        ),
+        AgentOrigin::SideQuestion => (
+            AgentSystemTagId("system:origin:side-quest".to_owned()),
+            "Side quest".to_owned(),
+        ),
+        AgentOrigin::BackendNative => (
+            AgentSystemTagId("system:origin:sub-agent".to_owned()),
+            "Sub-agent".to_owned(),
+        ),
+        AgentOrigin::TeamMember => (
+            AgentSystemTagId("system:origin:team".to_owned()),
+            "Team".to_owned(),
+        ),
+        AgentOrigin::Workflow => (
+            AgentSystemTagId("system:origin:workflow".to_owned()),
+            "Workflow".to_owned(),
+        ),
+    }
+}
+
+fn backend_system_tag(backend: BackendKind) -> (AgentSystemTagId, String) {
+    match backend {
+        BackendKind::Tycode => (
+            AgentSystemTagId("system:backend:tycode".to_owned()),
+            "Tycode".to_owned(),
+        ),
+        BackendKind::Kiro => (
+            AgentSystemTagId("system:backend:kiro".to_owned()),
+            "Kiro".to_owned(),
+        ),
+        BackendKind::Claude => (
+            AgentSystemTagId("system:backend:claude".to_owned()),
+            "Claude".to_owned(),
+        ),
+        BackendKind::Codex => (
+            AgentSystemTagId("system:backend:codex".to_owned()),
+            "Codex".to_owned(),
+        ),
+        BackendKind::Antigravity => (
+            AgentSystemTagId("system:backend:antigravity".to_owned()),
+            "Antigravity".to_owned(),
+        ),
+    }
+}
+
+fn project_system_tag(
+    project_id: &ProjectId,
+    project_name: Option<&String>,
+) -> (AgentSystemTagId, String) {
+    (
+        AgentSystemTagId(format!("system:project:{}", project_id.0)),
+        project_name
+            .cloned()
+            .unwrap_or_else(|| format!("Project {}", project_id.0)),
+    )
+}
+
+fn compare_annotation_targets(
+    left: &AgentAnnotationTarget,
+    right: &AgentAnnotationTarget,
+) -> std::cmp::Ordering {
+    annotation_target_key(left).cmp(&annotation_target_key(right))
+}
+
+fn annotation_target_key(target: &AgentAnnotationTarget) -> (u8, &str, &str) {
+    match target {
+        AgentAnnotationTarget::Session {
+            host_id,
+            session_id,
+        } => (0, host_id.0.as_str(), session_id.0.as_str()),
+        AgentAnnotationTarget::TransientAgent { host_id, agent_id } => {
+            (1, host_id.0.as_str(), agent_id.0.as_str())
+        }
+    }
+}
+
 async fn emit_new_agent_for_stream(
     start: &AgentStartPayload,
     agent_handle: &AgentHandle,
@@ -9655,6 +10076,15 @@ async fn fan_out_agents_view_preferences(
     for path in dead_paths {
         state.host_streams.remove(&path);
     }
+}
+
+async fn fan_out_current_agents_view_preferences(state: &mut HostState) {
+    let Some(store) = state.agents_view_preferences_store.clone() else {
+        return;
+    };
+    let mut snapshot = store.lock().await.snapshot();
+    complete_agents_view_preferences_snapshot(state, &mut snapshot).await;
+    fan_out_agents_view_preferences(state, snapshot).await;
 }
 
 async fn fan_out_session_schemas(state: &mut HostState) {

@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -488,6 +488,8 @@ pub enum FrameKind {
     SetSetting,
     SetAgentsViewPreferences,
     SetAgentsSmartViews,
+    SetAgentTags,
+    SetAgentPins,
     SpawnAgent,
     LoadAgent,
     ListSessions,
@@ -644,6 +646,8 @@ impl fmt::Display for FrameKind {
             Self::SetSetting => f.write_str("set_setting"),
             Self::SetAgentsViewPreferences => f.write_str("set_agents_view_preferences"),
             Self::SetAgentsSmartViews => f.write_str("set_agents_smart_views"),
+            Self::SetAgentTags => f.write_str("set_agent_tags"),
+            Self::SetAgentPins => f.write_str("set_agent_pins"),
             Self::SpawnAgent => f.write_str("spawn_agent"),
             Self::LoadAgent => f.write_str("load_agent"),
             Self::ListSessions => f.write_str("list_sessions"),
@@ -1145,6 +1149,8 @@ pub struct AgentsViewFilters {
     pub backends: Vec<BackendKind>,
     #[serde(default)]
     pub origins: Vec<AgentOrigin>,
+    #[serde(default)]
+    pub tags: Vec<AgentTagRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1174,6 +1180,9 @@ pub enum AgentGroupMode {
     Status,
     Backend,
     Project,
+    /// Group by tag. Agents with multiple tags may be rendered under each tag
+    /// group by clients; untagged agents belong in an explicit untagged group.
+    Tag,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1204,6 +1213,145 @@ pub enum AgentOrderKey {
         host_id: HostFilterId,
         agent_id: AgentId,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentManualTagId(pub String);
+
+impl fmt::Display for AgentManualTagId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentSystemTagId(pub String);
+
+impl fmt::Display for AgentSystemTagId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "tag_id", rename_all = "snake_case")]
+pub enum AgentTagRef {
+    Manual(AgentManualTagId),
+    System(AgentSystemTagId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentTagColor(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentAnnotationTarget {
+    Session {
+        host_id: HostFilterId,
+        session_id: SessionId,
+    },
+    TransientAgent {
+        host_id: HostFilterId,
+        agent_id: AgentId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentManualTagDescriptor {
+    pub id: AgentManualTagId,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<AgentTagColor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSystemTagDescriptor {
+    pub id: AgentSystemTagId,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<AgentTagColor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentManualTagAssignment {
+    pub target: AgentAnnotationTarget,
+    pub tag_ids: Vec<AgentManualTagId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSystemTagAssignment {
+    pub target: AgentAnnotationTarget,
+    pub tag_ids: Vec<AgentSystemTagId>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTagsSnapshot {
+    #[serde(default)]
+    pub manual: Vec<AgentManualTagDescriptor>,
+    #[serde(default)]
+    pub system: Vec<AgentSystemTagDescriptor>,
+    #[serde(default)]
+    pub manual_assignments: Vec<AgentManualTagAssignment>,
+    #[serde(default)]
+    pub system_assignments: Vec<AgentSystemTagAssignment>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPinsSnapshot {
+    /// Pinned agents are an outer section hint for clients. They do not bypass
+    /// active filters or Smart Views; filtered-out pinned agents stay hidden.
+    #[serde(default)]
+    pub pinned: Vec<AgentAnnotationTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentTagsUpdate {
+    CreateTag {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<AgentTagColor>,
+    },
+    RenameTag {
+        tag_id: AgentManualTagId,
+        name: String,
+    },
+    SetTagColor {
+        tag_id: AgentManualTagId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<AgentTagColor>,
+    },
+    DeleteTag {
+        tag_id: AgentManualTagId,
+    },
+    AssignTag {
+        target: AgentAnnotationTarget,
+        tag_id: AgentManualTagId,
+    },
+    RemoveTag {
+        target: AgentAnnotationTarget,
+        tag_id: AgentManualTagId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetAgentTagsPayload {
+    pub update: AgentTagsUpdate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentPinsUpdate {
+    Pin { target: AgentAnnotationTarget },
+    Unpin { target: AgentAnnotationTarget },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetAgentPinsPayload {
+    pub update: AgentPinsUpdate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1308,6 +1456,10 @@ pub struct AgentsViewPreferencesSnapshot {
     pub load_error: Option<AgentsViewPreferencesStoreError>,
     #[serde(default)]
     pub smart_views: AgentsSmartViewsSnapshot,
+    #[serde(default)]
+    pub tags: AgentTagsSnapshot,
+    #[serde(default)]
+    pub pins: AgentPinsSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4547,8 +4699,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_sixteen() {
-        assert_eq!(PROTOCOL_VERSION, 16);
+    fn protocol_version_is_seventeen() {
+        assert_eq!(PROTOCOL_VERSION, 17);
     }
 
     #[test]

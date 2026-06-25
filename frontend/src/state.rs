@@ -1623,6 +1623,8 @@ impl AppState {
                 preferences: AgentsViewPreferences::default(),
                 load_error: None,
                 smart_views: Default::default(),
+                tags: Default::default(),
+                pins: Default::default(),
             }),
             agents_view_preferences_host: RwSignal::new(None),
             pending_agents_view_overlay: RwSignal::new(AgentsViewOverlay::default()),

@@ -4,15 +4,18 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentGroupMode, AgentId, AgentListDensity,
-    AgentOrderKey, AgentSortMode, AgentStartPayload, AgentStatusFilter, AgentsSmartViewsSnapshot,
-    AgentsSmartViewsUpdate, AgentsViewFilters, AgentsViewPreferences,
-    AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesStoreErrorKind,
-    AgentsViewPreferencesUpdate, BackendKind, BuiltInSmartViewId, CommandErrorCode,
-    CommandErrorPayload, Envelope, FrameKind, HostBootstrapPayload, HostFilterId, LOCAL_HOST_ID,
-    NewAgentPayload, SessionId, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
-    SmartView, SmartViewId, SpawnAgentParams, SpawnAgentPayload, StreamPath, UserSmartViewId,
-    read_envelope, write_envelope,
+    AgentAnnotationTarget, AgentBootstrapEvent, AgentBootstrapPayload, AgentGroupMode, AgentId,
+    AgentListDensity, AgentManualTagId, AgentOrderKey, AgentPinsUpdate, AgentSortMode,
+    AgentStartPayload, AgentStatusFilter, AgentSystemTagId, AgentTagColor, AgentTagRef,
+    AgentTagsUpdate, AgentsSmartViewsSnapshot, AgentsSmartViewsUpdate, AgentsViewFilters,
+    AgentsViewPreferences, AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesStoreErrorKind,
+    AgentsViewPreferencesUpdate, BackendKind, BuiltInSmartViewId, CloseAgentPayload,
+    CommandErrorCode, CommandErrorPayload, DeleteSessionPayload, Envelope, FrameKind,
+    HostBootstrapPayload, HostFilterId, LOCAL_HOST_ID, NewAgentPayload, ProjectCreatePayload,
+    ProjectNotifyPayload, SessionId, SetAgentPinsPayload, SetAgentTagsPayload,
+    SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, SmartView, SmartViewId,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath, UserSmartViewId, read_envelope,
+    write_envelope,
 };
 
 async fn connect_host(host: server::HostHandle) -> (client::Connection, HostBootstrapPayload) {
@@ -55,6 +58,16 @@ async fn send_set_agents_smart_views(
 ) {
     let payload = SetAgentsSmartViewsPayload { update };
     send_host_payload(client, FrameKind::SetAgentsSmartViews, &payload).await;
+}
+
+async fn send_set_agent_tags(client: &mut client::Connection, update: AgentTagsUpdate) {
+    let payload = SetAgentTagsPayload { update };
+    send_host_payload(client, FrameKind::SetAgentTags, &payload).await;
+}
+
+async fn send_set_agent_pins(client: &mut client::Connection, update: AgentPinsUpdate) {
+    let payload = SetAgentPinsPayload { update };
+    send_host_payload(client, FrameKind::SetAgentPins, &payload).await;
 }
 
 async fn send_host_payload<T: serde::Serialize>(
@@ -153,6 +166,7 @@ fn saved_view_filters() -> AgentsViewFilters {
         statuses: vec![AgentStatusFilter::Idle],
         backends: vec![BackendKind::Codex, BackendKind::Claude],
         origins: vec![protocol::AgentOrigin::Workflow, protocol::AgentOrigin::User],
+        tags: vec![],
     }
 }
 
@@ -280,6 +294,35 @@ async fn spawn_agent_for_order(client: &mut client::Connection) -> NewAgentPaylo
     env.parse_payload().expect("parse NewAgentPayload")
 }
 
+async fn spawn_agent_for_tags(
+    client: &mut client::Connection,
+    backend_kind: BackendKind,
+    project_id: Option<protocol::ProjectId>,
+    prompt: &str,
+) -> NewAgentPayload {
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("tagged-agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/agents-view-tags".to_owned()],
+                prompt: prompt.to_owned(),
+                images: None,
+                backend_kind,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent for tags");
+
+    let env = expect_client_kind(client, FrameKind::NewAgent, "NewAgent for tags").await;
+    env.parse_payload().expect("parse NewAgentPayload")
+}
+
 async fn expect_agent_start_payload(
     client: &mut client::Connection,
     agent_stream: &StreamPath,
@@ -301,22 +344,178 @@ async fn expect_agent_start_payload(
     }
 }
 
+fn local_session_target(session_id: SessionId) -> AgentAnnotationTarget {
+    AgentAnnotationTarget::Session {
+        host_id: HostFilterId(LOCAL_HOST_ID.to_owned()),
+        session_id,
+    }
+}
+
+fn local_transient_target(agent_id: AgentId) -> AgentAnnotationTarget {
+    AgentAnnotationTarget::TransientAgent {
+        host_id: HostFilterId(LOCAL_HOST_ID.to_owned()),
+        agent_id,
+    }
+}
+
+async fn create_manual_tag(
+    client: &mut client::Connection,
+    name: &str,
+    color: Option<&str>,
+) -> AgentManualTagId {
+    send_set_agent_tags(
+        client,
+        AgentTagsUpdate::CreateTag {
+            name: name.to_owned(),
+            color: color.map(|color| AgentTagColor(color.to_owned())),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(client, "create tag notify").await;
+    notify
+        .snapshot
+        .tags
+        .manual
+        .last()
+        .expect("created manual tag")
+        .id
+        .clone()
+}
+
+async fn close_agent(client: &mut client::Connection, agent_stream: &StreamPath) {
+    let seq = client.outgoing_seq.get(agent_stream).copied().unwrap_or(0);
+    let envelope = Envelope::from_payload(
+        agent_stream.clone(),
+        FrameKind::CloseAgent,
+        seq,
+        &CloseAgentPayload {},
+    )
+    .expect("serialize close agent");
+    client.outgoing_seq.insert(agent_stream.clone(), seq + 1);
+    write_envelope(&mut client.writer, &envelope)
+        .await
+        .expect("write close agent");
+}
+
+async fn create_project(client: &mut client::Connection, name: &str) -> protocol::Project {
+    client
+        .project_create(ProjectCreatePayload {
+            name: name.to_owned(),
+            roots: vec![protocol::ProjectRootPath(format!("/tmp/{name}"))],
+        })
+        .await
+        .expect("create project");
+    let env = expect_client_kind(client, FrameKind::ProjectNotify, "project create notify").await;
+    match env
+        .parse_payload::<ProjectNotifyPayload>()
+        .expect("parse project notify")
+    {
+        ProjectNotifyPayload::Upsert { project } => project,
+        ProjectNotifyPayload::Delete { .. } => panic!("unexpected project delete notify"),
+    }
+}
+
 async fn expect_client_kind_any_agent_start(
     client: &mut client::Connection,
     context: &str,
 ) -> Envelope {
     loop {
-        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
-            Ok(Ok(Some(env))) => env,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        };
+        let env =
+            match tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut client.reader))
+                .await
+            {
+                Ok(Ok(Some(env))) => env,
+                Ok(Ok(None)) => panic!("connection closed before {context}"),
+                Ok(Err(err)) => panic!("read envelope failed before {context}: {err:?}"),
+                Err(_) => panic!("timed out waiting for {context}"),
+            };
+        client
+            .incoming_seq
+            .validate(&env.stream, env.seq, env.kind)
+            .expect("incoming sequence should be valid");
+        if env.kind == FrameKind::NewAgent {
+            let payload: NewAgentPayload = env.parse_payload().expect("parse NewAgentPayload");
+            client.outgoing_seq.insert(payload.instance_stream, 0);
+            continue;
+        }
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env.parse_payload().expect("CommandError");
+            panic!("unexpected CommandError before {context}: {error:?}");
+        }
         if fixture::is_builtin_team_custom_agent_notify(&env) {
             continue;
         }
         if matches!(env.kind, FrameKind::AgentStart | FrameKind::AgentBootstrap) {
             return env;
+        }
+    }
+}
+
+async fn expect_promoted_manual_assignment(
+    client: &mut client::Connection,
+    agent_stream: &StreamPath,
+    tag_id: &AgentManualTagId,
+) -> (SessionId, AgentsViewPreferencesNotifyPayload) {
+    let mut session_id = None;
+    let mut latest_notify = None;
+    loop {
+        let env =
+            match tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut client.reader))
+                .await
+            {
+                Ok(Ok(Some(env))) => env,
+                Ok(Ok(None)) => panic!("connection closed before promoted assignment"),
+                Ok(Err(err)) => panic!("read envelope failed before promoted assignment: {err:?}"),
+                Err(_) => panic!("timed out waiting for promoted assignment"),
+            };
+        client
+            .incoming_seq
+            .validate(&env.stream, env.seq, env.kind)
+            .expect("incoming sequence should be valid");
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        match env.kind {
+            FrameKind::AgentStart if env.stream == *agent_stream => {
+                let start: AgentStartPayload =
+                    env.parse_payload().expect("parse AgentStartPayload");
+                session_id = start.session_id;
+            }
+            FrameKind::AgentBootstrap if env.stream == *agent_stream => {
+                let bootstrap: AgentBootstrapPayload =
+                    env.parse_payload().expect("parse AgentBootstrapPayload");
+                for event in bootstrap.events {
+                    if let AgentBootstrapEvent::AgentStart(start) = event {
+                        session_id = start.session_id;
+                    }
+                }
+            }
+            FrameKind::AgentsViewPreferencesNotify => {
+                latest_notify = Some(
+                    env.parse_payload::<AgentsViewPreferencesNotifyPayload>()
+                        .expect("parse AgentsViewPreferencesNotifyPayload"),
+                );
+            }
+            FrameKind::CommandError => {
+                let error: CommandErrorPayload = env.parse_payload().expect("CommandError");
+                panic!("unexpected CommandError before promoted assignment: {error:?}");
+            }
+            _ => {}
+        }
+
+        if let (Some(session_id), Some(notify)) = (session_id.clone(), latest_notify.as_ref()) {
+            let target = local_session_target(session_id.clone());
+            if notify
+                .snapshot
+                .tags
+                .manual_assignments
+                .iter()
+                .any(|assignment| {
+                    assignment.target == target && assignment.tag_ids == vec![tag_id.clone()]
+                })
+            {
+                return (session_id, notify.clone());
+            }
         }
     }
 }
@@ -381,6 +580,43 @@ async fn agents_view_preferences_non_primary_host_omits_preferences_and_rejects_
             .exists(),
         "non-primary host must not create a competing smart view store"
     );
+
+    send_set_agent_tags(
+        &mut fixture.client,
+        AgentTagsUpdate::CreateTag {
+            name: "Remote tag".to_owned(),
+            color: None,
+        },
+    )
+    .await;
+
+    let error = expect_command_error(&mut fixture.client, "non-primary tags error").await;
+    assert_eq!(error.request_kind, FrameKind::SetAgentTags);
+    assert_eq!(error.operation, "set_agent_tags");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(
+        error.message.contains("owned by the primary local host"),
+        "unexpected error message: {}",
+        error.message
+    );
+
+    send_set_agent_pins(
+        &mut fixture.client,
+        AgentPinsUpdate::Pin {
+            target: local_transient_target(AgentId("remote-pin".to_owned())),
+        },
+    )
+    .await;
+
+    let error = expect_command_error(&mut fixture.client, "non-primary pins error").await;
+    assert_eq!(error.request_kind, FrameKind::SetAgentPins);
+    assert_eq!(error.operation, "set_agent_pins");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(
+        error.message.contains("owned by the primary local host"),
+        "unexpected error message: {}",
+        error.message
+    );
 }
 
 #[tokio::test]
@@ -402,6 +638,11 @@ async fn agents_view_preferences_update_notifies_and_persists_to_bootstrap() {
         bootstrap_snapshot.smart_views.active_view_id,
         Some(built_in_id(BuiltInSmartViewId::All))
     );
+    assert!(bootstrap_snapshot.tags.manual.is_empty());
+    assert!(bootstrap_snapshot.tags.manual_assignments.is_empty());
+    assert!(bootstrap_snapshot.tags.system.is_empty());
+    assert!(bootstrap_snapshot.tags.system_assignments.is_empty());
+    assert!(bootstrap_snapshot.pins.pinned.is_empty());
 
     let filters = AgentsViewFilters {
         host_ids: vec![HostFilterId(LOCAL_HOST_ID.to_owned())],
@@ -409,6 +650,7 @@ async fn agents_view_preferences_update_notifies_and_persists_to_bootstrap() {
         statuses: vec![protocol::AgentStatusFilter::Idle],
         backends: vec![BackendKind::Codex, BackendKind::Claude],
         origins: vec![protocol::AgentOrigin::Workflow, protocol::AgentOrigin::User],
+        tags: vec![],
     };
     send_set_agents_view_preferences(
         &mut fixture.client,
@@ -468,6 +710,12 @@ async fn corrupt_agents_view_preferences_store_does_not_block_bootstrap_and_clea
         snapshot.smart_views.active_view_id,
         Some(built_in_id(BuiltInSmartViewId::All))
     );
+    assert!(snapshot.tags.manual.is_empty());
+    assert!(snapshot.tags.manual_assignments.is_empty());
+    assert!(snapshot.pins.pinned.is_empty());
+    assert!(snapshot.tags.manual.is_empty());
+    assert!(snapshot.tags.manual_assignments.is_empty());
+    assert!(snapshot.pins.pinned.is_empty());
 
     send_set_agents_view_preferences(&mut client, AgentsViewPreferencesUpdate::Reset).await;
     let notify = expect_preferences_notify(&mut client, "reset preferences notify").await;
@@ -482,6 +730,427 @@ async fn corrupt_agents_view_preferences_store_does_not_block_bootstrap_and_clea
         notify.snapshot.smart_views.active_view_id,
         Some(built_in_id(BuiltInSmartViewId::All))
     );
+    assert!(notify.snapshot.tags.manual.is_empty());
+    assert!(notify.snapshot.tags.manual_assignments.is_empty());
+    assert!(notify.snapshot.pins.pinned.is_empty());
+}
+
+#[tokio::test]
+async fn agents_view_preferences_agent_tags_manual_lifecycle_persists_and_deletes_assignments() {
+    let mut fixture = Fixture::new().await;
+    let agent = spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "hello").await;
+    let start = expect_agent_start_payload(&mut fixture.client, &agent.instance_stream).await;
+    expect_preferences_notify(&mut fixture.client, "agent session annotation notify").await;
+    let session_id = start.session_id.expect("agent start session id");
+    let target = local_session_target(session_id.clone());
+
+    send_set_agent_tags(
+        &mut fixture.client,
+        AgentTagsUpdate::CreateTag {
+            name: "  Needs Review  ".to_owned(),
+            color: Some(AgentTagColor("#ffcc00".to_owned())),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "create manual tag").await;
+    assert_eq!(notify.snapshot.tags.manual.len(), 1);
+    let tag_id = notify.snapshot.tags.manual[0].id.clone();
+    assert_eq!(tag_id, AgentManualTagId("needs-review".to_owned()));
+    assert_eq!(notify.snapshot.tags.manual[0].name, "Needs Review");
+    assert_eq!(
+        notify.snapshot.tags.manual[0].color,
+        Some(AgentTagColor("#ffcc00".to_owned()))
+    );
+
+    send_set_agent_tags(
+        &mut fixture.client,
+        AgentTagsUpdate::AssignTag {
+            target: target.clone(),
+            tag_id: tag_id.clone(),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "assign manual tag").await;
+    assert_eq!(
+        notify.snapshot.tags.manual_assignments,
+        vec![protocol::AgentManualTagAssignment {
+            target: target.clone(),
+            tag_ids: vec![tag_id.clone()],
+        }]
+    );
+
+    send_set_agent_tags(
+        &mut fixture.client,
+        AgentTagsUpdate::RemoveTag {
+            target: target.clone(),
+            tag_id: tag_id.clone(),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "remove manual tag").await;
+    assert!(notify.snapshot.tags.manual_assignments.is_empty());
+
+    send_set_agent_tags(
+        &mut fixture.client,
+        AgentTagsUpdate::AssignTag {
+            target: target.clone(),
+            tag_id: tag_id.clone(),
+        },
+    )
+    .await;
+    expect_preferences_notify(&mut fixture.client, "reassign manual tag").await;
+
+    send_set_agent_tags(
+        &mut fixture.client,
+        AgentTagsUpdate::RenameTag {
+            tag_id: tag_id.clone(),
+            name: "Renamed Tag".to_owned(),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "rename manual tag").await;
+    assert_eq!(notify.snapshot.tags.manual[0].name, "Renamed Tag");
+
+    send_set_agent_tags(
+        &mut fixture.client,
+        AgentTagsUpdate::SetTagColor {
+            tag_id: tag_id.clone(),
+            color: Some(AgentTagColor("#11223344".to_owned())),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "recolor manual tag").await;
+    assert_eq!(
+        notify.snapshot.tags.manual[0].color,
+        Some(AgentTagColor("#11223344".to_owned()))
+    );
+
+    let (_fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let fresh_snapshot = fresh_bootstrap
+        .agents_view_preferences
+        .expect("fresh bootstrap preferences");
+    assert_eq!(fresh_snapshot.tags.manual, notify.snapshot.tags.manual);
+    assert_eq!(
+        fresh_snapshot.tags.manual_assignments,
+        notify.snapshot.tags.manual_assignments
+    );
+
+    send_set_agent_tags(&mut fixture.client, AgentTagsUpdate::DeleteTag { tag_id }).await;
+    let notify = expect_preferences_notify(&mut fixture.client, "delete manual tag").await;
+    assert!(notify.snapshot.tags.manual.is_empty());
+    assert!(notify.snapshot.tags.manual_assignments.is_empty());
+
+    let (_fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let fresh_snapshot = fresh_bootstrap
+        .agents_view_preferences
+        .expect("fresh bootstrap preferences after delete");
+    assert!(fresh_snapshot.tags.manual.is_empty());
+    assert!(fresh_snapshot.tags.manual_assignments.is_empty());
+}
+
+#[tokio::test]
+async fn agents_view_preferences_agent_tags_delete_strips_filter_refs() {
+    let mut fixture = Fixture::new().await;
+    let tag_id = create_manual_tag(&mut fixture.client, "Archive", None).await;
+    let remaining_system_tag =
+        AgentTagRef::System(AgentSystemTagId("system:backend:codex".to_owned()));
+    let filters = AgentsViewFilters {
+        tags: vec![
+            AgentTagRef::Manual(tag_id.clone()),
+            remaining_system_tag.clone(),
+        ],
+        ..AgentsViewFilters::default()
+    };
+
+    send_set_agents_view_preferences(
+        &mut fixture.client,
+        AgentsViewPreferencesUpdate::SetFilters {
+            filters: filters.clone(),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "set tag filters").await;
+    assert_eq!(notify.snapshot.preferences.filters.tags, filters.tags);
+
+    send_set_agents_smart_views(
+        &mut fixture.client,
+        AgentsSmartViewsUpdate::SaveCurrent {
+            name: "Tagged Archive".to_owned(),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "save tagged smart view").await;
+    assert_eq!(notify.snapshot.smart_views.user.len(), 1);
+    assert_eq!(
+        notify.snapshot.smart_views.user[0].filters.tags,
+        filters.tags
+    );
+
+    send_set_agent_tags(
+        &mut fixture.client,
+        AgentTagsUpdate::DeleteTag {
+            tag_id: tag_id.clone(),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "delete filtered tag").await;
+    assert!(notify.snapshot.tags.manual.is_empty());
+    assert_eq!(
+        notify.snapshot.preferences.filters.tags,
+        vec![remaining_system_tag.clone()]
+    );
+    assert_eq!(
+        notify.snapshot.smart_views.user[0].filters.tags,
+        vec![remaining_system_tag]
+    );
+    assert!(
+        !notify
+            .snapshot
+            .preferences
+            .filters
+            .tags
+            .contains(&AgentTagRef::Manual(tag_id.clone()))
+    );
+    assert!(!notify.snapshot.smart_views.user.iter().any(|view| {
+        view.filters
+            .tags
+            .contains(&AgentTagRef::Manual(tag_id.clone()))
+    }));
+}
+
+#[tokio::test]
+async fn agents_view_preferences_agent_tags_filters_group_mode_and_system_tags_are_snapshotted() {
+    let mut fixture = Fixture::new().await;
+    let project = create_project(&mut fixture.client, "tags-project").await;
+    let agent = spawn_agent_for_tags(
+        &mut fixture.client,
+        BackendKind::Codex,
+        Some(project.id.clone()),
+        "project agent",
+    )
+    .await;
+    let start = expect_agent_start_payload(&mut fixture.client, &agent.instance_stream).await;
+    expect_preferences_notify(&mut fixture.client, "agent session annotation notify").await;
+    let session_id = start.session_id.expect("agent start session id");
+    let target = local_session_target(session_id);
+    let tag_id = create_manual_tag(&mut fixture.client, "Important", None).await;
+
+    send_set_agent_tags(
+        &mut fixture.client,
+        AgentTagsUpdate::AssignTag {
+            target: target.clone(),
+            tag_id: tag_id.clone(),
+        },
+    )
+    .await;
+    let notify =
+        expect_preferences_notify(&mut fixture.client, "assign tag before filtering").await;
+    assert_eq!(
+        notify.snapshot.tags.manual_assignments,
+        vec![protocol::AgentManualTagAssignment {
+            target: target.clone(),
+            tag_ids: vec![tag_id.clone()],
+        }]
+    );
+
+    let system_ids = notify
+        .snapshot
+        .tags
+        .system_assignments
+        .iter()
+        .find(|assignment| assignment.target == target)
+        .expect("system assignment for tagged agent")
+        .tag_ids
+        .clone();
+    assert!(system_ids.contains(&AgentSystemTagId("system:origin:user".to_owned())));
+    assert!(system_ids.contains(&AgentSystemTagId("system:backend:codex".to_owned())));
+    assert!(system_ids.contains(&AgentSystemTagId(format!(
+        "system:project:{}",
+        project.id.0
+    ))));
+    let system_labels = notify
+        .snapshot
+        .tags
+        .system
+        .iter()
+        .map(|descriptor| (descriptor.id.clone(), descriptor.name.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        system_labels.get(&AgentSystemTagId("system:origin:user".to_owned())),
+        Some(&"User".to_owned())
+    );
+    assert_eq!(
+        system_labels.get(&AgentSystemTagId("system:backend:codex".to_owned())),
+        Some(&"Codex".to_owned())
+    );
+    assert_eq!(
+        system_labels.get(&AgentSystemTagId(format!(
+            "system:project:{}",
+            project.id.0
+        ))),
+        Some(&project.name)
+    );
+
+    let filters = AgentsViewFilters {
+        tags: vec![
+            AgentTagRef::Manual(tag_id.clone()),
+            AgentTagRef::System(AgentSystemTagId("system:backend:codex".to_owned())),
+        ],
+        ..AgentsViewFilters::default()
+    };
+    send_set_agents_view_preferences(
+        &mut fixture.client,
+        AgentsViewPreferencesUpdate::SetFilters {
+            filters: filters.clone(),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "tag filter notify").await;
+    assert_eq!(notify.snapshot.preferences.filters.tags, filters.tags);
+
+    send_set_agents_view_preferences(
+        &mut fixture.client,
+        AgentsViewPreferencesUpdate::SetGroupMode {
+            group_mode: AgentGroupMode::Tag,
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "tag group notify").await;
+    assert_eq!(notify.snapshot.preferences.group_mode, AgentGroupMode::Tag);
+}
+
+#[tokio::test]
+async fn agents_view_preferences_agent_pins_canonicalize_and_persist_session_targets() {
+    let mut fixture = Fixture::new().await;
+    let agent =
+        spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "pin me").await;
+    let start = expect_agent_start_payload(&mut fixture.client, &agent.instance_stream).await;
+    expect_preferences_notify(&mut fixture.client, "agent session annotation notify").await;
+    let session_id = start.session_id.expect("agent start session id");
+    let session_target = local_session_target(session_id.clone());
+    let transient_target = local_transient_target(agent.agent_id.clone());
+
+    send_set_agent_pins(
+        &mut fixture.client,
+        AgentPinsUpdate::Pin {
+            target: session_target.clone(),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "pin session").await;
+    assert_eq!(notify.snapshot.pins.pinned, vec![session_target.clone()]);
+
+    send_set_agent_pins(
+        &mut fixture.client,
+        AgentPinsUpdate::Pin {
+            target: transient_target.clone(),
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "pin duplicate transient").await;
+    assert_eq!(notify.snapshot.pins.pinned, vec![session_target.clone()]);
+
+    let (_fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert_eq!(
+        fresh_bootstrap
+            .agents_view_preferences
+            .expect("fresh bootstrap preferences")
+            .pins
+            .pinned,
+        vec![session_target.clone()]
+    );
+
+    send_set_agent_pins(
+        &mut fixture.client,
+        AgentPinsUpdate::Unpin {
+            target: transient_target,
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "unpin transient").await;
+    assert!(notify.snapshot.pins.pinned.is_empty());
+}
+
+#[tokio::test]
+async fn agents_view_preferences_agent_annotations_promote_drop_and_session_delete_cleanup() {
+    let mut fixture = Fixture::new().await;
+    let tag_id = create_manual_tag(&mut fixture.client, "Cleanup", None).await;
+    let agent =
+        spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "cleanup").await;
+    let transient_target = local_transient_target(agent.agent_id.clone());
+
+    send_set_agent_tags(
+        &mut fixture.client,
+        AgentTagsUpdate::AssignTag {
+            target: transient_target.clone(),
+            tag_id: tag_id.clone(),
+        },
+    )
+    .await;
+    let (session_id, promoted_notify) =
+        expect_promoted_manual_assignment(&mut fixture.client, &agent.instance_stream, &tag_id)
+            .await;
+    let session_target = local_session_target(session_id.clone());
+    assert_eq!(
+        promoted_notify.snapshot.tags.manual_assignments,
+        vec![protocol::AgentManualTagAssignment {
+            target: session_target.clone(),
+            tag_ids: vec![tag_id.clone()],
+        }]
+    );
+
+    send_set_agent_pins(
+        &mut fixture.client,
+        AgentPinsUpdate::Pin {
+            target: session_target.clone(),
+        },
+    )
+    .await;
+    expect_preferences_notify(&mut fixture.client, "pin before delete").await;
+
+    fixture
+        .client
+        .delete_session(DeleteSessionPayload {
+            session_id: session_id.clone(),
+        })
+        .await
+        .expect("delete session");
+    let notify = expect_preferences_notify(&mut fixture.client, "session delete cleanup").await;
+    assert!(notify.snapshot.tags.manual_assignments.is_empty());
+    assert!(notify.snapshot.pins.pinned.is_empty());
+    assert_eq!(notify.snapshot.tags.manual[0].id, tag_id);
+
+    let failing = spawn_agent_for_tags(
+        &mut fixture.client,
+        BackendKind::Claude,
+        None,
+        "__mock_fail_spawn__ no session",
+    )
+    .await;
+    let transient = local_transient_target(failing.agent_id.clone());
+    expect_preferences_notify(&mut fixture.client, "sessionless new agent system tags").await;
+    let cleanup_tag_id = notify.snapshot.tags.manual[0].id.clone();
+    send_set_agent_tags(
+        &mut fixture.client,
+        AgentTagsUpdate::AssignTag {
+            target: transient.clone(),
+            tag_id: cleanup_tag_id,
+        },
+    )
+    .await;
+    expect_preferences_notify(&mut fixture.client, "sessionless transient tag").await;
+    send_set_agent_pins(
+        &mut fixture.client,
+        AgentPinsUpdate::Pin {
+            target: transient.clone(),
+        },
+    )
+    .await;
+    expect_preferences_notify(&mut fixture.client, "sessionless transient pin").await;
+    close_agent(&mut fixture.client, &failing.instance_stream).await;
+    let notify = expect_preferences_notify(&mut fixture.client, "sessionless close cleanup").await;
+    assert!(notify.snapshot.tags.manual_assignments.is_empty());
+    assert!(notify.snapshot.pins.pinned.is_empty());
 }
 
 #[tokio::test]
@@ -651,6 +1320,7 @@ async fn agents_view_preferences_smart_views_query_change_clears_active_view_id(
         statuses: vec![AgentStatusFilter::Thinking],
         backends: vec![BackendKind::Claude],
         origins: vec![protocol::AgentOrigin::AgentControl],
+        tags: vec![],
     };
     send_set_agents_view_preferences(
         &mut fixture.client,
@@ -702,6 +1372,7 @@ async fn agents_view_preferences_smart_views_manage_lifecycle_and_reject_built_i
             statuses: vec![AgentStatusFilter::Thinking],
             backends: vec![BackendKind::Claude],
             origins: vec![protocol::AgentOrigin::AgentControl],
+            tags: vec![],
         },
         AgentSortMode::NewestFirst,
         AgentGroupMode::Status,
@@ -737,6 +1408,7 @@ async fn agents_view_preferences_smart_views_manage_lifecycle_and_reject_built_i
             statuses: vec![AgentStatusFilter::Compacting],
             backends: vec![BackendKind::Kiro],
             origins: vec![protocol::AgentOrigin::Workflow],
+            tags: vec![],
         },
         AgentSortMode::OldestFirst,
         AgentGroupMode::Project,
@@ -942,7 +1614,110 @@ async fn agents_view_preferences_smart_views_migrates_legacy_store() {
     assert!(
         std::fs::read_to_string(preferences_path)
             .expect("read migrated preferences store")
-            .contains("\"version\": 2")
+            .contains("\"version\": 3")
+    );
+}
+
+#[tokio::test]
+async fn agents_view_preferences_smart_views_v2_store_migrates_to_v3_with_user_views() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let preferences_path = dir.path().join("agents_view_preferences.json");
+    let v2_store = serde_json::json!({
+        "version": 2,
+        "preferences": {
+            "filters": {
+                "host_ids": [],
+                "project_ids": [],
+                "statuses": [],
+                "backends": [],
+                "origins": []
+            },
+            "sort_mode": "manual_then_activity",
+            "group_mode": "flat",
+            "density": "comfortable",
+            "hide_finished": false,
+            "manual_order": []
+        },
+        "smart_views": {
+            "user": [{
+                "id": { "kind": "user", "id": "review-queue" },
+                "name": "Review Queue",
+                "filters": {
+                    "host_ids": [LOCAL_HOST_ID],
+                    "project_ids": [],
+                    "statuses": ["idle"],
+                    "backends": ["codex"],
+                    "origins": ["user"]
+                },
+                "sort_mode": "name_asc",
+                "group_mode": "backend",
+                "hide_finished": true
+            }],
+            "active_view_id": { "kind": "user", "id": "review-queue" }
+        }
+    });
+    std::fs::write(
+        &preferences_path,
+        serde_json::to_string_pretty(&v2_store).expect("serialize v2 store"),
+    )
+    .expect("write v2 preferences store");
+    let host = server::spawn_host_with_mock_backend(
+        dir.path().join("sessions.json"),
+        dir.path().join("projects.json"),
+        dir.path().join("settings.json"),
+    )
+    .expect("spawn host");
+
+    let (mut client, bootstrap) = connect_host(host).await;
+    let snapshot = bootstrap
+        .agents_view_preferences
+        .expect("primary bootstrap preferences");
+    assert_built_in_smart_views(&snapshot.smart_views);
+    assert_eq!(
+        snapshot.smart_views.active_view_id,
+        Some(user_id("review-queue"))
+    );
+    assert_eq!(snapshot.smart_views.user.len(), 1);
+    let view = &snapshot.smart_views.user[0];
+    assert_eq!(view.id, user_id("review-queue"));
+    assert_eq!(view.name, "Review Queue");
+    assert_eq!(
+        view.filters.host_ids,
+        vec![HostFilterId(LOCAL_HOST_ID.to_owned())]
+    );
+    assert_eq!(view.filters.statuses, vec![AgentStatusFilter::Idle]);
+    assert_eq!(view.filters.backends, vec![BackendKind::Codex]);
+    assert_eq!(view.filters.origins, vec![protocol::AgentOrigin::User]);
+    assert!(view.filters.tags.is_empty());
+    assert_eq!(view.sort_mode, AgentSortMode::NameAsc);
+    assert_eq!(view.group_mode, AgentGroupMode::Backend);
+    assert!(view.hide_finished);
+    assert!(snapshot.tags.manual.is_empty());
+    assert!(snapshot.tags.manual_assignments.is_empty());
+    assert!(snapshot.tags.system.is_empty());
+    assert!(snapshot.tags.system_assignments.is_empty());
+    assert!(snapshot.pins.pinned.is_empty());
+
+    send_set_agents_view_preferences(
+        &mut client,
+        AgentsViewPreferencesUpdate::SetDensity {
+            density: AgentListDensity::Compact,
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut client, "v2 migration rewrite notify").await;
+    assert_eq!(notify.snapshot.smart_views.user, snapshot.smart_views.user);
+    assert_eq!(
+        notify.snapshot.smart_views.active_view_id,
+        Some(user_id("review-queue"))
+    );
+    assert!(notify.snapshot.tags.manual.is_empty());
+    assert!(notify.snapshot.tags.manual_assignments.is_empty());
+    assert!(notify.snapshot.pins.pinned.is_empty());
+    assert!(
+        std::fs::read_to_string(preferences_path)
+            .expect("read migrated preferences store")
+            .contains("\"version\": 3")
     );
 }
 
@@ -960,6 +1735,7 @@ async fn agents_view_preferences_host_filter_survives_new_host_stream_path() {
                 statuses: vec![],
                 backends: vec![],
                 origins: vec![],
+                tags: vec![],
             },
         },
     )
@@ -1011,6 +1787,7 @@ async fn agents_view_preferences_manual_order_is_canonicalized() {
     let mut fixture = Fixture::new().await;
     let agent = spawn_agent_for_order(&mut fixture.client).await;
     let start = expect_agent_start_payload(&mut fixture.client, &agent.instance_stream).await;
+    expect_preferences_notify(&mut fixture.client, "agent session annotation notify").await;
     let known_session = start
         .session_id
         .expect("mock backend should assign a session id");

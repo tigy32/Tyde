@@ -24,20 +24,20 @@ use crate::{
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
     ProjectSearchCompletePayload, ProjectSearchResultsPayload, ReviewEventPayload,
-    RunBackendSetupPayload, SessionListPayload, SessionSchemasPayload, SetAgentsSmartViewsPayload,
-    SetAgentsViewPreferencesPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
-    StreamPath, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
-    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
-    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
-    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
-    TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
-    ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload, WelcomePayload,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
-    WorkflowRunNotifyPayload,
+    RunBackendSetupPayload, SessionListPayload, SessionSchemasPayload, SetAgentPinsPayload,
+    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
+    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
+    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath,
+    TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
+    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
+    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberNotifyPayload, TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload,
+    TeamMemberUpdatePayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload,
+    TeamSetManagerPayload, TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload,
+    TerminalOutputPayload, ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload,
+    WelcomePayload, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload,
+    WorkflowRefreshPayload, WorkflowRunNotifyPayload,
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 32;
@@ -337,6 +337,12 @@ impl ProtocolValidator {
                 envelope,
                 "SetAgentsSmartViews",
             ),
+            FrameKind::SetAgentTags => {
+                parse_host_payload::<SetAgentTagsPayload>(self, envelope, "SetAgentTags")
+            }
+            FrameKind::SetAgentPins => {
+                parse_host_payload::<SetAgentPinsPayload>(self, envelope, "SetAgentPins")
+            }
             FrameKind::MobilePairingStart => parse_host_payload::<MobilePairingStartPayload>(
                 self,
                 envelope,
