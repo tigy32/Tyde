@@ -421,6 +421,7 @@ mod wasm_tests {
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
+                    code_intel: Default::default(),
                 },
             );
         });

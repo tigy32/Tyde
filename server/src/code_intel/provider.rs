@@ -15,6 +15,7 @@ use protocol::{
     CodeIntelProviderId, CodeIntelSetVisibleRangePayload, ProjectFileVersion, ProjectPath,
 };
 
+use super::language_server::LanguageServerConfig;
 use crate::stream::Stream;
 
 /// A code-intelligence provider for one project root. Methods are
@@ -24,6 +25,10 @@ use crate::stream::Stream;
 pub(crate) trait CodeIntelProvider: Send {
     /// Open wire identifier, e.g. `"rust-analyzer"`.
     fn provider_id(&self) -> CodeIntelProviderId;
+
+    /// Replace the language-server configuration for this provider and restart
+    /// discovery/spawn for any already-subscribed files.
+    fn reconfigure(&mut self, config: LanguageServerConfig);
 
     /// Start (or refresh) pushing the semantic model + diagnostics for a file
     /// at the given version onto `output`.
@@ -129,7 +134,7 @@ mod mock {
                         path: path.clone(),
                         version,
                         provider: self.provider_id(),
-                        language: language.config().language,
+                        language: language.config(&Default::default()).language,
                         model_range: CodeIntelModelRange::FullFile,
                         completeness: CodeIntelCompleteness::Complete,
                         occurrences: Vec::new(),
@@ -163,6 +168,8 @@ mod mock {
         fn provider_id(&self) -> CodeIntelProviderId {
             CodeIntelProviderId("mock".to_owned())
         }
+
+        fn reconfigure(&mut self, _config: LanguageServerConfig) {}
 
         fn subscribe(&mut self, path: ProjectPath, version: ProjectFileVersion, output: Stream) {
             let out = self.resolve(&path, version);
@@ -245,7 +252,10 @@ mod mock {
             assert_eq!(out.status.state, CodeIntelState::Ready);
             let model = out.model.expect("supported file has a model");
             assert_eq!(model.version, ProjectFileVersion(3));
-            assert_eq!(model.language, Language::Rust.config().language);
+            assert_eq!(
+                model.language,
+                Language::Rust.config(&Default::default()).language
+            );
         }
 
         #[test]

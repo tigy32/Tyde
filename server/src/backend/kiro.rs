@@ -4015,6 +4015,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
+                    code_intel: Default::default(),
                 },
                 mobile_access: protocol::MobileAccessStatePayload {
                     broker_status: protocol::MobileBrokerStatus::Disabled,

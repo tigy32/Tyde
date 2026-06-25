@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use protocol::{CodeIntelLanguageId, CodeIntelProviderId};
+use protocol::{CodeIntelLanguageId, CodeIntelProviderId, CodeIntelSettings, HostExecutablePath};
 use serde_json::json;
 
 use super::language_server::{LanguageServerConfig, ServerDiscovery};
@@ -23,12 +23,16 @@ use crate::process_env;
 
 /// The install hint surfaced when no pyright server binary is found.
 pub(crate) const INSTALL_HINT: &str = "npm install -g pyright";
+const CONFIGURED_PATH_HINT: &str =
+    "Set Tyde's pyright binary path to a usable pyright-langserver executable.";
 
 /// The pyright config consumed by [`LspProvider`](super::lsp_provider::LspProvider).
-pub(crate) fn pyright_config() -> LanguageServerConfig {
+pub(crate) fn pyright_config(settings: &CodeIntelSettings) -> LanguageServerConfig {
+    let provider_id = CodeIntelProviderId("pyright".to_owned());
+    let configured_path = settings.language_server_paths.get(&provider_id).cloned();
     LanguageServerConfig {
         language: CodeIntelLanguageId("python".to_owned()),
-        provider_id: CodeIntelProviderId("pyright".to_owned()),
+        provider_id,
         lsp_language_id: "python",
         extensions: &["py", "pyi"],
         workspace_markers: &[
@@ -37,7 +41,8 @@ pub(crate) fn pyright_config() -> LanguageServerConfig {
             "setup.cfg",
             "requirements.txt",
         ],
-        discover: discover_pyright,
+        discover: discover_pyright_configured,
+        configured_path,
         initialization_options: || json!({}),
     }
 }
@@ -52,6 +57,36 @@ pub(crate) fn pyright_config() -> LanguageServerConfig {
 /// Both candidates are launched with `--stdio` to put them in LSP mode.
 pub(crate) fn discover_pyright(_workspace_root: &Path) -> ServerDiscovery {
     discover_with(process_env::find_executable_in_path)
+}
+
+fn discover_pyright_configured(
+    workspace_root: &Path,
+    configured_path: Option<&HostExecutablePath>,
+) -> ServerDiscovery {
+    if let Some(configured_path) = configured_path {
+        let path = PathBuf::from(&configured_path.0);
+        if path.is_file() {
+            return ServerDiscovery::Found {
+                binary: path,
+                args: vec!["--stdio".to_owned()],
+            };
+        }
+        let reason = if path.exists() {
+            "not a file"
+        } else {
+            "file does not exist"
+        };
+        return ServerDiscovery::Absent {
+            message: format!(
+                "configured pyright binary path {} is not usable: {reason}",
+                path.display(),
+            ),
+            hint: CONFIGURED_PATH_HINT.to_owned(),
+            exit_status: None,
+            stderr: None,
+        };
+    }
+    discover_pyright(workspace_root)
 }
 
 /// Pure discovery ordering, with the PATH lookup injected so the ordering /
@@ -70,29 +105,81 @@ fn discover_with(mut find_in_path: impl FnMut(&str) -> Option<PathBuf>) -> Serve
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use protocol::{
-        CodeIntelResourceMode, CodeIntelState, CodeIntelStatusPayload, FrameKind,
-        ProjectFileVersion, ProjectPath, ProjectRootPath, StreamPath,
+        CodeIntelProviderId, CodeIntelResourceMode, CodeIntelSettings, CodeIntelState,
+        CodeIntelStatusPayload, FrameKind, HostExecutablePath, ProjectFileVersion, ProjectPath,
+        ProjectRootPath, StreamPath,
     };
     use tokio::sync::mpsc;
 
     use super::super::language_server::ServerDiscovery;
     use super::super::lsp_provider::LspProvider;
     use super::super::provider::CodeIntelProvider;
-    use super::{INSTALL_HINT, discover_pyright, discover_with, pyright_config};
+    use super::{
+        CONFIGURED_PATH_HINT, INSTALL_HINT, discover_pyright, discover_pyright_configured,
+        discover_with, pyright_config,
+    };
     use crate::stream::Stream;
 
     #[test]
     fn pyright_config_identifies_as_python() {
-        let config = pyright_config();
+        let config = pyright_config(&Default::default());
         assert_eq!(config.language.0, "python");
         assert_eq!(config.provider_id.0, "pyright");
         assert_eq!(config.lsp_language_id, "python");
         assert!(config.extensions.contains(&"py"));
         assert!(config.workspace_markers.contains(&"pyproject.toml"));
+        assert_eq!(config.configured_path, None);
+    }
+
+    #[test]
+    fn pyright_config_reads_configured_path() {
+        let mut settings = CodeIntelSettings::default();
+        let path = HostExecutablePath("/opt/pyright/bin/pyright-langserver".to_owned());
+        settings
+            .language_server_paths
+            .insert(CodeIntelProviderId("pyright".to_owned()), path.clone());
+        let config = pyright_config(&settings);
+        assert_eq!(config.configured_path, Some(path));
+    }
+
+    #[test]
+    fn configured_pyright_path_is_used_directly() {
+        let file = tempfile::NamedTempFile::new().expect("configured pyright path");
+        let result = discover_pyright_configured(
+            Path::new("/workspace"),
+            Some(&HostExecutablePath(
+                file.path().to_string_lossy().into_owned(),
+            )),
+        );
+        assert_eq!(
+            result,
+            ServerDiscovery::Found {
+                binary: file.path().to_path_buf(),
+                args: vec!["--stdio".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_configured_pyright_path_fails_without_install_hint() {
+        let result = discover_pyright_configured(
+            Path::new("/workspace"),
+            Some(&HostExecutablePath(
+                "/missing/pyright-langserver".to_owned(),
+            )),
+        );
+        match result {
+            ServerDiscovery::Absent { message, hint, .. } => {
+                assert!(message.contains("/missing/pyright-langserver"));
+                assert!(!message.contains(INSTALL_HINT));
+                assert_eq!(hint, CONFIGURED_PATH_HINT);
+            }
+            other => panic!("expected configured-path Absent, got {other:?}"),
+        }
     }
 
     #[test]
@@ -157,7 +244,7 @@ mod tests {
 
         let root_path = ProjectRootPath(root.to_string_lossy().into_owned());
         let mut provider = LspProvider::new(
-            pyright_config(),
+            pyright_config(&Default::default()),
             root_path.clone(),
             CodeIntelResourceMode::Full,
         );

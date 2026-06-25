@@ -12,9 +12,10 @@ use std::net::SocketAddr;
 
 use axum::{Json, Router, response::IntoResponse, routing::get};
 use protocol::{
-    BackendKind, CustomAgent, CustomAgentDeletePayload, CustomAgentId, CustomAgentUpsertPayload,
-    HostSettingValue, McpServerConfig, McpServerDeletePayload, McpServerId, McpServerUpsertPayload,
-    McpTransportConfig, SetSettingPayload, Skill, SkillId, SkillRefreshPayload, ToolPolicy,
+    BackendKind, CodeIntelProviderId, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
+    CustomAgentUpsertPayload, HostExecutablePath, HostSettingValue, McpServerConfig,
+    McpServerDeletePayload, McpServerId, McpServerUpsertPayload, McpTransportConfig,
+    SetSettingPayload, Skill, SkillId, SkillRefreshPayload, ToolPolicy,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -103,6 +104,11 @@ enum SettingInput {
     TydeAgentControlMcpEnabled { enabled: bool },
     /// Allow paired mobile devices to connect.
     EnableMobileConnections { enabled: bool },
+    /// Set (or clear, with null) a code-intelligence language-server binary path.
+    CodeIntelLanguageServerPath {
+        provider: String,
+        path: Option<String>,
+    },
 }
 
 impl From<SettingInput> for HostSettingValue {
@@ -123,6 +129,12 @@ impl From<SettingInput> for HostSettingValue {
             }
             SettingInput::EnableMobileConnections { enabled } => {
                 Self::EnableMobileConnections { enabled }
+            }
+            SettingInput::CodeIntelLanguageServerPath { provider, path } => {
+                Self::CodeIntelLanguageServerPath {
+                    provider: CodeIntelProviderId(provider),
+                    path: path.map(HostExecutablePath),
+                }
             }
         }
     }

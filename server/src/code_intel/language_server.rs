@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use protocol::{CodeIntelLanguageId, CodeIntelProviderId};
+use protocol::{CodeIntelLanguageId, CodeIntelProviderId, HostExecutablePath};
 use serde_json::Value;
 
 /// Result of discovering a language server's backing binary.
@@ -78,7 +78,10 @@ pub(crate) struct LanguageServerConfig {
     /// Binary discovery (PATH → language-specific fallback). May shell out, so
     /// the actor runs it via `spawn_blocking`. The workspace root lets rustup
     /// respect a project-local/default toolchain instead of hard-coding one.
-    pub discover: fn(&Path) -> ServerDiscovery,
+    pub discover: fn(&Path, Option<&HostExecutablePath>) -> ServerDiscovery,
+    /// Explicit user-configured executable path for this provider, if set.
+    /// Discovery validates this exact path and does not fall back when it fails.
+    pub configured_path: Option<HostExecutablePath>,
     /// `initializationOptions` for the LSP `initialize` request.
     pub initialization_options: fn() -> Value,
 }

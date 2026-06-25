@@ -6,7 +6,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use fixture::Fixture;
-use protocol::{BackendKind, BackendSetupStatus, FrameKind, HostSettings, SessionId};
+use protocol::{
+    BackendKind, BackendSetupStatus, CodeIntelProviderId, FrameKind, HostExecutablePath,
+    HostSettingValue, HostSettings, SessionId,
+};
 use server::backend::BackendSession;
 use server::store::session::SessionStore;
 use server::store::settings::HostSettingsStore;
@@ -89,6 +92,7 @@ fn expected_empty_settings() -> HostSettings {
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
+        code_intel: Default::default(),
     }
 }
 
@@ -188,7 +192,67 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
+            code_intel: Default::default(),
         }
+    );
+}
+
+#[test]
+fn code_intel_language_server_paths_default_set_and_clear() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("settings.json");
+    let store = HostSettingsStore::load(path).expect("load empty settings store");
+    let provider = CodeIntelProviderId("rust-analyzer".to_owned());
+    let executable = HostExecutablePath("/opt/rust-analyzer/bin/rust-analyzer".to_owned());
+
+    assert!(
+        store
+            .get()
+            .expect("read empty settings")
+            .code_intel
+            .language_server_paths
+            .is_empty(),
+        "code-intel language server paths should default empty"
+    );
+
+    let settings = store
+        .apply(HostSettingValue::CodeIntelLanguageServerPath {
+            provider: provider.clone(),
+            path: Some(executable.clone()),
+        })
+        .expect("set rust-analyzer path");
+    assert_eq!(
+        settings.code_intel.language_server_paths.get(&provider),
+        Some(&executable)
+    );
+    assert_eq!(
+        store
+            .get()
+            .expect("re-read set path")
+            .code_intel
+            .language_server_paths
+            .get(&provider),
+        Some(&executable)
+    );
+
+    let settings = store
+        .apply(HostSettingValue::CodeIntelLanguageServerPath {
+            provider: provider.clone(),
+            path: None,
+        })
+        .expect("clear rust-analyzer path");
+    assert!(
+        settings.code_intel.language_server_paths.is_empty(),
+        "clearing the path should remove the provider entry"
+    );
+    assert!(
+        store
+            .get()
+            .expect("re-read cleared path")
+            .code_intel
+            .language_server_paths
+            .is_empty(),
+        "cleared path should persist"
     );
 }
 

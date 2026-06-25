@@ -249,6 +249,11 @@ impl CodeIntelProvider for LspProvider {
         self.provider_id.clone()
     }
 
+    fn reconfigure(&mut self, config: LanguageServerConfig) {
+        self.provider_id = config.provider_id.clone();
+        let _ = self.tx.send(RaCommand::Reconfigure { config });
+    }
+
     fn subscribe(&mut self, path: ProjectPath, version: ProjectFileVersion, output: Stream) {
         let _ = self.tx.send(RaCommand::Subscribe {
             path,
@@ -290,6 +295,9 @@ impl CodeIntelProvider for LspProvider {
 }
 
 enum RaCommand {
+    Reconfigure {
+        config: LanguageServerConfig,
+    },
     Subscribe {
         path: ProjectPath,
         version: ProjectFileVersion,
@@ -516,6 +524,7 @@ impl RaActor {
 
     async fn handle_command(&mut self, command: RaCommand) {
         match command {
+            RaCommand::Reconfigure { config } => self.reconfigure(config).await,
             RaCommand::Subscribe {
                 path,
                 version,
@@ -673,6 +682,46 @@ impl RaActor {
                 }
             }
             RaCommand::Restart => self.restart().await,
+        }
+    }
+
+    async fn reconfigure(&mut self, config: LanguageServerConfig) {
+        if let Some(client) = self.client.take() {
+            self.notifications = None;
+            client.shutdown().await;
+        } else {
+            self.notifications = None;
+        }
+
+        self.config = config;
+        self.restart_attempts = 0;
+        self.phase = Phase::Cold;
+        self.message = None;
+        self.legend = SemanticLegend::default();
+        self.opened.clear();
+        self.active_progress.clear();
+        self.resolutions.clear();
+        self.references_active.store(0, Ordering::SeqCst);
+        self.navigate_active.store(0, Ordering::SeqCst);
+        self.hover_active.store(0, Ordering::SeqCst);
+        for file in self.files.values_mut() {
+            file.text.clear();
+            file.model_version = None;
+        }
+
+        if self.files.is_empty() {
+            return;
+        }
+
+        match self.start().await {
+            Ok(()) => {
+                let paths: Vec<ProjectPath> = self.files.keys().cloned().collect();
+                for path in paths {
+                    self.open_file(path).await;
+                }
+                self.ensure_file_models();
+            }
+            Err(failure) => self.emit_start_failure(failure, true),
         }
     }
 
@@ -1071,9 +1120,14 @@ impl RaActor {
         self.set_phase(Phase::Starting, None);
 
         let discover = self.config.discover;
+        let configured_path = self.config.configured_path.clone();
         let cwd = PathBuf::from(&self.root.0);
         let discover_cwd = cwd.clone();
-        let discovery = match tokio::task::spawn_blocking(move || discover(&discover_cwd)).await {
+        let discovery = match tokio::task::spawn_blocking(move || {
+            discover(&discover_cwd, configured_path.as_ref())
+        })
+        .await
+        {
             Ok(discovery) => discovery,
             Err(error) => {
                 let message = format!("language-server discovery task failed: {error}");
@@ -2746,7 +2800,8 @@ mod tests {
             lsp_language_id: "rust",
             extensions: &["rs"],
             workspace_markers: &["Cargo.toml"],
-            discover: |_| ServerDiscovery::absent_install("rust-analyzer", "test: no binary"),
+            discover: |_, _| ServerDiscovery::absent_install("rust-analyzer", "test: no binary"),
+            configured_path: None,
             initialization_options: || json!({}),
         }
     }
@@ -2755,7 +2810,10 @@ mod tests {
     static TEST_CRASHING_LSP: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
     #[cfg(unix)]
-    fn discover_test_crashing_lsp(_: &Path) -> ServerDiscovery {
+    fn discover_test_crashing_lsp(
+        _: &Path,
+        _configured_path: Option<&protocol::HostExecutablePath>,
+    ) -> ServerDiscovery {
         let binary = TEST_CRASHING_LSP
             .lock()
             .expect("test crashing LSP mutex poisoned")
@@ -2776,6 +2834,7 @@ mod tests {
             extensions: &["rs"],
             workspace_markers: &["Cargo.toml"],
             discover: discover_test_crashing_lsp,
+            configured_path: None,
             initialization_options: || json!({}),
         }
     }

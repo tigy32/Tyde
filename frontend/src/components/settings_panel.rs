@@ -9,12 +9,13 @@ use crate::state::{AppState, DiffViewMode, ToolOutputMode};
 
 use protocol::{
     BackendKind, BackendSetupAction, BackendSetupInfo, BackendSetupStatus, BackgroundAgentFeature,
-    BrokerUrl, CustomAgent, CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL, DiffContextMode,
-    FrameKind, HostSettingValue, McpServerConfig, McpServerId, McpTransportConfig,
-    MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState, MobilePairingOfferId,
-    MobilePairingOfferPayload, MobilePairingState, ProjectId, RunBackendSetupPayload, SelectOption,
-    SessionSchemaEntry, SessionSettingFieldType, SessionSettingValue, SessionSettingsValues,
-    SetSettingPayload, Skill, SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
+    BrokerUrl, CodeIntelProviderId, CustomAgent, CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL,
+    DiffContextMode, FrameKind, HostExecutablePath, HostSettingValue, McpServerConfig, McpServerId,
+    McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState,
+    MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState, ProjectId,
+    RunBackendSetupPayload, SelectOption, SessionSchemaEntry, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsValues, SetSettingPayload, Skill, SkillId, Steering,
+    SteeringId, SteeringScope, ToolPolicy,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -601,6 +602,9 @@ impl SettingsTab {
                 "Auto-connect on Launch",
                 "Automatically connect to the host server when the application starts",
                 "Connection",
+                "Code intelligence",
+                "rust-analyzer binary path",
+                "custom toolchain",
             ],
             Self::Backends => &[
                 "Backends",
@@ -1466,6 +1470,123 @@ fn GeneralTab() -> impl IntoView {
         </div>
 
         <BackgroundAgentFeaturesSection />
+        <CodeIntelSettingsSection />
+    }
+}
+
+const RUST_ANALYZER_PROVIDER_ID: &str = "rust-analyzer";
+
+fn rust_analyzer_provider_id() -> CodeIntelProviderId {
+    CodeIntelProviderId(RUST_ANALYZER_PROVIDER_ID.to_owned())
+}
+
+#[component]
+fn CodeIntelSettingsSection() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let state_for_value = state.clone();
+    let state_for_disabled = state.clone();
+    let state_for_commit = state.clone();
+    let state_for_keydown = state.clone();
+    let state_for_clear = state.clone();
+
+    let path_value = move || {
+        state_for_value
+            .selected_host_settings()
+            .and_then(|settings| {
+                settings
+                    .code_intel
+                    .language_server_paths
+                    .get(&rust_analyzer_provider_id())
+                    .map(|path| path.0.clone())
+            })
+            .unwrap_or_default()
+    };
+    let disabled = move || state_for_disabled.selected_host_settings().is_none();
+    let disabled_for_input = disabled.clone();
+    let disabled_for_button = disabled.clone();
+
+    let commit_path = move |state: &AppState, raw: &str| {
+        let trimmed = raw.trim();
+        let path = if trimmed.is_empty() {
+            None
+        } else {
+            Some(HostExecutablePath(trimmed.to_owned()))
+        };
+        send_host_setting(
+            state,
+            HostSettingValue::CodeIntelLanguageServerPath {
+                provider: rust_analyzer_provider_id(),
+                path,
+            },
+        );
+    };
+
+    let on_commit = move |ev: web_sys::Event| {
+        let Some(target) = ev.target() else {
+            return;
+        };
+        let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() else {
+            return;
+        };
+        commit_path(&state_for_commit, &input.value());
+    };
+    let on_keydown = move |ev: web_sys::KeyboardEvent| {
+        if ev.key() != "Enter" {
+            return;
+        }
+        ev.prevent_default();
+        let Some(target) = ev.target() else {
+            return;
+        };
+        let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() else {
+            return;
+        };
+        commit_path(&state_for_keydown, &input.value());
+    };
+    let on_clear = move |_: web_sys::MouseEvent| {
+        send_host_setting(
+            &state_for_clear,
+            HostSettingValue::CodeIntelLanguageServerPath {
+                provider: rust_analyzer_provider_id(),
+                path: None,
+            },
+        );
+    };
+
+    view! {
+        <h3 class="settings-section-title">"Code intelligence"</h3>
+
+        <div class="settings-field">
+            <label class="settings-label">"rust-analyzer binary path"</label>
+            <p class="settings-description">
+                "Optional absolute path to a standalone rust-analyzer binary. Use this for custom toolchains where the rustup proxy in ~/.cargo/bin cannot install rust-analyzer."
+            </p>
+            <div class="settings-mobile-broker-row">
+                <input
+                    class="settings-input settings-code-intel-path-input"
+                    type="text"
+                    prop:value=path_value
+                    placeholder="/path/to/rust-analyzer"
+                    disabled=disabled_for_input
+                    aria-label="rust-analyzer binary path"
+                    spellcheck="false"
+                    {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                    autocapitalize="none"
+                    autocomplete="off"
+                    on:change=on_commit
+                    on:keydown=on_keydown
+                />
+                <button
+                    type="button"
+                    class="filter-toggle settings-code-intel-path-clear"
+                    disabled=disabled_for_button
+                    title="Clear rust-analyzer binary path"
+                    on:click=on_clear
+                >
+                    "Clear"
+                </button>
+            </div>
+        </div>
     }
 }
 
@@ -4428,6 +4549,7 @@ mod wasm_tests {
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
+                    code_intel: Default::default(),
                 },
             );
         });
@@ -5523,6 +5645,7 @@ mod wasm_tests {
         state: &AppState,
         auto_generate_agent_names: bool,
         agent_activity_summaries: bool,
+        rust_analyzer_path: Option<&str>,
     ) {
         let host_id = "host-general".to_owned();
         state.selected_host_id.set(Some(host_id.clone()));
@@ -5535,6 +5658,14 @@ mod wasm_tests {
         state.connection_statuses.update(|m| {
             m.insert(host_id.clone(), crate::state::ConnectionStatus::Connected);
         });
+        let mut code_intel = protocol::CodeIntelSettings::default();
+        if let Some(path) = rust_analyzer_path {
+            code_intel.language_server_paths.insert(
+                CodeIntelProviderId("rust-analyzer".to_owned()),
+                HostExecutablePath(path.to_owned()),
+            );
+        }
+
         state.host_settings_by_host.update(|m| {
             m.insert(
                 host_id,
@@ -5551,6 +5682,7 @@ mod wasm_tests {
                         auto_generate_agent_names,
                         agent_activity_summaries,
                     },
+                    code_intel,
                 },
             );
         });
@@ -5594,7 +5726,7 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_general_host_settings(&state, true, false);
+            install_general_host_settings(&state, true, false, None);
             state.settings_open.set(true);
             provide_context(state);
             view! { <SettingsPanel /> }
@@ -5639,7 +5771,7 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_general_host_settings(&state, false, true);
+            install_general_host_settings(&state, false, true, None);
             state.settings_open.set(true);
             provide_context(state);
             view! { <SettingsPanel /> }
@@ -5664,5 +5796,77 @@ mod wasm_tests {
             body.contains("costs money") || body.contains("cost money"),
             "the section must warn the user that summaries cost money: {body}"
         );
+    }
+
+    fn rust_analyzer_path_input(container: &HtmlElement) -> web_sys::HtmlInputElement {
+        container
+            .query_selector("input[aria-label='rust-analyzer binary path']")
+            .unwrap()
+            .expect("rust-analyzer binary path input must render on the General tab")
+            .dyn_into()
+            .unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    async fn general_tab_rust_analyzer_path_commits_set_and_clear() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_general_host_settings(&state, true, false, Some("/old/rust-analyzer"));
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "General");
+        next_tick().await;
+
+        let input = rust_analyzer_path_input(&container);
+        assert_eq!(
+            input.value(),
+            "/old/rust-analyzer",
+            "rust-analyzer path input must reflect the current host setting"
+        );
+        input.set_value("/opt/bin/rust-analyzer");
+        dispatch_enter(&input);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_set_setting_payloads(&calls);
+        let set_frame = settings
+            .iter()
+            .find(|s| {
+                s.get("kind").and_then(|k| k.as_str()) == Some("code_intel_language_server_path")
+                    && s.get("provider").and_then(|p| p.as_str()) == Some("rust-analyzer")
+                    && s.get("path").and_then(|p| p.as_str()) == Some("/opt/bin/rust-analyzer")
+            })
+            .expect("Enter must emit CodeIntelLanguageServerPath with the typed path");
+        assert_eq!(
+            set_frame.get("path").and_then(|p| p.as_str()),
+            Some("/opt/bin/rust-analyzer")
+        );
+
+        let clear = find_button_by_text(&container, "Clear").expect("Clear button must render");
+        clear.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_set_setting_payloads(&calls);
+        let clear_frame = settings
+            .iter()
+            .rev()
+            .find(|s| {
+                s.get("kind").and_then(|k| k.as_str()) == Some("code_intel_language_server_path")
+                    && s.get("provider").and_then(|p| p.as_str()) == Some("rust-analyzer")
+            })
+            .expect("Clear must emit CodeIntelLanguageServerPath for rust-analyzer");
+        match clear_frame.get("path") {
+            None => {}
+            Some(value) if value.is_null() => {}
+            Some(value) => panic!("Clear must send path=None/null; got {value:?}"),
+        }
     }
 }

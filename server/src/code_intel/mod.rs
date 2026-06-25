@@ -32,7 +32,7 @@ pub(crate) use service::CodeIntelRouter;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use protocol::{CodeIntelResourceMode, FrameKind, ProjectPath};
+use protocol::{CodeIntelResourceMode, CodeIntelSettings, FrameKind, ProjectPath};
 use serde::Serialize;
 
 use language_server::LanguageServerConfig;
@@ -82,10 +82,10 @@ impl Language {
     /// markers, discovery, init options); the compiler forces a new variant to
     /// supply one. Everything else here reads *from* the config, so the config
     /// is the single source of truth per language (no duplicated tables).
-    pub(crate) fn config(self) -> LanguageServerConfig {
+    pub(crate) fn config(self, settings: &CodeIntelSettings) -> LanguageServerConfig {
         match self {
-            Language::Rust => rust_analyzer::rust_config(),
-            Language::Python => pyright::pyright_config(),
+            Language::Rust => rust_analyzer::rust_config(settings),
+            Language::Python => pyright::pyright_config(settings),
         }
     }
 
@@ -93,9 +93,12 @@ impl Language {
     /// language's `config().extensions` — no separate extension table to drift.
     /// `None` when no provider owns it.
     pub(crate) fn from_extension(extension: &str) -> Option<Self> {
-        Language::ALL
-            .into_iter()
-            .find(|language| language.config().extensions.contains(&extension))
+        Language::ALL.into_iter().find(|language| {
+            language
+                .config(&CodeIntelSettings::default())
+                .extensions
+                .contains(&extension)
+        })
     }
 
     /// Map a file to its language by extension alone. `None` means no provider
@@ -109,7 +112,7 @@ impl Language {
     /// file belongs to this language's kind of project (extension + marker,
     /// §M7 detection). Sourced from the config.
     pub(crate) fn workspace_markers(self) -> &'static [&'static str] {
-        self.config().workspace_markers
+        self.config(&CodeIntelSettings::default()).workspace_markers
     }
 }
 
@@ -174,13 +177,17 @@ mod tests {
     fn each_language_has_a_distinct_config() {
         // The §M7 proof at the type level: every language resolves to its own
         // config with distinct wire ids, all flowing through the one engine.
-        assert_eq!(Language::Rust.config().language.0, "rust");
-        assert_eq!(Language::Python.config().language.0, "python");
-        assert_eq!(Language::Rust.config().provider_id.0, "rust-analyzer");
-        assert_eq!(Language::Python.config().provider_id.0, "pyright");
+        let settings = CodeIntelSettings::default();
+        assert_eq!(Language::Rust.config(&settings).language.0, "rust");
+        assert_eq!(Language::Python.config(&settings).language.0, "python");
+        assert_eq!(
+            Language::Rust.config(&settings).provider_id.0,
+            "rust-analyzer"
+        );
+        assert_eq!(Language::Python.config(&settings).provider_id.0, "pyright");
         assert_ne!(
-            Language::Rust.config().language,
-            Language::Python.config().language
+            Language::Rust.config(&settings).language,
+            Language::Python.config(&settings).language
         );
     }
 

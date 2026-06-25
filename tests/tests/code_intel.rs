@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    CodeIntelErrorCode, CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelState,
-    CodeIntelStatusPayload, CodeIntelSubscribeFilePayload, Envelope, FrameKind, Project,
-    ProjectCreatePayload, ProjectId, ProjectNotifyPayload, ProjectPath, ProjectRootPath,
-    StreamPath, read_envelope, write_envelope,
+    CodeIntelErrorCode, CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelProviderId,
+    CodeIntelState, CodeIntelStatusPayload, CodeIntelSubscribeFilePayload, Envelope, FrameKind,
+    HostExecutablePath, HostSettingValue, HostSettingsPayload, Project, ProjectCreatePayload,
+    ProjectId, ProjectNotifyPayload, ProjectPath, ProjectRootPath, SetSettingPayload, StreamPath,
+    read_envelope, write_envelope,
 };
 
 #[cfg(unix)]
@@ -177,6 +178,50 @@ async fn next_raw_event(client: &mut client::Connection, context: &str) -> Envel
     env
 }
 
+async fn set_rust_analyzer_path(client: &mut client::Connection, path: Option<HostExecutablePath>) {
+    send_rust_analyzer_path_setting(client, path.clone()).await;
+    let provider = CodeIntelProviderId("rust-analyzer".to_owned());
+
+    loop {
+        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before rust-analyzer path HostSettings"),
+            Ok(Err(err)) => panic!("next_event failed before HostSettings: {err:?}"),
+            Err(_) => panic!("timed out waiting for rust-analyzer path HostSettings"),
+        };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        if env.kind != FrameKind::HostSettings {
+            continue;
+        }
+        let payload: HostSettingsPayload = env.parse_payload().expect("parse HostSettings");
+        assert_eq!(
+            payload
+                .settings
+                .code_intel
+                .language_server_paths
+                .get(&provider)
+                .cloned(),
+            path
+        );
+        return;
+    }
+}
+
+async fn send_rust_analyzer_path_setting(
+    client: &mut client::Connection,
+    path: Option<HostExecutablePath>,
+) {
+    let provider = CodeIntelProviderId("rust-analyzer".to_owned());
+    client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::CodeIntelLanguageServerPath { provider, path },
+        })
+        .await
+        .expect("set rust-analyzer path setting");
+}
+
 async fn wait_for_code_intel_unavailable(
     client: &mut client::Connection,
 ) -> (CodeIntelStatusPayload, CodeIntelErrorPayload) {
@@ -217,6 +262,47 @@ async fn wait_for_code_intel_unavailable(
         }
     }
     (unavailable.unwrap(), error.unwrap())
+}
+
+async fn wait_for_code_intel_status_matching(
+    client: &mut client::Connection,
+    context: &str,
+    mut predicate: impl FnMut(&CodeIntelStatusPayload) -> bool,
+) -> CodeIntelStatusPayload {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for code-intel status matching {context}"
+        );
+        let env = next_raw_event(client, context).await;
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        match env.kind {
+            FrameKind::CodeIntelStatus => {
+                let payload: CodeIntelStatusPayload =
+                    env.parse_payload().expect("parse CodeIntelStatusPayload");
+                if predicate(&payload) {
+                    return payload;
+                }
+            }
+            FrameKind::ProjectFileList
+            | FrameKind::ProjectGitStatus
+            | FrameKind::ProjectEvent
+            | FrameKind::HostSettings
+            | FrameKind::SessionSchemas
+            | FrameKind::BackendSetup
+            | FrameKind::QueuedMessages
+            | FrameKind::SessionSettings
+            | FrameKind::TeamPresetCatalogNotify
+            | FrameKind::SessionList
+            | FrameKind::WorkflowNotify
+            | FrameKind::AgentsViewPreferencesNotify
+            | FrameKind::CodeIntelError => {}
+            other => panic!("unexpected frame while waiting for code-intel status: {other}"),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -333,4 +419,194 @@ fn rust_analyzer_broken_path_hit_surfaces_actionable_error() {
                 "error payload should carry the failed probe exit status, got {error:?}"
             );
         });
+}
+
+#[tokio::test]
+async fn configured_invalid_rust_analyzer_path_fails_without_fallback() {
+    let configured_path = tempfile::tempdir()
+        .expect("create configured path tempdir")
+        .path()
+        .join("missing-rust-analyzer");
+    let configured_path_text = configured_path.to_string_lossy().into_owned();
+
+    let mut fixture = Fixture::new().await;
+    set_rust_analyzer_path(
+        &mut fixture.client,
+        Some(HostExecutablePath(configured_path_text.clone())),
+    )
+    .await;
+
+    let workspace = tempfile::tempdir().expect("create workspace");
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"ci_configured_missing_ra\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    fs::create_dir_all(workspace.path().join("src")).expect("create src");
+    fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("write main.rs");
+
+    let project = create_project_with_root(&mut fixture.client, workspace.path()).await;
+    let path = ProjectPath {
+        root: ProjectRootPath(workspace.path().to_string_lossy().into_owned()),
+        relative_path: "src/main.rs".to_owned(),
+    };
+
+    send_code_intel_subscribe(&mut fixture.client, &project.id, path).await;
+    let (status, error) = wait_for_code_intel_unavailable(&mut fixture.client).await;
+
+    assert_eq!(status.state, CodeIntelState::Unavailable);
+    let status_message = status
+        .message
+        .as_deref()
+        .expect("configured path status message");
+    assert!(
+        status_message.contains(&configured_path_text),
+        "status should name configured path, got {status:?}"
+    );
+    assert!(
+        !status_message.contains("rustup component add rust-analyzer"),
+        "configured path status must not suggest rustup component add, got {status:?}"
+    );
+    assert_eq!(error.code, CodeIntelErrorCode::ProviderUnavailable);
+    assert!(error.fatal);
+    assert!(
+        error.message.contains(&configured_path_text),
+        "error should name configured path, got {error:?}"
+    );
+    assert!(
+        !error.message.contains("rustup component add rust-analyzer"),
+        "configured path error must not suggest rustup component add, got {error:?}"
+    );
+    assert!(
+        error
+            .hint
+            .as_deref()
+            .is_some_and(|hint| !hint.contains("rustup component add rust-analyzer")),
+        "configured path hint must not be the rustup component hint, got {error:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn updating_configured_rust_analyzer_path_rediscovers_existing_provider() {
+    let mut fixture = Fixture::new().await;
+
+    let workspace = tempfile::tempdir().expect("create workspace");
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"ci_hot_reload_ra\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    fs::create_dir_all(workspace.path().join("src")).expect("create src");
+    fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("write main.rs");
+
+    let missing_path = workspace.path().join("missing-rust-analyzer");
+    let missing_path_text = missing_path.to_string_lossy().into_owned();
+    set_rust_analyzer_path(
+        &mut fixture.client,
+        Some(HostExecutablePath(missing_path_text.clone())),
+    )
+    .await;
+
+    let project = create_project_with_root(&mut fixture.client, workspace.path()).await;
+    let path = ProjectPath {
+        root: ProjectRootPath(workspace.path().to_string_lossy().into_owned()),
+        relative_path: "src/main.rs".to_owned(),
+    };
+
+    send_code_intel_subscribe(&mut fixture.client, &project.id, path).await;
+    let (status, error) = wait_for_code_intel_unavailable(&mut fixture.client).await;
+    assert!(
+        status
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains(&missing_path_text)),
+        "initial unavailable status should name the bad configured path, got {status:?}"
+    );
+    assert!(
+        error.message.contains(&missing_path_text),
+        "initial unavailable error should name the bad configured path, got {error:?}"
+    );
+
+    let valid_path = workspace.path().join("fake-rust-analyzer");
+    write_executable(
+        &valid_path,
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("rust-analyzer fake")
+    sys.exit(0)
+
+def send(payload):
+    data = json.dumps(payload, separators=(",", ":")).encode()
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data)
+    sys.stdout.buffer.flush()
+
+while True:
+    headers = {}
+    line = sys.stdin.buffer.readline()
+    if not line:
+        break
+    while line not in (b"\r\n", b"\n", b""):
+        key, _, value = line.decode("ascii", "replace").partition(":")
+        headers[key.lower()] = value.strip()
+        line = sys.stdin.buffer.readline()
+    length = int(headers.get("content-length", "0"))
+    body = sys.stdin.buffer.read(length)
+    if not body:
+        break
+    message = json.loads(body)
+    method = message.get("method")
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {
+                "capabilities": {
+                    "textDocumentSync": 1,
+                    "semanticTokensProvider": {
+                        "legend": {"tokenTypes": ["variable"], "tokenModifiers": []},
+                        "full": True
+                    }
+                }
+            }
+        })
+    elif method == "shutdown":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": None})
+    elif method == "exit":
+        break
+"#,
+    );
+
+    send_rust_analyzer_path_setting(
+        &mut fixture.client,
+        Some(HostExecutablePath(
+            valid_path.to_string_lossy().into_owned(),
+        )),
+    )
+    .await;
+
+    let status = wait_for_code_intel_status_matching(
+        &mut fixture.client,
+        "hot-reloaded rust-analyzer path",
+        |status| status.state != CodeIntelState::Unavailable,
+    )
+    .await;
+    assert!(
+        matches!(
+            status.state,
+            CodeIntelState::Starting | CodeIntelState::Indexing | CodeIntelState::Ready
+        ),
+        "valid configured path should restart discovery without an app restart, got {status:?}"
+    );
+    assert!(
+        status
+            .message
+            .as_deref()
+            .map(|message| !message.contains(&missing_path_text))
+            .unwrap_or(true),
+        "hot-reloaded status must not keep the old bad-path message, got {status:?}"
+    );
 }

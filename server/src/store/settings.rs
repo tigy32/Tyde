@@ -1,7 +1,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use protocol::{BackendKind, BackgroundAgentFeature, HostSettingValue, HostSettings};
+use protocol::{
+    BackendKind, BackgroundAgentFeature, CodeIntelSettings, HostSettingValue, HostSettings,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -335,6 +337,22 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
                 settings.background_agent_features.agent_activity_summaries = enabled;
             }
         },
+        HostSettingValue::CodeIntelLanguageServerPath { provider, path } => match path {
+            Some(path) => {
+                if path.0.trim().is_empty() {
+                    return Err(format!(
+                        "code-intel language server path for {provider} must not be empty"
+                    ));
+                }
+                settings
+                    .code_intel
+                    .language_server_paths
+                    .insert(provider, path);
+            }
+            None => {
+                settings.code_intel.language_server_paths.remove(&provider);
+            }
+        },
     }
 
     Ok(())
@@ -400,6 +418,7 @@ fn empty_settings() -> HostSettings {
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
+        code_intel: Default::default(),
     }
 }
 
@@ -423,6 +442,8 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         return Err("mobile_broker_url must not be empty".to_owned());
     }
 
+    let code_intel = validate_code_intel_settings(settings.code_intel)?;
+
     Ok(HostSettings {
         enabled_backends,
         default_backend: settings.default_backend,
@@ -433,7 +454,19 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         complexity_tiers_enabled: settings.complexity_tiers_enabled,
         backend_tier_configs: settings.backend_tier_configs,
         background_agent_features: settings.background_agent_features,
+        code_intel,
     })
+}
+
+fn validate_code_intel_settings(settings: CodeIntelSettings) -> Result<CodeIntelSettings, String> {
+    for (provider, path) in &settings.language_server_paths {
+        if path.0.trim().is_empty() {
+            return Err(format!(
+                "code-intel language server path for {provider} must not be empty"
+            ));
+        }
+    }
+    Ok(settings)
 }
 
 fn normalize_backend_list(backends: Vec<BackendKind>) -> Vec<BackendKind> {

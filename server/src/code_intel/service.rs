@@ -19,8 +19,8 @@ use protocol::{
     CodeIntelErrorPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
     CodeIntelHoverResultPayload, CodeIntelNavigatePayload, CodeIntelNavigateResultPayload,
     CodeIntelReferencesCompletePayload, CodeIntelResourceMode, CodeIntelSetVisibleRangePayload,
-    CodeIntelState, CodeIntelStatusPayload, CodeIntelStatusScope, CodeIntelSubscribeFilePayload,
-    FrameKind, ProjectFileVersion, ProjectPath, ProjectRootPath,
+    CodeIntelSettings, CodeIntelState, CodeIntelStatusPayload, CodeIntelStatusScope,
+    CodeIntelSubscribeFilePayload, FrameKind, ProjectFileVersion, ProjectPath, ProjectRootPath,
 };
 use tokio::sync::mpsc;
 
@@ -59,6 +59,9 @@ enum CodeIntelCommand {
     CancelReferences {
         payload: CodeIntelCancelReferencesPayload,
     },
+    UpdateSettings {
+        settings: CodeIntelSettings,
+    },
 }
 
 /// Clonable handle to a per-root service actor. Dropping every handle closes
@@ -88,6 +91,7 @@ struct CodeIntelService {
     /// delivery paces itself, and stamped on every status frame (including the
     /// `Unsupported` path below) so the UI can reflect it.
     resource_mode: CodeIntelResourceMode,
+    code_intel_settings: CodeIntelSettings,
 }
 
 impl CodeIntelService {
@@ -95,6 +99,7 @@ impl CodeIntelService {
         root: ProjectRootPath,
         project_handle: ProjectStreamHandle,
         resource_mode: CodeIntelResourceMode,
+        code_intel_settings: CodeIntelSettings,
     ) -> CodeIntelServiceHandle {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (version_tx, version_rx) = mpsc::unbounded_channel();
@@ -107,6 +112,7 @@ impl CodeIntelService {
                 version_listener_registered: false,
                 subscriptions: HashSet::new(),
                 resource_mode,
+                code_intel_settings,
             };
             let mut version_rx = Some(version_rx);
             loop {
@@ -210,8 +216,9 @@ impl CodeIntelService {
                     Some(language) => {
                         let root = self.root.clone();
                         let resource_mode = self.resource_mode;
+                        let config = language.config(&self.code_intel_settings);
                         let provider = self.providers.entry(language).or_insert_with(|| {
-                            Box::new(LspProvider::new(language.config(), root, resource_mode))
+                            Box::new(LspProvider::new(config, root, resource_mode))
                         });
                         tracing::debug!(
                             provider = %provider.provider_id(),
@@ -319,8 +326,27 @@ impl CodeIntelService {
                     provider.cancel_references(payload.references_id);
                 }
             }
+            CodeIntelCommand::UpdateSettings { settings } => {
+                for (language, provider) in &mut self.providers {
+                    if language_server_path_changed(*language, &self.code_intel_settings, &settings)
+                    {
+                        provider.reconfigure(language.config(&settings));
+                    }
+                }
+                self.code_intel_settings = settings;
+            }
         }
     }
+}
+
+fn language_server_path_changed(
+    language: Language,
+    old_settings: &CodeIntelSettings,
+    new_settings: &CodeIntelSettings,
+) -> bool {
+    let provider_id = language.config(old_settings).provider_id;
+    old_settings.language_server_paths.get(&provider_id)
+        != new_settings.language_server_paths.get(&provider_id)
 }
 
 /// The file names directly under a project root, used by [`detect_language`] to
@@ -366,23 +392,43 @@ pub(crate) struct CodeIntelRouter {
     /// real per-host signal later means changing only where this is sourced —
     /// the rest of the pipeline already threads it through.
     resource_mode: CodeIntelResourceMode,
+    code_intel_settings: CodeIntelSettings,
 }
 
 impl CodeIntelRouter {
-    pub(crate) fn new(project_handle: ProjectStreamHandle) -> Self {
+    pub(crate) fn new(
+        project_handle: ProjectStreamHandle,
+        code_intel_settings: CodeIntelSettings,
+    ) -> Self {
         Self {
             services: HashMap::new(),
             project_handle,
             resource_mode: host_resource_mode(),
+            code_intel_settings,
         }
     }
 
     fn service_for(&mut self, root: &ProjectRootPath) -> &CodeIntelServiceHandle {
         let project_handle = self.project_handle.clone();
         let resource_mode = self.resource_mode;
-        self.services
-            .entry(root.clone())
-            .or_insert_with(|| CodeIntelService::spawn(root.clone(), project_handle, resource_mode))
+        let code_intel_settings = self.code_intel_settings.clone();
+        self.services.entry(root.clone()).or_insert_with(|| {
+            CodeIntelService::spawn(
+                root.clone(),
+                project_handle,
+                resource_mode,
+                code_intel_settings,
+            )
+        })
+    }
+
+    pub(crate) fn update_settings(&mut self, settings: CodeIntelSettings) {
+        self.code_intel_settings = settings.clone();
+        for handle in self.services.values() {
+            let _ = handle.tx.send(CodeIntelCommand::UpdateSettings {
+                settings: settings.clone(),
+            });
+        }
     }
 
     pub(crate) fn subscribe(&mut self, payload: CodeIntelSubscribeFilePayload, output: Stream) {

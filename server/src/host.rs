@@ -6775,10 +6775,17 @@ impl HostHandle {
             )
             .await?;
         let mut state = self.state.lock().await;
+        let code_intel_settings = state
+            .settings_store
+            .lock()
+            .await
+            .get()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+            .code_intel;
         state
             .code_intel_routers
             .entry(project_id)
-            .or_insert_with(|| CodeIntelRouter::new(handle.clone()))
+            .or_insert_with(|| CodeIntelRouter::new(handle.clone(), code_intel_settings))
             .subscribe(payload, project_output_stream.clone());
         Ok(())
     }
@@ -6801,10 +6808,17 @@ impl HostHandle {
             )
             .await?;
         let mut state = self.state.lock().await;
+        let code_intel_settings = state
+            .settings_store
+            .lock()
+            .await
+            .get()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+            .code_intel;
         state
             .code_intel_routers
             .entry(project_id)
-            .or_insert_with(|| CodeIntelRouter::new(handle.clone()))
+            .or_insert_with(|| CodeIntelRouter::new(handle.clone(), code_intel_settings))
             .unsubscribe(payload.path);
         Ok(())
     }
@@ -6827,10 +6841,17 @@ impl HostHandle {
             )
             .await?;
         let mut state = self.state.lock().await;
+        let code_intel_settings = state
+            .settings_store
+            .lock()
+            .await
+            .get()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+            .code_intel;
         state
             .code_intel_routers
             .entry(project_id)
-            .or_insert_with(|| CodeIntelRouter::new(handle.clone()))
+            .or_insert_with(|| CodeIntelRouter::new(handle.clone(), code_intel_settings))
             .set_visible_range(payload);
         Ok(())
     }
@@ -6853,10 +6874,17 @@ impl HostHandle {
             )
             .await?;
         let mut state = self.state.lock().await;
+        let code_intel_settings = state
+            .settings_store
+            .lock()
+            .await
+            .get()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+            .code_intel;
         state
             .code_intel_routers
             .entry(project_id)
-            .or_insert_with(|| CodeIntelRouter::new(handle.clone()))
+            .or_insert_with(|| CodeIntelRouter::new(handle.clone(), code_intel_settings))
             .hover(payload, project_output_stream.clone());
         Ok(())
     }
@@ -6879,10 +6907,17 @@ impl HostHandle {
             )
             .await?;
         let mut state = self.state.lock().await;
+        let code_intel_settings = state
+            .settings_store
+            .lock()
+            .await
+            .get()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+            .code_intel;
         state
             .code_intel_routers
             .entry(project_id)
-            .or_insert_with(|| CodeIntelRouter::new(handle.clone()))
+            .or_insert_with(|| CodeIntelRouter::new(handle.clone(), code_intel_settings))
             .navigate(payload, project_output_stream.clone());
         Ok(())
     }
@@ -6905,10 +6940,17 @@ impl HostHandle {
             )
             .await?;
         let mut state = self.state.lock().await;
+        let code_intel_settings = state
+            .settings_store
+            .lock()
+            .await
+            .get()
+            .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+            .code_intel;
         state
             .code_intel_routers
             .entry(project_id)
-            .or_insert_with(|| CodeIntelRouter::new(handle.clone()))
+            .or_insert_with(|| CodeIntelRouter::new(handle.clone(), code_intel_settings))
             .find_references(payload, project_output_stream.clone());
         Ok(())
     }
@@ -10717,6 +10759,10 @@ async fn emit_review_list_changed_for_project(
 }
 
 async fn fan_out_host_settings(state: &mut HostState, settings: protocol::HostSettings) {
+    for router in state.code_intel_routers.values_mut() {
+        router.update_settings(settings.code_intel.clone());
+    }
+
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
 
@@ -11448,6 +11494,7 @@ mod tests {
             complexity_tiers_enabled: false,
             backend_tier_configs: HashMap::new(),
             background_agent_features: Default::default(),
+            code_intel: Default::default(),
         };
         let debug_mcp = DebugMcpHandle { url: String::new() };
         let agent_control = AgentControlMcpHandle { url: String::new() };

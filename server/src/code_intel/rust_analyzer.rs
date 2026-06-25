@@ -8,21 +8,24 @@
 //! diagnostics, go-to-def, hover, find-references, versioning, large-file
 //! delivery, crash/restart — lives in the engine and is reused unchanged.
 
-use protocol::{CodeIntelLanguageId, CodeIntelProviderId};
+use protocol::{CodeIntelLanguageId, CodeIntelProviderId, CodeIntelSettings};
 use serde_json::{Value, json};
 
 use super::bootstrap;
 use super::language_server::LanguageServerConfig;
 
 /// The rust-analyzer config consumed by [`LspProvider`](super::lsp_provider::LspProvider).
-pub(crate) fn rust_config() -> LanguageServerConfig {
+pub(crate) fn rust_config(settings: &CodeIntelSettings) -> LanguageServerConfig {
+    let provider_id = CodeIntelProviderId("rust-analyzer".to_owned());
+    let configured_path = settings.language_server_paths.get(&provider_id).cloned();
     LanguageServerConfig {
         language: CodeIntelLanguageId("rust".to_owned()),
-        provider_id: CodeIntelProviderId("rust-analyzer".to_owned()),
+        provider_id,
         lsp_language_id: "rust",
         extensions: &["rs"],
         workspace_markers: &["Cargo.toml"],
         discover: bootstrap::discover_rust_analyzer,
+        configured_path,
         initialization_options: rust_initialization_options,
     }
 }
@@ -55,12 +58,13 @@ mod tests {
 
     #[test]
     fn rust_config_identifies_as_rust_analyzer() {
-        let config = rust_config();
+        let config = rust_config(&Default::default());
         assert_eq!(config.language.0, "rust");
         assert_eq!(config.provider_id.0, "rust-analyzer");
         assert_eq!(config.lsp_language_id, "rust");
         assert_eq!(config.extensions, &["rs"]);
         assert_eq!(config.workspace_markers, &["Cargo.toml"]);
+        assert_eq!(config.configured_path, None);
     }
 
     /// rust-analyzer-gated end-to-end test, now driving the **generic**
@@ -73,7 +77,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path();
         if matches!(
-            bootstrap::discover_rust_analyzer(root),
+            bootstrap::discover_rust_analyzer(root, None),
             ServerDiscovery::Absent { .. }
         ) {
             eprintln!(
@@ -96,7 +100,7 @@ mod tests {
 
         let root_path = ProjectRootPath(root.to_string_lossy().into_owned());
         let mut provider = LspProvider::new(
-            rust_config(),
+            rust_config(&Default::default()),
             root_path.clone(),
             CodeIntelResourceMode::Full,
         );

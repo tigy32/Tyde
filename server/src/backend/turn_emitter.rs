@@ -850,6 +850,7 @@ mod tests {
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
+                    code_intel: Default::default(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: MobileBrokerStatus::Disabled,

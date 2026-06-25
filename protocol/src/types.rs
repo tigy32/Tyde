@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -1574,6 +1574,24 @@ pub struct HostSettings {
     pub backend_tier_configs: HashMap<BackendKind, BackendTierConfig>,
     #[serde(default = "default_background_agent_features")]
     pub background_agent_features: BackgroundAgentFeaturesSettings,
+    #[serde(default)]
+    pub code_intel: CodeIntelSettings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelSettings {
+    #[serde(default)]
+    pub language_server_paths: HashMap<CodeIntelProviderId, HostExecutablePath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HostExecutablePath(pub String);
+
+impl fmt::Display for HostExecutablePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1659,6 +1677,10 @@ pub enum HostSettingValue {
     BackgroundAgentFeatureEnabled {
         feature: BackgroundAgentFeature,
         enabled: bool,
+    },
+    CodeIntelLanguageServerPath {
+        provider: CodeIntelProviderId,
+        path: Option<HostExecutablePath>,
     },
 }
 
@@ -4807,8 +4829,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_nineteen() {
-        assert_eq!(PROTOCOL_VERSION, 19);
+    fn protocol_version_is_twenty() {
+        assert_eq!(PROTOCOL_VERSION, 20);
     }
 
     #[test]
@@ -4816,6 +4838,7 @@ mod search_serde_tests {
         let settings: HostSettings = serde_json::from_str("{}").expect("deserialize settings");
         assert!(settings.background_agent_features.auto_generate_agent_names);
         assert!(!settings.background_agent_features.agent_activity_summaries);
+        assert!(settings.code_intel.language_server_paths.is_empty());
     }
 
     #[test]
