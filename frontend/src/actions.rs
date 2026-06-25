@@ -1238,6 +1238,7 @@ mod wasm_tests {
                     instance_stream: StreamPath("/agent/antigravity-agent".to_owned()),
                     started: true,
                     fatal_error: None,
+                    activity_summary: Default::default(),
                 });
             });
 

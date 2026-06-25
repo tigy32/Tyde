@@ -2097,6 +2097,7 @@ mod wasm_tests {
             tyde_agent_control_mcp_enabled: false,
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
+            background_agent_features: Default::default(),
         }
     }
 

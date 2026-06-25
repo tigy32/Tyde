@@ -7,37 +7,38 @@ use crate::types::{
     ReviewBootstrapPayload, TeamCompactNotifyPayload, TeamCompactPayload, TerminalBootstrapPayload,
 };
 use crate::{
-    AgentClosedPayload, AgentOrigin, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
-    BackendKind, BackendSetupPayload, CancelWorkflowPayload, ChatEvent, ChatMessage, ChatMessageId,
-    ClientErrorPayload, CodeIntelDiagnosticsPayload, CodeIntelErrorPayload,
-    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
-    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
-    CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
-    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameKind, HostBootstrapPayload,
-    HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
-    ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload, McpServerNotifyPayload,
-    McpServerUpsertPayload, MobileAccessStatePayload, MobileDeviceRenamePayload,
-    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferPayload,
-    MobilePairingStartPayload, NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectSearchCompletePayload, ProjectSearchResultsPayload, ReviewEventPayload,
-    RunBackendSetupPayload, SessionListPayload, SessionSchemasPayload, SetAgentPinsPayload,
-    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
-    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
-    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath,
-    TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
-    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
-    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
-    TeamMemberNotifyPayload, TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload,
-    TeamMemberUpdatePayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload,
-    TeamSetManagerPayload, TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload,
-    TerminalOutputPayload, ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload,
-    WelcomePayload, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload,
-    WorkflowRefreshPayload, WorkflowRunNotifyPayload,
+    AgentActivitySummaryPayload, AgentClosedPayload, AgentOrigin, AgentStartPayload,
+    AgentsViewPreferencesNotifyPayload, BackendKind, BackendSetupPayload, CancelWorkflowPayload,
+    ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload, CodeIntelDiagnosticsPayload,
+    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
+    CodeIntelNavigateResultPayload, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, Envelope, FrameKind, HostBootstrapPayload, HostBrowseClosePayload,
+    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseListPayload,
+    HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload, ListSessionsPayload,
+    LoadAgentPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
+    MobileAccessStatePayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
+    MobilePairingCancelPayload, MobilePairingOfferPayload, MobilePairingStartPayload,
+    NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectNotifyPayload,
+    ProjectRenamePayload, ProjectReorderPayload, ProjectSearchCompletePayload,
+    ProjectSearchResultsPayload, ReviewEventPayload, RunBackendSetupPayload, SessionListPayload,
+    SessionSchemasPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
+    SetAgentsViewPreferencesPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
+    StreamPath, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
+    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
+    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
+    ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload, WelcomePayload,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
+    WorkflowRunNotifyPayload,
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 32;
@@ -250,6 +251,11 @@ impl ProtocolValidator {
             FrameKind::HostSettings => {
                 parse_host_payload::<HostSettingsPayload>(self, envelope, "HostSettings")
             }
+            FrameKind::AgentActivitySummary => parse_host_payload::<AgentActivitySummaryPayload>(
+                self,
+                envelope,
+                "AgentActivitySummary",
+            ),
             FrameKind::AgentsViewPreferencesNotify => {
                 parse_host_payload::<AgentsViewPreferencesNotifyPayload>(
                     self,
@@ -1659,6 +1665,7 @@ mod tests {
             workflow: None,
             created_at_ms: 0,
             instance_stream: agent_stream(),
+            activity_summary: Default::default(),
         }
     }
 
@@ -1677,6 +1684,7 @@ mod tests {
                     tyde_agent_control_mcp_enabled: true,
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: crate::MobileBrokerStatus::Disabled,
@@ -1906,6 +1914,7 @@ mod tests {
                     tyde_agent_control_mcp_enabled: true,
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
                 },
             },
         )

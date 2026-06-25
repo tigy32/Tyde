@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -580,6 +580,7 @@ pub enum FrameKind {
     AgentsViewPreferencesNotify,
     BackendSetup,
     NewAgent,
+    AgentActivitySummary,
     AgentStart,
     AgentRenamed,
     AgentCompactNotify,
@@ -734,6 +735,7 @@ impl fmt::Display for FrameKind {
             Self::AgentsViewPreferencesNotify => f.write_str("agents_view_preferences_notify"),
             Self::BackendSetup => f.write_str("backend_setup"),
             Self::NewAgent => f.write_str("new_agent"),
+            Self::AgentActivitySummary => f.write_str("agent_activity_summary"),
             Self::AgentStart => f.write_str("agent_start"),
             Self::AgentRenamed => f.write_str("agent_renamed"),
             Self::AgentCompactNotify => f.write_str("agent_compact_notify"),
@@ -1570,6 +1572,16 @@ pub struct HostSettings {
     /// Backends without an entry fall back to built-in defaults.
     #[serde(default)]
     pub backend_tier_configs: HashMap<BackendKind, BackendTierConfig>,
+    #[serde(default = "default_background_agent_features")]
+    pub background_agent_features: BackgroundAgentFeaturesSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundAgentFeaturesSettings {
+    #[serde(default = "default_auto_generate_agent_names_enabled")]
+    pub auto_generate_agent_names: bool,
+    #[serde(default)]
+    pub agent_activity_summaries: bool,
 }
 
 /// Per-backend mapping from spawn complexity tiers to session-settings
@@ -1585,6 +1597,30 @@ pub struct BackendTierConfig {
 
 fn default_agent_control_mcp_enabled() -> bool {
     true
+}
+
+pub fn default_auto_generate_agent_names_enabled() -> bool {
+    true
+}
+
+pub fn default_background_agent_features() -> BackgroundAgentFeaturesSettings {
+    BackgroundAgentFeaturesSettings {
+        auto_generate_agent_names: true,
+        agent_activity_summaries: false,
+    }
+}
+
+impl Default for BackgroundAgentFeaturesSettings {
+    fn default() -> Self {
+        default_background_agent_features()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundAgentFeature {
+    AutoGenerateAgentNames,
+    AgentActivitySummaries,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1619,6 +1655,10 @@ pub enum HostSettingValue {
     BackendTiers {
         backend: BackendKind,
         config: BackendTierConfig,
+    },
+    BackgroundAgentFeatureEnabled {
+        feature: BackgroundAgentFeature,
+        enabled: bool,
     },
 }
 
@@ -2183,6 +2223,51 @@ pub struct AgentClosedPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentActivitySummary {
+    pub text: String,
+    pub generated_at_ms: u64,
+    pub source_from_seq: Option<u64>,
+    pub source_through_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivitySummaryStaleReason {
+    NewActivity,
+    MaxAge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentActivitySummaryState {
+    #[default]
+    Disabled,
+    Empty,
+    Pending {
+        requested_at_ms: u64,
+        previous: Option<AgentActivitySummary>,
+    },
+    Fresh {
+        summary: AgentActivitySummary,
+    },
+    Stale {
+        summary: AgentActivitySummary,
+        reason: AgentActivitySummaryStaleReason,
+    },
+    Error {
+        message: String,
+        occurred_at_ms: u64,
+        previous: Option<AgentActivitySummary>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentActivitySummaryPayload {
+    pub agent_id: AgentId,
+    pub state: AgentActivitySummaryState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewAgentPayload {
     pub agent_id: AgentId,
     pub name: String,
@@ -2203,6 +2288,8 @@ pub struct NewAgentPayload {
     pub workflow: Option<AgentWorkflowMetadata>,
     pub created_at_ms: u64,
     pub instance_stream: StreamPath,
+    #[serde(default)]
+    pub activity_summary: AgentActivitySummaryState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4720,8 +4807,42 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_eighteen() {
-        assert_eq!(PROTOCOL_VERSION, 18);
+    fn protocol_version_is_nineteen() {
+        assert_eq!(PROTOCOL_VERSION, 19);
+    }
+
+    #[test]
+    fn background_agent_settings_defaults_are_safe() {
+        let settings: HostSettings = serde_json::from_str("{}").expect("deserialize settings");
+        assert!(settings.background_agent_features.auto_generate_agent_names);
+        assert!(!settings.background_agent_features.agent_activity_summaries);
+    }
+
+    #[test]
+    fn activity_summary_state_round_trips() {
+        let state = AgentActivitySummaryState::Fresh {
+            summary: AgentActivitySummary {
+                text: "Editing the backend scheduler.".to_owned(),
+                generated_at_ms: 42,
+                source_from_seq: Some(1),
+                source_through_seq: Some(9),
+            },
+        };
+        assert_eq!(round_trip(&state), state);
+
+        let payload = AgentActivitySummaryPayload {
+            agent_id: AgentId("agent-1".to_owned()),
+            state: AgentActivitySummaryState::Stale {
+                summary: AgentActivitySummary {
+                    text: "Editing the backend scheduler.".to_owned(),
+                    generated_at_ms: 42,
+                    source_from_seq: Some(1),
+                    source_through_seq: Some(9),
+                },
+                reason: AgentActivitySummaryStaleReason::NewActivity,
+            },
+        };
+        assert_eq!(round_trip(&payload), payload);
     }
 
     #[test]

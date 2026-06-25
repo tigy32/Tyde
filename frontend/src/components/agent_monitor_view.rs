@@ -2798,6 +2798,7 @@ mod tests {
             instance_stream: StreamPath(format!("/agent/{name}")),
             started,
             fatal_error: fatal_error.then(|| "failed".to_owned()),
+            activity_summary: Default::default(),
         }
     }
 
@@ -3143,6 +3144,7 @@ mod wasm_tests {
             instance_stream: StreamPath(format!("/agent/{name}")),
             started: true,
             fatal_error: fatal.then(|| "boom".to_owned()),
+            activity_summary: Default::default(),
         }
     }
 

@@ -84,6 +84,8 @@ async fn skip_noise(client: &mut client::Connection, context: &str) -> Envelope 
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList
+                | FrameKind::WorkflowNotify
+                | FrameKind::AgentsViewPreferencesNotify
         ) {
             continue;
         }
@@ -809,6 +811,8 @@ async fn queue_cleared_on_agent_termination() {
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList
+                | FrameKind::WorkflowNotify
+                | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::ChatEvent
         ) {
             continue;

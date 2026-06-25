@@ -3,14 +3,16 @@ mod fixture;
 use fixture::Fixture;
 use protocol::types::AgentClosedPayload;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentControlStatus, AgentErrorCode,
-    AgentErrorPayload, AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent,
+    AgentActivitySummaryPayload, AgentActivitySummaryState, AgentBootstrapEvent,
+    AgentBootstrapPayload, AgentControlStatus, AgentErrorCode, AgentErrorPayload, AgentOrigin,
+    AgentRenamedPayload, AgentStartPayload, BackendKind, BackgroundAgentFeature, ChatEvent,
     ClientErrorCode, ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope,
-    FrameKind, HostBootstrapPayload, ListSessionsPayload, MessageSender, NewAgentPayload, Project,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectId,
-    ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SendMessagePayload,
-    SendMessageToolResponse, SessionListPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
+    FrameKind, HostBootstrapPayload, HostSettingValue, HostSettingsPayload, ListSessionsPayload,
+    MessageSender, NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectId, ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath,
+    SendMessagePayload, SendMessageToolResponse, SessionListPayload, SetSettingPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath, ToolExecutionCompletedData,
+    ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -53,6 +55,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
         if matches!(
             env.kind,
             FrameKind::SessionSettings
+                | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
                 | FrameKind::BackendSetup
@@ -159,6 +162,7 @@ async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: 
         if matches!(
             env.kind,
             FrameKind::SessionSettings
+                | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
                 | FrameKind::BackendSetup
@@ -270,6 +274,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                     || matches!(
                         env.kind,
                         FrameKind::SessionSettings
+                            | FrameKind::AgentsViewPreferencesNotify
                             | FrameKind::TeamPresetCatalogNotify
                             | FrameKind::SessionSchemas
                             | FrameKind::BackendSetup
@@ -286,6 +291,80 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                 env.kind, env.stream
             ),
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+        }
+    }
+}
+
+async fn set_activity_summaries(client: &mut client::Connection, enabled: bool) {
+    client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::BackgroundAgentFeatureEnabled {
+                feature: BackgroundAgentFeature::AgentActivitySummaries,
+                enabled,
+            },
+        })
+        .await
+        .expect("set activity summary setting");
+
+    let env = expect_kind(
+        client,
+        FrameKind::HostSettings,
+        "activity summary HostSettings",
+    )
+    .await;
+    let payload: HostSettingsPayload = env.parse_payload().expect("parse HostSettings");
+    assert_eq!(
+        payload
+            .settings
+            .background_agent_features
+            .agent_activity_summaries,
+        enabled,
+        "activity summary setting did not round-trip through HostSettings"
+    );
+}
+
+async fn expect_activity_summary_matching(
+    client: &mut client::Connection,
+    agent_id: &protocol::AgentId,
+    context: &str,
+    mut matches_state: impl FnMut(&AgentActivitySummaryState) -> bool,
+) -> AgentActivitySummaryPayload {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for activity summary {context}"
+        );
+        let env = match tokio::time::timeout(remaining, client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before activity summary {context}"),
+            Ok(Err(err)) => {
+                panic!("next_event failed before activity summary {context}: {err:?}")
+            }
+            Err(_) => panic!("timed out waiting for activity summary {context}"),
+        };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        if env.kind == FrameKind::NewAgent {
+            let payload: NewAgentPayload = env.parse_payload().expect("parse unexpected NewAgent");
+            panic!(
+                "unexpected NewAgent while waiting for activity summary {context}: {}",
+                payload.agent_id
+            );
+        }
+        if env.kind != FrameKind::AgentActivitySummary {
+            continue;
+        }
+        let payload: AgentActivitySummaryPayload =
+            env.parse_payload().expect("parse AgentActivitySummary");
+        assert_eq!(
+            &payload.agent_id, agent_id,
+            "activity summary emitted for unexpected agent"
+        );
+        if matches_state(&payload.state) {
+            return payload;
         }
     }
 }
@@ -916,6 +995,7 @@ async fn expect_no_agent_error_message(
                     || matches!(
                         env.kind,
                         FrameKind::HostSettings
+                            | FrameKind::AgentsViewPreferencesNotify
                             | FrameKind::SessionSettings
                             | FrameKind::TeamPresetCatalogNotify
                             | FrameKind::SessionSchemas
@@ -3152,6 +3232,410 @@ async fn spawn_without_name_generates_short_name_and_persists_alias() {
 }
 
 #[tokio::test]
+async fn agent_activity_summaries_default_off_stay_disabled() {
+    let mut fixture = Fixture::new().await;
+    assert!(
+        fixture
+            .bootstrap
+            .settings
+            .background_agent_features
+            .auto_generate_agent_names
+    );
+    assert!(
+        !fixture
+            .bootstrap
+            .settings
+            .background_agent_features
+            .agent_activity_summaries
+    );
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("summary-off".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "summaries are disabled".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn with summaries off failed");
+
+    let env = expect_next_event(&mut fixture.client, "summaries-off NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse summaries-off NewAgent");
+    assert!(matches!(
+        new_agent.activity_summary,
+        AgentActivitySummaryState::Disabled
+    ));
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "summaries-off AgentStart",
+    )
+    .await;
+
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: summaries are disabled",
+    )
+    .await;
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_secs(1),
+        "activity summary while feature is disabled",
+    )
+    .await;
+    assert_eq!(
+        fixture.agent_ids().await,
+        vec![new_agent.agent_id],
+        "disabled summarizer must not register background agents"
+    );
+}
+
+#[tokio::test]
+async fn agent_activity_summaries_emit_fresh_mock_state_and_bootstrap() {
+    let mut fixture = Fixture::new().await;
+    set_activity_summaries(&mut fixture.client, true).await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("summary-on".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "summarize recent activity".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn with summaries on failed");
+
+    let env = expect_next_event(&mut fixture.client, "summaries-on NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse summaries-on NewAgent");
+    assert!(matches!(
+        new_agent.activity_summary,
+        AgentActivitySummaryState::Empty
+    ));
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "summaries-on AgentStart",
+    )
+    .await;
+
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: summarize recent activity",
+    )
+    .await;
+
+    let pending = expect_activity_summary_matching(
+        &mut fixture.client,
+        &new_agent.agent_id,
+        "Pending",
+        |state| matches!(state, AgentActivitySummaryState::Pending { .. }),
+    )
+    .await;
+    assert!(matches!(
+        pending.state,
+        AgentActivitySummaryState::Pending { previous: None, .. }
+    ));
+
+    let fresh = expect_activity_summary_matching(
+        &mut fixture.client,
+        &new_agent.agent_id,
+        "Fresh",
+        |state| matches!(state, AgentActivitySummaryState::Fresh { .. }),
+    )
+    .await;
+    let AgentActivitySummaryState::Fresh { summary } = fresh.state else {
+        panic!("expected Fresh summary");
+    };
+    assert_eq!(
+        summary.text,
+        "Mock summary: agent is working on recent activity"
+    );
+    assert!(summary.generated_at_ms > 0);
+    assert!(summary.source_through_seq.is_some());
+    assert_eq!(
+        fixture.agent_ids().await,
+        vec![new_agent.agent_id.clone()],
+        "summary helper must not register transient agents"
+    );
+
+    let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed = bootstrapped_agent(&bootstrap, &new_agent.agent_id);
+    assert!(matches!(
+        replayed.activity_summary,
+        AgentActivitySummaryState::Fresh { .. }
+    ));
+
+    fixture
+        .client
+        .close_agent(&new_agent.instance_stream)
+        .await
+        .expect("close summarized agent");
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "summarized AgentClosed",
+    )
+    .await;
+    let closed: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
+    assert_eq!(closed.agent_id, new_agent.agent_id);
+    assert!(
+        fixture.agent_ids().await.is_empty(),
+        "closed summarized agent should be removed from registry"
+    );
+    let (_after_close_client, after_close_bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        after_close_bootstrap.agents.is_empty(),
+        "closed summarized agent should not replay activity state"
+    );
+}
+
+#[tokio::test]
+async fn disabling_activity_summaries_discards_in_flight_result() {
+    let mut fixture = Fixture::new().await;
+    set_activity_summaries(&mut fixture.client, true).await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("summary-offswitch".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "__mock_slow_activity_summary__ keep working".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn slow summary agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "slow-summary NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse slow-summary NewAgent");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "slow-summary AgentStart",
+    )
+    .await;
+
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: __mock_slow_activity_summary__ keep working",
+    )
+    .await;
+    let _pending = expect_activity_summary_matching(
+        &mut fixture.client,
+        &new_agent.agent_id,
+        "slow Pending",
+        |state| matches!(state, AgentActivitySummaryState::Pending { .. }),
+    )
+    .await;
+
+    set_activity_summaries(&mut fixture.client, false).await;
+    let disabled = expect_activity_summary_matching(
+        &mut fixture.client,
+        &new_agent.agent_id,
+        "Disabled",
+        |state| matches!(state, AgentActivitySummaryState::Disabled),
+    )
+    .await;
+    assert!(matches!(
+        disabled.state,
+        AgentActivitySummaryState::Disabled
+    ));
+
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_secs(3),
+        "late activity summary after disabling",
+    )
+    .await;
+    assert_eq!(
+        fixture.agent_ids().await,
+        vec![new_agent.agent_id],
+        "off switch must not leave registered summary agents"
+    );
+}
+
+#[tokio::test]
+async fn agent_activity_summaries_error_state_backs_off_retries() {
+    let mut fixture = Fixture::new().await;
+    set_activity_summaries(&mut fixture.client, true).await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("summary-error".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "__mock_fail_activity_summary__ keep working".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn failing summary agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "failing-summary NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse failing-summary NewAgent");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "failing-summary AgentStart",
+    )
+    .await;
+
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: __mock_fail_activity_summary__ keep working",
+    )
+    .await;
+    let _pending = expect_activity_summary_matching(
+        &mut fixture.client,
+        &new_agent.agent_id,
+        "error Pending",
+        |state| matches!(state, AgentActivitySummaryState::Pending { .. }),
+    )
+    .await;
+
+    let error = expect_activity_summary_matching(
+        &mut fixture.client,
+        &new_agent.agent_id,
+        "Error",
+        |state| matches!(state, AgentActivitySummaryState::Error { .. }),
+    )
+    .await;
+    let AgentActivitySummaryState::Error {
+        message, previous, ..
+    } = error.state
+    else {
+        panic!("expected Error summary state");
+    };
+    assert_eq!(message, "mock activity summary failure");
+    assert!(previous.is_none());
+
+    fixture
+        .client
+        .send_message(
+            &new_agent.instance_stream,
+            "activity after summary failure".to_owned(),
+        )
+        .await
+        .expect("send follow-up after summary failure failed");
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: activity after summary failure",
+    )
+    .await;
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_secs(7),
+        "immediate activity summary retry after failure",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn agent_activity_summaries_unchanged_history_does_not_resummarize() {
+    let mut fixture = Fixture::new().await;
+    set_activity_summaries(&mut fixture.client, true).await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("summary-unchanged".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "summarize unchanged history".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn unchanged summary agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "unchanged-summary NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env
+        .parse_payload()
+        .expect("parse unchanged-summary NewAgent");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "unchanged-summary AgentStart",
+    )
+    .await;
+
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: summarize unchanged history",
+    )
+    .await;
+    let _pending = expect_activity_summary_matching(
+        &mut fixture.client,
+        &new_agent.agent_id,
+        "unchanged Pending",
+        |state| matches!(state, AgentActivitySummaryState::Pending { .. }),
+    )
+    .await;
+    let _fresh = expect_activity_summary_matching(
+        &mut fixture.client,
+        &new_agent.agent_id,
+        "unchanged Fresh",
+        |state| matches!(state, AgentActivitySummaryState::Fresh { .. }),
+    )
+    .await;
+
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_secs(7),
+        "second activity summary for unchanged history",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn renaming_agent_updates_live_streams_and_replay() {
     let mut fixture = Fixture::new().await;
 
@@ -3278,6 +3762,7 @@ async fn multiple_agents() {
         if matches!(
             env.kind,
             FrameKind::SessionSettings
+                | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
                 | FrameKind::BackendSetup

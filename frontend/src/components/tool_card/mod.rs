@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use leptos::prelude::*;
 use protocol::{
+    AgentActivitySummary, AgentActivitySummaryStaleReason, AgentActivitySummaryState,
     AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind, SubAgentProgress,
     ToolExecutionResult, ToolProgressData, ToolProgressUpdate, ToolRequestType, WorkflowRunState,
     WorkflowRunStatus,
@@ -730,6 +731,24 @@ fn AgentControlAgentRow(
         }
     });
 
+    // Server-owned activity summary for this agent, looked up reactively from
+    // `AppState::agents` so it re-renders when an `AgentActivitySummary` frame
+    // updates the record. The frontend renders this state verbatim — it never
+    // infers a summary from streaming text or tool cards.
+    let activity_summary = Signal::derive({
+        let state = state.clone();
+        let agent_id = agent_id.clone();
+        move || {
+            let parent = parent_ref.get()?;
+            state.agents.with(|agents| {
+                agents
+                    .iter()
+                    .find(|agent| agent.host_id == parent.host_id && agent.agent_id == agent_id)
+                    .map(|agent| agent.activity_summary.clone())
+            })
+        }
+    });
+
     let open_state = state.clone();
     let open_agent_id = agent_id.clone();
     let on_open = move |_: web_sys::MouseEvent| {
@@ -759,7 +778,94 @@ fn AgentControlAgentRow(
             {move || preview.get().map(|text| view! {
                 <div class="tool-live-agent-preview">{text}</div>
             })}
+            {move || activity_summary.get().and_then(agent_activity_summary_view)}
         </div>
+    }
+}
+
+/// Render the server-owned activity summary for an agent row, or `None` when
+/// there is nothing to show (disabled / empty / a pending state with no prior
+/// text). The freshness/stale/error framing comes straight from the server
+/// enum; the frontend only formats the timestamp for display.
+fn agent_activity_summary_view(state: AgentActivitySummaryState) -> Option<AnyView> {
+    match state {
+        AgentActivitySummaryState::Disabled | AgentActivitySummaryState::Empty => None,
+        AgentActivitySummaryState::Pending { previous, .. } => match previous {
+            Some(summary) => Some(
+                view! {
+                    <div class="tool-live-agent-summary">
+                        <span class="tool-live-agent-summary-text">{summary.text}</span>
+                        <span class="tool-live-agent-summary-meta updating">"updating\u{2026}"</span>
+                    </div>
+                }
+                .into_any(),
+            ),
+            None => Some(
+                view! {
+                    <div class="tool-live-agent-summary">
+                        <span class="tool-live-agent-summary-meta pending">"summarizing\u{2026}"</span>
+                    </div>
+                }
+                .into_any(),
+            ),
+        },
+        AgentActivitySummaryState::Fresh { summary } => {
+            let freshness = format_summary_age(&summary);
+            Some(
+                view! {
+                    <div class="tool-live-agent-summary">
+                        <span class="tool-live-agent-summary-text">{summary.text}</span>
+                        <span class="tool-live-agent-summary-meta">{freshness}</span>
+                    </div>
+                }
+                .into_any(),
+            )
+        }
+        AgentActivitySummaryState::Stale { summary, reason } => {
+            let hint = match reason {
+                AgentActivitySummaryStaleReason::NewActivity => "stale \u{00b7} new activity",
+                AgentActivitySummaryStaleReason::MaxAge => "stale",
+            };
+            Some(
+                view! {
+                    <div class="tool-live-agent-summary">
+                        <span class="tool-live-agent-summary-text">{summary.text}</span>
+                        <span class="tool-live-agent-summary-meta stale">{hint}</span>
+                    </div>
+                }
+                .into_any(),
+            )
+        }
+        AgentActivitySummaryState::Error { previous, .. } => Some(
+            view! {
+                <div class="tool-live-agent-summary">
+                    {previous.map(|summary| view! {
+                        <span class="tool-live-agent-summary-text">{summary.text}</span>
+                    })}
+                    <span class="tool-live-agent-summary-meta error">"summary unavailable"</span>
+                </div>
+            }
+            .into_any(),
+        ),
+    }
+}
+
+/// Compact "updated Ns ago" freshness label derived from the summary's
+/// `generated_at_ms`. Mirrors the relative-time scheme used elsewhere in chat.
+fn format_summary_age(summary: &AgentActivitySummary) -> String {
+    if summary.generated_at_ms == 0 {
+        return "updated just now".to_owned();
+    }
+    let now_ms = js_sys::Date::now() as u64;
+    let diff_secs = now_ms.saturating_sub(summary.generated_at_ms) / 1000;
+    if diff_secs < 60 {
+        "updated just now".to_owned()
+    } else if diff_secs < 3600 {
+        format!("updated {}m ago", diff_secs / 60)
+    } else if diff_secs < 86400 {
+        format!("updated {}h ago", diff_secs / 3600)
+    } else {
+        format!("updated {}d ago", diff_secs / 86400)
     }
 }
 
@@ -1413,6 +1519,7 @@ mod live_card_wasm_tests {
             instance_stream: StreamPath(format!("/agents/{id}")),
             started,
             fatal_error: None,
+            activity_summary: Default::default(),
         }
     }
 
@@ -1650,6 +1757,76 @@ mod live_card_wasm_tests {
             tool_header_status(&container),
             "Done",
             "completed await tool header should not stay running"
+        );
+    }
+
+    /// The await-agents card surfaces the server-owned activity summary so the
+    /// user can glance at "what is this agent doing?". The summary text, the
+    /// pending hint, and the disabled (render-nothing) state all come straight
+    /// from `AgentInfo.activity_summary` — the frontend never infers them.
+    #[wasm_bindgen_test]
+    async fn agent_control_await_card_renders_server_activity_summary() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+        );
+        let agent_id = AgentId("agent-sub".to_owned());
+
+        // Fresh: the server summary text shows verbatim with a freshness label.
+        let mut info = agent_info("agent-sub", "Awaited Worker", true);
+        info.activity_summary = AgentActivitySummaryState::Fresh {
+            summary: AgentActivitySummary {
+                text: "Refactoring the auth module and adding tests".to_owned(),
+                generated_at_ms: js_sys::Date::now() as u64,
+                source_from_seq: Some(1),
+                source_through_seq: Some(9),
+            },
+        };
+        state.agents.update(|agents| agents.push(info));
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("Refactoring the auth module and adding tests"),
+            "fresh summary text visible: {body}"
+        );
+        assert!(
+            body.contains("updated"),
+            "fresh summary shows a freshness label: {body}"
+        );
+
+        // Pending with no previous: a subtle summarizing hint, no stale text.
+        state.agents.update(|agents| {
+            if let Some(agent) = agents.iter_mut().find(|agent| agent.agent_id == agent_id) {
+                agent.activity_summary = AgentActivitySummaryState::Pending {
+                    requested_at_ms: js_sys::Date::now() as u64,
+                    previous: None,
+                };
+            }
+        });
+        next_tick().await;
+        let body = text(&container);
+        assert!(
+            body.contains("summarizing"),
+            "pending state shows a summarizing hint: {body}"
+        );
+        assert!(
+            !body.contains("Refactoring the auth module"),
+            "no stale summary text once pending with no previous: {body}"
+        );
+
+        // Disabled: nothing summary-related renders.
+        state.agents.update(|agents| {
+            if let Some(agent) = agents.iter_mut().find(|agent| agent.agent_id == agent_id) {
+                agent.activity_summary = AgentActivitySummaryState::Disabled;
+            }
+        });
+        next_tick().await;
+        let body = text(&container);
+        assert!(
+            !body.contains("summarizing") && !body.contains("updated"),
+            "disabled renders no summary line: {body}"
         );
     }
 }

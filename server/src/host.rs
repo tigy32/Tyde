@@ -12,21 +12,23 @@ use protocol::types::{
     TeamCompactNotifyPayload, TeamCompactPayload, TeamCompactStatus,
 };
 use protocol::{
-    AgentAnnotationTarget, AgentControlStatus, AgentId, AgentInput, AgentOrderKey, AgentOrigin,
-    AgentPinsUpdate, AgentStartPayload, AgentSystemTagAssignment, AgentSystemTagDescriptor,
-    AgentSystemTagId, AgentTagsSnapshot, AgentTagsUpdate, AgentWorkflowMetadata,
-    AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate,
-    BackendKind, BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload,
-    CancelWorkflowPayload, CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload,
-    CodeIntelHoverPayload, CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload,
-    CodeIntelSubscribeFilePayload, CodeIntelUnsubscribeFilePayload, CustomAgent,
-    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind,
-    GitBranchName, HostAbsPath, HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload,
-    HostBrowseStartPayload, HostFilterId, HostSettingsPayload, ImageData, LOCAL_HOST_ID,
-    McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
-    McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
-    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    AgentActivitySummary, AgentActivitySummaryPayload, AgentActivitySummaryStaleReason,
+    AgentActivitySummaryState, AgentAnnotationTarget, AgentControlStatus, AgentId, AgentInput,
+    AgentOrderKey, AgentOrigin, AgentPinsUpdate, AgentStartPayload, AgentSystemTagAssignment,
+    AgentSystemTagDescriptor, AgentSystemTagId, AgentTagsSnapshot, AgentTagsUpdate,
+    AgentWorkflowMetadata, AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesSnapshot,
+    AgentsViewPreferencesUpdate, BackendKind, BackendSetupPayload, BrowseBootstrapListing,
+    BrowseBootstrapPayload, CancelWorkflowPayload, CodeIntelCancelReferencesPayload,
+    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
+    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
+    CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, GitBranchName, HostAbsPath,
+    HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
+    HostFilterId, HostSettingsPayload, ImageData, LOCAL_HOST_ID, McpServerConfig,
+    McpServerDeletePayload, McpServerId, McpServerNotifyPayload, McpServerUpsertPayload,
+    McpTransportConfig, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
+    MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
     ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
@@ -54,7 +56,7 @@ use protocol::{
     WorkflowSaveTarget, WorkflowSource, WorkflowSourceScope, WorkflowStepRunId,
     WorkflowStepRunSnapshot, WorkflowTargetDirectory, WorkflowTargetsResponse,
 };
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::agent::customization::{
@@ -67,7 +69,8 @@ use crate::agent::registry::{
 };
 use crate::agent::{
     AgentHandle, CompactionStart, CompactionSummary, DEFAULT_COMPACTION_SUMMARY_MAX_BYTES,
-    GenerateAgentNameRequest, InterruptOutcome, MAX_COMPACTION_SUMMARY_BYTES, derive_agent_name,
+    GenerateAgentActivitySummaryRequest, GenerateAgentNameRequest, InterruptOutcome,
+    MAX_COMPACTION_SUMMARY_BYTES, derive_agent_name, generate_agent_activity_summary,
     generate_agent_name,
 };
 use crate::agent_control_mcp::AgentControlMcpHandle;
@@ -199,6 +202,48 @@ struct ReviewTargetAgentRequest {
 }
 
 const COMPACTION_SUMMARY_PREVIEW_CHARS: usize = 512;
+const ACTIVITY_SUMMARY_HISTORY_EVENTS: usize = 40;
+const ACTIVITY_SUMMARY_HISTORY_BYTES: usize = 16 * 1024;
+const ACTIVITY_SUMMARY_INITIAL_DELAY: Duration = Duration::from_secs(10);
+const ACTIVITY_SUMMARY_DEBOUNCE: Duration = Duration::from_secs(5);
+const ACTIVITY_SUMMARY_MAX_FREQUENCY: Duration = Duration::from_secs(60);
+const ACTIVITY_SUMMARY_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActivitySummarySettingsSignal {
+    enabled: bool,
+    epoch: u64,
+}
+
+#[derive(Clone)]
+struct ActivitySummaryObservation {
+    agent_id: AgentId,
+    handle: AgentHandle,
+    start: AgentStartPayload,
+    status: crate::agent::registry::AgentStatus,
+}
+
+#[derive(Default)]
+struct ActivitySummarySchedulerEntry {
+    last_activity_counter: u64,
+    first_meaningful_at: Option<Instant>,
+    pending_due: Option<Instant>,
+    queued_final_refresh: bool,
+    in_flight: bool,
+    was_active: bool,
+    last_call_at: Option<Instant>,
+    backoff_until: Option<Instant>,
+    last_summarized_through_seq: Option<u64>,
+    latest_observed_through_seq: Option<u64>,
+}
+
+struct ActivitySummaryTaskResult {
+    agent_id: AgentId,
+    epoch: u64,
+    transient_agent_id: AgentId,
+    source_through_seq: Option<u64>,
+    result: Result<AgentActivitySummary, String>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct TeamMemberMessageOutcome {
@@ -252,6 +297,9 @@ pub(crate) struct HostState {
     pub steering_store: Arc<Mutex<SteeringStore>>,
     pub skill_store: Arc<Mutex<SkillStore>>,
     pub agent_sessions: HashMap<AgentId, SessionId>,
+    pub agent_activity_summaries: HashMap<AgentId, AgentActivitySummaryState>,
+    activity_summary_epoch: u64,
+    activity_summary_settings_tx: watch::Sender<ActivitySummarySettingsSignal>,
     pub sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub use_mock_backend: bool,
     pub debug_mcp: DebugMcpHandle,
@@ -687,6 +735,7 @@ impl HostHandle {
                 )
             });
             let start = agent_handle.snapshot();
+            let activity_summary = current_agent_activity_summary_state(&state, &start.agent_id);
             let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
                 panic!(
                     "host stream {} disappeared during registration bootstrap build",
@@ -709,6 +758,7 @@ impl HostHandle {
                 workflow: start.workflow.clone(),
                 created_at_ms: start.created_at_ms,
                 instance_stream: instance_stream.clone(),
+                activity_summary,
             };
             subscriber
                 .known_agent_streams
@@ -1839,7 +1889,11 @@ impl HostHandle {
                     ),
                     None => {
                         let provisional = derive_agent_name(&prompt);
-                        if startup_failure.is_none() {
+                        if startup_failure.is_none()
+                            && host_settings
+                                .background_agent_features
+                                .auto_generate_agent_names
+                        {
                             deferred_generated_name = Some(GenerateAgentNameRequest {
                                 backend_kind,
                                 workspace_roots: workspace_roots.clone(),
@@ -2541,6 +2595,8 @@ impl HostHandle {
                 sub_agent_spawn_tx,
                 review_registry,
             );
+            let activity_summary =
+                initial_agent_activity_summary_state(&mut state, &spawned.start.agent_id);
             let host_streams = state
                 .host_streams
                 .iter_mut()
@@ -2560,6 +2616,7 @@ impl HostHandle {
                         subscriber.stream.clone(),
                         attach_eagerly,
                         instance_stream,
+                        activity_summary.clone(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -2572,13 +2629,14 @@ impl HostHandle {
         };
 
         let mut dead_paths = Vec::new();
-        for (path, stream, attach_eagerly, instance_stream) in host_streams {
+        for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
             if emit_new_agent_for_stream(
                 &start,
                 &agent_handle,
                 &stream,
                 instance_stream,
                 attach_eagerly,
+                activity_summary,
             )
             .await
             .is_err()
@@ -2692,6 +2750,8 @@ impl HostHandle {
                 state
                     .registry
                     .spawn(request, session_store, sub_agent_spawn_tx, review_registry);
+            let activity_summary =
+                initial_agent_activity_summary_state(&mut state, &spawned.start.agent_id);
             let host_streams = state
                 .host_streams
                 .iter_mut()
@@ -2711,6 +2771,7 @@ impl HostHandle {
                         subscriber.stream.clone(),
                         attach_eagerly,
                         instance_stream,
+                        activity_summary.clone(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -2723,13 +2784,14 @@ impl HostHandle {
         };
 
         let mut dead_paths = Vec::new();
-        for (path, stream, attach_eagerly, instance_stream) in host_streams {
+        for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
             if emit_new_agent_for_stream(
                 &start,
                 &agent_handle,
                 &stream,
                 instance_stream,
                 attach_eagerly,
+                activity_summary,
             )
             .await
             .is_err()
@@ -4428,6 +4490,7 @@ impl HostHandle {
             .apply(payload.setting)
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         fan_out_host_settings(&mut state, settings.clone()).await;
+        apply_agent_activity_summary_setting(&mut state, &settings).await;
         state.mobile_access.settings_changed(settings);
         if refresh_session_schemas {
             drop(state);
@@ -5047,6 +5110,7 @@ impl HostHandle {
             }
 
             let removed_session_id = state.agent_sessions.remove(&closed_agent_id);
+            state.agent_activity_summaries.remove(&closed_agent_id);
             let snapshot_session_id = removed
                 .as_ref()
                 .and_then(|agent| agent.snapshot().session_id);
@@ -5143,6 +5207,167 @@ impl HostHandle {
 
     pub(crate) async fn read_settings(&self) -> Result<protocol::HostSettings, String> {
         self.state.lock().await.settings_store.lock().await.get()
+    }
+
+    async fn activity_summary_settings_receiver(
+        &self,
+    ) -> watch::Receiver<ActivitySummarySettingsSignal> {
+        self.state
+            .lock()
+            .await
+            .activity_summary_settings_tx
+            .subscribe()
+    }
+
+    async fn activity_summary_observations(&self) -> Vec<ActivitySummaryObservation> {
+        let entries = {
+            let state = self.state.lock().await;
+            state
+                .registry
+                .agent_ids()
+                .into_iter()
+                .filter_map(|agent_id| {
+                    let handle = state.registry.agent_handle(&agent_id)?;
+                    let status_handle = state.registry.agent_status_handle(&agent_id)?;
+                    Some((agent_id, handle, status_handle))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut observations = Vec::with_capacity(entries.len());
+        for (agent_id, handle, status_handle) in entries {
+            let status = status_handle.snapshot().await;
+            let start = handle.snapshot();
+            observations.push(ActivitySummaryObservation {
+                agent_id,
+                handle,
+                start,
+                status,
+            });
+        }
+        observations
+    }
+
+    async fn activity_summary_observation(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<ActivitySummaryObservation> {
+        let (handle, status_handle) = {
+            let state = self.state.lock().await;
+            (
+                state.registry.agent_handle(agent_id)?,
+                state.registry.agent_status_handle(agent_id)?,
+            )
+        };
+        let status = status_handle.snapshot().await;
+        let start = handle.snapshot();
+        Some(ActivitySummaryObservation {
+            agent_id: agent_id.clone(),
+            handle,
+            start,
+            status,
+        })
+    }
+
+    async fn use_mock_backend(&self) -> bool {
+        self.state.lock().await.use_mock_backend
+    }
+
+    async fn is_agent_registered(&self, agent_id: &AgentId) -> bool {
+        self.state
+            .lock()
+            .await
+            .registry
+            .agent_handle(agent_id)
+            .is_some()
+    }
+
+    async fn agent_activity_summary_for_context(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<AgentActivitySummary> {
+        let state = self.state.lock().await;
+        state
+            .agent_activity_summaries
+            .get(agent_id)
+            .and_then(activity_summary_from_state)
+    }
+
+    async fn set_agent_activity_summary_empty(&self, agent_id: AgentId) {
+        self.set_agent_activity_summary_state(agent_id, AgentActivitySummaryState::Empty)
+            .await;
+    }
+
+    async fn set_agent_activity_summary_error(&self, agent_id: AgentId, message: String) {
+        let previous = self.agent_activity_summary_for_context(&agent_id).await;
+        self.set_agent_activity_summary_state(
+            agent_id,
+            AgentActivitySummaryState::Error {
+                message,
+                occurred_at_ms: crate::agent::now_ms(),
+                previous,
+            },
+        )
+        .await;
+    }
+
+    async fn mark_agent_activity_summary_stale_if_fresh(&self, agent_id: AgentId) {
+        let state_to_emit = {
+            let mut state = self.state.lock().await;
+            let Some(AgentActivitySummaryState::Fresh { summary }) =
+                state.agent_activity_summaries.get(&agent_id).cloned()
+            else {
+                return;
+            };
+            let stale = AgentActivitySummaryState::Stale {
+                summary,
+                reason: AgentActivitySummaryStaleReason::NewActivity,
+            };
+            state
+                .agent_activity_summaries
+                .insert(agent_id.clone(), stale.clone());
+            stale
+        };
+        self.fan_out_agent_activity_summary(agent_id, state_to_emit)
+            .await;
+    }
+
+    async fn set_agent_activity_summary_state(
+        &self,
+        agent_id: AgentId,
+        summary_state: AgentActivitySummaryState,
+    ) {
+        let changed = {
+            let mut state = self.state.lock().await;
+            if state.agent_activity_summaries.get(&agent_id) == Some(&summary_state) {
+                false
+            } else {
+                state
+                    .agent_activity_summaries
+                    .insert(agent_id.clone(), summary_state.clone());
+                true
+            }
+        };
+        if changed {
+            self.fan_out_agent_activity_summary(agent_id, summary_state)
+                .await;
+        }
+    }
+
+    async fn fan_out_agent_activity_summary(
+        &self,
+        agent_id: AgentId,
+        summary_state: AgentActivitySummaryState,
+    ) {
+        let mut state = self.state.lock().await;
+        fan_out_agent_activity_summary(
+            &mut state,
+            AgentActivitySummaryPayload {
+                agent_id,
+                state: summary_state,
+            },
+        )
+        .await;
     }
 
     pub async fn agent_control_mcp_url(&self) -> String {
@@ -6117,6 +6342,8 @@ impl HostHandle {
             state
                 .agent_sessions
                 .insert(spawned.start.agent_id.clone(), session_id.clone());
+            let activity_summary =
+                initial_agent_activity_summary_state(&mut state, &spawned.start.agent_id);
             let host_streams = state
                 .host_streams
                 .iter_mut()
@@ -6136,6 +6363,7 @@ impl HostHandle {
                         subscriber.stream.clone(),
                         attach_eagerly,
                         instance_stream,
+                        activity_summary.clone(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -6168,13 +6396,14 @@ impl HostHandle {
             });
 
         let mut dead_paths = Vec::new();
-        for (path, stream, attach_eagerly, instance_stream) in host_streams {
+        for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
             if emit_new_agent_for_stream(
                 &start,
                 &agent_handle,
                 &stream,
                 instance_stream,
                 attach_eagerly,
+                activity_summary,
             )
             .await
             .is_err()
@@ -8457,6 +8686,13 @@ fn spawn_host_inner(
         .then(|| AgentsViewPreferencesStore::load(paths.agents_view_preferences));
     let host_settings = settings_store.get()?;
     let initial_mobile_settings = host_settings.clone();
+    let (activity_summary_settings_tx, _activity_summary_settings_rx) =
+        watch::channel(ActivitySummarySettingsSignal {
+            enabled: host_settings
+                .background_agent_features
+                .agent_activity_summaries,
+            epoch: 0,
+        });
     let mobile_pairings_store = MobilePairingsStore::load(paths.mobile_pairings)?;
     let custom_agent_store = CustomAgentStore::load(paths.custom_agent)?;
     let (role_preset_ids, personality_preset_ids) = team_preset_validation_refs();
@@ -8534,6 +8770,9 @@ fn spawn_host_inner(
             steering_store: Arc::new(Mutex::new(steering_store)),
             skill_store: Arc::new(Mutex::new(skill_store)),
             agent_sessions: HashMap::new(),
+            agent_activity_summaries: HashMap::new(),
+            activity_summary_epoch: 0,
+            activity_summary_settings_tx,
             sub_agent_spawn_tx,
             use_mock_backend,
             debug_mcp,
@@ -8655,6 +8894,7 @@ fn spawn_host_inner(
     spawn_host_review_project_update_task(host.clone(), review_project_update_rx);
     spawn_host_workflow_catalog_task(host.clone(), workflow_signal_rx);
     spawn_host_team_status_task(host.clone());
+    spawn_agent_activity_summary_task(host.clone());
 
     Ok(host)
 }
@@ -8747,6 +8987,361 @@ fn spawn_host_team_status_task(host: HostHandle) {
             error = %err,
             "failed to spawn host team-status worker thread"
         );
+    }
+}
+
+fn spawn_agent_activity_summary_task(host: HostHandle) {
+    let worker = async move {
+        let mut status_rx = host.subscribe_agent_status_changes().await;
+        let mut settings_rx = host.activity_summary_settings_receiver().await;
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<ActivitySummaryTaskResult>();
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut entries = HashMap::<AgentId, ActivitySummarySchedulerEntry>::new();
+
+        loop {
+            let current_settings = *settings_rx.borrow();
+            let next_due = if current_settings.enabled {
+                entries
+                    .values()
+                    .filter_map(|entry| (!entry.in_flight).then_some(entry.pending_due).flatten())
+                    .min()
+            } else {
+                None
+            };
+            let sleep_duration = next_due
+                .map(|due| due.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|| Duration::from_secs(3600));
+            let sleep = tokio::time::sleep(sleep_duration);
+            tokio::pin!(sleep);
+
+            tokio::select! {
+                _ = &mut sleep, if next_due.is_some() => {
+                    start_due_activity_summary_calls(
+                        &host,
+                        &mut entries,
+                        current_settings,
+                        Arc::clone(&semaphore),
+                        result_tx.clone(),
+                    )
+                    .await;
+                }
+                changed = status_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let settings = *settings_rx.borrow();
+                    if settings.enabled {
+                        observe_activity_summary_agents(&host, &mut entries).await;
+                    }
+                }
+                changed = settings_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let settings = *settings_rx.borrow();
+                    if settings.enabled {
+                        observe_activity_summary_agents(&host, &mut entries).await;
+                    } else {
+                        for entry in entries.values_mut() {
+                            entry.pending_due = None;
+                            entry.queued_final_refresh = false;
+                            entry.in_flight = false;
+                        }
+                    }
+                }
+                Some(result) = result_rx.recv() => {
+                    let settings = *settings_rx.borrow();
+                    finish_activity_summary_call(&host, &mut entries, result, settings).await;
+                }
+            }
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    if let Err(err) = std::thread::Builder::new()
+        .name("tyde-agent-activity-summaries".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "failed to build agent activity summary runtime"
+                    );
+                    return;
+                }
+            };
+            runtime.block_on(worker);
+        })
+    {
+        tracing::error!(
+            error = %err,
+            "failed to spawn agent activity summary worker thread"
+        );
+    }
+}
+
+async fn observe_activity_summary_agents(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, ActivitySummarySchedulerEntry>,
+) {
+    let observations = host.activity_summary_observations().await;
+    let live_agent_ids = observations
+        .iter()
+        .map(|observation| observation.agent_id.clone())
+        .collect::<HashSet<_>>();
+    entries.retain(|agent_id, _| live_agent_ids.contains(agent_id));
+
+    for observation in observations {
+        let entry = entries.entry(observation.agent_id.clone()).or_default();
+        if entry.last_activity_counter == observation.status.activity_counter
+            && entry.latest_observed_through_seq.is_some()
+        {
+            continue;
+        }
+        entry.last_activity_counter = observation.status.activity_counter;
+
+        let Some(history) = observation
+            .handle
+            .read_activity_history(
+                None,
+                ACTIVITY_SUMMARY_HISTORY_EVENTS,
+                ACTIVITY_SUMMARY_HISTORY_BYTES,
+            )
+            .await
+        else {
+            host.set_agent_activity_summary_error(
+                observation.agent_id.clone(),
+                "agent activity history reader closed".to_owned(),
+            )
+            .await;
+            continue;
+        };
+
+        if history.event_count == 0 || history.through_seq.is_none() {
+            host.set_agent_activity_summary_empty(observation.agent_id.clone())
+                .await;
+            continue;
+        }
+
+        let first_observed_history = entry.latest_observed_through_seq.is_none();
+        if entry.latest_observed_through_seq != history.through_seq {
+            entry.latest_observed_through_seq = history.through_seq;
+            host.mark_agent_activity_summary_stale_if_fresh(observation.agent_id.clone())
+                .await;
+        }
+
+        if history.through_seq == entry.last_summarized_through_seq {
+            continue;
+        }
+
+        let now = Instant::now();
+        let is_active = observation.status.is_active();
+        let final_refresh = !is_active && (entry.was_active || first_observed_history);
+        if !is_active && !final_refresh {
+            continue;
+        }
+        if is_active {
+            entry.was_active = true;
+        }
+        if entry.first_meaningful_at.is_none() {
+            entry.first_meaningful_at = Some(now);
+        }
+        let mut due = if final_refresh {
+            entry.queued_final_refresh = true;
+            now + ACTIVITY_SUMMARY_DEBOUNCE
+        } else {
+            let initial_due = entry
+                .first_meaningful_at
+                .expect("first meaningful timestamp must be set")
+                + ACTIVITY_SUMMARY_INITIAL_DELAY;
+            std::cmp::max(now + ACTIVITY_SUMMARY_DEBOUNCE, initial_due)
+        };
+        if !final_refresh && let Some(last_call_at) = entry.last_call_at {
+            due = std::cmp::max(due, last_call_at + ACTIVITY_SUMMARY_MAX_FREQUENCY);
+        }
+        if let Some(backoff_until) = entry.backoff_until {
+            due = std::cmp::max(due, backoff_until);
+        }
+        entry.pending_due = Some(due);
+    }
+}
+
+async fn start_due_activity_summary_calls(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, ActivitySummarySchedulerEntry>,
+    settings: ActivitySummarySettingsSignal,
+    semaphore: Arc<Semaphore>,
+    result_tx: mpsc::UnboundedSender<ActivitySummaryTaskResult>,
+) {
+    let now = Instant::now();
+    let due_agent_ids = entries
+        .iter()
+        .filter_map(|(agent_id, entry)| {
+            (!entry.in_flight && entry.pending_due.is_some_and(|due| due <= now))
+                .then_some(agent_id.clone())
+        })
+        .collect::<Vec<_>>();
+
+    for agent_id in due_agent_ids {
+        let Some(entry) = entries.get_mut(&agent_id) else {
+            continue;
+        };
+        let Some(context) = host.activity_summary_observation(&agent_id).await else {
+            entries.remove(&agent_id);
+            continue;
+        };
+        let Some(history) = context
+            .handle
+            .read_activity_history(
+                None,
+                ACTIVITY_SUMMARY_HISTORY_EVENTS,
+                ACTIVITY_SUMMARY_HISTORY_BYTES,
+            )
+            .await
+        else {
+            host.set_agent_activity_summary_error(
+                agent_id.clone(),
+                "agent activity history reader closed".to_owned(),
+            )
+            .await;
+            entry.pending_due = None;
+            continue;
+        };
+        if history.event_count == 0 || history.through_seq.is_none() {
+            host.set_agent_activity_summary_empty(agent_id.clone())
+                .await;
+            entry.pending_due = None;
+            continue;
+        }
+        if history.through_seq == entry.last_summarized_through_seq {
+            entry.pending_due = None;
+            continue;
+        }
+
+        let previous_summary = host.agent_activity_summary_for_context(&agent_id).await;
+        let previous_text = previous_summary
+            .as_ref()
+            .map(|summary| summary.text.clone());
+        let requested_at_ms = crate::agent::now_ms();
+        host.set_agent_activity_summary_state(
+            agent_id.clone(),
+            AgentActivitySummaryState::Pending {
+                requested_at_ms,
+                previous: previous_summary,
+            },
+        )
+        .await;
+
+        let transient_agent_id = AgentId(Uuid::new_v4().to_string());
+        debug_assert!(
+            !host.is_agent_registered(&transient_agent_id).await,
+            "activity summary transient agent id was registered before spawn"
+        );
+
+        entry.in_flight = true;
+        entry.pending_due = None;
+        entry.queued_final_refresh = false;
+        entry.last_call_at = Some(now);
+
+        let request = GenerateAgentActivitySummaryRequest {
+            summary_agent_id: transient_agent_id.clone(),
+            backend_kind: context.start.backend_kind,
+            workspace_roots: context.start.workspace_roots.clone(),
+            rendered_history: history.rendered,
+            previous_summary: previous_text,
+            source_from_seq: history.from_seq,
+            source_through_seq: history.through_seq,
+            use_mock_backend: host.use_mock_backend().await,
+        };
+        let result_tx = result_tx.clone();
+        let host_for_assert = host.clone();
+        let semaphore = Arc::clone(&semaphore);
+        tokio::spawn(async move {
+            let permit = match semaphore.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let _ = result_tx.send(ActivitySummaryTaskResult {
+                        agent_id,
+                        epoch: settings.epoch,
+                        transient_agent_id,
+                        source_through_seq: request.source_through_seq,
+                        result: Err("activity summary concurrency limiter closed".to_owned()),
+                    });
+                    return;
+                }
+            };
+            debug_assert!(
+                !host_for_assert
+                    .is_agent_registered(&transient_agent_id)
+                    .await,
+                "activity summary transient agent id was registered before direct backend spawn"
+            );
+            let source_through_seq = request.source_through_seq;
+            let result = generate_agent_activity_summary(request).await;
+            debug_assert!(
+                !host_for_assert
+                    .is_agent_registered(&transient_agent_id)
+                    .await,
+                "activity summary transient agent id was registered after direct backend spawn"
+            );
+            drop(permit);
+            let _ = result_tx.send(ActivitySummaryTaskResult {
+                agent_id,
+                epoch: settings.epoch,
+                transient_agent_id,
+                source_through_seq,
+                result,
+            });
+        });
+    }
+}
+
+async fn finish_activity_summary_call(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, ActivitySummarySchedulerEntry>,
+    result: ActivitySummaryTaskResult,
+    settings: ActivitySummarySettingsSignal,
+) {
+    debug_assert!(
+        !host.is_agent_registered(&result.transient_agent_id).await,
+        "activity summary transient agent id was registered when result was handled"
+    );
+    let Some(entry) = entries.get_mut(&result.agent_id) else {
+        return;
+    };
+    entry.in_flight = false;
+
+    if !settings.enabled || settings.epoch != result.epoch {
+        return;
+    }
+    if !host.is_agent_registered(&result.agent_id).await {
+        entries.remove(&result.agent_id);
+        return;
+    }
+
+    match result.result {
+        Ok(summary) => {
+            entry.last_summarized_through_seq = result.source_through_seq;
+            entry.backoff_until = None;
+            host.set_agent_activity_summary_state(
+                result.agent_id,
+                AgentActivitySummaryState::Fresh { summary },
+            )
+            .await;
+        }
+        Err(message) => {
+            entry.backoff_until = Some(Instant::now() + ACTIVITY_SUMMARY_FAILURE_BACKOFF);
+            host.set_agent_activity_summary_error(result.agent_id, message)
+                .await;
+        }
     }
 }
 
@@ -9649,6 +10244,7 @@ async fn emit_new_agent_for_stream(
     stream: &Stream,
     instance_stream: StreamPath,
     attach_eagerly: bool,
+    activity_summary: AgentActivitySummaryState,
 ) -> Result<(), StreamClosed> {
     let new_agent = NewAgentPayload {
         agent_id: start.agent_id.clone(),
@@ -9665,6 +10261,7 @@ async fn emit_new_agent_for_stream(
         workflow: start.workflow.clone(),
         created_at_ms: start.created_at_ms,
         instance_stream: instance_stream.clone(),
+        activity_summary,
     };
 
     let payload = serde_json::to_value(&new_agent)
@@ -10140,6 +10737,111 @@ async fn fan_out_host_settings(state: &mut HostState, settings: protocol::HostSe
     }
 }
 
+async fn apply_agent_activity_summary_setting(
+    state: &mut HostState,
+    settings: &protocol::HostSettings,
+) {
+    let enabled = settings.background_agent_features.agent_activity_summaries;
+    let current = *state.activity_summary_settings_tx.borrow();
+    if current.enabled == enabled {
+        return;
+    }
+    state.activity_summary_epoch = state.activity_summary_epoch.saturating_add(1);
+    let signal = ActivitySummarySettingsSignal {
+        enabled,
+        epoch: state.activity_summary_epoch,
+    };
+    let _ = state.activity_summary_settings_tx.send(signal);
+    if enabled {
+        return;
+    }
+
+    let agent_ids = state.registry.agent_ids();
+    for agent_id in agent_ids {
+        let disabled = AgentActivitySummaryState::Disabled;
+        if state.agent_activity_summaries.get(&agent_id) == Some(&disabled) {
+            continue;
+        }
+        state
+            .agent_activity_summaries
+            .insert(agent_id.clone(), disabled.clone());
+        fan_out_agent_activity_summary(
+            state,
+            AgentActivitySummaryPayload {
+                agent_id,
+                state: disabled,
+            },
+        )
+        .await;
+    }
+}
+
+fn initial_agent_activity_summary_state(
+    state: &mut HostState,
+    agent_id: &AgentId,
+) -> AgentActivitySummaryState {
+    if !state.activity_summary_settings_tx.borrow().enabled {
+        return AgentActivitySummaryState::Disabled;
+    }
+    let summary_state = AgentActivitySummaryState::Empty;
+    state
+        .agent_activity_summaries
+        .entry(agent_id.clone())
+        .or_insert_with(|| summary_state.clone())
+        .clone()
+}
+
+fn current_agent_activity_summary_state(
+    state: &HostState,
+    agent_id: &AgentId,
+) -> AgentActivitySummaryState {
+    state
+        .agent_activity_summaries
+        .get(agent_id)
+        .cloned()
+        .unwrap_or_else(|| {
+            if state.activity_summary_settings_tx.borrow().enabled {
+                AgentActivitySummaryState::Empty
+            } else {
+                AgentActivitySummaryState::Disabled
+            }
+        })
+}
+
+fn activity_summary_from_state(state: &AgentActivitySummaryState) -> Option<AgentActivitySummary> {
+    match state {
+        AgentActivitySummaryState::Fresh { summary }
+        | AgentActivitySummaryState::Stale { summary, .. } => Some(summary.clone()),
+        AgentActivitySummaryState::Pending { previous, .. }
+        | AgentActivitySummaryState::Error { previous, .. } => previous.clone(),
+        AgentActivitySummaryState::Disabled | AgentActivitySummaryState::Empty => None,
+    }
+}
+
+async fn fan_out_agent_activity_summary(
+    state: &mut HostState,
+    payload: AgentActivitySummaryPayload,
+) {
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_agent_activity_summary_for_subscriber(&payload, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
 async fn fan_out_agents_view_preferences(
     state: &mut HostState,
     snapshot: AgentsViewPreferencesSnapshot,
@@ -10366,6 +11068,17 @@ async fn emit_host_settings_for_subscriber(
     subscriber
         .stream
         .send_value(FrameKind::HostSettings, payload)
+}
+
+async fn emit_agent_activity_summary_for_subscriber(
+    payload: &AgentActivitySummaryPayload,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(payload)
+        .expect("failed to serialize AgentActivitySummary payload for host stream fanout");
+    subscriber
+        .stream
+        .send_value(FrameKind::AgentActivitySummary, payload)
 }
 
 async fn emit_agents_view_preferences_for_subscriber(
@@ -10734,6 +11447,7 @@ mod tests {
             tyde_agent_control_mcp_enabled: false,
             complexity_tiers_enabled: false,
             backend_tier_configs: HashMap::new(),
+            background_agent_features: Default::default(),
         };
         let debug_mcp = DebugMcpHandle { url: String::new() };
         let agent_control = AgentControlMcpHandle { url: String::new() };

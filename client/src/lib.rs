@@ -8,13 +8,13 @@ mod runtime;
 
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
-    AgentBootstrapPayload, AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
-    AgentsViewPreferencesNotifyPayload, BackendSetupPayload, BrowseBootstrapPayload,
-    CancelQueuedMessagePayload, CancelWorkflowPayload, CommandErrorPayload,
-    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    DeleteSessionPayload, Envelope, FrameError, FrameKind, HelloPayload, HostBootstrapPayload,
-    HostBrowseStartPayload, HostSettingsPayload, InterruptPayload, ListSessionsPayload,
-    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
+    AgentActivitySummaryPayload, AgentBootstrapPayload, AgentErrorPayload, AgentId,
+    AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
+    BackendSetupPayload, BrowseBootstrapPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
+    CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
+    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameError, FrameKind, HelloPayload,
+    HostBootstrapPayload, HostBrowseStartPayload, HostSettingsPayload, InterruptPayload,
+    ListSessionsPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
     MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
     PROTOCOL_VERSION, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
     ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
@@ -889,6 +889,10 @@ impl Connection {
                 }
                 FrameKind::HostSettings => {
                     let _: HostSettingsPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::AgentActivitySummary => {
+                    let _: AgentActivitySummaryPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::MobileAccessState => {

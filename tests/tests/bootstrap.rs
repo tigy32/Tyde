@@ -107,6 +107,7 @@ fn write_enabled_backends_settings(path: &std::path::Path, backends: &[BackendKi
         tyde_agent_control_mcp_enabled: true,
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
+        background_agent_features: Default::default(),
     };
     let json = serde_json::json!({ "settings": settings });
     std::fs::write(

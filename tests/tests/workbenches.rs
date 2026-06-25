@@ -33,6 +33,8 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::SessionList
+                | FrameKind::WorkflowNotify
+                | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::CustomAgentNotify
                 | FrameKind::SteeringNotify
                 | FrameKind::SkillNotify

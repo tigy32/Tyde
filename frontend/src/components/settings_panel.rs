@@ -8,13 +8,13 @@ use crate::send::send_frame;
 use crate::state::{AppState, DiffViewMode, ToolOutputMode};
 
 use protocol::{
-    BackendKind, BackendSetupAction, BackendSetupInfo, BackendSetupStatus, BrokerUrl, CustomAgent,
-    CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL, DiffContextMode, FrameKind, HostSettingValue,
-    McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus,
-    MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState,
-    ProjectId, RunBackendSetupPayload, SelectOption, SessionSchemaEntry, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsValues, SetSettingPayload, Skill, SkillId, Steering,
-    SteeringId, SteeringScope, ToolPolicy,
+    BackendKind, BackendSetupAction, BackendSetupInfo, BackendSetupStatus, BackgroundAgentFeature,
+    BrokerUrl, CustomAgent, CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL, DiffContextMode,
+    FrameKind, HostSettingValue, McpServerConfig, McpServerId, McpTransportConfig,
+    MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState, MobilePairingOfferId,
+    MobilePairingOfferPayload, MobilePairingState, ProjectId, RunBackendSetupPayload, SelectOption,
+    SessionSchemaEntry, SessionSettingFieldType, SessionSettingValue, SessionSettingsValues,
+    SetSettingPayload, Skill, SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -1460,6 +1460,113 @@ fn GeneralTab() -> impl IntoView {
                 </div>
                 <label class="settings-toggle">
                     <input type="checkbox" checked=true disabled=true />
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <BackgroundAgentFeaturesSection />
+    }
+}
+
+/// "Background agent features" — opt-in background model calls that enhance the
+/// agent UI. Both toggles spend money because they run extra model calls, so
+/// the copy is explicit about cost and the activity-summaries toggle defaults
+/// off. Values are reflected from `HostSettings.background_agent_features` and
+/// each change is sent as a typed `BackgroundAgentFeatureEnabled` setting.
+#[component]
+fn BackgroundAgentFeaturesSection() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let state_for_names_checked = state.clone();
+    let state_for_summaries_checked = state.clone();
+    let state_for_names_disabled = state.clone();
+    let state_for_summaries_disabled = state.clone();
+
+    let names_checked = move || {
+        state_for_names_checked
+            .selected_host_settings()
+            .is_some_and(|settings| settings.background_agent_features.auto_generate_agent_names)
+    };
+    let summaries_checked = move || {
+        state_for_summaries_checked
+            .selected_host_settings()
+            .is_some_and(|settings| settings.background_agent_features.agent_activity_summaries)
+    };
+    let names_disabled = move || state_for_names_disabled.selected_host_settings().is_none();
+    let summaries_disabled = move || {
+        state_for_summaries_disabled
+            .selected_host_settings()
+            .is_none()
+    };
+
+    let names_on_toggle = {
+        let state = state.clone();
+        move |ev: web_sys::Event| {
+            let target = ev.target().unwrap();
+            let input: web_sys::HtmlInputElement = target.unchecked_into();
+            send_host_setting(
+                &state,
+                HostSettingValue::BackgroundAgentFeatureEnabled {
+                    feature: BackgroundAgentFeature::AutoGenerateAgentNames,
+                    enabled: input.checked(),
+                },
+            );
+        }
+    };
+
+    let summaries_on_toggle = {
+        let state = state.clone();
+        move |ev: web_sys::Event| {
+            let target = ev.target().unwrap();
+            let input: web_sys::HtmlInputElement = target.unchecked_into();
+            send_host_setting(
+                &state,
+                HostSettingValue::BackgroundAgentFeatureEnabled {
+                    feature: BackgroundAgentFeature::AgentActivitySummaries,
+                    enabled: input.checked(),
+                },
+            );
+        }
+    };
+
+    view! {
+        <h3 class="settings-section-title">"Background agent features"</h3>
+
+        <div class="settings-field">
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label">"Auto-generate agent names"</label>
+                    <p class="settings-description">
+                        "When an agent is started without a name, Tyde asks a cheap model to name it from the opening prompt. This makes an extra background model call that costs money. When off, the agent keeps a simple name derived from its prompt and no model is called."
+                    </p>
+                </div>
+                <label class="settings-toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=names_checked
+                        disabled=names_disabled
+                        on:change=names_on_toggle
+                    />
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
+        <div class="settings-field">
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label">"Agent activity summaries"</label>
+                    <p class="settings-description">
+                        "Periodically summarize what each active agent is doing so a short \"what is this agent doing?\" line can appear in agent views. This runs a model in the background on a schedule and costs money for as long as agents stay active. Off by default."
+                    </p>
+                </div>
+                <label class="settings-toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=summaries_checked
+                        disabled=summaries_disabled
+                        on:change=summaries_on_toggle
+                    />
                     <span class="settings-toggle-slider"></span>
                 </label>
             </div>
@@ -4320,6 +4427,7 @@ mod wasm_tests {
                     tyde_agent_control_mcp_enabled: true,
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
                 },
             );
         });
@@ -5403,6 +5511,158 @@ mod wasm_tests {
         assert!(
             stored.is_none(),
             "Non-Active phase must clear the stored offer (still had: {stored:?})"
+        );
+    }
+
+    // ---- General tab: background agent features ----
+
+    /// Install a connected host whose `background_agent_features` are set to
+    /// the given values, so the General tab's toggles have a selected host to
+    /// read from and a stream to commit settings against.
+    fn install_general_host_settings(
+        state: &AppState,
+        auto_generate_agent_names: bool,
+        agent_activity_summaries: bool,
+    ) {
+        let host_id = "host-general".to_owned();
+        state.selected_host_id.set(Some(host_id.clone()));
+        state.host_streams.update(|m| {
+            m.insert(
+                host_id.clone(),
+                protocol::StreamPath(format!("/host/{host_id}")),
+            );
+        });
+        state.connection_statuses.update(|m| {
+            m.insert(host_id.clone(), crate::state::ConnectionStatus::Connected);
+        });
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                host_id,
+                protocol::HostSettings {
+                    enabled_backends: vec![protocol::BackendKind::Claude],
+                    default_backend: Some(protocol::BackendKind::Claude),
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: protocol::BackgroundAgentFeaturesSettings {
+                        auto_generate_agent_names,
+                        agent_activity_summaries,
+                    },
+                },
+            );
+        });
+    }
+
+    /// Find the checkbox inside the `.settings-toggle-row` whose visible text
+    /// contains `label`. Resolves toggles by what the user reads, not by
+    /// element ordering or private classes.
+    fn toggle_for_label(container: &HtmlElement, label: &str) -> web_sys::HtmlInputElement {
+        let rows = container
+            .query_selector_all(".settings-toggle-row")
+            .expect("toggle rows");
+        let mut observed: Vec<String> = Vec::new();
+        for i in 0..rows.length() {
+            let Some(node) = rows.item(i) else { continue };
+            let Ok(row) = node.dyn_into::<HtmlElement>() else {
+                continue;
+            };
+            let txt = row.text_content().unwrap_or_default();
+            if txt.contains(label) {
+                let input = row
+                    .query_selector("input[type='checkbox']")
+                    .unwrap()
+                    .expect("toggle row must contain a checkbox");
+                return input.dyn_into().expect("checkbox element");
+            }
+            observed.push(txt);
+        }
+        panic!("no settings-toggle-row containing {label:?}; saw {observed:?}");
+    }
+
+    /// Toggling "Agent activity summaries" on must commit a `SetSetting`
+    /// frame whose payload is
+    /// `BackgroundAgentFeatureEnabled { feature: AgentActivitySummaries,
+    /// enabled: true }`. This is the load-bearing wire assertion for the
+    /// paid opt-in: if the toggle silently became a no-op nothing else
+    /// would notice.
+    #[wasm_bindgen_test]
+    async fn general_tab_activity_summaries_toggle_commits_setting() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_general_host_settings(&state, true, false);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "General");
+        next_tick().await;
+
+        let toggle = toggle_for_label(&container, "Agent activity summaries");
+        assert!(
+            !toggle.checked(),
+            "summaries start off in this fixture before the user toggles"
+        );
+        toggle.set_checked(true);
+        dispatch_change(&toggle);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_set_setting_payloads(&calls);
+        let frame = settings
+            .iter()
+            .find(|s| {
+                s.get("kind").and_then(|k| k.as_str()) == Some("background_agent_feature_enabled")
+                    && s.get("feature").and_then(|f| f.as_str()) == Some("agent_activity_summaries")
+            })
+            .expect(
+                "toggling activity summaries must emit a BackgroundAgentFeatureEnabled SetSetting",
+            );
+        assert_eq!(
+            frame.get("enabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "the committed frame must carry enabled=true: {frame:?}"
+        );
+    }
+
+    /// The Background agent features section must reflect the host's current
+    /// `background_agent_features` values (checked/unchecked) and tell the
+    /// user the summaries feature costs money.
+    #[wasm_bindgen_test]
+    async fn general_tab_background_features_reflect_current_settings() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_general_host_settings(&state, false, true);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "General");
+        next_tick().await;
+
+        let names = toggle_for_label(&container, "Auto-generate agent names");
+        let summaries = toggle_for_label(&container, "Agent activity summaries");
+        assert!(
+            !names.checked(),
+            "auto_generate_agent_names=false must render as an unchecked toggle"
+        );
+        assert!(
+            summaries.checked(),
+            "agent_activity_summaries=true must render as a checked toggle"
+        );
+
+        let body = container.text_content().unwrap_or_default().to_lowercase();
+        assert!(
+            body.contains("costs money") || body.contains("cost money"),
+            "the section must warn the user that summaries cost money: {body}"
         );
     }
 }

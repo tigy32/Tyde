@@ -57,6 +57,8 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
+                | FrameKind::WorkflowNotify
+                | FrameKind::AgentsViewPreferencesNotify
         ) {
             continue;
         }
@@ -90,6 +92,8 @@ async fn wait_for_session_list(
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
+                | FrameKind::WorkflowNotify
+                | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::NewAgent
                 | FrameKind::AgentStart
                 | FrameKind::AgentError
@@ -161,6 +165,8 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::SessionSettings
                             | FrameKind::TeamPresetCatalogNotify
                             | FrameKind::SessionList
+                            | FrameKind::WorkflowNotify
+                            | FrameKind::AgentsViewPreferencesNotify
                     ) =>
             {
                 continue;

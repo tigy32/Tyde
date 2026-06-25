@@ -1407,6 +1407,7 @@ mod wasm_tests {
             instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
             started: true,
             fatal_error: None,
+            activity_summary: Default::default(),
         }]);
         state.connection_statuses.update(|m| {
             m.insert(HOST.to_owned(), ConnectionStatus::Connected);

@@ -624,6 +624,10 @@ fn new_frame_kinds_and_project_diff_scope_use_snake_case() {
     assert_eq!(FrameKind::ReviewEvent.to_string(), "review_event");
     assert_eq!(FrameKind::ReviewSubscribe.to_string(), "review_subscribe");
     assert_eq!(FrameKind::HostBootstrap.to_string(), "host_bootstrap");
+    assert_eq!(
+        FrameKind::AgentActivitySummary.to_string(),
+        "agent_activity_summary"
+    );
     assert_eq!(FrameKind::AgentBootstrap.to_string(), "agent_bootstrap");
     assert_eq!(FrameKind::ProjectBootstrap.to_string(), "project_bootstrap");
     assert_eq!(FrameKind::ReviewBootstrap.to_string(), "review_bootstrap");
@@ -651,6 +655,7 @@ fn bootstrap_payloads_round_trip() {
             tyde_agent_control_mcp_enabled: true,
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
+            background_agent_features: Default::default(),
         },
         mobile_access: MobileAccessStatePayload {
             broker_status: MobileBrokerStatus::Disabled,
@@ -714,6 +719,7 @@ fn bootstrap_payloads_round_trip() {
             workflow: None,
             created_at_ms: 1,
             instance_stream: StreamPath("/agent/agent-1/instance-1".to_owned()),
+            activity_summary: Default::default(),
         }],
         workflow_summaries: vec![],
         workflow_diagnostics: vec![],

@@ -80,6 +80,8 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
+                | FrameKind::WorkflowNotify
+                | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
@@ -225,6 +227,8 @@ async fn expect_session_list(
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
+                | FrameKind::WorkflowNotify
+                | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
@@ -280,6 +284,8 @@ async fn wait_for_session_list(
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
+                | FrameKind::WorkflowNotify
+                | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList

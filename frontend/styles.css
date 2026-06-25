@@ -6894,6 +6894,13 @@ kbd {
     margin-bottom: var(--space-5);
 }
 
+.settings-section-title {
+    font-size: 1.077rem;
+    font-weight: 600;
+    color: var(--text-bright);
+    margin: var(--space-5) 0 var(--space-4);
+}
+
 .settings-field {
     margin-bottom: var(--space-5);
 }
@@ -10046,6 +10053,42 @@ pre.tool-error-pre {
     white-space: nowrap;
     font-size: 0.769rem;
     color: var(--text-tertiary, var(--text-secondary));
+}
+
+.tool-live-agent-summary {
+    grid-column: 1 / -1;
+    display: flex;
+    min-width: 0;
+    align-items: baseline;
+    gap: var(--space-2);
+    font-size: 0.769rem;
+}
+
+.tool-live-agent-summary-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+}
+
+.tool-live-agent-summary-meta {
+    flex-shrink: 0;
+    font-size: 0.692rem;
+    color: var(--text-tertiary, var(--text-secondary));
+}
+
+.tool-live-agent-summary-meta.pending,
+.tool-live-agent-summary-meta.updating {
+    font-style: italic;
+}
+
+.tool-live-agent-summary-meta.stale {
+    color: var(--warning);
+}
+
+.tool-live-agent-summary-meta.error {
+    color: var(--error);
 }
 
 .tool-live-title {

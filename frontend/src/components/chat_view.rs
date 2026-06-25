@@ -1772,6 +1772,7 @@ mod wasm_tests {
                     instance_stream: StreamPath("/agent/agent-mgr".to_owned()),
                     started: true,
                     fatal_error: None,
+                    activity_summary: Default::default(),
                 });
             });
             state.teams.update(|m| {

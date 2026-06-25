@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use protocol::{BackendKind, HostSettingValue, HostSettings};
+use protocol::{BackendKind, BackgroundAgentFeature, HostSettingValue, HostSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -327,6 +327,14 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
         HostSettingValue::BackendTiers { backend, config } => {
             settings.backend_tier_configs.insert(backend, config);
         }
+        HostSettingValue::BackgroundAgentFeatureEnabled { feature, enabled } => match feature {
+            BackgroundAgentFeature::AutoGenerateAgentNames => {
+                settings.background_agent_features.auto_generate_agent_names = enabled;
+            }
+            BackgroundAgentFeature::AgentActivitySummaries => {
+                settings.background_agent_features.agent_activity_summaries = enabled;
+            }
+        },
     }
 
     Ok(())
@@ -391,6 +399,7 @@ fn empty_settings() -> HostSettings {
         tyde_agent_control_mcp_enabled: true,
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
+        background_agent_features: Default::default(),
     }
 }
 
@@ -423,6 +432,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         tyde_agent_control_mcp_enabled: settings.tyde_agent_control_mcp_enabled,
         complexity_tiers_enabled: settings.complexity_tiers_enabled,
         backend_tier_configs: settings.backend_tier_configs,
+        background_agent_features: settings.background_agent_features,
     })
 }
 
@@ -508,6 +518,47 @@ mod tests {
         let settings = store.get().expect("get settings");
         assert!(!settings.complexity_tiers_enabled);
         assert!(settings.backend_tier_configs.is_empty());
+    }
+
+    #[test]
+    fn old_store_files_default_background_agent_features_safely() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"settings":{"enabled_backends":["claude"],"default_backend":"claude"}}"#,
+        )
+        .expect("write legacy store file");
+
+        let store = HostSettingsStore::load(path).expect("load legacy store");
+        let settings = store.get().expect("get settings");
+        assert!(settings.background_agent_features.auto_generate_agent_names);
+        assert!(!settings.background_agent_features.agent_activity_summaries);
+    }
+
+    #[test]
+    fn background_agent_feature_settings_apply_independently() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            HostSettingsStore::load(dir.path().join("settings.json")).expect("load empty store");
+
+        let settings = store
+            .apply(HostSettingValue::BackgroundAgentFeatureEnabled {
+                feature: BackgroundAgentFeature::AgentActivitySummaries,
+                enabled: true,
+            })
+            .expect("enable activity summaries");
+        assert!(settings.background_agent_features.agent_activity_summaries);
+        assert!(settings.background_agent_features.auto_generate_agent_names);
+
+        let settings = store
+            .apply(HostSettingValue::BackgroundAgentFeatureEnabled {
+                feature: BackgroundAgentFeature::AutoGenerateAgentNames,
+                enabled: false,
+            })
+            .expect("disable generated names");
+        assert!(settings.background_agent_features.agent_activity_summaries);
+        assert!(!settings.background_agent_features.auto_generate_agent_names);
     }
 
     #[test]

@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode, AgentErrorPayload, AgentId,
-    AgentInput, AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendKind, ChatEvent,
-    ChatMessage, ChatMessageId, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin,
-    MessageSender, QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext,
-    SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues, SpawnCostHint,
-    StreamStartData, StreamTextDeltaData, ToolExecutionCompletedData, ToolExecutionResult,
+    AgentActivitySummary, AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode,
+    AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
+    BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId, Envelope, FrameKind,
+    MessageMetadataUpdateData, MessageOrigin, MessageSender, QueuedMessageEntry, QueuedMessageId,
+    QueuedMessagesPayload, ReviewErrorContext, SendMessagePayload, SessionId,
+    SessionSettingsPayload, SessionSettingsValues, SpawnCostHint, StreamStartData,
+    StreamTextDeltaData, ToolExecutionCompletedData, ToolExecutionResult,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -100,6 +101,12 @@ enum AgentCommand {
         limit: usize,
         reply: oneshot::Sender<Vec<Envelope>>,
     },
+    ReadActivityHistory {
+        after_seq: Option<u64>,
+        max_events: usize,
+        max_bytes: usize,
+        reply: oneshot::Sender<AgentActivityHistorySnapshot>,
+    },
     Interrupt {
         reply: oneshot::Sender<InterruptOutcome>,
     },
@@ -113,6 +120,15 @@ enum AgentCommand {
 pub(crate) struct CompactionSummary {
     pub session_id: SessionId,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentActivityHistorySnapshot {
+    pub rendered: String,
+    pub from_seq: Option<u64>,
+    pub through_seq: Option<u64>,
+    pub event_count: usize,
+    pub active_stream_included: bool,
 }
 
 pub(crate) enum CompactionStart {
@@ -296,6 +312,28 @@ impl AgentHandle {
         reply_rx.await.ok()
     }
 
+    pub async fn read_activity_history(
+        &self,
+        after_seq: Option<u64>,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Option<AgentActivityHistorySnapshot> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::ReadActivityHistory {
+                after_seq,
+                max_events,
+                max_bytes,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return None;
+        }
+        reply_rx.await.ok()
+    }
+
     pub async fn interrupt(&self) -> InterruptOutcome {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -336,6 +374,17 @@ pub(crate) struct GenerateAgentNameRequest {
     pub workspace_roots: Vec<String>,
     pub prompt: String,
     pub startup_mcp_servers: Vec<StartupMcpServer>,
+    pub use_mock_backend: bool,
+}
+
+pub(crate) struct GenerateAgentActivitySummaryRequest {
+    pub summary_agent_id: AgentId,
+    pub backend_kind: BackendKind,
+    pub workspace_roots: Vec<String>,
+    pub rendered_history: String,
+    pub previous_summary: Option<String>,
+    pub source_from_seq: Option<u64>,
+    pub source_through_seq: Option<u64>,
     pub use_mock_backend: bool,
 }
 
@@ -455,6 +504,129 @@ pub(crate) async fn generate_agent_name(
         "agent name generator ended before producing a final response"
     );
     Err("agent name generator ended before producing a final response".to_string())
+}
+
+pub(crate) async fn generate_agent_activity_summary(
+    request: GenerateAgentActivitySummaryRequest,
+) -> Result<AgentActivitySummary, String> {
+    let rendered_history = request.rendered_history.trim();
+    if rendered_history.is_empty() {
+        return Err("activity summary input was empty".to_owned());
+    }
+
+    if request.use_mock_backend {
+        return generate_mock_activity_summary(request).await;
+    }
+
+    let prompt =
+        build_activity_summary_prompt(rendered_history, request.previous_summary.as_deref());
+    let logged_prompt_len = prompt.len();
+    let target_workspace_root_count = request.workspace_roots.len();
+    let resolved_spawn_config = crate::agent::customization::ResolvedSpawnConfig {
+        access_mode: BackendAccessMode::ReadOnly,
+        ..Default::default()
+    };
+    let spawn_config = BackendSpawnConfig {
+        cost_hint: Some(SpawnCostHint::Low),
+        custom_agent_id: None,
+        startup_mcp_servers: Vec::new(),
+        session_settings: None,
+        resolved_spawn_config,
+    };
+    let initial_input = SendMessagePayload {
+        message: prompt,
+        images: None,
+        origin: None,
+        tool_response: None,
+    };
+    let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
+    // Some backends require a real workspace root at spawn time. The helper
+    // keeps the summarized agent's roots but remains read-only and has no MCP
+    // servers, so it can read context without write/tool side effects.
+    let workspace_roots = request.workspace_roots.clone();
+    let (_backend, mut events, _session_id) = match spawn_backend(
+        &request.summary_agent_id,
+        request.backend_kind,
+        workspace_roots,
+        spawn_config,
+        initial_input,
+        host_sub_agent_spawn_tx,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            return Err(format!(
+                "agent activity summary generator failed to start for backend {:?}: {}",
+                request.backend_kind, err
+            ));
+        }
+    };
+
+    let mut streamed_text = String::new();
+    let mut stream_delta_count = 0usize;
+    let mut chat_event_count = 0usize;
+    let mut backend_error: Option<String> = None;
+    while let Some(event) = events.recv().await {
+        chat_event_count += 1;
+        match event {
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error) => {
+                backend_error = Some(message.content);
+            }
+            ChatEvent::StreamDelta(delta) => {
+                stream_delta_count += 1;
+                streamed_text.push_str(&delta.text);
+            }
+            ChatEvent::StreamEnd(data) => {
+                let final_content = data.message.content;
+                let candidate = if final_content.trim().is_empty() {
+                    streamed_text
+                } else {
+                    final_content
+                };
+                let text = sanitize_activity_summary_text(&candidate)?;
+                return Ok(AgentActivitySummary {
+                    text,
+                    generated_at_ms: now_ms(),
+                    source_from_seq: request.source_from_seq,
+                    source_through_seq: request.source_through_seq,
+                });
+            }
+            ChatEvent::ToolRequest(requested_tool) => {
+                tracing::warn!(
+                    summary_agent_id = %request.summary_agent_id,
+                    backend_kind = ?request.backend_kind,
+                    tool_name = %requested_tool.tool_name,
+                    "activity summary generator attempted a tool call; ignoring and continuing to read text"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if !streamed_text.trim().is_empty() {
+        let text = sanitize_activity_summary_text(&streamed_text)?;
+        return Ok(AgentActivitySummary {
+            text,
+            generated_at_ms: now_ms(),
+            source_from_seq: request.source_from_seq,
+            source_through_seq: request.source_through_seq,
+        });
+    }
+
+    tracing::warn!(
+        summary_agent_id = %request.summary_agent_id,
+        backend_kind = ?request.backend_kind,
+        cost_hint = ?SpawnCostHint::Low,
+        prompt_len = logged_prompt_len,
+        target_workspace_root_count,
+        chat_event_count,
+        stream_delta_count,
+        "agent activity summary generator ended without usable assistant text"
+    );
+    Err(backend_error.unwrap_or_else(|| {
+        "agent activity summary generator ended before producing usable text".to_owned()
+    }))
 }
 
 /// Type-erased backend handle. The actor loop only needs `send()` — this lets
@@ -2055,6 +2227,20 @@ pub(crate) fn spawn_agent_actor(
                         } => {
                             let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                         }
+                        AgentCommand::ReadActivityHistory {
+                            after_seq,
+                            max_events,
+                            max_bytes,
+                            reply,
+                        } => {
+                            let _ = reply.send(activity_history_snapshot(
+                                &event_log,
+                                Some(&replay_state),
+                                after_seq,
+                                max_events,
+                                max_bytes,
+                            ));
+                        }
                         AgentCommand::Interrupt { reply } => {
                             if matches!(lifecycle, ActorLifecycle::Closing) {
                                 let _ = reply.send(InterruptOutcome::NotRunning);
@@ -2409,6 +2595,20 @@ pub(crate) fn spawn_relay_agent_actor(
                         } => {
                             let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                         }
+                        AgentCommand::ReadActivityHistory {
+                            after_seq,
+                            max_events,
+                            max_bytes,
+                            reply,
+                        } => {
+                            let _ = reply.send(activity_history_snapshot(
+                                &event_log,
+                                Some(&replay_state),
+                                after_seq,
+                                max_events,
+                                max_bytes,
+                            ));
+                        }
                         AgentCommand::Close { reply } => {
                             accepting_input_task.store(false, Ordering::SeqCst);
                             if matches!(lifecycle, ActorLifecycle::Closing) {
@@ -2628,6 +2828,16 @@ async fn park_terminal_agent(
             } => {
                 let _ = reply.send(output_events_since(event_log, after_seq, limit));
             }
+            AgentCommand::ReadActivityHistory {
+                after_seq,
+                max_events,
+                max_bytes,
+                reply,
+            } => {
+                let _ = reply.send(activity_history_snapshot(
+                    event_log, None, after_seq, max_events, max_bytes,
+                ));
+            }
             AgentCommand::Attach(stream) => {
                 attach_subscriber(event_log, None, subscribers, stream);
             }
@@ -2695,6 +2905,16 @@ async fn park_relay_terminal_agent(
                 reply,
             } => {
                 let _ = reply.send(output_events_since(event_log, after_seq, limit));
+            }
+            AgentCommand::ReadActivityHistory {
+                after_seq,
+                max_events,
+                max_bytes,
+                reply,
+            } => {
+                let _ = reply.send(activity_history_snapshot(
+                    event_log, None, after_seq, max_events, max_bytes,
+                ));
             }
             AgentCommand::Attach(stream) => {
                 attach_subscriber(event_log, None, subscribers, stream);
@@ -3227,6 +3447,187 @@ fn output_events_since(
         .collect()
 }
 
+fn activity_history_snapshot(
+    event_log: &[Envelope],
+    replay_state: Option<&AgentReplayState>,
+    after_seq: Option<u64>,
+    max_events: usize,
+    max_bytes: usize,
+) -> AgentActivityHistorySnapshot {
+    let mut entries = Vec::new();
+    for envelope in event_log {
+        if after_seq.is_some_and(|seq| envelope.seq <= seq) {
+            continue;
+        }
+        match envelope.kind {
+            FrameKind::ChatEvent => {
+                if let Ok(event) = serde_json::from_value::<ChatEvent>(envelope.payload.clone())
+                    && let Some(rendered) = render_activity_chat_event(&event)
+                {
+                    entries.push((envelope.seq, rendered));
+                }
+            }
+            FrameKind::AgentError => {
+                if let Ok(error) =
+                    serde_json::from_value::<AgentErrorPayload>(envelope.payload.clone())
+                {
+                    entries.push((
+                        envelope.seq,
+                        cap_activity_text(&format!("Agent error: {}", error.message), 1024),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut active_stream_included = false;
+    if let Some(replay_state) = replay_state {
+        for (index, event) in replay_state.active_stream_events().into_iter().enumerate() {
+            if let Some(rendered) = render_activity_chat_event(&event) {
+                active_stream_included = true;
+                entries.push((event_log.len() as u64 + index as u64, rendered));
+            }
+        }
+    }
+
+    let max_events = max_events.max(1);
+    let max_bytes = max_bytes.max(1);
+    if entries.len() > max_events {
+        let start = entries.len() - max_events;
+        entries.drain(0..start);
+    }
+
+    while rendered_activity_entries_len(&entries) > max_bytes && entries.len() > 1 {
+        entries.remove(0);
+    }
+
+    let mut rendered = String::new();
+    for (seq, line) in &entries {
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str(&format!("[seq {seq}] {line}"));
+    }
+
+    AgentActivityHistorySnapshot {
+        rendered,
+        from_seq: entries.first().map(|(seq, _)| *seq),
+        through_seq: entries.last().map(|(seq, _)| *seq),
+        event_count: entries.len(),
+        active_stream_included,
+    }
+}
+
+fn rendered_activity_entries_len(entries: &[(u64, String)]) -> usize {
+    entries
+        .iter()
+        .map(|(seq, line)| "[seq ] ".len() + seq.to_string().len() + line.len() + 1)
+        .sum()
+}
+
+fn render_activity_chat_event(event: &ChatEvent) -> Option<String> {
+    match event {
+        ChatEvent::MessageAdded(message) => {
+            let sender = match &message.sender {
+                MessageSender::User => "User",
+                MessageSender::System => "System",
+                MessageSender::Warning => "Warning",
+                MessageSender::Error => "Error",
+                MessageSender::Assistant { .. } => "Assistant",
+            };
+            let mut parts = Vec::new();
+            if !message.content.trim().is_empty() {
+                parts.push(cap_activity_text(message.content.trim(), 1200));
+            }
+            if let Some(reasoning) = &message.reasoning
+                && !reasoning.text.trim().is_empty()
+            {
+                parts.push(format!(
+                    "reasoning: {}",
+                    cap_activity_text(reasoning.text.trim(), 600)
+                ));
+            }
+            if !message.tool_calls.is_empty() {
+                let tool_names = message
+                    .tool_calls
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                parts.push(format!("tool calls: {tool_names}"));
+            }
+            (!parts.is_empty()).then(|| format!("{sender}: {}", parts.join(" | ")))
+        }
+        ChatEvent::StreamStart(start) => {
+            Some(format!("Assistant started streaming as {}", start.agent))
+        }
+        ChatEvent::StreamDelta(delta) => {
+            let text = delta.text.trim();
+            (!text.is_empty())
+                .then(|| format!("Assistant streaming: {}", cap_activity_text(text, 1200)))
+        }
+        ChatEvent::StreamReasoningDelta(delta) => {
+            let text = delta.text.trim();
+            (!text.is_empty())
+                .then(|| format!("Assistant reasoning: {}", cap_activity_text(text, 800)))
+        }
+        ChatEvent::StreamEnd(data) => {
+            let text = data.message.content.trim();
+            (!text.is_empty())
+                .then(|| format!("Assistant finished: {}", cap_activity_text(text, 1200)))
+        }
+        ChatEvent::ToolRequest(request) => Some(format!("Tool requested: {}", request.tool_name)),
+        ChatEvent::ToolProgress(progress) => Some(format!("Tool progress: {}", progress.tool_name)),
+        ChatEvent::ToolExecutionCompleted(completion) => Some(format!(
+            "Tool {} {}",
+            completion.tool_name,
+            if completion.success {
+                "completed"
+            } else {
+                "failed"
+            }
+        )),
+        ChatEvent::TaskUpdate(tasks) => {
+            let title = tasks.title.trim();
+            if title.is_empty() {
+                Some(format!(
+                    "Task list updated with {} tasks",
+                    tasks.tasks.len()
+                ))
+            } else {
+                Some(format!(
+                    "Task list updated: {}",
+                    cap_activity_text(title, 300)
+                ))
+            }
+        }
+        ChatEvent::OperationCancelled(cancelled) => Some(format!(
+            "Operation cancelled: {}",
+            cap_activity_text(&cancelled.message, 500)
+        )),
+        ChatEvent::RetryAttempt(retry) => Some(format!(
+            "Retry attempt {}/{} after error: {}",
+            retry.attempt,
+            retry.max_retries,
+            cap_activity_text(&retry.error, 500)
+        )),
+        ChatEvent::TypingStatusChanged(typing) => {
+            Some(format!("Agent typing status changed: {typing}"))
+        }
+        ChatEvent::MessageMetadataUpdated(_) => None,
+    }
+}
+
+fn cap_activity_text(text: &str, max_chars: usize) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
 async fn update_queued_messages_snapshot(
     canonical_stream: &str,
     event_log: &mut Vec<Envelope>,
@@ -3438,6 +3839,57 @@ fn build_name_generation_prompt(prompt: &str) -> String {
     )
 }
 
+fn build_activity_summary_prompt(rendered_history: &str, previous_summary: Option<&str>) -> String {
+    let previous = previous_summary
+        .filter(|summary| !summary.trim().is_empty())
+        .unwrap_or("None");
+    format!(
+        "You summarize live coding-agent activity for a UI.\n\
+Return one concise sentence, max 18 words.\n\
+Describe what the agent is currently doing or just finished.\n\
+Do not mention that you are summarizing. Do not invent facts.\n\
+If the input is insufficient, return exactly: No clear activity yet.\n\n\
+Previous summary: {previous}\n\
+Recent activity:\n{rendered_history}"
+    )
+}
+
+async fn generate_mock_activity_summary(
+    request: GenerateAgentActivitySummaryRequest,
+) -> Result<AgentActivitySummary, String> {
+    if request
+        .rendered_history
+        .contains("__mock_slow_activity_summary__")
+    {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    if request
+        .rendered_history
+        .contains("__mock_fail_activity_summary__")
+    {
+        return Err("mock activity summary failure".to_owned());
+    }
+    Ok(AgentActivitySummary {
+        text: "Mock summary: agent is working on recent activity".to_owned(),
+        generated_at_ms: now_ms(),
+        source_from_seq: request.source_from_seq,
+        source_through_seq: request.source_through_seq,
+    })
+}
+
+fn sanitize_activity_summary_text(text: &str) -> Result<String, String> {
+    let stripped = strip_wrapping_quotes(text.trim());
+    let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    let without_markdown = collapsed
+        .trim_matches(|ch: char| matches!(ch, '*' | '_' | '`' | '#' | '-' | '•'))
+        .trim()
+        .to_owned();
+    if without_markdown.is_empty() {
+        return Err("activity summary was empty".to_owned());
+    }
+    Ok(without_markdown.chars().take(180).collect())
+}
+
 pub(crate) fn derive_agent_name(prompt: &str) -> String {
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
@@ -3579,9 +4031,9 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        AgentCommand, AgentHandle, AgentReplayState, InterruptOutcome, append_chat_event,
-        append_event, attach_subscriber, generate_mock_name, name_generation_fallback,
-        output_events_since, sanitize_generated_agent_name,
+        AgentCommand, AgentHandle, AgentReplayState, InterruptOutcome, activity_history_snapshot,
+        append_chat_event, append_event, attach_subscriber, generate_mock_name,
+        name_generation_fallback, output_events_since, sanitize_generated_agent_name,
     };
     use crate::agent::registry::AgentStatusHandle;
     use crate::stream::Stream;
@@ -3631,6 +4083,16 @@ mod tests {
                         reply,
                     } => {
                         let _ = reply.send(output_events_since(&event_log, after_seq, limit));
+                    }
+                    AgentCommand::ReadActivityHistory {
+                        after_seq,
+                        max_events,
+                        max_bytes,
+                        reply,
+                    } => {
+                        let _ = reply.send(activity_history_snapshot(
+                            &event_log, None, after_seq, max_events, max_bytes,
+                        ));
                     }
                     AgentCommand::Attach(stream) => {
                         attach_subscriber(&event_log, None, &mut subscribers, stream);

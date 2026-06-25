@@ -4,29 +4,29 @@ use std::collections::{HashMap, HashSet};
 use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId,
-    AgentOrigin, AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
-    BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ByteRange, ChatEvent,
-    CodeIntelDiagnosticsPayload, CodeIntelErrorContext, CodeIntelErrorPayload,
-    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelLocation,
-    CodeIntelNavigateResultPayload, CodeIntelReferenceLine, CodeIntelReferencesCompletePayload,
-    CodeIntelReferencesFileResult, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
-    CodeIntelStatusScope, CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind,
-    HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HostBrowseOpenedPayload, HostSettingsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
-    MobilePairingOfferPayload, MobilePairingState, NewAgentPayload, NewTerminalPayload,
-    ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectPath,
-    ProjectSearchCompletePayload, ProjectSearchResultsPayload, ProtocolValidator,
-    QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
-    ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionId,
-    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload,
-    SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
-    TeamMemberId, TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload,
-    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload,
-    TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload, TerminalStartPayload,
-    WelcomePayload, WorkflowNotifyPayload, WorkflowRunNotifyPayload,
+    AgentActivitySummaryPayload, AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload,
+    AgentErrorPayload, AgentId, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
+    AgentsViewPreferencesNotifyPayload, BackendSetupPayload, BrowseBootstrapListing,
+    BrowseBootstrapPayload, ByteRange, ChatEvent, CodeIntelDiagnosticsPayload,
+    CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelHoverResultPayload, CodeIntelLocation, CodeIntelNavigateResultPayload,
+    CodeIntelReferenceLine, CodeIntelReferencesCompletePayload, CodeIntelReferencesFileResult,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CodeIntelStatusScope,
+    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
+    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
+    McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload,
+    MobilePairingState, NewAgentPayload, NewTerminalPayload, ProjectBootstrapPayload,
+    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload,
+    ProjectGitCommitResultPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectNotifyPayload, ProjectPath, ProjectSearchCompletePayload, ProjectSearchResultsPayload,
+    ProtocolValidator, QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload,
+    ReviewCommentSource, ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState,
+    SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
+    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload,
+    TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
+    TerminalBootstrapPayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
+    TerminalStartPayload, WelcomePayload, WorkflowNotifyPayload, WorkflowRunNotifyPayload,
 };
 
 use crate::line_source::FileLines;
@@ -179,6 +179,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
             tyde_agent_control_mcp_enabled: true,
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
+            background_agent_features: Default::default(),
         },
         mobile_access: BootstrapMobileAccess {
             broker_status: BootstrapBrokerStatus::Disabled,
@@ -620,6 +621,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse host_settings payload: {error}"),
             ),
         },
+        FrameKind::AgentActivitySummary => {
+            match envelope.parse_payload::<AgentActivitySummaryPayload>() {
+                Ok(payload) => apply_agent_activity_summary(state, host_id, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse agent_activity_summary payload: {error}"),
+                ),
+            }
+        }
         FrameKind::AgentsViewPreferencesNotify => {
             match envelope.parse_payload::<AgentsViewPreferencesNotifyPayload>() {
                 Ok(payload) => {
@@ -802,6 +815,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     instance_stream: payload.instance_stream,
                     started: false,
                     fatal_error: None,
+                    activity_summary: payload.activity_summary,
                 };
                 let project_id = info.project_id.clone();
                 let agent_name_for_upgrade = info.name.clone();
@@ -3348,6 +3362,28 @@ fn apply_agent_started(
     });
 }
 
+fn apply_agent_activity_summary(
+    state: &AppState,
+    host_id: &str,
+    payload: AgentActivitySummaryPayload,
+) {
+    let agent_id = payload.agent_id;
+    log::info!(
+        "dispatch agent_activity_summary host={host_id} agent_id={agent_id} state={:?}",
+        payload.state
+    );
+    state.agents.update(|agents| {
+        if let Some(agent) = agents
+            .iter_mut()
+            .find(|agent| agent.host_id == host_id && agent.agent_id == agent_id)
+        {
+            agent.activity_summary = payload.state;
+        } else {
+            log::warn!("agent_activity_summary for unknown agent {agent_id} on host {host_id}");
+        }
+    });
+}
+
 fn apply_agent_rename(state: &AppState, host_id: &str, payload: AgentRenamedPayload) {
     let agent_id = payload.agent_id;
     let name = payload.name;
@@ -4280,6 +4316,7 @@ fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo
         instance_stream: payload.instance_stream,
         started: false,
         fatal_error: None,
+        activity_summary: payload.activity_summary,
     }
 }
 
@@ -4600,6 +4637,7 @@ mod tests {
                     tyde_agent_control_mcp_enabled: true,
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: protocol::MobileBrokerStatus::Disabled,
@@ -4915,6 +4953,7 @@ mod tests {
                     instance_stream: stream.clone(),
                     started: true,
                     fatal_error: None,
+                    activity_summary: Default::default(),
                 });
             });
 

@@ -88,6 +88,7 @@ fn expected_empty_settings() -> HostSettings {
         tyde_agent_control_mcp_enabled: true,
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
+        background_agent_features: Default::default(),
     }
 }
 
@@ -186,6 +187,7 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             tyde_agent_control_mcp_enabled: true,
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
+            background_agent_features: Default::default(),
         }
     );
 }

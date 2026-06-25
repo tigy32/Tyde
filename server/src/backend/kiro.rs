@@ -3979,6 +3979,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
             workflow: None,
             created_at_ms: 0,
             instance_stream: agent_stream.clone(),
+            activity_summary: Default::default(),
         };
         let welcome = protocol::Envelope::from_payload(
             host_stream.clone(),
@@ -4013,6 +4014,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                     tyde_agent_control_mcp_enabled: true,
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
                 },
                 mobile_access: protocol::MobileAccessStatePayload {
                     broker_status: protocol::MobileBrokerStatus::Disabled,

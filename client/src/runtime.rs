@@ -3,25 +3,26 @@ use std::sync::{Arc, Mutex};
 
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
-    AgentBootstrapPayload, AgentErrorPayload, AgentRenamedPayload, AgentStartPayload,
-    BackendSetupPayload, CancelWorkflowPayload, ChatEvent, CommandErrorPayload,
-    CustomAgentNotifyPayload, Envelope, FrameError, FrameKind, HostBootstrapPayload,
-    HostSettingsPayload, InterruptPayload, ListSessionsPayload, McpServerNotifyPayload,
-    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
-    ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
-    SendMessagePayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
-    SetAgentNamePayload, SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload,
-    SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
-    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload, TerminalBootstrapPayload, TerminalClosePayload,
-    TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
-    TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, TriggerWorkflowPayload,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
-    WorkflowRunNotifyPayload, read_envelope, write_envelope,
+    AgentActivitySummaryPayload, AgentBootstrapPayload, AgentErrorPayload, AgentRenamedPayload,
+    AgentStartPayload, AgentsViewPreferencesNotifyPayload, BackendSetupPayload,
+    CancelWorkflowPayload, ChatEvent, CommandErrorPayload, CustomAgentNotifyPayload, Envelope,
+    FrameError, FrameKind, HostBootstrapPayload, HostSettingsPayload, InterruptPayload,
+    ListSessionsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
+    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, ProjectAddRootPayload,
+    ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
+    ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload, SessionListPayload,
+    SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload,
+    SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload, StreamPath,
+    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
+    TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
+    TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
+    TerminalStartPayload, TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    WorkflowNotifyPayload, WorkflowRefreshPayload, WorkflowRunNotifyPayload, read_envelope,
+    write_envelope,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -123,6 +124,8 @@ pub struct TerminalCommands {
 pub enum HostEvent {
     HostBootstrap(Box<HostBootstrapPayload>),
     HostSettings(HostSettingsPayload),
+    AgentActivitySummary(AgentActivitySummaryPayload),
+    AgentsViewPreferencesNotify(AgentsViewPreferencesNotifyPayload),
     BackendSetup(BackendSetupPayload),
     SessionSchemas(SessionSchemasPayload),
     SessionList(SessionListPayload),
@@ -801,6 +804,24 @@ async fn handle_host_envelope(
                 Err(_) => return false,
             };
             let _ = host_tx.send(HostEvent::HostSettings(payload)).await;
+            true
+        }
+        FrameKind::AgentActivitySummary => {
+            let payload: AgentActivitySummaryPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::AgentActivitySummary(payload)).await;
+            true
+        }
+        FrameKind::AgentsViewPreferencesNotify => {
+            let payload: AgentsViewPreferencesNotifyPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx
+                .send(HostEvent::AgentsViewPreferencesNotify(payload))
+                .await;
             true
         }
         FrameKind::BackendSetup => {

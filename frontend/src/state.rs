@@ -5,22 +5,22 @@ use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
 use protocol::FrameKind;
 use protocol::{
-    AgentGroupMode, AgentId, AgentListDensity, AgentOrderKey, AgentOrigin, AgentSortMode,
-    AgentWorkflowMetadata, AgentsViewFilters, AgentsViewPreferences, AgentsViewPreferencesSnapshot,
-    BackendKind, BackendSetupInfo, ChatMessage, ChatMessageId, CodeIntelDiagnostic,
-    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelLocation, CodeIntelOccurrence,
-    CodeIntelReferencesFileResult, CodeIntelStatusPayload, CustomAgent, CustomAgentId,
-    DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry, HostBrowseErrorPayload,
-    HostPlatform, HostSettings, McpServerConfig, McpServerId, MessageMetadataUpdateData,
-    MobileAccessStatePayload, MobilePairingOfferPayload, Project, ProjectDiffScope,
-    ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId, ProjectPath,
-    ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, ProjectSearchFileResult,
-    QueuedMessageEntry, Review, ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary,
-    SessionId, SessionSchemaEntry, SessionSettingsValues, SessionSummary, Skill, SkillId,
-    SmartViewId, Steering, SteeringId, StreamPath, TaskList, Team, TeamDraft, TeamDraftId, TeamId,
-    TeamMember, TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
-    ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
+    AgentActivitySummaryState, AgentGroupMode, AgentId, AgentListDensity, AgentOrderKey,
+    AgentOrigin, AgentSortMode, AgentWorkflowMetadata, AgentsViewFilters, AgentsViewPreferences,
+    AgentsViewPreferencesSnapshot, BackendKind, BackendSetupInfo, ChatMessage, ChatMessageId,
+    CodeIntelDiagnostic, CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelLocation,
+    CodeIntelOccurrence, CodeIntelReferencesFileResult, CodeIntelStatusPayload, CustomAgent,
+    CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry,
+    HostBrowseErrorPayload, HostPlatform, HostSettings, McpServerConfig, McpServerId,
+    MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload, Project,
+    ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId,
+    ProjectPath, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
+    ProjectSearchFileResult, QueuedMessageEntry, Review, ReviewCommentId, ReviewId,
+    ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry, SessionSettingsValues,
+    SessionSummary, Skill, SkillId, SmartViewId, Steering, SteeringId, StreamPath, TaskList, Team,
+    TeamDraft, TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId,
+    TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog,
+    TerminalId, ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
     WorkflowDiagnostic, WorkflowId, WorkflowInputSpec, WorkflowRunId, WorkflowRunSnapshot,
     WorkflowSummary,
 };
@@ -71,6 +71,11 @@ pub struct AgentInfo {
     /// Set when a fatal `AgentError` arrives. The agent is terminated and no
     /// further events will arrive on its stream.
     pub fatal_error: Option<String>,
+    /// Server-owned background activity summary state. Rendered (when enabled)
+    /// in surfaces like the await-agents tool card. Defaults to `Disabled`;
+    /// the frontend never infers this — it mirrors server-emitted state from
+    /// `NewAgentPayload.activity_summary` and `AgentActivitySummary` frames.
+    pub activity_summary: AgentActivitySummaryState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -4116,6 +4121,7 @@ mod tests {
                         tyde_agent_control_mcp_enabled: true,
                         complexity_tiers_enabled: false,
                         backend_tier_configs: std::collections::HashMap::new(),
+                        background_agent_features: Default::default(),
                     },
                 );
                 settings.insert(
@@ -4129,6 +4135,7 @@ mod tests {
                         tyde_agent_control_mcp_enabled: true,
                         complexity_tiers_enabled: false,
                         backend_tier_configs: std::collections::HashMap::new(),
+                        background_agent_features: Default::default(),
                     },
                 );
             });
@@ -4211,6 +4218,7 @@ mod tests {
                 instance_stream: StreamPath(format!("/agents/{}", id.0)),
                 started: true,
                 fatal_error: None,
+                activity_summary: Default::default(),
             };
 
             state.agents.update(|agents| {

@@ -2574,6 +2574,7 @@ mod wasm_tests {
                     tyde_agent_control_mcp_enabled: true,
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
                 },
             );
         });
@@ -2866,6 +2867,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/a-mgr/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                activity_summary: Default::default(),
             });
         });
 
@@ -5097,6 +5099,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/a-mgr/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                activity_summary: Default::default(),
             });
             agents.push(crate::state::AgentInfo {
                 host_id: host_id.to_owned(),
@@ -5114,6 +5117,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/a-rep/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                activity_summary: Default::default(),
             });
         });
 
@@ -5315,6 +5319,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/a-mgr/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                activity_summary: Default::default(),
             });
         });
         // Manager: bound, Idle (a valid target on its own).

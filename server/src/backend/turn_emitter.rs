@@ -815,6 +815,7 @@ mod tests {
             workflow: None,
             created_at_ms: 0,
             instance_stream: agent_stream.clone(),
+            activity_summary: Default::default(),
         };
         let welcome = Envelope::from_payload(
             host_stream.clone(),
@@ -848,6 +849,7 @@ mod tests {
                     tyde_agent_control_mcp_enabled: true,
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: MobileBrokerStatus::Disabled,

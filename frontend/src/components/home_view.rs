@@ -420,6 +420,7 @@ mod wasm_tests {
                     tyde_agent_control_mcp_enabled: false,
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
                 },
             );
         });
@@ -459,6 +460,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/a-1/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                activity_summary: Default::default(),
             });
         });
     }

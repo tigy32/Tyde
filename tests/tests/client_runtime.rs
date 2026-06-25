@@ -68,6 +68,8 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                     }
                 }
                 HostEvent::HostSettings(_)
+                | HostEvent::AgentActivitySummary(_)
+                | HostEvent::AgentsViewPreferencesNotify(_)
                 | HostEvent::HostBootstrap(_)
                 | HostEvent::BackendSetup(_)
                 | HostEvent::AgentClosed(_)

@@ -36,6 +36,8 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
+                | FrameKind::WorkflowNotify
+                | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectEvent
                 | FrameKind::ProjectFileList
@@ -64,6 +66,8 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::SessionSettings
                             | FrameKind::TeamPresetCatalogNotify
                             | FrameKind::SessionList
+                            | FrameKind::WorkflowNotify
+                            | FrameKind::AgentsViewPreferencesNotify
                             | FrameKind::ProjectBootstrap
                             | FrameKind::ProjectEvent
                             | FrameKind::ProjectFileList

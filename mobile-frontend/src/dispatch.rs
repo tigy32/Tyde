@@ -6,20 +6,20 @@ use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 use protocol::MobileAccessErrorCode;
 use protocol::types::{AgentCompactNotifyPayload, AgentCompactStatus};
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId,
-    AgentOrigin, AgentRenamedPayload, AgentStartPayload, BackendSetupPayload,
-    BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent, ClientErrorCode,
-    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
-    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
-    McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
-    QueuedMessagesPayload, RejectPayload, ReviewBootstrapPayload, ReviewEventPayload, ReviewId,
-    SeqMismatch, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
-    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TeamCompactNotifyPayload,
-    TeamCompactStatus, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
-    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload,
+    AgentActivitySummaryPayload, AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload,
+    AgentErrorPayload, AgentId, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
+    BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent,
+    ClientErrorCode, CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind,
+    HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    HostBrowseOpenedPayload, HostSettingsPayload, McpServerNotifyPayload, NewAgentPayload,
+    ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectNotifyPayload, ProtocolValidator, QueuedMessagesPayload, RejectPayload,
+    ReviewBootstrapPayload, ReviewEventPayload, ReviewId, SeqMismatch, SessionListPayload,
+    SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
+    StreamPath, TeamCompactNotifyPayload, TeamCompactStatus, TeamDraftNotifyPayload,
+    TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
 };
 
 use crate::state::MobileShellError;
@@ -142,6 +142,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
             tyde_agent_control_mcp_enabled: true,
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
+            background_agent_features: Default::default(),
         },
         mobile_access: BootstrapMobileAccess {
             broker_status: BootstrapBrokerStatus::Disabled,
@@ -318,6 +319,18 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 state.host_settings_by_host.update(|map| {
                     map.insert(host.clone(), payload.settings);
                 });
+            }
+        }
+        FrameKind::AgentActivitySummary => {
+            match envelope.parse_payload::<AgentActivitySummaryPayload>() {
+                Ok(_payload) => {}
+                Err(error) => log::error!(
+                    "failed to parse AgentActivitySummary host={} stream={} seq={}: {}",
+                    host,
+                    envelope.stream,
+                    envelope.seq,
+                    error
+                ),
             }
         }
         FrameKind::BackendSetup => {
@@ -2294,6 +2307,7 @@ mod wasm_tests {
                     workflow: None,
                     created_at_ms: 1,
                     instance_stream: StreamPath("/agent/old-agent/inst".to_owned()),
+                    activity_summary: Default::default(),
                 },
             ),
         );
@@ -2350,6 +2364,7 @@ mod wasm_tests {
                     workflow: None,
                     created_at_ms: 2,
                     instance_stream: StreamPath("/agent/new-agent/inst".to_owned()),
+                    activity_summary: Default::default(),
                 },
             ),
         );
@@ -2571,6 +2586,7 @@ mod wasm_tests {
             workflow: None,
             created_at_ms: 1,
             instance_stream: StreamPath("/agent/a-1/inst".to_owned()),
+            activity_summary: Default::default(),
         };
         let bootstrap = protocol::HostBootstrapPayload {
             settings: protocol::HostSettings {
@@ -2582,6 +2598,7 @@ mod wasm_tests {
                 tyde_agent_control_mcp_enabled: true,
                 complexity_tiers_enabled: false,
                 backend_tier_configs: std::collections::HashMap::new(),
+                background_agent_features: Default::default(),
             },
             mobile_access: protocol::MobileAccessStatePayload {
                 broker_status: protocol::MobileBrokerStatus::Disabled,
@@ -2689,6 +2706,7 @@ mod wasm_tests {
                     workflow: None,
                     created_at_ms: 1,
                     instance_stream: instance_stream.clone(),
+                    activity_summary: Default::default(),
                 },
             ),
         );

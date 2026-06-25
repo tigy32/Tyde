@@ -879,6 +879,7 @@ mod tests {
             instance_stream: StreamPath("s".to_string()),
             started,
             fatal_error: None,
+            activity_summary: Default::default(),
         }
     }
 
@@ -1279,6 +1280,7 @@ mod wasm_tests {
                 instance_stream: StreamPath(format!("/agent/{agent_id}/inst")),
                 started,
                 fatal_error: None,
+                activity_summary: Default::default(),
             });
         });
     }
@@ -1639,6 +1641,7 @@ mod wasm_tests {
                 workflow: None,
                 created_at_ms,
                 instance_stream: agent_stream(agent_id),
+                activity_summary: Default::default(),
             },
         );
         // Prime the agent's instance stream so subsequent
@@ -2126,6 +2129,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/a-new/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                activity_summary: Default::default(),
             },
         );
         // Without an entry in compaction_pending_close,
@@ -2152,6 +2156,7 @@ mod wasm_tests {
                 instance_stream: StreamPath("/agent/a-new/inst".to_owned()),
                 started: true,
                 fatal_error: None,
+                activity_summary: Default::default(),
             },
         );
         assert!(
