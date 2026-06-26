@@ -1096,6 +1096,8 @@ pub struct AgentsViewOverlay {
     pub sort_mode: Option<AgentSortMode>,
     pub group_mode: Option<AgentGroupMode>,
     pub density: Option<AgentListDensity>,
+    /// Deprecated protocol preference retained in the overlay shape for
+    /// compatibility; current UI no longer sets or applies it.
     pub hide_finished: Option<bool>,
     pub manual_order: Option<Vec<AgentOrderKey>>,
     /// Optimistic override for the active Smart View id (dev-docs/26 §12.4):
@@ -1407,7 +1409,8 @@ pub struct AppState {
     pub team_member_shuffle_suggestions:
         RwSignal<HashMap<String, HashMap<TeamId, TeamMemberShuffleSuggestionEntry>>>,
     /// Durable Agents-tab view preferences (filters, sort, group, density,
-    /// hide-finished, manual order). The server is the single source of truth:
+    /// manual order, plus deprecated protocol fields). The server is the single
+    /// source of truth:
     /// the primary local host emits a `Some` snapshot in its bootstrap and via
     /// `AgentsViewPreferencesNotify`. This signal is *not* pruned on host
     /// cleanup, so a remount/reconnect re-reads the same server-fed base rather

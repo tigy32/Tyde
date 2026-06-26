@@ -176,19 +176,16 @@ pub(crate) fn status_to_filter(status: DerivedAgentState) -> AgentStatusFilter {
 }
 
 /// Pure predicate for the Agents Center. An empty filter list means "no
-/// constraint on this dimension". `hide_finished` drops terminated/fatal rows
-/// (the only present-but-done lifecycle signal in Phase 1a). `query_lc` is the
-/// ephemeral, never-persisted search box, lowercased.
+/// constraint on this dimension". `query_lc` is the ephemeral, never-persisted
+/// search box, lowercased. The deprecated hide-finished preference is not
+/// applied: closed agents leave state, and fatal/terminated rows remain visible
+/// unless an explicit status filter excludes them.
 pub(crate) fn agent_passes_view_filters(
     agent: &AgentInfo,
     status: DerivedAgentState,
     filters: &AgentsViewFilters,
-    hide_finished: bool,
     query_lc: &str,
 ) -> bool {
-    if hide_finished && status == DerivedAgentState::Terminated {
-        return false;
-    }
     if !filters.host_ids.is_empty() && !filters.host_ids.iter().any(|id| id.0 == agent.host_id) {
         return false;
     }
@@ -746,13 +743,7 @@ fn toggle_tag_filter(state: &AppState, tag: &AgentTagRef) {
     let prefs = state.effective_agents_view_preferences();
     let mut filters = prefs.filters.clone();
     filters.tags = toggle_in_vec(&filters.tags, tag);
-    let active = active_view_after_query_edit(
-        state,
-        &filters,
-        prefs.sort_mode,
-        prefs.group_mode,
-        prefs.hide_finished,
-    );
+    let active = active_view_after_query_edit(state, &filters, prefs.sort_mode, prefs.group_mode);
     state.set_agents_view_overlay(|overlay| {
         overlay.filters = Some(filters.clone());
         overlay.active_view_id = Some(active);
@@ -761,10 +752,10 @@ fn toggle_tag_filter(state: &AppState, tag: &AgentTagRef) {
 }
 
 /// Optimistically reflect a Smart View selection then send `SetActive`. Copies
-/// the view's query domains (`filters`, `sort_mode`, `group_mode`,
-/// `hide_finished` — never search, density, or manual order, per dev-docs/26
-/// §4.2/§4.4) plus the active view id into the overlay so the switcher and rows
-/// update instantly; the next authoritative snapshot drops the overlay.
+/// the live query domains (`filters`, `sort_mode`, `group_mode` — never search,
+/// density, manual order, or deprecated hide-finished) plus the active view id
+/// into the overlay so the switcher and rows update instantly; the next
+/// authoritative snapshot drops the overlay.
 fn select_smart_view(state: &AppState, view: &SmartView) {
     let view = view.clone();
     let id = view.id.clone();
@@ -772,24 +763,21 @@ fn select_smart_view(state: &AppState, view: &SmartView) {
         overlay.filters = Some(view.filters);
         overlay.sort_mode = Some(view.sort_mode);
         overlay.group_mode = Some(view.group_mode);
-        overlay.hide_finished = Some(view.hide_finished);
         overlay.active_view_id = Some(Some(view.id));
     });
     send_smart_view_update(state, AgentsSmartViewsUpdate::SetActive { id });
 }
 
-/// Optimistic `active_view_id` value after a direct query edit. Mirrors the
-/// backend, which only clears `active_view_id` when the query actually diverges
-/// from the active view's saved query: if the new query still equals the active
-/// view's `filters`/`sort_mode`/`group_mode`/`hide_finished`, the highlight is
-/// kept (e.g. Reset while already on the default-query "All" must not flash);
-/// otherwise it clears. Returns the value to store in `overlay.active_view_id`.
+/// Optimistic `active_view_id` value after a direct query edit. If the new
+/// query still equals the active view's live query fields
+/// (`filters`/`sort_mode`/`group_mode`), the highlight is kept (e.g. Reset while
+/// already on the default-query "All" must not flash); otherwise it clears.
+/// Deprecated `hide_finished` values in stored Smart Views are ignored.
 fn active_view_after_query_edit(
     state: &AppState,
     filters: &AgentsViewFilters,
     sort_mode: AgentSortMode,
     group_mode: AgentGroupMode,
-    hide_finished: bool,
 ) -> Option<SmartViewId> {
     let active_id = state.effective_active_smart_view_id()?;
     let snapshot = state.agents_view_preferences.get().smart_views;
@@ -799,10 +787,7 @@ fn active_view_after_query_edit(
         .chain(snapshot.user.iter())
         .find(|view| view.id == active_id)
         .is_some_and(|view| {
-            &view.filters == filters
-                && view.sort_mode == sort_mode
-                && view.group_mode == group_mode
-                && view.hide_finished == hide_finished
+            &view.filters == filters && view.sort_mode == sort_mode && view.group_mode == group_mode
         });
     still_matches.then_some(active_id)
 }
@@ -977,13 +962,7 @@ pub fn AgentMonitorView() -> impl IntoView {
                     let mut normal_rows: Vec<AgentMonitorRow> = Vec::new();
                     for agent in agents.iter() {
                         let status = derive_agent_state(agent, streaming, turn_active, compaction);
-                        if !agent_passes_view_filters(
-                            agent,
-                            status,
-                            &preferences.filters,
-                            preferences.hide_finished,
-                            &query,
-                        ) {
+                        if !agent_passes_view_filters(agent, status, &preferences.filters, &query) {
                             continue;
                         }
                         let target = agent_annotation_target(agent);
@@ -1068,14 +1047,12 @@ pub fn AgentMonitorView() -> impl IntoView {
             &AgentsViewFilters::default(),
             AgentSortMode::default(),
             AgentGroupMode::default(),
-            false,
         );
         reset_state.set_agents_view_overlay(|overlay| {
             overlay.filters = Some(AgentsViewFilters::default());
             overlay.sort_mode = Some(AgentSortMode::default());
             overlay.group_mode = Some(AgentGroupMode::default());
             overlay.density = Some(AgentListDensity::default());
-            overlay.hide_finished = Some(false);
             overlay.manual_order = Some(Vec::new());
             overlay.active_view_id = Some(active);
         });
@@ -1089,13 +1066,8 @@ pub fn AgentMonitorView() -> impl IntoView {
             return;
         };
         let prefs = sort_state.effective_agents_view_preferences();
-        let active = active_view_after_query_edit(
-            &sort_state,
-            &prefs.filters,
-            mode,
-            prefs.group_mode,
-            prefs.hide_finished,
-        );
+        let active =
+            active_view_after_query_edit(&sort_state, &prefs.filters, mode, prefs.group_mode);
         sort_state.set_agents_view_overlay(|overlay| {
             overlay.sort_mode = Some(mode);
             overlay.active_view_id = Some(active);
@@ -1112,13 +1084,8 @@ pub fn AgentMonitorView() -> impl IntoView {
             return;
         };
         let prefs = group_state.effective_agents_view_preferences();
-        let active = active_view_after_query_edit(
-            &group_state,
-            &prefs.filters,
-            prefs.sort_mode,
-            mode,
-            prefs.hide_finished,
-        );
+        let active =
+            active_view_after_query_edit(&group_state, &prefs.filters, prefs.sort_mode, mode);
         group_state.set_agents_view_overlay(|overlay| {
             overlay.group_mode = Some(mode);
             overlay.active_view_id = Some(active);
@@ -1139,29 +1106,6 @@ pub fn AgentMonitorView() -> impl IntoView {
         send_pref_update(
             &density_state,
             AgentsViewPreferencesUpdate::SetDensity { density: next },
-        );
-    };
-
-    let hide_state = state.clone();
-    let toggle_hide_finished = move |_| {
-        let prefs = hide_state.effective_agents_view_preferences();
-        let next = !prefs.hide_finished;
-        let active = active_view_after_query_edit(
-            &hide_state,
-            &prefs.filters,
-            prefs.sort_mode,
-            prefs.group_mode,
-            next,
-        );
-        hide_state.set_agents_view_overlay(|overlay| {
-            overlay.hide_finished = Some(next);
-            overlay.active_view_id = Some(active);
-        });
-        send_pref_update(
-            &hide_state,
-            AgentsViewPreferencesUpdate::SetHideFinished {
-                hide_finished: next,
-            },
         );
     };
 
@@ -1272,20 +1216,6 @@ pub fn AgentMonitorView() -> impl IntoView {
                 >
                     "Compact"
                 </button>
-                <button
-                    type="button"
-                    class=move || {
-                        if prefs_for_controls.get().hide_finished {
-                            "filter-toggle active"
-                        } else {
-                            "filter-toggle"
-                        }
-                    }
-                    data-test="agent-monitor-hide-finished"
-                    on:click=toggle_hide_finished
-                >
-                    "Hide finished"
-                </button>
             </div>
 
             <div class="agent-monitor-filters">
@@ -1306,7 +1236,6 @@ pub fn AgentMonitorView() -> impl IntoView {
                                     &filters,
                                     prefs.sort_mode,
                                     prefs.group_mode,
-                                    prefs.hide_finished,
                                 );
                                 chip_state
                                     .set_agents_view_overlay(|overlay| {
@@ -1347,7 +1276,6 @@ pub fn AgentMonitorView() -> impl IntoView {
                                     &filters,
                                     prefs.sort_mode,
                                     prefs.group_mode,
-                                    prefs.hide_finished,
                                 );
                                 chip_state
                                     .set_agents_view_overlay(|overlay| {
@@ -1388,7 +1316,6 @@ pub fn AgentMonitorView() -> impl IntoView {
                                     &filters,
                                     prefs.sort_mode,
                                     prefs.group_mode,
-                                    prefs.hide_finished,
                                 );
                                 chip_state
                                     .set_agents_view_overlay(|overlay| {
@@ -1875,7 +1802,6 @@ fn HostProjectFilters() -> impl IntoView {
                             &filters,
                             prefs.sort_mode,
                             prefs.group_mode,
-                            prefs.hide_finished,
                         );
                         chip_state.set_agents_view_overlay(|overlay| {
                             overlay.filters = Some(filters.clone());
@@ -1929,7 +1855,6 @@ fn HostProjectFilters() -> impl IntoView {
                             &filters,
                             prefs.sort_mode,
                             prefs.group_mode,
-                            prefs.hide_finished,
                         );
                         chip_state.set_agents_view_overlay(|overlay| {
                             overlay.filters = Some(filters.clone());
@@ -2849,19 +2774,18 @@ mod tests {
         let claude = agent("c", "h1", Some("p1"), 1, true, false);
         let terminated = agent("t", "h1", Some("p1"), 2, true, true);
 
-        // hide_finished drops terminated rows only.
+        // Deprecated hide-finished is not part of filtering; terminated rows
+        // are controlled by the explicit status filter dimension.
         assert!(agent_passes_view_filters(
             &claude,
             DerivedAgentState::Idle,
             &AgentsViewFilters::default(),
-            true,
             "",
         ));
-        assert!(!agent_passes_view_filters(
+        assert!(agent_passes_view_filters(
             &terminated,
             DerivedAgentState::Terminated,
             &AgentsViewFilters::default(),
-            true,
             "",
         ));
 
@@ -2874,14 +2798,12 @@ mod tests {
             &claude,
             DerivedAgentState::Idle,
             &only_idle,
-            false,
             "",
         ));
         assert!(!agent_passes_view_filters(
             &claude,
             DerivedAgentState::Thinking,
             &only_idle,
-            false,
             "",
         ));
 
@@ -2894,7 +2816,6 @@ mod tests {
             &claude,
             DerivedAgentState::Idle,
             &other_host,
-            false,
             "",
         ));
 
@@ -2903,7 +2824,6 @@ mod tests {
             &claude,
             DerivedAgentState::Idle,
             &AgentsViewFilters::default(),
-            false,
             "zzz",
         ));
     }
@@ -3178,6 +3098,19 @@ mod wasm_tests {
             .collect()
     }
 
+    fn button_with_text(container: &HtmlElement, text: &str) -> HtmlElement {
+        let nodes = container.query_selector_all("button").unwrap();
+        for i in 0..nodes.length() {
+            let Some(node) = nodes.item(i) else {
+                continue;
+            };
+            if node.text_content().unwrap_or_default().trim() == text {
+                return node.dyn_into::<HtmlElement>().unwrap();
+            }
+        }
+        panic!("button with text {text:?} not found");
+    }
+
     fn transient_key(name: &str) -> AgentOrderKey {
         AgentOrderKey::TransientAgent {
             host_id: HostFilterId(HOST.to_owned()),
@@ -3216,13 +3149,16 @@ mod wasm_tests {
         assert_eq!(rendered_names(&container), vec!["alpha", "zeta"]);
     }
 
-    // (b) A user change emits the correct SetAgentsViewPreferences frame AND
-    // updates the view immediately via the overlay (no server round-trip).
+    // (b) Hide-finished is deprecated: the control is gone and persisted
+    // hide_finished values no longer filter terminated rows.
     #[wasm_bindgen_test]
-    async fn user_toggle_emits_frame_and_updates_view_immediately() {
-        install_send_stub();
+    async fn hide_finished_control_is_removed_and_pref_is_noop() {
         let agents = vec![agent("live", 100, false), agent("dead", 200, true)];
-        let state = primed_state(agents, AgentsViewPreferences::default());
+        let prefs = AgentsViewPreferences {
+            hide_finished: true,
+            ..AgentsViewPreferences::default()
+        };
+        let state = primed_state(agents, prefs);
         let mount_state = state.clone();
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
@@ -3231,29 +3167,13 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        // Both rows visible before hiding finished.
         assert_eq!(rendered_names(&container).len(), 2);
-
-        let toggle: HtmlElement = container
-            .query_selector("[data-test='agent-monitor-hide-finished']")
-            .unwrap()
-            .expect("hide-finished toggle present")
-            .dyn_into()
-            .unwrap();
-        toggle.click();
-        next_tick().await;
-
-        // Overlay applied instantly: terminated "dead" row gone, no notify yet.
-        assert_eq!(rendered_names(&container), vec!["live"]);
-        // The correct typed frame went on the wire.
-        assert_eq!(last_pref_update_kind(), "set_hide_finished");
-        // The durable server snapshot was NOT mutated locally.
         assert!(
-            !state
-                .agents_view_preferences
-                .get_untracked()
-                .preferences
-                .hide_finished
+            !container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Hide finished"),
+            "Agents Center must not render a Hide finished control"
         );
     }
 
@@ -3311,21 +3231,19 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        // User hides finished → overlay installed.
-        let toggle: HtmlElement = container
-            .query_selector("[data-test='agent-monitor-hide-finished']")
-            .unwrap()
-            .expect("hide-finished toggle present")
-            .dyn_into()
-            .unwrap();
-        toggle.click();
+        // User filters to idle rows → overlay installed.
+        button_with_text(&container, "Idle").click();
         next_tick().await;
         assert!(state.agents_view_overlay_pending());
         assert_eq!(rendered_names(&container), vec!["live"]);
+        assert_eq!(last_pref_update_kind(), "set_filters");
 
         // Server confirms the change via a full-snapshot notify.
         let confirmed = AgentsViewPreferences {
-            hide_finished: true,
+            filters: AgentsViewFilters {
+                statuses: vec![AgentStatusFilter::Idle],
+                ..AgentsViewFilters::default()
+            },
             ..AgentsViewPreferences::default()
         };
         state.apply_agents_view_snapshot(HOST, snapshot(confirmed));
@@ -3339,7 +3257,9 @@ mod wasm_tests {
                 .agents_view_preferences
                 .get_untracked()
                 .preferences
-                .hide_finished
+                .filters
+                .statuses
+                .contains(&AgentStatusFilter::Idle)
         );
         assert_eq!(rendered_names(&container), vec!["live"]);
     }
@@ -3789,7 +3709,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn divergent_edit_clears_highlight_optimistically() {
         install_send_stub();
-        // Active is the default-query "All"; toggling "Hide finished" diverges.
+        // Active is the default-query "All"; adding a status filter diverges.
         let views = smart_views(vec![], Some(SmartViewId::BuiltIn(BuiltInSmartViewId::All)));
         let state = primed_state_views(vec![agent("a", 100, false)], Default::default(), views);
         let mount_state = state.clone();
@@ -3801,13 +3721,7 @@ mod wasm_tests {
         next_tick().await;
         assert_eq!(active_tab_names(&container), vec!["All"]);
 
-        let hide: HtmlElement = container
-            .query_selector("[data-test='agent-monitor-hide-finished']")
-            .unwrap()
-            .expect("hide-finished toggle present")
-            .dyn_into()
-            .unwrap();
-        hide.click();
+        button_with_text(&container, "Idle").click();
         next_tick().await;
 
         // Query now diverges from "All" → no tab highlighted.
@@ -4231,9 +4145,13 @@ mod wasm_tests {
     // pins respect the active filters/search (dev-docs/26 §4.7).
     #[wasm_bindgen_test]
     async fn filtered_out_pinned_agent_is_hidden() {
-        // "y" is terminated AND pinned; hide_finished must still drop it.
+        // "y" is terminated AND pinned; an explicit Idle status filter must
+        // still drop it.
         let prefs = AgentsViewPreferences {
-            hide_finished: true,
+            filters: AgentsViewFilters {
+                statuses: vec![AgentStatusFilter::Idle],
+                ..AgentsViewFilters::default()
+            },
             ..AgentsViewPreferences::default()
         };
         let agents = vec![agent("x", 100, false), agent("y", 200, true)];

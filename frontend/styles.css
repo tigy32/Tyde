@@ -5070,6 +5070,31 @@ kbd {
     gap: var(--space-1);
 }
 
+.agent-sidebar-host-section,
+.agent-sidebar-project-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.agent-sidebar-host-section + .agent-sidebar-host-section {
+    margin-top: var(--space-2);
+}
+
+.agent-sidebar-host-header,
+.agent-sidebar-project-header {
+    color: var(--text-tertiary);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+
+.agent-sidebar-project-header {
+    padding-left: var(--space-1);
+    color: var(--text-secondary);
+}
+
 .agent-card-group {
     display: flex;
     flex-direction: column;

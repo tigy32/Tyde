@@ -1158,6 +1158,8 @@ pub struct AgentsViewPreferences {
     pub group_mode: AgentGroupMode,
     #[serde(default)]
     pub density: AgentListDensity,
+    /// Deprecated: retained for protocol and persisted-store compatibility.
+    /// Current clients no longer expose or apply hide-finished filtering.
     #[serde(default)]
     pub hide_finished: bool,
     #[serde(default)]
@@ -1384,12 +1386,26 @@ pub struct SetAgentPinsPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentsViewPreferencesUpdate {
-    SetFilters { filters: AgentsViewFilters },
-    SetSortMode { sort_mode: AgentSortMode },
-    SetGroupMode { group_mode: AgentGroupMode },
-    SetDensity { density: AgentListDensity },
-    SetHideFinished { hide_finished: bool },
-    SetManualOrder { manual_order: Vec<AgentOrderKey> },
+    SetFilters {
+        filters: AgentsViewFilters,
+    },
+    SetSortMode {
+        sort_mode: AgentSortMode,
+    },
+    SetGroupMode {
+        group_mode: AgentGroupMode,
+    },
+    SetDensity {
+        density: AgentListDensity,
+    },
+    /// Deprecated: retained so older clients can deserialize/round-trip the
+    /// preference during the protocol-20 compatibility window.
+    SetHideFinished {
+        hide_finished: bool,
+    },
+    SetManualOrder {
+        manual_order: Vec<AgentOrderKey>,
+    },
     Reset,
 }
 
@@ -1407,6 +1423,8 @@ pub struct SmartView {
     pub sort_mode: AgentSortMode,
     #[serde(default)]
     pub group_mode: AgentGroupMode,
+    /// Deprecated: retained for protocol and persisted Smart View
+    /// compatibility. Current clients ignore this field.
     #[serde(default)]
     pub hide_finished: bool,
 }

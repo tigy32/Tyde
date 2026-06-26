@@ -3,12 +3,12 @@ use std::collections::{HashMap, HashSet};
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use protocol::{AgentId, AgentsViewPreferencesUpdate, FrameKind, SetAgentNamePayload};
+use protocol::{AgentId, FrameKind, ProjectId, SetAgentNamePayload};
 
-use crate::send::{close_agent, compact_agent, send_frame, set_agents_view_preferences};
+use crate::send::{close_agent, compact_agent, send_frame};
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, CompactionOldInfo,
-    ConnectionStatus, StreamingState, TabContent,
+    ConnectionStatus, ProjectInfo, StreamingState, TabContent, sort_project_infos,
 };
 
 /// Pure predicate used by the Agents panel filter memo. Extracted so the
@@ -147,6 +147,184 @@ pub(crate) fn status_class(derived: &DerivedAgentState) -> &'static str {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct AgentTreeGroup {
+    parent: AgentInfo,
+    children: Vec<AgentInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AgentProjectSection {
+    key: String,
+    label: String,
+    groups: Vec<AgentTreeGroup>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AgentHostSection {
+    key: String,
+    label: String,
+    projects: Vec<AgentProjectSection>,
+}
+
+fn host_label(host_labels: &HashMap<String, String>, host_id: &str) -> String {
+    host_labels
+        .get(host_id)
+        .cloned()
+        .unwrap_or_else(|| host_id.to_owned())
+}
+
+fn project_label(
+    project_labels: &HashMap<(String, ProjectId), String>,
+    host_id: &str,
+    project_id: Option<&ProjectId>,
+) -> String {
+    let Some(project_id) = project_id else {
+        return "No project".to_owned();
+    };
+    project_labels
+        .get(&(host_id.to_owned(), project_id.clone()))
+        .cloned()
+        .unwrap_or_else(|| project_id.0.clone())
+}
+
+fn build_parent_child_groups(agents: Vec<AgentInfo>) -> Vec<AgentTreeGroup> {
+    let visible_ids: HashSet<AgentId> = agents.iter().map(|a| a.agent_id.clone()).collect();
+    let mut children_by_parent: HashMap<AgentId, Vec<AgentInfo>> = HashMap::new();
+    let mut top_level: Vec<AgentInfo> = Vec::new();
+    let mut orphans: Vec<AgentInfo> = Vec::new();
+
+    for agent in agents {
+        match &agent.parent_agent_id {
+            Some(parent_id) if visible_ids.contains(parent_id) => {
+                children_by_parent
+                    .entry(parent_id.clone())
+                    .or_default()
+                    .push(agent);
+            }
+            Some(_) => orphans.push(agent),
+            None => top_level.push(agent),
+        }
+    }
+
+    let mut groups = Vec::with_capacity(top_level.len() + orphans.len());
+    for parent in top_level {
+        let children = children_by_parent
+            .remove(&parent.agent_id)
+            .unwrap_or_default();
+        groups.push(AgentTreeGroup { parent, children });
+    }
+    for orphan in orphans {
+        groups.push(AgentTreeGroup {
+            parent: orphan,
+            children: Vec::new(),
+        });
+    }
+    groups
+}
+
+fn build_sidebar_sections(
+    agents: Vec<AgentInfo>,
+    configured_hosts: Vec<crate::bridge::ConfiguredHost>,
+    mut projects: Vec<ProjectInfo>,
+) -> Vec<AgentHostSection> {
+    let host_labels: HashMap<String, String> = configured_hosts
+        .iter()
+        .map(|host| (host.id.clone(), host.label.clone()))
+        .collect();
+    let known_host_order: Vec<String> = configured_hosts
+        .iter()
+        .map(|host| host.id.clone())
+        .collect();
+
+    sort_project_infos(&mut projects);
+    let project_labels: HashMap<(String, ProjectId), String> = projects
+        .iter()
+        .map(|project| {
+            (
+                (project.host_id.clone(), project.project.id.clone()),
+                project.project.name.clone(),
+            )
+        })
+        .collect();
+
+    let mut leaf_agents: HashMap<(String, Option<ProjectId>), Vec<AgentInfo>> = HashMap::new();
+    let mut first_seen_hosts: Vec<String> = Vec::new();
+    let mut first_seen_projects: HashMap<String, Vec<Option<ProjectId>>> = HashMap::new();
+    for agent in agents {
+        let host_id = agent.host_id.clone();
+        let project_id = agent.project_id.clone();
+        if !known_host_order.contains(&host_id) && !first_seen_hosts.contains(&host_id) {
+            first_seen_hosts.push(host_id.clone());
+        }
+        let project_order = first_seen_projects.entry(host_id.clone()).or_default();
+        if !project_order.contains(&project_id) {
+            project_order.push(project_id.clone());
+        }
+        leaf_agents
+            .entry((host_id, project_id))
+            .or_default()
+            .push(agent);
+    }
+
+    let mut host_order: Vec<String> = known_host_order
+        .into_iter()
+        .filter(|host_id| {
+            leaf_agents
+                .keys()
+                .any(|(leaf_host, _)| leaf_host == host_id)
+        })
+        .collect();
+    host_order.extend(first_seen_hosts);
+
+    host_order
+        .into_iter()
+        .filter_map(|host_id| {
+            let mut project_order: Vec<Option<ProjectId>> = projects
+                .iter()
+                .filter(|project| project.host_id == host_id)
+                .filter_map(|project| {
+                    let key = (host_id.clone(), Some(project.project.id.clone()));
+                    leaf_agents
+                        .contains_key(&key)
+                        .then_some(Some(project.project.id.clone()))
+                })
+                .collect();
+
+            if let Some(first_seen) = first_seen_projects.get(&host_id) {
+                for project_id in first_seen {
+                    if !project_order.contains(project_id) {
+                        project_order.push(project_id.clone());
+                    }
+                }
+            }
+
+            let sections: Vec<AgentProjectSection> = project_order
+                .into_iter()
+                .filter_map(|project_id| {
+                    let key = (host_id.clone(), project_id.clone());
+                    let agents = leaf_agents.remove(&key)?;
+                    let label = project_label(&project_labels, &host_id, project_id.as_ref());
+                    Some(AgentProjectSection {
+                        key: project_id
+                            .as_ref()
+                            .map(|id| format!("{}:{}", host_id, id.0))
+                            .unwrap_or_else(|| format!("{host_id}:no-project")),
+                        label,
+                        groups: build_parent_child_groups(agents),
+                    })
+                })
+                .collect();
+
+            (!sections.is_empty()).then(|| AgentHostSection {
+                key: host_id.clone(),
+                label: host_label(&host_labels, &host_id),
+                projects: sections,
+            })
+        })
+        .collect()
+}
+
 #[component]
 pub fn AgentsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -166,10 +344,7 @@ pub fn AgentsPanel() -> impl IntoView {
     // `agents_panel_filters` signal it cannot be a flicker source. It exists
     // only to restore per-project reactivity — `current_filters` re-derives
     // through `active_project`, so switching projects re-applies that project's
-    // defaults while remembering in-session overrides. "Hide finished" is the
-    // one shared, server-owned preference and is read from / written to the
-    // Agents-view preferences object so it stays consistent with the Agents
-    // Center. See `dev-docs/26-agent-organization.md` §5.2.
+    // defaults while remembering in-session overrides.
     let local_filters: RwSignal<HashMap<Option<ActiveProjectRef>, AgentsPanelFilters>> =
         RwSignal::new(HashMap::new());
     let filters_state = state.clone();
@@ -180,13 +355,6 @@ pub fn AgentsPanel() -> impl IntoView {
             .get(&active)
             .cloned()
             .unwrap_or_else(|| AgentsPanelFilters::defaults_for(active.as_ref()))
-    });
-
-    let hide_finished_state = state.clone();
-    let hide_finished = Memo::new(move |_| {
-        hide_finished_state
-            .effective_agents_view_preferences()
-            .hide_finished
     });
 
     let update_state = state.clone();
@@ -200,43 +368,11 @@ pub fn AgentsPanel() -> impl IntoView {
         });
     };
 
-    let hide_finished_toggle_state = state.clone();
-    let toggle_hide_finished = move |_| {
-        let next = !hide_finished_toggle_state
-            .effective_agents_view_preferences()
-            .hide_finished;
-        hide_finished_toggle_state
-            .set_agents_view_overlay(|overlay| overlay.hide_finished = Some(next));
-        let Some(host_id) = hide_finished_toggle_state
-            .agents_view_preferences_host
-            .get_untracked()
-        else {
-            return;
-        };
-        let Some(stream) = hide_finished_toggle_state.host_stream_untracked(&host_id) else {
-            return;
-        };
-        spawn_local(async move {
-            if let Err(error) = set_agents_view_preferences(
-                &host_id,
-                stream,
-                AgentsViewPreferencesUpdate::SetHideFinished {
-                    hide_finished: next,
-                },
-            )
-            .await
-            {
-                log::error!("failed to send hide-finished preference: {error}");
-            }
-        });
-    };
-
     let filter_state = state.clone();
     let filtered_agents = Memo::new(move |_| {
         let active_project = filter_state.active_project.get();
         let query = search.get().to_lowercase();
         let filters = current_filters.get();
-        let hide_finished = hide_finished.get();
 
         // Read the noisy maps in place via `with` rather than cloning
         // them up-front. The Memo re-runs on every keystroke in the
@@ -245,83 +381,33 @@ pub fn AgentsPanel() -> impl IntoView {
         // dominant per-keystroke cost in the audit.
         filter_state.streaming_text.with(|streaming_map| {
             filter_state.agent_turn_active.with(|turn_active_map| {
-                filter_state.compaction_in_progress.with(|compaction_map| {
-                    filter_state.agents.with(|agents| {
-                        agents
-                            .iter()
-                            .filter(|a| {
-                                if hide_finished
-                                    && derive_agent_state(
-                                        a,
-                                        streaming_map,
-                                        turn_active_map,
-                                        compaction_map,
-                                    ) == DerivedAgentState::Terminated
-                                {
-                                    return false;
-                                }
-                                agent_passes_filters(
-                                    a,
-                                    &filters,
-                                    active_project.as_ref(),
-                                    streaming_map,
-                                    turn_active_map,
-                                    &query,
-                                )
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    })
+                filter_state.agents.with(|agents| {
+                    agents
+                        .iter()
+                        .filter(|a| {
+                            agent_passes_filters(
+                                a,
+                                &filters,
+                                active_project.as_ref(),
+                                streaming_map,
+                                turn_active_map,
+                                &query,
+                            )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
                 })
             })
         })
     });
 
-    // Build parent-children grouping in O(N). The previous version
-    // did O(N×M) parent-lookup per parent and a second O(N) pass to
-    // detect orphans, which the agents panel re-runs on every chat
-    // streaming delta because `filtered_agents` subscribes to
-    // `streaming_text` and `agent_turn_active`. With dozens of agents
-    // and a fast model this would dominate per-delta main-thread time.
-    let grouped = Memo::new(move |_| {
-        use std::collections::{HashMap, HashSet};
-        let agents = filtered_agents.get();
-
-        // Index every visible agent's id once; lets us tell orphans
-        // (parent filtered out) from real children in a single pass.
-        let visible_ids: HashSet<AgentId> = agents.iter().map(|a| a.agent_id.clone()).collect();
-
-        // Bucket children by parent_agent_id. One alloc per parent
-        // group; orphans land in a synthetic "orphan" bucket whose
-        // entries we later promote to top-level rows.
-        let mut children_by_parent: HashMap<AgentId, Vec<AgentInfo>> = HashMap::new();
-        let mut top_level: Vec<AgentInfo> = Vec::new();
-        let mut orphans: Vec<AgentInfo> = Vec::new();
-        for agent in agents {
-            match &agent.parent_agent_id {
-                Some(pid) if visible_ids.contains(pid) => {
-                    children_by_parent
-                        .entry(pid.clone())
-                        .or_default()
-                        .push(agent);
-                }
-                Some(_) => orphans.push(agent),
-                None => top_level.push(agent),
-            }
-        }
-
-        let mut result: Vec<(AgentInfo, Vec<AgentInfo>)> =
-            Vec::with_capacity(top_level.len() + orphans.len());
-        for parent in top_level {
-            let children = children_by_parent
-                .remove(&parent.agent_id)
-                .unwrap_or_default();
-            result.push((parent, children));
-        }
-        for orphan in orphans {
-            result.push((orphan, Vec::new()));
-        }
-        result
+    let section_state = state.clone();
+    let sections = Memo::new(move |_| {
+        build_sidebar_sections(
+            filtered_agents.get(),
+            section_state.configured_hosts.get(),
+            section_state.projects.get(),
+        )
     });
 
     let on_search = move |ev: leptos::ev::Event| {
@@ -381,50 +467,59 @@ pub fn AgentsPanel() -> impl IntoView {
                 >
                     "Show other projects"
                 </button>
-                <button
-                    class=move || if hide_finished.get() { "filter-toggle active" } else { "filter-toggle" }
-                    data-test="agents-panel-hide-finished"
-                    on:click=toggle_hide_finished
-                >
-                    "Hide finished"
-                </button>
             </div>
             <div class="panel-content">
                 {move || {
-                    let groups = grouped.get();
-                    if groups.is_empty() {
+                    let sections = sections.get();
+                    if sections.is_empty() {
                         view! {
                             <div class="panel-empty">"No agents yet"</div>
                         }.into_any()
                     } else {
                         view! {
                             <div class="agent-card-list">
-                                {groups.into_iter().map(|(parent, children)| {
-                                    let parent_id = parent.agent_id.clone();
-                                    let group_id = parent_id.0.clone();
-                                    let child_count = children.len();
-                                    let parent_view = agent_card(state.clone(), parent, editing_agent, edit_value, child_count, collapsed_parents);
-                                    let children_view = children.into_iter().map(|child| {
-                                        let pid = parent_id.clone();
-                                        view! {
-                                            <div
-                                                class=move || {
-                                                    if collapsed_parents.with(|s| s.contains(&pid)) {
-                                                        "agent-card-child agent-card-child-hidden"
-                                                    } else {
-                                                        "agent-card-child"
-                                                    }
-                                                }
-                                            >
-                                                {agent_card(state.clone(), child, editing_agent, edit_value, 0, collapsed_parents)}
-                                            </div>
-                                        }
-                                    }).collect_view();
+                                {sections.into_iter().map(|host| {
                                     view! {
-                                        <div class="agent-card-group" data-agent-id=group_id>
-                                            {parent_view}
-                                            {children_view}
-                                        </div>
+                                        <section class="agent-sidebar-host-section" data-host-id=host.key>
+                                            <div class="agent-sidebar-host-header">{format!("Host: {}", host.label)}</div>
+                                            {host.projects.into_iter().map(|project| {
+                                                view! {
+                                                    <section class="agent-sidebar-project-section" data-project-key=project.key>
+                                                        <div class="agent-sidebar-project-header">{format!("Project: {}", project.label)}</div>
+                                                        {project.groups.into_iter().map(|group| {
+                                                            let parent = group.parent;
+                                                            let children = group.children;
+                                                            let parent_id = parent.agent_id.clone();
+                                                            let group_id = parent_id.0.clone();
+                                                            let child_count = children.len();
+                                                            let parent_view = agent_card(state.clone(), parent, editing_agent, edit_value, child_count, collapsed_parents);
+                                                            let children_view = children.into_iter().map(|child| {
+                                                                let pid = parent_id.clone();
+                                                                view! {
+                                                                    <div
+                                                                        class=move || {
+                                                                            if collapsed_parents.with(|s| s.contains(&pid)) {
+                                                                                "agent-card-child agent-card-child-hidden"
+                                                                            } else {
+                                                                                "agent-card-child"
+                                                                            }
+                                                                        }
+                                                                    >
+                                                                        {agent_card(state.clone(), child, editing_agent, edit_value, 0, collapsed_parents)}
+                                                                    </div>
+                                                                }
+                                                            }).collect_view();
+                                                            view! {
+                                                                <div class="agent-card-group" data-agent-id=group_id>
+                                                                    {parent_view}
+                                                                    {children_view}
+                                                                </div>
+                                                            }
+                                                        }).collect_view()}
+                                                    </section>
+                                                }
+                                            }).collect_view()}
+                                        </section>
                                     }
                                 }).collect_view()}
                             </div>
@@ -1129,8 +1224,8 @@ mod wasm_tests {
         AgentCompactNotifyPayload, AgentCompactStatus, TeamCompactNotifyPayload, TeamCompactStatus,
     };
     use protocol::{
-        AgentOrigin, BackendKind, ChatMessage, Envelope, MessageSender, NewAgentPayload,
-        StreamPath, TeamId, TeamMemberId,
+        AgentOrigin, BackendKind, ChatMessage, Envelope, MessageSender, NewAgentPayload, Project,
+        ProjectId, ProjectRootPath, ProjectSource, StreamPath, TeamId, TeamMemberId,
     };
     use serde_json::Value as JsonValue;
     use wasm_bindgen::JsCast;
@@ -1259,6 +1354,18 @@ mod wasm_tests {
     }
 
     fn push_agent(state: &AppState, host_id: &str, agent_id: &str, name: &str, started: bool) {
+        push_agent_with_scope(state, host_id, agent_id, name, started, None, None);
+    }
+
+    fn push_agent_with_scope(
+        state: &AppState,
+        host_id: &str,
+        agent_id: &str,
+        name: &str,
+        started: bool,
+        project_id: Option<&str>,
+        parent_agent_id: Option<&str>,
+    ) {
         state.agents.update(|agents| {
             agents.push(AgentInfo {
                 host_id: host_id.to_owned(),
@@ -1267,8 +1374,8 @@ mod wasm_tests {
                 origin: AgentOrigin::User,
                 backend_kind: BackendKind::Claude,
                 workspace_roots: Vec::new(),
-                project_id: None,
-                parent_agent_id: None,
+                project_id: project_id.map(|id| ProjectId(id.to_owned())),
+                parent_agent_id: parent_agent_id.map(|id| AgentId(id.to_owned())),
                 session_id: None,
                 custom_agent_id: None,
                 workflow: None,
@@ -1283,6 +1390,85 @@ mod wasm_tests {
                 activity_summary: Default::default(),
             });
         });
+    }
+
+    fn configured_host(id: &str, label: &str) -> crate::bridge::ConfiguredHost {
+        crate::bridge::ConfiguredHost {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            transport: if id == "local" {
+                crate::bridge::HostTransportConfig::LocalEmbedded
+            } else {
+                crate::bridge::HostTransportConfig::SshStdio {
+                    ssh_destination: id.to_owned(),
+                    remote_command: None,
+                    lifecycle: Default::default(),
+                }
+            },
+            auto_connect: true,
+        }
+    }
+
+    fn project_info(host_id: &str, project_id: &str, name: &str, sort_order: u64) -> ProjectInfo {
+        ProjectInfo {
+            host_id: host_id.to_owned(),
+            project: Project {
+                id: ProjectId(project_id.to_owned()),
+                name: name.to_owned(),
+                sort_order,
+                source: ProjectSource::Standalone {
+                    roots: vec![ProjectRootPath(format!("/tmp/{project_id}"))],
+                },
+            },
+        }
+    }
+
+    fn seed_sidebar_group_fixture(state: &AppState) {
+        state.configured_hosts.set(vec![
+            configured_host("local", "Local Host"),
+            configured_host("remote", "Remote Host"),
+        ]);
+        state.projects.set(vec![
+            project_info("local", "alpha", "Alpha Project", 0),
+            project_info("local", "beta", "Beta Project", 1),
+            project_info("remote", "gamma", "Gamma Project", 0),
+        ]);
+        push_agent_with_scope(
+            state,
+            "local",
+            "parent-alpha",
+            "Parent Alpha Agent",
+            true,
+            Some("alpha"),
+            None,
+        );
+        push_agent_with_scope(
+            state,
+            "local",
+            "child-alpha",
+            "Child Alpha Agent",
+            true,
+            Some("alpha"),
+            Some("parent-alpha"),
+        );
+        push_agent_with_scope(
+            state,
+            "local",
+            "beta-agent",
+            "Beta Agent",
+            true,
+            Some("beta"),
+            None,
+        );
+        push_agent_with_scope(
+            state,
+            "remote",
+            "gamma-agent",
+            "Gamma Agent",
+            true,
+            Some("gamma"),
+            None,
+        );
     }
 
     fn seed_chat_row(state: &AppState, agent_id: &str) {
@@ -1325,6 +1511,111 @@ mod wasm_tests {
             provide_context(state_for_mount.clone());
             view! { <AgentsPanel /> }
         })
+    }
+
+    fn text_position(text: &str, needle: &str) -> usize {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("expected rendered text to contain {needle:?}; got {text:?}"))
+    }
+
+    /// The sidebar groups visible agents by host, then project, using the
+    /// server-provided labels that users see in the rest of the UI.
+    #[wasm_bindgen_test]
+    async fn sidebar_renders_host_and_project_section_headers() {
+        let container = make_container();
+        let state = make_app_state("local");
+        seed_sidebar_group_fixture(&state);
+
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let text = container.text_content().unwrap_or_default();
+        for expected in [
+            "Host: Local Host",
+            "Project: Alpha Project",
+            "Project: Beta Project",
+            "Host: Remote Host",
+            "Project: Gamma Project",
+        ] {
+            assert!(
+                text.contains(expected),
+                "sidebar should render section header {expected:?}; got {text:?}"
+            );
+        }
+
+        assert!(
+            text_position(&text, "Host: Local Host")
+                < text_position(&text, "Project: Alpha Project")
+        );
+        assert!(
+            text_position(&text, "Project: Alpha Project")
+                < text_position(&text, "Parent Alpha Agent")
+        );
+        assert!(
+            text_position(&text, "Parent Alpha Agent")
+                < text_position(&text, "Project: Beta Project")
+        );
+        assert!(text_position(&text, "Project: Beta Project") < text_position(&text, "Beta Agent"));
+        assert!(text_position(&text, "Beta Agent") < text_position(&text, "Host: Remote Host"));
+        assert!(text_position(&text, "Host: Remote Host") < text_position(&text, "Gamma Agent"));
+    }
+
+    /// Parent/child sub-agent nesting remains inside the host/project leaf:
+    /// the parent keeps its visible child-count affordance and the child stays
+    /// under the same project before the next project section starts.
+    #[wasm_bindgen_test]
+    async fn sidebar_preserves_parent_child_nesting_within_project_leaf() {
+        let container = make_container();
+        let state = make_app_state("local");
+        seed_sidebar_group_fixture(&state);
+
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let text = container.text_content().unwrap_or_default();
+        let alpha = text_position(&text, "Project: Alpha Project");
+        let parent = text_position(&text, "Parent Alpha Agent");
+        let child = text_position(&text, "Child Alpha Agent");
+        let beta = text_position(&text, "Project: Beta Project");
+        assert!(
+            alpha < parent && parent < child && child < beta,
+            "parent and child should render together inside Alpha before Beta; got {text:?}"
+        );
+
+        let parent_group = container
+            .query_selector("[data-agent-id='parent-alpha']")
+            .unwrap()
+            .expect("parent group present");
+        let group_text = parent_group.text_content().unwrap_or_default();
+        assert!(
+            group_text.contains("Parent Alpha Agent")
+                && group_text.contains("Child Alpha Agent")
+                && group_text.contains('1'),
+            "parent group should show parent, child, and visible child count; got {group_text:?}"
+        );
+    }
+
+    /// The retired Hide finished control must not render in the sidebar.
+    #[wasm_bindgen_test]
+    async fn sidebar_does_not_render_hide_finished_control() {
+        let container = make_container();
+        let state = make_app_state("local");
+        push_agent(&state, "local", "a-idle", "Agent", true);
+
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("Hide finished"),
+            "sidebar must not render a Hide finished control; got {text:?}"
+        );
     }
 
     /// Idle agent on a connected host with at least one chat row should
