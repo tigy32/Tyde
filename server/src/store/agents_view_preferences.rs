@@ -3,7 +3,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use protocol::{
-    AgentAnnotationTarget, AgentGroupMode, AgentId, AgentManualTagAssignment,
+    AgentAnnotationTarget, AgentGroup, AgentGroupAssignment, AgentGroupId, AgentGroupMode,
+    AgentGroupsSnapshot, AgentGroupsUpdate, AgentId, AgentManualTagAssignment,
     AgentManualTagDescriptor, AgentManualTagId, AgentOrderKey, AgentOrigin, AgentPinsSnapshot,
     AgentPinsUpdate, AgentSortMode, AgentStatusFilter, AgentTagColor, AgentTagRef,
     AgentTagsSnapshot, AgentTagsUpdate, AgentsSmartViewsSnapshot, AgentsSmartViewsUpdate,
@@ -15,7 +16,8 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const STORE_VERSION: u32 = 3;
+const STORE_VERSION: u32 = 4;
+const TAGS_PINS_STORE_VERSION: u32 = 3;
 const SMART_VIEWS_STORE_VERSION: u32 = 2;
 const LEGACY_STORE_VERSION: u32 = 1;
 
@@ -29,6 +31,8 @@ struct StoreFile {
     tags: PersistedTags,
     #[serde(default)]
     pins: AgentPinsSnapshot,
+    #[serde(default)]
+    groups: AgentGroupsSnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +64,7 @@ struct StoreState {
     manual_tags: Vec<AgentManualTagDescriptor>,
     manual_tag_assignments: Vec<AgentManualTagAssignment>,
     pins: AgentPinsSnapshot,
+    groups: AgentGroupsSnapshot,
 }
 
 impl Default for StoreState {
@@ -71,6 +76,7 @@ impl Default for StoreState {
             manual_tags: Vec::new(),
             manual_tag_assignments: Vec::new(),
             pins: AgentPinsSnapshot::default(),
+            groups: AgentGroupsSnapshot::default(),
         }
     }
 }
@@ -92,6 +98,7 @@ pub struct AgentsViewPreferencesStore {
     manual_tags: Vec<AgentManualTagDescriptor>,
     manual_tag_assignments: Vec<AgentManualTagAssignment>,
     pins: AgentPinsSnapshot,
+    groups: AgentGroupsSnapshot,
     load_error: Option<AgentsViewPreferencesStoreError>,
 }
 
@@ -106,6 +113,7 @@ impl AgentsViewPreferencesStore {
                 manual_tags: state.manual_tags,
                 manual_tag_assignments: state.manual_tag_assignments,
                 pins: state.pins,
+                groups: state.groups,
                 load_error: None,
             },
             Err(load_error) => {
@@ -118,6 +126,7 @@ impl AgentsViewPreferencesStore {
                     manual_tags: state.manual_tags,
                     manual_tag_assignments: state.manual_tag_assignments,
                     pins: state.pins,
+                    groups: state.groups,
                     load_error: Some(load_error),
                 }
             }
@@ -144,6 +153,7 @@ impl AgentsViewPreferencesStore {
             smart_views: self.smart_views_snapshot(),
             tags: self.tags_snapshot(),
             pins: self.pins.clone(),
+            groups: self.groups.clone(),
         }
     }
 
@@ -202,6 +212,25 @@ impl AgentsViewPreferencesStore {
         let mut state = self.read_current_state_or_default();
         apply_pins_update(&mut state, update)?;
         canonicalize_annotation_targets(&mut state, canonicalize_target)?;
+        let state = validate_state(state)?;
+        Self::save(&self.path, &state)?;
+        self.set_state(state);
+        self.load_error = None;
+        Ok(self.snapshot())
+    }
+
+    pub fn apply_groups<F>(
+        &mut self,
+        update: AgentGroupsUpdate,
+        canonicalize_target: F,
+    ) -> Result<AgentsViewPreferencesSnapshot, String>
+    where
+        F: FnMut(AgentAnnotationTarget) -> Result<Option<AgentAnnotationTarget>, String>,
+    {
+        let mut state = self.read_current_state_or_default();
+        apply_groups_update(&mut state, update)?;
+        canonicalize_annotation_targets(&mut state, canonicalize_target)?;
+        prune_empty_groups(&mut state);
         let state = validate_state(state)?;
         Self::save(&self.path, &state)?;
         self.set_state(state);
@@ -285,6 +314,7 @@ impl AgentsViewPreferencesStore {
         self.manual_tags = state.manual_tags;
         self.manual_tag_assignments = state.manual_tag_assignments;
         self.pins = state.pins;
+        self.groups = state.groups;
     }
 
     fn smart_views_snapshot(&self) -> AgentsSmartViewsSnapshot {
@@ -361,6 +391,7 @@ impl AgentsViewPreferencesStore {
                     manual_tags: Vec::new(),
                     manual_tag_assignments: Vec::new(),
                     pins: AgentPinsSnapshot::default(),
+                    groups: AgentGroupsSnapshot::default(),
                 })
                 .map_err(|err| {
                     store_error(
@@ -374,6 +405,7 @@ impl AgentsViewPreferencesStore {
             }
             matched_version
                 if matched_version == u64::from(SMART_VIEWS_STORE_VERSION)
+                    || matched_version == u64::from(TAGS_PINS_STORE_VERSION)
                     || matched_version == u64::from(STORE_VERSION) =>
             {
                 let active_view_id_was_present = value
@@ -401,6 +433,7 @@ impl AgentsViewPreferencesStore {
                     manual_tags: store.tags.manual,
                     manual_tag_assignments: store.tags.manual_assignments,
                     pins: store.pins,
+                    groups: store.groups,
                 })
                 .map_err(|err| {
                     store_error(
@@ -435,6 +468,7 @@ impl AgentsViewPreferencesStore {
                 manual_assignments: state.manual_tag_assignments.clone(),
             },
             pins: state.pins.clone(),
+            groups: state.groups.clone(),
         })
         .map_err(|err| format!("Failed to serialize agents view preferences store: {err}"))?;
 
@@ -590,6 +624,7 @@ fn validate_state(state: StoreState) -> Result<StoreState, String> {
     let manual_tag_assignments =
         validate_manual_tag_assignments(state.manual_tag_assignments, &manual_tag_ids)?;
     let pins = validate_pins(state.pins)?;
+    let groups = validate_groups(state.groups)?;
     let user_ids = user_smart_views
         .iter()
         .filter_map(user_smart_view_id)
@@ -603,6 +638,7 @@ fn validate_state(state: StoreState) -> Result<StoreState, String> {
         manual_tags,
         manual_tag_assignments,
         pins,
+        groups,
     })
 }
 
@@ -678,6 +714,60 @@ fn validate_pins(pins: AgentPinsSnapshot) -> Result<AgentPinsSnapshot, String> {
     pinned.sort_by(compare_annotation_targets);
     pinned.dedup();
     Ok(AgentPinsSnapshot { pinned })
+}
+
+fn validate_groups(groups: AgentGroupsSnapshot) -> Result<AgentGroupsSnapshot, String> {
+    let mut seen_group_ids = HashSet::new();
+    let mut validated_groups = Vec::with_capacity(groups.groups.len());
+    for group in groups.groups {
+        validate_agent_group_id(&group.id)?;
+        if !seen_group_ids.insert(group.id.clone()) {
+            return Err(format!("duplicate agent group id {}", group.id));
+        }
+        validated_groups.push(AgentGroup {
+            id: group.id,
+            name: normalize_group_name(group.name)?,
+        });
+    }
+
+    let known_group_ids = validated_groups
+        .iter()
+        .map(|group| group.id.clone())
+        .collect::<HashSet<_>>();
+    let mut by_target = HashMap::<AgentAnnotationTarget, AgentGroupId>::new();
+    for assignment in groups.assignments {
+        validate_agent_group_id(&assignment.group_id)?;
+        if !known_group_ids.contains(&assignment.group_id) {
+            return Err(format!(
+                "agent group assignment references unknown group {}",
+                assignment.group_id
+            ));
+        }
+        validate_annotation_target(&assignment.target)?;
+        if by_target
+            .insert(assignment.target, assignment.group_id.clone())
+            .is_some()
+        {
+            return Err("agent group assignments contain duplicate targets".to_owned());
+        }
+    }
+
+    let mut assignments = by_target
+        .into_iter()
+        .map(|(target, group_id)| AgentGroupAssignment { group_id, target })
+        .collect::<Vec<_>>();
+    assignments.sort_by(|left, right| compare_annotation_targets(&left.target, &right.target));
+
+    let non_empty_group_ids = assignments
+        .iter()
+        .map(|assignment| assignment.group_id.clone())
+        .collect::<HashSet<_>>();
+    validated_groups.retain(|group| non_empty_group_ids.contains(&group.id));
+
+    Ok(AgentGroupsSnapshot {
+        groups: validated_groups,
+        assignments,
+    })
 }
 
 fn validate_user_smart_views(views: Vec<SmartView>) -> Result<Vec<SmartView>, String> {
@@ -936,6 +1026,85 @@ fn apply_pins_update(state: &mut StoreState, update: AgentPinsUpdate) -> Result<
     Ok(())
 }
 
+fn apply_groups_update(state: &mut StoreState, update: AgentGroupsUpdate) -> Result<(), String> {
+    match update {
+        AgentGroupsUpdate::CreateGroup { name, targets } => {
+            let name = normalize_group_name(name)?;
+            let targets = normalize_group_targets(targets)?;
+            let id = next_agent_group_id(&name, &state.groups.groups);
+            state.groups.groups.push(AgentGroup {
+                id: id.clone(),
+                name,
+            });
+            move_targets_to_group(state, Some(id), targets)?;
+        }
+        AgentGroupsUpdate::RenameGroup { id, name } => {
+            validate_agent_group_id(&id)?;
+            let name = normalize_group_name(name)?;
+            let group = find_agent_group_mut(&mut state.groups.groups, &id)?;
+            group.name = name;
+        }
+        AgentGroupsUpdate::DeleteGroup { id } => {
+            validate_agent_group_id(&id)?;
+            let position = agent_group_position(&state.groups.groups, &id)
+                .ok_or_else(|| unknown_agent_group_message(&id))?;
+            state.groups.groups.remove(position);
+            state
+                .groups
+                .assignments
+                .retain(|assignment| assignment.group_id != id);
+        }
+        AgentGroupsUpdate::MoveTargets { group_id, targets } => {
+            if let Some(group_id) = &group_id {
+                validate_agent_group_id(group_id)?;
+                ensure_agent_group_exists(&state.groups.groups, group_id)?;
+            }
+            let targets = normalize_group_targets(targets)?;
+            move_targets_to_group(state, group_id, targets)?;
+        }
+    }
+    prune_empty_groups(state);
+    Ok(())
+}
+
+fn move_targets_to_group(
+    state: &mut StoreState,
+    group_id: Option<AgentGroupId>,
+    targets: Vec<AgentAnnotationTarget>,
+) -> Result<(), String> {
+    for target in targets {
+        validate_annotation_target(&target)?;
+        state
+            .groups
+            .assignments
+            .retain(|assignment| assignment.target != target);
+        if let Some(group_id) = &group_id {
+            state.groups.assignments.push(AgentGroupAssignment {
+                group_id: group_id.clone(),
+                target,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn normalize_group_targets(
+    targets: Vec<AgentAnnotationTarget>,
+) -> Result<Vec<AgentAnnotationTarget>, String> {
+    if targets.is_empty() {
+        return Err("agent group targets must not be empty".to_owned());
+    }
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(targets.len());
+    for target in targets {
+        validate_annotation_target(&target)?;
+        if seen.insert(target.clone()) {
+            normalized.push(target);
+        }
+    }
+    Ok(normalized)
+}
+
 fn canonicalize_annotation_targets<F>(
     state: &mut StoreState,
     mut canonicalize_target: F,
@@ -961,6 +1130,17 @@ where
         }
     }
     state.pins.pinned = pinned;
+
+    let mut group_assignments = Vec::new();
+    for assignment in std::mem::take(&mut state.groups.assignments) {
+        if let Some(target) = canonicalize_target(assignment.target)? {
+            group_assignments.push(AgentGroupAssignment {
+                group_id: assignment.group_id,
+                target,
+            });
+        }
+    }
+    state.groups.assignments = group_assignments_with_single_membership(group_assignments);
     Ok(())
 }
 
@@ -996,7 +1176,46 @@ fn replace_annotation_target_in_state(
         state.pins.pinned.retain(|target| target != from);
         changed |= state.pins.pinned.len() != before;
     }
+
+    if let Some(replacement) = to {
+        state
+            .groups
+            .assignments
+            .retain(|assignment| &assignment.target == from || assignment.target != *replacement);
+    }
+    for assignment in &mut state.groups.assignments {
+        if &assignment.target == from {
+            if let Some(replacement) = to {
+                assignment.target = replacement.clone();
+            }
+            changed = true;
+        }
+    }
+    if to.is_none() {
+        let before = state.groups.assignments.len();
+        state
+            .groups
+            .assignments
+            .retain(|assignment| &assignment.target != from);
+        changed |= state.groups.assignments.len() != before;
+    }
+    prune_empty_groups(state);
     changed
+}
+
+fn group_assignments_with_single_membership(
+    assignments: Vec<AgentGroupAssignment>,
+) -> Vec<AgentGroupAssignment> {
+    let mut by_target = HashMap::<AgentAnnotationTarget, AgentGroupId>::new();
+    for assignment in assignments {
+        by_target.insert(assignment.target, assignment.group_id);
+    }
+    let mut assignments = by_target
+        .into_iter()
+        .map(|(target, group_id)| AgentGroupAssignment { group_id, target })
+        .collect::<Vec<_>>();
+    assignments.sort_by(|left, right| compare_annotation_targets(&left.target, &right.target));
+    assignments
 }
 
 fn validate_annotation_target(target: &AgentAnnotationTarget) -> Result<(), String> {
@@ -1405,6 +1624,108 @@ fn unknown_manual_tag_message(id: &AgentManualTagId) -> String {
     format!("unknown manual tag id {}", id.0)
 }
 
+fn normalize_group_name(name: String) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("agent group name must not be empty".to_owned());
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn next_agent_group_id(name: &str, groups: &[AgentGroup]) -> AgentGroupId {
+    let base = sanitize_agent_group_id(name);
+    let existing = groups
+        .iter()
+        .map(|group| group.id.clone())
+        .collect::<HashSet<_>>();
+    if !existing.contains(&AgentGroupId(base.clone())) {
+        return AgentGroupId(base);
+    }
+    let mut suffix = 2_u64;
+    loop {
+        let candidate = AgentGroupId(format!("{base}-{suffix}"));
+        if !existing.contains(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn sanitize_agent_group_id(value: &str) -> String {
+    let mut output = String::new();
+    let mut last_was_dash = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !output.is_empty() && !last_was_dash {
+            output.push('-');
+            last_was_dash = true;
+        }
+    }
+    while output.ends_with('-') {
+        output.pop();
+    }
+    if output.is_empty() {
+        "group".to_owned()
+    } else {
+        output
+    }
+}
+
+fn validate_agent_group_id(id: &AgentGroupId) -> Result<(), String> {
+    ensure_non_empty("agent group id", id.0.as_str())?;
+    let sanitized = sanitize_agent_group_id(&id.0);
+    if id.0 != sanitized {
+        return Err(format!(
+            "agent group id {} must be sanitized as {}",
+            id.0, sanitized
+        ));
+    }
+    Ok(())
+}
+
+fn agent_group_position(groups: &[AgentGroup], id: &AgentGroupId) -> Option<usize> {
+    groups.iter().position(|group| &group.id == id)
+}
+
+fn find_agent_group_mut<'a>(
+    groups: &'a mut [AgentGroup],
+    id: &AgentGroupId,
+) -> Result<&'a mut AgentGroup, String> {
+    groups
+        .iter_mut()
+        .find(|group| &group.id == id)
+        .ok_or_else(|| unknown_agent_group_message(id))
+}
+
+fn ensure_agent_group_exists(groups: &[AgentGroup], id: &AgentGroupId) -> Result<(), String> {
+    if agent_group_position(groups, id).is_some() {
+        Ok(())
+    } else {
+        Err(unknown_agent_group_message(id))
+    }
+}
+
+fn unknown_agent_group_message(id: &AgentGroupId) -> String {
+    format!("unknown agent group id {}", id.0)
+}
+
+fn prune_empty_groups(state: &mut StoreState) {
+    state.groups.assignments =
+        group_assignments_with_single_membership(std::mem::take(&mut state.groups.assignments));
+    let non_empty_group_ids = state
+        .groups
+        .assignments
+        .iter()
+        .map(|assignment| assignment.group_id.clone())
+        .collect::<HashSet<_>>();
+    state
+        .groups
+        .groups
+        .retain(|group| non_empty_group_ids.contains(&group.id));
+}
+
 fn ensure_non_empty(field: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("{field} must not be empty"));
@@ -1444,6 +1765,8 @@ mod tests {
         assert!(snapshot.tags.manual.is_empty());
         assert!(snapshot.tags.manual_assignments.is_empty());
         assert!(snapshot.pins.pinned.is_empty());
+        assert!(snapshot.groups.groups.is_empty());
+        assert!(snapshot.groups.assignments.is_empty());
     }
 
     #[test]
@@ -1471,7 +1794,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(path)
                 .expect("read rewritten store")
-                .contains("\"version\": 3")
+                .contains("\"version\": 4")
         );
     }
 
@@ -1537,5 +1860,7 @@ mod tests {
         assert!(snapshot.tags.manual.is_empty());
         assert!(snapshot.tags.manual_assignments.is_empty());
         assert!(snapshot.pins.pinned.is_empty());
+        assert!(snapshot.groups.groups.is_empty());
+        assert!(snapshot.groups.assignments.is_empty());
     }
 }

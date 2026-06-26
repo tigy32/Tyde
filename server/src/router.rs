@@ -19,8 +19,8 @@ use protocol::{
     ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload,
     ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
     ReviewActionPayload, ReviewCreatePayload, ReviewId, ReviewSubscribePayload,
-    RunBackendSetupPayload, SendMessagePayload, SendQueuedMessageNowPayload, SetAgentNamePayload,
-    SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
+    RunBackendSetupPayload, SendMessagePayload, SendQueuedMessageNowPayload, SetAgentGroupsPayload,
+    SetAgentNamePayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
     SetAgentsViewPreferencesPayload, SetSessionSettingsPayload, SetSettingPayload,
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
     SteeringUpsertPayload, StreamPath, TeamCompactPayload, TeamCreatePayload, TeamDeletePayload,
@@ -69,6 +69,10 @@ pub(crate) async fn route_client_envelope(
             FrameKind::SetAgentPins => {
                 let payload: SetAgentPinsPayload = parse_payload(&envelope, "set_agent_pins")?;
                 host.set_agent_pins(payload).await?;
+            }
+            FrameKind::SetAgentGroups => {
+                let payload: SetAgentGroupsPayload = parse_payload(&envelope, "set_agent_groups")?;
+                host.set_agent_groups(payload).await?;
             }
             FrameKind::MobilePairingStart => {
                 let _: MobilePairingStartPayload =

@@ -13,14 +13,14 @@ use protocol::types::{
 };
 use protocol::{
     AgentActivitySummary, AgentActivitySummaryPayload, AgentActivitySummaryStaleReason,
-    AgentActivitySummaryState, AgentAnnotationTarget, AgentControlStatus, AgentId, AgentInput,
-    AgentOrderKey, AgentOrigin, AgentPinsUpdate, AgentStartPayload, AgentSystemTagAssignment,
-    AgentSystemTagDescriptor, AgentSystemTagId, AgentTagsSnapshot, AgentTagsUpdate,
-    AgentWorkflowMetadata, AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesSnapshot,
-    AgentsViewPreferencesUpdate, BackendKind, BackendSetupPayload, BrowseBootstrapListing,
-    BrowseBootstrapPayload, CancelWorkflowPayload, CodeIntelCancelReferencesPayload,
-    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
-    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
+    AgentActivitySummaryState, AgentAnnotationTarget, AgentControlStatus, AgentGroupsUpdate,
+    AgentId, AgentInput, AgentOrderKey, AgentOrigin, AgentPinsUpdate, AgentStartPayload,
+    AgentSystemTagAssignment, AgentSystemTagDescriptor, AgentSystemTagId, AgentTagsSnapshot,
+    AgentTagsUpdate, AgentWorkflowMetadata, AgentsViewPreferencesNotifyPayload,
+    AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate, BackendKind, BackendSetupPayload,
+    BrowseBootstrapListing, BrowseBootstrapPayload, CancelWorkflowPayload,
+    CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
+    CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, GitBranchName, HostAbsPath,
     HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
@@ -37,25 +37,25 @@ use protocol::{
     ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
     ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
     SessionHistoryPayload, SessionId, SessionListPayload, SessionSchemaEntry,
-    SessionSchemasPayload, SessionSettingsSchema, SessionSummary, SetAgentPinsPayload,
-    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
-    SetSettingPayload, Skill, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringScope,
-    SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
-    TeamDraftUpdatePayload, TeamId, TeamMember, TeamMemberBindingNotifyPayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload,
-    TeamMemberRole, TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload,
-    TeamMemberState, TeamMemberUpdatePayload, TeamNotifyPayload, TeamRenamePayload,
-    TeamSetManagerPayload, TerminalCreatePayload, TerminalId, TerminalLaunchTarget,
-    TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload, WorkbenchCreatePayload,
-    WorkbenchRemovePayload, WorkbenchRoot, WorkflowCatalogLocation, WorkflowDiagnostic,
-    WorkflowDiagnosticSeverity, WorkflowInputControl, WorkflowInputSpec, WorkflowNotifyPayload,
-    WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus,
-    WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse, WorkflowSaveTarget,
-    WorkflowSource, WorkflowSourceScope, WorkflowStepRunId, WorkflowStepRunSnapshot,
-    WorkflowTargetDirectory, WorkflowTargetsResponse,
+    SessionSchemasPayload, SessionSettingsSchema, SessionSummary, SetAgentGroupsPayload,
+    SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
+    SetAgentsViewPreferencesPayload, SetSettingPayload, Skill, SkillNotifyPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TeamCreatePayload,
+    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
+    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
+    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId,
+    TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
+    TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
+    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowCatalogLocation,
+    WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowInputControl, WorkflowInputSpec,
+    WorkflowNotifyPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
+    WorkflowRunSnapshotStatus, WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse,
+    WorkflowSaveTarget, WorkflowSource, WorkflowSourceScope, WorkflowStepRunId,
+    WorkflowStepRunSnapshot, WorkflowTargetDirectory, WorkflowTargetsResponse,
 };
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -4630,6 +4630,28 @@ impl HostHandle {
             .lock()
             .await
             .apply_pins(update, |target| resolver.canonicalize(target))
+            .map_err(|error| AppError::invalid(OPERATION, error))?;
+        complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
+        fan_out_agents_view_preferences(&mut state, snapshot).await;
+        Ok(())
+    }
+
+    pub(crate) async fn set_agent_groups(&self, payload: SetAgentGroupsPayload) -> AppResult<()> {
+        const OPERATION: &str = "set_agent_groups";
+        let mut state = self.state.lock().await;
+        let Some(store) = state.agents_view_preferences_store.clone() else {
+            return Err(AppError::invalid(
+                OPERATION,
+                "agents view preferences are owned by the primary local host",
+            ));
+        };
+        let resolver = AnnotationTargetResolver::new(&state);
+        let update = canonicalize_agent_groups_update(payload.update, &resolver)
+            .map_err(|error| AppError::invalid(OPERATION, error))?;
+        let mut snapshot = store
+            .lock()
+            .await
+            .apply_groups(update, |target| resolver.canonicalize(target))
             .map_err(|error| AppError::invalid(OPERATION, error))?;
         complete_agents_view_preferences_snapshot(&state, &mut snapshot).await;
         fan_out_agents_view_preferences(&mut state, snapshot).await;
@@ -10110,21 +10132,41 @@ fn percent_encode_query_component(value: &str) -> String {
 
 struct AnnotationTargetResolver {
     live_sessions: HashMap<AgentId, Option<SessionId>>,
+    agent_by_session: HashMap<SessionId, AgentId>,
+    children_by_parent: HashMap<AgentId, Vec<AgentId>>,
 }
 
 impl AnnotationTargetResolver {
     fn new(state: &HostState) -> Self {
         let mut live_sessions = HashMap::new();
+        let mut agent_by_session = HashMap::new();
+        let mut children_by_parent = HashMap::<AgentId, Vec<AgentId>>::new();
         for agent_id in state.registry.agent_ids() {
-            let session_id = state.agent_sessions.get(&agent_id).cloned().or_else(|| {
-                state
-                    .registry
-                    .agent_handle(&agent_id)
-                    .and_then(|agent| agent.snapshot().session_id)
-            });
+            let snapshot = state
+                .registry
+                .agent_handle(&agent_id)
+                .map(|agent| agent.snapshot());
+            let session_id = state
+                .agent_sessions
+                .get(&agent_id)
+                .cloned()
+                .or_else(|| snapshot.as_ref().and_then(|start| start.session_id.clone()));
+            if let Some(session_id) = session_id.clone() {
+                agent_by_session.insert(session_id, agent_id.clone());
+            }
+            if let Some(parent_agent_id) = snapshot.and_then(|start| start.parent_agent_id) {
+                children_by_parent
+                    .entry(parent_agent_id)
+                    .or_default()
+                    .push(agent_id.clone());
+            }
             live_sessions.insert(agent_id, session_id);
         }
-        Self { live_sessions }
+        Self {
+            live_sessions,
+            agent_by_session,
+            children_by_parent,
+        }
     }
 
     fn canonicalize(
@@ -10177,6 +10219,105 @@ impl AnnotationTargetResolver {
             }
         }
     }
+
+    fn expand_parent_targets(
+        &self,
+        targets: Vec<AgentAnnotationTarget>,
+    ) -> Vec<AgentAnnotationTarget> {
+        let mut expanded = Vec::new();
+        let mut seen = HashSet::new();
+        for target in targets {
+            let host_id = match &target {
+                AgentAnnotationTarget::Session { host_id, .. }
+                | AgentAnnotationTarget::TransientAgent { host_id, .. } => host_id.clone(),
+            };
+            let parent_agent_id = self.agent_id_for_target(&target);
+            push_unique_annotation_target(&mut expanded, &mut seen, target);
+            if host_id.0 != LOCAL_HOST_ID {
+                continue;
+            }
+            if let Some(parent_agent_id) = parent_agent_id {
+                let mut visited = HashSet::new();
+                visited.insert(parent_agent_id.clone());
+                self.push_descendant_targets(
+                    &host_id,
+                    &parent_agent_id,
+                    &mut expanded,
+                    &mut seen,
+                    &mut visited,
+                );
+            }
+        }
+        expanded
+    }
+
+    fn push_descendant_targets(
+        &self,
+        host_id: &HostFilterId,
+        parent_agent_id: &AgentId,
+        expanded: &mut Vec<AgentAnnotationTarget>,
+        seen: &mut HashSet<AgentAnnotationTarget>,
+        visited: &mut HashSet<AgentId>,
+    ) {
+        let Some(children) = self.children_by_parent.get(parent_agent_id) else {
+            return;
+        };
+        for child_id in children {
+            if !visited.insert(child_id.clone()) {
+                continue;
+            }
+            push_unique_annotation_target(
+                expanded,
+                seen,
+                self.target_for_agent_id(host_id, child_id),
+            );
+            self.push_descendant_targets(host_id, child_id, expanded, seen, visited);
+        }
+    }
+
+    fn agent_id_for_target(&self, target: &AgentAnnotationTarget) -> Option<AgentId> {
+        match target {
+            AgentAnnotationTarget::TransientAgent { host_id, agent_id }
+                if host_id.0 == LOCAL_HOST_ID =>
+            {
+                self.live_sessions
+                    .contains_key(agent_id)
+                    .then(|| agent_id.clone())
+            }
+            AgentAnnotationTarget::Session {
+                host_id,
+                session_id,
+            } if host_id.0 == LOCAL_HOST_ID => self.agent_by_session.get(session_id).cloned(),
+            _ => None,
+        }
+    }
+
+    fn target_for_agent_id(
+        &self,
+        host_id: &HostFilterId,
+        agent_id: &AgentId,
+    ) -> AgentAnnotationTarget {
+        match self.live_sessions.get(agent_id).and_then(Clone::clone) {
+            Some(session_id) => AgentAnnotationTarget::Session {
+                host_id: host_id.clone(),
+                session_id,
+            },
+            None => AgentAnnotationTarget::TransientAgent {
+                host_id: host_id.clone(),
+                agent_id: agent_id.clone(),
+            },
+        }
+    }
+}
+
+fn push_unique_annotation_target(
+    targets: &mut Vec<AgentAnnotationTarget>,
+    seen: &mut HashSet<AgentAnnotationTarget>,
+    target: AgentAnnotationTarget,
+) {
+    if seen.insert(target.clone()) {
+        targets.push(target);
+    }
 }
 
 fn ensure_non_empty_annotation_field(field: &str, value: &str) -> Result<(), String> {
@@ -10220,6 +10361,43 @@ fn canonicalize_agent_pins_update(
             let target = resolver.canonicalize(target)?.unwrap_or(original);
             Ok(AgentPinsUpdate::Unpin { target })
         }
+    }
+}
+
+fn canonicalize_agent_groups_update(
+    update: AgentGroupsUpdate,
+    resolver: &AnnotationTargetResolver,
+) -> Result<AgentGroupsUpdate, String> {
+    match update {
+        AgentGroupsUpdate::CreateGroup { name, targets } => Ok(AgentGroupsUpdate::CreateGroup {
+            name,
+            targets: resolver
+                .expand_parent_targets(targets)
+                .into_iter()
+                .map(|target| {
+                    let original = target.clone();
+                    resolver
+                        .canonicalize(target)
+                        .map(|target| target.unwrap_or(original))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        AgentGroupsUpdate::MoveTargets { group_id, targets } => {
+            Ok(AgentGroupsUpdate::MoveTargets {
+                group_id,
+                targets: resolver
+                    .expand_parent_targets(targets)
+                    .into_iter()
+                    .map(|target| {
+                        let original = target.clone();
+                        resolver
+                            .canonicalize(target)
+                            .map(|target| target.unwrap_or(original))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        }
+        other => Ok(other),
     }
 }
 

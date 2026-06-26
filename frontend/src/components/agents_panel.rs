@@ -1,9 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
-use protocol::{AgentId, FrameKind, ProjectId, SetAgentNamePayload};
+use protocol::{
+    AgentAnnotationTarget, AgentGroup, AgentGroupId, AgentGroupsSnapshot, AgentGroupsUpdate,
+    AgentId, FrameKind, HostFilterId, ProjectId, SetAgentNamePayload,
+};
 
 use crate::send::{close_agent, compact_agent, send_frame};
 use crate::state::{
@@ -167,6 +171,43 @@ struct AgentHostSection {
     projects: Vec<AgentProjectSection>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct AgentCustomGroupSection {
+    group: AgentGroup,
+    groups: Vec<AgentTreeGroup>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AgentSidebarProjection {
+    custom_groups: Vec<AgentCustomGroupSection>,
+    default_hosts: Vec<AgentHostSection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SidebarAgentRef {
+    host_id: String,
+    agent_id: AgentId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SidebarKeyboardTarget {
+    Agent(SidebarAgentRef),
+    Group(AgentGroupId),
+    Ungroup,
+}
+
+#[derive(Clone)]
+struct AgentsPanelInteractions {
+    editing_agent: RwSignal<Option<protocol::AgentId>>,
+    edit_value: RwSignal<String>,
+    collapsed_parents: RwSignal<HashSet<AgentId>>,
+    dragged_agent: RwSignal<Option<SidebarAgentRef>>,
+    keyboard_agent: RwSignal<Option<SidebarAgentRef>>,
+    keyboard_target: RwSignal<Option<SidebarKeyboardTarget>>,
+    pending_rename_group_name: RwSignal<Option<String>>,
+    group_live_status: RwSignal<String>,
+}
+
 fn host_label(host_labels: &HashMap<String, String>, host_id: &str) -> String {
     host_labels
         .get(host_id)
@@ -325,6 +366,340 @@ fn build_sidebar_sections(
         .collect()
 }
 
+fn agent_annotation_target(agent: &AgentInfo) -> AgentAnnotationTarget {
+    let host_id = HostFilterId(agent.host_id.clone());
+    match agent.session_id.clone() {
+        Some(session_id) => AgentAnnotationTarget::Session {
+            host_id,
+            session_id,
+        },
+        None => AgentAnnotationTarget::TransientAgent {
+            host_id,
+            agent_id: agent.agent_id.clone(),
+        },
+    }
+}
+
+fn agent_ref(agent: &AgentInfo) -> SidebarAgentRef {
+    SidebarAgentRef {
+        host_id: agent.host_id.clone(),
+        agent_id: agent.agent_id.clone(),
+    }
+}
+
+fn build_sidebar_projection(
+    agents: Vec<AgentInfo>,
+    configured_hosts: Vec<crate::bridge::ConfiguredHost>,
+    projects: Vec<ProjectInfo>,
+    groups_snapshot: AgentGroupsSnapshot,
+) -> AgentSidebarProjection {
+    let known_groups = groups_snapshot
+        .groups
+        .iter()
+        .map(|group| group.id.clone())
+        .collect::<HashSet<_>>();
+    let assignments = groups_snapshot
+        .assignments
+        .into_iter()
+        .filter(|assignment| known_groups.contains(&assignment.group_id))
+        .map(|assignment| (assignment.target, assignment.group_id))
+        .collect::<HashMap<_, _>>();
+
+    let mut grouped_agents = HashMap::<AgentGroupId, Vec<AgentInfo>>::new();
+    let mut ungrouped_agents = Vec::new();
+    for agent in agents {
+        let target = agent_annotation_target(&agent);
+        if let Some(group_id) = assignments.get(&target) {
+            grouped_agents
+                .entry(group_id.clone())
+                .or_default()
+                .push(agent);
+        } else {
+            ungrouped_agents.push(agent);
+        }
+    }
+
+    let custom_groups = groups_snapshot
+        .groups
+        .into_iter()
+        .filter_map(|group| {
+            let agents = grouped_agents.remove(&group.id)?;
+            let groups = build_parent_child_groups(agents);
+            (!groups.is_empty()).then_some(AgentCustomGroupSection { group, groups })
+        })
+        .collect();
+
+    AgentSidebarProjection {
+        custom_groups,
+        default_hosts: build_sidebar_sections(ungrouped_agents, configured_hosts, projects),
+    }
+}
+
+fn agent_for_ref(state: &AppState, agent_ref: &SidebarAgentRef) -> Option<AgentInfo> {
+    state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .find(|agent| {
+                agent.host_id == agent_ref.host_id && agent.agent_id == agent_ref.agent_id
+            })
+            .cloned()
+    })
+}
+
+fn target_for_ref(state: &AppState, agent_ref: &SidebarAgentRef) -> Option<AgentAnnotationTarget> {
+    agent_for_ref(state, agent_ref).map(|agent| agent_annotation_target(&agent))
+}
+
+fn group_id_for_agent(state: &AppState, agent: &AgentInfo) -> Option<AgentGroupId> {
+    let target = agent_annotation_target(agent);
+    state
+        .agents_view_preferences
+        .get_untracked()
+        .groups
+        .assignments
+        .into_iter()
+        .find(|assignment| assignment.target == target)
+        .map(|assignment| assignment.group_id)
+}
+
+fn auto_group_name(state: &AppState, dragged: &AgentInfo, target: &AgentInfo) -> String {
+    let base = format!("{} + {}", dragged.name, target.name);
+    let existing = state
+        .agents_view_preferences
+        .get_untracked()
+        .groups
+        .groups
+        .into_iter()
+        .map(|group| group.name)
+        .collect::<HashSet<_>>();
+    if !existing.contains(&base) {
+        return base;
+    }
+    let mut suffix = 2_u64;
+    loop {
+        let candidate = format!("{base} {suffix}");
+        if !existing.contains(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn send_groups_update(state: &AppState, update: AgentGroupsUpdate) {
+    let Some(host_id) = state.agents_view_preferences_host.get_untracked() else {
+        log::error!("cannot send agent group update before primary preferences host is known");
+        return;
+    };
+    let Some(stream) = state.host_stream_untracked(&host_id) else {
+        log::error!("cannot send agent group update without host stream for {host_id}");
+        return;
+    };
+    spawn_local(async move {
+        if let Err(error) = crate::send::set_agent_groups(&host_id, stream, update).await {
+            log::error!("failed to send SetAgentGroups: {error}");
+        }
+    });
+}
+
+fn drop_agent_on_group(
+    state: &AppState,
+    dragged: Option<SidebarAgentRef>,
+    group_id: AgentGroupId,
+    live_status: RwSignal<String>,
+) {
+    let Some(dragged) = dragged else {
+        return;
+    };
+    let Some(target) = target_for_ref(state, &dragged) else {
+        live_status.set("Agent is no longer available to move".to_owned());
+        return;
+    };
+    send_groups_update(
+        state,
+        AgentGroupsUpdate::MoveTargets {
+            group_id: Some(group_id),
+            targets: vec![target],
+        },
+    );
+    live_status.set("Moving agent to group".to_owned());
+}
+
+fn drop_agent_on_ungroup(
+    state: &AppState,
+    dragged: Option<SidebarAgentRef>,
+    live_status: RwSignal<String>,
+) {
+    let Some(dragged) = dragged else {
+        return;
+    };
+    let Some(target) = target_for_ref(state, &dragged) else {
+        live_status.set("Agent is no longer available to ungroup".to_owned());
+        return;
+    };
+    send_groups_update(
+        state,
+        AgentGroupsUpdate::MoveTargets {
+            group_id: None,
+            targets: vec![target],
+        },
+    );
+    live_status.set("Removing agent from its custom group".to_owned());
+}
+
+fn drop_agent_on_agent(
+    state: &AppState,
+    dragged: Option<SidebarAgentRef>,
+    target_agent: AgentInfo,
+    pending_rename_group_name: RwSignal<Option<String>>,
+    live_status: RwSignal<String>,
+) {
+    let Some(dragged_ref) = dragged else {
+        return;
+    };
+    let target_ref = agent_ref(&target_agent);
+    if dragged_ref == target_ref {
+        live_status.set("Move cancelled".to_owned());
+        return;
+    }
+    let Some(dragged_agent) = agent_for_ref(state, &dragged_ref) else {
+        live_status.set("Agent is no longer available to move".to_owned());
+        return;
+    };
+    let Some(dragged_target) = target_for_ref(state, &dragged_ref) else {
+        live_status.set("Agent is no longer available to move".to_owned());
+        return;
+    };
+    if let Some(group_id) = group_id_for_agent(state, &target_agent) {
+        send_groups_update(
+            state,
+            AgentGroupsUpdate::MoveTargets {
+                group_id: Some(group_id),
+                targets: vec![dragged_target],
+            },
+        );
+        live_status.set("Moving agent to group".to_owned());
+    } else {
+        let group_name = auto_group_name(state, &dragged_agent, &target_agent);
+        pending_rename_group_name.set(Some(group_name.clone()));
+        send_groups_update(
+            state,
+            AgentGroupsUpdate::CreateGroup {
+                name: group_name,
+                targets: vec![dragged_target, agent_annotation_target(&target_agent)],
+            },
+        );
+        live_status.set("Creating custom group".to_owned());
+    }
+}
+
+fn focus_relative_drop_target(current: &web_sys::EventTarget, offset: i32) {
+    let Some(current_element) = current.dyn_ref::<web_sys::Element>() else {
+        return;
+    };
+    let Some(document) = current_element.owner_document() else {
+        return;
+    };
+    let Ok(nodes) = document.query_selector_all("[data-agent-group-keyboard-target='true']") else {
+        return;
+    };
+    let len = nodes.length();
+    if len == 0 {
+        return;
+    }
+    let mut current_index = None;
+    for index in 0..len {
+        if let Some(node) = nodes.get(index)
+            && let Ok(element) = node.dyn_into::<web_sys::Element>()
+            && element.is_same_node(Some(current_element))
+        {
+            current_index = Some(index);
+            break;
+        }
+    }
+    let Some(current_index) = current_index else {
+        return;
+    };
+    let next_index = if offset < 0 {
+        current_index.checked_sub(1).unwrap_or(len - 1)
+    } else {
+        (current_index + 1) % len
+    };
+    if let Some(node) = nodes.get(next_index)
+        && let Ok(element) = node.dyn_into::<web_sys::HtmlElement>()
+    {
+        let _ = element.focus();
+    }
+}
+
+fn render_ungroup_drop_target(
+    state: AppState,
+    dragged_agent: RwSignal<Option<SidebarAgentRef>>,
+    keyboard_agent: RwSignal<Option<SidebarAgentRef>>,
+    keyboard_target: RwSignal<Option<SidebarKeyboardTarget>>,
+    group_live_status: RwSignal<String>,
+) -> impl IntoView {
+    let ungroup_drag_state = state.clone();
+    let ungroup_keyboard_state = state;
+    let ungroup_on_dragover = move |ev: web_sys::DragEvent| {
+        ev.prevent_default();
+    };
+    let ungroup_on_drop = move |ev: web_sys::DragEvent| {
+        ev.prevent_default();
+        ev.stop_propagation();
+        drop_agent_on_ungroup(
+            &ungroup_drag_state,
+            dragged_agent.get_untracked(),
+            group_live_status,
+        );
+        dragged_agent.set(None);
+    };
+    let ungroup_on_keydown = move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
+        " " | "Enter" => {
+            if let Some(agent) = keyboard_agent.get_untracked() {
+                ev.prevent_default();
+                drop_agent_on_ungroup(&ungroup_keyboard_state, Some(agent), group_live_status);
+                keyboard_agent.set(None);
+                keyboard_target.set(None);
+            }
+        }
+        "Escape" => {
+            keyboard_agent.set(None);
+            keyboard_target.set(None);
+            group_live_status.set("Move cancelled".to_owned());
+        }
+        "ArrowDown" | "ArrowRight" => {
+            ev.prevent_default();
+            focus_relative_drop_target(&ev.target().expect("keydown target"), 1);
+        }
+        "ArrowUp" | "ArrowLeft" => {
+            ev.prevent_default();
+            focus_relative_drop_target(&ev.target().expect("keydown target"), -1);
+        }
+        _ => {}
+    };
+
+    view! {
+        <div
+            class=move || if keyboard_agent.get().is_some() {
+                "agent-ungroup-drop-target agent-group-keyboard-active"
+            } else {
+                "agent-ungroup-drop-target"
+            }
+            tabindex="0"
+            role="button"
+            data-agent-group-keyboard-target="true"
+            aria-label="Ungroup selected agent"
+            aria-dropeffect=move || if keyboard_agent.get().is_some() { "move" } else { "none" }
+            on:focus=move |_| keyboard_target.set(Some(SidebarKeyboardTarget::Ungroup))
+            on:dragover=ungroup_on_dragover
+            on:drop=ungroup_on_drop
+            on:keydown=ungroup_on_keydown
+        >
+            "Ungroup"
+        </div>
+    }
+}
+
 #[component]
 pub fn AgentsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -335,6 +710,41 @@ pub fn AgentsPanel() -> impl IntoView {
     // streaming / turn-active updates. Only one agent can be renamed at a time.
     let editing_agent: RwSignal<Option<protocol::AgentId>> = RwSignal::new(None);
     let edit_value: RwSignal<String> = RwSignal::new(String::new());
+    let editing_group: RwSignal<Option<AgentGroupId>> = RwSignal::new(None);
+    let group_edit_value: RwSignal<String> = RwSignal::new(String::new());
+    let dragged_agent: RwSignal<Option<SidebarAgentRef>> = RwSignal::new(None);
+    let drag_hover_group: RwSignal<Option<AgentGroupId>> = RwSignal::new(None);
+    let keyboard_agent: RwSignal<Option<SidebarAgentRef>> = RwSignal::new(None);
+    let keyboard_target: RwSignal<Option<SidebarKeyboardTarget>> = RwSignal::new(None);
+    let pending_rename_group_name: RwSignal<Option<String>> = RwSignal::new(None);
+    let group_live_status: RwSignal<String> = RwSignal::new(String::new());
+    let interactions = AgentsPanelInteractions {
+        editing_agent,
+        edit_value,
+        collapsed_parents,
+        dragged_agent,
+        keyboard_agent,
+        keyboard_target,
+        pending_rename_group_name,
+        group_live_status,
+    };
+
+    let pending_rename_state = state.clone();
+    Effect::new(move |_| {
+        let Some(name) = pending_rename_group_name.get() else {
+            return;
+        };
+        let snapshot = pending_rename_state.agents_view_preferences.get().groups;
+        if let Some(group) = snapshot.groups.iter().find(|group| group.name == name) {
+            editing_group.set(Some(group.id.clone()));
+            group_edit_value.set(group.name.clone());
+            pending_rename_group_name.set(None);
+            group_live_status.set(format!(
+                "Created group {}; rename field is focused",
+                group.name
+            ));
+        }
+    });
 
     // Sidebar-only view toggles (hide sub-agents / inactive / other projects)
     // are ephemeral interaction state, like the search box — they have no
@@ -402,11 +812,12 @@ pub fn AgentsPanel() -> impl IntoView {
     });
 
     let section_state = state.clone();
-    let sections = Memo::new(move |_| {
-        build_sidebar_sections(
+    let projection = Memo::new(move |_| {
+        build_sidebar_projection(
             filtered_agents.get(),
             section_state.configured_hosts.get(),
             section_state.projects.get(),
+            section_state.agents_view_preferences.get().groups,
         )
     });
 
@@ -470,15 +881,280 @@ pub fn AgentsPanel() -> impl IntoView {
             </div>
             <div class="panel-content">
                 {move || {
-                    let sections = sections.get();
-                    if sections.is_empty() {
+                    let projection = projection.get();
+                    if projection.custom_groups.is_empty() && projection.default_hosts.is_empty() {
                         view! {
                             <div class="panel-empty">"No agents yet"</div>
                         }.into_any()
                     } else {
+                        let default_drop_state = state.clone();
+                        let custom_groups = projection.custom_groups;
+                        let has_custom_groups = !custom_groups.is_empty();
+                        let ungroup_target_state = state.clone();
+                        let default_hosts = projection.default_hosts;
+                        let custom_groups_view = if custom_groups.is_empty() {
+                            ().into_any()
+                        } else {
+                            view! {
+                                    <section class="agent-sidebar-custom-groups-section">
+                                        <div class="agent-sidebar-groups-heading">"Groups"</div>
+                                        {custom_groups.into_iter().map(|custom_group| {
+                                            let group_id = custom_group.group.id.clone();
+                                            let group_id_attr = group_id.0.clone();
+                                            let group_name = custom_group.group.name.clone();
+                                            let section_group_id = group_id.clone();
+                                            let header_group_id = group_id.clone();
+                                            let hover_class_group_id = group_id.clone();
+                                            let hover_enter_group_id = group_id.clone();
+                                            let hover_leave_group_id = group_id.clone();
+                                            let drop_state = state.clone();
+                                            let drop_dragged = dragged_agent;
+                                            let drop_status = group_live_status;
+                                            let hover_on_drop = drag_hover_group;
+                                            let on_group_dragenter = move |ev: web_sys::DragEvent| {
+                                                ev.prevent_default();
+                                                drag_hover_group.set(Some(hover_enter_group_id.clone()));
+                                            };
+                                            let on_group_dragleave = move |ev: web_sys::DragEvent| {
+                                                ev.prevent_default();
+                                                if drag_hover_group.with_untracked(|current| current.as_ref() == Some(&hover_leave_group_id)) {
+                                                    drag_hover_group.set(None);
+                                                }
+                                            };
+                                            let on_group_dragover = move |ev: web_sys::DragEvent| {
+                                                ev.prevent_default();
+                                            };
+                                            let on_group_drop = move |ev: web_sys::DragEvent| {
+                                                ev.prevent_default();
+                                                ev.stop_propagation();
+                                                drop_agent_on_group(
+                                                    &drop_state,
+                                                    drop_dragged.get_untracked(),
+                                                    section_group_id.clone(),
+                                                    drop_status,
+                                                );
+                                                drop_dragged.set(None);
+                                                hover_on_drop.set(None);
+                                            };
+                                            let keyboard_state = state.clone();
+                                            let keyboard_group_id = group_id.clone();
+                                            let keyboard_status = group_live_status;
+                                            let on_group_keydown = move |ev: web_sys::KeyboardEvent| {
+                                                match ev.key().as_str() {
+                                                    " " | "Enter" => {
+                                                        if let Some(agent) = keyboard_agent.get_untracked() {
+                                                            ev.prevent_default();
+                                                            drop_agent_on_group(
+                                                                &keyboard_state,
+                                                                Some(agent),
+                                                                keyboard_group_id.clone(),
+                                                                keyboard_status,
+                                                            );
+                                                            keyboard_agent.set(None);
+                                                            keyboard_target.set(None);
+                                                        }
+                                                    }
+                                                    "Escape" => {
+                                                        keyboard_agent.set(None);
+                                                        keyboard_target.set(None);
+                                                        keyboard_status.set("Move cancelled".to_owned());
+                                                    }
+                                                    "ArrowDown" | "ArrowRight" => {
+                                                        ev.prevent_default();
+                                                        focus_relative_drop_target(&ev.target().expect("keydown target"), 1);
+                                                    }
+                                                    "ArrowUp" | "ArrowLeft" => {
+                                                        ev.prevent_default();
+                                                        focus_relative_drop_target(&ev.target().expect("keydown target"), -1);
+                                                    }
+                                                    _ => {}
+                                                }
+                                            };
+                                            let rename_group_id = group_id.clone();
+                                            let rename_group_name = group_name.clone();
+                                            let on_group_rename = move |ev: web_sys::MouseEvent| {
+                                                ev.stop_propagation();
+                                                group_edit_value.set(rename_group_name.clone());
+                                                editing_group.set(Some(rename_group_id.clone()));
+                                            };
+                                            let delete_state = state.clone();
+                                            let delete_group_id = group_id.clone();
+                                            let on_group_delete = move |ev: web_sys::MouseEvent| {
+                                                ev.stop_propagation();
+                                                send_groups_update(
+                                                    &delete_state,
+                                                    AgentGroupsUpdate::DeleteGroup {
+                                                        id: delete_group_id.clone(),
+                                                    },
+                                                );
+                                                group_live_status.set("Deleted group; members return to Host and Project".to_owned());
+                                            };
+                                            let edit_state_base = state.clone();
+                                            let edit_group_id_base = group_id.clone();
+                                            let edit_compare_name_base = group_name.clone();
+                                            let header_class_group_id = header_group_id.clone();
+                                            let header_focus_group_id = header_group_id.clone();
+                                            view! {
+                                                <section
+                                                    class=move || {
+                                                        if drag_hover_group.get().as_ref() == Some(&hover_class_group_id) {
+                                                            "agent-sidebar-custom-group agent-sidebar-custom-group-drag-over"
+                                                        } else {
+                                                            "agent-sidebar-custom-group"
+                                                        }
+                                                    }
+                                                    data-group-id=group_id_attr
+                                                    on:dragenter=on_group_dragenter
+                                                    on:dragleave=on_group_dragleave
+                                                    on:dragover=on_group_dragover
+                                                    on:drop=on_group_drop
+                                                >
+                                                    <div
+                                                        class=move || if keyboard_target.get().as_ref() == Some(&SidebarKeyboardTarget::Group(header_class_group_id.clone())) {
+                                                            "agent-sidebar-custom-group-header agent-group-keyboard-focus"
+                                                        } else {
+                                                            "agent-sidebar-custom-group-header"
+                                                        }
+                                                        tabindex="0"
+                                                        data-agent-group-keyboard-target="true"
+                                                        aria-dropeffect=move || if keyboard_agent.get().is_some() { "move" } else { "none" }
+                                                        on:focus=move |_| keyboard_target.set(Some(SidebarKeyboardTarget::Group(header_focus_group_id.clone())))
+                                                        on:keydown=on_group_keydown
+                                                    >
+                                                        {move || {
+                                                            if editing_group.with(|current| current.as_ref() == Some(&group_id)) {
+                                                                let keydown_state = edit_state_base.clone();
+                                                                let keydown_group_id = edit_group_id_base.clone();
+                                                                let keydown_compare_name = edit_compare_name_base.clone();
+                                                                let on_group_edit_keydown = move |ev: web_sys::KeyboardEvent| {
+                                                                    ev.stop_propagation();
+                                                                    match ev.key().as_str() {
+                                                                        "Enter" => {
+                                                                            let new_name = group_edit_value.get_untracked().trim().to_owned();
+                                                                            editing_group.set(None);
+                                                                            if !new_name.is_empty() && new_name != keydown_compare_name {
+                                                                                send_groups_update(
+                                                                                    &keydown_state,
+                                                                                    AgentGroupsUpdate::RenameGroup {
+                                                                                        id: keydown_group_id.clone(),
+                                                                                        name: new_name,
+                                                                                    },
+                                                                                );
+                                                                            }
+                                                                        }
+                                                                        "Escape" => editing_group.set(None),
+                                                                        _ => {}
+                                                                    }
+                                                                };
+                                                                let blur_state = edit_state_base.clone();
+                                                                let blur_group_id = edit_group_id_base.clone();
+                                                                let blur_compare_name = edit_compare_name_base.clone();
+                                                                let on_group_edit_blur = move |_: web_sys::FocusEvent| {
+                                                                    if editing_group.with_untracked(|current| current.as_ref() != Some(&blur_group_id)) {
+                                                                        return;
+                                                                    }
+                                                                    let new_name = group_edit_value.get_untracked().trim().to_owned();
+                                                                    editing_group.set(None);
+                                                                    if !new_name.is_empty() && new_name != blur_compare_name {
+                                                                        send_groups_update(
+                                                                            &blur_state,
+                                                                            AgentGroupsUpdate::RenameGroup {
+                                                                                id: blur_group_id.clone(),
+                                                                                name: new_name,
+                                                                            },
+                                                                        );
+                                                                    }
+                                                                };
+                                                                view! {
+                                                                    <input
+                                                                        type="text"
+                                                                        class="agent-sidebar-group-name-input"
+                                                                        prop:value=move || group_edit_value.get()
+                                                                        on:input=move |ev| group_edit_value.set(event_target_value(&ev))
+                                                                        on:keydown=on_group_edit_keydown
+                                                                        on:blur=on_group_edit_blur
+                                                                        autofocus=true
+                                                                        spellcheck="false"
+                                                                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                                                                        autocapitalize="none"
+                                                                        autocomplete="off"
+                                                                    />
+                                                                }.into_any()
+                                                            } else {
+                                                                view! {
+                                                                    <span class="agent-sidebar-custom-group-name">{group_name.clone()}</span>
+                                                                }.into_any()
+                                                            }
+                                                        }}
+                                                        <span class="agent-sidebar-custom-group-actions">
+                                                            <button
+                                                                type="button"
+                                                                class="filter-toggle agent-sidebar-group-rename"
+                                                                aria-label="Rename group"
+                                                                title="Rename group"
+                                                                on:click=on_group_rename
+                                                            >
+                                                                "\u{270E}"
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                class="filter-toggle agent-sidebar-group-delete"
+                                                                aria-label="Delete group"
+                                                                title="Delete group"
+                                                                on:click=on_group_delete
+                                                            >
+                                                                "\u{00D7}"
+                                                            </button>
+                                                        </span>
+                                                    </div>
+                                                    {custom_group.groups.into_iter().map(|group| {
+                                                        render_agent_tree_group(
+                                                            state.clone(),
+                                                            group,
+                                                            interactions.clone(),
+                                                        )
+                                                    }).collect_view()}
+                                                </section>
+                                            }
+                                        }).collect_view()}
+                                    </section>
+                                }.into_any()
+                        };
                         view! {
                             <div class="agent-card-list">
-                                {sections.into_iter().map(|host| {
+                                <div class="agent-group-live-status" aria-live="polite">
+                                    {move || group_live_status.get()}
+                                </div>
+                                {move || {
+                                    if has_custom_groups || keyboard_agent.get().is_some() {
+                                        render_ungroup_drop_target(
+                                            ungroup_target_state.clone(),
+                                            dragged_agent,
+                                            keyboard_agent,
+                                            keyboard_target,
+                                            group_live_status,
+                                        ).into_any()
+                                    } else {
+                                        ().into_any()
+                                    }
+                                }}
+                                {custom_groups_view}
+                                <div
+                                    class="agent-sidebar-default-tree"
+                                    on:dragover=move |ev: web_sys::DragEvent| {
+                                        ev.prevent_default();
+                                    }
+                                    on:drop=move |ev: web_sys::DragEvent| {
+                                        ev.prevent_default();
+                                        drop_agent_on_ungroup(
+                                            &default_drop_state,
+                                            dragged_agent.get_untracked(),
+                                            group_live_status,
+                                        );
+                                        dragged_agent.set(None);
+                                    }
+                                >
+                                {default_hosts.into_iter().map(|host| {
                                     view! {
                                         <section class="agent-sidebar-host-section" data-host-id=host.key>
                                             <div class="agent-sidebar-host-header">{format!("Host: {}", host.label)}</div>
@@ -487,34 +1163,11 @@ pub fn AgentsPanel() -> impl IntoView {
                                                     <section class="agent-sidebar-project-section" data-project-key=project.key>
                                                         <div class="agent-sidebar-project-header">{format!("Project: {}", project.label)}</div>
                                                         {project.groups.into_iter().map(|group| {
-                                                            let parent = group.parent;
-                                                            let children = group.children;
-                                                            let parent_id = parent.agent_id.clone();
-                                                            let group_id = parent_id.0.clone();
-                                                            let child_count = children.len();
-                                                            let parent_view = agent_card(state.clone(), parent, editing_agent, edit_value, child_count, collapsed_parents);
-                                                            let children_view = children.into_iter().map(|child| {
-                                                                let pid = parent_id.clone();
-                                                                view! {
-                                                                    <div
-                                                                        class=move || {
-                                                                            if collapsed_parents.with(|s| s.contains(&pid)) {
-                                                                                "agent-card-child agent-card-child-hidden"
-                                                                            } else {
-                                                                                "agent-card-child"
-                                                                            }
-                                                                        }
-                                                                    >
-                                                                        {agent_card(state.clone(), child, editing_agent, edit_value, 0, collapsed_parents)}
-                                                                    </div>
-                                                                }
-                                                            }).collect_view();
-                                                            view! {
-                                                                <div class="agent-card-group" data-agent-id=group_id>
-                                                                    {parent_view}
-                                                                    {children_view}
-                                                                </div>
-                                                            }
+                                                            render_agent_tree_group(
+                                                                state.clone(),
+                                                                group,
+                                                                interactions.clone(),
+                                                            )
                                                         }).collect_view()}
                                                     </section>
                                                 }
@@ -522,6 +1175,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                         </section>
                                     }
                                 }).collect_view()}
+                                </div>
                             </div>
                         }.into_any()
                     }
@@ -531,14 +1185,64 @@ pub fn AgentsPanel() -> impl IntoView {
     }
 }
 
+fn render_agent_tree_group(
+    state: AppState,
+    group: AgentTreeGroup,
+    interactions: AgentsPanelInteractions,
+) -> impl IntoView {
+    let parent = group.parent;
+    let children = group.children;
+    let parent_id = parent.agent_id.clone();
+    let group_id = parent_id.0.clone();
+    let child_count = children.len();
+    let collapsed_parents = interactions.collapsed_parents;
+    let parent_view = agent_card(state.clone(), parent, child_count, interactions.clone());
+    let children_view = children
+        .into_iter()
+        .map(|child| {
+            let pid = parent_id.clone();
+            view! {
+                <div
+                    class=move || {
+                        if collapsed_parents.with(|s| s.contains(&pid)) {
+                            "agent-card-child agent-card-child-hidden"
+                        } else {
+                            "agent-card-child"
+                        }
+                    }
+                >
+                    {agent_card(
+                        state.clone(),
+                        child,
+                        0,
+                        interactions.clone(),
+                    )}
+                </div>
+            }
+        })
+        .collect_view();
+    view! {
+        <div class="agent-card-group" data-agent-id=group_id>
+            {parent_view}
+            {children_view}
+        </div>
+    }
+}
+
 fn agent_card(
     state: AppState,
     agent: AgentInfo,
-    editing_agent: RwSignal<Option<protocol::AgentId>>,
-    edit_value: RwSignal<String>,
     child_count: usize,
-    collapsed_parents: RwSignal<HashSet<AgentId>>,
+    interactions: AgentsPanelInteractions,
 ) -> impl IntoView {
+    let editing_agent = interactions.editing_agent;
+    let edit_value = interactions.edit_value;
+    let collapsed_parents = interactions.collapsed_parents;
+    let dragged_agent = interactions.dragged_agent;
+    let keyboard_agent = interactions.keyboard_agent;
+    let keyboard_target = interactions.keyboard_target;
+    let pending_rename_group_name = interactions.pending_rename_group_name;
+    let group_live_status = interactions.group_live_status;
     let agent_id = agent.agent_id.clone();
     let name = agent.name.clone();
     let backend = agent.backend_kind;
@@ -604,6 +1308,101 @@ fn agent_card(
             );
         }
     };
+
+    let drag_ref = agent_ref(&agent);
+    let drag_name = name.clone();
+    let on_dragstart = {
+        let drag_ref = drag_ref.clone();
+        let drag_name = drag_name.clone();
+        move |ev: web_sys::DragEvent| {
+            dragged_agent.set(Some(drag_ref.clone()));
+            group_live_status.set(format!("Moving {drag_name}"));
+            if let Some(data_transfer) = ev.data_transfer() {
+                data_transfer.set_effect_allowed("move");
+                let _ = data_transfer.set_data("text/plain", &drag_ref.agent_id.0);
+            }
+        }
+    };
+    let on_dragover_agent = move |ev: web_sys::DragEvent| {
+        ev.prevent_default();
+        ev.stop_propagation();
+    };
+    let drop_state = state.clone();
+    let drop_agent = agent.clone();
+    let on_drop_agent = move |ev: web_sys::DragEvent| {
+        ev.prevent_default();
+        ev.stop_propagation();
+        drop_agent_on_agent(
+            &drop_state,
+            dragged_agent.get_untracked(),
+            drop_agent.clone(),
+            pending_rename_group_name,
+            group_live_status,
+        );
+        dragged_agent.set(None);
+    };
+    let on_dragend = move |_: web_sys::DragEvent| {
+        dragged_agent.set(None);
+    };
+
+    let move_handle_ref = drag_ref.clone();
+    let move_handle_name = name.clone();
+    let move_handle_state = state.clone();
+    let move_handle_agent = agent.clone();
+    let on_move_handle_keydown = move |ev: web_sys::KeyboardEvent| {
+        ev.stop_propagation();
+        match ev.key().as_str() {
+            " " | "Enter" => {
+                ev.prevent_default();
+                if let Some(picked) = keyboard_agent.get_untracked() {
+                    if picked == move_handle_ref {
+                        keyboard_agent.set(None);
+                        keyboard_target.set(None);
+                        group_live_status.set("Move cancelled".to_owned());
+                    } else {
+                        drop_agent_on_agent(
+                            &move_handle_state,
+                            Some(picked),
+                            move_handle_agent.clone(),
+                            pending_rename_group_name,
+                            group_live_status,
+                        );
+                        keyboard_agent.set(None);
+                        keyboard_target.set(None);
+                    }
+                } else {
+                    keyboard_agent.set(Some(move_handle_ref.clone()));
+                    keyboard_target
+                        .set(Some(SidebarKeyboardTarget::Agent(move_handle_ref.clone())));
+                    group_live_status.set(format!(
+                        "Picked up {move_handle_name}. Move focus to a group, agent, or Ungroup and press Space or Enter."
+                    ));
+                }
+            }
+            "Escape" => {
+                keyboard_agent.set(None);
+                keyboard_target.set(None);
+                group_live_status.set("Move cancelled".to_owned());
+            }
+            "ArrowDown" | "ArrowRight" => {
+                ev.prevent_default();
+                focus_relative_drop_target(&ev.target().expect("keydown target"), 1);
+            }
+            "ArrowUp" | "ArrowLeft" => {
+                ev.prevent_default();
+                focus_relative_drop_target(&ev.target().expect("keydown target"), -1);
+            }
+            _ => {}
+        }
+    };
+    let move_focus_ref = drag_ref.clone();
+    let on_move_handle_focus = move |_| {
+        keyboard_target.set(Some(SidebarKeyboardTarget::Agent(move_focus_ref.clone())));
+    };
+    let move_click_name = name.clone();
+    let class_drag_ref = drag_ref.clone();
+    let aria_drag_ref = drag_ref.clone();
+    let click_drag_ref = drag_ref.clone();
 
     let input_ref = NodeRef::<leptos::html::Input>::new();
 
@@ -754,11 +1553,23 @@ fn agent_card(
 
     view! {
         <div
-            class="agent-card"
+            class=move || {
+                if keyboard_target.get().as_ref() == Some(&SidebarKeyboardTarget::Agent(class_drag_ref.clone())) {
+                    "agent-card agent-group-keyboard-focus"
+                } else {
+                    "agent-card"
+                }
+            }
             tabindex="0"
             role="button"
+            draggable="true"
+            aria-dropeffect=move || if keyboard_agent.get().is_some() { "move" } else { "none" }
             on:click=on_click
             on:keydown=on_keydown_card
+            on:dragstart=on_dragstart
+            on:dragover=on_dragover_agent
+            on:drop=on_drop_agent
+            on:dragend=on_dragend
         >
             <div class="agent-card-top">
                 <div class="agent-card-top-main">
@@ -881,6 +1692,39 @@ fn agent_card(
                 })}
                 </div>
                 <div class="agent-card-top-actions">
+                    <button
+                        type="button"
+                        class="filter-toggle agent-card-move agent-card-action"
+                        title="Move agent to group"
+                        aria-label="Move agent to group"
+                        aria-grabbed=move || {
+                            keyboard_agent
+                                .get()
+                                .as_ref()
+                                .is_some_and(|picked| picked == &aria_drag_ref)
+                                .to_string()
+                        }
+                        data-agent-group-keyboard-target="true"
+                        on:focus=on_move_handle_focus
+                        on:keydown=on_move_handle_keydown
+                        on:click=move |ev: web_sys::MouseEvent| {
+                            ev.stop_propagation();
+                            if keyboard_agent.get_untracked().as_ref() == Some(&click_drag_ref) {
+                                keyboard_agent.set(None);
+                                keyboard_target.set(None);
+                                group_live_status.set("Move cancelled".to_owned());
+                            } else {
+                                keyboard_agent.set(Some(click_drag_ref.clone()));
+                                keyboard_target.set(Some(SidebarKeyboardTarget::Agent(click_drag_ref.clone())));
+                                group_live_status.set(format!(
+                                    "Picked up {}. Move focus to a group, agent, or Ungroup and press Space or Enter.",
+                                    move_click_name
+                                ));
+                            }
+                        }
+                    >
+                        "\u{2630}"
+                    </button>
                     <button
                         type="button"
                         class="filter-toggle agent-card-action"
@@ -1224,8 +2068,10 @@ mod wasm_tests {
         AgentCompactNotifyPayload, AgentCompactStatus, TeamCompactNotifyPayload, TeamCompactStatus,
     };
     use protocol::{
-        AgentOrigin, BackendKind, ChatMessage, Envelope, MessageSender, NewAgentPayload, Project,
-        ProjectId, ProjectRootPath, ProjectSource, StreamPath, TeamId, TeamMemberId,
+        AgentAnnotationTarget, AgentGroup, AgentGroupAssignment, AgentGroupId, AgentGroupsSnapshot,
+        AgentOrigin, AgentsViewPreferences, AgentsViewPreferencesSnapshot, BackendKind,
+        ChatMessage, Envelope, HostFilterId, MessageSender, NewAgentPayload, Project, ProjectId,
+        ProjectRootPath, ProjectSource, StreamPath, TeamId, TeamMemberId,
     };
     use serde_json::Value as JsonValue;
     use wasm_bindgen::JsCast;
@@ -1319,6 +2165,38 @@ mod wasm_tests {
             out.push((kind, payload, stream));
         }
         out
+    }
+
+    fn last_group_update_json(calls: &js_sys::Array) -> JsonValue {
+        recorded_frames(calls)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "set_agent_groups")
+            .map(|(_, payload, _)| payload["update"].clone())
+            .last()
+            .expect("expected a set_agent_groups frame")
+    }
+
+    fn dispatch_dom_event(element: &HtmlElement, event_name: &str) {
+        let event = web_sys::Event::new(event_name).expect("event");
+        element.dispatch_event(&event).expect("dispatch event");
+    }
+
+    fn dispatch_drag_event(element: &HtmlElement, event_name: &str) {
+        let event = web_sys::DragEvent::new(event_name).expect("drag event");
+        element.dispatch_event(&event).expect("dispatch drag event");
+    }
+
+    fn dispatch_key(element: &HtmlElement, key: &str) {
+        let escaped_key = serde_json::to_string(key).expect("serialize key");
+        let event: web_sys::Event = js_sys::eval(&format!(
+            "new KeyboardEvent('keydown', {{ key: {escaped_key}, bubbles: true, cancelable: true }})"
+        ))
+        .expect("keyboard event")
+        .dyn_into()
+        .expect("KeyboardEvent is an Event");
+        element
+            .dispatch_event(&event)
+            .expect("dispatch keyboard event");
     }
 
     /// Synthesize an `Envelope` and feed it through `dispatch_envelope`
@@ -1471,6 +2349,44 @@ mod wasm_tests {
         );
     }
 
+    fn local_target(agent_id: &str) -> AgentAnnotationTarget {
+        AgentAnnotationTarget::TransientAgent {
+            host_id: HostFilterId("local".to_owned()),
+            agent_id: AgentId(agent_id.to_owned()),
+        }
+    }
+
+    fn apply_group_snapshot(state: &AppState, groups: AgentGroupsSnapshot) {
+        state.apply_agents_view_snapshot(
+            "local",
+            AgentsViewPreferencesSnapshot {
+                preferences: AgentsViewPreferences::default(),
+                load_error: None,
+                smart_views: Default::default(),
+                tags: Default::default(),
+                pins: Default::default(),
+                groups,
+            },
+        );
+    }
+
+    fn assigned_group(id: &str, name: &str, targets: &[&str]) -> AgentGroupsSnapshot {
+        let group_id = AgentGroupId(id.to_owned());
+        AgentGroupsSnapshot {
+            groups: vec![AgentGroup {
+                id: group_id.clone(),
+                name: name.to_owned(),
+            }],
+            assignments: targets
+                .iter()
+                .map(|target| AgentGroupAssignment {
+                    group_id: group_id.clone(),
+                    target: local_target(target),
+                })
+                .collect(),
+        }
+    }
+
     fn seed_chat_row(state: &AppState, agent_id: &str) {
         state.chat_rows.update(|m| {
             m.insert(
@@ -1597,6 +2513,253 @@ mod wasm_tests {
                 && group_text.contains('1'),
             "parent group should show parent, child, and visible child count; got {group_text:?}"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn custom_group_renders_members_only_in_groups_section() {
+        let container = make_container();
+        let state = make_app_state("local");
+        seed_sidebar_group_fixture(&state);
+        apply_group_snapshot(
+            &state,
+            assigned_group("review", "Review Group", &["beta-agent"]),
+        );
+
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let custom_group: HtmlElement = container
+            .query_selector(".agent-sidebar-custom-group")
+            .unwrap()
+            .expect("custom group renders")
+            .dyn_into()
+            .unwrap();
+        let group_text = custom_group.text_content().unwrap_or_default();
+        assert!(
+            group_text.contains("Review Group") && group_text.contains("Beta Agent"),
+            "custom group should show its header and assigned member; got {group_text:?}"
+        );
+        let default_tree = container
+            .query_selector(".agent-sidebar-default-tree")
+            .unwrap()
+            .expect("default tree renders");
+        let default_text = default_tree.text_content().unwrap_or_default();
+        assert!(
+            default_text.contains("Parent Alpha Agent")
+                && default_text.contains("Child Alpha Agent")
+                && !default_text.contains("Beta Agent"),
+            "grouped agents must not be duplicated in Host/Project; got {default_text:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn dragging_ungrouped_agent_onto_agent_sends_create_group() {
+        let calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = make_app_state("local");
+        seed_sidebar_group_fixture(&state);
+        apply_group_snapshot(&state, AgentGroupsSnapshot::default());
+
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .query_selector(".agent-ungroup-drop-target")
+                .unwrap()
+                .is_none(),
+            "Ungroup target should stay hidden when there are no custom groups"
+        );
+
+        let beta_card: HtmlElement = container
+            .query_selector("[data-agent-id='beta-agent'] .agent-card")
+            .unwrap()
+            .expect("beta card")
+            .dyn_into()
+            .unwrap();
+        let parent_card: HtmlElement = container
+            .query_selector("[data-agent-id='parent-alpha'] .agent-card")
+            .unwrap()
+            .expect("parent card")
+            .dyn_into()
+            .unwrap();
+        dispatch_drag_event(&beta_card, "dragstart");
+        dispatch_drag_event(&parent_card, "drop");
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let update = last_group_update_json(&calls);
+        assert_eq!(update["kind"], "create_group");
+        assert_eq!(update["targets"].as_array().expect("targets").len(), 2);
+        assert!(
+            update["name"]
+                .as_str()
+                .expect("name")
+                .contains("Beta Agent"),
+            "new group should receive an automatic member-based name: {update:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn ungroup_target_appears_for_keyboard_pickup_without_groups() {
+        let _calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = make_app_state("local");
+        seed_sidebar_group_fixture(&state);
+        apply_group_snapshot(&state, AgentGroupsSnapshot::default());
+
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .query_selector(".agent-ungroup-drop-target")
+                .unwrap()
+                .is_none(),
+            "Ungroup target should not clutter the sidebar before keyboard pickup"
+        );
+
+        let move_button: HtmlElement = container
+            .query_selector("[data-agent-id='beta-agent'] .agent-card-move")
+            .unwrap()
+            .expect("move handle")
+            .dyn_into()
+            .unwrap();
+        dispatch_key(&move_button, " ");
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .query_selector(".agent-ungroup-drop-target")
+                .unwrap()
+                .is_some(),
+            "Ungroup target should remain reachable during keyboard pickup"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn keyboard_pickup_can_drop_on_ungroup_target() {
+        let calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = make_app_state("local");
+        seed_sidebar_group_fixture(&state);
+        apply_group_snapshot(
+            &state,
+            assigned_group("review", "Review Group", &["beta-agent"]),
+        );
+
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .query_selector(".agent-ungroup-drop-target")
+                .unwrap()
+                .is_some(),
+            "Ungroup target should render when custom groups exist"
+        );
+
+        let move_button: HtmlElement = container
+            .query_selector("[data-agent-id='beta-agent'] .agent-card-move")
+            .unwrap()
+            .expect("move handle")
+            .dyn_into()
+            .unwrap();
+        dispatch_key(&move_button, " ");
+        let ungroup_target: HtmlElement = container
+            .query_selector(".agent-ungroup-drop-target")
+            .unwrap()
+            .expect("ungroup target")
+            .dyn_into()
+            .unwrap();
+        dispatch_key(&ungroup_target, "Enter");
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let update = last_group_update_json(&calls);
+        assert_eq!(update["kind"], "move_targets");
+        assert!(update["group_id"].is_null());
+        assert_eq!(update["targets"].as_array().expect("targets").len(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    async fn group_rename_and_delete_use_inline_controls_and_snapshots() {
+        let calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = make_app_state("local");
+        seed_sidebar_group_fixture(&state);
+        apply_group_snapshot(
+            &state,
+            assigned_group("review", "Review Group", &["beta-agent"]),
+        );
+
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let rename: HtmlElement = container
+            .query_selector(".agent-sidebar-group-rename")
+            .unwrap()
+            .expect("rename button")
+            .dyn_into()
+            .unwrap();
+        rename.click();
+        for _ in 0..2 {
+            next_tick().await;
+        }
+        let input_el: HtmlElement = container
+            .query_selector(".agent-sidebar-group-name-input")
+            .unwrap()
+            .expect("rename input")
+            .dyn_into()
+            .unwrap();
+        let input: web_sys::HtmlInputElement = input_el.clone().dyn_into().unwrap();
+        input.set_value("Renamed Group");
+        dispatch_dom_event(&input_el, "input");
+        dispatch_key(&input_el, "Enter");
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let update = last_group_update_json(&calls);
+        assert_eq!(update["kind"], "rename_group");
+        assert_eq!(update["id"], "review");
+        assert_eq!(update["name"], "Renamed Group");
+
+        apply_group_snapshot(
+            &state,
+            assigned_group("review", "Renamed Group", &["beta-agent"]),
+        );
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Renamed Group"),
+            "server snapshot should render renamed group; got {text:?}"
+        );
+
+        let delete: HtmlElement = container
+            .query_selector(".agent-sidebar-group-delete")
+            .unwrap()
+            .expect("delete button")
+            .dyn_into()
+            .unwrap();
+        delete.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let update = last_group_update_json(&calls);
+        assert_eq!(update["kind"], "delete_group");
+        assert_eq!(update["id"], "review");
     }
 
     /// The retired Hide finished control must not render in the sidebar.

@@ -3,18 +3,18 @@ use std::collections::HashMap;
 
 use protocol::types::{AgentCompactPayload, TeamCompactPayload};
 use protocol::{
-    AgentPinsUpdate, AgentTagsUpdate, AgentsSmartViewsUpdate, AgentsViewPreferencesUpdate,
-    CancelWorkflowPayload, CloseAgentPayload, CustomAgent, CustomAgentDeletePayload, CustomAgentId,
-    CustomAgentUpsertPayload, Envelope, FrameKind, ImageData, McpServerConfig,
-    McpServerDeletePayload, McpServerId, McpServerUpsertPayload, MobileDeviceId,
-    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferId,
-    MobilePairingStartPayload, ProjectId, SetAgentPinsPayload, SetAgentTagsPayload,
-    SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, SkillRefreshPayload, Steering,
-    SteeringDeletePayload, SteeringId, SteeringUpsertPayload, StreamPath, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftId, TeamDraftMemberEdit, TeamDraftMemberId,
-    TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload, TeamId,
-    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
+    AgentGroupsUpdate, AgentPinsUpdate, AgentTagsUpdate, AgentsSmartViewsUpdate,
+    AgentsViewPreferencesUpdate, CancelWorkflowPayload, CloseAgentPayload, CustomAgent,
+    CustomAgentDeletePayload, CustomAgentId, CustomAgentUpsertPayload, Envelope, FrameKind,
+    ImageData, McpServerConfig, McpServerDeletePayload, McpServerId, McpServerUpsertPayload,
+    MobileDeviceId, MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferId,
+    MobilePairingStartPayload, ProjectId, SetAgentGroupsPayload, SetAgentPinsPayload,
+    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
+    SkillRefreshPayload, Steering, SteeringDeletePayload, SteeringId, SteeringUpsertPayload,
+    StreamPath, TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftId, TeamDraftMemberEdit,
+    TeamDraftMemberId, TeamDraftShufflePayload, TeamDraftShuffleScope, TeamDraftUpdatePayload,
+    TeamId, TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
     TeamMemberDeletePayload, TeamMemberId, TeamMemberShufflePayload, TeamMemberUpdatePayload,
     TeamSetManagerPayload, TeamTemplateId, TriggerWorkflowPayload, WorkflowId,
     WorkflowRefreshPayload, WorkflowRunId,
@@ -159,6 +159,24 @@ pub async fn set_agent_pins(
         host_stream,
         FrameKind::SetAgentPins,
         &SetAgentPinsPayload { update },
+    )
+    .await
+}
+
+/// Send a custom group mutation to the primary local host. Groups are
+/// server-owned and carried by the full `AgentsViewPreferencesNotify`
+/// snapshot, so callers should treat the sent frame as interaction state and
+/// render from the next authoritative snapshot.
+pub async fn set_agent_groups(
+    host_id: &str,
+    host_stream: StreamPath,
+    update: AgentGroupsUpdate,
+) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::SetAgentGroups,
+        &SetAgentGroupsPayload { update },
     )
     .await
 }

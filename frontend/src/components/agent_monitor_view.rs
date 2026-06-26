@@ -3075,6 +3075,7 @@ mod wasm_tests {
             smart_views: Default::default(),
             tags: Default::default(),
             pins: Default::default(),
+            groups: Default::default(),
         }
     }
 
@@ -3400,6 +3401,7 @@ mod wasm_tests {
             smart_views: views,
             tags: Default::default(),
             pins: Default::default(),
+            groups: Default::default(),
         }
     }
 
@@ -3767,6 +3769,7 @@ mod wasm_tests {
             smart_views: Default::default(),
             tags,
             pins,
+            groups: Default::default(),
         }
     }
 

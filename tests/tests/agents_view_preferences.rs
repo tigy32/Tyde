@@ -4,17 +4,18 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentAnnotationTarget, AgentBootstrapEvent, AgentBootstrapPayload, AgentGroupMode, AgentId,
-    AgentListDensity, AgentManualTagId, AgentOrderKey, AgentPinsUpdate, AgentSortMode,
-    AgentStartPayload, AgentStatusFilter, AgentSystemTagId, AgentTagColor, AgentTagRef,
-    AgentTagsUpdate, AgentsSmartViewsSnapshot, AgentsSmartViewsUpdate, AgentsViewFilters,
+    AgentAnnotationTarget, AgentBootstrapEvent, AgentBootstrapPayload, AgentGroupAssignment,
+    AgentGroupId, AgentGroupMode, AgentGroupsUpdate, AgentId, AgentListDensity, AgentManualTagId,
+    AgentClosedPayload, AgentOrderKey, AgentPinsUpdate, AgentSortMode, AgentStartPayload,
+    AgentStatusFilter, AgentSystemTagId, AgentTagColor, AgentTagRef, AgentTagsUpdate,
+    AgentsSmartViewsSnapshot, AgentsSmartViewsUpdate, AgentsViewFilters,
     AgentsViewPreferences, AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesStoreErrorKind,
     AgentsViewPreferencesUpdate, BackendKind, BuiltInSmartViewId, CloseAgentPayload,
     CommandErrorCode, CommandErrorPayload, DeleteSessionPayload, Envelope, FrameKind,
     HostBootstrapPayload, HostFilterId, LOCAL_HOST_ID, NewAgentPayload, ProjectCreatePayload,
-    ProjectNotifyPayload, SessionId, SetAgentPinsPayload, SetAgentTagsPayload,
-    SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, SmartView, SmartViewId,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath, UserSmartViewId, read_envelope,
+    ProjectNotifyPayload, SessionId, SetAgentGroupsPayload, SetAgentPinsPayload,
+    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, SmartView,
+    SmartViewId, SpawnAgentParams, SpawnAgentPayload, StreamPath, UserSmartViewId, read_envelope,
     write_envelope,
 };
 
@@ -68,6 +69,11 @@ async fn send_set_agent_tags(client: &mut client::Connection, update: AgentTagsU
 async fn send_set_agent_pins(client: &mut client::Connection, update: AgentPinsUpdate) {
     let payload = SetAgentPinsPayload { update };
     send_host_payload(client, FrameKind::SetAgentPins, &payload).await;
+}
+
+async fn send_set_agent_groups(client: &mut client::Connection, update: AgentGroupsUpdate) {
+    let payload = SetAgentGroupsPayload { update };
+    send_host_payload(client, FrameKind::SetAgentGroups, &payload).await;
 }
 
 async fn send_host_payload<T: serde::Serialize>(
@@ -211,6 +217,52 @@ async fn expect_preferences_notify(
         .expect("parse AgentsViewPreferencesNotifyPayload")
 }
 
+async fn assert_no_agent_closed_for(
+    client: &mut client::Connection,
+    agent_ids: &[AgentId],
+    context: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            break;
+        };
+        let env = match tokio::time::timeout(remaining, client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed while checking {context}"),
+            Ok(Err(err)) => panic!("next_event failed while checking {context}: {err:?}"),
+            Err(_) => break,
+        };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        if env.kind == FrameKind::CommandError {
+            let error: CommandErrorPayload = env.parse_payload().expect("CommandError");
+            panic!("unexpected CommandError while checking {context}: {error:?}");
+        }
+        if env.kind == FrameKind::AgentClosed {
+            let closed: AgentClosedPayload = env.parse_payload().expect("parse AgentClosed");
+            assert!(
+                !agent_ids.contains(&closed.agent_id),
+                "{context}: delete-group must ungroup, not close agent {}",
+                closed.agent_id
+            );
+        }
+    }
+}
+
+async fn expect_non_empty_group_notify(
+    client: &mut client::Connection,
+    context: &str,
+) -> AgentsViewPreferencesNotifyPayload {
+    loop {
+        let notify = expect_preferences_notify(client, context).await;
+        if !notify.snapshot.groups.groups.is_empty() {
+            return notify;
+        }
+    }
+}
+
 async fn set_active_preferences_query(
     client: &mut client::Connection,
     filters: AgentsViewFilters,
@@ -320,6 +372,34 @@ async fn spawn_agent_for_tags(
         .expect("spawn agent for tags");
 
     let env = expect_client_kind(client, FrameKind::NewAgent, "NewAgent for tags").await;
+    env.parse_payload().expect("parse NewAgentPayload")
+}
+
+async fn spawn_agent_with_parent(
+    client: &mut client::Connection,
+    name: &str,
+    parent_agent_id: Option<AgentId>,
+) -> NewAgentPayload {
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/agents-view-groups".to_owned()],
+                prompt: name.to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent for groups");
+
+    let env = expect_client_kind(client, FrameKind::NewAgent, "NewAgent for groups").await;
     env.parse_payload().expect("parse NewAgentPayload")
 }
 
@@ -520,6 +600,75 @@ async fn expect_promoted_manual_assignment(
     }
 }
 
+async fn expect_promoted_group_assignment(
+    client: &mut client::Connection,
+    agent_stream: &StreamPath,
+    group_id: &AgentGroupId,
+) -> (SessionId, AgentsViewPreferencesNotifyPayload) {
+    let mut session_id = None;
+    let mut latest_notify = None;
+    loop {
+        let env =
+            match tokio::time::timeout(Duration::from_secs(5), read_envelope(&mut client.reader))
+                .await
+            {
+                Ok(Ok(Some(env))) => env,
+                Ok(Ok(None)) => panic!("connection closed before promoted group assignment"),
+                Ok(Err(err)) => {
+                    panic!("read envelope failed before promoted group assignment: {err:?}")
+                }
+                Err(_) => panic!("timed out waiting for promoted group assignment"),
+            };
+        client
+            .incoming_seq
+            .validate(&env.stream, env.seq, env.kind)
+            .expect("incoming sequence should be valid");
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        match env.kind {
+            FrameKind::AgentStart if env.stream == *agent_stream => {
+                let start: AgentStartPayload =
+                    env.parse_payload().expect("parse AgentStartPayload");
+                session_id = start.session_id;
+            }
+            FrameKind::AgentBootstrap if env.stream == *agent_stream => {
+                let bootstrap: AgentBootstrapPayload =
+                    env.parse_payload().expect("parse AgentBootstrapPayload");
+                for event in bootstrap.events {
+                    if let AgentBootstrapEvent::AgentStart(start) = event {
+                        session_id = start.session_id;
+                    }
+                }
+            }
+            FrameKind::AgentsViewPreferencesNotify => {
+                latest_notify = Some(
+                    env.parse_payload::<AgentsViewPreferencesNotifyPayload>()
+                        .expect("parse AgentsViewPreferencesNotifyPayload"),
+                );
+            }
+            FrameKind::CommandError => {
+                let error: CommandErrorPayload = env.parse_payload().expect("CommandError");
+                panic!("unexpected CommandError before promoted group assignment: {error:?}");
+            }
+            _ => {}
+        }
+
+        if let (Some(session_id), Some(notify)) = (session_id.clone(), latest_notify.as_ref()) {
+            let target = local_session_target(session_id.clone());
+            if notify
+                .snapshot
+                .groups
+                .assignments
+                .iter()
+                .any(|assignment| assignment.target == target && assignment.group_id == *group_id)
+            {
+                return (session_id, notify.clone());
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn agents_view_preferences_non_primary_host_omits_preferences_and_rejects_writes() {
     let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
@@ -611,6 +760,25 @@ async fn agents_view_preferences_non_primary_host_omits_preferences_and_rejects_
     let error = expect_command_error(&mut fixture.client, "non-primary pins error").await;
     assert_eq!(error.request_kind, FrameKind::SetAgentPins);
     assert_eq!(error.operation, "set_agent_pins");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(
+        error.message.contains("owned by the primary local host"),
+        "unexpected error message: {}",
+        error.message
+    );
+
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::CreateGroup {
+            name: "Remote group".to_owned(),
+            targets: vec![local_transient_target(AgentId("remote-group".to_owned()))],
+        },
+    )
+    .await;
+
+    let error = expect_command_error(&mut fixture.client, "non-primary groups error").await;
+    assert_eq!(error.request_kind, FrameKind::SetAgentGroups);
+    assert_eq!(error.operation, "set_agent_groups");
     assert_eq!(error.code, CommandErrorCode::InvalidInput);
     assert!(
         error.message.contains("owned by the primary local host"),
@@ -740,7 +908,6 @@ async fn agents_view_preferences_agent_tags_manual_lifecycle_persists_and_delete
     let mut fixture = Fixture::new().await;
     let agent = spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "hello").await;
     let start = expect_agent_start_payload(&mut fixture.client, &agent.instance_stream).await;
-    expect_preferences_notify(&mut fixture.client, "agent session annotation notify").await;
     let session_id = start.session_id.expect("agent start session id");
     let target = local_session_target(session_id.clone());
 
@@ -930,7 +1097,6 @@ async fn agents_view_preferences_agent_tags_filters_group_mode_and_system_tags_a
     )
     .await;
     let start = expect_agent_start_payload(&mut fixture.client, &agent.instance_stream).await;
-    expect_preferences_notify(&mut fixture.client, "agent session annotation notify").await;
     let session_id = start.session_id.expect("agent start session id");
     let target = local_session_target(session_id);
     let tag_id = create_manual_tag(&mut fixture.client, "Important", None).await;
@@ -1025,7 +1191,6 @@ async fn agents_view_preferences_agent_pins_canonicalize_and_persist_session_tar
     let agent =
         spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "pin me").await;
     let start = expect_agent_start_payload(&mut fixture.client, &agent.instance_stream).await;
-    expect_preferences_notify(&mut fixture.client, "agent session annotation notify").await;
     let session_id = start.session_id.expect("agent start session id");
     let session_target = local_session_target(session_id.clone());
     let transient_target = local_transient_target(agent.agent_id.clone());
@@ -1069,6 +1234,303 @@ async fn agents_view_preferences_agent_pins_canonicalize_and_persist_session_tar
     .await;
     let notify = expect_preferences_notify(&mut fixture.client, "unpin transient").await;
     assert!(notify.snapshot.pins.pinned.is_empty());
+}
+
+#[tokio::test]
+async fn agents_view_preferences_agent_groups_lifecycle_single_membership_and_persistence() {
+    let mut fixture = Fixture::new().await;
+    let first =
+        spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "group one").await;
+    let first_start = expect_agent_start_payload(&mut fixture.client, &first.instance_stream).await;
+    let second =
+        spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "group two").await;
+    let second_start =
+        expect_agent_start_payload(&mut fixture.client, &second.instance_stream).await;
+
+    let first_target = local_session_target(first_start.session_id.expect("first session id"));
+    let second_target = local_session_target(second_start.session_id.expect("second session id"));
+
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::CreateGroup {
+            name: "  Review Pair  ".to_owned(),
+            targets: vec![first_target.clone(), second_target.clone()],
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "create group notify").await;
+    assert_eq!(notify.snapshot.groups.groups.len(), 1);
+    let first_group_id = notify.snapshot.groups.groups[0].id.clone();
+    assert_eq!(first_group_id, AgentGroupId("review-pair".to_owned()));
+    assert_eq!(notify.snapshot.groups.groups[0].name, "Review Pair");
+    assert_eq!(notify.snapshot.groups.assignments.len(), 2);
+    assert!(notify.snapshot.groups.assignments.contains(&AgentGroupAssignment {
+        group_id: first_group_id.clone(),
+        target: first_target.clone(),
+    }));
+    assert!(notify.snapshot.groups.assignments.contains(&AgentGroupAssignment {
+        group_id: first_group_id.clone(),
+        target: second_target.clone(),
+    }));
+
+    let (_fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let fresh_groups = fresh_bootstrap
+        .agents_view_preferences
+        .expect("fresh bootstrap preferences")
+        .groups;
+    assert_eq!(fresh_groups.groups, notify.snapshot.groups.groups);
+    assert_eq!(fresh_groups.assignments, notify.snapshot.groups.assignments);
+
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::CreateGroup {
+            name: "Solo".to_owned(),
+            targets: vec![second_target.clone()],
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "move to second group").await;
+    let second_group_id = notify
+        .snapshot
+        .groups
+        .groups
+        .iter()
+        .find(|group| group.name == "Solo")
+        .expect("second group")
+        .id
+        .clone();
+    assert_eq!(notify.snapshot.groups.assignments.len(), 2);
+    assert!(
+        notify
+            .snapshot
+            .groups
+            .assignments
+            .contains(&AgentGroupAssignment {
+                group_id: first_group_id.clone(),
+                target: first_target.clone(),
+            }),
+        "first target should stay in the first group"
+    );
+    assert!(
+        notify
+            .snapshot
+            .groups
+            .assignments
+            .contains(&AgentGroupAssignment {
+                group_id: second_group_id.clone(),
+                target: second_target.clone(),
+            }),
+        "moving to another group enforces one group per target"
+    );
+
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::MoveTargets {
+            group_id: None,
+            targets: vec![first_target.clone()],
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "ungroup first target").await;
+    assert_eq!(notify.snapshot.groups.groups.len(), 1);
+    assert_eq!(notify.snapshot.groups.groups[0].id, second_group_id);
+    assert_eq!(
+        notify.snapshot.groups.assignments,
+        vec![AgentGroupAssignment {
+            group_id: second_group_id.clone(),
+            target: second_target.clone(),
+        }],
+        "empty groups auto-delete when their last member leaves"
+    );
+
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::DeleteGroup {
+            id: second_group_id,
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "delete group ungroup notify").await;
+    assert!(notify.snapshot.groups.groups.is_empty());
+    assert!(notify.snapshot.groups.assignments.is_empty());
+    assert_no_agent_closed_for(
+        &mut fixture.client,
+        &[first.agent_id.clone(), second.agent_id.clone()],
+        "delete group ungroup",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn agents_view_preferences_agent_groups_moving_parent_moves_children() {
+    let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_with_parent(&mut fixture.client, "parent group", None).await;
+    let parent_start =
+        expect_agent_start_payload(&mut fixture.client, &parent.instance_stream).await;
+    let child = spawn_agent_with_parent(
+        &mut fixture.client,
+        "child group",
+        Some(parent.agent_id.clone()),
+    )
+    .await;
+    let child_start = expect_agent_start_payload(&mut fixture.client, &child.instance_stream).await;
+
+    let parent_target = local_session_target(parent_start.session_id.expect("parent session id"));
+    let child_target = local_session_target(child_start.session_id.expect("child session id"));
+
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::CreateGroup {
+            name: "Family".to_owned(),
+            targets: vec![parent_target.clone()],
+        },
+    )
+    .await;
+    let notify = expect_non_empty_group_notify(&mut fixture.client, "parent group create").await;
+    let group_id = notify.snapshot.groups.groups[0].id.clone();
+    assert_eq!(notify.snapshot.groups.assignments.len(), 2);
+    assert!(notify.snapshot.groups.assignments.contains(&AgentGroupAssignment {
+        group_id: group_id.clone(),
+        target: parent_target,
+    }));
+    assert!(notify.snapshot.groups.assignments.contains(&AgentGroupAssignment {
+        group_id,
+        target: child_target,
+    }));
+}
+
+#[tokio::test]
+async fn agents_view_preferences_agent_groups_promote_and_cleanup_targets() {
+    let mut fixture = Fixture::new().await;
+    let agent =
+        spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "group promote").await;
+    let transient_target = local_transient_target(agent.agent_id.clone());
+
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::CreateGroup {
+            name: "Promotion".to_owned(),
+            targets: vec![transient_target],
+        },
+    )
+    .await;
+    let create_notify =
+        expect_non_empty_group_notify(&mut fixture.client, "create transient group").await;
+    let group_id = create_notify.snapshot.groups.groups[0].id.clone();
+    let already_promoted_session_id = create_notify
+        .snapshot
+        .groups
+        .assignments
+        .iter()
+        .find(|assignment| assignment.group_id == group_id)
+        .and_then(|assignment| match &assignment.target {
+            AgentAnnotationTarget::Session { session_id, .. } => Some(session_id.clone()),
+            AgentAnnotationTarget::TransientAgent { .. } => None,
+        });
+    let (session_id, promoted_notify) = if let Some(session_id) = already_promoted_session_id {
+        (session_id, create_notify)
+    } else {
+        expect_promoted_group_assignment(&mut fixture.client, &agent.instance_stream, &group_id)
+            .await
+    };
+    let session_target = local_session_target(session_id.clone());
+    assert_eq!(
+        promoted_notify.snapshot.groups.assignments,
+        vec![AgentGroupAssignment {
+            group_id: group_id.clone(),
+            target: session_target,
+        }]
+    );
+
+    fixture
+        .client
+        .delete_session(DeleteSessionPayload {
+            session_id: session_id.clone(),
+        })
+        .await
+        .expect("delete session");
+    let notify = expect_preferences_notify(&mut fixture.client, "group session cleanup").await;
+    assert!(notify.snapshot.groups.groups.is_empty());
+    assert!(notify.snapshot.groups.assignments.is_empty());
+
+    let failing = spawn_agent_for_tags(
+        &mut fixture.client,
+        BackendKind::Claude,
+        None,
+        "__mock_fail_spawn__ no group session",
+    )
+    .await;
+    expect_preferences_notify(&mut fixture.client, "sessionless new agent system tags").await;
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::CreateGroup {
+            name: "Transient only".to_owned(),
+            targets: vec![local_transient_target(failing.agent_id.clone())],
+        },
+    )
+    .await;
+    let notify = expect_preferences_notify(&mut fixture.client, "sessionless transient group")
+        .await;
+    assert_eq!(notify.snapshot.groups.groups.len(), 1);
+    close_agent(&mut fixture.client, &failing.instance_stream).await;
+    let notify = expect_preferences_notify(&mut fixture.client, "sessionless group close cleanup")
+        .await;
+    assert!(notify.snapshot.groups.groups.is_empty());
+    assert!(notify.snapshot.groups.assignments.is_empty());
+}
+
+#[tokio::test]
+async fn agents_view_preferences_agent_groups_reject_invalid_updates() {
+    let mut fixture = Fixture::new().await;
+
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::CreateGroup {
+            name: "   ".to_owned(),
+            targets: vec![local_transient_target(AgentId("agent-a".to_owned()))],
+        },
+    )
+    .await;
+    let error = expect_command_error(&mut fixture.client, "empty group name error").await;
+    assert_eq!(error.request_kind, FrameKind::SetAgentGroups);
+    assert_eq!(error.operation, "set_agent_groups");
+    assert!(error.message.contains("name must not be empty"));
+
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::CreateGroup {
+            name: "Empty targets".to_owned(),
+            targets: Vec::new(),
+        },
+    )
+    .await;
+    let error = expect_command_error(&mut fixture.client, "empty group targets error").await;
+    assert_eq!(error.request_kind, FrameKind::SetAgentGroups);
+    assert!(error.message.contains("targets must not be empty"));
+
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::MoveTargets {
+            group_id: Some(AgentGroupId("missing".to_owned())),
+            targets: vec![local_transient_target(AgentId("agent-a".to_owned()))],
+        },
+    )
+    .await;
+    let error = expect_command_error(&mut fixture.client, "unknown group move error").await;
+    assert_eq!(error.request_kind, FrameKind::SetAgentGroups);
+    assert!(error.message.contains("unknown agent group id"));
+
+    send_set_agent_groups(
+        &mut fixture.client,
+        AgentGroupsUpdate::RenameGroup {
+            id: AgentGroupId("bad id".to_owned()),
+            name: "Bad".to_owned(),
+        },
+    )
+    .await;
+    let error = expect_command_error(&mut fixture.client, "invalid group id error").await;
+    assert_eq!(error.request_kind, FrameKind::SetAgentGroups);
+    assert!(error.message.contains("must be sanitized"));
 }
 
 #[tokio::test]
@@ -1614,7 +2076,7 @@ async fn agents_view_preferences_smart_views_migrates_legacy_store() {
     assert!(
         std::fs::read_to_string(preferences_path)
             .expect("read migrated preferences store")
-            .contains("\"version\": 3")
+            .contains("\"version\": 4")
     );
 }
 
@@ -1717,7 +2179,7 @@ async fn agents_view_preferences_smart_views_v2_store_migrates_to_v3_with_user_v
     assert!(
         std::fs::read_to_string(preferences_path)
             .expect("read migrated preferences store")
-            .contains("\"version\": 3")
+            .contains("\"version\": 4")
     );
 }
 
@@ -1787,7 +2249,6 @@ async fn agents_view_preferences_manual_order_is_canonicalized() {
     let mut fixture = Fixture::new().await;
     let agent = spawn_agent_for_order(&mut fixture.client).await;
     let start = expect_agent_start_payload(&mut fixture.client, &agent.instance_stream).await;
-    expect_preferences_notify(&mut fixture.client, "agent session annotation notify").await;
     let known_session = start
         .session_id
         .expect("mock backend should assign a session id");

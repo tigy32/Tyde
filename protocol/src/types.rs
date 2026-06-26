@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -490,6 +490,7 @@ pub enum FrameKind {
     SetAgentsSmartViews,
     SetAgentTags,
     SetAgentPins,
+    SetAgentGroups,
     SpawnAgent,
     LoadAgent,
     FetchSessionHistory,
@@ -651,6 +652,7 @@ impl fmt::Display for FrameKind {
             Self::SetAgentsSmartViews => f.write_str("set_agents_smart_views"),
             Self::SetAgentTags => f.write_str("set_agent_tags"),
             Self::SetAgentPins => f.write_str("set_agent_pins"),
+            Self::SetAgentGroups => f.write_str("set_agent_groups"),
             Self::SpawnAgent => f.write_str("spawn_agent"),
             Self::LoadAgent => f.write_str("load_agent"),
             Self::FetchSessionHistory => f.write_str("fetch_session_history"),
@@ -1336,6 +1338,36 @@ pub struct AgentPinsSnapshot {
     pub pinned: Vec<AgentAnnotationTarget>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentGroupId(pub String);
+
+impl fmt::Display for AgentGroupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGroup {
+    pub id: AgentGroupId,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGroupAssignment {
+    pub group_id: AgentGroupId,
+    pub target: AgentAnnotationTarget,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentGroupsSnapshot {
+    #[serde(default)]
+    pub groups: Vec<AgentGroup>,
+    #[serde(default)]
+    pub assignments: Vec<AgentGroupAssignment>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentTagsUpdate {
@@ -1381,6 +1413,32 @@ pub enum AgentPinsUpdate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetAgentPinsPayload {
     pub update: AgentPinsUpdate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentGroupsUpdate {
+    CreateGroup {
+        name: String,
+        targets: Vec<AgentAnnotationTarget>,
+    },
+    RenameGroup {
+        id: AgentGroupId,
+        name: String,
+    },
+    DeleteGroup {
+        id: AgentGroupId,
+    },
+    MoveTargets {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_id: Option<AgentGroupId>,
+        targets: Vec<AgentAnnotationTarget>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetAgentGroupsPayload {
+    pub update: AgentGroupsUpdate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1505,6 +1563,8 @@ pub struct AgentsViewPreferencesSnapshot {
     pub tags: AgentTagsSnapshot,
     #[serde(default)]
     pub pins: AgentPinsSnapshot,
+    #[serde(default)]
+    pub groups: AgentGroupsSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4870,8 +4930,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty() {
-        assert_eq!(PROTOCOL_VERSION, 20);
+    fn protocol_version_is_twenty_one() {
+        assert_eq!(PROTOCOL_VERSION, 21);
     }
 
     #[test]
@@ -4911,6 +4971,7 @@ mod search_serde_tests {
 
     #[test]
     fn search_frame_kinds_display_snake_case() {
+        assert_eq!(FrameKind::SetAgentGroups.to_string(), "set_agent_groups");
         assert_eq!(FrameKind::ProjectSearch.to_string(), "project_search");
         assert_eq!(
             FrameKind::ProjectSearchCancel.to_string(),

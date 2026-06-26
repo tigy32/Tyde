@@ -5071,10 +5071,25 @@ kbd {
 }
 
 .agent-sidebar-host-section,
-.agent-sidebar-project-section {
+.agent-sidebar-project-section,
+.agent-sidebar-custom-groups-section,
+.agent-sidebar-custom-group,
+.agent-sidebar-default-tree {
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
+}
+
+.agent-sidebar-custom-groups-section {
+    margin-bottom: var(--space-2);
+}
+
+.agent-sidebar-groups-heading {
+    color: var(--text-tertiary);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
 }
 
 .agent-sidebar-host-section + .agent-sidebar-host-section {
@@ -5082,12 +5097,84 @@ kbd {
 }
 
 .agent-sidebar-host-header,
-.agent-sidebar-project-header {
+.agent-sidebar-project-header,
+.agent-sidebar-custom-group-header {
     color: var(--text-tertiary);
     font-size: 0.7rem;
     font-weight: 700;
     letter-spacing: 0.05em;
     text-transform: uppercase;
+}
+
+.agent-sidebar-custom-group-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-1);
+    min-height: 24px;
+    padding: 2px var(--space-1);
+    border: 1px solid transparent;
+    border-radius: 6px;
+}
+
+.agent-sidebar-custom-group-header:focus,
+.agent-group-keyboard-focus,
+.agent-group-keyboard-active {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 2px;
+}
+
+.agent-sidebar-custom-group-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.agent-sidebar-custom-group-actions {
+    display: inline-flex;
+    gap: 2px;
+}
+
+.agent-sidebar-group-name-input {
+    width: 100%;
+    min-width: 0;
+    padding: 2px 4px;
+    color: var(--text-primary);
+    background: var(--surface-1);
+    border: 1px solid var(--accent-primary);
+    border-radius: 4px;
+    font: inherit;
+}
+
+.agent-group-live-status {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+}
+
+.agent-ungroup-drop-target {
+    padding: var(--space-1) var(--space-2);
+    color: var(--text-secondary);
+    background: var(--surface-1);
+    border: 1px dashed var(--border-primary);
+    border-radius: 6px;
+    font-size: 0.75rem;
+    text-align: center;
+}
+
+.agent-ungroup-drop-target:focus,
+.agent-ungroup-drop-target:hover,
+.agent-sidebar-custom-group-header:hover,
+.agent-sidebar-custom-group-drag-over,
+.agent-sidebar-custom-group[aria-dropeffect="move"] {
+    border-color: var(--accent-primary);
+}
+
+.agent-sidebar-custom-group-drag-over {
+    background: color-mix(in srgb, var(--accent-primary) 10%, transparent);
 }
 
 .agent-sidebar-project-header {

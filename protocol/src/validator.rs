@@ -26,7 +26,7 @@ use crate::{
     ProjectGitStatusPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
     ProjectSearchCompletePayload, ProjectSearchResultsPayload, ReviewEventPayload,
     RunBackendSetupPayload, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
-    SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
+    SetAgentGroupsPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
     SetAgentsViewPreferencesPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
     SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
     StreamPath, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
@@ -349,6 +349,9 @@ impl ProtocolValidator {
             }
             FrameKind::SetAgentPins => {
                 parse_host_payload::<SetAgentPinsPayload>(self, envelope, "SetAgentPins")
+            }
+            FrameKind::SetAgentGroups => {
+                parse_host_payload::<SetAgentGroupsPayload>(self, envelope, "SetAgentGroups")
             }
             FrameKind::MobilePairingStart => parse_host_payload::<MobilePairingStartPayload>(
                 self,
