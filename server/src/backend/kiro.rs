@@ -3316,6 +3316,8 @@ impl Backend for KiroBackend {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (resume_replay_complete_tx, resume_replay_complete_rx) =
+            tokio::sync::oneshot::channel();
         let events_tx_task = events_tx.clone();
         let known_session_id = Arc::new(std::sync::Mutex::new(Some(session_id.clone())));
         let known_session_id_task = Arc::clone(&known_session_id);
@@ -3384,6 +3386,16 @@ impl Backend for KiroBackend {
                 session.shutdown().await;
                 return;
             }
+            while let Ok(raw) = raw_events.try_recv() {
+                if let Some(event) = map_kiro_value_to_chat_event(&raw)
+                    && events_tx_task.send(event).is_err()
+                {
+                    session.shutdown().await;
+                    return;
+                }
+            }
+            let _ = resume_replay_complete_tx.send(());
+
             if let Some(tx) = ready_tx.take() {
                 let _ = tx.send(Ok(()));
             }
@@ -3477,7 +3489,7 @@ impl Backend for KiroBackend {
                 interrupt_tx,
                 session_id: known_session_id,
             },
-            EventStream::new(events_rx),
+            EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
         ))
     }
 

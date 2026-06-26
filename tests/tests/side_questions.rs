@@ -94,7 +94,7 @@ fn record_agent_bootstrap_events(
         .events
         .into_iter()
         .enumerate()
-        .map(|(index, event)| agent_bootstrap_event_envelope(stream, index as u64, event));
+        .filter_map(|(index, event)| agent_bootstrap_event_envelope(stream, index as u64, event));
     let first = events.next();
     let mut rest = events.collect::<VecDeque<_>>();
     if !rest.is_empty() {
@@ -146,25 +146,41 @@ fn agent_bootstrap_event_envelope(
     stream: &StreamPath,
     seq: u64,
     event: AgentBootstrapEvent,
-) -> Envelope {
+) -> Option<Envelope> {
     match event {
-        AgentBootstrapEvent::AgentStart(payload) => {
-            Envelope::from_payload(stream.clone(), FrameKind::AgentStart, seq, &payload)
-        }
-        AgentBootstrapEvent::AgentError(payload) => {
-            Envelope::from_payload(stream.clone(), FrameKind::AgentError, seq, &payload)
-        }
-        AgentBootstrapEvent::SessionSettings(payload) => {
-            Envelope::from_payload(stream.clone(), FrameKind::SessionSettings, seq, &payload)
-        }
-        AgentBootstrapEvent::QueuedMessages(payload) => {
-            Envelope::from_payload(stream.clone(), FrameKind::QueuedMessages, seq, &payload)
-        }
-        AgentBootstrapEvent::ChatEvent(payload) => {
-            Envelope::from_payload(stream.clone(), FrameKind::ChatEvent, seq, &payload)
-        }
+        AgentBootstrapEvent::AgentStart(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::AgentStart,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::AgentError(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::AgentError,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::SessionSettings(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::SessionSettings,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::QueuedMessages(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::QueuedMessages,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::ChatEvent(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::ChatEvent,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::HasPriorHistory { .. } => None,
     }
-    .expect("serialize synthetic bootstrap event")
+    .map(|result| result.expect("serialize synthetic bootstrap event"))
 }
 
 async fn expect_new_agent(client: &mut client::Connection, context: &str) -> NewAgentPayload {

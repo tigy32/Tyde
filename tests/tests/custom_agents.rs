@@ -117,7 +117,9 @@ fn bootstrap_event_envelope(
             seq,
             &payload,
         )),
-        AgentBootstrapEvent::SessionSettings(_) | AgentBootstrapEvent::QueuedMessages(_) => None,
+        AgentBootstrapEvent::SessionSettings(_)
+        | AgentBootstrapEvent::QueuedMessages(_)
+        | AgentBootstrapEvent::HasPriorHistory { .. } => None,
     }
     .map(|result| result.expect("serialize AgentBootstrap event"))
 }

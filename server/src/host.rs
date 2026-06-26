@@ -36,25 +36,26 @@ use protocol::{
     ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
     ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
     ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
-    SessionId, SessionListPayload, SessionSchemaEntry, SessionSchemasPayload,
-    SessionSettingsSchema, SessionSummary, SetAgentPinsPayload, SetAgentTagsPayload,
-    SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, SetSettingPayload, Skill,
-    SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
-    SteeringDeletePayload, SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
-    TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
-    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
-    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId,
-    TeamMemberNotifyPayload, TeamMemberRole, TeamMemberShufflePayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberState, TeamMemberUpdatePayload,
-    TeamNotifyPayload, TeamRenamePayload, TeamSetManagerPayload, TerminalCreatePayload, TerminalId,
-    TerminalLaunchTarget, TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowCatalogLocation,
-    WorkflowDiagnostic, WorkflowDiagnosticSeverity, WorkflowInputControl, WorkflowInputSpec,
-    WorkflowNotifyPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
-    WorkflowRunSnapshotStatus, WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse,
-    WorkflowSaveTarget, WorkflowSource, WorkflowSourceScope, WorkflowStepRunId,
-    WorkflowStepRunSnapshot, WorkflowTargetDirectory, WorkflowTargetsResponse,
+    SessionHistoryPayload, SessionId, SessionListPayload, SessionSchemaEntry,
+    SessionSchemasPayload, SessionSettingsSchema, SessionSummary, SetAgentPinsPayload,
+    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
+    SetSettingPayload, Skill, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringScope,
+    SteeringUpsertPayload, StreamPath, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
+    TeamDraftUpdatePayload, TeamId, TeamMember, TeamMemberBindingNotifyPayload,
+    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload,
+    TeamMemberRole, TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload,
+    TeamMemberState, TeamMemberUpdatePayload, TeamNotifyPayload, TeamRenamePayload,
+    TeamSetManagerPayload, TerminalCreatePayload, TerminalId, TerminalLaunchTarget,
+    TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload, WorkbenchCreatePayload,
+    WorkbenchRemovePayload, WorkbenchRoot, WorkflowCatalogLocation, WorkflowDiagnostic,
+    WorkflowDiagnosticSeverity, WorkflowInputControl, WorkflowInputSpec, WorkflowNotifyPayload,
+    WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus,
+    WorkflowSaveMode, WorkflowSaveRequest, WorkflowSaveResponse, WorkflowSaveTarget,
+    WorkflowSource, WorkflowSourceScope, WorkflowStepRunId, WorkflowStepRunSnapshot,
+    WorkflowTargetDirectory, WorkflowTargetsResponse,
 };
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -140,7 +141,15 @@ struct HostSubscriber {
     agent_replay: AgentReplayMode,
     known_agent_streams: HashSet<StreamPath>,
     attached_agent_streams: HashSet<StreamPath>,
+    bootstrapped_agent_streams: HashSet<StreamPath>,
     last_session_schemas: Option<Vec<SessionSchemaEntry>>,
+}
+
+pub(crate) struct DeferredAgentAttachment {
+    host_stream: StreamPath,
+    agent_stream: StreamPath,
+    agent_handle: AgentHandle,
+    stream: Stream,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -513,7 +522,7 @@ impl HostHandle {
         &self,
         host_stream: Stream,
         agent_replay: AgentReplayMode,
-    ) -> Vec<(AgentHandle, Stream)> {
+    ) -> Vec<DeferredAgentAttachment> {
         let backend_setup = self.collect_backend_setup_respecting_probe().await;
         let mut state = self.state.lock().await;
         let host_path = host_stream.path().clone();
@@ -525,6 +534,7 @@ impl HostHandle {
                 agent_replay,
                 known_agent_streams: HashSet::new(),
                 attached_agent_streams: HashSet::new(),
+                bootstrapped_agent_streams: HashSet::new(),
                 last_session_schemas: None,
             },
         );
@@ -772,7 +782,12 @@ impl HostHandle {
             }
             agents.push(new_agent);
             if attach_eagerly {
-                deferred_attachments.push((agent_handle, agent_stream));
+                deferred_attachments.push(DeferredAgentAttachment {
+                    host_stream: host_path.clone(),
+                    agent_stream: instance_stream.clone(),
+                    agent_handle,
+                    stream: agent_stream,
+                });
             }
         }
 
@@ -840,6 +855,26 @@ impl HostHandle {
             self.schedule_session_schema_refresh();
         }
         deferred_attachments
+    }
+
+    pub(crate) async fn attach_deferred_agent_stream(&self, attachment: DeferredAgentAttachment) {
+        let attached = attachment.agent_handle.attach(attachment.stream).await;
+        let mut state = self.state.lock().await;
+        let Some(subscriber) = state.host_streams.get_mut(&attachment.host_stream) else {
+            return;
+        };
+        if attached {
+            subscriber
+                .bootstrapped_agent_streams
+                .insert(attachment.agent_stream);
+        } else {
+            subscriber
+                .attached_agent_streams
+                .remove(&attachment.agent_stream);
+            subscriber
+                .bootstrapped_agent_streams
+                .remove(&attachment.agent_stream);
+        }
     }
 
     pub(crate) async fn unregister_host_stream(&self, path: &StreamPath) {
@@ -2630,7 +2665,7 @@ impl HostHandle {
 
         let mut dead_paths = Vec::new();
         for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
-            if emit_new_agent_for_stream(
+            match emit_new_agent_for_stream(
                 &start,
                 &agent_handle,
                 &stream,
@@ -2639,9 +2674,15 @@ impl HostHandle {
                 activity_summary,
             )
             .await
-            .is_err()
             {
-                dead_paths.push(path);
+                Ok(Some(attachment)) => {
+                    let host = self.clone();
+                    tokio::spawn(async move {
+                        host.attach_deferred_agent_stream(attachment).await;
+                    });
+                }
+                Ok(None) => {}
+                Err(_) => dead_paths.push(path),
             }
         }
         if !dead_paths.is_empty() {
@@ -2785,7 +2826,7 @@ impl HostHandle {
 
         let mut dead_paths = Vec::new();
         for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
-            if emit_new_agent_for_stream(
+            match emit_new_agent_for_stream(
                 &start,
                 &agent_handle,
                 &stream,
@@ -2794,9 +2835,15 @@ impl HostHandle {
                 activity_summary,
             )
             .await
-            .is_err()
             {
-                dead_paths.push(path);
+                Ok(Some(attachment)) => {
+                    let host = self.clone();
+                    tokio::spawn(async move {
+                        host.attach_deferred_agent_stream(attachment).await;
+                    });
+                }
+                Ok(None) => {}
+                Err(_) => dead_paths.push(path),
             }
         }
         if !dead_paths.is_empty() {
@@ -5023,17 +5070,105 @@ impl HostHandle {
         };
 
         if agent_handle.attach(stream).await {
+            let mut state = self.state.lock().await;
+            if let Some(subscriber) = state.host_streams.get_mut(connection_host_stream) {
+                subscriber
+                    .bootstrapped_agent_streams
+                    .insert(agent_stream.clone());
+            }
             Ok(())
         } else {
             let mut state = self.state.lock().await;
             if let Some(subscriber) = state.host_streams.get_mut(connection_host_stream) {
                 subscriber.attached_agent_streams.remove(&agent_stream);
+                subscriber.bootstrapped_agent_streams.remove(&agent_stream);
             }
             Err(AppError::not_found(
                 "load_agent",
                 format!("agent {} is not running", agent_id),
             ))
         }
+    }
+
+    pub(crate) async fn fetch_session_history(
+        &self,
+        connection_host_stream: &StreamPath,
+        host_output_stream: &Stream,
+        agent_stream: StreamPath,
+        payload: protocol::FetchSessionHistoryPayload,
+    ) -> AppResult<()> {
+        if payload.limit == 0 {
+            return Err(AppError::invalid(
+                "fetch_session_history",
+                "limit must be greater than zero",
+            ));
+        }
+
+        let agent_handle = {
+            let state = self.state.lock().await;
+            let subscriber = state
+                .host_streams
+                .get(connection_host_stream)
+                .ok_or_else(|| {
+                    AppError::not_found(
+                        "fetch_session_history",
+                        format!("host stream {} is not registered", connection_host_stream),
+                    )
+                })?;
+            if !subscriber.known_agent_streams.contains(&agent_stream) {
+                return Err(AppError::not_found(
+                    "fetch_session_history",
+                    format!(
+                        "agent stream {} was not advertised on host stream {}",
+                        agent_stream, connection_host_stream
+                    ),
+                ));
+            }
+            if !subscriber
+                .bootstrapped_agent_streams
+                .contains(&agent_stream)
+            {
+                return Err(AppError::invalid(
+                    "fetch_session_history",
+                    format!(
+                        "agent stream {} has not completed AgentBootstrap on host stream {}",
+                        agent_stream, connection_host_stream
+                    ),
+                ));
+            }
+            state
+                .registry
+                .agent_handle(&payload.agent_id)
+                .ok_or_else(|| {
+                    AppError::not_found(
+                        "fetch_session_history",
+                        format!("agent {} is not running", payload.agent_id),
+                    )
+                })?
+        };
+
+        let Some(window) = agent_handle
+            .fetch_session_history(payload.before_seq, payload.limit as usize)
+            .await
+        else {
+            return Err(AppError::not_found(
+                "fetch_session_history",
+                format!("agent {} is not running", payload.agent_id),
+            ));
+        };
+
+        let response = SessionHistoryPayload {
+            agent_id: payload.agent_id,
+            events: window.events,
+            has_more_before: window.has_more_before,
+            oldest_seq: window.oldest_seq,
+        };
+        let response = serde_json::to_value(response)
+            .map_err(|error| AppError::internal("fetch_session_history", error))?;
+        host_output_stream
+            .with_path(agent_stream)
+            .send_value(FrameKind::SessionHistory, response)
+            .map_err(|_| AppError::internal("fetch_session_history", anyhow!("stream closed")))
     }
 
     pub(crate) async fn interrupt_agent(&self, agent_id: &AgentId) -> InterruptOutcome {
@@ -6396,8 +6531,9 @@ impl HostHandle {
             });
 
         let mut dead_paths = Vec::new();
+        let mut deferred_attachments = Vec::new();
         for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
-            if emit_new_agent_for_stream(
+            match emit_new_agent_for_stream(
                 &start,
                 &agent_handle,
                 &stream,
@@ -6406,9 +6542,10 @@ impl HostHandle {
                 activity_summary,
             )
             .await
-            .is_err()
             {
-                dead_paths.push(path);
+                Ok(Some(attachment)) => deferred_attachments.push(attachment),
+                Ok(None) => {}
+                Err(_) => dead_paths.push(path),
             }
         }
         if !dead_paths.is_empty() {
@@ -6416,6 +6553,12 @@ impl HostHandle {
             for path in dead_paths {
                 state.host_streams.remove(&path);
             }
+        }
+        for attachment in deferred_attachments {
+            let host = self.clone();
+            tokio::spawn(async move {
+                host.attach_deferred_agent_stream(attachment).await;
+            });
         }
         {
             let mut state = self.state.lock().await;
@@ -10287,7 +10430,7 @@ async fn emit_new_agent_for_stream(
     instance_stream: StreamPath,
     attach_eagerly: bool,
     activity_summary: AgentActivitySummaryState,
-) -> Result<(), StreamClosed> {
+) -> Result<Option<DeferredAgentAttachment>, StreamClosed> {
     let new_agent = NewAgentPayload {
         agent_id: start.agent_id.clone(),
         name: start.name.clone(),
@@ -10310,17 +10453,14 @@ async fn emit_new_agent_for_stream(
         .expect("failed to serialize NewAgent payload for host stream fanout");
     stream.send_value(FrameKind::NewAgent, payload)?;
 
-    let agent_stream = stream.with_path(instance_stream);
-    if attach_eagerly {
-        let attached = agent_handle.attach(agent_stream).await;
-        assert!(
-            attached,
-            "failed to attach newly spawned agent stream {}; registry is inconsistent",
-            start.agent_id
-        );
-    }
+    let attachment = attach_eagerly.then(|| DeferredAgentAttachment {
+        host_stream: stream.path().clone(),
+        agent_stream: instance_stream.clone(),
+        agent_handle: agent_handle.clone(),
+        stream: stream.with_path(instance_stream),
+    });
 
-    Ok(())
+    Ok(attachment)
 }
 
 async fn fan_out_session_lists(state: &mut HostState) {

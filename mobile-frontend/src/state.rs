@@ -237,6 +237,14 @@ pub struct ChatMessageEntry {
     pub tool_requests: Vec<ToolRequestEntry>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionHistoryState {
+    pub message_count: u32,
+    pub oldest_seq: Option<u64>,
+    pub has_more_before: bool,
+    pub loading: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolRequestEntry {
     pub request: ToolRequest,
@@ -440,22 +448,11 @@ pub struct AppState {
     /// patched in place. Cleared anywhere `chat_messages` is cleared
     /// (host runtime reset, agent close, agent bootstrap snapshot).
     pub chat_message_index: RwSignal<HashMap<AgentRef, HashMap<ChatMessageId, usize>>>,
-    /// Per-agent index of the first chat message the chat view renders. 0 (or
-    /// an absent entry) means "render the whole history". A long restored
-    /// session collapses everything but the last message behind a "Load
-    /// previous conversation history" control; this holds the absolute floor
-    /// it windows from. The AI always keeps the full conversation in context —
-    /// this is purely a UI window. Cleared anywhere `chat_messages` is cleared.
-    /// See [`crate::components::chat_view::initial_history_floor`].
-    pub history_floor: RwSignal<HashMap<AgentRef, usize>>,
-    /// Agents whose restored history is still trickling in (a resumed backend
-    /// re-streams its whole transcript as live events, so a bootstrap snapshot
-    /// may carry only a prefix). While an agent is in this set the floor is
-    /// re-derived as messages arrive so it keeps tracking the tail. Cleared
-    /// when the agent's first new turn begins (a `TypingStatusChanged` going
-    /// active or a local submit starts a turn) or when the user reveals the
-    /// history, and anywhere `chat_messages` is cleared.
-    pub history_settling: RwSignal<HashSet<AgentRef>>,
+    /// Server-owned prior-history availability for each agent. The server
+    /// sends only this indicator in `AgentBootstrap`; actual prior transcript
+    /// rows are fetched explicitly with `FetchSessionHistory` and prepended
+    /// when `SessionHistory` arrives.
+    pub session_history: RwSignal<HashMap<AgentRef, SessionHistoryState>>,
     pub streaming_text: RwSignal<HashMap<AgentRef, StreamingState>>,
     pub chat_input: RwSignal<String>,
     pub task_lists: RwSignal<HashMap<AgentRef, TaskList>>,
@@ -540,8 +537,7 @@ impl AppState {
             agent_loaded: RwSignal::new(HashSet::new()),
             chat_messages: RwSignal::new(HashMap::new()),
             chat_message_index: RwSignal::new(HashMap::new()),
-            history_floor: RwSignal::new(HashMap::new()),
-            history_settling: RwSignal::new(HashSet::new()),
+            session_history: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
             task_lists: RwSignal::new(HashMap::new()),
@@ -584,45 +580,20 @@ impl AppState {
     /// window for any single observer (each signal is internally
     /// consistent), and consumers only ever read the index after they
     /// can see the row that produced it.
-    /// Drop the history-window state (floor + settling flag) for a single
-    /// agent. Call wherever `chat_messages` is cleared for that agent so a
-    /// re-bootstrap starts from a clean window with no orphaned floor.
-    pub fn forget_history_window(&self, agent_ref: &AgentRef) {
-        self.history_floor.update(|map| {
+    /// Drop server-provided prior-history state for a single agent. Call
+    /// wherever `chat_messages` is cleared for that agent so a re-bootstrap
+    /// starts from the server's new authoritative indicator.
+    pub fn forget_session_history(&self, agent_ref: &AgentRef) {
+        self.session_history.update(|map| {
             map.remove(agent_ref);
-        });
-        self.history_settling.update(|set| {
-            set.remove(agent_ref);
-        });
-    }
-
-    pub fn stop_history_settling(&self, agent_ref: &AgentRef) {
-        self.history_settling.update(|set| {
-            set.remove(agent_ref);
         });
     }
 
     pub fn push_chat_message_entry(&self, agent_ref: &AgentRef, entry: ChatMessageEntry) {
         let message_id = entry.message.message_id.clone();
-        let new_len = self.chat_messages.try_update(|messages| {
-            let agent_messages = messages.entry(agent_ref.clone()).or_default();
-            agent_messages.push(entry);
-            agent_messages.len()
+        self.chat_messages.update(|messages| {
+            messages.entry(agent_ref.clone()).or_default().push(entry);
         });
-        // While a resumed agent is still replaying its restored history, keep
-        // the render floor tracking the tail so trickled-in old messages stay
-        // hidden behind the "Load previous" control. Genuinely-new turns clear
-        // the settling flag first, so live conversation accumulates visibly.
-        if let Some(new_len) = new_len
-            && self
-                .history_settling
-                .with_untracked(|set| set.contains(agent_ref))
-        {
-            let floor = crate::components::chat_view::initial_history_floor(new_len);
-            self.history_floor.update(|map| {
-                map.insert(agent_ref.clone(), floor);
-            });
-        }
         if let Some(message_id) = message_id {
             let position = self
                 .chat_messages
@@ -853,11 +824,8 @@ impl AppState {
         self.chat_message_index.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
         });
-        self.history_floor.update(|m| {
+        self.session_history.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
-        });
-        self.history_settling.update(|s| {
-            s.retain(|k| k.local_host_id != *host);
         });
         self.streaming_text.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);

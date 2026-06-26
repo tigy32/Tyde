@@ -12,32 +12,33 @@ use protocol::{
     AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
     BackendSetupPayload, BrowseBootstrapPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
     CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
-    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FrameError, FrameKind, HelloPayload,
-    HostBootstrapPayload, HostBrowseStartPayload, HostSettingsPayload, InterruptPayload,
-    ListSessionsPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
-    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
-    PROTOCOL_VERSION, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload, RejectPayload,
-    ReviewActionPayload, ReviewBootstrapPayload, ReviewCreatePayload, ReviewEventPayload, ReviewId,
-    ReviewSubscribePayload, SendMessagePayload, SendQueuedMessageNowPayload, SeqValidator,
-    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
-    SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
-    StreamPath, TYDE_VERSION, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
-    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
-    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
-    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
-    TeamMemberUpdatePayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload,
-    TeamSetManagerPayload, TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload,
-    TerminalErrorPayload, TerminalExitPayload, TerminalId, TerminalOutputPayload,
-    TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, TriggerWorkflowPayload,
-    Version, WelcomePayload, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload,
-    WorkflowRefreshPayload, WorkflowRunNotifyPayload, read_envelope, write_envelope,
+    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload,
+    FrameError, FrameKind, HelloPayload, HostBootstrapPayload, HostBrowseStartPayload,
+    HostSettingsPayload, InterruptPayload, ListSessionsPayload, McpServerDeletePayload,
+    McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
+    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, PROTOCOL_VERSION,
+    ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectListDirPayload, ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload,
+    ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
+    QueuedMessagesPayload, RejectPayload, ReviewActionPayload, ReviewBootstrapPayload,
+    ReviewCreatePayload, ReviewEventPayload, ReviewId, ReviewSubscribePayload, SendMessagePayload,
+    SendQueuedMessageNowPayload, SeqValidator, SessionHistoryPayload, SessionListPayload,
+    SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload,
+    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
+    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath, TYDE_VERSION,
+    TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
+    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
+    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberNotifyPayload, TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
+    TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
+    TerminalSendPayload, TerminalStartPayload, TriggerWorkflowPayload, Version, WelcomePayload,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
+    WorkflowRunNotifyPayload, read_envelope, write_envelope,
 };
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader};
 #[cfg(unix)]
@@ -638,6 +639,26 @@ impl Connection {
         write_envelope(&mut self.writer, &envelope).await
     }
 
+    pub async fn fetch_session_history(
+        &mut self,
+        stream: &StreamPath,
+        payload: FetchSessionHistoryPayload,
+    ) -> Result<(), FrameError> {
+        let seq =
+            self.outgoing_seq.get(stream).copied().expect(
+                "fetch_session_history on unknown stream — AgentStart must be received first",
+            );
+        let envelope = Envelope::from_payload(
+            stream.clone(),
+            FrameKind::FetchSessionHistory,
+            seq,
+            &payload,
+        )
+        .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
     pub async fn set_agent_name(
         &mut self,
         stream: &StreamPath,
@@ -1003,6 +1024,21 @@ impl Connection {
                     assert!(
                         self.outgoing_seq.contains_key(&envelope.stream),
                         "ChatEvent on stream {} before NewAgent",
+                        envelope.stream
+                    );
+                }
+                FrameKind::SessionHistory => {
+                    let payload: SessionHistoryPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    let stream_parts = parse_agent_stream(&envelope.stream);
+                    assert_eq!(
+                        payload.agent_id, stream_parts.agent_id,
+                        "session_history payload agent_id {} does not match stream {}",
+                        payload.agent_id, envelope.stream
+                    );
+                    assert!(
+                        self.outgoing_seq.contains_key(&envelope.stream),
+                        "SessionHistory on stream {} before NewAgent",
                         envelope.stream
                     );
                 }

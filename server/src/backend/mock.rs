@@ -54,6 +54,7 @@ const MOCK_EXIT_PLAN_MODE_STREAM_END_FIRST_SENTINEL: &str =
     "__mock_exit_plan_mode_stream_end_first__";
 const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
 const MOCK_HISTORY_SENTINEL: &str = "__mock_history__";
+const MOCK_CLOSE_RESUME_BEFORE_BARRIER_SENTINEL: &str = "__mock_close_resume_before_barrier__";
 const MOCK_FAILED_TOOL_CALL_ID: &str = "mock-failed-tool";
 const MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID: &str = "mock-exit-plan-tool";
 const MOCK_EXIT_PLAN_MODE_PLAN: &str = "# Plan\n\nApprove the mock plan.";
@@ -70,6 +71,7 @@ const MOCK_SLOW_SLEEP_MS: u64 = 4_000;
 /// Sleep for __mock_die_after_busy__ — just enough for tests to queue messages.
 const MOCK_DIE_SLEEP_MS: u64 = 300;
 const MOCK_EXIT_PLAN_MODE_RESUME_DELAY_MS: u64 = 1_000;
+const MOCK_RESUME_REPLAY_DELAY_MS: u64 = 25;
 
 struct PendingExitPlanMode {
     tool_call_id: String,
@@ -234,13 +236,14 @@ impl Backend for MockBackend {
             })
             .collect::<Vec<_>>();
         let resolved_spawn_config = config.resolved_spawn_config.clone();
-        {
+        let replay_prompts = {
             let mut store = session_store()
                 .lock()
                 .expect("mock backend session store mutex poisoned");
             let Some(record) = store.get_mut(&session_id.0) else {
                 return Err(format!("unknown mock session {}", session_id.0));
             };
+            let replay_prompts = record.prompts.clone();
             record.workspace_roots = workspace_roots;
             record.startup_mcp_servers = startup_mcp_servers;
             record.instructions = resolved_spawn_config.instructions;
@@ -253,18 +256,41 @@ impl Backend for MockBackend {
             record.tool_policy = resolved_spawn_config.tool_policy;
             record.access_mode = resolved_spawn_config.access_mode;
             record.updated_at_ms = now_ms();
-        }
+            replay_prompts
+        };
 
         let (command_tx, command_rx) = mpsc::unbounded_channel::<MockCommand>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (resume_replay_complete_tx, resume_replay_complete_rx) =
+            tokio::sync::oneshot::channel();
         let (subagent_emitter_tx, subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
         let session_id_for_task = session_id.clone();
 
+        if replay_prompts
+            .iter()
+            .any(|prompt| prompt.contains(MOCK_CLOSE_RESUME_BEFORE_BARRIER_SENTINEL))
+        {
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                drop(events_tx);
+                sleep(Duration::from_secs(5)).await;
+                drop(resume_replay_complete_tx);
+            });
+            return Ok((
+                Self {
+                    command_tx,
+                    session_id,
+                    subagent_emitter_tx,
+                },
+                EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
+            ));
+        }
+
         start_mock_command_loop(
             session_id_for_task,
             command_rx,
-            events_tx,
+            events_tx.clone(),
             subagent_emitter_rx,
             MockLoopConfig {
                 initial_message: None,
@@ -274,13 +300,20 @@ impl Backend for MockBackend {
             },
         );
 
+        let replay_session_id = session_id.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(MOCK_RESUME_REPLAY_DELAY_MS)).await;
+            emit_mock_resume_history(&events_tx, &replay_session_id, &replay_prompts);
+            let _ = resume_replay_complete_tx.send(());
+        });
+
         Ok((
             Self {
                 command_tx,
                 session_id,
                 subagent_emitter_tx,
             },
-            EventStream::new(events_rx),
+            EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
         ))
     }
 
@@ -670,6 +703,35 @@ fn mock_prompt_history(session_id: &SessionId) -> Vec<String> {
         .get(&session_id.0)
         .map(|record| record.prompts.clone())
         .unwrap_or_default()
+}
+
+fn emit_mock_resume_history(
+    events_tx: &mpsc::UnboundedSender<ChatEvent>,
+    session_id: &SessionId,
+    prompts: &[String],
+) {
+    for prompt in prompts {
+        let content = format!(
+            "{}mock backend response to: {prompt}",
+            startup_mcp_response_prefix(session_id)
+        );
+        let _ = events_tx.send(ChatEvent::MessageAdded(ChatMessage {
+            message_id: Some(protocol::ChatMessageId(Uuid::new_v4().to_string())),
+            timestamp: now_ms(),
+            sender: MessageSender::Assistant {
+                agent: "mock".to_owned(),
+            },
+            content,
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: Some(ModelInfo {
+                model: MOCK_MODEL.to_owned(),
+            }),
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        }));
+    }
 }
 
 async fn emit_turn(

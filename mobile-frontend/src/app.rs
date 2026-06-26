@@ -684,11 +684,8 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
     state.chat_message_index.update(|m| {
         m.retain(|k, _| k.local_host_id != *host);
     });
-    state.history_floor.update(|m| {
+    state.session_history.update(|m| {
         m.retain(|k, _| k.local_host_id != *host);
-    });
-    state.history_settling.update(|s| {
-        s.retain(|k| k.local_host_id != *host);
     });
     state.streaming_text.update(|m| {
         m.retain(|k, _| k.local_host_id != *host);

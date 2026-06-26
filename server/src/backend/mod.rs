@@ -18,7 +18,7 @@ use protocol::{
     SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
 };
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use self::subprocess::ImageAttachment;
 use crate::agent::customization::ResolvedSpawnConfig;
@@ -150,17 +150,35 @@ pub struct BackendSpawnConfig {
 /// through the Backend handle — true duplex.
 pub struct EventStream {
     rx: mpsc::UnboundedReceiver<ChatEvent>,
+    resume_replay_complete: Option<oneshot::Receiver<()>>,
 }
 
 impl EventStream {
     pub fn new(rx: mpsc::UnboundedReceiver<ChatEvent>) -> Self {
-        Self { rx }
+        Self {
+            rx,
+            resume_replay_complete: None,
+        }
+    }
+
+    pub fn new_with_resume_replay_barrier(
+        rx: mpsc::UnboundedReceiver<ChatEvent>,
+        resume_replay_complete: oneshot::Receiver<()>,
+    ) -> Self {
+        Self {
+            rx,
+            resume_replay_complete: Some(resume_replay_complete),
+        }
     }
 
     /// Receive the next ChatEvent from the backend.
     /// Returns None when the backend has terminated.
     pub async fn recv(&mut self) -> Option<ChatEvent> {
         self.rx.recv().await
+    }
+
+    pub fn take_resume_replay_complete(&mut self) -> Option<oneshot::Receiver<()>> {
+        self.resume_replay_complete.take()
     }
 }
 

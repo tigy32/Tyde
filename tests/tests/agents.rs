@@ -7,10 +7,11 @@ use protocol::{
     AgentBootstrapPayload, AgentControlStatus, AgentErrorCode, AgentErrorPayload, AgentOrigin,
     AgentRenamedPayload, AgentStartPayload, BackendKind, BackgroundAgentFeature, ChatEvent,
     ClientErrorCode, ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope,
-    FrameKind, HostBootstrapPayload, HostSettingValue, HostSettingsPayload, ListSessionsPayload,
-    MessageSender, NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectId, ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath,
-    SendMessagePayload, SendMessageToolResponse, SessionListPayload, SetSettingPayload,
+    FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload, HostSettingValue,
+    HostSettingsPayload, ListSessionsPayload, MessageSender, NewAgentPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectId,
+    ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SendMessagePayload,
+    SendMessageToolResponse, SessionHistoryPayload, SessionListPayload, SetSettingPayload,
     SpawnAgentParams, SpawnAgentPayload, StreamPath, ToolExecutionCompletedData,
     ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
 };
@@ -83,7 +84,7 @@ fn record_agent_bootstrap_events(
         .events
         .into_iter()
         .enumerate()
-        .map(|(index, event)| agent_bootstrap_event_envelope(stream, index as u64, event));
+        .filter_map(|(index, event)| agent_bootstrap_event_envelope(stream, index as u64, event));
     let first = events.next();
     let mut rest = events.collect::<VecDeque<_>>();
     if !rest.is_empty() {
@@ -101,25 +102,41 @@ fn agent_bootstrap_event_envelope(
     stream: &StreamPath,
     seq: u64,
     event: AgentBootstrapEvent,
-) -> Envelope {
+) -> Option<Envelope> {
     match event {
-        AgentBootstrapEvent::AgentStart(payload) => {
-            Envelope::from_payload(stream.clone(), FrameKind::AgentStart, seq, &payload)
-        }
-        AgentBootstrapEvent::AgentError(payload) => {
-            Envelope::from_payload(stream.clone(), FrameKind::AgentError, seq, &payload)
-        }
-        AgentBootstrapEvent::SessionSettings(payload) => {
-            Envelope::from_payload(stream.clone(), FrameKind::SessionSettings, seq, &payload)
-        }
-        AgentBootstrapEvent::QueuedMessages(payload) => {
-            Envelope::from_payload(stream.clone(), FrameKind::QueuedMessages, seq, &payload)
-        }
-        AgentBootstrapEvent::ChatEvent(payload) => {
-            Envelope::from_payload(stream.clone(), FrameKind::ChatEvent, seq, &payload)
-        }
+        AgentBootstrapEvent::AgentStart(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::AgentStart,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::AgentError(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::AgentError,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::SessionSettings(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::SessionSettings,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::QueuedMessages(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::QueuedMessages,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::ChatEvent(payload) => Some(Envelope::from_payload(
+            stream.clone(),
+            FrameKind::ChatEvent,
+            seq,
+            &payload,
+        )),
+        AgentBootstrapEvent::HasPriorHistory { .. } => None,
     }
-    .expect("serialize synthetic bootstrap event")
+    .map(|result| result.expect("serialize synthetic bootstrap event"))
 }
 
 fn pop_pending_agent_event(stream: &StreamPath, kind: FrameKind) -> Option<Envelope> {
@@ -133,6 +150,18 @@ fn pop_pending_agent_event(stream: &StreamPath, kind: FrameKind) -> Option<Envel
         pending.remove(stream);
     }
     env
+}
+
+fn push_pending_agent_event(env: Envelope) {
+    if !env.stream.0.starts_with("/agent/") {
+        return;
+    }
+    pending_agent_events()
+        .lock()
+        .expect("pending agent event mutex poisoned")
+        .entry(env.stream.clone())
+        .or_default()
+        .push_back(env);
 }
 
 /// Wait for the first envelope of a specific kind, skipping noise frames.
@@ -669,7 +698,10 @@ async fn expect_turn_on_stream(
 ) {
     let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(true)").await;
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+    assert!(
+        matches!(event, ChatEvent::TypingStatusChanged(true)),
+        "expected TypingStatusChanged(true) on {stream}, got {event:?}"
+    );
 
     let env = expect_chat_event_on_stream(client, stream, "StreamStart").await;
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
@@ -830,29 +862,40 @@ async fn expect_operation_cancelled_on_stream(
 async fn expect_replayed_turn_on_stream(
     client: &mut client::Connection,
     stream: &StreamPath,
+    agent_id: &protocol::AgentId,
     expected_text: &str,
 ) {
-    let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(true)").await;
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+    client
+        .fetch_session_history(
+            stream,
+            FetchSessionHistoryPayload {
+                agent_id: agent_id.clone(),
+                before_seq: None,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("fetch_session_history failed");
 
-    let env = expect_chat_event_on_stream(client, stream, "MessageAdded").await;
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    match &event {
-        ChatEvent::MessageAdded(message) => {
-            assert!(
-                message.content.contains(expected_text),
-                "unexpected replayed message text on {}: {}",
-                stream,
-                message.content,
-            );
+    let history = loop {
+        let env = expect_next_event(client, "SessionHistory").await;
+        if env.kind != FrameKind::SessionHistory || env.stream != *stream {
+            continue;
         }
-        other => panic!("expected replayed MessageAdded on {stream}, got {other:?}"),
-    }
-
-    let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(false)").await;
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+        break env
+            .parse_payload::<SessionHistoryPayload>()
+            .expect("parse SessionHistoryPayload");
+    };
+    assert!(
+        history.events.iter().any(|event| match event {
+            ChatEvent::MessageAdded(message) => message.content.contains(expected_text),
+            ChatEvent::StreamEnd(data) => data.message.content.contains(expected_text),
+            ChatEvent::StreamDelta(delta) => delta.text.contains(expected_text),
+            _ => false,
+        }),
+        "expected fetched session history on {stream} to contain {expected_text:?}, got {:?}",
+        history.events
+    );
 }
 
 async fn expect_chat_event_on_stream(
@@ -1030,6 +1073,7 @@ async fn expect_replayed_new_agent(
     loop {
         let env = expect_next_event(client, context).await;
         if env.kind != FrameKind::NewAgent {
+            push_pending_agent_event(env);
             continue;
         }
         let payload: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
@@ -2683,6 +2727,7 @@ async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
     expect_replayed_turn_on_stream(
         &mut late_client,
         &replayed_child_new.instance_stream,
+        &replayed_child_new.agent_id,
         "mock native child response to: parent prompt",
     )
     .await;
@@ -3984,6 +4029,7 @@ async fn late_joining_client_gets_replay() {
     expect_replayed_turn_on_stream(
         &mut client2,
         &client2_instance_stream,
+        &agent_id,
         "mock backend response to: late join replay",
     )
     .await;

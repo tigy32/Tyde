@@ -43,6 +43,7 @@ use self::registry::{
 
 const IMAGE_ONLY_AGENT_NAME: &str = "Image Review Task";
 const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const RESUME_REPLAY_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const DEFAULT_COMPACTION_SUMMARY_MAX_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_COMPACTION_SUMMARY_BYTES: usize = 128 * 1024;
 
@@ -69,6 +70,25 @@ struct TerminalFailureContext<'a> {
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     queue: &'a mut VecDeque<QueuedMessageEntry>,
+}
+
+struct InitialFollowUpContext<'a> {
+    backend: &'a mut Option<BackendHandle>,
+    in_turn: &'a mut bool,
+    idle_transition_armed: &'a mut bool,
+    session_store: &'a Arc<Mutex<SessionStore>>,
+    current_session_id: Option<&'a SessionId>,
+    pending_alias: &'a mut Option<InitialAgentAlias>,
+    current_start: &'a mut AgentStartPayload,
+    start_tx: &'a watch::Sender<AgentStartPayload>,
+    accepting_input: &'a Arc<AtomicBool>,
+    status_handle: &'a registry::AgentStatusHandle,
+    canonical_stream: &'a str,
+    event_log: &'a mut Vec<Envelope>,
+    replay_state: &'a mut AgentReplayState,
+    subscribers: &'a mut Vec<Stream>,
+    queue: &'a mut VecDeque<QueuedMessageEntry>,
+    rx: &'a mut mpsc::UnboundedReceiver<AgentCommand>,
 }
 
 struct AgentNameChangeContext<'a> {
@@ -101,6 +121,14 @@ enum AgentCommand {
         limit: usize,
         reply: oneshot::Sender<Vec<Envelope>>,
     },
+    FetchSessionHistory {
+        before_seq: Option<u64>,
+        limit: usize,
+        reply: oneshot::Sender<SessionHistoryWindow>,
+    },
+    ResumeReplayBarrier {
+        result: Result<(), String>,
+    },
     ReadActivityHistory {
         after_seq: Option<u64>,
         max_events: usize,
@@ -113,7 +141,10 @@ enum AgentCommand {
     Close {
         reply: oneshot::Sender<()>,
     },
-    Attach(Stream),
+    Attach {
+        stream: Stream,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +160,13 @@ pub(crate) struct AgentActivityHistorySnapshot {
     pub through_seq: Option<u64>,
     pub event_count: usize,
     pub active_stream_included: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionHistoryWindow {
+    pub events: Vec<ChatEvent>,
+    pub has_more_before: bool,
+    pub oldest_seq: Option<u64>,
 }
 
 pub(crate) enum CompactionStart {
@@ -312,6 +350,26 @@ impl AgentHandle {
         reply_rx.await.ok()
     }
 
+    pub async fn fetch_session_history(
+        &self,
+        before_seq: Option<u64>,
+        limit: usize,
+    ) -> Option<SessionHistoryWindow> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::FetchSessionHistory {
+                before_seq,
+                limit,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return None;
+        }
+        reply_rx.await.ok()
+    }
+
     pub async fn read_activity_history(
         &self,
         after_seq: Option<u64>,
@@ -360,7 +418,18 @@ impl AgentHandle {
     }
 
     pub async fn attach(&self, stream: Stream) -> bool {
-        self.tx.send(AgentCommand::Attach(stream)).is_ok()
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::Attach {
+                stream,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.await.unwrap_or(false)
     }
 }
 
@@ -917,6 +986,7 @@ pub(crate) fn spawn_agent_actor(
     let accepting_input_task = Arc::clone(&accepting_input);
     let (startup_tx, startup_rx) = oneshot::channel();
     let (start_tx, start_rx) = watch::channel(start.clone());
+    let actor_tx = tx.clone();
 
     tokio::spawn(async move {
         let ResolvedSpawnRequest {
@@ -972,6 +1042,7 @@ pub(crate) fn spawn_agent_actor(
             "spawn request cannot both resume and fork a session"
         );
         let starts_with_initial_turn = resume_session_id.is_none();
+        let is_resume = resume_session_id.is_some();
 
         let startup_result: Result<
             (
@@ -1127,6 +1198,17 @@ pub(crate) fn spawn_agent_actor(
         current_session_id = Some(actor_session_id.clone());
         current_start.session_id = Some(actor_session_id.clone());
         let _ = start_tx.send(current_start.clone());
+        let mut resume_replay_gate_pending = false;
+        let mut pending_resume_attaches: Vec<(Stream, oneshot::Sender<bool>)> = Vec::new();
+        let mut resume_replay_barrier_task = None;
+        if is_resume && let Some(barrier_rx) = events.take_resume_replay_complete() {
+            resume_replay_gate_pending = true;
+            resume_replay_barrier_task = Some(spawn_resume_replay_barrier_task(
+                actor_tx.clone(),
+                barrier_rx,
+                current_start.agent_id.clone(),
+            ));
+        }
         if let Err(err) = persist_agent_session(
             &session_store,
             &actor_session_id,
@@ -1145,7 +1227,7 @@ pub(crate) fn spawn_agent_actor(
             );
         }
         let _ = startup_tx.send(Ok(actor_session_id.clone()));
-        accepting_input_task.store(true, Ordering::SeqCst);
+        accepting_input_task.store(!resume_replay_gate_pending, Ordering::SeqCst);
         status_handle
             .update(|s| {
                 s.started = true;
@@ -1194,53 +1276,40 @@ pub(crate) fn spawn_agent_actor(
         )
         .await;
 
-        if let Some(input) = initial_follow_up.filter(|input| {
+        let mut initial_follow_up = initial_follow_up.filter(|input| {
             !input.message.trim().is_empty()
                 || input
                     .images
                     .as_ref()
                     .is_some_and(|images| !images.is_empty())
-        }) {
-            in_turn = true;
-            idle_transition_armed = false;
-            if !backend
-                .as_ref()
-                .expect("backend must exist after successful startup")
-                .send(AgentInput::SendMessage(input))
-                .await
-            {
-                let payload = AgentErrorPayload {
-                    agent_id: current_start.agent_id.clone(),
-                    code: AgentErrorCode::Internal,
-                    message: "agent backend closed".to_owned(),
-                    fatal: true,
-                };
-                enter_terminal_failure(
-                    TerminalFailureContext {
-                        accepting_input: &accepting_input_task,
-                        status_handle: &status_handle,
-                        canonical_stream: &canonical_stream,
-                        event_log: &mut event_log,
-                        replay_state: &mut replay_state,
-                        subscribers: &mut subscribers,
-                        queue: &mut queue,
-                    },
-                    &payload,
-                )
-                .await;
-                park_terminal_agent(
-                    &session_store,
-                    current_session_id.as_ref(),
-                    &mut pending_alias,
-                    &mut current_start,
-                    &start_tx,
-                    &mut event_log,
-                    &mut subscribers,
-                    &mut rx,
-                )
-                .await;
-                return;
-            }
+        });
+        if !resume_replay_gate_pending
+            && let Some(input) = initial_follow_up.take()
+            && !send_initial_follow_up_or_park(
+                input,
+                InitialFollowUpContext {
+                    backend: &mut backend,
+                    in_turn: &mut in_turn,
+                    idle_transition_armed: &mut idle_transition_armed,
+                    session_store: &session_store,
+                    current_session_id: current_session_id.as_ref(),
+                    pending_alias: &mut pending_alias,
+                    current_start: &mut current_start,
+                    start_tx: &start_tx,
+                    accepting_input: &accepting_input_task,
+                    status_handle: &status_handle,
+                    canonical_stream: &canonical_stream,
+                    event_log: &mut event_log,
+                    replay_state: &mut replay_state,
+                    subscribers: &mut subscribers,
+                    queue: &mut queue,
+                    rx: &mut rx,
+                },
+            )
+            .await
+        {
+            abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
+            return;
         }
 
         loop {
@@ -1252,6 +1321,51 @@ pub(crate) fn spawn_agent_actor(
                                 .reply
                                 .send(Err("agent backend closed during compaction".to_owned()));
                         }
+                        if resume_replay_gate_pending {
+                            let payload = AgentErrorPayload {
+                                agent_id: current_start.agent_id.clone(),
+                                code: AgentErrorCode::BackendFailed,
+                                message: "agent backend closed before resume replay completed"
+                                    .to_owned(),
+                                fatal: true,
+                            };
+                            enter_terminal_failure(
+                                TerminalFailureContext {
+                                    accepting_input: &accepting_input_task,
+                                    status_handle: &status_handle,
+                                    canonical_stream: &canonical_stream,
+                                    event_log: &mut event_log,
+                                    replay_state: &mut replay_state,
+                                    subscribers: &mut subscribers,
+                                    queue: &mut queue,
+                                },
+                                &payload,
+                            )
+                            .await;
+                            flush_pending_resume_attaches(
+                                &event_log,
+                                None,
+                                &mut subscribers,
+                                &mut pending_resume_attaches,
+                            );
+                            abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
+                            if let Some(backend) = backend.take() {
+                                shutdown_backend_with_timeout(backend, &current_start.agent_id)
+                                    .await;
+                            }
+                            park_terminal_agent(
+                                &session_store,
+                                current_session_id.as_ref(),
+                                &mut pending_alias,
+                                &mut current_start,
+                                &start_tx,
+                                &mut event_log,
+                                &mut subscribers,
+                                &mut rx,
+                            )
+                            .await;
+                            return;
+                        }
                         if matches!(lifecycle, ActorLifecycle::Closing) {
                             let reply = close_reply
                                 .take()
@@ -1259,6 +1373,7 @@ pub(crate) fn spawn_agent_actor(
                             if let Some(backend) = backend.take() {
                                 shutdown_backend_with_timeout(backend, &current_start.agent_id).await;
                             }
+                            abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                             finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                             return;
                         }
@@ -1294,6 +1409,15 @@ pub(crate) fn spawn_agent_actor(
                         .await;
                         return;
                     };
+                    if resume_replay_gate_pending {
+                        record_chat_event_for_replay(
+                            &canonical_stream,
+                            &mut event_log,
+                            &mut replay_state,
+                            &event,
+                        );
+                        continue;
+                    }
                     let mut real_idle_transition = false;
                     let mut synthesize_idle_after_error = false;
                     match &event {
@@ -1530,6 +1654,7 @@ pub(crate) fn spawn_agent_actor(
                             .take()
                             .expect("backend must exist while closing a live actor");
                         shutdown_backend_with_timeout(backend, &current_start.agent_id).await;
+                        abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                         finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                         return;
                     }
@@ -1647,6 +1772,101 @@ pub(crate) fn spawn_agent_actor(
                         break;
                     };
                     match command {
+                        AgentCommand::ResumeReplayBarrier { result } => {
+                            if !resume_replay_gate_pending {
+                                continue;
+                            }
+                            resume_replay_gate_pending = false;
+                            match result {
+                                Ok(()) => {
+                                    accepting_input_task.store(true, Ordering::SeqCst);
+                                    flush_pending_resume_attaches(
+                                        &event_log,
+                                        Some(&replay_state),
+                                        &mut subscribers,
+                                        &mut pending_resume_attaches,
+                                    );
+                                    if let Some(input) = initial_follow_up.take()
+                                        && !send_initial_follow_up_or_park(
+                                            input,
+                                            InitialFollowUpContext {
+                                                backend: &mut backend,
+                                                in_turn: &mut in_turn,
+                                                idle_transition_armed: &mut idle_transition_armed,
+                                                session_store: &session_store,
+                                                current_session_id: current_session_id.as_ref(),
+                                                pending_alias: &mut pending_alias,
+                                                current_start: &mut current_start,
+                                                start_tx: &start_tx,
+                                                accepting_input: &accepting_input_task,
+                                                status_handle: &status_handle,
+                                                canonical_stream: &canonical_stream,
+                                                event_log: &mut event_log,
+                                                replay_state: &mut replay_state,
+                                                subscribers: &mut subscribers,
+                                                queue: &mut queue,
+                                                rx: &mut rx,
+                                            },
+                                        )
+                                        .await
+                                    {
+                                        abort_resume_replay_barrier_task(
+                                            &mut resume_replay_barrier_task,
+                                        );
+                                        return;
+                                    }
+                                }
+                                Err(err) => {
+                                    accepting_input_task.store(false, Ordering::SeqCst);
+                                    let payload = AgentErrorPayload {
+                                        agent_id: current_start.agent_id.clone(),
+                                        code: AgentErrorCode::BackendFailed,
+                                        message: format!(
+                                            "failed to resume agent history before live replay boundary: {err}"
+                                        ),
+                                        fatal: true,
+                                    };
+                                    enter_terminal_failure(
+                                        TerminalFailureContext {
+                                            accepting_input: &accepting_input_task,
+                                            status_handle: &status_handle,
+                                            canonical_stream: &canonical_stream,
+                                            event_log: &mut event_log,
+                                            replay_state: &mut replay_state,
+                                            subscribers: &mut subscribers,
+                                            queue: &mut queue,
+                                        },
+                                        &payload,
+                                    )
+                                    .await;
+                                    flush_pending_resume_attaches(
+                                        &event_log,
+                                        None,
+                                        &mut subscribers,
+                                        &mut pending_resume_attaches,
+                                    );
+                                    if let Some(backend) = backend.take() {
+                                        shutdown_backend_with_timeout(
+                                            backend,
+                                            &current_start.agent_id,
+                                        )
+                                        .await;
+                                    }
+                                    park_terminal_agent(
+                                        &session_store,
+                                        current_session_id.as_ref(),
+                                        &mut pending_alias,
+                                        &mut current_start,
+                                        &start_tx,
+                                        &mut event_log,
+                                        &mut subscribers,
+                                        &mut rx,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                        }
                         AgentCommand::SendInput(input) => {
                             if matches!(lifecycle, ActorLifecycle::Closing) {
                                 continue;
@@ -2227,6 +2447,14 @@ pub(crate) fn spawn_agent_actor(
                         } => {
                             let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                         }
+                        AgentCommand::FetchSessionHistory {
+                            before_seq,
+                            limit,
+                            reply,
+                        } => {
+                            let _ =
+                                reply.send(session_history_window(&event_log, before_seq, limit));
+                        }
                         AgentCommand::ReadActivityHistory {
                             after_seq,
                             max_events,
@@ -2318,17 +2546,23 @@ pub(crate) fn spawn_agent_actor(
                                     .take()
                                     .expect("backend must exist while closing a live actor");
                                 shutdown_backend_with_timeout(backend, &current_start.agent_id).await;
+                                abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                                 finish_actor_close(&accepting_input_task, &status_handle, reply).await;
                                 return;
                             }
                         }
-                        AgentCommand::Attach(stream) => {
-                            attach_subscriber(
+                        AgentCommand::Attach { stream, reply } => {
+                            if resume_replay_gate_pending {
+                                pending_resume_attaches.push((stream, reply));
+                                continue;
+                            }
+                            let attached = attach_subscriber(
                                 &event_log,
                                 Some(&replay_state),
                                 &mut subscribers,
                                 stream,
                             );
+                            let _ = reply.send(attached);
                         }
                     }
                 }
@@ -2538,6 +2772,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         return;
                     };
                     match command {
+                        AgentCommand::ResumeReplayBarrier { .. } => {}
                         AgentCommand::Compact { reply, .. } => {
                             let _ = reply.send(Err("backend-native agents cannot be compacted".to_owned()));
                         }
@@ -2595,6 +2830,14 @@ pub(crate) fn spawn_relay_agent_actor(
                         } => {
                             let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                         }
+                        AgentCommand::FetchSessionHistory {
+                            before_seq,
+                            limit,
+                            reply,
+                        } => {
+                            let _ =
+                                reply.send(session_history_window(&event_log, before_seq, limit));
+                        }
                         AgentCommand::ReadActivityHistory {
                             after_seq,
                             max_events,
@@ -2629,13 +2872,14 @@ pub(crate) fn spawn_relay_agent_actor(
                                 return;
                             }
                         }
-                        AgentCommand::Attach(stream) => {
-                            attach_subscriber(
+                        AgentCommand::Attach { stream, reply } => {
+                            let attached = attach_subscriber(
                                 &event_log,
                                 Some(&replay_state),
                                 &mut subscribers,
                                 stream,
                             );
+                            let _ = reply.send(attached);
                         }
                     }
                 }
@@ -2800,6 +3044,7 @@ async fn park_terminal_agent(
             break;
         };
         match command {
+            AgentCommand::ResumeReplayBarrier { .. } => {}
             AgentCommand::SetName {
                 name,
                 persistence,
@@ -2828,6 +3073,13 @@ async fn park_terminal_agent(
             } => {
                 let _ = reply.send(output_events_since(event_log, after_seq, limit));
             }
+            AgentCommand::FetchSessionHistory {
+                before_seq,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(session_history_window(event_log, before_seq, limit));
+            }
             AgentCommand::ReadActivityHistory {
                 after_seq,
                 max_events,
@@ -2838,8 +3090,9 @@ async fn park_terminal_agent(
                     event_log, None, after_seq, max_events, max_bytes,
                 ));
             }
-            AgentCommand::Attach(stream) => {
-                attach_subscriber(event_log, None, subscribers, stream);
+            AgentCommand::Attach { stream, reply } => {
+                let attached = attach_subscriber(event_log, None, subscribers, stream);
+                let _ = reply.send(attached);
             }
             AgentCommand::Close { reply } => {
                 let _ = reply.send(());
@@ -2878,6 +3131,7 @@ async fn park_relay_terminal_agent(
             break;
         };
         match command {
+            AgentCommand::ResumeReplayBarrier { .. } => {}
             AgentCommand::SetName {
                 name,
                 persistence,
@@ -2906,6 +3160,13 @@ async fn park_relay_terminal_agent(
             } => {
                 let _ = reply.send(output_events_since(event_log, after_seq, limit));
             }
+            AgentCommand::FetchSessionHistory {
+                before_seq,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(session_history_window(event_log, before_seq, limit));
+            }
             AgentCommand::ReadActivityHistory {
                 after_seq,
                 max_events,
@@ -2916,8 +3177,9 @@ async fn park_relay_terminal_agent(
                     event_log, None, after_seq, max_events, max_bytes,
                 ));
             }
-            AgentCommand::Attach(stream) => {
-                attach_subscriber(event_log, None, subscribers, stream);
+            AgentCommand::Attach { stream, reply } => {
+                let attached = attach_subscriber(event_log, None, subscribers, stream);
+                let _ = reply.send(attached);
             }
             AgentCommand::Close { reply } => {
                 finish_actor_close(accepting_input, status_handle, reply).await;
@@ -3239,6 +3501,94 @@ async fn append_chat_event(
 ) {
     record_chat_event_for_replay(canonical_stream, event_log, replay_state, event);
     broadcast_live_event(subscribers, FrameKind::ChatEvent, event).await;
+}
+
+fn spawn_resume_replay_barrier_task(
+    tx: mpsc::UnboundedSender<AgentCommand>,
+    barrier_rx: oneshot::Receiver<()>,
+    agent_id: AgentId,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = match tokio::time::timeout(RESUME_REPLAY_BARRIER_TIMEOUT, barrier_rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err("agent backend ended before resume replay completed".to_owned()),
+            Err(_) => Err(format!(
+                "timed out after {}s waiting for resume replay to complete",
+                RESUME_REPLAY_BARRIER_TIMEOUT.as_secs()
+            )),
+        };
+        if result.is_err() {
+            tracing::warn!(agent_id = %agent_id, "resume replay barrier failed");
+        }
+        let _ = tx.send(AgentCommand::ResumeReplayBarrier { result });
+    })
+}
+
+fn abort_resume_replay_barrier_task(task: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = task.take() {
+        task.abort();
+    }
+}
+
+fn flush_pending_resume_attaches(
+    event_log: &[Envelope],
+    replay_state: Option<&AgentReplayState>,
+    subscribers: &mut Vec<Stream>,
+    pending_attaches: &mut Vec<(Stream, oneshot::Sender<bool>)>,
+) {
+    for (stream, reply) in std::mem::take(pending_attaches) {
+        let attached = attach_subscriber(event_log, replay_state, subscribers, stream);
+        let _ = reply.send(attached);
+    }
+}
+
+async fn send_initial_follow_up_or_park(
+    input: SendMessagePayload,
+    context: InitialFollowUpContext<'_>,
+) -> bool {
+    *context.in_turn = true;
+    *context.idle_transition_armed = false;
+    if context
+        .backend
+        .as_ref()
+        .expect("backend must exist after successful startup")
+        .send(AgentInput::SendMessage(input))
+        .await
+    {
+        return true;
+    }
+
+    let payload = AgentErrorPayload {
+        agent_id: context.current_start.agent_id.clone(),
+        code: AgentErrorCode::Internal,
+        message: "agent backend closed".to_owned(),
+        fatal: true,
+    };
+    enter_terminal_failure(
+        TerminalFailureContext {
+            accepting_input: context.accepting_input,
+            status_handle: context.status_handle,
+            canonical_stream: context.canonical_stream,
+            event_log: context.event_log,
+            replay_state: context.replay_state,
+            subscribers: context.subscribers,
+            queue: context.queue,
+        },
+        &payload,
+    )
+    .await;
+    park_terminal_agent(
+        context.session_store,
+        context.current_session_id,
+        context.pending_alias,
+        context.current_start,
+        context.start_tx,
+        context.event_log,
+        context.subscribers,
+        context.rx,
+    )
+    .await;
+    false
 }
 
 fn record_chat_event_for_replay(
@@ -3692,8 +4042,16 @@ fn attach_subscriber(
     replay_state: Option<&AgentReplayState>,
     subscribers: &mut Vec<Stream>,
     stream: Stream,
-) {
+) -> bool {
     let mut events = agent_bootstrap_events_from_log(event_log);
+    let prior_history_before_seq = event_log.len() as u64;
+    let prior_history_count = prior_history_message_count(event_log, prior_history_before_seq);
+    if prior_history_count > 0 {
+        events.push(AgentBootstrapEvent::HasPriorHistory {
+            message_count: prior_history_count,
+            before_seq: prior_history_before_seq,
+        });
+    }
     if let Some(replay_state) = replay_state {
         events.extend(
             replay_state
@@ -3709,37 +4067,91 @@ fn attach_subscriber(
         .send_value(FrameKind::AgentBootstrap, payload)
         .is_err()
     {
-        return;
+        return false;
     }
 
     subscribers.push(stream);
+    true
 }
 
 fn agent_bootstrap_events_from_log(event_log: &[Envelope]) -> Vec<AgentBootstrapEvent> {
     let mut events = Vec::new();
     for envelope in event_log {
-        let event = agent_bootstrap_event_from_envelope(envelope);
-        if let AgentBootstrapEvent::ChatEvent(ChatEvent::MessageMetadataUpdated(update)) = &event {
-            if fold_message_metadata_update_into_bootstrap_events(&mut events, update) {
-                continue;
-            }
-            tracing::warn!(
-                message_id = %update.message_id,
-                "skipping MessageMetadataUpdated without a matching bootstrap message"
-            );
-            continue;
+        if matches!(
+            envelope.kind,
+            FrameKind::AgentStart
+                | FrameKind::AgentError
+                | FrameKind::SessionSettings
+                | FrameKind::QueuedMessages
+        ) {
+            events.push(agent_bootstrap_event_from_envelope(envelope));
         }
-        events.push(event);
     }
     events
 }
 
-fn fold_message_metadata_update_into_bootstrap_events(
-    events: &mut [AgentBootstrapEvent],
+fn prior_history_message_count(event_log: &[Envelope], before_seq: u64) -> u32 {
+    session_history_entries_from_log(event_log)
+        .iter()
+        .filter(|(seq, event)| *seq < before_seq && matches!(event, ChatEvent::MessageAdded(_)))
+        .count()
+        .min(u32::MAX as usize) as u32
+}
+
+fn session_history_window(
+    event_log: &[Envelope],
+    before_seq: Option<u64>,
+    limit: usize,
+) -> SessionHistoryWindow {
+    let entries = session_history_entries_from_log(event_log);
+    let eligible_end = entries
+        .iter()
+        .position(|(seq, _)| before_seq.is_some_and(|before_seq| *seq >= before_seq))
+        .unwrap_or(entries.len());
+    let limit = limit.max(1);
+    let start = eligible_end.saturating_sub(limit);
+    let selected = &entries[start..eligible_end];
+    SessionHistoryWindow {
+        events: selected
+            .iter()
+            .rev()
+            .map(|(_, event)| event.clone())
+            .collect(),
+        has_more_before: start > 0,
+        oldest_seq: selected.first().map(|(seq, _)| *seq),
+    }
+}
+
+fn session_history_entries_from_log(event_log: &[Envelope]) -> Vec<(u64, ChatEvent)> {
+    let mut events = Vec::new();
+    for envelope in event_log {
+        if envelope.kind != FrameKind::ChatEvent {
+            continue;
+        }
+        let event: ChatEvent = serde_json::from_value(envelope.payload.clone())
+            .expect("failed to parse ChatEvent from replay log");
+        match event {
+            ChatEvent::MessageMetadataUpdated(update) => {
+                if !fold_message_metadata_update_into_history_events(&mut events, &update) {
+                    tracing::warn!(
+                        message_id = %update.message_id,
+                        "skipping MessageMetadataUpdated without a matching history message"
+                    );
+                }
+            }
+            ChatEvent::TypingStatusChanged(_) => {}
+            event => events.push((envelope.seq, event)),
+        }
+    }
+    events
+}
+
+fn fold_message_metadata_update_into_history_events(
+    events: &mut [(u64, ChatEvent)],
     update: &MessageMetadataUpdateData,
 ) -> bool {
     for event in events.iter_mut().rev() {
-        let AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message)) = event else {
+        let ChatEvent::MessageAdded(message) = &mut event.1 else {
             continue;
         };
         if message.message_id.as_ref() != Some(&update.message_id) {
@@ -4034,6 +4446,7 @@ mod tests {
         AgentCommand, AgentHandle, AgentReplayState, InterruptOutcome, activity_history_snapshot,
         append_chat_event, append_event, attach_subscriber, generate_mock_name,
         name_generation_fallback, output_events_since, sanitize_generated_agent_name,
+        session_history_window,
     };
     use crate::agent::registry::AgentStatusHandle;
     use crate::stream::Stream;
@@ -4077,12 +4490,20 @@ mod tests {
 
             while let Some(command) = rx.recv().await {
                 match command {
+                    AgentCommand::ResumeReplayBarrier { .. } => {}
                     AgentCommand::ReadOutput {
                         after_seq,
                         limit,
                         reply,
                     } => {
                         let _ = reply.send(output_events_since(&event_log, after_seq, limit));
+                    }
+                    AgentCommand::FetchSessionHistory {
+                        before_seq,
+                        limit,
+                        reply,
+                    } => {
+                        let _ = reply.send(session_history_window(&event_log, before_seq, limit));
                     }
                     AgentCommand::ReadActivityHistory {
                         after_seq,
@@ -4094,8 +4515,10 @@ mod tests {
                             &event_log, None, after_seq, max_events, max_bytes,
                         ));
                     }
-                    AgentCommand::Attach(stream) => {
-                        attach_subscriber(&event_log, None, &mut subscribers, stream);
+                    AgentCommand::Attach { stream, reply } => {
+                        let attached =
+                            attach_subscriber(&event_log, None, &mut subscribers, stream);
+                        let _ = reply.send(attached);
                     }
                     AgentCommand::SetName { reply, .. } => {
                         let _ = reply.send(false);
@@ -4287,12 +4710,22 @@ mod tests {
             .into_iter();
         assert!(matches!(
             events.next(),
-            Some(AgentBootstrapEvent::ChatEvent(
-                ChatEvent::TypingStatusChanged(true)
-            ))
+            Some(AgentBootstrapEvent::HasPriorHistory {
+                message_count: 1,
+                ..
+            })
         ));
-        match events.next() {
-            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))) => {
+        assert!(events.next().is_none());
+        assert!(
+            timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+            "bootstrap should not include prior transcript events"
+        );
+
+        let window = session_history_window(&event_log, None, 10);
+        assert!(!window.has_more_before);
+        assert!(window.oldest_seq.is_some());
+        match window.events.as_slice() {
+            [ChatEvent::MessageAdded(message)] => {
                 assert_eq!(message.content, "hello world");
                 assert_eq!(
                     message.message_id,
@@ -4303,19 +4736,8 @@ mod tests {
                     Some(42)
                 );
             }
-            other => panic!("expected compacted MessageAdded, got {other:?}"),
+            other => panic!("expected one compacted history message, got {other:?}"),
         }
-        assert!(matches!(
-            events.next(),
-            Some(AgentBootstrapEvent::ChatEvent(
-                ChatEvent::TypingStatusChanged(false)
-            ))
-        ));
-        assert!(events.next().is_none());
-        assert!(
-            timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
-            "replay should not include granular stream events after compaction"
-        );
     }
 
     #[tokio::test]
@@ -4526,12 +4948,6 @@ mod tests {
             .into_iter();
         assert!(matches!(
             events.next(),
-            Some(AgentBootstrapEvent::ChatEvent(
-                ChatEvent::TypingStatusChanged(true)
-            ))
-        ));
-        assert!(matches!(
-            events.next(),
             Some(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(..)))
         ));
         match events.next() {
@@ -4709,23 +5125,26 @@ mod tests {
             .into_iter();
         assert!(matches!(
             events.next(),
-            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(_)))
-        ));
-        assert!(matches!(
-            events.next(),
-            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(_)))
-        ));
-        assert!(matches!(
-            events.next(),
-            Some(AgentBootstrapEvent::ChatEvent(
-                ChatEvent::ToolExecutionCompleted(_)
-            ))
+            Some(AgentBootstrapEvent::HasPriorHistory {
+                message_count: 1,
+                ..
+            })
         ));
         assert!(events.next().is_none());
         assert!(
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
-            "completed stream tool replay should not include raw stream events"
+            "bootstrap should not include completed stream tool history"
         );
+
+        let window = session_history_window(&event_log, None, 10);
+        assert!(matches!(
+            window.events.as_slice(),
+            [
+                ChatEvent::ToolExecutionCompleted(_),
+                ChatEvent::ToolRequest(_),
+                ChatEvent::MessageAdded(_)
+            ]
+        ));
     }
 
     #[tokio::test]

@@ -14,18 +14,19 @@ use crate::{
     CodeIntelNavigateResultPayload, CodeIntelReferencesCompletePayload,
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
     CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    DeleteSessionPayload, Envelope, FrameKind, HostBootstrapPayload, HostBrowseClosePayload,
-    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseListPayload,
-    HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload, ListSessionsPayload,
-    LoadAgentPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
-    MobileAccessStatePayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
-    MobilePairingCancelPayload, MobilePairingOfferPayload, MobilePairingStartPayload,
-    NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectNotifyPayload,
-    ProjectRenamePayload, ProjectReorderPayload, ProjectSearchCompletePayload,
-    ProjectSearchResultsPayload, ReviewEventPayload, RunBackendSetupPayload, SessionListPayload,
-    SessionSchemasPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
+    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload,
+    HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
+    ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload, McpServerNotifyPayload,
+    McpServerUpsertPayload, MobileAccessStatePayload, MobileDeviceRenamePayload,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferPayload,
+    MobilePairingStartPayload, NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectSearchCompletePayload, ProjectSearchResultsPayload, ReviewEventPayload,
+    RunBackendSetupPayload, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
+    SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
     SetAgentsViewPreferencesPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
     SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
     StreamPath, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
@@ -635,6 +636,49 @@ impl ProtocolValidator {
                 })?;
                 validate_chat_event(&recent_frames, envelope, state, &event)?;
             }
+            FrameKind::FetchSessionHistory => {
+                let payload: FetchSessionHistoryPayload =
+                    envelope.parse_payload().map_err(|error| {
+                        build_violation(
+                            &recent_frames,
+                            envelope,
+                            Some(state.backend_kind),
+                            format!("failed to parse FetchSessionHistory payload: {error}"),
+                        )
+                    })?;
+                if payload.agent_id != state.agent_id {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!(
+                            "FetchSessionHistory agent_id {} does not match stream agent_id {}",
+                            payload.agent_id, state.agent_id
+                        ),
+                    ));
+                }
+            }
+            FrameKind::SessionHistory => {
+                let payload: SessionHistoryPayload = envelope.parse_payload().map_err(|error| {
+                    build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!("failed to parse SessionHistory payload: {error}"),
+                    )
+                })?;
+                if payload.agent_id != state.agent_id {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!(
+                            "SessionHistory agent_id {} does not match stream agent_id {}",
+                            payload.agent_id, state.agent_id
+                        ),
+                    ));
+                }
+            }
             FrameKind::AgentRenamed => {
                 if !state.saw_agent_start {
                     return Err(build_violation(
@@ -1172,6 +1216,7 @@ fn validate_agent_bootstrap_event(
         AgentBootstrapEvent::AgentError(_) => Ok(()),
         AgentBootstrapEvent::SessionSettings(_) => Ok(()),
         AgentBootstrapEvent::QueuedMessages(_) => Ok(()),
+        AgentBootstrapEvent::HasPriorHistory { .. } => Ok(()),
         AgentBootstrapEvent::ChatEvent(event) => {
             if !state.saw_agent_start {
                 return Err(build_violation(

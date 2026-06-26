@@ -167,7 +167,8 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                             }
                             AgentBootstrapEvent::AgentError(_)
                             | AgentBootstrapEvent::SessionSettings(_)
-                            | AgentBootstrapEvent::QueuedMessages(_) => {}
+                            | AgentBootstrapEvent::QueuedMessages(_)
+                            | AgentBootstrapEvent::HasPriorHistory { .. } => {}
                         }
                     }
                 }
@@ -187,7 +188,8 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 }
                 AgentEvent::Renamed(_)
                 | AgentEvent::SessionSettings(_)
-                | AgentEvent::QueuedMessages(_) => {}
+                | AgentEvent::QueuedMessages(_)
+                | AgentEvent::SessionHistory(_) => {}
                 AgentEvent::Error(err) => panic!("unexpected agent error: {}", err.message),
             }
         }

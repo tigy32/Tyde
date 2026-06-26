@@ -8,28 +8,29 @@ use protocol::{
     CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
     CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgentDeletePayload, CustomAgentUpsertPayload,
-    DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FrameKind, HostBrowseClosePayload,
-    HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload, InterruptPayload,
-    ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload, McpServerUpsertPayload,
-    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
-    MobilePairingStartPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
-    ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload,
-    ProjectSearchPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
-    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewId,
-    ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
-    SendQueuedMessageNowPayload, SetAgentNamePayload, SetAgentPinsPayload, SetAgentTagsPayload,
-    SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload, SetSessionSettingsPayload,
-    SetSettingPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
-    SteeringDeletePayload, SteeringUpsertPayload, StreamPath, TeamCompactPayload,
-    TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
-    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftShufflePayload,
-    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberCreatePayload,
-    TeamMemberDeletePayload, TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamRenamePayload,
-    TeamSetManagerPayload, TerminalClosePayload, TerminalCreatePayload, TerminalId,
-    TerminalResizePayload, TerminalSendPayload, TriggerWorkflowPayload, WorkbenchCreatePayload,
-    WorkbenchRemovePayload, WorkflowRefreshPayload,
+    DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload,
+    FrameKind, HostBrowseClosePayload, HostBrowseInitial, HostBrowseListPayload,
+    HostBrowseStartPayload, InterruptPayload, ListSessionsPayload, LoadAgentPayload,
+    McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceRenamePayload,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingStartPayload,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload,
+    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
+    ReviewActionPayload, ReviewCreatePayload, ReviewId, ReviewSubscribePayload,
+    RunBackendSetupPayload, SendMessagePayload, SendQueuedMessageNowPayload, SetAgentNamePayload,
+    SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
+    SetAgentsViewPreferencesPayload, SetSessionSettingsPayload, SetSettingPayload,
+    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
+    SteeringUpsertPayload, StreamPath, TeamCompactPayload, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
+    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload,
+    TerminalClosePayload, TerminalCreatePayload, TerminalId, TerminalResizePayload,
+    TerminalSendPayload, TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    WorkflowRefreshPayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -434,6 +435,28 @@ pub(crate) async fn route_client_envelope(
                     host_output_stream,
                     agent_id,
                     stream_path,
+                )
+                .await?;
+            }
+            FrameKind::FetchSessionHistory => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path)?;
+                let payload: FetchSessionHistoryPayload =
+                    parse_payload(&envelope, "fetch_session_history")?;
+                if payload.agent_id != agent_id {
+                    return Err(AppError::invalid(
+                        "fetch_session_history",
+                        format!(
+                            "payload agent_id {} does not match stream agent_id {}",
+                            payload.agent_id, agent_id
+                        ),
+                    ));
+                }
+                host.fetch_session_history(
+                    connection_host_stream,
+                    host_output_stream,
+                    stream_path,
+                    payload,
                 )
                 .await?;
             }

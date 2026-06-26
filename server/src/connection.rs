@@ -57,9 +57,12 @@ async fn run_connection_with_origin(
     let deferred_attachments = host
         .register_host_stream(host_output_stream.clone(), agent_replay)
         .await;
+    let host_for_attachments = host.clone();
     tokio::spawn(async move {
-        for (agent_handle, stream) in deferred_attachments {
-            agent_handle.attach(stream).await;
+        for attachment in deferred_attachments {
+            host_for_attachments
+                .attach_deferred_agent_stream(attachment)
+                .await;
         }
     });
 

@@ -3,14 +3,75 @@ mod fixture;
 use fixture::Fixture;
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentStartPayload, BackendKind, ChatEvent,
-    DeleteSessionPayload, Envelope, FrameKind, ListSessionsPayload, NewAgentPayload, Project,
-    ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath, SessionId, SessionListPayload,
-    SpawnAgentParams, SpawnAgentPayload,
+    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, ListSessionsPayload,
+    NewAgentPayload, Project, ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath,
+    SessionHistoryPayload, SessionId, SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
+    StreamPath,
 };
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
+const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
+const MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL: &str = "__mock_hold_until_interrupt__";
+const MOCK_CLOSE_RESUME_BEFORE_BARRIER_SENTINEL: &str = "__mock_close_resume_before_barrier__";
+
+static PENDING_BOOTSTRAP_EVENTS: OnceLock<Mutex<HashMap<StreamPath, VecDeque<Envelope>>>> =
+    OnceLock::new();
+
+fn pending_bootstrap_events() -> &'static Mutex<HashMap<StreamPath, VecDeque<Envelope>>> {
+    PENDING_BOOTSTRAP_EVENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn client_key(client: &client::Connection) -> StreamPath {
+    let mut host_streams = client
+        .outgoing_seq
+        .keys()
+        .filter(|stream| stream.0.starts_with("/host/"));
+    let host_stream = host_streams
+        .next()
+        .cloned()
+        .expect("missing host stream for test connection");
+    assert!(
+        host_streams.next().is_none(),
+        "test connection has multiple host streams"
+    );
+    host_stream
+}
+
+fn pop_pending_bootstrap_event(client: &mut client::Connection) -> Option<Envelope> {
+    let key = client_key(client);
+    let mut pending = pending_bootstrap_events()
+        .lock()
+        .expect("pending bootstrap event lock poisoned");
+    let queue = pending.get_mut(&key)?;
+    let event = queue.pop_front();
+    if queue.is_empty() {
+        pending.remove(&key);
+    }
+    event
+}
+
+fn push_bootstrap_events(
+    client: &mut client::Connection,
+    events: impl IntoIterator<Item = Envelope>,
+) {
+    let mut events = events.into_iter().collect::<VecDeque<_>>();
+    if events.is_empty() {
+        return;
+    }
+    let key = client_key(client);
+    let mut pending = pending_bootstrap_events()
+        .lock()
+        .expect("pending bootstrap event lock poisoned");
+    pending.entry(key).or_default().append(&mut events);
+}
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
+        if let Some(env) = pop_pending_bootstrap_event(client) {
+            return env;
+        }
         let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
             Ok(Ok(Some(env))) => env,
             Ok(Ok(None)) => panic!("connection closed before {context}"),
@@ -23,7 +84,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
         if env.kind == FrameKind::AgentBootstrap {
             let payload: AgentBootstrapPayload =
                 env.parse_payload().expect("parse AgentBootstrapPayload");
-            if let Some(env) = payload.events.into_iter().find_map(|event| match event {
+            let events = payload.events.into_iter().filter_map(|event| match event {
                 AgentBootstrapEvent::AgentStart(payload) => Some(
                     Envelope::from_payload(
                         env.stream.clone(),
@@ -43,9 +104,8 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                     .expect("serialize ChatEvent"),
                 ),
                 _ => None,
-            }) {
-                return env;
-            }
+            });
+            push_bootstrap_events(client, events);
             continue;
         }
         if matches!(
@@ -65,6 +125,202 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
 
         return env;
     }
+}
+
+async fn expect_raw_event_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    kind: FrameKind,
+    context: &str,
+) -> Envelope {
+    loop {
+        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        if env.stream != *stream {
+            continue;
+        }
+        if env.kind == kind {
+            return env;
+        }
+        if matches!(
+            env.kind,
+            FrameKind::HostSettings
+                | FrameKind::SessionSchemas
+                | FrameKind::BackendSetup
+                | FrameKind::QueuedMessages
+                | FrameKind::SessionSettings
+                | FrameKind::TeamPresetCatalogNotify
+                | FrameKind::WorkflowNotify
+                | FrameKind::AgentsViewPreferencesNotify
+        ) {
+            continue;
+        }
+        panic!(
+            "wait for {kind} on {stream} during {context} received unexpected event: kind={} stream={}",
+            env.kind, env.stream
+        );
+    }
+}
+
+async fn expect_chat_event_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    context: &str,
+) -> ChatEvent {
+    loop {
+        let env = expect_next_event(client, context).await;
+        if env.stream != *stream {
+            continue;
+        }
+        assert_eq!(env.kind, FrameKind::ChatEvent);
+        return env.parse_payload().expect("failed to parse ChatEvent");
+    }
+}
+
+async fn expect_agent_start_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    context: &str,
+) -> AgentStartPayload {
+    loop {
+        let env = expect_next_event(client, context).await;
+        if env.stream != *stream {
+            continue;
+        }
+        assert_eq!(env.kind, FrameKind::AgentStart);
+        return env.parse_payload().expect("failed to parse AgentStart");
+    }
+}
+
+async fn expect_turn_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_text: &str,
+) {
+    let event =
+        expect_chat_event_on_stream(client, stream, "TypingStatusChanged(true) or StreamStart")
+            .await;
+    let delta = match event {
+        ChatEvent::TypingStatusChanged(true) => {
+            let event = expect_chat_event_on_stream(client, stream, "StreamStart").await;
+            match event {
+                ChatEvent::StreamStart(_) => {
+                    expect_chat_event_on_stream(client, stream, "StreamDelta").await
+                }
+                delta @ ChatEvent::StreamDelta(_) => delta,
+                other => panic!("expected StreamStart or StreamDelta, got {other:?}"),
+            }
+        }
+        ChatEvent::StreamStart(_) => {
+            expect_chat_event_on_stream(client, stream, "StreamDelta").await
+        }
+        delta @ ChatEvent::StreamDelta(_) => delta,
+        other => panic!("expected TypingStatusChanged(true) or StreamStart, got {other:?}"),
+    };
+    match &delta {
+        ChatEvent::StreamDelta(delta) => {
+            assert!(
+                delta.text.contains(expected_text),
+                "unexpected delta text: {}",
+                delta.text,
+            );
+        }
+        other => panic!("expected StreamDelta, got {other:?}"),
+    }
+
+    let event = expect_chat_event_on_stream(client, stream, "StreamEnd").await;
+    assert!(matches!(event, ChatEvent::StreamEnd(..)));
+
+    let event = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(false)").await;
+    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+}
+
+fn assert_bootstrap_prior_history_indicator(
+    payload: &AgentBootstrapPayload,
+    expected_message_count: u32,
+) -> u64 {
+    let before_seq = payload.events.iter().find_map(|event| match event {
+        AgentBootstrapEvent::HasPriorHistory {
+            message_count,
+            before_seq,
+        } if *message_count == expected_message_count => Some(*before_seq),
+        _ => None,
+    });
+    assert!(
+        before_seq.is_some(),
+        "AgentBootstrap should include HasPriorHistory({expected_message_count}), got {:?}",
+        payload.events
+    );
+    before_seq.expect("checked above")
+}
+
+fn assert_bootstrap_has_no_prior_chat(payload: &AgentBootstrapPayload) {
+    assert!(
+        payload.events.iter().all(|event| !matches!(
+            event,
+            AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(_))
+                | AgentBootstrapEvent::ChatEvent(ChatEvent::MessageMetadataUpdated(_))
+        )),
+        "AgentBootstrap must not include prior transcript ChatEvents: {:?}",
+        payload.events
+    );
+}
+
+async fn fetch_history_page(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    agent_id: protocol::AgentId,
+    before_seq: Option<u64>,
+    limit: u32,
+) -> SessionHistoryPayload {
+    client
+        .fetch_session_history(
+            stream,
+            FetchSessionHistoryPayload {
+                agent_id,
+                before_seq,
+                limit,
+            },
+        )
+        .await
+        .expect("fetch_session_history failed");
+
+    let env =
+        expect_raw_event_on_stream(client, stream, FrameKind::SessionHistory, "SessionHistory")
+            .await;
+    env.parse_payload()
+        .expect("failed to parse SessionHistoryPayload")
+}
+
+fn assert_history_page(
+    page: &SessionHistoryPayload,
+    expected_newest_first: &[&str],
+    expected_has_more_before: bool,
+) {
+    assert_eq!(
+        page.events.len(),
+        expected_newest_first.len(),
+        "unexpected SessionHistory event count: {:?}",
+        page.events
+    );
+    for (event, expected) in page.events.iter().zip(expected_newest_first) {
+        let ChatEvent::MessageAdded(message) = event else {
+            panic!("expected MessageAdded history event, got {event:?}");
+        };
+        assert!(
+            message.content.contains(expected),
+            "history message content {:?} did not contain {expected:?}",
+            message.content
+        );
+    }
+    assert_eq!(page.has_more_before, expected_has_more_before);
 }
 
 async fn wait_for_session_list(
@@ -114,20 +370,34 @@ async fn wait_for_session_list(
 }
 
 async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
-    let env = expect_next_event(client, "TypingStatusChanged(true)").await;
+    let env = expect_next_event(client, "TypingStatusChanged(true) or StreamStart").await;
     assert_eq!(env.kind, FrameKind::ChatEvent);
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+    let delta = match event {
+        ChatEvent::TypingStatusChanged(true) => {
+            let env = expect_next_event(client, "StreamStart").await;
+            assert_eq!(env.kind, FrameKind::ChatEvent);
+            let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+            match event {
+                ChatEvent::StreamStart(_) => {
+                    let env = expect_next_event(client, "StreamDelta").await;
+                    assert_eq!(env.kind, FrameKind::ChatEvent);
+                    env.parse_payload().expect("failed to parse ChatEvent")
+                }
+                delta @ ChatEvent::StreamDelta(_) => delta,
+                other => panic!("expected StreamStart or StreamDelta, got {other:?}"),
+            }
+        }
+        ChatEvent::StreamStart(_) => {
+            let env = expect_next_event(client, "StreamDelta").await;
+            assert_eq!(env.kind, FrameKind::ChatEvent);
+            env.parse_payload().expect("failed to parse ChatEvent")
+        }
+        delta @ ChatEvent::StreamDelta(_) => delta,
+        other => panic!("expected TypingStatusChanged(true) or StreamStart, got {other:?}"),
+    };
 
-    let env = expect_next_event(client, "StreamStart").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::StreamStart(..)));
-
-    let env = expect_next_event(client, "StreamDelta").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    match &event {
+    match &delta {
         ChatEvent::StreamDelta(delta) => {
             assert!(
                 delta.text.contains(expected_text),
@@ -175,6 +445,27 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                 "unexpected event before {context}: kind={} stream={}",
                 env.kind, env.stream
             ),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+        }
+    }
+}
+
+async fn expect_no_chat_event_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    duration: Duration,
+    context: &str,
+) {
+    loop {
+        match tokio::time::timeout(duration, client.next_event()).await {
+            Err(_) => return,
+            Ok(Ok(None)) => return,
+            Ok(Ok(Some(env))) if fixture::is_builtin_team_custom_agent_notify(&env) => continue,
+            Ok(Ok(Some(env))) if env.stream == *stream && env.kind == FrameKind::ChatEvent => {
+                let event: ChatEvent = env.parse_payload().expect("parse unexpected ChatEvent");
+                panic!("unexpected live ChatEvent on {stream} before {context}: {event:?}");
+            }
+            Ok(Ok(Some(_))) => continue,
             Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
         }
     }
@@ -276,6 +567,649 @@ async fn list_sessions_and_resume_agent() {
     );
     assert_eq!(list.sessions[0].id, session.id);
     assert_eq!(list.sessions[0].message_count, 2);
+}
+
+#[tokio::test]
+async fn opening_agent_bootstrap_gates_prior_history_until_fetch() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("history-on-demand".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/history-on-demand".to_owned()],
+                prompt: "history 0".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn history agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "history NewAgent").await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse history NewAgent");
+    let _ = expect_next_event(&mut fixture.client, "history AgentStart").await;
+    expect_turn(&mut fixture.client, "mock backend response to: history 0").await;
+
+    for index in 1..5 {
+        let prompt = format!("history {index}");
+        fixture
+            .client
+            .send_message(&new_agent.instance_stream, prompt.clone())
+            .await
+            .expect("send history follow-up failed");
+        expect_turn(
+            &mut fixture.client,
+            &format!("mock backend response to: {prompt}"),
+        )
+        .await;
+    }
+
+    let (mut second_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let second_agent_stream = bootstrap
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == new_agent.agent_id)
+        .map(|agent| agent.instance_stream.clone())
+        .expect("host bootstrap must advertise the running history agent");
+
+    let env = expect_raw_event_on_stream(
+        &mut second_client,
+        &second_agent_stream,
+        FrameKind::AgentBootstrap,
+        "history AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
+    let gate_before_seq = assert_bootstrap_prior_history_indicator(&payload, 5);
+    assert_bootstrap_has_no_prior_chat(&payload);
+    assert!(
+        payload
+            .events
+            .iter()
+            .all(|event| !matches!(event, AgentBootstrapEvent::ChatEvent(_))),
+        "completed prior history must not be sent in AgentBootstrap: {:?}",
+        payload.events
+    );
+
+    let first_page = fetch_history_page(
+        &mut second_client,
+        &second_agent_stream,
+        new_agent.agent_id.clone(),
+        Some(gate_before_seq),
+        2,
+    )
+    .await;
+    assert_history_page(&first_page, &["history 4", "history 3"], true);
+    let first_cursor = first_page
+        .oldest_seq
+        .expect("first history page should include an oldest_seq cursor");
+
+    let second_page = fetch_history_page(
+        &mut second_client,
+        &second_agent_stream,
+        new_agent.agent_id.clone(),
+        Some(first_cursor),
+        2,
+    )
+    .await;
+    assert_history_page(&second_page, &["history 2", "history 1"], true);
+    let second_cursor = second_page
+        .oldest_seq
+        .expect("second history page should include an oldest_seq cursor");
+
+    let third_page = fetch_history_page(
+        &mut second_client,
+        &second_agent_stream,
+        new_agent.agent_id.clone(),
+        Some(second_cursor),
+        2,
+    )
+    .await;
+    assert_history_page(&third_page, &["history 0"], false);
+}
+
+#[tokio::test]
+async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("history-no-dupe".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/history-no-dupe".to_owned()],
+                prompt: "prior message".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn history no-dupe agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "no-dupe NewAgent").await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse no-dupe NewAgent");
+    let _ = expect_next_event(&mut fixture.client, "no-dupe AgentStart").await;
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: prior message",
+    )
+    .await;
+
+    let (mut second_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let second_agent_stream = bootstrap
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == new_agent.agent_id)
+        .map(|agent| agent.instance_stream.clone())
+        .expect("host bootstrap must advertise the running history agent");
+
+    let env = expect_raw_event_on_stream(
+        &mut second_client,
+        &second_agent_stream,
+        FrameKind::AgentBootstrap,
+        "no-dupe AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
+    let gate_before_seq = assert_bootstrap_prior_history_indicator(&payload, 1);
+    assert_bootstrap_has_no_prior_chat(&payload);
+
+    second_client
+        .send_message(&second_agent_stream, "new visible message".to_owned())
+        .await
+        .expect("send visible follow-up failed");
+    expect_turn_on_stream(
+        &mut second_client,
+        &second_agent_stream,
+        "mock backend response to: new visible message",
+    )
+    .await;
+
+    let first_page = fetch_history_page(
+        &mut second_client,
+        &second_agent_stream,
+        new_agent.agent_id.clone(),
+        Some(gate_before_seq),
+        10,
+    )
+    .await;
+    assert_history_page(&first_page, &["prior message"], false);
+    assert!(
+        first_page.events.iter().all(|event| {
+            !matches!(
+                event,
+                ChatEvent::MessageAdded(message)
+                    if message.content.contains("new visible message")
+            )
+        }),
+        "first history fetch must not duplicate live rows: {:?}",
+        first_page.events
+    );
+}
+
+#[tokio::test]
+async fn async_resume_replay_history_is_ingested_without_live_broadcast() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("resume-no-leak-source".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/resume-no-leak".to_owned()],
+                prompt: "original history".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn resume no-leak source failed");
+
+    let _ = expect_next_event(&mut fixture.client, "resume source NewAgent").await;
+    let _ = expect_next_event(&mut fixture.client, "resume source AgentStart").await;
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: original history",
+    )
+    .await;
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list_sessions before resume failed");
+    let list =
+        wait_for_session_list(&mut fixture.client, "SessionList before no-leak resume").await;
+    let session_id = list
+        .sessions
+        .first()
+        .expect("expected source session")
+        .id
+        .clone();
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("resume-no-leak".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id,
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume no-leak agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "resume no-leak NewAgent").await;
+    let resumed: NewAgentPayload = env.parse_payload().expect("parse resume no-leak NewAgent");
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        FrameKind::AgentBootstrap,
+        "resume no-leak AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
+    assert_bootstrap_prior_history_indicator(&payload, 1);
+    assert_bootstrap_has_no_prior_chat(&payload);
+
+    expect_no_chat_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        Duration::from_millis(150),
+        "new turn after quiet resume",
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message(&resumed.instance_stream, "new turn after resume".to_owned())
+        .await
+        .expect("send after no-leak resume failed");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        "mock backend response to: new turn after resume",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn resume_backend_close_before_barrier_flushes_eager_attach_with_fatal_error() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("resume-close-before-barrier-source".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/resume-close-before-barrier".to_owned()],
+                prompt: MOCK_CLOSE_RESUME_BEFORE_BARRIER_SENTINEL.to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn resume close-before-barrier source failed");
+
+    let _ = expect_next_event(&mut fixture.client, "close-before-barrier source NewAgent").await;
+    let _ = expect_next_event(
+        &mut fixture.client,
+        "close-before-barrier source AgentStart",
+    )
+    .await;
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: __mock_close_resume_before_barrier__",
+    )
+    .await;
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list_sessions before close-before-barrier resume failed");
+    let list = wait_for_session_list(
+        &mut fixture.client,
+        "SessionList before close-before-barrier resume",
+    )
+    .await;
+    let session_id = list
+        .sessions
+        .first()
+        .expect("expected source session")
+        .id
+        .clone();
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("resume-close-before-barrier".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id,
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume close-before-barrier agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "close-before-barrier resumed NewAgent").await;
+    let resumed: NewAgentPayload = env
+        .parse_payload()
+        .expect("parse close-before-barrier resumed NewAgent");
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        FrameKind::AgentBootstrap,
+        "close-before-barrier AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
+    let error = payload
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::AgentError(error) => Some(error),
+            _ => None,
+        })
+        .expect("AgentBootstrap should surface fatal resume barrier error");
+    assert!(error.fatal);
+    assert!(
+        error
+            .message
+            .contains("agent backend closed before resume replay completed"),
+        "unexpected fatal error: {}",
+        error.message
+    );
+    assert_bootstrap_has_no_prior_chat(&payload);
+}
+
+#[tokio::test]
+async fn tycode_resume_replay_history_is_ingested_without_live_broadcast() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("tycode-resume-no-leak-source".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/tycode-resume-no-leak".to_owned()],
+                prompt: "tycode original history".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Tycode,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn tycode resume no-leak source failed");
+
+    let _ = expect_next_event(&mut fixture.client, "tycode resume source NewAgent").await;
+    let _ = expect_next_event(&mut fixture.client, "tycode resume source AgentStart").await;
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: tycode original history",
+    )
+    .await;
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list_sessions before tycode resume failed");
+    let list = wait_for_session_list(
+        &mut fixture.client,
+        "SessionList before tycode no-leak resume",
+    )
+    .await;
+    let session_id = list
+        .sessions
+        .first()
+        .expect("expected tycode source session")
+        .id
+        .clone();
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("tycode-resume-no-leak".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id,
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume tycode no-leak agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "tycode resume no-leak NewAgent").await;
+    let resumed: NewAgentPayload = env
+        .parse_payload()
+        .expect("parse tycode resume no-leak NewAgent");
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        FrameKind::AgentBootstrap,
+        "tycode resume no-leak AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
+    assert_bootstrap_prior_history_indicator(&payload, 1);
+    assert_bootstrap_has_no_prior_chat(&payload);
+
+    expect_no_chat_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        Duration::from_millis(150),
+        "new turn after quiet tycode resume",
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message(
+            &resumed.instance_stream,
+            "new tycode turn after resume".to_owned(),
+        )
+        .await
+        .expect("send after tycode no-leak resume failed");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        "mock backend response to: new tycode turn after resume",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn agent_bootstrap_keeps_active_stream_while_history_is_gated() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("active-history-parent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/active-history-parent".to_owned()],
+                prompt: "parent ready".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn parent failed");
+
+    let env = expect_next_event(&mut fixture.client, "active parent NewAgent").await;
+    let parent: NewAgentPayload = env.parse_payload().expect("parse parent NewAgent");
+    let _ = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &parent.instance_stream,
+        "active parent AgentStart",
+    )
+    .await;
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &parent.instance_stream,
+        "mock backend response to: parent ready",
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("active-history-child".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(parent.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/active-history-child".to_owned()],
+                prompt: format!("{MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL} child active"),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn child failed");
+
+    let env = expect_next_event(&mut fixture.client, "active child NewAgent").await;
+    let child: NewAgentPayload = env.parse_payload().expect("parse child NewAgent");
+    let _ = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "active child AgentStart",
+    )
+    .await;
+    loop {
+        let event = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &child.instance_stream,
+            "held child StreamEnd",
+        )
+        .await;
+        if matches!(event, ChatEvent::StreamEnd(_)) {
+            break;
+        }
+    }
+
+    fixture
+        .client
+        .send_message(
+            &parent.instance_stream,
+            format!("{MOCK_AGENT_CONTROL_AWAIT_SENTINEL} {}", child.agent_id.0),
+        )
+        .await
+        .expect("send parent await prompt failed");
+
+    loop {
+        let event = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &parent.instance_stream,
+            "parent active ToolRequest",
+        )
+        .await;
+        if matches!(event, ChatEvent::ToolRequest(_)) {
+            break;
+        }
+    }
+
+    let (mut second_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let second_parent_stream = bootstrap
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == parent.agent_id)
+        .map(|agent| agent.instance_stream.clone())
+        .expect("host bootstrap must advertise the running parent agent");
+    let env = expect_raw_event_on_stream(
+        &mut second_client,
+        &second_parent_stream,
+        FrameKind::AgentBootstrap,
+        "active parent AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
+    let gate_before_seq = assert_bootstrap_prior_history_indicator(&payload, 1);
+    assert!(
+        gate_before_seq > 0,
+        "history gate cursor should be a real sequence boundary"
+    );
+    assert_bootstrap_has_no_prior_chat(&payload);
+    assert!(
+        payload.events.iter().any(|event| matches!(
+            event,
+            AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(_))
+        )),
+        "active StreamStart should be replayed in AgentBootstrap: {:?}",
+        payload.events
+    );
+    assert!(
+        payload.events.iter().any(|event| matches!(
+            event,
+            AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(request))
+                if request.tool_name == "tyde_await_agents"
+        )),
+        "active tool request should be replayed in AgentBootstrap: {:?}",
+        payload.events
+    );
+    assert!(
+        payload.events.iter().all(|event| !matches!(
+            event,
+            AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(_))
+        )),
+        "active bootstrap should not synthesize a completed prior turn: {:?}",
+        payload.events
+    );
+
+    fixture
+        .client
+        .interrupt(&child.instance_stream)
+        .await
+        .expect("interrupt held child");
 }
 
 #[tokio::test]
@@ -631,15 +1565,21 @@ async fn delete_session_removes_it_from_list() {
         .await
         .expect("delete_session failed");
 
-    let list = wait_for_session_list(&mut fixture.client, "SessionList after delete").await;
-    assert!(
-        list.sessions.is_empty(),
-        "session list must be empty after delete, got {:?}",
-        list.sessions
-            .iter()
-            .map(|s| s.id.0.as_str())
-            .collect::<Vec<_>>()
-    );
+    for attempt in 0..3 {
+        let list = wait_for_session_list(&mut fixture.client, "SessionList after delete").await;
+        if list.sessions.is_empty() {
+            return;
+        }
+        if attempt == 2 {
+            panic!(
+                "session list must be empty after delete, got {:?}",
+                list.sessions
+                    .iter()
+                    .map(|s| s.id.0.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }
 
 #[tokio::test]

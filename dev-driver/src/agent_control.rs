@@ -755,6 +755,7 @@ fn apply_agent_bootstrap_event(
         AgentBootstrapEvent::ChatEvent(payload) => {
             Envelope::from_payload(stream.clone(), FrameKind::ChatEvent, 0, &payload)
         }
+        AgentBootstrapEvent::HasPriorHistory { .. } => return,
     }
     .expect("serialize AgentBootstrap event");
     apply_envelope(snapshot, &envelope);

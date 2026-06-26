@@ -6,17 +6,17 @@ use protocol::{
     AgentActivitySummaryPayload, AgentBootstrapPayload, AgentErrorPayload, AgentRenamedPayload,
     AgentStartPayload, AgentsViewPreferencesNotifyPayload, BackendSetupPayload,
     CancelWorkflowPayload, ChatEvent, CommandErrorPayload, CustomAgentNotifyPayload, Envelope,
-    FrameError, FrameKind, HostBootstrapPayload, HostSettingsPayload, InterruptPayload,
-    ListSessionsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
+    FetchSessionHistoryPayload, FrameError, FrameKind, HostBootstrapPayload, HostSettingsPayload,
+    InterruptPayload, ListSessionsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
     MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, ProjectAddRootPayload,
     ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
-    ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload, SessionListPayload,
-    SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload,
-    SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload, StreamPath,
-    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
+    ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload, SessionHistoryPayload,
+    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
+    SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload,
+    StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
     TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
@@ -156,6 +156,7 @@ pub enum AgentEvent {
     Renamed(AgentRenamedPayload),
     Error(AgentErrorPayload),
     Chat(Box<ChatEvent>),
+    SessionHistory(SessionHistoryPayload),
     SessionSettings(SessionSettingsPayload),
     QueuedMessages(QueuedMessagesPayload),
 }
@@ -369,6 +370,19 @@ impl AgentCommands {
     pub async fn send_message(&self, payload: SendMessagePayload) -> Result<(), ClientError> {
         self.shared
             .send(self.stream.clone(), FrameKind::SendMessage, &payload)
+            .await
+    }
+
+    pub async fn fetch_session_history(
+        &self,
+        payload: FetchSessionHistoryPayload,
+    ) -> Result<(), ClientError> {
+        self.shared
+            .send(
+                self.stream.clone(),
+                FrameKind::FetchSessionHistory,
+                &payload,
+            )
             .await
     }
 
@@ -1173,6 +1187,13 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
                 Err(_) => return,
             };
             AgentEvent::Chat(Box::new(payload))
+        }
+        FrameKind::SessionHistory => {
+            let payload: SessionHistoryPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            AgentEvent::SessionHistory(payload)
         }
         FrameKind::SessionSettings => {
             let payload: SessionSettingsPayload = match envelope.parse_payload() {

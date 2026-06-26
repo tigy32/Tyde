@@ -492,6 +492,7 @@ pub enum FrameKind {
     SetAgentPins,
     SpawnAgent,
     LoadAgent,
+    FetchSessionHistory,
     ListSessions,
     DeleteSession,
     SendMessage,
@@ -586,6 +587,7 @@ pub enum FrameKind {
     AgentCompactNotify,
     AgentClosed,
     ChatEvent,
+    SessionHistory,
     AgentError,
     QueuedMessages,
     SessionList,
@@ -651,6 +653,7 @@ impl fmt::Display for FrameKind {
             Self::SetAgentPins => f.write_str("set_agent_pins"),
             Self::SpawnAgent => f.write_str("spawn_agent"),
             Self::LoadAgent => f.write_str("load_agent"),
+            Self::FetchSessionHistory => f.write_str("fetch_session_history"),
             Self::ListSessions => f.write_str("list_sessions"),
             Self::DeleteSession => f.write_str("delete_session"),
             Self::SendMessage => f.write_str("send_message"),
@@ -741,6 +744,7 @@ impl fmt::Display for FrameKind {
             Self::AgentCompactNotify => f.write_str("agent_compact_notify"),
             Self::AgentClosed => f.write_str("agent_closed"),
             Self::ChatEvent => f.write_str("chat_event"),
+            Self::SessionHistory => f.write_str("session_history"),
             Self::AgentError => f.write_str("agent_error"),
             Self::QueuedMessages => f.write_str("queued_messages"),
             Self::SessionList => f.write_str("session_list"),
@@ -1503,6 +1507,7 @@ pub enum AgentBootstrapEvent {
     SessionSettings(SessionSettingsPayload),
     QueuedMessages(QueuedMessagesPayload),
     ChatEvent(ChatEvent),
+    HasPriorHistory { message_count: u32, before_seq: u64 },
 }
 
 impl AgentBootstrapEvent {
@@ -1513,6 +1518,7 @@ impl AgentBootstrapEvent {
             Self::SessionSettings(_) => FrameKind::SessionSettings,
             Self::QueuedMessages(_) => FrameKind::QueuedMessages,
             Self::ChatEvent(_) => FrameKind::ChatEvent,
+            Self::HasPriorHistory { .. } => FrameKind::AgentBootstrap,
         }
     }
 }
@@ -2038,6 +2044,23 @@ pub struct CloseAgentPayload {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LoadAgentPayload {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchSessionHistoryPayload {
+    pub agent_id: AgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_seq: Option<u64>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryPayload {
+    pub agent_id: AgentId,
+    pub events: Vec<ChatEvent>,
+    pub has_more_before: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_seq: Option<u64>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListSessionsPayload {}

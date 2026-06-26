@@ -21,9 +21,9 @@ use protocol::{
     ProjectNotifyPayload, ProjectPath, ProjectSearchCompletePayload, ProjectSearchResultsPayload,
     ProtocolValidator, QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload,
     ReviewCommentSource, ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState,
-    SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
-    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload,
-    TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
+    SessionHistoryPayload, SessionId, SessionListPayload, SessionSchemasPayload,
+    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
+    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
     TerminalBootstrapPayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     TerminalStartPayload, WelcomePayload, WorkflowNotifyPayload, WorkflowRunNotifyPayload,
@@ -33,8 +33,8 @@ use crate::line_source::FileLines;
 use crate::state::{
     ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry, CodeIntelKey,
     ConnectionStatus, OpenFile, ProjectInfo, ProjectReferencesMode, ProjectReferencesUiState,
-    ReviewActionTarget, SessionInfo, StreamingState, StreamingToolRequest, TabContent,
-    TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent, WorkflowPanelError,
+    ReviewActionTarget, SessionHistoryState, SessionInfo, StreamingState, StreamingToolRequest,
+    TabContent, TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent, WorkflowPanelError,
     reduce_diff_response, root_display_name, sort_project_infos,
 };
 
@@ -508,6 +508,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                             ConnectionStatus::Error(payload.message),
                         );
                     });
+                    clear_session_history_loading_for_host(state, host_id);
                 }
             }
             Err(error) => {
@@ -538,6 +539,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 state.command_errors_by_host.update(|errors| {
                     errors.insert(host_id.to_string(), message);
                 });
+                clear_session_history_loading_on_error(state, host_id, &payload);
                 // Release any review-side pending gate the rejected
                 // command was holding. Without this, a server-side
                 // failure (unknown project, git error, malformed
@@ -1114,6 +1116,16 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
             ),
         },
         FrameKind::ChatEvent => dispatch_chat_event(state, host_id, &envelope.stream, &envelope),
+        FrameKind::SessionHistory => match envelope.parse_payload::<SessionHistoryPayload>() {
+            Ok(payload) => apply_session_history(state, host_id, &envelope.stream, payload),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse session_history payload: {error}"),
+            ),
+        },
         FrameKind::SessionList => match envelope.parse_payload::<SessionListPayload>() {
             Ok(payload) => {
                 state.sessions.update(|sessions| {
@@ -3567,7 +3579,7 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.chat_message_rows.update(|map| {
         map.remove(&agent_id);
     });
-    state.forget_history_window(&agent_id);
+    state.forget_session_history(&agent_id);
     state.streaming_text.update(|map| {
         map.remove(&agent_id);
     });
@@ -3727,6 +3739,267 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
     apply_chat_event(state, host_id, &agent_id, event);
 }
 
+fn clear_session_history_loading_on_error(
+    state: &AppState,
+    host_id: &str,
+    payload: &CommandErrorPayload,
+) {
+    if !matches!(payload.request_kind, FrameKind::FetchSessionHistory) {
+        return;
+    }
+    let Some(agent_id) = resolve_agent_id(state, host_id, &payload.stream) else {
+        log::warn!(
+            "fetch_session_history error on unknown stream host={} stream={}",
+            host_id,
+            payload.stream
+        );
+        return;
+    };
+    state.session_history.update(|map| {
+        if let Some(history) = map.get_mut(&agent_id) {
+            history.loading = false;
+        }
+    });
+}
+
+fn clear_session_history_loading_for_host(state: &AppState, host_id: &str) {
+    let agent_ids = state.agents.with_untracked(|agents| {
+        agents
+            .iter()
+            .filter(|agent| agent.host_id == host_id)
+            .map(|agent| agent.agent_id.clone())
+            .collect::<HashSet<_>>()
+    });
+    state.session_history.update(|map| {
+        for agent_id in agent_ids {
+            if let Some(history) = map.get_mut(&agent_id) {
+                history.loading = false;
+            }
+        }
+    });
+}
+
+fn apply_session_history(
+    state: &AppState,
+    host_id: &str,
+    stream: &StreamPath,
+    payload: SessionHistoryPayload,
+) {
+    let Some(agent_id) = resolve_agent_id(state, host_id, stream) else {
+        log::warn!("session_history on unknown stream {stream}");
+        return;
+    };
+    if payload.agent_id != agent_id {
+        log::error!(
+            "session_history agent mismatch host={} stream={} payload_agent_id={} stream_agent_id={}",
+            host_id,
+            stream,
+            payload.agent_id,
+            agent_id
+        );
+        return;
+    }
+
+    let mut replay = HistoryReplay::default();
+    for event in payload.events.into_iter().rev() {
+        replay.apply(event, host_id, &agent_id);
+    }
+
+    if !replay.rows.is_empty() {
+        state.chat_rows.update(|map| {
+            let current = map.remove(&agent_id).unwrap_or_default();
+            let mut combined = replay.rows.clone();
+            combined.extend(current);
+            map.insert(agent_id.clone(), combined);
+        });
+        state.chat_message_rows.update(|map| {
+            let agent_index = map.entry(agent_id.clone()).or_default();
+            for (message_id, row_id) in replay.message_rows {
+                agent_index.insert(message_id, row_id);
+            }
+        });
+        state.chat_tool_rows.update(|map| {
+            let agent_index = map.entry(agent_id.clone()).or_default();
+            for (tool_call_id, row_id) in replay.tool_rows {
+                agent_index.insert(tool_call_id, row_id);
+            }
+        });
+    }
+
+    for (tool_call_id, progress) in replay.tool_progress {
+        let key = (agent_id.clone(), tool_call_id);
+        let existing = state
+            .tool_progress
+            .with_untracked(|map| map.get(&key).cloned());
+        if let Some(signal) = existing {
+            signal.set(progress);
+        } else {
+            state.tool_progress.update(|map| {
+                map.insert(key, leptos::prelude::ArcRwSignal::new(progress));
+            });
+        }
+    }
+
+    state.session_history.update(|map| {
+        let mut remove = false;
+        if let Some(history) = map.get_mut(&agent_id) {
+            history.oldest_seq = payload.oldest_seq;
+            history.has_more_before = payload.has_more_before;
+            history.loading = false;
+            history.message_count = 0;
+            if !history.has_more_before {
+                remove = true;
+            }
+        } else if payload.has_more_before {
+            map.insert(
+                agent_id.clone(),
+                SessionHistoryState {
+                    message_count: 0,
+                    oldest_seq: payload.oldest_seq,
+                    has_more_before: payload.has_more_before,
+                    loading: false,
+                },
+            );
+        }
+        if remove {
+            map.remove(&agent_id);
+        }
+    });
+}
+
+#[derive(Default)]
+struct HistoryReplay {
+    rows: Vec<crate::state::ChatRowHandle>,
+    message_rows: HashMap<protocol::ChatMessageId, crate::state::ChatRowId>,
+    tool_rows: HashMap<ToolCallId, crate::state::ChatRowId>,
+    tool_progress: HashMap<ToolCallId, protocol::ToolProgressData>,
+}
+
+impl HistoryReplay {
+    fn apply(&mut self, event: ChatEvent, host_id: &str, agent_id: &AgentId) {
+        match event {
+            ChatEvent::MessageAdded(message) => {
+                self.push_entry(ChatMessageEntry {
+                    message,
+                    tool_requests: Vec::new(),
+                });
+            }
+            ChatEvent::MessageMetadataUpdated(data) => {
+                let Some(row_id) = self.message_rows.get(&data.message_id).copied() else {
+                    return;
+                };
+                let Some(row) = self.rows.iter().find(|row| row.id == row_id) else {
+                    return;
+                };
+                row.entry.update(|entry| {
+                    if data.model_info.is_some() {
+                        entry.message.model_info = data.model_info.clone();
+                    }
+                    if data.token_usage.is_some() {
+                        entry.message.token_usage = data.token_usage.clone();
+                    }
+                    if data.context_breakdown.is_some() {
+                        entry.message.context_breakdown = data.context_breakdown.clone();
+                    }
+                });
+            }
+            ChatEvent::StreamEnd(data) => {
+                if history_message_has_renderable_content(&data.message) {
+                    self.push_entry(ChatMessageEntry {
+                        message: data.message,
+                        tool_requests: Vec::new(),
+                    });
+                }
+            }
+            ChatEvent::ToolRequest(request) => {
+                let tool_name = request.tool_name.clone();
+                let tool_call_id = request.tool_call_id.clone();
+                let tool_entry = ToolRequestEntry {
+                    request,
+                    result: None,
+                };
+                if let Some(row) = self.rows.last() {
+                    row.entry.update(|entry| {
+                        entry.tool_requests.push(tool_entry);
+                    });
+                    self.tool_rows.insert(ToolCallId(tool_call_id), row.id);
+                } else {
+                    log::error!(
+                        "HISTORY TOOL REQUEST DROPPED: tool '{}' (call_id={}) for host {} agent {} — history page has no message row",
+                        tool_name,
+                        tool_call_id,
+                        host_id,
+                        agent_id
+                    );
+                }
+            }
+            ChatEvent::ToolExecutionCompleted(data) => {
+                let call_id = data.tool_call_id.clone();
+                let Some(row_id) = self.tool_rows.get(&ToolCallId(call_id.clone())).copied() else {
+                    return;
+                };
+                let Some(row) = self.rows.iter().find(|row| row.id == row_id) else {
+                    return;
+                };
+                row.entry.update(|entry| {
+                    if let Some(tool) = entry
+                        .tool_requests
+                        .iter_mut()
+                        .find(|tool| tool.request.tool_call_id == call_id)
+                    {
+                        tool.result = Some(data);
+                    }
+                });
+            }
+            ChatEvent::ToolProgress(data) => {
+                self.tool_progress
+                    .insert(ToolCallId(data.tool_call_id.clone()), data);
+            }
+            ChatEvent::TypingStatusChanged(_)
+            | ChatEvent::StreamStart(_)
+            | ChatEvent::StreamDelta(_)
+            | ChatEvent::StreamReasoningDelta(_)
+            | ChatEvent::TaskUpdate(_)
+            | ChatEvent::OperationCancelled(_)
+            | ChatEvent::RetryAttempt(_) => {}
+        }
+    }
+
+    fn push_entry(&mut self, entry: ChatMessageEntry) {
+        let handle = crate::state::ChatRowHandle::new(entry);
+        let (tool_call_ids, message_id) = handle.entry.with_untracked(|entry| {
+            (
+                entry
+                    .tool_requests
+                    .iter()
+                    .map(|tool| tool.request.tool_call_id.clone())
+                    .collect::<Vec<_>>(),
+                entry.message.message_id.clone(),
+            )
+        });
+        if let Some(message_id) = message_id {
+            self.message_rows.insert(message_id, handle.id);
+        }
+        for tool_call_id in tool_call_ids {
+            self.tool_rows.insert(ToolCallId(tool_call_id), handle.id);
+        }
+        self.rows.push(handle);
+    }
+}
+
+fn history_message_has_renderable_content(message: &protocol::ChatMessage) -> bool {
+    !message.content.trim().is_empty()
+        || message
+            .reasoning
+            .as_ref()
+            .is_some_and(|reasoning| !reasoning.text.trim().is_empty())
+        || !message.tool_calls.is_empty()
+        || message
+            .images
+            .as_ref()
+            .is_some_and(|images| !images.is_empty())
+}
+
 /// Apply an already-parsed `ChatEvent` to the per-agent state.
 ///
 /// Split out from `dispatch_chat_event` so an `AgentBootstrap` (or any
@@ -3755,15 +4028,6 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                     map.remove(&agent_id);
                 }
             });
-            // A new turn starting means the restore/replay phase is over, so
-            // freeze the history floor: any rows from here on are genuinely
-            // new conversation and should accumulate visibly rather than be
-            // swallowed by the windowing tail-tracking.
-            if typing {
-                state.history_settling.update(|set| {
-                    set.remove(&agent_id);
-                });
-            }
         }
         ChatEvent::MessageAdded(message) => {
             log::trace!(
@@ -4260,8 +4524,8 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
     // the only place that runs the auto-tab / compaction side effects.
     let snapshot_ids: HashSet<AgentId> =
         payload.agents.iter().map(|p| p.agent_id.clone()).collect();
-    // Prune the history window for agents on this host the snapshot no longer
-    // knows about, so a dropped agent doesn't leave an orphaned floor behind.
+    // Prune prior-history state for agents on this host the snapshot no
+    // longer knows about.
     let dropped_ids: Vec<AgentId> = state.agents.with_untracked(|agents| {
         agents
             .iter()
@@ -4270,7 +4534,7 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
             .collect()
     });
     for dropped in &dropped_ids {
-        state.forget_history_window(dropped);
+        state.forget_session_history(dropped);
     }
     state.agents.update(|agents| {
         agents.retain(|agent| agent.host_id != host_id || snapshot_ids.contains(&agent.agent_id));
@@ -4353,7 +4617,7 @@ fn apply_agent_bootstrap(
     state.chat_message_rows.update(|map| {
         map.remove(&agent_id);
     });
-    state.forget_history_window(&agent_id);
+    state.forget_session_history(&agent_id);
     state.streaming_text.update(|map| {
         map.remove(&agent_id);
     });
@@ -4416,37 +4680,28 @@ fn apply_agent_bootstrap(
                     map.insert(agent_id.clone(), inner.messages);
                 });
             }
+            AgentBootstrapEvent::HasPriorHistory {
+                message_count,
+                before_seq,
+            } => {
+                if message_count > 0 {
+                    state.session_history.update(|map| {
+                        map.insert(
+                            agent_id.clone(),
+                            SessionHistoryState {
+                                message_count,
+                                oldest_seq: Some(before_seq),
+                                has_more_before: true,
+                                loading: false,
+                            },
+                        );
+                    });
+                }
+            }
             AgentBootstrapEvent::ChatEvent(event) => {
                 apply_chat_event(state, host_id, &agent_id, event);
             }
         }
-    }
-
-    // Window long restored histories: render only the last message, collapsing
-    // earlier ones behind a "Load previous conversation history" control. The
-    // floor is the absolute index of the first rendered row. If the restored
-    // agent is idle, mark it as "settling" so the floor keeps tracking the tail
-    // if the resumed backend trickles the rest of its transcript in as live
-    // events after this snapshot (see `AppState::push_chat_entry`). The AI
-    // still has the full conversation in context — this only changes what the
-    // view renders.
-    let total = state
-        .chat_rows
-        .with_untracked(|map| map.get(&agent_id).map(|v| v.len()).unwrap_or(0));
-    let floor = crate::components::chat_view::initial_history_floor(total);
-    state.history_floor.update(|map| {
-        map.insert(agent_id.clone(), floor);
-    });
-    let turn_active = state
-        .agent_turn_active
-        .with_untracked(|map| map.get(&agent_id).copied().unwrap_or(false));
-    let stream_active = state
-        .streaming_text
-        .with_untracked(|map| map.contains_key(&agent_id));
-    if !turn_active && !stream_active {
-        state.history_settling.update(|set| {
-            set.insert(agent_id.clone());
-        });
     }
 }
 
@@ -4972,17 +5227,10 @@ mod tests {
                     context_breakdown: None,
                     images: None,
                 };
-            let mut events = (0..20)
-                .map(|index| {
-                    AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message(
-                        format!("history {index}"),
-                        protocol::MessageSender::User,
-                    )))
-                })
-                .collect::<Vec<_>>();
-            events.push(AgentBootstrapEvent::ChatEvent(
-                ChatEvent::TypingStatusChanged(true),
-            ));
+            let mut events = vec![AgentBootstrapEvent::HasPriorHistory {
+                message_count: 20,
+                before_seq: 42,
+            }];
             events.push(AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(
                 protocol::StreamStartData {
                     message_id: Some("midturn-message".to_owned()),
@@ -5001,15 +5249,13 @@ mod tests {
 
             assert!(
                 state
-                    .agent_turn_active
-                    .with_untracked(|map| map.get(&agent_id).copied().unwrap_or(false)),
-                "bootstrap should leave the restored agent mid-turn"
-            );
-            assert!(
-                !state
-                    .history_settling
-                    .with_untracked(|set| set.contains(&agent_id)),
-                "mid-turn restore must not keep tail-tracking history"
+                    .session_history
+                    .with_untracked(|map| map
+                        .get(&agent_id)
+                        .is_some_and(
+                            |history| history.message_count == 20 && history.oldest_seq == Some(42)
+                        )),
+                "bootstrap should retain the server-provided prior-history indicator"
             );
             assert_eq!(
                 state
@@ -5037,15 +5283,121 @@ mod tests {
                 state
                     .chat_rows
                     .with_untracked(|map| map.get(&agent_id).map(Vec::len)),
-                Some(21),
-                "live StreamEnd should append to the restored transcript"
+                Some(1),
+                "live StreamEnd should append while prior history remains unloaded"
             );
+        });
+    }
+
+    #[test]
+    fn session_history_prepends_newest_first_page() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_id = "history-host";
+            let agent_id = AgentId("a-history".to_owned());
+            let stream = StreamPath("/agent/a-history/inst".to_owned());
+
+            state.agents.update(|agents| {
+                agents.push(AgentInfo {
+                    host_id: host_id.to_owned(),
+                    agent_id: agent_id.clone(),
+                    name: "History Agent".to_owned(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: protocol::BackendKind::Codex,
+                    workspace_roots: Vec::new(),
+                    project_id: None,
+                    parent_agent_id: None,
+                    session_id: None,
+                    custom_agent_id: None,
+                    workflow: None,
+                    created_at_ms: 0,
+                    instance_stream: stream.clone(),
+                    started: true,
+                    fatal_error: None,
+                    activity_summary: Default::default(),
+                });
+            });
+
+            let message = |content: &str, sender: protocol::MessageSender| protocol::ChatMessage {
+                message_id: None,
+                timestamp: 0,
+                sender,
+                content: content.to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            };
+
+            state.push_chat_entry(
+                agent_id.clone(),
+                ChatMessageEntry {
+                    message: message(
+                        "live row",
+                        protocol::MessageSender::Assistant {
+                            agent: "History Agent".to_owned(),
+                        },
+                    ),
+                    tool_requests: Vec::new(),
+                },
+            );
+            state.session_history.update(|map| {
+                map.insert(
+                    agent_id.clone(),
+                    SessionHistoryState {
+                        message_count: 2,
+                        oldest_seq: Some(12),
+                        has_more_before: true,
+                        loading: true,
+                    },
+                );
+            });
+
+            apply_session_history(
+                &state,
+                host_id,
+                &stream,
+                SessionHistoryPayload {
+                    agent_id: agent_id.clone(),
+                    events: vec![
+                        ChatEvent::MessageAdded(message(
+                            "older row 2",
+                            protocol::MessageSender::User,
+                        )),
+                        ChatEvent::MessageAdded(message(
+                            "older row 1",
+                            protocol::MessageSender::User,
+                        )),
+                    ],
+                    has_more_before: false,
+                    oldest_seq: Some(3),
+                },
+            );
+
+            let rows = state
+                .chat_rows
+                .with_untracked(|map| map.get(&agent_id).cloned())
+                .expect("history rows");
+            let contents = rows
+                .iter()
+                .map(|row| row.entry.get_untracked().message.content)
+                .collect::<Vec<_>>();
             assert_eq!(
+                contents,
+                vec![
+                    "older row 1".to_owned(),
+                    "older row 2".to_owned(),
+                    "live row".to_owned()
+                ]
+            );
+            assert!(
                 state
-                    .history_floor
-                    .with_untracked(|map| map.get(&agent_id).copied().unwrap_or(0)),
-                0,
-                "live StreamEnd must accumulate instead of collapsing behind the history window"
+                    .session_history
+                    .with_untracked(|map| !map.contains_key(&agent_id)),
+                "final page should remove the load-older affordance"
             );
         });
     }

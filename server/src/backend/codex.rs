@@ -6572,6 +6572,8 @@ impl Backend for CodexBackend {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (resume_replay_complete_tx, resume_replay_complete_rx) =
+            tokio::sync::oneshot::channel();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
 
@@ -6639,6 +6641,16 @@ impl Backend for CodexBackend {
                 session.shutdown().await;
                 return;
             }
+
+            while let Ok(raw) = raw_events.try_recv() {
+                if let Some(event) = raw_chat_event(&raw)
+                    && events_tx.send(event).is_err()
+                {
+                    session.shutdown().await;
+                    return;
+                }
+            }
+            let _ = resume_replay_complete_tx.send(());
 
             loop {
                 tokio::select! {
@@ -6719,7 +6731,7 @@ impl Backend for CodexBackend {
                 session_id: backend_session_id,
                 subagent_emitter_tx,
             },
-            EventStream::new(events_rx),
+            EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
         ))
     }
 

@@ -542,6 +542,14 @@ impl ChatRowHandle {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionHistoryState {
+    pub message_count: u32,
+    pub oldest_seq: Option<u64>,
+    pub has_more_before: bool,
+    pub loading: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenFile {
     pub path: ProjectPath,
@@ -1235,23 +1243,11 @@ pub struct AppState {
     /// appending a duplicate row. Cleared anywhere `chat_rows` is cleared
     /// (host runtime reset, agent close, agent bootstrap snapshot).
     pub chat_message_rows: RwSignal<HashMap<AgentId, HashMap<ChatMessageId, ChatRowId>>>,
-    /// Per-agent index of the first chat row that the chat view renders. A
-    /// value of 0 (or an absent entry) means "render the whole history".
-    /// When a long session is restored, the view collapses everything but the
-    /// last message behind a "Load previous conversation history" control;
-    /// this holds the absolute floor index it windows from. The AI always
-    /// keeps the full conversation in context — this is purely a UI window.
-    /// Cleared anywhere `chat_rows` is cleared. See [`crate::components::
-    /// chat_view::initial_history_floor`].
-    pub history_floor: RwSignal<HashMap<AgentId, usize>>,
-    /// Agents whose restored history is still trickling in (a resumed backend
-    /// re-streams its whole transcript as live events, so the bootstrap
-    /// snapshot may carry only a prefix). While an agent is in this set the
-    /// floor is re-derived as rows arrive so it keeps tracking the tail.
-    /// Cleared when the agent's first new turn begins (a `TypingStatusChanged`
-    /// going active or a local submit starts a turn) or when the user reveals
-    /// the history, and anywhere `chat_rows` is cleared.
-    pub history_settling: RwSignal<std::collections::HashSet<AgentId>>,
+    /// Server-owned prior-history availability for each agent. The server
+    /// sends only this indicator in `AgentBootstrap`; actual prior transcript
+    /// rows are fetched explicitly with `FetchSessionHistory` and prepended
+    /// when `SessionHistory` arrives.
+    pub session_history: RwSignal<HashMap<AgentId, SessionHistoryState>>,
     pub streaming_text: RwSignal<HashMap<AgentId, StreamingState>>,
     /// Latest `ToolProgress` snapshot per tool call, keyed by the owning
     /// agent and tool call id. The single source of truth for live tool
@@ -1613,8 +1609,7 @@ impl AppState {
             chat_rows: RwSignal::new(HashMap::new()),
             chat_tool_rows: RwSignal::new(HashMap::new()),
             chat_message_rows: RwSignal::new(HashMap::new()),
-            history_floor: RwSignal::new(HashMap::new()),
-            history_settling: RwSignal::new(std::collections::HashSet::new()),
+            session_history: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
             tool_progress: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
@@ -1940,21 +1935,12 @@ impl AppState {
     /// (e.g. a future tab type that `finish_compaction_success`
     /// doesn't know about), and leaving a stray tab pointing at a
     /// dead agent is worse than a redundant scan.
-    /// Drop the history-window state (floor + settling flag) for a single
-    /// agent. Call wherever `chat_rows` is cleared for that agent so a
-    /// re-bootstrap starts from a clean window and no orphaned floor lingers.
-    pub fn forget_history_window(&self, agent_id: &AgentId) {
-        self.history_floor.update(|map| {
+    /// Drop server-provided prior-history state for a single agent. Call
+    /// wherever `chat_rows` is cleared for that agent so a re-bootstrap starts
+    /// from the server's new authoritative indicator.
+    pub fn forget_session_history(&self, agent_id: &AgentId) {
+        self.session_history.update(|map| {
             map.remove(agent_id);
-        });
-        self.history_settling.update(|set| {
-            set.remove(agent_id);
-        });
-    }
-
-    pub fn stop_history_settling(&self, agent_id: &AgentId) {
-        self.history_settling.update(|set| {
-            set.remove(agent_id);
         });
     }
 
@@ -1965,7 +1951,7 @@ impl AppState {
         self.chat_rows.update(|map| {
             map.remove(agent_id);
         });
-        self.forget_history_window(agent_id);
+        self.forget_session_history(agent_id);
         self.chat_tool_rows.update(|map| {
             map.remove(agent_id);
         });
@@ -2247,27 +2233,10 @@ impl AppState {
             )
         });
 
-        let new_len = self.chat_rows.try_update(|rows| {
+        self.chat_rows.update(|rows| {
             let agent_rows = rows.entry(agent_id.clone()).or_default();
             agent_rows.push(handle.clone());
-            agent_rows.len()
         });
-
-        // While a resumed agent is still replaying its restored history, keep
-        // the render floor tracking the tail so trickled-in old messages stay
-        // hidden behind the "Load previous" control instead of appearing one
-        // by one. Genuinely-new turns clear the settling flag first, so live
-        // conversation accumulates visibly.
-        if let Some(new_len) = new_len
-            && self
-                .history_settling
-                .with_untracked(|set| set.contains(&agent_id))
-        {
-            let floor = crate::components::chat_view::initial_history_floor(new_len);
-            self.history_floor.update(|map| {
-                map.insert(agent_id.clone(), floor);
-            });
-        }
 
         if !indexed_tool_call_ids.is_empty() {
             self.chat_tool_rows.update(|indexes| {
@@ -2654,11 +2623,8 @@ impl AppState {
             self.streaming_text.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
-            self.history_floor.update(|map| {
+            self.session_history.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
-            });
-            self.history_settling.update(|set| {
-                set.retain(|id| !drop_set.contains(id));
             });
             self.task_lists.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));

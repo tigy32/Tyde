@@ -15,10 +15,10 @@ use protocol::{
     ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
     ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
     ProjectNotifyPayload, ProtocolValidator, QueuedMessagesPayload, RejectPayload,
-    ReviewBootstrapPayload, ReviewEventPayload, ReviewId, SeqMismatch, SessionListPayload,
-    SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
-    StreamPath, TeamCompactNotifyPayload, TeamCompactStatus, TeamDraftNotifyPayload,
-    TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
+    ReviewBootstrapPayload, ReviewEventPayload, ReviewId, SeqMismatch, SessionHistoryPayload,
+    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload,
+    SteeringNotifyPayload, StreamPath, TeamCompactNotifyPayload, TeamCompactStatus,
+    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
 };
 
@@ -26,7 +26,7 @@ use crate::state::MobileShellError;
 use crate::state::{
     ActiveAgentRef, AgentInfo, AgentRef, AppState, ChatMessageEntry, ConnectionStatus,
     HostBrowseSession, LocalHostId, ProjectDiffRef, ProjectFileRef, ProjectFileState, ProjectInfo,
-    ReviewRef, SessionInfo, StreamingState, ToolRequestEntry, TransientEvent,
+    ReviewRef, SessionHistoryState, SessionInfo, StreamingState, ToolRequestEntry, TransientEvent,
     reduce_project_diff_response, sort_project_infos,
 };
 
@@ -301,6 +301,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 state.connection_statuses.update(|map| {
                     map.insert(host.clone(), ConnectionStatus::Error(payload.message));
                 });
+                clear_session_history_loading_for_host(state, host);
             }
         }
         FrameKind::CommandError => {
@@ -313,6 +314,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 state.command_errors_by_host.update(|map| {
                     map.insert(host.clone(), message);
                 });
+                clear_session_history_loading_on_error(state, host, &payload);
             }
         }
         FrameKind::HostSettings => {
@@ -542,6 +544,16 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
             }
         }
         FrameKind::ChatEvent => dispatch_chat_event(state, host, &envelope.stream, &envelope),
+        FrameKind::SessionHistory => match envelope.parse_payload::<SessionHistoryPayload>() {
+            Ok(payload) => apply_session_history(state, host, &envelope.stream, payload),
+            Err(error) => log::error!(
+                "failed to parse SessionHistory host={} stream={} seq={}: {}",
+                host,
+                envelope.stream,
+                envelope.seq,
+                error
+            ),
+        },
         FrameKind::SessionList => match envelope.parse_payload::<SessionListPayload>() {
             Ok(payload) => {
                 let count = payload.sessions.len();
@@ -954,7 +966,7 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
     state.chat_message_index.update(|m| {
         m.remove(agent_ref);
     });
-    state.forget_history_window(agent_ref);
+    state.forget_session_history(agent_ref);
     state.streaming_text.update(|m| {
         m.remove(agent_ref);
     });
@@ -1206,6 +1218,39 @@ fn resolve_agent_id(state: &AppState, host: &LocalHostId, stream: &StreamPath) -
     resolve_agent_ref(state, host, stream).map(|r| r.agent_id)
 }
 
+fn clear_session_history_loading_on_error(
+    state: &AppState,
+    host: &LocalHostId,
+    payload: &CommandErrorPayload,
+) {
+    if !matches!(payload.request_kind, FrameKind::FetchSessionHistory) {
+        return;
+    }
+    let Some(agent_ref) = resolve_agent_ref(state, host, &payload.stream) else {
+        log::warn!(
+            "fetch_session_history error on unknown stream host={} stream={}",
+            host,
+            payload.stream
+        );
+        return;
+    };
+    state.session_history.update(|map| {
+        if let Some(history) = map.get_mut(&agent_ref) {
+            history.loading = false;
+        }
+    });
+}
+
+fn clear_session_history_loading_for_host(state: &AppState, host: &LocalHostId) {
+    state.session_history.update(|map| {
+        for (agent_ref, history) in map.iter_mut() {
+            if agent_ref.local_host_id == *host {
+                history.loading = false;
+            }
+        }
+    });
+}
+
 fn dispatch_chat_event(
     state: &AppState,
     host: &LocalHostId,
@@ -1279,15 +1324,6 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                     map.remove(&agent_ref);
                 }
             });
-            // A new turn starting means the restore/replay phase is over, so
-            // freeze the history floor: rows from here on are genuinely new
-            // conversation and should accumulate visibly rather than be
-            // swallowed by the windowing tail-tracking.
-            if typing {
-                state.history_settling.update(|set| {
-                    set.remove(&agent_ref);
-                });
-            }
         }
         ChatEvent::MessageAdded(message) => {
             let entry = ChatMessageEntry {
@@ -1476,6 +1512,207 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
     }
 }
 
+fn apply_session_history(
+    state: &AppState,
+    host: &LocalHostId,
+    stream: &StreamPath,
+    payload: SessionHistoryPayload,
+) {
+    let Some(agent_ref) = resolve_agent_ref(state, host, stream) else {
+        log::warn!("session_history on unknown stream host={host} stream={stream}");
+        return;
+    };
+    if payload.agent_id != agent_ref.agent_id {
+        log::error!(
+            "session_history agent mismatch host={} stream={} payload_agent_id={} stream_agent_id={}",
+            host,
+            stream,
+            payload.agent_id,
+            agent_ref.agent_id
+        );
+        return;
+    }
+
+    let mut replay = MobileHistoryReplay::default();
+    for event in payload.events.into_iter().rev() {
+        replay.apply(event, host, &agent_ref);
+    }
+
+    if !replay.rows.is_empty() {
+        state.chat_messages.update(|map| {
+            let current = map.remove(&agent_ref).unwrap_or_default();
+            let mut combined = replay.rows;
+            combined.extend(current);
+            map.insert(agent_ref.clone(), combined);
+        });
+        rebuild_chat_message_index(state, &agent_ref);
+    }
+
+    state.session_history.update(|map| {
+        let mut remove = false;
+        if let Some(history) = map.get_mut(&agent_ref) {
+            history.oldest_seq = payload.oldest_seq;
+            history.has_more_before = payload.has_more_before;
+            history.loading = false;
+            history.message_count = 0;
+            if !history.has_more_before {
+                remove = true;
+            }
+        } else if payload.has_more_before {
+            map.insert(
+                agent_ref.clone(),
+                SessionHistoryState {
+                    message_count: 0,
+                    oldest_seq: payload.oldest_seq,
+                    has_more_before: payload.has_more_before,
+                    loading: false,
+                },
+            );
+        }
+        if remove {
+            map.remove(&agent_ref);
+        }
+    });
+}
+
+#[derive(Default)]
+struct MobileHistoryReplay {
+    rows: Vec<ChatMessageEntry>,
+    message_index: HashMap<protocol::ChatMessageId, usize>,
+    tool_index: HashMap<String, usize>,
+}
+
+impl MobileHistoryReplay {
+    fn apply(&mut self, event: ChatEvent, host: &LocalHostId, agent_ref: &AgentRef) {
+        match event {
+            ChatEvent::MessageAdded(message) => {
+                self.push_entry(ChatMessageEntry {
+                    message,
+                    tool_requests: Vec::new(),
+                });
+            }
+            ChatEvent::MessageMetadataUpdated(data) => {
+                let Some(index) = self.message_index.get(&data.message_id).copied() else {
+                    return;
+                };
+                let Some(row) = self.rows.get_mut(index) else {
+                    return;
+                };
+                if data.model_info.is_some() {
+                    row.message.model_info = data.model_info;
+                }
+                if data.token_usage.is_some() {
+                    row.message.token_usage = data.token_usage;
+                }
+                if data.context_breakdown.is_some() {
+                    row.message.context_breakdown = data.context_breakdown;
+                }
+            }
+            ChatEvent::StreamEnd(data) => {
+                if history_message_has_renderable_content(&data.message) {
+                    self.push_entry(ChatMessageEntry {
+                        message: data.message,
+                        tool_requests: Vec::new(),
+                    });
+                }
+            }
+            ChatEvent::ToolRequest(request) => {
+                let tool_name = request.tool_name.clone();
+                let tool_call_id = request.tool_call_id.clone();
+                let tool_entry = ToolRequestEntry {
+                    request,
+                    result: None,
+                };
+                let last_index = self.rows.len().saturating_sub(1);
+                if let Some(last) = self.rows.last_mut() {
+                    last.tool_requests.push(tool_entry);
+                    self.tool_index.insert(tool_call_id, last_index);
+                } else {
+                    log::error!(
+                        "mobile history tool request dropped: tool '{}' (call_id={}) for host {} agent {} without a message row",
+                        tool_name,
+                        tool_call_id,
+                        host,
+                        agent_ref.agent_id
+                    );
+                }
+            }
+            ChatEvent::ToolExecutionCompleted(data) => {
+                let Some(index) = self.tool_index.get(&data.tool_call_id).copied() else {
+                    return;
+                };
+                let Some(row) = self.rows.get_mut(index) else {
+                    return;
+                };
+                if let Some(tool) = row
+                    .tool_requests
+                    .iter_mut()
+                    .find(|tool| tool.request.tool_call_id == data.tool_call_id)
+                {
+                    tool.result = Some(data);
+                }
+            }
+            ChatEvent::TypingStatusChanged(_)
+            | ChatEvent::StreamStart(_)
+            | ChatEvent::StreamDelta(_)
+            | ChatEvent::StreamReasoningDelta(_)
+            | ChatEvent::ToolProgress(_)
+            | ChatEvent::TaskUpdate(_)
+            | ChatEvent::OperationCancelled(_)
+            | ChatEvent::RetryAttempt(_) => {}
+        }
+    }
+
+    fn push_entry(&mut self, entry: ChatMessageEntry) {
+        let index = self.rows.len();
+        if let Some(message_id) = entry.message.message_id.clone() {
+            self.message_index.insert(message_id, index);
+        }
+        for tool in &entry.tool_requests {
+            self.tool_index
+                .insert(tool.request.tool_call_id.clone(), index);
+        }
+        self.rows.push(entry);
+    }
+}
+
+fn history_message_has_renderable_content(message: &protocol::ChatMessage) -> bool {
+    !message.content.trim().is_empty()
+        || message
+            .reasoning
+            .as_ref()
+            .is_some_and(|reasoning| !reasoning.text.trim().is_empty())
+        || !message.tool_calls.is_empty()
+        || message
+            .images
+            .as_ref()
+            .is_some_and(|images| !images.is_empty())
+}
+
+fn rebuild_chat_message_index(state: &AppState, agent_ref: &AgentRef) {
+    let next = state.chat_messages.with_untracked(|messages| {
+        messages.get(agent_ref).map(|rows| {
+            rows.iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    entry
+                        .message
+                        .message_id
+                        .clone()
+                        .map(|message_id| (message_id, index))
+                })
+                .collect::<HashMap<protocol::ChatMessageId, usize>>()
+        })
+    });
+    state.chat_message_index.update(|indexes| {
+        if let Some(next) = next {
+            indexes.insert(agent_ref.clone(), next);
+        } else {
+            indexes.remove(agent_ref);
+        }
+    });
+}
+
 // ── Bootstrap apply helpers ──────────────────────────────────────────────
 //
 // HostBootstrap (seq 1 on the host stream after Welcome at seq 0) carries
@@ -1596,8 +1833,8 @@ fn apply_host_bootstrap(state: &AppState, host: &LocalHostId, payload: HostBoots
 
     let snapshot_ids: HashSet<AgentId> =
         payload.agents.iter().map(|p| p.agent_id.clone()).collect();
-    // Prune the history window for agents on this host the snapshot no longer
-    // knows about, so a dropped agent doesn't leave an orphaned floor behind.
+    // Prune prior-history state for agents on this host the snapshot no longer
+    // knows about, so a dropped agent doesn't leave an orphaned indicator.
     let dropped_refs: Vec<AgentRef> = state.agents.with_untracked(|agents| {
         agents
             .iter()
@@ -1606,7 +1843,7 @@ fn apply_host_bootstrap(state: &AppState, host: &LocalHostId, payload: HostBoots
             .collect()
     });
     for dropped in &dropped_refs {
-        state.forget_history_window(dropped);
+        state.forget_session_history(dropped);
     }
     state.agents.update(|agents| {
         agents.retain(|a| a.local_host_id != *host || snapshot_ids.contains(&a.agent_id));
@@ -1684,7 +1921,7 @@ fn apply_agent_bootstrap(
     state.chat_message_index.update(|m| {
         m.remove(&agent_ref);
     });
-    state.forget_history_window(&agent_ref);
+    state.forget_session_history(&agent_ref);
     state.streaming_text.update(|m| {
         m.remove(&agent_ref);
     });
@@ -1759,36 +1996,28 @@ fn apply_agent_bootstrap(
                     map.insert(agent_ref.clone(), inner.messages);
                 });
             }
+            AgentBootstrapEvent::HasPriorHistory {
+                message_count,
+                before_seq,
+            } => {
+                if message_count > 0 {
+                    state.session_history.update(|map| {
+                        map.insert(
+                            agent_ref.clone(),
+                            SessionHistoryState {
+                                message_count,
+                                oldest_seq: Some(before_seq),
+                                has_more_before: true,
+                                loading: false,
+                            },
+                        );
+                    });
+                }
+            }
             AgentBootstrapEvent::ChatEvent(event) => {
                 apply_chat_event(state, &agent_ref, event);
             }
         }
-    }
-
-    // Window a long restored history: render only the last message, collapsing
-    // earlier ones behind a "Load previous conversation history" control. If
-    // the restored agent is idle, mark it as "settling" so the floor keeps
-    // tracking the tail if the resumed backend trickles the rest of its
-    // transcript in as live events after this snapshot (see
-    // `AppState::push_chat_message_entry`). The AI still has the full
-    // conversation in context — this only changes what the view renders.
-    let total = state
-        .chat_messages
-        .with_untracked(|m| m.get(&agent_ref).map(|v| v.len()).unwrap_or(0));
-    let floor = crate::components::chat_view::initial_history_floor(total);
-    state.history_floor.update(|m| {
-        m.insert(agent_ref.clone(), floor);
-    });
-    let turn_active = state
-        .agent_turn_active
-        .with_untracked(|m| m.get(&agent_ref).copied().unwrap_or(false));
-    let stream_active = state
-        .streaming_text
-        .with_untracked(|m| m.contains_key(&agent_ref));
-    if !turn_active && !stream_active {
-        state.history_settling.update(|s| {
-            s.insert(agent_ref.clone());
-        });
     }
 }
 
@@ -1955,14 +2184,10 @@ mod tests {
                     context_breakdown: None,
                     images: None,
                 };
-            let mut events = (0..20)
-                .map(|index| {
-                    AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message(
-                        format!("history {index}"),
-                        protocol::MessageSender::User,
-                    )))
-                })
-                .collect::<Vec<_>>();
+            let mut events = vec![AgentBootstrapEvent::HasPriorHistory {
+                message_count: 20,
+                before_seq: 42,
+            }];
             events.push(AgentBootstrapEvent::ChatEvent(
                 ChatEvent::TypingStatusChanged(true),
             ));
@@ -1989,10 +2214,14 @@ mod tests {
                 "bootstrap should leave the restored agent mid-turn"
             );
             assert!(
-                !state
-                    .history_settling
-                    .with_untracked(|set| set.contains(&agent_ref)),
-                "mid-turn restore must not keep tail-tracking history"
+                state
+                    .session_history
+                    .with_untracked(|map| map
+                        .get(&agent_ref)
+                        .is_some_and(
+                            |history| history.message_count == 20 && history.oldest_seq == Some(42)
+                        )),
+                "bootstrap should keep the server-owned prior-history gate"
             );
             assert_eq!(
                 state
@@ -2019,15 +2248,8 @@ mod tests {
                 state
                     .chat_messages
                     .with_untracked(|map| map.get(&agent_ref).map(Vec::len)),
-                Some(21),
-                "live StreamEnd should append to the restored transcript"
-            );
-            assert_eq!(
-                state
-                    .history_floor
-                    .with_untracked(|map| map.get(&agent_ref).copied().unwrap_or(0)),
-                0,
-                "live StreamEnd must accumulate instead of collapsing behind the history window"
+                Some(1),
+                "live StreamEnd should append while prior history remains unloaded"
             );
         });
     }

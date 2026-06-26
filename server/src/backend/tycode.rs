@@ -21,7 +21,7 @@ use super::{
     empty_session_settings_schema, render_combined_spawn_instructions,
     setup::resolve_tycode_binary_path,
 };
-use crate::process_env;
+use crate::{paths, process_env};
 
 fn subprocess_bin() -> Result<String, String> {
     resolve_tycode_binary_path().ok_or_else(|| "tycode-subprocess not found".to_string())
@@ -395,10 +395,13 @@ impl Backend for TycodeBackend {
         config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
+        let replay_event_count = tycode_resume_replay_event_count(&session_id)?;
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (resume_replay_complete_tx, resume_replay_complete_rx) =
+            tokio::sync::oneshot::channel();
         let known_session_id = Arc::new(std::sync::Mutex::new(Some(session_id.clone())));
         let mcp_servers_json = build_tycode_mcp_servers_json(&config.startup_mcp_servers);
 
@@ -493,6 +496,14 @@ impl Backend for TycodeBackend {
             {
                 return;
             }
+            if stdin_tx
+                .send(TycodeStdinCommand::Json(Value::String(
+                    "ListSessions".to_owned(),
+                )))
+                .is_err()
+            {
+                return;
+            }
 
             let stdin_tx2 = stdin_tx.clone();
             tokio::spawn(async move {
@@ -533,6 +544,9 @@ impl Backend for TycodeBackend {
             let mut lines = BufReader::new(stdout).lines();
             let mut stream_open = false;
             let mut accumulated_text = String::new();
+            let mut replay_barrier =
+                TycodeResumeReplayBarrier::new(session_id.0.clone(), replay_event_count);
+            let mut resume_replay_complete_tx = Some(resume_replay_complete_tx);
             loop {
                 let line = tokio::select! {
                     line = lines.next_line() => line,
@@ -560,6 +574,13 @@ impl Backend for TycodeBackend {
                         continue;
                     }
                 };
+
+                if resume_replay_complete_tx.is_some() && replay_barrier.observe(&value) {
+                    if let Some(tx) = resume_replay_complete_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    continue;
+                }
 
                 let events = map_tycode_value_to_chat_events(&value);
                 if events.is_empty() {
@@ -601,7 +622,7 @@ impl Backend for TycodeBackend {
                 shutdown_tx,
                 session_id: known_session_id,
             },
-            EventStream::new(events_rx),
+            EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
         ))
     }
 
@@ -877,6 +898,80 @@ fn extract_tycode_title(value: &Value) -> Option<String> {
     None
 }
 
+fn is_tycode_sessions_list(value: &Value) -> bool {
+    value.get("kind").and_then(Value::as_str) == Some("SessionsList")
+}
+
+struct TycodeResumeReplayBarrier {
+    session_id: String,
+    replay_started: bool,
+    replay_events_remaining: usize,
+}
+
+impl TycodeResumeReplayBarrier {
+    fn new(session_id: String, replay_events_remaining: usize) -> Self {
+        Self {
+            session_id,
+            replay_started: false,
+            replay_events_remaining,
+        }
+    }
+
+    fn observe(&mut self, value: &Value) -> bool {
+        if !self.replay_started {
+            if is_tycode_session_started(value, &self.session_id) {
+                self.replay_started = true;
+                self.replay_events_remaining = self.replay_events_remaining.saturating_sub(1);
+            }
+            return false;
+        }
+        if self.replay_events_remaining > 0 {
+            self.replay_events_remaining -= 1;
+            return false;
+        }
+        is_tycode_sessions_list(value)
+    }
+}
+
+fn is_tycode_session_started(value: &Value, session_id: &str) -> bool {
+    value.get("kind").and_then(Value::as_str) == Some("SessionStarted")
+        && value
+            .get("data")
+            .and_then(|data| data.get("session_id"))
+            .and_then(Value::as_str)
+            == Some(session_id)
+}
+
+fn tycode_resume_replay_event_count(session_id: &SessionId) -> Result<usize, String> {
+    let path = paths::home_dir()?
+        .join(".tycode")
+        .join("sessions")
+        .join(format!("{}.json", session_id.0));
+    let json = fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read Tycode session {}: {err}", path.display()))?;
+    tycode_resume_replay_event_count_from_json(&json)
+}
+
+fn tycode_resume_replay_event_count_from_json(json: &str) -> Result<usize, String> {
+    let value: Value = serde_json::from_str(json)
+        .map_err(|err| format!("failed to parse Tycode session JSON: {err}"))?;
+    let events = value
+        .get("events")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Tycode session JSON is missing an events array".to_owned())?;
+    Ok(2 + events
+        .iter()
+        .filter(|event| !is_tycode_replay_filtered_delta(event))
+        .count())
+}
+
+fn is_tycode_replay_filtered_delta(value: &Value) -> bool {
+    matches!(
+        value.get("kind").and_then(Value::as_str),
+        Some("StreamDelta" | "StreamReasoningDelta")
+    )
+}
+
 fn map_tycode_value_to_chat_events(value: &Value) -> Vec<ChatEvent> {
     if let Ok(event) = serde_json::from_value::<ChatEvent>(value.clone()) {
         return vec![event];
@@ -1095,6 +1190,102 @@ mod tests {
         assert!(
             events.is_empty(),
             "SessionStarted should stay out of chat streams"
+        );
+    }
+
+    #[test]
+    fn resume_replay_barrier_ignores_historical_sessions_list_until_replay_count_exhausted() {
+        let mut barrier = TycodeResumeReplayBarrier::new("session-1".to_owned(), 5);
+        let pre_resume_warning = serde_json::json!({
+            "kind": "MessageAdded",
+            "data": {
+                "timestamp": 1_u64,
+                "sender": {
+                    "Error": {}
+                },
+                "content": "startup warning before resume",
+                "reasoning": null,
+                "tool_calls": [],
+                "model_info": null,
+                "token_usage": null,
+                "context_breakdown": null,
+                "images": []
+            }
+        });
+        let session_started = serde_json::json!({
+            "kind": "SessionStarted",
+            "data": { "session_id": "session-1" }
+        });
+        let conversation_cleared = serde_json::json!({ "kind": "ConversationCleared" });
+        let historical_sessions_list = serde_json::json!({
+            "kind": "SessionsList",
+            "data": { "sessions": [] }
+        });
+        let historical_message = serde_json::json!({
+            "kind": "MessageAdded",
+            "data": {
+                "timestamp": 1_u64,
+                "sender": {
+                    "Assistant": {
+                        "agent": "tycode"
+                    }
+                },
+                "content": "still replayed after historical SessionsList",
+                "reasoning": null,
+                "tool_calls": [],
+                "model_info": null,
+                "token_usage": null,
+                "context_breakdown": null,
+                "images": []
+            }
+        });
+        let historical_final_sessions_list = serde_json::json!({
+            "kind": "SessionsList",
+            "data": { "sessions": [] }
+        });
+        let genuine_sentinel = serde_json::json!({
+            "kind": "SessionsList",
+            "data": { "sessions": [] }
+        });
+
+        assert!(
+            !barrier.observe(&pre_resume_warning),
+            "pre-resume startup output must not consume replay count or complete the barrier"
+        );
+        for event in [
+            &session_started,
+            &conversation_cleared,
+            &historical_sessions_list,
+            &historical_message,
+            &historical_final_sessions_list,
+        ] {
+            assert!(
+                !barrier.observe(event),
+                "historical replay event must not complete the barrier: {event}"
+            );
+        }
+        assert!(
+            barrier.observe(&genuine_sentinel),
+            "the post-resume ListSessions response should complete the barrier"
+        );
+    }
+
+    #[test]
+    fn resume_replay_event_count_includes_historical_sessions_list_and_skips_deltas() {
+        let session = serde_json::json!({
+            "id": "session-1",
+            "events": [
+                { "kind": "SessionsList", "data": { "sessions": [] } },
+                { "kind": "StreamDelta", "data": { "message_id": "m1", "text": "skip" } },
+                { "kind": "StreamReasoningDelta", "data": { "message_id": "m1", "text": "skip" } },
+                { "kind": "MessageAdded", "data": { "content": "keep" } }
+            ]
+        });
+        let count = tycode_resume_replay_event_count_from_json(&session.to_string())
+            .expect("session replay count should parse");
+        assert_eq!(
+            count, 4,
+            "SessionStarted and ConversationCleared plus non-delta persisted events"
         );
     }
 }
