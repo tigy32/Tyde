@@ -917,23 +917,25 @@ async fn antigravity_direct_resume_missing_native_db_reports_startup_failure() {
         .list_sessions(ListSessionsPayload::default())
         .await
         .expect("list sessions with fake Antigravity db");
-    let session_list = loop {
+    let session = loop {
         let env = expect_fixture_event(
             &mut fixture.client,
             "Antigravity SessionList with fake native db",
         )
         .await;
         if env.kind == FrameKind::SessionList {
-            break env
+            let session_list = env
                 .parse_payload::<SessionListPayload>()
                 .expect("parse Antigravity SessionList with fake native db");
+            if let Some(session) = session_list
+                .sessions
+                .into_iter()
+                .find(|session| session.id == session_id && session.resumable)
+            {
+                break session;
+            }
         }
     };
-    let session = session_list
-        .sessions
-        .iter()
-        .find(|session| session.id == session_id)
-        .expect("persisted Antigravity session with fake native db");
     assert!(
         session.resumable,
         "test setup must first observe the Antigravity session as resumable"

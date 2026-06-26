@@ -182,6 +182,44 @@ export function resolveBootTarget(version, manifest) {
   };
 }
 
+// Resolves the newest bootable version present in the manifest. Used when the
+// loader has no host-specific remembered version (for example a fresh install
+// or a browser whose paired hosts were deleted): in that case we should show
+// the latest mobile app/onboarding UI, not fall back to the loader's legacy
+// pair screen or a stale stored version.
+export function resolveLatestBootTarget(manifest) {
+  if (!manifest || typeof manifest !== "object") {
+    return { ok: false, reason: "no-manifest" };
+  }
+  const versions =
+    manifest.versions && typeof manifest.versions === "object"
+      ? manifest.versions
+      : {};
+
+  let best = null;
+  let lastFailure = null;
+  for (const raw of Object.keys(versions)) {
+    const norm = validateReleaseVersion(raw);
+    if (!norm) continue;
+    const resolved = resolveBootTarget(norm, manifest);
+    if (!resolved.ok) {
+      if (resolved.reason === "bad-policy" || resolved.reason === "no-manifest") {
+        return resolved;
+      }
+      lastFailure = resolved;
+      continue;
+    }
+
+    if (!best || compareVersions(resolved.version, best.version) > 0) {
+      best = resolved;
+    }
+  }
+
+  if (best) return best;
+  if (lastFailure) return lastFailure;
+  return { ok: false, reason: "not-in-manifest" };
+}
+
 // Selects the two URLs the loader dynamically imports to boot a Trunk bundle:
 // the entry ES module (`entryUrl`) and the explicit hashed `…_bg.wasm` the
 // module's default `init()` must be called with (`wasmUrl`).

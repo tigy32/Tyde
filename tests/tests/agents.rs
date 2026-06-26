@@ -257,40 +257,8 @@ fn single_host_stream(client: &client::Connection) -> StreamPath {
     host_stream
 }
 
-async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
-    let env = expect_chat_event(client, "TypingStatusChanged(true)").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
-
-    let env = expect_chat_event(client, "StreamStart").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::StreamStart(..)));
-
-    let env = expect_chat_event(client, "StreamDelta").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    match &event {
-        ChatEvent::StreamDelta(delta) => {
-            assert!(
-                delta.text.contains(expected_text),
-                "unexpected delta text: {}",
-                delta.text,
-            );
-        }
-        other => panic!("expected StreamDelta, got {other:?}"),
-    }
-
-    let env = expect_chat_event(client, "StreamEnd").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::StreamEnd(..)));
-
-    let env = expect_chat_event(client, "TypingStatusChanged(false)").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+async fn expect_turn(client: &mut client::Connection, stream: &StreamPath, expected_text: &str) {
+    expect_turn_on_stream(client, stream, expected_text).await;
 }
 
 async fn expect_no_event(client: &mut client::Connection, duration: Duration, context: &str) {
@@ -705,7 +673,10 @@ async fn expect_turn_on_stream(
 
     let env = expect_chat_event_on_stream(client, stream, "StreamStart").await;
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::StreamStart(..)));
+    assert!(
+        matches!(event, ChatEvent::StreamStart(..)),
+        "expected StreamStart on {stream}, got {event:?}"
+    );
 
     let env = expect_chat_event_on_stream(client, stream, "StreamDelta").await;
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
@@ -723,11 +694,17 @@ async fn expect_turn_on_stream(
 
     let env = expect_chat_event_on_stream(client, stream, "StreamEnd").await;
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::StreamEnd(..)));
+    assert!(
+        matches!(event, ChatEvent::StreamEnd(..)),
+        "expected StreamEnd on {stream}, got {event:?}"
+    );
 
     let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(false)").await;
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
-    assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+    assert!(
+        matches!(event, ChatEvent::TypingStatusChanged(false)),
+        "expected TypingStatusChanged(false) on {stream}, got {event:?}"
+    );
 }
 
 async fn expect_error_message_on_stream(
@@ -911,6 +888,7 @@ async fn expect_chat_event_on_stream(
         if env.kind == FrameKind::ChatEvent && env.stream == *stream {
             return env;
         }
+        push_pending_agent_event(env);
     }
 }
 
@@ -1106,6 +1084,7 @@ async fn expect_agent_start_on_stream(
         }
         let env = expect_next_event(client, context).await;
         if env.kind != FrameKind::AgentStart || env.stream != *stream {
+            push_pending_agent_event(env);
             continue;
         }
         return env.parse_payload().expect("parse AgentStart");
@@ -1263,21 +1242,19 @@ async fn agent_lifecycle() {
     let agent_stream = new_agent.instance_stream.clone();
 
     // 3. Receive AgentStart
-    let env = expect_next_event(&mut fixture.client, "AgentStart").await;
-
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    assert_eq!(env.stream, agent_stream);
-    assert_eq!(env.seq, 0);
-
-    let start: AgentStartPayload = env
-        .parse_payload()
-        .expect("failed to parse AgentStartPayload");
+    let start =
+        expect_agent_start_on_stream(&mut fixture.client, &agent_stream, "AgentStart").await;
     assert!(!start.agent_id.0.is_empty());
     assert_eq!(start.backend_kind, BackendKind::Claude);
     assert_eq!(start.name, "test-agent");
 
     // 4. Receive mock's initial turn: StreamStart → StreamDelta → StreamEnd
-    expect_turn(&mut fixture.client, "mock backend response to: hello").await;
+    expect_turn(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: hello",
+    )
+    .await;
 
     // 5. Send a follow-up message
     fixture
@@ -1287,7 +1264,12 @@ async fn agent_lifecycle() {
         .expect("send_message failed");
 
     // 6. Receive follow-up turn: StreamStart → StreamDelta → StreamEnd
-    expect_turn(&mut fixture.client, "mock backend response to: follow up").await;
+    expect_turn(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: follow up",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1470,12 +1452,16 @@ async fn client_error_report_is_accepted_before_agent_flow() {
         .expect("parse NewAgent after client error report");
     assert_eq!(new_agent.name, "after-client-error-report");
 
-    let env = expect_next_event(&mut fixture.client, "AgentStart after client error report").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    assert_eq!(env.stream, new_agent.instance_stream);
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "AgentStart after client error report",
+    )
+    .await;
 
     expect_turn(
         &mut fixture.client,
+        &new_agent.instance_stream,
         "mock backend response to: hello after client error report",
     )
     .await;
@@ -1510,11 +1496,15 @@ async fn close_agent_emits_agent_closed_and_removes_agent_from_registry() {
     let new_agent: NewAgentPayload = env.parse_payload().expect("parse close-agent NewAgent");
     let agent_stream = new_agent.instance_stream.clone();
 
-    let env = expect_next_event(&mut fixture.client, "close-agent AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    assert_eq!(env.stream, agent_stream);
+    expect_agent_start_on_stream(&mut fixture.client, &agent_stream, "close-agent AgentStart")
+        .await;
 
-    expect_turn(&mut fixture.client, "mock backend response to: hello").await;
+    expect_turn(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: hello",
+    )
+    .await;
     assert!(
         fixture.agent_ids().await.contains(&new_agent.agent_id),
         "agent should be registered before close"
@@ -3067,7 +3057,7 @@ async fn interrupting_parent_keeps_agent_control_children_running() {
     let base_url = fixture.agent_control_http_url().await;
     let child_agent_id = mcp_spawn_agent(
         &format!("{base_url}?agent_id={}", parent_new.agent_id.0),
-        "agent-control child first",
+        "__mock_slow__ agent-control child first",
         "agent-control-child",
     )
     .await;
@@ -3099,7 +3089,7 @@ async fn interrupting_parent_keeps_agent_control_children_running() {
     expect_turn_on_stream(
         &mut fixture.client,
         &child_new.instance_stream,
-        "mock backend response to: agent-control child first",
+        "mock backend response to: __mock_slow__ agent-control child first",
     )
     .await;
 
@@ -3247,13 +3237,17 @@ async fn spawn_without_name_generates_short_name_and_persists_alias() {
     let new_agent: NewAgentPayload = env.parse_payload().expect("parse generated NewAgent");
     assert_eq!(new_agent.name, "Review Auth Logs");
 
-    let env = expect_next_event(&mut fixture.client, "generated-name AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    let start: AgentStartPayload = env.parse_payload().expect("parse generated AgentStart");
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "generated-name AgentStart",
+    )
+    .await;
     assert_eq!(start.name, "Review Auth Logs");
 
     expect_turn(
         &mut fixture.client,
+        &new_agent.instance_stream,
         "mock backend response to: review auth logs",
     )
     .await;
@@ -3330,6 +3324,7 @@ async fn agent_activity_summaries_default_off_stay_disabled() {
 
     expect_turn(
         &mut fixture.client,
+        &new_agent.instance_stream,
         "mock backend response to: summaries are disabled",
     )
     .await;
@@ -3387,6 +3382,7 @@ async fn agent_activity_summaries_emit_fresh_mock_state_and_bootstrap() {
 
     expect_turn(
         &mut fixture.client,
+        &new_agent.instance_stream,
         "mock backend response to: summarize recent activity",
     )
     .await;
@@ -3493,6 +3489,7 @@ async fn disabling_activity_summaries_discards_in_flight_result() {
 
     expect_turn(
         &mut fixture.client,
+        &new_agent.instance_stream,
         "mock backend response to: __mock_slow_activity_summary__ keep working",
     )
     .await;
@@ -3567,6 +3564,7 @@ async fn agent_activity_summaries_error_state_backs_off_retries() {
 
     expect_turn(
         &mut fixture.client,
+        &new_agent.instance_stream,
         "mock backend response to: __mock_fail_activity_summary__ keep working",
     )
     .await;
@@ -3604,6 +3602,7 @@ async fn agent_activity_summaries_error_state_backs_off_retries() {
         .expect("send follow-up after summary failure failed");
     expect_turn(
         &mut fixture.client,
+        &new_agent.instance_stream,
         "mock backend response to: activity after summary failure",
     )
     .await;
@@ -3654,6 +3653,7 @@ async fn agent_activity_summaries_unchanged_history_does_not_resummarize() {
 
     expect_turn(
         &mut fixture.client,
+        &new_agent.instance_stream,
         "mock backend response to: summarize unchanged history",
     )
     .await;
@@ -3708,11 +3708,17 @@ async fn renaming_agent_updates_live_streams_and_replay() {
     let new_agent: NewAgentPayload = env.parse_payload().expect("parse rename NewAgent");
     let agent_stream = new_agent.instance_stream.clone();
 
-    let env = expect_next_event(&mut fixture.client, "rename test AgentStart").await;
-    let start: AgentStartPayload = env.parse_payload().expect("parse rename AgentStart");
+    let start =
+        expect_agent_start_on_stream(&mut fixture.client, &agent_stream, "rename test AgentStart")
+            .await;
     assert_eq!(start.name, "Original Name");
 
-    expect_turn(&mut fixture.client, "mock backend response to: hello").await;
+    expect_turn(
+        &mut fixture.client,
+        &agent_stream,
+        "mock backend response to: hello",
+    )
+    .await;
 
     fixture
         .client
@@ -4182,13 +4188,17 @@ async fn project_replay_happens_before_agent_replay() {
     let new_agent: NewAgentPayload = env.parse_payload().expect("parse project NewAgent");
     assert_eq!(new_agent.project_id.as_ref(), Some(&project.id));
 
-    let env = expect_next_event(&mut fixture.client, "project agent start").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    let start: AgentStartPayload = env.parse_payload().expect("parse project AgentStart");
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "project agent start",
+    )
+    .await;
     assert_eq!(start.project_id.as_ref(), Some(&project.id));
 
     expect_turn(
         &mut fixture.client,
+        &new_agent.instance_stream,
         "mock backend response to: hello from project",
     )
     .await;
@@ -4268,10 +4278,18 @@ async fn project_delete_detaches_sessions_that_reference_it() {
         .await
         .expect("spawn delete guard agent failed");
 
-    let _ = expect_next_event(&mut fixture.client, "delete guard NewAgent").await;
-    let _ = expect_next_event(&mut fixture.client, "delete guard AgentStart").await;
+    let env = expect_next_event(&mut fixture.client, "delete guard NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse delete guard NewAgent");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "delete guard AgentStart",
+    )
+    .await;
     expect_turn(
         &mut fixture.client,
+        &new_agent.instance_stream,
         "mock backend response to: hold project",
     )
     .await;

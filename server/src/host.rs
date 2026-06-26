@@ -2676,10 +2676,7 @@ impl HostHandle {
             .await
             {
                 Ok(Some(attachment)) => {
-                    let host = self.clone();
-                    tokio::spawn(async move {
-                        host.attach_deferred_agent_stream(attachment).await;
-                    });
+                    self.attach_deferred_agent_stream(attachment).await;
                 }
                 Ok(None) => {}
                 Err(_) => dead_paths.push(path),
@@ -2837,10 +2834,7 @@ impl HostHandle {
             .await
             {
                 Ok(Some(attachment)) => {
-                    let host = self.clone();
-                    tokio::spawn(async move {
-                        host.attach_deferred_agent_stream(attachment).await;
-                    });
+                    self.attach_deferred_agent_stream(attachment).await;
                 }
                 Ok(None) => {}
                 Err(_) => dead_paths.push(path),
@@ -6577,10 +6571,7 @@ impl HostHandle {
             }
         }
         for attachment in deferred_attachments {
-            let host = self.clone();
-            tokio::spawn(async move {
-                host.attach_deferred_agent_stream(attachment).await;
-            });
+            self.attach_deferred_agent_stream(attachment).await;
         }
         {
             let mut state = self.state.lock().await;

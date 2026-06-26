@@ -12,7 +12,11 @@
 // versioned, so every byte here is permanent surface.
 
 import { parsePairingUri, extractPairingUri } from "./pairing.js";
-import { resolveBootTarget, selectBootUrls } from "./manifest-policy.js";
+import {
+  resolveBootTarget,
+  resolveLatestBootTarget,
+  selectBootUrls,
+} from "./manifest-policy.js";
 import { verifyArtifacts } from "./integrity.js";
 import { resolveBundleStylesheets } from "./styles.js";
 import { detectScanCapability, pairingUiState } from "./pairing-ui.js";
@@ -26,6 +30,11 @@ export const STORAGE_KEY = "tyde.loader.version"; // last successfully-paired ve
 // and clears it. MUST match `PENDING_PAIRING_URI_KEY` in the Rust web bridge.
 export const PAIR_URI_KEY = "tyde.pair.uri";
 const BUNDLE_CACHE = "tyde-bundle-v1"; // shared with sw.js
+const WEB_DB_NAME = "tyde-mobile";
+const WEB_DB_VERSION = 1;
+const WEB_HOSTS_STORE = "paired_hosts";
+const WEB_PSK_STORE = "psk";
+const WEB_HOSTS_KEY = "all";
 
 const ui = {};
 
@@ -330,6 +339,102 @@ function forgetVersion() {
   } catch {
     /* ignore */
   }
+}
+
+function indexedDbFactory() {
+  try {
+    if (typeof window !== "undefined" && window.indexedDB) return window.indexedDB;
+    if (typeof indexedDB !== "undefined") return indexedDB;
+  } catch {
+    // Accessing indexedDB can throw in restricted/private contexts.
+  }
+  return null;
+}
+
+function idbError(request) {
+  const error = request && request.error;
+  return error && error.message ? error.message : "indexeddb request failed";
+}
+
+function openWebStoreDb(factory) {
+  return new Promise((resolve, reject) => {
+    let request;
+    try {
+      request = factory.open(WEB_DB_NAME, WEB_DB_VERSION);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(WEB_HOSTS_STORE)) {
+        db.createObjectStore(WEB_HOSTS_STORE);
+      }
+      if (!db.objectStoreNames.contains(WEB_PSK_STORE)) {
+        db.createObjectStore(WEB_PSK_STORE);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(new Error(idbError(request)));
+    request.onblocked = () => reject(new Error("indexeddb open was blocked"));
+  });
+}
+
+function idbGet(db, store, key) {
+  return new Promise((resolve, reject) => {
+    let request;
+    try {
+      const tx = db.transaction(store, "readonly");
+      request = tx.objectStore(store).get(key);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(new Error(idbError(request)));
+  });
+}
+
+export function decodeStoredPairedHostsState(raw) {
+  if (raw === undefined || raw === null) return false;
+  if (typeof raw !== "string") return null;
+  try {
+    const records = JSON.parse(raw);
+    return Array.isArray(records) ? records.length > 0 : null;
+  } catch {
+    return null;
+  }
+}
+
+// Returns true when the web app has stored paired hosts, false when the browser
+// store is present but empty, and null when storage cannot be inspected. The
+// loader uses this only to ignore a stale remembered bundle version after all
+// hosts have been forgotten; unknown preserves the existing remembered-version
+// behavior so storage errors do not strand already-paired users.
+export async function hasStoredPairedHosts(factory = indexedDbFactory()) {
+  if (!factory || typeof factory.open !== "function") return null;
+  let db = null;
+  try {
+    db = await openWebStoreDb(factory);
+    const raw = await idbGet(db, WEB_HOSTS_STORE, WEB_HOSTS_KEY);
+    return decodeStoredPairedHostsState(raw);
+  } catch {
+    return null;
+  } finally {
+    if (db && typeof db.close === "function") db.close();
+  }
+}
+
+export function resolveStartupTarget(manifest, remembered, pairedHosts) {
+  if (remembered && pairedHosts !== false) {
+    const resolved = resolveBootTarget(remembered, manifest);
+    if (resolved.ok) return { ...resolved, source: "remembered" };
+  }
+
+  const latest = resolveLatestBootTarget(manifest);
+  if (latest.ok) return { ...latest, source: "latest" };
+  return latest;
 }
 
 // True when the loader is running as an INSTALLED PWA — an iOS "Add to Home
@@ -707,18 +812,21 @@ async function init() {
     }
   }
 
-  // Returning-user fast path: boot the remembered version with no QR, as long
-  // as it is still allowed by the (freshly fetched) manifest. If it is gone or
-  // now blocked, fall through to pairing.
+  // Startup fast path. If there are paired hosts, prefer the remembered
+  // host-specific bundle version so an older paired host can still boot. If
+  // there are NO paired hosts, ignore that stale remembered version and boot
+  // the newest published client so first-time onboarding/scanning uses the
+  // latest bug fixes. If IndexedDB cannot be inspected, preserve the old
+  // remembered-version behavior for already-paired users.
   const remembered = readVersion();
-  if (remembered) {
-    const resolved = resolveBootTarget(remembered, manifest);
-    if (resolved.ok) {
-      await bootTarget(resolved);
-      return;
-    }
-    forgetVersion();
+  const pairedHosts = await hasStoredPairedHosts();
+  const startup = resolveStartupTarget(manifest, remembered, pairedHosts);
+  if (startup.ok) {
+    if (remembered && startup.source !== "remembered") forgetVersion();
+    await bootTarget(startup);
+    return;
   }
+  if (remembered) forgetVersion();
 
   // Pairing flow. Decide the layout from real browser capability FIRST so the
   // pair screen never leads with a scan button on a browser that can't scan

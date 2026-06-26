@@ -9,7 +9,12 @@ import {
   extractPairingUri,
   MAX_URI_LEN,
 } from "../pairing.js";
-import { resolveBootTarget, compareVersions, selectBootUrls } from "../manifest-policy.js";
+import {
+  resolveBootTarget,
+  resolveLatestBootTarget,
+  compareVersions,
+  selectBootUrls,
+} from "../manifest-policy.js";
 import {
   REAL_WITH_PRERELEASE,
   REAL_STABLE,
@@ -214,6 +219,35 @@ test("resolveBootTarget rejects malformed manifest entries (defense in depth)", 
 
 test("resolveBootTarget handles a missing manifest", () => {
   assert.equal(resolveBootTarget("0.8.19", null).reason, "no-manifest");
+});
+
+test("resolveLatestBootTarget selects the newest bootable manifest version", () => {
+  const integrity = "sha384-" + "A".repeat(64);
+  const wasmIntegrity = "sha384-" + "B".repeat(64);
+  const makeEntry = (version) => ({
+    path: `/tyde/v${version}/`,
+    entry: `/tyde/v${version}/app.js`,
+    integrity,
+    artifacts: { [`/tyde/v${version}/app_bg.wasm`]: wasmIntegrity },
+  });
+  const manifest = {
+    schemaVersion: 1,
+    minSupported: "0.8.19-beta.1",
+    blocked: [],
+    versions: {
+      "0.8.19-beta.4": makeEntry("0.8.19-beta.4"),
+      "0.8.19-beta.8": makeEntry("0.8.19-beta.8"),
+    },
+  };
+
+  const latest = resolveLatestBootTarget(manifest);
+  assert.equal(latest.ok, true);
+  assert.equal(latest.version, "0.8.19-beta.8");
+
+  const blockedLatest = { ...manifest, blocked: ["0.8.19-beta.8"] };
+  const fallback = resolveLatestBootTarget(blockedLatest);
+  assert.equal(fallback.ok, true);
+  assert.equal(fallback.version, "0.8.19-beta.4");
 });
 
 // --- returning-user path (end to end of the pure logic) --------------------

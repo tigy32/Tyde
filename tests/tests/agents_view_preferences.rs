@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentAnnotationTarget, AgentBootstrapEvent, AgentBootstrapPayload, AgentGroupAssignment,
-    AgentGroupId, AgentGroupMode, AgentGroupsUpdate, AgentId, AgentListDensity, AgentManualTagId,
-    AgentClosedPayload, AgentOrderKey, AgentPinsUpdate, AgentSortMode, AgentStartPayload,
-    AgentStatusFilter, AgentSystemTagId, AgentTagColor, AgentTagRef, AgentTagsUpdate,
-    AgentsSmartViewsSnapshot, AgentsSmartViewsUpdate, AgentsViewFilters,
+    AgentAnnotationTarget, AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload,
+    AgentGroupAssignment, AgentGroupId, AgentGroupMode, AgentGroupsUpdate, AgentId,
+    AgentListDensity, AgentManualTagId, AgentOrderKey, AgentPinsUpdate, AgentSortMode,
+    AgentStartPayload, AgentStatusFilter, AgentSystemTagId, AgentTagColor, AgentTagRef,
+    AgentTagsUpdate, AgentsSmartViewsSnapshot, AgentsSmartViewsUpdate, AgentsViewFilters,
     AgentsViewPreferences, AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesStoreErrorKind,
     AgentsViewPreferencesUpdate, BackendKind, BuiltInSmartViewId, CloseAgentPayload,
     CommandErrorCode, CommandErrorPayload, DeleteSessionPayload, Envelope, FrameKind,
@@ -263,6 +263,19 @@ async fn expect_non_empty_group_notify(
     }
 }
 
+async fn expect_preferences_notify_where(
+    client: &mut client::Connection,
+    context: &str,
+    mut predicate: impl FnMut(&AgentsViewPreferencesNotifyPayload) -> bool,
+) -> AgentsViewPreferencesNotifyPayload {
+    loop {
+        let notify = expect_preferences_notify(client, context).await;
+        if predicate(&notify) {
+            return notify;
+        }
+    }
+}
+
 async fn set_active_preferences_query(
     client: &mut client::Connection,
     filters: AgentsViewFilters,
@@ -451,7 +464,10 @@ async fn create_manual_tag(
         },
     )
     .await;
-    let notify = expect_preferences_notify(client, "create tag notify").await;
+    let notify = expect_preferences_notify_where(client, "create tag notify", |notify| {
+        !notify.snapshot.tags.manual.is_empty()
+    })
+    .await;
     notify
         .snapshot
         .tags
@@ -919,7 +935,11 @@ async fn agents_view_preferences_agent_tags_manual_lifecycle_persists_and_delete
         },
     )
     .await;
-    let notify = expect_preferences_notify(&mut fixture.client, "create manual tag").await;
+    let notify =
+        expect_preferences_notify_where(&mut fixture.client, "create manual tag", |notify| {
+            notify.snapshot.tags.manual.len() == 1
+        })
+        .await;
     assert_eq!(notify.snapshot.tags.manual.len(), 1);
     let tag_id = notify.snapshot.tags.manual[0].id.clone();
     assert_eq!(tag_id, AgentManualTagId("needs-review".to_owned()));
@@ -1202,7 +1222,10 @@ async fn agents_view_preferences_agent_pins_canonicalize_and_persist_session_tar
         },
     )
     .await;
-    let notify = expect_preferences_notify(&mut fixture.client, "pin session").await;
+    let notify = expect_preferences_notify_where(&mut fixture.client, "pin session", |notify| {
+        notify.snapshot.pins.pinned == vec![session_target.clone()]
+    })
+    .await;
     assert_eq!(notify.snapshot.pins.pinned, vec![session_target.clone()]);
 
     send_set_agent_pins(
@@ -1258,20 +1281,32 @@ async fn agents_view_preferences_agent_groups_lifecycle_single_membership_and_pe
         },
     )
     .await;
-    let notify = expect_preferences_notify(&mut fixture.client, "create group notify").await;
+    let notify = expect_non_empty_group_notify(&mut fixture.client, "create group notify").await;
     assert_eq!(notify.snapshot.groups.groups.len(), 1);
     let first_group_id = notify.snapshot.groups.groups[0].id.clone();
     assert_eq!(first_group_id, AgentGroupId("review-pair".to_owned()));
     assert_eq!(notify.snapshot.groups.groups[0].name, "Review Pair");
     assert_eq!(notify.snapshot.groups.assignments.len(), 2);
-    assert!(notify.snapshot.groups.assignments.contains(&AgentGroupAssignment {
-        group_id: first_group_id.clone(),
-        target: first_target.clone(),
-    }));
-    assert!(notify.snapshot.groups.assignments.contains(&AgentGroupAssignment {
-        group_id: first_group_id.clone(),
-        target: second_target.clone(),
-    }));
+    assert!(
+        notify
+            .snapshot
+            .groups
+            .assignments
+            .contains(&AgentGroupAssignment {
+                group_id: first_group_id.clone(),
+                target: first_target.clone(),
+            })
+    );
+    assert!(
+        notify
+            .snapshot
+            .groups
+            .assignments
+            .contains(&AgentGroupAssignment {
+                group_id: first_group_id.clone(),
+                target: second_target.clone(),
+            })
+    );
 
     let (_fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
     let fresh_groups = fresh_bootstrap
@@ -1350,7 +1385,8 @@ async fn agents_view_preferences_agent_groups_lifecycle_single_membership_and_pe
         },
     )
     .await;
-    let notify = expect_preferences_notify(&mut fixture.client, "delete group ungroup notify").await;
+    let notify =
+        expect_preferences_notify(&mut fixture.client, "delete group ungroup notify").await;
     assert!(notify.snapshot.groups.groups.is_empty());
     assert!(notify.snapshot.groups.assignments.is_empty());
     assert_no_agent_closed_for(
@@ -1389,21 +1425,38 @@ async fn agents_view_preferences_agent_groups_moving_parent_moves_children() {
     let notify = expect_non_empty_group_notify(&mut fixture.client, "parent group create").await;
     let group_id = notify.snapshot.groups.groups[0].id.clone();
     assert_eq!(notify.snapshot.groups.assignments.len(), 2);
-    assert!(notify.snapshot.groups.assignments.contains(&AgentGroupAssignment {
-        group_id: group_id.clone(),
-        target: parent_target,
-    }));
-    assert!(notify.snapshot.groups.assignments.contains(&AgentGroupAssignment {
-        group_id,
-        target: child_target,
-    }));
+    assert!(
+        notify
+            .snapshot
+            .groups
+            .assignments
+            .contains(&AgentGroupAssignment {
+                group_id: group_id.clone(),
+                target: parent_target,
+            })
+    );
+    assert!(
+        notify
+            .snapshot
+            .groups
+            .assignments
+            .contains(&AgentGroupAssignment {
+                group_id,
+                target: child_target,
+            })
+    );
 }
 
 #[tokio::test]
 async fn agents_view_preferences_agent_groups_promote_and_cleanup_targets() {
     let mut fixture = Fixture::new().await;
-    let agent =
-        spawn_agent_for_tags(&mut fixture.client, BackendKind::Claude, None, "group promote").await;
+    let agent = spawn_agent_for_tags(
+        &mut fixture.client,
+        BackendKind::Claude,
+        None,
+        "group promote",
+    )
+    .await;
     let transient_target = local_transient_target(agent.agent_id.clone());
 
     send_set_agent_groups(
@@ -1469,12 +1522,12 @@ async fn agents_view_preferences_agent_groups_promote_and_cleanup_targets() {
         },
     )
     .await;
-    let notify = expect_preferences_notify(&mut fixture.client, "sessionless transient group")
-        .await;
+    let notify =
+        expect_preferences_notify(&mut fixture.client, "sessionless transient group").await;
     assert_eq!(notify.snapshot.groups.groups.len(), 1);
     close_agent(&mut fixture.client, &failing.instance_stream).await;
-    let notify = expect_preferences_notify(&mut fixture.client, "sessionless group close cleanup")
-        .await;
+    let notify =
+        expect_preferences_notify(&mut fixture.client, "sessionless group close cleanup").await;
     assert!(notify.snapshot.groups.groups.is_empty());
     assert!(notify.snapshot.groups.assignments.is_empty());
 }
@@ -2284,7 +2337,11 @@ async fn agents_view_preferences_manual_order_is_canonicalized() {
     )
     .await;
 
-    let notify = expect_preferences_notify(&mut fixture.client, "manual order notify").await;
+    let notify =
+        expect_preferences_notify_where(&mut fixture.client, "manual order notify", |notify| {
+            !notify.snapshot.preferences.manual_order.is_empty()
+        })
+        .await;
     assert_eq!(
         notify.snapshot.preferences.manual_order,
         vec![
