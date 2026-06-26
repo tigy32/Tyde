@@ -903,11 +903,10 @@ pub(crate) fn antigravity_cli_args(
         log_file.to_string_lossy().to_string(),
     ];
     match access_mode {
-        // NOTE: `--sandbox` and `--dangerously-skip-permissions` must be
-        // mutually exclusive: a known `agy` bug lets that combination bypass
-        // the sandbox, so each access mode pushes exactly one of them.
+        // `agy` has no workspace-write middle mode. ReadOnly is advisory, so it
+        // must use the non-sandbox path to let build/test commands write target/.
         BackendAccessMode::Unrestricted => args.push("--dangerously-skip-permissions".to_string()),
-        BackendAccessMode::ReadOnly => args.push("--sandbox".to_string()),
+        BackendAccessMode::ReadOnly => args.push("--dangerously-skip-permissions".to_string()),
     }
     args.push("--model".to_string());
     args.push(model.to_string());
@@ -2137,10 +2136,8 @@ mod tests {
 
     #[test]
     fn read_only_no_longer_produces_read_only_refusal() {
-        // ReadOnly is now enforced by passing `--sandbox` to `agy` rather than a
-        // hard refusal. We assert the arg builder no longer surfaces the old "no
-        // enforceable read-only mode" error. (A full live spawn is not exercised
-        // here because `agy` does not run in CI.)
+        // ReadOnly is advisory for `agy`; keep asserting the arg builder no
+        // longer surfaces the old "no enforceable read-only mode" error.
         let log_file = Path::new("/tmp/tyde-agy-readonly.log");
         let args = antigravity_cli_args(
             BackendAccessMode::ReadOnly,
@@ -2595,7 +2592,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_args_read_only_uses_sandbox_not_skip_permissions() {
+    fn cli_args_read_only_uses_skip_permissions_without_sandbox() {
         let args = antigravity_cli_args(
             BackendAccessMode::ReadOnly,
             ANTIGRAVITY_DEFAULT_MODEL,
@@ -2605,15 +2602,13 @@ mod tests {
             "hello",
         );
         assert!(
-            args.iter().any(|arg| arg == "--sandbox"),
-            "read-only args must enforce the sandbox: {args:?}"
+            args.iter()
+                .any(|arg| arg == "--dangerously-skip-permissions"),
+            "read-only args must allow non-interactive build/test commands: {args:?}"
         );
         assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "--dangerously-skip-permissions"),
-            "read-only args must not skip permissions (combining --sandbox with \
-             --dangerously-skip-permissions bypasses the sandbox): {args:?}"
+            !args.iter().any(|arg| arg == "--sandbox"),
+            "read-only args must not enable the hard sandbox: {args:?}"
         );
         assert!(
             !args

@@ -25,7 +25,10 @@ use crate::backend::agent_control_progress::{
 use crate::backend::turn_emitter::{
     AgentName, AssistantMessagePayload, StreamEndPayload, ToolCompletedPayload, TurnEmitter,
 };
-use crate::backend::{AgentIdentity, SessionCommand, StartupMcpServer, StartupMcpTransport};
+use crate::backend::{
+    AgentIdentity, READ_ONLY_ACCESS_MODE_INSTRUCTIONS, SessionCommand, StartupMcpServer,
+    StartupMcpTransport,
+};
 use crate::process_env;
 use crate::sub_agent::SubAgentEmitter;
 #[cfg(test)]
@@ -65,7 +68,8 @@ const CLAUDE_ESTIMATED_CONTEXT_WINDOW_1M: u64 = 1_000_000;
 const CLAUDE_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CLAUDE_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CLAUDE_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
-const CLAUDE_READ_ONLY_PERMISSION_MODE: &str = "plan";
+// Claude plan mode blocks build/test Bash; ReadOnly is advisory in Tyde.
+const CLAUDE_READ_ONLY_PERMISSION_MODE: &str = "acceptEdits";
 const CLAUDE_CONVERSATION_COMPACTED_NOTICE: &str = "Conversation compacted.";
 const CLAUDE_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLAUDE_CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -7812,6 +7816,9 @@ fn claude_agent_identity(config: &BackendSpawnConfig) -> Option<AgentIdentity> {
 
 fn claude_steering_content(config: &BackendSpawnConfig) -> Option<String> {
     let mut sections = Vec::new();
+    if config.resolved_spawn_config.access_mode == BackendAccessMode::ReadOnly {
+        sections.push(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.to_string());
+    }
     if !config.resolved_spawn_config.steering_body.trim().is_empty() {
         sections.push(
             config
@@ -8565,15 +8572,30 @@ mod tests {
     }
 
     #[test]
-    fn claude_read_only_access_mode_uses_plan_permission_mode() {
+    fn claude_read_only_access_mode_uses_accept_edits_permission_mode() {
         assert_eq!(
             claude_permission_mode_for_access_mode(BackendAccessMode::ReadOnly),
-            "plan"
+            "acceptEdits"
         );
         assert_eq!(
             claude_permission_mode_for_access_mode(BackendAccessMode::Unrestricted),
             "bypassPermissions"
         );
+    }
+
+    #[test]
+    fn claude_read_only_steering_includes_shared_advisory() {
+        let steering = claude_steering_content(&BackendSpawnConfig {
+            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
+                access_mode: BackendAccessMode::ReadOnly,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect("read-only advisory");
+
+        assert!(steering.contains("Backend access mode is read-only (best effort)"));
+        assert!(steering.contains("do not create, edit, or delete files"));
     }
 
     #[test]

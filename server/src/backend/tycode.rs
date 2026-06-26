@@ -116,7 +116,8 @@ fn tycode_read_only_agent_json(config: &BackendSpawnConfig) -> Option<String> {
             "tools": [
                 "set_tracked_files",
                 "search_types",
-                "get_type_docs"
+                "get_type_docs",
+                "run_build_test"
             ]
         })
         .to_string(),
@@ -1008,9 +1009,12 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(tools.contains(&"set_tracked_files"));
+        assert!(
+            tools.contains(&"run_build_test"),
+            "read-only is advisory, so build/test commands must still be available"
+        );
         assert!(!tools.contains(&"write_file"));
         assert!(!tools.contains(&"modify_file"));
-        assert!(!tools.contains(&"run_build_test"));
     }
 
     #[test]

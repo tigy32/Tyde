@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use self::subprocess::ImageAttachment;
 use crate::agent::customization::ResolvedSpawnConfig;
 
-const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
+pub(crate) const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
     "Backend access mode is read-only (best effort). Treat the workspace as ",
     "read-only: do not create, edit, or delete files, and do not run commands ",
     "that modify files, processes, or external state. You MAY freely inspect ",

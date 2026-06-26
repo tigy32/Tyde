@@ -33,20 +33,18 @@ struct KiroSpawnMode<'a> {
     ssh_host: Option<String>,
     startup_mcp_servers: &'a [StartupMcpServer],
     steering_content: Option<&'a str>,
-    access_mode: protocol::BackendAccessMode,
     program_override: Option<String>,
 }
 
-fn kiro_initialize_params(access_mode: protocol::BackendAccessMode) -> Value {
-    let read_only = access_mode == protocol::BackendAccessMode::ReadOnly;
+fn kiro_initialize_params() -> Value {
     json!({
         "protocolVersion": 1,
         "clientCapabilities": {
             "fs": {
                 "readTextFile": true,
-                "writeTextFile": !read_only
+                "writeTextFile": true
             },
-            "terminal": !read_only
+            "terminal": true
         },
         "clientInfo": {
             "name": "tyde",
@@ -78,7 +76,6 @@ impl KiroSession {
         ssh_host: Option<String>,
         startup_mcp_servers: &[StartupMcpServer],
         steering_content: Option<&str>,
-        access_mode: protocol::BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
         Self::spawn_with_mode(
             workspace_roots,
@@ -89,7 +86,6 @@ impl KiroSession {
                 ssh_host,
                 startup_mcp_servers,
                 steering_content,
-                access_mode,
                 program_override: None,
             },
         )
@@ -112,7 +108,6 @@ impl KiroSession {
                 ssh_host,
                 startup_mcp_servers,
                 steering_content,
-                access_mode: protocol::BackendAccessMode::Unrestricted,
                 program_override: None,
             },
         )
@@ -154,7 +149,6 @@ impl KiroSession {
                 ssh_host,
                 startup_mcp_servers,
                 steering_content,
-                access_mode: protocol::BackendAccessMode::Unrestricted,
                 program_override,
             },
         )
@@ -193,11 +187,10 @@ impl KiroSession {
             spawn_spec = spawn_spec.with_remote_cwd(roots.session_cwd.clone());
         }
 
-        let (bridge, inbound_rx) =
-            AcpBridge::spawn(spawn_spec, mode.ssh_host.as_deref(), mode.access_mode).await?;
+        let (bridge, inbound_rx) = AcpBridge::spawn(spawn_spec, mode.ssh_host.as_deref()).await?;
 
         bridge
-            .request("initialize", kiro_initialize_params(mode.access_mode))
+            .request("initialize", kiro_initialize_params())
             .await?;
 
         let session_result: Result<(String, Value), String> = async {
@@ -3163,7 +3156,6 @@ impl Backend for KiroBackend {
                 None,
                 &config.startup_mcp_servers,
                 combined_instructions.as_deref(),
-                config.resolved_spawn_config.access_mode,
             )
             .await
             {
@@ -3339,7 +3331,6 @@ impl Backend for KiroBackend {
                 None,
                 &config.startup_mcp_servers,
                 combined_instructions.as_deref(),
-                config.resolved_spawn_config.access_mode,
             )
             .await
             {
@@ -3733,8 +3724,8 @@ mod tests {
     }
 
     #[test]
-    fn kiro_read_only_access_mode_disables_write_and_terminal_capabilities() {
-        let params = kiro_initialize_params(protocol::BackendAccessMode::ReadOnly);
+    fn kiro_initialize_params_keeps_write_and_terminal_capabilities() {
+        let params = kiro_initialize_params();
 
         assert_eq!(
             params["clientCapabilities"]["fs"]["readTextFile"],
@@ -3742,9 +3733,9 @@ mod tests {
         );
         assert_eq!(
             params["clientCapabilities"]["fs"]["writeTextFile"],
-            Value::Bool(false)
+            Value::Bool(true)
         );
-        assert_eq!(params["clientCapabilities"]["terminal"], Value::Bool(false));
+        assert_eq!(params["clientCapabilities"]["terminal"], Value::Bool(true));
     }
 
     #[test]

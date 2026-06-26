@@ -44,7 +44,8 @@ const CODEX_ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
 const CODEX_MIN_SYSTEM_PROMPT_BYTES: u64 = 1_024;
 const CODEX_FORCED_APPROVAL_POLICY: &str = "never";
 const CODEX_UNRESTRICTED_SANDBOX: &str = "danger-full-access";
-const CODEX_READ_ONLY_SANDBOX: &str = "read-only";
+// ReadOnly is advisory in Tyde; keep Codex writable enough for cargo target/.
+const CODEX_READ_ONLY_SANDBOX: &str = "workspace-write";
 const CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS: bool = true;
 const CODEX_REASONING_SUMMARY_LEVEL: &str = "detailed";
 static DISCOVERED_MODELS: OnceLock<Vec<protocol::SelectOption>> = OnceLock::new();
@@ -4531,9 +4532,9 @@ fn codex_danger_full_access_sandbox_policy(_network_access: bool) -> Value {
     json!({ "type": "dangerFullAccess" })
 }
 
-fn codex_read_only_sandbox_policy(network_access: bool) -> Value {
+fn codex_workspace_write_sandbox_policy(network_access: bool) -> Value {
     json!({
-        "type": "readOnly",
+        "type": "workspaceWrite",
         "networkAccess": network_access,
     })
 }
@@ -4541,7 +4542,7 @@ fn codex_read_only_sandbox_policy(network_access: bool) -> Value {
 fn codex_sandbox_policy(access_mode: BackendAccessMode, network_access: bool) -> Value {
     match access_mode {
         BackendAccessMode::Unrestricted => codex_danger_full_access_sandbox_policy(network_access),
-        BackendAccessMode::ReadOnly => codex_read_only_sandbox_policy(network_access),
+        BackendAccessMode::ReadOnly => codex_workspace_write_sandbox_policy(network_access),
     }
 }
 
@@ -7618,7 +7619,7 @@ for line in sys.stdin:
             turn_params
                 .pointer("/sandboxPolicy/type")
                 .and_then(Value::as_str),
-            Some("readOnly")
+            Some("workspaceWrite")
         );
     }
 
@@ -10466,19 +10467,40 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
-    fn codex_read_only_access_mode_sets_cli_and_turn_sandbox() {
+    fn codex_read_only_access_mode_sets_writable_cli_and_turn_sandbox() {
         let args = codex_app_server_args(BackendAccessMode::ReadOnly, &[]);
         assert_eq!(
             args.iter().map(String::as_str).collect::<Vec<_>>()[..3],
-            ["--sandbox", "read-only", "app-server"]
+            ["--sandbox", "workspace-write", "app-server"]
         );
 
+        // Intentional behavior change: read-only is best-effort guidance, so
+        // Codex must allow workspace writes for build/test outputs like target/.
         let policy = codex_sandbox_policy(BackendAccessMode::ReadOnly, true);
-        assert_eq!(policy.get("type").and_then(Value::as_str), Some("readOnly"));
+        assert_eq!(
+            policy.get("type").and_then(Value::as_str),
+            Some("workspaceWrite")
+        );
         assert_eq!(
             policy.get("networkAccess").and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn codex_unrestricted_access_mode_keeps_danger_full_sandbox() {
+        let args = codex_app_server_args(BackendAccessMode::Unrestricted, &[]);
+        assert_eq!(
+            args.iter().map(String::as_str).collect::<Vec<_>>()[..3],
+            ["--sandbox", "danger-full-access", "app-server"]
+        );
+
+        let policy = codex_sandbox_policy(BackendAccessMode::Unrestricted, true);
+        assert_eq!(
+            policy.get("type").and_then(Value::as_str),
+            Some("dangerFullAccess")
+        );
+        assert_eq!(policy.get("networkAccess"), None);
     }
 
     #[test]
