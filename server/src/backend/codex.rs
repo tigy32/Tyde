@@ -2861,9 +2861,7 @@ impl CodexInner {
         tool_name: &str,
         arguments: &Value,
     ) {
-        if let Some(progress) = await_progress_data_for_tool(tool_call_id, tool_name, arguments) {
-            self.emitter.tool_progress(&progress);
-        }
+        emit_agent_control_await_progress_to(&self.emitter, tool_call_id, tool_name, arguments);
     }
 
     fn emit_agent_control_spawn_progress_if_needed(
@@ -2872,11 +2870,7 @@ impl CodexInner {
         tool_name: &str,
         tool_result: &Value,
     ) {
-        if let Some(progress) =
-            spawn_progress_data_for_tool_result(tool_call_id, tool_name, tool_result)
-        {
-            self.emitter.tool_progress(&progress);
-        }
+        emit_agent_control_spawn_progress_to(&self.emitter, tool_call_id, tool_name, tool_result);
     }
 
     fn emit_modify_file_request(
@@ -5216,6 +5210,30 @@ fn add_codex_loop_turn_reasoning_bytes(
     estimate.reasoning_bytes = estimate.reasoning_bytes.saturating_add(bytes);
 }
 
+fn emit_agent_control_await_progress_to(
+    emitter: &TurnEmitter,
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: &Value,
+) {
+    if let Some(progress) = await_progress_data_for_tool(tool_call_id, tool_name, arguments) {
+        emitter.tool_progress(&progress);
+    }
+}
+
+fn emit_agent_control_spawn_progress_to(
+    emitter: &TurnEmitter,
+    tool_call_id: &str,
+    tool_name: &str,
+    tool_result: &Value,
+) {
+    if let Some(progress) =
+        spawn_progress_data_for_tool_result(tool_call_id, tool_name, tool_result)
+    {
+        emitter.tool_progress(&progress);
+    }
+}
+
 fn codex_loop_reasoning_message_id(
     params: &Value,
     current_message_id: Option<&str>,
@@ -6200,6 +6218,14 @@ impl Backend for CodexBackend {
                                                     == Some(true);
                                         let error_message =
                                             (!success).then(|| format!("{tool_name} failed"));
+                                        if success {
+                                            emit_agent_control_spawn_progress_to(
+                                                &emitter,
+                                                &item_id,
+                                                &tool_name,
+                                                &item,
+                                            );
+                                        }
                                         emitter.tool_completed(ToolCompletedPayload {
                                             tool_call_id: &item_id,
                                             tool_name: &tool_name,
@@ -6317,6 +6343,9 @@ impl Backend for CodexBackend {
                                                 "kind": "Other",
                                                 "args": item,
                                             }),
+                                        );
+                                        emit_agent_control_await_progress_to(
+                                            &emitter, &item_id, &tool_name, &item,
                                         );
                                     }
                                     _ => {}
@@ -6969,11 +6998,12 @@ mod tests {
     use super::*;
     use crate::sub_agent::SubAgentHandle;
     use protocol::{
-        AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode, AgentId, AgentOrigin,
-        AgentStartPayload, BackendKind, BackendSetupPayload, ChatEvent, Envelope, FrameKind,
-        HostBootstrapPayload, HostSettings, MobileAccessStatePayload, MobileBrokerStatus,
-        MobilePairingState, NewAgentPayload, PROTOCOL_VERSION, ProtocolValidator, StreamPath,
-        TeamPresetCatalog, Version, WelcomePayload,
+        AgentBootstrapEvent, AgentBootstrapPayload, AgentControlProgressKind, AgentErrorCode,
+        AgentId, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload, ChatEvent,
+        Envelope, FrameKind, HostBootstrapPayload, HostSettings, MobileAccessStatePayload,
+        MobileBrokerStatus, MobilePairingState, NewAgentPayload, PROTOCOL_VERSION,
+        ProtocolValidator, StreamPath, TeamPresetCatalog, ToolProgressUpdate, Version,
+        WelcomePayload,
     };
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7106,6 +7136,19 @@ for line in sys.stdin:
                 "platformOs": "test"
             }
         })
+    elif method == "thread/start":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "thread": {
+                    "id": "fresh-thread-id",
+                    "sessionId": "fresh-thread-id",
+                    "turns": []
+                },
+                "model": "fake-codex-model"
+            }
+        })
     elif method == "thread/fork":
         if MODE == "unsupported":
             send({
@@ -7131,6 +7174,79 @@ for line in sys.stdin:
                 }
             })
     elif method == "turn/start":
+        if MODE == "fresh_agent_control_progress":
+            send({
+                "jsonrpc": "2.0",
+                "method": "turn/started",
+                "params": {
+                    "turn": {
+                        "id": "turn-fresh"
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "await-call-1",
+                        "type": "mcpToolCall",
+                        "tool": "mcp__tyde-agent-control__tyde_await_agents",
+                        "arguments": {
+                            "agent_ids": ["agent-a", "agent-b"]
+                        }
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "await-call-1",
+                        "type": "mcpToolCall",
+                        "tool": "mcp__tyde-agent-control__tyde_await_agents",
+                        "status": "completed"
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "id": "spawn-call-1",
+                        "type": "mcpToolCall",
+                        "tool": "mcp__tyde-agent-control__tyde_spawn_agent",
+                        "arguments": {
+                            "name": "Builder"
+                        }
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "spawn-call-1",
+                        "type": "mcpToolCall",
+                        "tool": "mcp__tyde-agent-control__tyde_spawn_agent",
+                        "status": "completed",
+                        "output": "{\"agent_id\":\"agent-spawned\",\"name\":\"Builder\"}"
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {
+                    "turn": {
+                        "id": "turn-fresh",
+                        "status": "completed"
+                    }
+                }
+            })
         send({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -7942,6 +8058,72 @@ for line in sys.stdin:
             .iter()
             .filter_map(|event| event.get("kind").and_then(Value::as_str))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn codex_backend_spawn_inline_loop_emits_agent_control_progress() {
+        let fake = CodexFakeAppServer::new("fresh_agent_control_progress", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_string_lossy().to_string();
+
+        let (backend, mut events) = <CodexBackend as Backend>::spawn(
+            vec![workspace_root],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: "start".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("Codex fresh spawn should start against fake app-server");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_await = false;
+        let mut saw_spawn = false;
+        while tokio::time::Instant::now() < deadline && !(saw_await && saw_spawn) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Some(ChatEvent::ToolProgress(progress))) => {
+                    let ToolProgressUpdate::AgentControl(progress_update) = progress.update else {
+                        continue;
+                    };
+                    match progress_update.progress_kind {
+                        AgentControlProgressKind::Await => {
+                            saw_await |= progress.tool_call_id == "await-call-1"
+                                && progress_update
+                                    .agents
+                                    .iter()
+                                    .map(|agent| agent.agent_id.0.as_str())
+                                    .collect::<Vec<_>>()
+                                    == vec!["agent-a", "agent-b"];
+                        }
+                        AgentControlProgressKind::Spawn => {
+                            saw_spawn |= progress.tool_call_id == "spawn-call-1"
+                                && progress_update.agents.len() == 1
+                                && progress_update.agents[0].agent_id
+                                    == AgentId("agent-spawned".to_string())
+                                && progress_update.agents[0].name.as_deref() == Some("Builder");
+                        }
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        backend.shutdown().await;
+        assert!(
+            saw_await,
+            "fresh Codex inline loop did not emit Await progress"
+        );
+        assert!(
+            saw_spawn,
+            "fresh Codex inline loop did not emit Spawn progress"
+        );
     }
 
     fn assert_codex_protocol_valid(events: &[Value]) {

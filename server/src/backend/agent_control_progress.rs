@@ -324,6 +324,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_await_agent_ids_from_codex_mcp_item_wrapper() {
+        let progress = await_progress_data_for_tool(
+            "call-await",
+            "mcp__tyde-agent-control__tyde_await_agents",
+            &json!({
+                "id": "call-await",
+                "type": "mcpToolCall",
+                "tool": "mcp__tyde-agent-control__tyde_await_agents",
+                "arguments": {
+                    "agent_ids": [
+                        "agent-a",
+                        { "agent_id": "agent-b", "name": " Builder " }
+                    ]
+                }
+            }),
+        )
+        .expect("await progress");
+
+        let ToolProgressUpdate::AgentControl(progress) = progress.update else {
+            panic!("expected agent-control progress");
+        };
+        assert_eq!(progress.progress_kind, AgentControlProgressKind::Await);
+        assert_eq!(
+            progress
+                .agents
+                .iter()
+                .map(|agent| (agent.agent_id.0.as_str(), agent.name.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("agent-a", None), ("agent-b", Some("Builder"))]
+        );
+    }
+
+    #[test]
     fn parses_spawn_agent_result_from_wrappers() {
         let direct = parse_spawn_agent_ref(&json!({
             "agent_id": "agent-a",
