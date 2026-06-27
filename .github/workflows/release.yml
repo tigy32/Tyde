@@ -519,7 +519,7 @@ jobs:
           aws-region: us-west-2
 
       - name: Deploy mobile web bundle
-        run: web/deploy/deploy.sh "${RELEASE_TAG}" --confirm --live-manifest-base
+        run: bash web/deploy/deploy.sh "${RELEASE_TAG}" --confirm --live-manifest-base
 
       - name: Verify deployed mobile web manifest
         run: |

@@ -125,7 +125,7 @@ jobs:
             fi
           fi
 
-          deploy-tools/web/deploy/deploy.sh "$RELEASE_TAG" \
+          bash deploy-tools/web/deploy/deploy.sh "$RELEASE_TAG" \
             --confirm \
             --live-manifest-base \
             --source-root "$GITHUB_WORKSPACE/release-source"
