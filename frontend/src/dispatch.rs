@@ -4,13 +4,14 @@ use std::collections::{HashMap, HashSet};
 use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 
 use protocol::{
-    AgentActivitySummaryPayload, AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload,
-    AgentErrorPayload, AgentId, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
-    AgentsViewPreferencesNotifyPayload, BackendSetupPayload, BrowseBootstrapListing,
-    BrowseBootstrapPayload, ByteRange, ChatEvent, CodeIntelDiagnosticsPayload,
-    CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelHoverResultPayload, CodeIntelLocation, CodeIntelNavigateResultPayload,
-    CodeIntelReferenceLine, CodeIntelReferencesCompletePayload, CodeIntelReferencesFileResult,
+    AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapEvent,
+    AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin,
+    AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
+    BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ByteRange, ChatEvent,
+    CodeIntelDiagnosticsPayload, CodeIntelErrorContext, CodeIntelErrorPayload,
+    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelLocation,
+    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferenceLine,
+    CodeIntelReferencesCompletePayload, CodeIntelReferencesFileResult,
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CodeIntelStatusScope,
     CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
     HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
@@ -31,11 +32,11 @@ use protocol::{
 
 use crate::line_source::FileLines;
 use crate::state::{
-    ActiveAgentRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry, CodeIntelKey,
-    ConnectionStatus, OpenFile, ProjectInfo, ProjectReferencesMode, ProjectReferencesUiState,
-    ReviewActionTarget, SessionHistoryState, SessionInfo, StreamingState, StreamingToolRequest,
-    TabContent, TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent, WorkflowPanelError,
-    reduce_diff_response, root_display_name, sort_project_infos,
+    ActiveAgentRef, ActiveProjectRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry,
+    CodeIntelKey, ConnectionStatus, OpenFile, ProjectInfo, ProjectReferencesMode,
+    ProjectReferencesUiState, ReviewActionTarget, SessionHistoryState, SessionInfo, StreamingState,
+    StreamingToolRequest, TabContent, TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent,
+    WorkflowPanelError, reduce_diff_response, root_display_name, sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -633,6 +634,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     &envelope.stream,
                     envelope.kind,
                     format!("failed to parse agent_activity_summary payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::AgentActivityStats => {
+            match envelope.parse_payload::<AgentActivityStatsPayload>() {
+                Ok(payload) => apply_agent_activity_stats(state, host_id, payload),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse agent_activity_stats payload: {error}"),
                 ),
             }
         }
@@ -1328,6 +1341,35 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     &envelope.stream,
                     envelope.kind,
                     format!("failed to parse project_git_status payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::CodeIntelOverview => {
+            let Some(project_id) = resolve_project_id(&envelope.stream) else {
+                log::warn!(
+                    "code_intel_overview on non-project stream {}",
+                    envelope.stream
+                );
+                return;
+            };
+            match envelope.parse_payload::<CodeIntelOverviewPayload>() {
+                Ok(payload) => {
+                    state.code_intel_overview.update(|overview| {
+                        overview.insert(
+                            ActiveProjectRef {
+                                host_id: host_id.to_owned(),
+                                project_id,
+                            },
+                            payload,
+                        );
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse code_intel_overview payload: {error}"),
                 ),
             }
         }
@@ -3397,6 +3439,23 @@ fn apply_agent_activity_summary(
     });
 }
 
+fn apply_agent_activity_stats(state: &AppState, host_id: &str, payload: AgentActivityStatsPayload) {
+    let agent_id = payload.agent_id;
+    log::debug!(
+        "dispatch agent_activity_stats host={host_id} agent_id={agent_id} tool_calls={}",
+        payload.stats.tool_calls
+    );
+    state.agent_activity_stats.update(|map| {
+        map.insert(
+            ActiveAgentRef {
+                host_id: host_id.to_owned(),
+                agent_id,
+            },
+            payload.stats,
+        );
+    });
+}
+
 fn apply_agent_rename(state: &AppState, host_id: &str, payload: AgentRenamedPayload) {
     let agent_id = payload.agent_id;
     let name = payload.name;
@@ -3582,6 +3641,12 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.forget_session_history(&agent_id);
     state.streaming_text.update(|map| {
         map.remove(&agent_id);
+    });
+    state.agent_activity_stats.update(|map| {
+        map.remove(&ActiveAgentRef {
+            host_id: host_id.to_owned(),
+            agent_id: agent_id.clone(),
+        });
     });
     state.agent_turn_active.update(|map| {
         map.remove(&agent_id);
@@ -4621,6 +4686,12 @@ fn apply_agent_bootstrap(
     state.streaming_text.update(|map| {
         map.remove(&agent_id);
     });
+    state.agent_activity_stats.update(|map| {
+        map.remove(&ActiveAgentRef {
+            host_id: host_id.to_owned(),
+            agent_id: agent_id.clone(),
+        });
+    });
     state.agent_turn_active.update(|map| {
         map.remove(&agent_id);
     });
@@ -4700,6 +4771,9 @@ fn apply_agent_bootstrap(
             }
             AgentBootstrapEvent::ChatEvent(event) => {
                 apply_chat_event(state, host_id, &agent_id, event);
+            }
+            AgentBootstrapEvent::AgentActivityStats(inner) => {
+                apply_agent_activity_stats(state, host_id, inner);
             }
         }
     }

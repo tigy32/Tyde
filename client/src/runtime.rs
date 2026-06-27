@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
-    AgentActivitySummaryPayload, AgentBootstrapPayload, AgentErrorPayload, AgentRenamedPayload,
-    AgentStartPayload, AgentsViewPreferencesNotifyPayload, BackendSetupPayload,
-    CancelWorkflowPayload, ChatEvent, CommandErrorPayload, CustomAgentNotifyPayload, Envelope,
-    FetchSessionHistoryPayload, FrameError, FrameKind, HostBootstrapPayload, HostSettingsPayload,
-    InterruptPayload, ListSessionsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
+    AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
+    AgentErrorPayload, AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
+    BackendSetupPayload, CancelWorkflowPayload, ChatEvent, CodeIntelOverviewPayload,
+    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FetchSessionHistoryPayload,
+    FrameError, FrameKind, HostBootstrapPayload, HostSettingsPayload, InterruptPayload,
+    ListSessionsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
     MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, ProjectAddRootPayload,
     ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
@@ -155,6 +156,7 @@ pub enum AgentEvent {
     Start(Box<AgentStartPayload>),
     Renamed(AgentRenamedPayload),
     Error(AgentErrorPayload),
+    ActivityStats(AgentActivityStatsPayload),
     Chat(Box<ChatEvent>),
     SessionHistory(SessionHistoryPayload),
     SessionSettings(SessionSettingsPayload),
@@ -165,6 +167,7 @@ pub enum ProjectEvent {
     Bootstrap(ProjectBootstrapPayload),
     FileList(ProjectFileListPayload),
     GitStatus(ProjectGitStatusPayload),
+    CodeIntelOverview(CodeIntelOverviewPayload),
     FileContents(ProjectFileContentsPayload),
     GitDiff(ProjectGitDiffPayload),
     Notify(ProjectEventPayload),
@@ -1181,6 +1184,19 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
             );
             AgentEvent::Renamed(payload)
         }
+        FrameKind::AgentActivityStats => {
+            let payload: AgentActivityStatsPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            let stream_parts = parse_agent_stream(&envelope.stream);
+            assert_eq!(
+                payload.agent_id, stream_parts.agent_id,
+                "agent_activity_stats payload agent_id {} does not match stream {}",
+                payload.agent_id, envelope.stream
+            );
+            AgentEvent::ActivityStats(payload)
+        }
         FrameKind::ChatEvent => {
             let payload: ChatEvent = match envelope.parse_payload() {
                 Ok(payload) => payload,
@@ -1248,6 +1264,13 @@ async fn handle_project_envelope(envelope: Envelope, shared: &Arc<Shared>) {
                 Err(_) => return,
             };
             ProjectEvent::GitStatus(payload)
+        }
+        FrameKind::CodeIntelOverview => {
+            let payload: CodeIntelOverviewPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            ProjectEvent::CodeIntelOverview(payload)
         }
         FrameKind::ProjectFileContents => {
             let payload: ProjectFileContentsPayload = match envelope.parse_payload() {

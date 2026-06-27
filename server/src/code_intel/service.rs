@@ -18,9 +18,10 @@ use protocol::{
     CodeIntelCancelReferencesPayload, CodeIntelErrorCode, CodeIntelErrorContext,
     CodeIntelErrorPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
     CodeIntelHoverResultPayload, CodeIntelNavigatePayload, CodeIntelNavigateResultPayload,
-    CodeIntelReferencesCompletePayload, CodeIntelResourceMode, CodeIntelSetVisibleRangePayload,
-    CodeIntelSettings, CodeIntelState, CodeIntelStatusPayload, CodeIntelStatusScope,
-    CodeIntelSubscribeFilePayload, FrameKind, ProjectFileVersion, ProjectPath, ProjectRootPath,
+    CodeIntelProviderStatus, CodeIntelReferencesCompletePayload, CodeIntelResourceMode,
+    CodeIntelSetVisibleRangePayload, CodeIntelSettings, CodeIntelState, CodeIntelStatusPayload,
+    CodeIntelStatusScope, CodeIntelSubscribeFilePayload, FrameKind, ProjectFileVersion,
+    ProjectPath, ProjectRootPath,
 };
 use tokio::sync::mpsc;
 
@@ -85,6 +86,7 @@ struct CodeIntelService {
     providers: HashMap<Language, Box<dyn CodeIntelProvider>>,
     project_handle: ProjectStreamHandle,
     version_listener_tx: mpsc::UnboundedSender<FileVersionChange>,
+    provider_status_tx: mpsc::UnboundedSender<CodeIntelProviderStatus>,
     version_listener_registered: bool,
     subscriptions: HashSet<ProjectPath>,
     /// The host's resource mode (spec §M6). Passed to each provider so progressive
@@ -103,18 +105,21 @@ impl CodeIntelService {
     ) -> CodeIntelServiceHandle {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (version_tx, version_rx) = mpsc::unbounded_channel();
+        let (provider_status_tx, provider_status_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut service = CodeIntelService {
                 root,
                 providers: HashMap::new(),
                 project_handle,
                 version_listener_tx: version_tx,
+                provider_status_tx,
                 version_listener_registered: false,
                 subscriptions: HashSet::new(),
                 resource_mode,
                 code_intel_settings,
             };
             let mut version_rx = Some(version_rx);
+            let mut provider_status_rx = Some(provider_status_rx);
             loop {
                 tokio::select! {
                     command = rx.recv() => {
@@ -130,6 +135,12 @@ impl CodeIntelService {
                             // sender (the project subscription ended). Stop
                             // polling the dead channel; keep serving commands.
                             None => version_rx = None,
+                        }
+                    }
+                    status = recv_provider_status(&mut provider_status_rx) => {
+                        match status {
+                            Some(status) => service.handle_provider_status(status),
+                            None => provider_status_rx = None,
                         }
                     }
                 }
@@ -191,6 +202,19 @@ impl CodeIntelService {
         }
     }
 
+    fn handle_provider_status(&self, status: CodeIntelProviderStatus) {
+        if let Err(error) = self
+            .project_handle
+            .update_code_intel_provider_status(self.root.clone(), status)
+        {
+            tracing::warn!(
+                root = %self.root,
+                error = %error,
+                "failed to publish code-intel overview provider status"
+            );
+        }
+    }
+
     /// The already-spawned provider serving `path`'s language, if any. Routing
     /// an on-demand query (hover/navigate/references) only needs to reach an
     /// existing provider — extension is enough since a provider exists only
@@ -217,8 +241,14 @@ impl CodeIntelService {
                         let root = self.root.clone();
                         let resource_mode = self.resource_mode;
                         let config = language.config(&self.code_intel_settings);
+                        let provider_status_tx = self.provider_status_tx.clone();
                         let provider = self.providers.entry(language).or_insert_with(|| {
-                            Box::new(LspProvider::new(config, root, resource_mode))
+                            Box::new(LspProvider::with_status_updates(
+                                config,
+                                root,
+                                resource_mode,
+                                Some(provider_status_tx),
+                            ))
                         });
                         tracing::debug!(
                             provider = %provider.provider_id(),
@@ -375,6 +405,15 @@ async fn recv_version_change(
     match rx.as_mut() {
         Some(rx) => rx.recv().await,
         None => std::future::pending::<Option<FileVersionChange>>().await,
+    }
+}
+
+async fn recv_provider_status(
+    rx: &mut Option<mpsc::UnboundedReceiver<CodeIntelProviderStatus>>,
+) -> Option<CodeIntelProviderStatus> {
+    match rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending::<Option<CodeIntelProviderStatus>>().await,
     }
 }
 

@@ -42,10 +42,11 @@ use protocol::{
     CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelHoverResultPayload,
     CodeIntelLanguageId, CodeIntelLocation, CodeIntelModelRange, CodeIntelNavigatePayload,
     CodeIntelNavigateResultPayload, CodeIntelOccurrence, CodeIntelProviderId,
-    CodeIntelReferenceLine, CodeIntelReferencesCompletePayload, CodeIntelReferencesFileResult,
-    CodeIntelReferencesResultsPayload, CodeIntelResourceMode, CodeIntelRole,
-    CodeIntelSetVisibleRangePayload, CodeIntelSeverity, CodeIntelState, CodeIntelStatusPayload,
-    CodeIntelStatusScope, FrameKind, ProjectFileVersion, ProjectPath, ProjectRootPath,
+    CodeIntelProviderStatus, CodeIntelReferenceLine, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesFileResult, CodeIntelReferencesResultsPayload, CodeIntelResourceMode,
+    CodeIntelRole, CodeIntelSetVisibleRangePayload, CodeIntelSeverity, CodeIntelState,
+    CodeIntelStatusPayload, CodeIntelStatusScope, FrameKind, ProjectFileVersion, ProjectPath,
+    ProjectRootPath,
 };
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -229,16 +230,26 @@ pub(crate) struct LspProvider {
 }
 
 impl LspProvider {
+    #[cfg(test)]
     pub(crate) fn new(
         config: LanguageServerConfig,
         root: ProjectRootPath,
         resource_mode: CodeIntelResourceMode,
     ) -> Self {
+        Self::with_status_updates(config, root, resource_mode, None)
+    }
+
+    pub(crate) fn with_status_updates(
+        config: LanguageServerConfig,
+        root: ProjectRootPath,
+        resource_mode: CodeIntelResourceMode,
+        provider_status_tx: Option<mpsc::UnboundedSender<CodeIntelProviderStatus>>,
+    ) -> Self {
         let provider_id = config.provider_id.clone();
         let (tx, rx) = mpsc::unbounded_channel();
         // The actor keeps a clone of its own sender so the crash/restart path can
         // schedule a delayed `Restart` onto itself (spec §M7).
-        let actor = RaActor::new(config, root, resource_mode, tx.clone());
+        let actor = RaActor::new(config, root, resource_mode, tx.clone(), provider_status_tx);
         tokio::spawn(actor.run(rx));
         Self { tx, provider_id }
     }
@@ -437,6 +448,7 @@ struct RaActor {
     /// without ever narrowing scope. Constant for the actor's lifetime today
     /// (the only host variable; see [`super::host_resource_mode`]).
     resource_mode: CodeIntelResourceMode,
+    provider_status_tx: Option<mpsc::UnboundedSender<CodeIntelProviderStatus>>,
     phase: Phase,
     message: Option<String>,
     client: Option<LspClient>,
@@ -471,6 +483,7 @@ impl RaActor {
         root: ProjectRootPath,
         resource_mode: CodeIntelResourceMode,
         self_tx: mpsc::UnboundedSender<RaCommand>,
+        provider_status_tx: Option<mpsc::UnboundedSender<CodeIntelProviderStatus>>,
     ) -> Self {
         Self {
             config,
@@ -478,6 +491,7 @@ impl RaActor {
             restart_attempts: 0,
             root,
             resource_mode,
+            provider_status_tx,
             phase: Phase::Cold,
             message: None,
             client: None,
@@ -1581,9 +1595,25 @@ impl RaActor {
     }
 
     fn emit_status_all(&self, work_done: Option<u32>, total_work: Option<u32>) {
+        self.emit_provider_status(work_done, total_work);
         for (path, file) in &self.files {
             self.emit_one_status(path, file, work_done, total_work);
         }
+    }
+
+    fn emit_provider_status(&self, work_done: Option<u32>, total_work: Option<u32>) {
+        let Some(tx) = &self.provider_status_tx else {
+            return;
+        };
+        let _ = tx.send(CodeIntelProviderStatus {
+            provider: self.config.provider_id.clone(),
+            language: self.config.language.clone(),
+            state: self.phase.wire_state(),
+            resource_mode: self.resource_mode,
+            work_done,
+            total_work,
+            message: self.message.clone(),
+        });
     }
 
     fn emit_status_for(&self, path: &ProjectPath) {
@@ -2855,7 +2885,45 @@ mod tests {
     /// scheduler is exercised explicitly where needed).
     fn test_actor(root: ProjectRootPath, resource_mode: CodeIntelResourceMode) -> RaActor {
         let (tx, _rx) = mpsc::unbounded_channel();
-        RaActor::new(test_config(), root, resource_mode, tx)
+        RaActor::new(test_config(), root, resource_mode, tx, None)
+    }
+
+    fn test_actor_with_status_tx(
+        root: ProjectRootPath,
+        resource_mode: CodeIntelResourceMode,
+        provider_status_tx: mpsc::UnboundedSender<CodeIntelProviderStatus>,
+    ) -> RaActor {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        RaActor::new(
+            test_config(),
+            root,
+            resource_mode,
+            tx,
+            Some(provider_status_tx),
+        )
+    }
+
+    #[test]
+    fn provider_status_updates_include_provider_language_and_progress() {
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        let actor = test_actor_with_status_tx(
+            ProjectRootPath("/repo".to_owned()),
+            CodeIntelResourceMode::Limited,
+            status_tx,
+        );
+
+        actor.emit_status_all(Some(25), Some(100));
+
+        let status = status_rx.try_recv().expect("provider status update");
+        assert_eq!(
+            status.provider,
+            CodeIntelProviderId("rust-analyzer".to_owned())
+        );
+        assert_eq!(status.language, CodeIntelLanguageId("rust".to_owned()));
+        assert_eq!(status.state, CodeIntelState::Starting);
+        assert_eq!(status.resource_mode, CodeIntelResourceMode::Limited);
+        assert_eq!(status.work_done, Some(25));
+        assert_eq!(status.total_work, Some(100));
     }
 
     #[test]

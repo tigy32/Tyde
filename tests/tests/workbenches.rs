@@ -35,6 +35,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionList
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
+                | FrameKind::AgentActivityStats
                 | FrameKind::CustomAgentNotify
                 | FrameKind::SteeringNotify
                 | FrameKind::SkillNotify
@@ -43,6 +44,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::ProjectEvent
                 | FrameKind::ProjectFileList
                 | FrameKind::ProjectGitStatus
+                | FrameKind::CodeIntelOverview
                 | FrameKind::ChatEvent
                 | FrameKind::AgentBootstrap
                 | FrameKind::AgentStart

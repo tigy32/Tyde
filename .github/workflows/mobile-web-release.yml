@@ -1,0 +1,139 @@
+name: Mobile Web Release Deploy
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag to deploy (for example v0.8.19 or v0.8.19-beta.9)'
+        required: true
+      confirm:
+        description: 'Actually deploy to tycode.dev/tyde (required for manual backfills)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    if: |
+      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: mobile-web-manifest
+      cancel-in-progress: false
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
+    steps:
+      - name: Require manual confirmation
+        if: github.event_name == 'workflow_dispatch' && !inputs.confirm
+        run: |
+          echo "::error::Set confirm=true to deploy the requested mobile web bundle"
+          exit 1
+
+      - name: Verify release tag
+        run: |
+          if [[ "$RELEASE_TAG" != v* ]]; then
+            echo "::error::Mobile web deploy is scoped to release tags, got $RELEASE_TAG"
+            exit 1
+          fi
+
+      - name: Checkout deploy tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          path: deploy-tools
+
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.version }}
+          fetch-depth: 0
+          path: release-source
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@0.21.14
+
+      - name: Verify release source version
+        run: |
+          python3 release-source/tools/check_release_version.py "$RELEASE_TAG"
+          git -C release-source fetch origin "${{ github.event.repository.default_branch }}"
+          git -C release-source merge-base --is-ancestor HEAD "origin/${{ github.event.repository.default_branch }}" || {
+            echo "::error::Release tag $RELEASE_TAG is not contained in ${{ github.event.repository.default_branch }}"
+            exit 1
+          }
+
+      - name: Test web release tooling
+        working-directory: deploy-tools
+        run: |
+          node --test web/deploy/*.test.mjs
+          python3 -m unittest tools/test_check_mobile_web_manifest.py
+          bash -n web/deploy/deploy.sh
+          cd web/loader
+          node --test
+
+      - name: Validate AWS deploy role
+        env:
+          AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_TYDE_WEB_DEPLOY_ROLE_ARN || vars.AWS_TYDE_WEB_DEPLOY_ROLE_ARN }}
+        run: |
+          if [[ -z "$AWS_DEPLOY_ROLE_ARN" ]]; then
+            echo "::error::Set AWS_TYDE_WEB_DEPLOY_ROLE_ARN as a GitHub secret or variable"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TYDE_WEB_DEPLOY_ROLE_ARN || vars.AWS_TYDE_WEB_DEPLOY_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Deploy if live manifest does not already match
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            live_manifest="$RUNNER_TEMP/tyde-live-manifest.json"
+            if aws s3 cp s3://tycode-static/tyde/manifest.json "$live_manifest" --region us-west-2; then
+              if python3 deploy-tools/tools/check_mobile_web_manifest.py \
+                  --manifest "$live_manifest" \
+                  --protocol-source "$GITHUB_WORKSPACE/release-source/protocol/src/types.rs" \
+                  "$RELEASE_TAG"; then
+                echo "Mobile web bundle for $RELEASE_TAG is already present with matching protocolVersion."
+                exit 0
+              fi
+            fi
+          fi
+
+          deploy-tools/web/deploy/deploy.sh "$RELEASE_TAG" \
+            --confirm \
+            --live-manifest-base \
+            --source-root "$GITHUB_WORKSPACE/release-source"
+
+      - name: Verify deployed mobile web manifest
+        run: |
+          aws s3 cp s3://tycode-static/tyde/manifest.json "$RUNNER_TEMP/tyde-manifest.json" --region us-west-2
+          python3 deploy-tools/tools/check_mobile_web_manifest.py \
+            --manifest "$RUNNER_TEMP/tyde-manifest.json" \
+            --protocol-source "$GITHUB_WORKSPACE/release-source/protocol/src/types.rs" \
+            "$RELEASE_TAG"

@@ -148,7 +148,7 @@ async fn expect_project_response(
         }
         if matches!(
             env.kind,
-            FrameKind::ProjectFileList | FrameKind::ProjectGitStatus
+            FrameKind::ProjectFileList | FrameKind::ProjectGitStatus | FrameKind::CodeIntelOverview
         ) {
             continue;
         }
@@ -172,7 +172,10 @@ async fn expect_project_file_list_matching(
             }
             continue;
         }
-        if env.kind == FrameKind::ProjectGitStatus {
+        if matches!(
+            env.kind,
+            FrameKind::ProjectGitStatus | FrameKind::CodeIntelOverview
+        ) {
             continue;
         }
         assert_eq!(env.kind, FrameKind::ProjectFileList);
@@ -195,7 +198,10 @@ async fn expect_project_git_status_matching(
             }
             continue;
         }
-        if env.kind == FrameKind::ProjectFileList {
+        if matches!(
+            env.kind,
+            FrameKind::ProjectFileList | FrameKind::CodeIntelOverview
+        ) {
             continue;
         }
         assert_eq!(env.kind, FrameKind::ProjectGitStatus);
@@ -364,6 +370,7 @@ async fn drain_initial_project_state_pushes(client: &mut client::Connection, con
                             | FrameKind::ProjectBootstrap
                             | FrameKind::ProjectFileList
                             | FrameKind::ProjectGitStatus
+                            | FrameKind::CodeIntelOverview
                     ) =>
             {
                 continue;

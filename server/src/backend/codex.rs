@@ -5052,7 +5052,10 @@ impl CodexBackend {
 
 fn codex_backend_defaults(cost_hint: Option<SpawnCostHint>) -> (Option<String>, Option<String>) {
     match cost_hint {
-        Some(SpawnCostHint::Low) => (None, Some("low".to_string())),
+        // Low is usually reserved for small UI-facing helpers like agent
+        // naming and activity summaries, so keep it on the cheapest capable
+        // model.
+        Some(SpawnCostHint::Low) => (Some("gpt-5.4-mini".to_string()), Some("low".to_string())),
         // Medium is a legacy no-op: spawn on the backend's own defaults.
         Some(SpawnCostHint::Medium) => (None, None),
         Some(SpawnCostHint::High) => (None, Some("xhigh".to_string())),
@@ -7078,6 +7081,22 @@ mod tests {
             .expect_err("ssh-only local roots should remain invalid");
 
         assert!(err.contains("requires at least one local workspace root"));
+    }
+
+    #[test]
+    fn codex_low_cost_hint_defaults_use_gpt_54_mini_for_ui_helpers() {
+        let values = codex_cost_hint_defaults(protocol::SpawnCostHint::Low);
+
+        assert_eq!(
+            values.0.get("model"),
+            Some(&protocol::SessionSettingValue::String(
+                "gpt-5.4-mini".to_owned()
+            ))
+        );
+        assert_eq!(
+            values.0.get("reasoning_effort"),
+            Some(&protocol::SessionSettingValue::String("low".to_owned()))
+        );
     }
 
     impl CodexFakeAppServer {

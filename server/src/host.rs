@@ -5348,6 +5348,11 @@ impl HostHandle {
         starts
     }
 
+    async fn agent_project_id(&self, agent_id: &AgentId) -> Option<ProjectId> {
+        let handle = self.state.lock().await.registry.agent_handle(agent_id)?;
+        handle.snapshot().project_id
+    }
+
     pub async fn agent_ids(&self) -> Vec<AgentId> {
         self.state.lock().await.registry.agent_ids()
     }
@@ -5545,8 +5550,8 @@ impl HostHandle {
         registry.ai_suggestion(review_id, suggestion).await
     }
 
-    /// Spawn an agent from agent-control MCP, inheriting workflow context from
-    /// the calling agent when applicable.
+    /// Spawn an agent from agent-control MCP, inheriting workflow context and
+    /// project ownership from the calling or parent agent when applicable.
     pub(crate) async fn spawn_agent_from_agent_control(
         &self,
         mut payload: SpawnAgentPayload,
@@ -5557,6 +5562,23 @@ impl HostHandle {
         } else {
             None
         };
+        let inherited_project_source = if payload.project_id.is_none() {
+            if workflow.is_some() {
+                caller_agent_id.cloned()
+            } else {
+                payload
+                    .parent_agent_id
+                    .clone()
+                    .or_else(|| caller_agent_id.cloned())
+            }
+        } else {
+            None
+        };
+        if let Some(source_agent_id) = inherited_project_source
+            && let Some(project_id) = self.agent_project_id(&source_agent_id).await
+        {
+            payload.project_id = Some(project_id);
+        }
         if let Some(workflow) = workflow {
             let backend_kind = match &payload.params {
                 SpawnAgentParams::New { backend_kind, .. } => *backend_kind,

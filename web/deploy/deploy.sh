@@ -23,6 +23,7 @@
 #
 # Usage:
 #   web/deploy/deploy.sh [VERSION] [--confirm] [--dist DIR]
+#                         [--source-root DIR] [--live-manifest-base]
 #
 #   VERSION     Release version (e.g. 0.8.19-beta.2). Default: the canonical
 #               version printed by tools/check_release_version.py.
@@ -31,7 +32,14 @@
 #               CloudFront invalidation so you can preview exactly what would be
 #               written (all under tyde/, no deletes).
 #   --dist DIR  Built Trunk output to publish as the versioned bundle.
-#               Default: mobile-frontend/dist.
+#               Default: <source-root>/mobile-frontend/dist.
+#   --source-root DIR
+#               Source checkout to build/verify. Defaults to the current repo.
+#               CI backfills use this to build an exact release tag while running
+#               the latest deploy tooling from the default branch.
+#   --live-manifest-base
+#               Fetch s3://tycode-static/tyde/manifest.json first and merge into
+#               that live manifest, so CI never clobbers newer published entries.
 #
 set -euo pipefail
 
@@ -53,7 +61,21 @@ readonly GENERATOR="${SCRIPT_DIR}/generate-manifest.mjs"
 # --- arg parsing -----------------------------------------------------------
 CONFIRM=0
 VERSION=""
-DIST_DIR="${REPO_ROOT}/mobile-frontend/dist"
+DIST_DIR=""
+SOURCE_ROOT="${REPO_ROOT}"
+LIVE_MANIFEST_BASE=0
+LIVE_MANIFEST=""
+LATEST_MANIFEST=""
+
+cleanup() {
+  if [ -n "${LIVE_MANIFEST}" ]; then
+    rm -f "${LIVE_MANIFEST}"
+  fi
+  if [ -n "${LATEST_MANIFEST}" ]; then
+    rm -f "${LATEST_MANIFEST}"
+  fi
+}
+trap cleanup EXIT
 
 die() { echo "deploy: $*" >&2; exit 1; }
 
@@ -62,10 +84,12 @@ while [ $# -gt 0 ]; do
     --confirm) CONFIRM=1 ;;
     --dry-run) CONFIRM=0 ;;                 # explicit default; accepted for clarity
     --dist) shift; [ $# -gt 0 ] || die "--dist needs a directory"; DIST_DIR="$1" ;;
+    --source-root) shift; [ $# -gt 0 ] || die "--source-root needs a directory"; SOURCE_ROOT="$1" ;;
+    --live-manifest-base) LIVE_MANIFEST_BASE=1 ;;
     --delete)
       die "refusing --delete: this deploy is strictly additive and must never delete keys" ;;
     -h|--help)
-      sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+      sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     --*) die "unknown flag: $1" ;;
     *)
       [ -z "${VERSION}" ] || die "unexpected extra argument: $1"
@@ -78,6 +102,13 @@ done
 case " ${AWS_S3_SYNC_EXTRA_ARGS:-} " in
   *" --delete "*) die "AWS_S3_SYNC_EXTRA_ARGS must not contain --delete" ;;
 esac
+
+# Normalize the source checkout after arg parsing so all subsequent checks and
+# builds read the release source of truth, not necessarily the deploy-tooling repo.
+SOURCE_ROOT="$(cd "${SOURCE_ROOT}" && pwd)" || die "source root not found: ${SOURCE_ROOT}"
+if [ -z "${DIST_DIR}" ]; then
+  DIST_DIR="${SOURCE_ROOT}/mobile-frontend/dist"
+fi
 
 # --- version resolution + validation ---------------------------------------
 # Mirror of host-config::validate_release_version / web/loader/pairing.js.
@@ -92,13 +123,13 @@ validate_version() {
 
 if [ -z "${VERSION}" ]; then
   command -v python3 >/dev/null 2>&1 || die "python3 required to read the canonical version"
-  VERSION="$(python3 "${REPO_ROOT}/tools/check_release_version.py")" \
+  VERSION="$(python3 "${SOURCE_ROOT}/tools/check_release_version.py")" \
     || die "tools/check_release_version.py failed (versions inconsistent?)"
 else
   # A version was supplied: assert it matches the repo's canonical version so a
   # typo can't publish a /tyde/vX/ that no host actually advertises.
   if command -v python3 >/dev/null 2>&1; then
-    python3 "${REPO_ROOT}/tools/check_release_version.py" "${VERSION}" >/dev/null \
+    python3 "${SOURCE_ROOT}/tools/check_release_version.py" "${VERSION}" >/dev/null \
       || die "version '${VERSION}' does not match tools/check_release_version.py"
   fi
 fi
@@ -139,12 +170,46 @@ deploy: mode=${MODE}
   bucket:       ${BUCKET}
   loader -> ${S3_LOADER}
   bundle -> ${S3_BUNDLE}
+  source:       ${SOURCE_ROOT}
   dist:         ${DIST_DIR}
   manifest:     ${MANIFEST}
   distribution: ${DISTRIBUTION_ID}  (invalidate ${INVALIDATION_PATHS})
+  live base:    ${LIVE_MANIFEST_BASE}
 BANNER
 if [ "${CONFIRM}" -ne 1 ]; then
   echo "deploy: DRY-RUN (default). Re-run with --confirm to actually deploy." >&2
+fi
+
+# ===========================================================================
+# 0. Optional CI guard: start from the live manifest.
+# ===========================================================================
+# Release CI may run from an older tag while newer versions are already published.
+# Fetching the live manifest as the generator's merge base preserves those newer
+# entries and fails closed if the authority cannot be read or parsed.
+MANIFEST_INPUT="${MANIFEST}"
+if [ "${LIVE_MANIFEST_BASE}" -eq 1 ]; then
+  command -v aws >/dev/null 2>&1 || die "aws CLI required for --live-manifest-base"
+  command -v python3 >/dev/null 2>&1 || die "python3 required for --live-manifest-base"
+  LIVE_MANIFEST="$(mktemp)"
+  echo "deploy: fetching live manifest base from ${S3_LOADER}manifest.json…" >&2
+  aws s3 cp "${S3_LOADER}manifest.json" "${LIVE_MANIFEST}" \
+    --region "${AWS_REGION}" \
+    || die "failed to fetch live manifest from ${S3_LOADER}manifest.json"
+  python3 -m json.tool "${LIVE_MANIFEST}" >/dev/null \
+    || die "live manifest is not valid JSON"
+  if ! python3 - "${LIVE_MANIFEST}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+if not isinstance(manifest, dict) or not isinstance(manifest.get("versions"), dict):
+    raise SystemExit(1)
+PY
+  then
+    die "live manifest root/versions shape is invalid"
+  fi
+  MANIFEST_INPUT="${LIVE_MANIFEST}"
 fi
 
 # ===========================================================================
@@ -155,11 +220,11 @@ fi
 if [ "${CONFIRM}" -eq 1 ]; then
   command -v trunk >/dev/null 2>&1 || die "trunk not found (cargo install trunk; wasm-opt recommended)"
   echo "deploy: building mobile-frontend bundle with trunk (release)…" >&2
-  ( cd "${REPO_ROOT}/mobile-frontend" \
+  ( cd "${SOURCE_ROOT}/mobile-frontend" \
       && trunk build --release \
            --public-url "/${PREFIX}/v${VERSION}/" \
            --dist "${DIST_DIR}" \
-           "${REPO_ROOT}/mobile-frontend/index.html" ) \
+           "${SOURCE_ROOT}/mobile-frontend/index.html" ) \
     || die "trunk build failed"
 fi
 
@@ -186,9 +251,16 @@ if [ "${CONFIRM}" -eq 1 ] || [ "${HAVE_DIST}" -eq 1 ]; then
   node "${GENERATOR}" \
     --dist "${DIST_DIR}" \
     --version "${VERSION}" \
-    --manifest "${MANIFEST}" \
+    --manifest "${MANIFEST_INPUT}" \
+    --out "${MANIFEST}" \
     --prefix "/${PREFIX}" \
+    --protocol-source "${SOURCE_ROOT}/protocol/src/types.rs" \
     || die "manifest generation failed"
+  python3 "${REPO_ROOT}/tools/check_mobile_web_manifest.py" \
+    --manifest "${MANIFEST}" \
+    --protocol-source "${SOURCE_ROOT}/protocol/src/types.rs" \
+    "${VERSION}" \
+    || die "generated manifest failed release/protocol validation"
 else
   echo "deploy: [dry-run] no dist at ${DIST_DIR} — skipping manifest regen + bundle sync." >&2
   echo "deploy: [dry-run] (a real deploy builds the bundle first; bundle sync cannot be" >&2
@@ -196,39 +268,7 @@ else
 fi
 
 # ===========================================================================
-# 3. Publish the loader shell -> /tyde/  (short/no-cache so logic + the
-#    revocation manifest propagate). NEVER --delete; scoped to tyde/.
-# ===========================================================================
-# Short cache for the un-versioned shell (index.html, sw.js, loader .js modules,
-# css, webmanifest, icons) so loader fixes + blocked/minSupported revocations go
-# live within ~a minute.
-echo "deploy: syncing loader shell -> ${S3_LOADER} (${MODE})…" >&2
-aws s3 sync "${LOADER_DIR}/" "${S3_LOADER}" \
-  --region "${AWS_REGION}" \
-  --exclude 'test/*' \
-  --exclude 'node_modules/*' \
-  --exclude '*.test.js' \
-  --exclude 'package.json' \
-  --exclude '*.md' \
-  --exclude '.*' \
-  --exclude '._*' \
-  --exclude '*/._*' \
-  --cache-control 'public, max-age=60, must-revalidate' \
-  ${DRYFLAG} \
-  ${AWS_S3_SYNC_EXTRA_ARGS:-}
-
-# The manifest is the security/revocation authority — it must NEVER be cached.
-# Re-put it with no-store (overrides the bulk short cache above). The loader and
-# service worker already fetch it no-store; this hardens the CDN/browser layer.
-echo "deploy: setting no-store cache on manifest.json (${MODE})…" >&2
-aws s3 cp "${MANIFEST}" "${S3_LOADER}manifest.json" \
-  --region "${AWS_REGION}" \
-  --content-type 'application/json' \
-  --cache-control 'no-store, max-age=0, must-revalidate' \
-  ${DRYFLAG}
-
-# ===========================================================================
-# 4. Publish the immutable versioned bundle -> /tyde/v<version>/
+# 3. Publish the immutable versioned bundle -> /tyde/v<version>/
 # ===========================================================================
 # Immutable: hash-stamped filenames never change, so cache them for a year.
 # NEVER --delete (a re-publish of the same version is byte-identical anyway).
@@ -253,12 +293,108 @@ if [ "${CONFIRM}" -eq 1 ] || [ "${HAVE_DIST}" -eq 1 ]; then
     --region "${AWS_REGION}" \
     --recursive \
     --exclude '*' \
-    --include '*.wasm' \
-    --no-guess-mime-type \
-    --content-type 'application/wasm' \
-    --metadata-directive REPLACE \
-    --cache-control 'public, max-age=31536000, immutable' \
+	    --include '*.wasm' \
+	    --no-guess-mime-type \
+	    --content-type 'application/wasm' \
+	    --metadata-directive REPLACE \
+	    --cache-control 'public, max-age=31536000, immutable' \
+	    ${DRYFLAG}
+
+  if [ "${CONFIRM}" -eq 1 ]; then
+    echo "deploy: validating uploaded bundle artifacts before publishing manifest…" >&2
+    python3 - "${MANIFEST}" "${VERSION}" <<'PY' | while IFS= read -r key; do
+import json
+import sys
+
+manifest_path, version = sys.argv[1], sys.argv[2]
+with open(manifest_path, "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+entry = manifest["versions"][version]
+paths = [entry["entry"], *entry.get("artifacts", {}).keys()]
+for path in paths:
+    print(path.lstrip("/"))
+PY
+      aws s3api head-object \
+        --bucket "${BUCKET}" \
+        --key "${key}" \
+        --region "${AWS_REGION}" >/dev/null \
+        || die "uploaded bundle artifact missing from S3: s3://${BUCKET}/${key}"
+      case "${key}" in
+        *.wasm)
+          content_type="$(aws s3api head-object \
+            --bucket "${BUCKET}" \
+            --key "${key}" \
+            --region "${AWS_REGION}" \
+            --query ContentType \
+            --output text)"
+          [ "${content_type}" = "application/wasm" ] \
+            || die "uploaded wasm has wrong Content-Type (${content_type}): s3://${BUCKET}/${key}"
+          ;;
+      esac
+    done
+  fi
+fi
+
+# ===========================================================================
+# 4. Publish the loader shell -> /tyde/  (short/no-cache so logic + revocations
+#    propagate). NEVER --delete; scoped to tyde/. Exclude manifest.json: the
+#    manifest is uploaded last, after the versioned bundle is verified.
+# ===========================================================================
+# Short cache for the un-versioned shell (index.html, sw.js, loader .js modules,
+# css, webmanifest, icons) so loader fixes + blocked/minSupported revocations go
+# live within ~a minute.
+echo "deploy: syncing loader shell -> ${S3_LOADER} (${MODE})…" >&2
+aws s3 sync "${LOADER_DIR}/" "${S3_LOADER}" \
+  --region "${AWS_REGION}" \
+  --exclude 'manifest.json' \
+  --exclude 'test/*' \
+  --exclude 'node_modules/*' \
+  --exclude '*.test.js' \
+  --exclude 'package.json' \
+  --exclude '*.md' \
+  --exclude '.*' \
+  --exclude '._*' \
+  --exclude '*/._*' \
+  --cache-control 'public, max-age=60, must-revalidate' \
+  ${DRYFLAG} \
+  ${AWS_S3_SYNC_EXTRA_ARGS:-}
+
+if [ "${CONFIRM}" -eq 1 ] || [ "${HAVE_DIST}" -eq 1 ]; then
+  # Re-fetch the live global manifest immediately before upload and merge just
+  # this generated version entry. GitHub also serializes mobile-web manifest
+  # writers, but this protects against stale local/CI state and preserves newer
+  # live entries.
+  if [ "${CONFIRM}" -eq 1 ] && [ "${LIVE_MANIFEST_BASE}" -eq 1 ]; then
+    LATEST_MANIFEST="$(mktemp)"
+    echo "deploy: re-fetching live manifest before final manifest upload…" >&2
+    aws s3 cp "${S3_LOADER}manifest.json" "${LATEST_MANIFEST}" \
+      --region "${AWS_REGION}" \
+      || die "failed to re-fetch live manifest from ${S3_LOADER}manifest.json"
+    python3 "${REPO_ROOT}/tools/merge_mobile_web_manifest.py" \
+      "${VERSION}" \
+      --base "${LATEST_MANIFEST}" \
+      --entry-source "${MANIFEST}" \
+      --out "${MANIFEST}" \
+      --protocol-source "${SOURCE_ROOT}/protocol/src/types.rs" \
+      || die "failed to merge generated entry into latest live manifest"
+  fi
+
+  python3 "${REPO_ROOT}/tools/check_mobile_web_manifest.py" \
+    --manifest "${MANIFEST}" \
+    --protocol-source "${SOURCE_ROOT}/protocol/src/types.rs" \
+    "${VERSION}" \
+    || die "final manifest failed release/protocol validation"
+
+  # The manifest is the security/revocation authority and is uploaded LAST so the
+  # loader never advertises a bundle until its files and wasm metadata are present.
+  echo "deploy: publishing manifest.json last (${MODE})…" >&2
+  aws s3 cp "${MANIFEST}" "${S3_LOADER}manifest.json" \
+    --region "${AWS_REGION}" \
+    --content-type 'application/json' \
+    --cache-control 'no-store, max-age=0, must-revalidate' \
     ${DRYFLAG}
+else
+  echo "deploy: [dry-run] SKIPPING manifest upload because no bundle manifest was generated." >&2
 fi
 
 # ===========================================================================

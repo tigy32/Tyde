@@ -294,7 +294,10 @@ pub fn ChatMessageView(
     }
 }
 
-fn token_badge_data(tu: &protocol::TokenUsage) -> (String, String, String) {
+/// Format a `TokenUsage` into `(input_text, output_text, tooltip)` for the
+/// token badge: `↑input (cached N)` / `↓output (reasoning N)`. Shared so other
+/// surfaces (e.g. the agent-control await stats line) render tokens identically.
+pub(crate) fn token_badge_data(tu: &protocol::TokenUsage) -> (String, String, String) {
     let input_base = tu.input_tokens;
     let cached_hits = tu.cached_prompt_tokens.unwrap_or(0);
     let cache_writes = tu.cache_creation_input_tokens.unwrap_or(0);

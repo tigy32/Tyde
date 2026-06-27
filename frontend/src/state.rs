@@ -5,12 +5,13 @@ use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
 use leptos::prelude::*;
 use protocol::FrameKind;
 use protocol::{
-    AgentActivitySummaryState, AgentGroupMode, AgentId, AgentListDensity, AgentOrderKey,
-    AgentOrigin, AgentSortMode, AgentWorkflowMetadata, AgentsViewFilters, AgentsViewPreferences,
-    AgentsViewPreferencesSnapshot, BackendKind, BackendSetupInfo, ByteRange, ChatMessage,
-    ChatMessageId, CodeIntelDiagnostic, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelLocation, CodeIntelOccurrence, CodeIntelReferencesFileResult, CodeIntelStatusPayload,
-    CustomAgent, CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry,
+    AgentActivityStats, AgentActivitySummaryState, AgentGroupMode, AgentId, AgentListDensity,
+    AgentOrderKey, AgentOrigin, AgentSortMode, AgentWorkflowMetadata, AgentsSidebarPreferences,
+    AgentsViewFilters, AgentsViewPreferences, AgentsViewPreferencesSnapshot, BackendKind,
+    BackendSetupInfo, ByteRange, ChatMessage, ChatMessageId, CodeIntelDiagnostic,
+    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelLocation, CodeIntelOccurrence,
+    CodeIntelOverviewPayload, CodeIntelReferencesFileResult, CodeIntelStatusPayload, CustomAgent,
+    CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry,
     HostBrowseErrorPayload, HostPlatform, HostSettings, McpServerConfig, McpServerId,
     MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload, Project,
     ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId,
@@ -1062,6 +1063,11 @@ pub struct AgentsPanelFilters {
 }
 
 impl AgentsPanelFilters {
+    /// Test-only helper encoding the `ContextualDefault` projection (Home shows
+    /// all projects, in-project shows current only). Production code derives the
+    /// effective filters from the server-owned sidebar preferences via
+    /// `agents_panel::sidebar_to_panel_filters`.
+    #[cfg(test)]
     pub fn defaults_for(project: Option<&ActiveProjectRef>) -> Self {
         Self {
             hide_sub_agents: false,
@@ -1100,6 +1106,11 @@ pub struct AgentsViewOverlay {
     /// compatibility; current UI no longer sets or applies it.
     pub hide_finished: Option<bool>,
     pub manual_order: Option<Vec<AgentOrderKey>>,
+    /// Optimistic override for the server-owned sidebar selectors (hide
+    /// inactive / hide sub-agents / project visibility). `Some` only while a
+    /// `SetSidebarPreferences` send is in flight; dropped wholesale on the next
+    /// authoritative snapshot like every other domain.
+    pub sidebar: Option<AgentsSidebarPreferences>,
     /// Optimistic override for the active Smart View id (dev-docs/26 §12.4):
     /// selecting a view sets the inner value to `Some(id)` so the switcher
     /// highlights instantly, while editing the query directly sets it to `None`
@@ -1135,7 +1146,7 @@ impl SessionsPanelFilters {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ActiveAgentRef {
     pub host_id: String,
     pub agent_id: AgentId,
@@ -1262,6 +1273,13 @@ pub struct AppState {
     pub tool_progress: RwSignal<HashMap<(AgentId, ToolCallId), ArcRwSignal<ToolProgressData>>>,
     pub chat_input: RwSignal<String>,
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
+    /// Server-owned per-agent activity stats (running tool-call count, token
+    /// usage, last output line), keyed by the owning `(host_id, agent_id)` so two
+    /// hosts that hand out the same agent-id string can't collide. Populated from
+    /// `AgentActivityStats` frames and agent bootstrap; the frontend renders
+    /// these verbatim and never derives tool/token counts from chat rows. Cleared
+    /// on agent close and host disconnect.
+    pub agent_activity_stats: RwSignal<HashMap<ActiveAgentRef, AgentActivityStats>>,
     pub center_zone: RwSignal<CenterZoneState>,
     /// Tabs whose content components are currently mounted, MRU-first. The
     /// active tab is always at the front; the next slot (if any) is the most
@@ -1279,6 +1297,12 @@ pub struct AppState {
     pub bottom_dock: RwSignal<DockVisibility>,
     pub file_tree: RwSignal<HashMap<ProjectId, Vec<ProjectRootListing>>>,
     pub git_status: RwSignal<HashMap<ProjectId, Vec<ProjectRootGitStatus>>>,
+    /// Server-authored code-intelligence overview per project (full-replacement
+    /// frame `code_intel_overview`), keyed by the owning `(host_id, project_id)`
+    /// so two hosts sharing a project-id string can't collide. Drives the
+    /// Files-explorer status footer. The frontend renders this verbatim; it never
+    /// infers provider state from open files or extensions.
+    pub code_intel_overview: RwSignal<HashMap<ActiveProjectRef, CodeIntelOverviewPayload>>,
     pub open_files: RwSignal<HashMap<ProjectPath, OpenFile>>,
     /// Server-pushed code-intelligence state, keyed by `(host_id, project_id,
     /// path)`. Kept separate from `Token`/syntax data on purpose (spec §6): the
@@ -1614,6 +1638,7 @@ impl AppState {
             chat_message_rows: RwSignal::new(HashMap::new()),
             session_history: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
+            agent_activity_stats: RwSignal::new(HashMap::new()),
             tool_progress: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
             task_lists: RwSignal::new(HashMap::new()),
@@ -1627,6 +1652,7 @@ impl AppState {
             bottom_dock: RwSignal::new(DockVisibility::Hidden),
             file_tree: RwSignal::new(HashMap::new()),
             git_status: RwSignal::new(HashMap::new()),
+            code_intel_overview: RwSignal::new(HashMap::new()),
             open_files: RwSignal::new(HashMap::new()),
             code_intel: RwSignal::new(HashMap::new()),
             diff_contents: RwSignal::new(HashMap::new()),
@@ -1689,6 +1715,7 @@ impl AppState {
             team_member_shuffle_suggestions: RwSignal::new(HashMap::new()),
             agents_view_preferences: RwSignal::new(AgentsViewPreferencesSnapshot {
                 preferences: AgentsViewPreferences::default(),
+                sidebar: Default::default(),
                 load_error: None,
                 smart_views: Default::default(),
                 tags: Default::default(),
@@ -1968,6 +1995,12 @@ impl AppState {
         self.streaming_text.update(|map| {
             map.remove(agent_id);
         });
+        self.agent_activity_stats.update(|map| {
+            map.remove(&ActiveAgentRef {
+                host_id: host_id.to_owned(),
+                agent_id: agent_id.clone(),
+            });
+        });
         self.agent_turn_active.update(|map| {
             map.remove(agent_id);
         });
@@ -2112,6 +2145,17 @@ impl AppState {
             hide_finished: overlay.hide_finished.unwrap_or(base.hide_finished),
             manual_order: overlay.manual_order.unwrap_or(base.manual_order),
         }
+    }
+
+    /// Reactively resolve the effective sidebar selector preferences (hide
+    /// inactive / hide sub-agents / project visibility): the durable server
+    /// snapshot with the optimistic overlay layered on top. Reads both signals,
+    /// so callers inside a reactive closure re-run when either changes.
+    pub fn effective_agents_sidebar_preferences(&self) -> AgentsSidebarPreferences {
+        self.pending_agents_view_overlay
+            .get()
+            .sidebar
+            .unwrap_or_else(|| self.agents_view_preferences.get().sidebar)
     }
 
     /// Reactively resolve the active Smart View id: the optimistic overlay
@@ -2627,6 +2671,9 @@ impl AppState {
             self.streaming_text.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
+            self.agent_activity_stats.update(|map| {
+                map.retain(|key, _| key.host_id != host_id);
+            });
             self.session_history.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
@@ -2691,6 +2738,9 @@ impl AppState {
         });
         self.git_status.update(|map| {
             map.retain(|project_id, _| !host_project_ids.contains(project_id));
+        });
+        self.code_intel_overview.update(|map| {
+            map.retain(|key, _| key.host_id != host_id);
         });
         self.code_intel.update(|map| {
             map.retain(|key, _| key.host_id != host_id);

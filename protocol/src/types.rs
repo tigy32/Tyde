@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 23;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -583,6 +583,7 @@ pub enum FrameKind {
     BackendSetup,
     NewAgent,
     AgentActivitySummary,
+    AgentActivityStats,
     AgentStart,
     AgentRenamed,
     AgentCompactNotify,
@@ -609,6 +610,7 @@ pub enum FrameKind {
     ProjectFileContents,
     ProjectSearchResults,
     ProjectSearchComplete,
+    CodeIntelOverview,
     CodeIntelStatus,
     CodeIntelFileModel,
     CodeIntelDiagnostics,
@@ -741,6 +743,7 @@ impl fmt::Display for FrameKind {
             Self::BackendSetup => f.write_str("backend_setup"),
             Self::NewAgent => f.write_str("new_agent"),
             Self::AgentActivitySummary => f.write_str("agent_activity_summary"),
+            Self::AgentActivityStats => f.write_str("agent_activity_stats"),
             Self::AgentStart => f.write_str("agent_start"),
             Self::AgentRenamed => f.write_str("agent_renamed"),
             Self::AgentCompactNotify => f.write_str("agent_compact_notify"),
@@ -769,6 +772,7 @@ impl fmt::Display for FrameKind {
             Self::ProjectFileContents => f.write_str("project_file_contents"),
             Self::ProjectSearchResults => f.write_str("project_search_results"),
             Self::ProjectSearchComplete => f.write_str("project_search_complete"),
+            Self::CodeIntelOverview => f.write_str("code_intel_overview"),
             Self::CodeIntelStatus => f.write_str("code_intel_status"),
             Self::CodeIntelFileModel => f.write_str("code_intel_file_model"),
             Self::CodeIntelDiagnostics => f.write_str("code_intel_diagnostics"),
@@ -1368,6 +1372,25 @@ pub struct AgentGroupsSnapshot {
     pub assignments: Vec<AgentGroupAssignment>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentsSidebarProjectVisibility {
+    #[default]
+    ContextualDefault,
+    CurrentProjectOnly,
+    AllProjects,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentsSidebarPreferences {
+    #[serde(default)]
+    pub hide_inactive: bool,
+    #[serde(default)]
+    pub hide_sub_agents: bool,
+    #[serde(default)]
+    pub project_visibility: AgentsSidebarProjectVisibility,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentTagsUpdate {
@@ -1464,6 +1487,9 @@ pub enum AgentsViewPreferencesUpdate {
     SetManualOrder {
         manual_order: Vec<AgentOrderKey>,
     },
+    SetSidebarPreferences {
+        sidebar: AgentsSidebarPreferences,
+    },
     Reset,
 }
 
@@ -1555,6 +1581,8 @@ pub struct AgentsViewPreferencesStoreError {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentsViewPreferencesSnapshot {
     pub preferences: AgentsViewPreferences,
+    #[serde(default)]
+    pub sidebar: AgentsSidebarPreferences,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_error: Option<AgentsViewPreferencesStoreError>,
     #[serde(default)]
@@ -1584,6 +1612,7 @@ pub enum AgentBootstrapEvent {
     AgentError(AgentErrorPayload),
     SessionSettings(SessionSettingsPayload),
     QueuedMessages(QueuedMessagesPayload),
+    AgentActivityStats(AgentActivityStatsPayload),
     ChatEvent(ChatEvent),
     HasPriorHistory { message_count: u32, before_seq: u64 },
 }
@@ -1595,6 +1624,7 @@ impl AgentBootstrapEvent {
             Self::AgentError(_) => FrameKind::AgentError,
             Self::SessionSettings(_) => FrameKind::SessionSettings,
             Self::QueuedMessages(_) => FrameKind::QueuedMessages,
+            Self::AgentActivityStats(_) => FrameKind::AgentActivityStats,
             Self::ChatEvent(_) => FrameKind::ChatEvent,
             Self::HasPriorHistory { .. } => FrameKind::AgentBootstrap,
         }
@@ -2388,6 +2418,24 @@ pub enum AgentActivitySummaryState {
 pub struct AgentActivitySummaryPayload {
     pub agent_id: AgentId,
     pub state: AgentActivitySummaryState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentActivityStats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_line: Option<String>,
+    #[serde(default)]
+    pub tool_calls: u64,
+    #[serde(default)]
+    pub token_usage: TokenUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_through_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentActivityStatsPayload {
+    pub agent_id: AgentId,
+    pub stats: AgentActivityStats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3439,6 +3487,55 @@ pub enum CodeIntelResourceMode {
     Full,
     Limited,
     Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelProviderStatus {
+    pub provider: CodeIntelProviderId,
+    pub language: CodeIntelLanguageId,
+    pub state: CodeIntelState,
+    pub resource_mode: CodeIntelResourceMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_done: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_work: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelRootOverview {
+    pub root: ProjectRootPath,
+    pub providers: Vec<CodeIntelProviderStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeIntelOverviewHeadline {
+    NotStarted,
+    Starting,
+    Indexing,
+    Ready,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelOverviewSummary {
+    pub headline: CodeIntelOverviewHeadline,
+    pub ready: u32,
+    pub indexing: u32,
+    pub starting: u32,
+    pub unavailable: u32,
+    pub failed: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeIntelOverviewPayload {
+    pub roots: Vec<CodeIntelRootOverview>,
+    pub summary: CodeIntelOverviewSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4565,7 +4662,7 @@ pub struct ModelInfo {
     pub model: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -4930,8 +5027,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_one() {
-        assert_eq!(PROTOCOL_VERSION, 21);
+    fn protocol_version_is_twenty_three() {
+        assert_eq!(PROTOCOL_VERSION, 23);
     }
 
     #[test]
@@ -4967,6 +5064,63 @@ mod search_serde_tests {
             },
         };
         assert_eq!(round_trip(&payload), payload);
+    }
+
+    #[test]
+    fn activity_stats_payload_and_bootstrap_round_trip() {
+        assert_eq!(
+            FrameKind::AgentActivityStats.to_string(),
+            "agent_activity_stats"
+        );
+        let stats = AgentActivityStats {
+            last_output_line: Some("Done".to_owned()),
+            tool_calls: 2,
+            token_usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                cached_prompt_tokens: Some(3),
+                cache_creation_input_tokens: Some(1),
+                reasoning_tokens: Some(2),
+            },
+            source_through_seq: Some(42),
+        };
+        let payload = AgentActivityStatsPayload {
+            agent_id: AgentId("agent-1".to_owned()),
+            stats,
+        };
+        assert_eq!(round_trip(&payload), payload);
+
+        let bootstrap = AgentBootstrapPayload {
+            events: vec![AgentBootstrapEvent::AgentActivityStats(payload.clone())],
+        };
+        assert!(matches!(
+            round_trip(&bootstrap).events.as_slice(),
+            [AgentBootstrapEvent::AgentActivityStats(round_tripped)] if round_tripped == &payload
+        ));
+    }
+
+    #[test]
+    fn sidebar_preferences_default_and_update_round_trip() {
+        let snapshot: AgentsViewPreferencesSnapshot =
+            serde_json::from_str(r#"{"preferences":{"filters":{}}}"#)
+                .expect("deserialize snapshot");
+        assert_eq!(snapshot.sidebar, AgentsSidebarPreferences::default());
+
+        let update = AgentsViewPreferencesUpdate::SetSidebarPreferences {
+            sidebar: AgentsSidebarPreferences {
+                hide_inactive: true,
+                hide_sub_agents: true,
+                project_visibility: AgentsSidebarProjectVisibility::CurrentProjectOnly,
+            },
+        };
+        let json = serde_json::to_value(&update).expect("serialize update");
+        assert_eq!(json["kind"], "set_sidebar_preferences");
+        assert_eq!(
+            json["sidebar"]["project_visibility"],
+            "current_project_only"
+        );
+        assert_eq!(round_trip(&update), update);
     }
 
     #[test]
@@ -5137,6 +5291,10 @@ mod code_intel_serde_tests {
             FrameKind::CodeIntelCancelReferences.to_string(),
             "code_intel_cancel_references"
         );
+        assert_eq!(
+            FrameKind::CodeIntelOverview.to_string(),
+            "code_intel_overview"
+        );
         assert_eq!(FrameKind::CodeIntelStatus.to_string(), "code_intel_status");
         assert_eq!(
             FrameKind::CodeIntelFileModel.to_string(),
@@ -5217,6 +5375,63 @@ mod code_intel_serde_tests {
         assert_eq!(round_trip(&find), find);
         let cancel = CodeIntelCancelReferencesPayload { references_id: 5 };
         assert_eq!(round_trip(&cancel), cancel);
+    }
+
+    #[test]
+    fn overview_payload_round_trips_provider_state() {
+        let payload = CodeIntelOverviewPayload {
+            roots: vec![
+                CodeIntelRootOverview {
+                    root: ProjectRootPath("/repo-a".to_owned()),
+                    providers: vec![CodeIntelProviderStatus {
+                        provider: CodeIntelProviderId("rust-analyzer".to_owned()),
+                        language: CodeIntelLanguageId("rust".to_owned()),
+                        state: CodeIntelState::Indexing,
+                        resource_mode: CodeIntelResourceMode::Full,
+                        work_done: Some(40),
+                        total_work: Some(100),
+                        message: Some("indexing".to_owned()),
+                    }],
+                },
+                CodeIntelRootOverview {
+                    root: ProjectRootPath("/repo-b".to_owned()),
+                    providers: Vec::new(),
+                },
+            ],
+            summary: CodeIntelOverviewSummary {
+                headline: CodeIntelOverviewHeadline::Indexing,
+                ready: 0,
+                indexing: 1,
+                starting: 0,
+                unavailable: 0,
+                failed: 0,
+                message: Some("Indexing code intelligence".to_owned()),
+            },
+        };
+        assert_eq!(round_trip(&payload), payload);
+    }
+
+    #[test]
+    fn overview_headline_round_trips_not_started() {
+        let payload = CodeIntelOverviewPayload {
+            roots: vec![CodeIntelRootOverview {
+                root: ProjectRootPath("/repo".to_owned()),
+                providers: Vec::new(),
+            }],
+            summary: CodeIntelOverviewSummary {
+                headline: CodeIntelOverviewHeadline::NotStarted,
+                ready: 0,
+                indexing: 0,
+                starting: 0,
+                unavailable: 0,
+                failed: 0,
+                message: Some("No language server running — open a file to index".to_owned()),
+            },
+        };
+
+        let json = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(json["summary"]["headline"], "not_started");
+        assert_eq!(round_trip(&payload), payload);
     }
 
     #[test]

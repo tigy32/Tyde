@@ -7,21 +7,21 @@ use crate::types::{
     ReviewBootstrapPayload, TeamCompactNotifyPayload, TeamCompactPayload, TerminalBootstrapPayload,
 };
 use crate::{
-    AgentActivitySummaryPayload, AgentClosedPayload, AgentOrigin, AgentStartPayload,
-    AgentsViewPreferencesNotifyPayload, BackendKind, BackendSetupPayload, CancelWorkflowPayload,
-    ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload, CodeIntelDiagnosticsPayload,
-    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
-    CodeIntelNavigateResultPayload, CodeIntelReferencesCompletePayload,
-    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
-    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload,
-    HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
-    ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload, McpServerNotifyPayload,
-    McpServerUpsertPayload, MobileAccessStatePayload, MobileDeviceRenamePayload,
-    MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingOfferPayload,
-    MobilePairingStartPayload, NewAgentPayload, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentClosedPayload, AgentOrigin,
+    AgentStartPayload, AgentsViewPreferencesNotifyPayload, BackendKind, BackendSetupPayload,
+    CancelWorkflowPayload, ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload,
+    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
+    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
+    CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
+    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload,
+    FrameKind, HostBootstrapPayload, HostBrowseClosePayload, HostBrowseEntriesPayload,
+    HostBrowseErrorPayload, HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload,
+    HostSettingsPayload, ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload,
+    McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
+    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
+    MobilePairingOfferPayload, MobilePairingStartPayload, NewAgentPayload, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
     ProjectSearchCompletePayload, ProjectSearchResultsPayload, ReviewEventPayload,
@@ -257,6 +257,14 @@ impl ProtocolValidator {
                 envelope,
                 "AgentActivitySummary",
             ),
+            FrameKind::AgentActivityStats => Err(self.violation(
+                envelope,
+                None,
+                format!(
+                    "AgentActivityStats is an agent-stream-only frame, received on host stream {}",
+                    envelope.stream
+                ),
+            )),
             FrameKind::AgentsViewPreferencesNotify => {
                 parse_host_payload::<AgentsViewPreferencesNotifyPayload>(
                     self,
@@ -705,6 +713,39 @@ impl ProtocolValidator {
                     )
                 })?;
             }
+            FrameKind::AgentActivityStats => {
+                if !state.saw_agent_start {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!(
+                            "AgentActivityStats arrived before AgentStart on {}",
+                            envelope.stream
+                        ),
+                    ));
+                }
+                let payload: AgentActivityStatsPayload =
+                    envelope.parse_payload().map_err(|error| {
+                        build_violation(
+                            &recent_frames,
+                            envelope,
+                            Some(state.backend_kind),
+                            format!("failed to parse AgentActivityStats payload: {error}"),
+                        )
+                    })?;
+                if payload.agent_id != state.agent_id {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!(
+                            "AgentActivityStats agent_id {} does not match stream agent_id {}",
+                            payload.agent_id, state.agent_id
+                        ),
+                    ));
+                }
+            }
             FrameKind::AgentError => {}
             FrameKind::SessionSettings => {}
             FrameKind::SetSessionSettings => {}
@@ -833,6 +874,11 @@ impl ProtocolValidator {
                     "ProjectSearchComplete",
                 )
             }
+            FrameKind::CodeIntelOverview => parse_stream_payload::<CodeIntelOverviewPayload>(
+                &self.recent,
+                envelope,
+                "CodeIntelOverview",
+            ),
             FrameKind::CodeIntelStatus => parse_stream_payload::<CodeIntelStatusPayload>(
                 &self.recent,
                 envelope,
@@ -1219,6 +1265,31 @@ fn validate_agent_bootstrap_event(
         AgentBootstrapEvent::AgentError(_) => Ok(()),
         AgentBootstrapEvent::SessionSettings(_) => Ok(()),
         AgentBootstrapEvent::QueuedMessages(_) => Ok(()),
+        AgentBootstrapEvent::AgentActivityStats(payload) => {
+            if !state.saw_agent_start {
+                return Err(build_violation(
+                    recent_frames,
+                    envelope,
+                    Some(state.backend_kind),
+                    format!(
+                        "AgentActivityStats arrived before AgentStart inside {}",
+                        envelope.kind
+                    ),
+                ));
+            }
+            if payload.agent_id != state.agent_id {
+                return Err(build_violation(
+                    recent_frames,
+                    envelope,
+                    Some(state.backend_kind),
+                    format!(
+                        "AgentActivityStats agent_id {} does not match stream agent_id {}",
+                        payload.agent_id, state.agent_id
+                    ),
+                ));
+            }
+            Ok(())
+        }
         AgentBootstrapEvent::HasPriorHistory { .. } => Ok(()),
         AgentBootstrapEvent::ChatEvent(event) => {
             if !state.saw_agent_start {
@@ -1806,6 +1877,19 @@ mod tests {
     fn chat_envelope(seq: u64, event: &ChatEvent) -> Envelope {
         Envelope::from_payload(agent_stream(), FrameKind::ChatEvent, seq, event)
             .expect("serialize ChatEvent")
+    }
+
+    fn activity_stats_envelope(stream: StreamPath, seq: u64) -> Envelope {
+        Envelope::from_payload(
+            stream,
+            FrameKind::AgentActivityStats,
+            seq,
+            &AgentActivityStatsPayload {
+                agent_id: crate::AgentId("test-agent".to_owned()),
+                stats: Default::default(),
+            },
+        )
+        .expect("serialize AgentActivityStats")
     }
 
     fn new_agent_with_team_fields(
@@ -2458,6 +2542,36 @@ mod tests {
                 .to_string()
                 .contains("StreamDelta before StreamStart")
         );
+    }
+
+    #[test]
+    fn rejects_agent_activity_stats_on_host_stream() {
+        let mut validator = ProtocolValidator::new();
+        let bootstrap = new_agent_envelope();
+        validator.validate_envelope(&bootstrap).unwrap();
+
+        let err = validator
+            .validate_envelope(&activity_stats_envelope(host_stream(), 1))
+            .expect_err("AgentActivityStats must not be accepted on the host stream");
+
+        assert!(
+            err.message.contains("agent-stream-only"),
+            "unexpected violation: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn accepts_agent_activity_stats_on_agent_stream_after_start() {
+        let mut validator = ProtocolValidator::new();
+        validator.validate_envelope(&new_agent_envelope()).unwrap();
+        validator
+            .validate_envelope(&agent_bootstrap_start_envelope())
+            .unwrap();
+
+        validator
+            .validate_envelope(&activity_stats_envelope(agent_stream(), 1))
+            .unwrap();
     }
 
     #[test]

@@ -87,7 +87,9 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectFileList
                 | FrameKind::ProjectGitStatus
+                | FrameKind::CodeIntelOverview
                 | FrameKind::TeamPresetCatalogNotify
+                | FrameKind::AgentActivityStats
         ) {
             continue;
         }

@@ -100,6 +100,18 @@ async fn wait_for_kind(
     }
 }
 
+async fn wait_for_command_error(
+    client: &mut client::Connection,
+    context: &str,
+) -> CommandErrorPayload {
+    loop {
+        let env = next_event(client, context).await;
+        if env.kind == FrameKind::CommandError {
+            return env.parse_payload().expect("parse CommandError");
+        }
+    }
+}
+
 async fn wait_for_chat_stream_end(client: &mut client::Connection, context: &str) -> ChatEvent {
     loop {
         let env = next_event(client, context).await;
@@ -430,13 +442,7 @@ async fn mqtt_pairing_accepts_mobile_tyde_hello_over_encrypted_stream() {
         },
     )
     .await;
-    let env = expect_next_kind(
-        &mut mobile,
-        FrameKind::CommandError,
-        "mobile terminal command rejection",
-    )
-    .await;
-    let error: CommandErrorPayload = env.parse_payload().expect("parse CommandError");
+    let error = wait_for_command_error(&mut mobile, "mobile terminal command rejection").await;
     assert_eq!(error.request_kind, FrameKind::TerminalCreate);
     assert!(
         error.message.contains("not allowed from Tyde Mobile"),

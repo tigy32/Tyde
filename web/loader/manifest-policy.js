@@ -86,13 +86,24 @@ function isValidIntegrity(value) {
   return typeof value === "string" && INTEGRITY_RE.test(value);
 }
 
+// A version record's `protocolVersion` (when present) must be a non-negative
+// safe integer — it mirrors Rust's `PROTOCOL_VERSION: u32`. Absent is allowed
+// here (older manifest entries predate the field); the QR↔bundle protocol
+// cross-check that fails closed on an absent value lives in the loader's
+// `handlePairingUri` (it is the only path that has the host's QR protocol to
+// compare against). A PRESENT-but-malformed value is a corrupt manifest.
+function isValidProtocolVersion(value) {
+  return Number.isInteger(value) && value >= 0;
+}
+
 // Resolves the boot target for a version against the manifest. Returns either
-// `{ ok: true, version, path, entry, integrity, artifacts }` (artifacts is the
-// full list of `{ url, integrity }` that must be SRI-verified before the bundle
-// runs — entry JS first, then wasm + chunks) or `{ ok: false, reason }` where
-// reason is one of:
+// `{ ok: true, version, path, entry, integrity, artifacts, protocolVersion }`
+// (artifacts is the full list of `{ url, integrity }` that must be SRI-verified
+// before the bundle runs — entry JS first, then wasm + chunks; `protocolVersion`
+// is the record's stamped protocol number, or `null` when the entry predates the
+// field) or `{ ok: false, reason }` where reason is one of:
 //   invalid-version | no-manifest | bad-policy | blocked | below-min-supported |
-//   not-in-manifest | bad-entry-path | bad-integrity
+//   not-in-manifest | bad-entry-path | bad-integrity | bad-protocol-version
 //
 // FAIL-CLOSED: a manifest whose POLICY fields are malformed (non-array
 // `blocked`, or a present-but-invalid `minSupported`) is rejected wholesale
@@ -153,6 +164,18 @@ export function resolveBootTarget(version, manifest) {
     return { ok: false, reason: "bad-integrity" };
   }
 
+  // `protocolVersion`: absent is tolerated (legacy entry), but a PRESENT value
+  // must be a valid u32 — a malformed one is a corrupt manifest → fail closed.
+  if (
+    entry.protocolVersion !== undefined &&
+    !isValidProtocolVersion(entry.protocolVersion)
+  ) {
+    return { ok: false, reason: "bad-protocol-version" };
+  }
+  const protocolVersion = isValidProtocolVersion(entry.protocolVersion)
+    ? entry.protocolVersion
+    : null;
+
   // Build the full executable-artifact list. The entry JS is implicit; every
   // additional executable artifact (the wasm and any code-split chunks) MUST be
   // listed in `entry.artifacts` as `{ "<path>": "<integrity>" }` so it can be
@@ -179,6 +202,7 @@ export function resolveBootTarget(version, manifest) {
     entry: target,
     integrity: entry.integrity,
     artifacts,
+    protocolVersion,
   };
 }
 

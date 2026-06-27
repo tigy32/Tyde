@@ -5,13 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    AgentActivitySummary, AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode,
-    AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
-    BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId, Envelope, FrameKind,
-    MessageMetadataUpdateData, MessageOrigin, MessageSender, QueuedMessageEntry, QueuedMessageId,
-    QueuedMessagesPayload, ReviewErrorContext, SendMessagePayload, SessionId,
-    SessionSettingsPayload, SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData,
-    StreamTextDeltaData, ToolExecutionCompletedData, ToolExecutionResult,
+    AgentActivityStats, AgentActivityStatsPayload, AgentActivitySummary, AgentBootstrapEvent,
+    AgentBootstrapPayload, AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, AgentOrigin,
+    AgentRenamedPayload, AgentStartPayload, BackendAccessMode, BackendKind, ChatEvent, ChatMessage,
+    ChatMessageId, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin, MessageSender,
+    QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext,
+    SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues, SpawnCostHint,
+    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData,
+    ToolExecutionResult,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -44,6 +45,7 @@ use self::registry::{
 const IMAGE_ONLY_AGENT_NAME: &str = "Image Review Task";
 const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const RESUME_REPLAY_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
+const INITIAL_HISTORY_TAIL_LIMIT: usize = 50;
 pub(crate) const DEFAULT_COMPACTION_SUMMARY_MAX_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_COMPACTION_SUMMARY_BYTES: usize = 128 * 1024;
 
@@ -252,6 +254,114 @@ impl AgentReplayState {
         }
         events.extend(completed.stream.tool_events.iter().cloned());
         events.push(ChatEvent::StreamEnd(completed.end.clone()));
+        events.extend(completed.post_end_events.iter().cloned());
+    }
+
+    fn active_completed_stream_history_filter(&self) -> Option<CompletedStreamHistoryFilter> {
+        if !self.typing || self.active_stream.is_some() {
+            return None;
+        }
+        let completed = self.completed_stream.as_ref()?;
+        let mut tool_call_ids = completed
+            .stream
+            .tool_events
+            .iter()
+            .filter_map(chat_event_tool_call_id)
+            .map(ToOwned::to_owned)
+            .collect::<HashSet<_>>();
+        tool_call_ids.extend(
+            completed
+                .post_end_events
+                .iter()
+                .filter_map(chat_event_tool_call_id)
+                .map(ToOwned::to_owned),
+        );
+        let mut message = completed.end.message.clone();
+        if message.message_id.is_none()
+            && let Some(message_id) = completed.stream.current_message_id.clone().or(completed
+                .stream
+                .start
+                .message_id
+                .clone())
+        {
+            message.message_id = Some(ChatMessageId(message_id));
+        }
+        let message =
+            message_has_renderable_content(&message, !tool_call_ids.is_empty()).then_some(message);
+        Some(CompletedStreamHistoryFilter {
+            message,
+            tool_call_ids,
+        })
+    }
+
+    fn update_completed_stream_metadata(&mut self, update: &MessageMetadataUpdateData) {
+        if !self.typing || self.active_stream.is_some() {
+            return;
+        }
+        let Some(completed) = self.completed_stream.as_mut() else {
+            return;
+        };
+        if completed.end.message.message_id.as_ref() != Some(&update.message_id) {
+            return;
+        }
+        if update.model_info.is_some() {
+            completed.end.message.model_info = update.model_info.clone();
+        }
+        if update.token_usage.is_some() {
+            completed.end.message.token_usage = update.token_usage.clone();
+        }
+        if update.context_breakdown.is_some() {
+            completed.end.message.context_breakdown = update.context_breakdown.clone();
+        }
+    }
+
+    fn update_completed_stream_tool_snapshot(&mut self, event: &ChatEvent) {
+        if !self.typing || self.active_stream.is_some() {
+            return;
+        }
+        let Some(completed) = self.completed_stream.as_mut() else {
+            return;
+        };
+        let Some(tool_call_id) = chat_event_tool_call_id(event) else {
+            return;
+        };
+        if upsert_tool_event(&mut completed.post_end_events, event) {
+            return;
+        }
+        let belongs_to_completed_stream = completed
+            .stream
+            .tool_events
+            .iter()
+            .filter_map(chat_event_tool_call_id)
+            .any(|existing_tool_call_id| existing_tool_call_id == tool_call_id);
+        if belongs_to_completed_stream {
+            if !upsert_tool_event(&mut completed.stream.tool_events, event) {
+                completed.post_end_events.push(event.clone());
+            }
+            return;
+        }
+        completed.post_end_events.push(event.clone());
+    }
+}
+
+struct CompletedStreamHistoryFilter {
+    message: Option<ChatMessage>,
+    tool_call_ids: HashSet<String>,
+}
+
+impl CompletedStreamHistoryFilter {
+    fn matches(&self, event: &ChatEvent) -> bool {
+        match event {
+            ChatEvent::MessageAdded(message) => self
+                .message
+                .as_ref()
+                .is_some_and(|completed_message| same_chat_message(completed_message, message)),
+            ChatEvent::ToolRequest(_)
+            | ChatEvent::ToolProgress(_)
+            | ChatEvent::ToolExecutionCompleted(_) => chat_event_tool_call_id(event)
+                .is_some_and(|tool_call_id| self.tool_call_ids.contains(tool_call_id)),
+            _ => false,
+        }
     }
 }
 
@@ -266,6 +376,7 @@ struct ReplayActiveStream {
 struct ReplayCompletedStream {
     stream: ReplayActiveStream,
     end: StreamEndData,
+    post_end_events: Vec<ChatEvent>,
 }
 
 #[derive(Clone, Copy)]
@@ -284,6 +395,145 @@ pub(crate) struct AgentHandle {
     /// without a message round-trip — which makes it structurally impossible
     /// for a stopped actor to cause the old "agent disappeared" panic.
     start: watch::Receiver<AgentStartPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum TokenUsageSource {
+    Message(ChatMessageId),
+    EventSeq(u64),
+}
+
+#[derive(Debug, Default)]
+struct AgentActivityStatsTracker {
+    stats: AgentActivityStats,
+    seen_tool_calls: HashSet<String>,
+    token_usage_by_source: HashMap<TokenUsageSource, TokenUsage>,
+}
+
+impl AgentActivityStatsTracker {
+    fn snapshot(&self) -> AgentActivityStats {
+        self.stats.clone()
+    }
+
+    fn observe_chat_event(
+        &mut self,
+        event: &ChatEvent,
+        source_seq: u64,
+        active_stream_text: &str,
+    ) -> bool {
+        let previous = self.stats.clone();
+        match event {
+            ChatEvent::MessageAdded(message) => {
+                if matches!(message.sender, MessageSender::Assistant { .. }) {
+                    self.update_last_output(&message.content, source_seq);
+                }
+                self.update_token_usage(
+                    token_usage_source_for_message(message, source_seq),
+                    message.token_usage.clone(),
+                    source_seq,
+                );
+            }
+            ChatEvent::MessageMetadataUpdated(update) => {
+                self.update_token_usage(
+                    TokenUsageSource::Message(update.message_id.clone()),
+                    update.token_usage.clone(),
+                    source_seq,
+                );
+            }
+            ChatEvent::StreamDelta(delta) => {
+                if !delta.text.trim().is_empty() {
+                    self.update_last_output(active_stream_text, source_seq);
+                }
+            }
+            ChatEvent::StreamReasoningDelta(delta) => {
+                self.update_last_output(&delta.text, source_seq);
+            }
+            ChatEvent::StreamEnd(data) => {
+                self.update_last_output(&data.message.content, source_seq);
+                self.update_token_usage(
+                    token_usage_source_for_message(&data.message, source_seq),
+                    data.message.token_usage.clone(),
+                    source_seq,
+                );
+            }
+            ChatEvent::ToolRequest(request) => {
+                if self.seen_tool_calls.insert(request.tool_call_id.clone()) {
+                    self.stats.tool_calls = self.stats.tool_calls.saturating_add(1);
+                    self.stats.source_through_seq = Some(source_seq);
+                }
+            }
+            ChatEvent::TypingStatusChanged(_)
+            | ChatEvent::ToolProgress(_)
+            | ChatEvent::ToolExecutionCompleted(_)
+            | ChatEvent::TaskUpdate(_)
+            | ChatEvent::OperationCancelled(_)
+            | ChatEvent::RetryAttempt(_)
+            | ChatEvent::StreamStart(_) => {}
+        }
+        self.stats != previous
+    }
+
+    fn update_last_output(&mut self, text: &str, source_seq: u64) {
+        let Some(line) = last_non_empty_logical_line(text) else {
+            return;
+        };
+        if self.stats.last_output_line.as_ref() != Some(&line) {
+            self.stats.last_output_line = Some(line);
+            self.stats.source_through_seq = Some(source_seq);
+        }
+    }
+
+    fn update_token_usage(
+        &mut self,
+        source: TokenUsageSource,
+        token_usage: Option<TokenUsage>,
+        source_seq: u64,
+    ) {
+        let Some(token_usage) = token_usage else {
+            return;
+        };
+        self.token_usage_by_source.insert(source, token_usage);
+        self.stats.token_usage = total_token_usage(self.token_usage_by_source.values());
+        self.stats.source_through_seq = Some(source_seq);
+    }
+}
+
+fn token_usage_source_for_message(message: &ChatMessage, source_seq: u64) -> TokenUsageSource {
+    message
+        .message_id
+        .clone()
+        .map(TokenUsageSource::Message)
+        .unwrap_or(TokenUsageSource::EventSeq(source_seq))
+}
+
+fn last_non_empty_logical_line(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+fn total_token_usage<'a>(entries: impl Iterator<Item = &'a TokenUsage>) -> TokenUsage {
+    let mut total = TokenUsage::default();
+    for usage in entries {
+        total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+        total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+        total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+        add_optional_tokens(&mut total.cached_prompt_tokens, usage.cached_prompt_tokens);
+        add_optional_tokens(
+            &mut total.cache_creation_input_tokens,
+            usage.cache_creation_input_tokens,
+        );
+        add_optional_tokens(&mut total.reasoning_tokens, usage.reasoning_tokens);
+    }
+    total
+}
+
+fn add_optional_tokens(total: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or(0).saturating_add(value));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1061,6 +1311,8 @@ pub(crate) fn spawn_agent_actor(
         let mut replay_state = AgentReplayState::default();
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
+        let mut activity_stats = AgentActivityStatsTracker::default();
+        let mut activity_event_seq = 0_u64;
         let mut current_session_id = resume_session_id.clone();
         let mut pending_alias = initial_alias;
         let session_schema = session_settings_schema;
@@ -1198,6 +1450,14 @@ pub(crate) fn spawn_agent_actor(
                     &current_start,
                 )
                 .await;
+                upsert_activity_stats_snapshot(
+                    &canonical_stream,
+                    &mut event_log,
+                    &mut subscribers,
+                    &current_start.agent_id,
+                    activity_stats.snapshot(),
+                )
+                .await;
                 enter_terminal_failure(
                     TerminalFailureContext {
                         accepting_input: &accepting_input_task,
@@ -1279,6 +1539,14 @@ pub(crate) fn spawn_agent_actor(
             &mut subscribers,
             FrameKind::AgentStart,
             &current_start,
+        )
+        .await;
+        upsert_activity_stats_snapshot(
+            &canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &current_start.agent_id,
+            activity_stats.snapshot(),
         )
         .await;
         if let Some(warning) = startup_warning {
@@ -1448,6 +1716,32 @@ pub(crate) fn spawn_agent_actor(
                         return;
                     };
                     if resume_replay_gate_pending {
+                        match &event {
+                            ChatEvent::StreamStart(_) => active_stream_text.clear(),
+                            ChatEvent::StreamDelta(delta) => {
+                                active_stream_text.push_str(&delta.text)
+                            }
+                            _ => {}
+                        }
+                        let source_seq = activity_event_seq;
+                        activity_event_seq = activity_event_seq.saturating_add(1);
+                        if activity_stats.observe_chat_event(
+                            &event,
+                            source_seq,
+                            &active_stream_text,
+                        ) {
+                            upsert_activity_stats_snapshot(
+                                &canonical_stream,
+                                &mut event_log,
+                                &mut subscribers,
+                                &current_start.agent_id,
+                                activity_stats.snapshot(),
+                            )
+                            .await;
+                        }
+                        if matches!(event, ChatEvent::StreamEnd(_)) {
+                            active_stream_text.clear();
+                        }
                         record_chat_event_for_replay(
                             &canonical_stream,
                             &mut event_log,
@@ -1638,6 +1932,18 @@ pub(crate) fn spawn_agent_actor(
                         &event,
                     )
                     .await;
+                    let source_seq = activity_event_seq;
+                    activity_event_seq = activity_event_seq.saturating_add(1);
+                    if activity_stats.observe_chat_event(&event, source_seq, &active_stream_text) {
+                        upsert_activity_stats_snapshot(
+                            &canonical_stream,
+                            &mut event_log,
+                            &mut subscribers,
+                            &current_start.agent_id,
+                            activity_stats.snapshot(),
+                        )
+                        .await;
+                    }
                     append_chat_event(
                         &canonical_stream,
                         &mut event_log,
@@ -2491,7 +2797,7 @@ pub(crate) fn spawn_agent_actor(
                             reply,
                         } => {
                             let _ =
-                                reply.send(session_history_window(&event_log, before_seq, limit));
+                                reply.send(session_history_window(&event_log, before_seq, limit, Some(&replay_state)));
                         }
                         AgentCommand::ReadActivityHistory {
                             after_seq,
@@ -2637,6 +2943,8 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut replay_state = AgentReplayState::default();
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
+        let mut activity_stats = AgentActivityStatsTracker::default();
+        let mut activity_event_seq = 0_u64;
         let mut current_start = start;
         let mut pending_alias = None;
         let mut in_turn = false;
@@ -2657,6 +2965,14 @@ pub(crate) fn spawn_relay_agent_actor(
             &mut subscribers,
             FrameKind::AgentStart,
             &current_start,
+        )
+        .await;
+        upsert_activity_stats_snapshot(
+            &canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &current_start.agent_id,
+            activity_stats.snapshot(),
         )
         .await;
 
@@ -2786,6 +3102,18 @@ pub(crate) fn spawn_relay_agent_actor(
                     }
 
                     apply_runtime_session_updates(&session_store, &session_id, &event).await;
+                    let source_seq = activity_event_seq;
+                    activity_event_seq = activity_event_seq.saturating_add(1);
+                    if activity_stats.observe_chat_event(&event, source_seq, &active_stream_text) {
+                        upsert_activity_stats_snapshot(
+                            &canonical_stream,
+                            &mut event_log,
+                            &mut subscribers,
+                            &current_start.agent_id,
+                            activity_stats.snapshot(),
+                        )
+                        .await;
+                    }
                     append_chat_event(
                         &canonical_stream,
                         &mut event_log,
@@ -2874,7 +3202,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             reply,
                         } => {
                             let _ =
-                                reply.send(session_history_window(&event_log, before_seq, limit));
+                                reply.send(session_history_window(&event_log, before_seq, limit, Some(&replay_state)));
                         }
                         AgentCommand::ReadActivityHistory {
                             after_seq,
@@ -3116,7 +3444,7 @@ async fn park_terminal_agent(
                 limit,
                 reply,
             } => {
-                let _ = reply.send(session_history_window(event_log, before_seq, limit));
+                let _ = reply.send(session_history_window(event_log, before_seq, limit, None));
             }
             AgentCommand::ReadActivityHistory {
                 after_seq,
@@ -3203,7 +3531,7 @@ async fn park_relay_terminal_agent(
                 limit,
                 reply,
             } => {
-                let _ = reply.send(session_history_window(event_log, before_seq, limit));
+                let _ = reply.send(session_history_window(event_log, before_seq, limit, None));
             }
             AgentCommand::ReadActivityHistory {
                 after_seq,
@@ -3541,6 +3869,37 @@ async fn append_chat_event(
     broadcast_live_event(subscribers, FrameKind::ChatEvent, event).await;
 }
 
+async fn upsert_activity_stats_snapshot(
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+    subscribers: &mut Vec<Stream>,
+    agent_id: &AgentId,
+    stats: AgentActivityStats,
+) {
+    let payload = AgentActivityStatsPayload {
+        agent_id: agent_id.clone(),
+        stats,
+    };
+    let value =
+        serde_json::to_value(&payload).expect("failed to serialize AgentActivityStats payload");
+
+    if let Some(snapshot) = event_log
+        .iter_mut()
+        .find(|event| event.kind == FrameKind::AgentActivityStats)
+    {
+        snapshot.payload = value.clone();
+    } else {
+        event_log.push(Envelope {
+            stream: protocol::StreamPath(canonical_stream.to_owned()),
+            kind: FrameKind::AgentActivityStats,
+            seq: event_log.len() as u64,
+            payload: value.clone(),
+        });
+    }
+
+    broadcast_live_event(subscribers, FrameKind::AgentActivityStats, &payload).await;
+}
+
 fn spawn_resume_replay_barrier_task(
     tx: mpsc::UnboundedSender<AgentCommand>,
     barrier_rx: oneshot::Receiver<()>,
@@ -3686,9 +4045,13 @@ fn record_chat_event_for_replay(
                         message.message_id = Some(ChatMessageId(message_id));
                     }
                     let tool_events = stream.tool_events.clone();
+                    let end = StreamEndData {
+                        message: message.clone(),
+                    };
                     replay_state.completed_stream = Some(ReplayCompletedStream {
                         stream,
-                        end: data.clone(),
+                        end,
+                        post_end_events: Vec::new(),
                     });
                     tool_events
                 })
@@ -3715,6 +4078,7 @@ fn record_chat_event_for_replay(
             }
         }
         ChatEvent::MessageMetadataUpdated(update) => {
+            replay_state.update_completed_stream_metadata(update);
             push_chat_event_to_replay_log(
                 canonical_stream,
                 event_log,
@@ -3725,6 +4089,7 @@ fn record_chat_event_for_replay(
             if let Some(active) = replay_state.active_stream.as_mut() {
                 active.tool_events.push(event.clone());
             } else {
+                replay_state.update_completed_stream_tool_snapshot(event);
                 push_chat_event_to_replay_log(canonical_stream, event_log, event);
             }
         }
@@ -3742,6 +4107,7 @@ fn record_chat_event_for_replay(
                     active.tool_events.push(event.clone());
                 }
             } else {
+                replay_state.update_completed_stream_tool_snapshot(event);
                 coalesce_progress_into_replay_log(
                     canonical_stream,
                     event_log,
@@ -3780,6 +4146,66 @@ fn message_has_renderable_content(message: &ChatMessage, has_tool_events: bool) 
             .as_ref()
             .is_some_and(|images| !images.is_empty())
         || has_tool_events
+}
+
+fn same_chat_message(expected: &ChatMessage, actual: &ChatMessage) -> bool {
+    if let Some(message_id) = &expected.message_id {
+        return actual.message_id.as_ref() == Some(message_id);
+    }
+    actual.message_id.is_none()
+        && actual.timestamp == expected.timestamp
+        && actual.content == expected.content
+        && same_message_sender(&actual.sender, &expected.sender)
+}
+
+fn same_message_sender(left: &MessageSender, right: &MessageSender) -> bool {
+    match (left, right) {
+        (MessageSender::User, MessageSender::User)
+        | (MessageSender::System, MessageSender::System)
+        | (MessageSender::Warning, MessageSender::Warning)
+        | (MessageSender::Error, MessageSender::Error) => true,
+        (MessageSender::Assistant { agent: left }, MessageSender::Assistant { agent: right }) => {
+            left == right
+        }
+        _ => false,
+    }
+}
+
+fn chat_event_tool_call_id(event: &ChatEvent) -> Option<&str> {
+    match event {
+        ChatEvent::ToolRequest(request) => Some(request.tool_call_id.as_str()),
+        ChatEvent::ToolProgress(progress) => Some(progress.tool_call_id.as_str()),
+        ChatEvent::ToolExecutionCompleted(completion) => Some(completion.tool_call_id.as_str()),
+        _ => None,
+    }
+}
+
+fn upsert_tool_event(events: &mut Vec<ChatEvent>, event: &ChatEvent) -> bool {
+    let Some(tool_call_id) = chat_event_tool_call_id(event) else {
+        return false;
+    };
+    for existing in events {
+        let Some(existing_tool_call_id) = chat_event_tool_call_id(existing) else {
+            continue;
+        };
+        if existing_tool_call_id == tool_call_id && same_tool_event_kind(existing, event) {
+            *existing = event.clone();
+            return true;
+        }
+    }
+    false
+}
+
+fn same_tool_event_kind(left: &ChatEvent, right: &ChatEvent) -> bool {
+    matches!(
+        (left, right),
+        (ChatEvent::ToolRequest(_), ChatEvent::ToolRequest(_))
+            | (ChatEvent::ToolProgress(_), ChatEvent::ToolProgress(_))
+            | (
+                ChatEvent::ToolExecutionCompleted(_),
+                ChatEvent::ToolExecutionCompleted(_)
+            )
+    )
 }
 
 /// Latest-wins coalescing for `ToolProgress`: at most one envelope per
@@ -4094,14 +4520,22 @@ fn attach_subscriber(
     stream: Stream,
 ) -> bool {
     let mut events = agent_bootstrap_events_from_log(event_log);
-    let prior_history_before_seq = event_log.len() as u64;
-    let prior_history_count = prior_history_message_count(event_log, prior_history_before_seq);
-    if prior_history_count > 0 {
-        events.push(AgentBootstrapEvent::HasPriorHistory {
-            message_count: prior_history_count,
-            before_seq: prior_history_before_seq,
-        });
+    let history_entries = filtered_session_history_entries_from_log(event_log, replay_state);
+    let history_tail = initial_history_tail_entries(&history_entries);
+    if let Some((oldest_tail_seq, _)) = history_tail.first() {
+        let prior_history_count = prior_history_message_count(&history_entries, *oldest_tail_seq);
+        if prior_history_count > 0 {
+            events.push(AgentBootstrapEvent::HasPriorHistory {
+                message_count: prior_history_count,
+                before_seq: *oldest_tail_seq,
+            });
+        }
     }
+    events.extend(
+        history_tail
+            .into_iter()
+            .map(|(_, event)| AgentBootstrapEvent::ChatEvent(event)),
+    );
     if let Some(replay_state) = replay_state {
         events.extend(
             replay_state
@@ -4124,6 +4558,27 @@ fn attach_subscriber(
     true
 }
 
+fn filtered_session_history_entries_from_log(
+    event_log: &[Envelope],
+    replay_state: Option<&AgentReplayState>,
+) -> Vec<(u64, ChatEvent)> {
+    let completed_stream_filter =
+        replay_state.and_then(AgentReplayState::active_completed_stream_history_filter);
+    session_history_entries_from_log(event_log)
+        .into_iter()
+        .filter(|(_, event)| {
+            completed_stream_filter
+                .as_ref()
+                .is_none_or(|filter| !filter.matches(event))
+        })
+        .collect()
+}
+
+fn initial_history_tail_entries(entries: &[(u64, ChatEvent)]) -> Vec<(u64, ChatEvent)> {
+    let start = history_start_for_message_limit(entries, entries.len(), INITIAL_HISTORY_TAIL_LIMIT);
+    entries[start..].to_vec()
+}
+
 fn agent_bootstrap_events_from_log(event_log: &[Envelope]) -> Vec<AgentBootstrapEvent> {
     let mut events = Vec::new();
     for envelope in event_log {
@@ -4133,6 +4588,7 @@ fn agent_bootstrap_events_from_log(event_log: &[Envelope]) -> Vec<AgentBootstrap
                 | FrameKind::AgentError
                 | FrameKind::SessionSettings
                 | FrameKind::QueuedMessages
+                | FrameKind::AgentActivityStats
         ) {
             events.push(agent_bootstrap_event_from_envelope(envelope));
         }
@@ -4140,8 +4596,8 @@ fn agent_bootstrap_events_from_log(event_log: &[Envelope]) -> Vec<AgentBootstrap
     events
 }
 
-fn prior_history_message_count(event_log: &[Envelope], before_seq: u64) -> u32 {
-    session_history_entries_from_log(event_log)
+fn prior_history_message_count(entries: &[(u64, ChatEvent)], before_seq: u64) -> u32 {
+    entries
         .iter()
         .filter(|(seq, event)| *seq < before_seq && matches!(event, ChatEvent::MessageAdded(_)))
         .count()
@@ -4152,14 +4608,15 @@ fn session_history_window(
     event_log: &[Envelope],
     before_seq: Option<u64>,
     limit: usize,
+    replay_state: Option<&AgentReplayState>,
 ) -> SessionHistoryWindow {
-    let entries = session_history_entries_from_log(event_log);
+    let entries = filtered_session_history_entries_from_log(event_log, replay_state);
     let eligible_end = entries
         .iter()
         .position(|(seq, _)| before_seq.is_some_and(|before_seq| *seq >= before_seq))
         .unwrap_or(entries.len());
     let limit = limit.max(1);
-    let start = eligible_end.saturating_sub(limit);
+    let start = history_start_for_message_limit(&entries, eligible_end, limit);
     let selected = &entries[start..eligible_end];
     SessionHistoryWindow {
         events: selected
@@ -4170,6 +4627,36 @@ fn session_history_window(
         has_more_before: start > 0,
         oldest_seq: selected.first().map(|(seq, _)| *seq),
     }
+}
+
+fn history_start_for_message_limit(
+    entries: &[(u64, ChatEvent)],
+    end: usize,
+    limit: usize,
+) -> usize {
+    let message_count = entries[..end]
+        .iter()
+        .filter(|(_, event)| matches!(event, ChatEvent::MessageAdded(_)))
+        .count();
+    if message_count <= limit {
+        return 0;
+    }
+
+    let messages_to_skip = message_count - limit;
+    let mut skipped = 0;
+    entries[..end]
+        .iter()
+        .position(|(_, event)| {
+            if !matches!(event, ChatEvent::MessageAdded(_)) {
+                return false;
+            }
+            if skipped == messages_to_skip {
+                return true;
+            }
+            skipped += 1;
+            false
+        })
+        .expect("message_count > limit requires a history window start message")
 }
 
 fn session_history_entries_from_log(event_log: &[Envelope]) -> Vec<(u64, ChatEvent)> {
@@ -4238,6 +4725,10 @@ fn agent_bootstrap_event_from_envelope(envelope: &Envelope) -> AgentBootstrapEve
         FrameKind::QueuedMessages => AgentBootstrapEvent::QueuedMessages(
             serde_json::from_value(envelope.payload.clone())
                 .expect("failed to parse QueuedMessages from replay log"),
+        ),
+        FrameKind::AgentActivityStats => AgentBootstrapEvent::AgentActivityStats(
+            serde_json::from_value(envelope.payload.clone())
+                .expect("failed to parse AgentActivityStats from replay log"),
         ),
         FrameKind::ChatEvent => AgentBootstrapEvent::ChatEvent(
             serde_json::from_value(envelope.payload.clone())
@@ -4484,19 +4975,20 @@ mod tests {
     use std::time::Duration;
 
     use protocol::{
-        AgentBootstrapEvent, AgentBootstrapPayload, AgentInput, AgentStartPayload, ChatEvent,
-        ChatMessage, ChatMessageId, FrameKind, MessageMetadataUpdateData, MessageSender, ModelInfo,
-        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TokenUsage,
-        ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType,
+        AgentActivityStats, AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentInput,
+        AgentStartPayload, ChatEvent, ChatMessage, ChatMessageId, FrameKind,
+        MessageMetadataUpdateData, MessageSender, ModelInfo, StreamEndData, StreamPath,
+        StreamStartData, StreamTextDeltaData, TaskList, TokenUsage, ToolExecutionCompletedData,
+        ToolExecutionResult, ToolRequest, ToolRequestType,
     };
     use tokio::sync::{mpsc, watch};
     use tokio::time::timeout;
 
     use super::{
-        AgentCommand, AgentHandle, AgentReplayState, InterruptOutcome, activity_history_snapshot,
-        append_chat_event, append_event, attach_subscriber, generate_mock_name,
-        name_generation_fallback, output_events_since, sanitize_generated_agent_name,
-        session_history_window,
+        AgentActivityStatsTracker, AgentCommand, AgentHandle, AgentReplayState, InterruptOutcome,
+        activity_history_snapshot, append_chat_event, append_event, attach_subscriber,
+        generate_mock_name, name_generation_fallback, output_events_since,
+        sanitize_generated_agent_name, session_history_window, upsert_activity_stats_snapshot,
     };
     use crate::agent::registry::AgentStatusHandle;
     use crate::stream::Stream;
@@ -4553,7 +5045,8 @@ mod tests {
                         limit,
                         reply,
                     } => {
-                        let _ = reply.send(session_history_window(&event_log, before_seq, limit));
+                        let _ =
+                            reply.send(session_history_window(&event_log, before_seq, limit, None));
                     }
                     AgentCommand::ReadActivityHistory {
                         after_seq,
@@ -4633,6 +5126,285 @@ mod tests {
         })
     }
 
+    fn tool_request(tool_call_id: &str) -> ChatEvent {
+        ChatEvent::ToolRequest(ToolRequest {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: "run_command".to_owned(),
+            tool_type: ToolRequestType::RunCommand {
+                command: "echo hi".to_owned(),
+                working_directory: "/tmp".to_owned(),
+            },
+        })
+    }
+
+    fn tool_completed(tool_call_id: &str) -> ChatEvent {
+        ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: "run_command".to_owned(),
+            tool_result: ToolExecutionResult::RunCommand {
+                exit_code: 0,
+                stdout: "hi\n".to_owned(),
+                stderr: String::new(),
+            },
+            success: true,
+            error: None,
+        })
+    }
+
+    fn token_usage(total_tokens: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: total_tokens / 2,
+            output_tokens: total_tokens - (total_tokens / 2),
+            total_tokens,
+            cached_prompt_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+            reasoning_tokens: Some(0),
+        }
+    }
+
+    fn test_agent_start(agent_id: &str) -> AgentStartPayload {
+        AgentStartPayload {
+            agent_id: AgentId(agent_id.to_owned()),
+            name: "Test Agent".to_owned(),
+            origin: protocol::AgentOrigin::User,
+            backend_kind: protocol::BackendKind::Tycode,
+            workspace_roots: vec!["/tmp/test".to_owned()],
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            workflow: None,
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn activity_stats_tracks_latest_output_without_stream_start_or_end_clearing() {
+        let mut stats = AgentActivityStatsTracker::default();
+
+        assert!(!stats.observe_chat_event(
+            &ChatEvent::StreamStart(StreamStartData {
+                message_id: Some("message-1".to_owned()),
+                agent: "mock".to_owned(),
+                model: None,
+            }),
+            0,
+            "",
+        ));
+        assert_eq!(stats.snapshot().last_output_line, None);
+
+        assert!(stats.observe_chat_event(
+            &ChatEvent::StreamDelta(StreamTextDeltaData {
+                message_id: Some("message-1".to_owned()),
+                text: "first line".to_owned(),
+            }),
+            1,
+            "first line",
+        ));
+        assert_eq!(
+            stats.snapshot().last_output_line.as_deref(),
+            Some("first line")
+        );
+
+        let mut empty_end = assistant_message("");
+        empty_end.message_id = Some(ChatMessageId("message-1".to_owned()));
+        assert!(!stats.observe_chat_event(
+            &ChatEvent::StreamEnd(StreamEndData { message: empty_end }),
+            2,
+            "",
+        ));
+        assert_eq!(
+            stats.snapshot().last_output_line.as_deref(),
+            Some("first line")
+        );
+
+        assert!(!stats.observe_chat_event(
+            &ChatEvent::StreamStart(StreamStartData {
+                message_id: Some("message-2".to_owned()),
+                agent: "mock".to_owned(),
+                model: None,
+            }),
+            3,
+            "",
+        ));
+        assert_eq!(
+            stats.snapshot().last_output_line.as_deref(),
+            Some("first line")
+        );
+
+        let mut final_message = assistant_message("second line\nfinal line");
+        final_message.message_id = Some(ChatMessageId("message-2".to_owned()));
+        assert!(stats.observe_chat_event(
+            &ChatEvent::StreamEnd(StreamEndData {
+                message: final_message
+            }),
+            4,
+            "",
+        ));
+        assert_eq!(
+            stats.snapshot().last_output_line.as_deref(),
+            Some("final line")
+        );
+        assert_eq!(stats.snapshot().source_through_seq, Some(4));
+    }
+
+    #[test]
+    fn activity_stats_counts_unique_tool_requests() {
+        let mut stats = AgentActivityStatsTracker::default();
+
+        assert!(stats.observe_chat_event(&tool_request("tool-1"), 0, ""));
+        assert_eq!(stats.snapshot().tool_calls, 1);
+        assert!(!stats.observe_chat_event(&tool_request("tool-1"), 1, ""));
+        assert_eq!(stats.snapshot().tool_calls, 1);
+        assert!(stats.observe_chat_event(&tool_request("tool-2"), 2, ""));
+        assert_eq!(stats.snapshot().tool_calls, 2);
+        assert_eq!(stats.snapshot().source_through_seq, Some(2));
+    }
+
+    #[test]
+    fn activity_stats_token_metadata_replaces_by_message_id() {
+        let mut stats = AgentActivityStatsTracker::default();
+        let mut message = assistant_message("done");
+        message.message_id = Some(ChatMessageId("message-1".to_owned()));
+        message.token_usage = Some(token_usage(10));
+
+        assert!(stats.observe_chat_event(&ChatEvent::MessageAdded(message), 0, ""));
+        assert_eq!(stats.snapshot().token_usage.total_tokens, 10);
+        assert!(stats.observe_chat_event(&metadata_update("message-1", 22), 1, ""));
+        assert_eq!(stats.snapshot().token_usage.total_tokens, 22);
+        assert_eq!(stats.snapshot().source_through_seq, Some(1));
+    }
+
+    #[test]
+    fn activity_stats_uses_event_seq_for_unidentified_token_usage() {
+        let mut stats = AgentActivityStatsTracker::default();
+        let mut first = assistant_message("first");
+        first.token_usage = Some(token_usage(6));
+        let mut second = assistant_message("second");
+        second.token_usage = Some(token_usage(8));
+
+        assert!(stats.observe_chat_event(&ChatEvent::MessageAdded(first), 7, ""));
+        assert!(stats.observe_chat_event(&ChatEvent::MessageAdded(second), 8, ""));
+        assert_eq!(stats.snapshot().token_usage.total_tokens, 14);
+        assert_eq!(stats.snapshot().source_through_seq, Some(8));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_includes_current_activity_stats_snapshot() {
+        let canonical_stream = "/agent/stats-agent";
+        let mut event_log = Vec::new();
+        let mut subscribers = Vec::new();
+        let start = test_agent_start("stats-agent");
+        append_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            FrameKind::AgentStart,
+            &start,
+        )
+        .await;
+        upsert_activity_stats_snapshot(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &start.agent_id,
+            AgentActivityStats {
+                last_output_line: Some("latest output".to_owned()),
+                tool_calls: 3,
+                token_usage: token_usage(30),
+                source_through_seq: Some(9),
+            },
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        attach_subscriber(&event_log, None, &mut subscribers, replay_stream(tx));
+
+        let events = recv_agent_bootstrap_events(&mut rx, "agent activity stats bootstrap").await;
+        let stats = events
+            .iter()
+            .find_map(|event| match event {
+                AgentBootstrapEvent::AgentActivityStats(payload) => Some(payload),
+                _ => None,
+            })
+            .expect("AgentBootstrap should include AgentActivityStats");
+        assert_eq!(stats.agent_id, start.agent_id);
+        assert_eq!(
+            stats.stats.last_output_line.as_deref(),
+            Some("latest output")
+        );
+        assert_eq!(stats.stats.tool_calls, 3);
+        assert_eq!(stats.stats.token_usage.total_tokens, 30);
+        assert_eq!(stats.stats.source_through_seq, Some(9));
+    }
+
+    async fn append_completed_tool_turn(
+        canonical_stream: &str,
+        event_log: &mut Vec<protocol::Envelope>,
+        subscribers: &mut Vec<Stream>,
+        replay_state: &mut AgentReplayState,
+        message_id: &str,
+        tool_call_id: &str,
+        content: &str,
+    ) {
+        append_chat_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            replay_state,
+            &ChatEvent::TypingStatusChanged(true),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            replay_state,
+            &ChatEvent::StreamStart(StreamStartData {
+                message_id: Some(message_id.to_owned()),
+                agent: "mock".to_owned(),
+                model: Some("mock-model".to_owned()),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            replay_state,
+            &tool_request(tool_call_id),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            replay_state,
+            &tool_completed(tool_call_id),
+        )
+        .await;
+        let mut message = assistant_message(content);
+        message.message_id = Some(ChatMessageId(message_id.to_owned()));
+        append_chat_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            replay_state,
+            &ChatEvent::StreamEnd(StreamEndData { message }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            replay_state,
+            &ChatEvent::TypingStatusChanged(false),
+        )
+        .await;
+    }
+
     async fn recv_agent_bootstrap_events(
         rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
         context: &str,
@@ -4678,6 +5450,507 @@ mod tests {
     #[test]
     fn mock_name_uses_default_words_when_prompt_has_no_name_words() {
         assert_eq!(generate_mock_name("!!!").unwrap(), "New Agent Task");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_tail_starts_at_message_boundary_with_tool_history() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        append_completed_tool_turn(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            "message-0",
+            "tool-0",
+            "tool history 0",
+        )
+        .await;
+        append_completed_tool_turn(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            "message-1",
+            "tool-1",
+            "tool history 1",
+        )
+        .await;
+        for index in 2..=50 {
+            let mut message = assistant_message(&format!("history {index}"));
+            message.message_id = Some(ChatMessageId(format!("message-{index}")));
+            append_chat_event(
+                canonical_stream,
+                &mut event_log,
+                &mut subscribers,
+                &mut replay_state,
+                &ChatEvent::MessageAdded(message),
+            )
+            .await;
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(tx),
+        );
+
+        let events = recv_agent_bootstrap_events(&mut rx, "agent bootstrap").await;
+        let before_seq = events
+            .iter()
+            .find_map(|event| match event {
+                AgentBootstrapEvent::HasPriorHistory {
+                    message_count: 1,
+                    before_seq,
+                } => Some(*before_seq),
+                _ => None,
+            })
+            .expect("bootstrap should gate the single older message");
+        let chat_events = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(event) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chat_events
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::MessageAdded(_)))
+                .count(),
+            50
+        );
+        match chat_events.as_slice() {
+            [
+                ChatEvent::MessageAdded(message),
+                ChatEvent::ToolRequest(request),
+                ChatEvent::ToolExecutionCompleted(completion),
+                ..,
+            ] => {
+                assert_eq!(message.content, "tool history 1");
+                assert_eq!(request.tool_call_id, "tool-1");
+                assert_eq!(completion.tool_call_id, "tool-1");
+            }
+            other => panic!("tail should start with a complete tool-bearing turn, got {other:?}"),
+        }
+
+        let older_page = session_history_window(&event_log, Some(before_seq), 10, None);
+        assert!(!older_page.has_more_before);
+        match older_page.events.as_slice() {
+            [
+                ChatEvent::ToolExecutionCompleted(completion),
+                ChatEvent::ToolRequest(request),
+                ChatEvent::MessageAdded(message),
+            ] => {
+                assert_eq!(completion.tool_call_id, "tool-0");
+                assert_eq!(request.tool_call_id, "tool-0");
+                assert_eq!(message.content, "tool history 0");
+            }
+            other => {
+                panic!("older page should contain the complete older tool turn, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_history_window_pages_by_message_boundary_with_tool_history() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        append_completed_tool_turn(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            "message-0",
+            "tool-0",
+            "tool history 0",
+        )
+        .await;
+        append_completed_tool_turn(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            "message-1",
+            "tool-1",
+            "tool history 1",
+        )
+        .await;
+
+        let newest_page = session_history_window(&event_log, None, 1, None);
+        assert!(newest_page.has_more_before);
+        let newest_cursor = newest_page
+            .oldest_seq
+            .expect("newest page should expose a cursor");
+        match newest_page.events.as_slice() {
+            [
+                ChatEvent::ToolExecutionCompleted(completion),
+                ChatEvent::ToolRequest(request),
+                ChatEvent::MessageAdded(message),
+            ] => {
+                assert_eq!(completion.tool_call_id, "tool-1");
+                assert_eq!(request.tool_call_id, "tool-1");
+                assert_eq!(message.content, "tool history 1");
+            }
+            other => panic!("newest page should contain one complete tool turn, got {other:?}"),
+        }
+
+        let older_page = session_history_window(&event_log, Some(newest_cursor), 1, None);
+        assert!(!older_page.has_more_before);
+        match older_page.events.as_slice() {
+            [
+                ChatEvent::ToolExecutionCompleted(completion),
+                ChatEvent::ToolRequest(request),
+                ChatEvent::MessageAdded(message),
+            ] => {
+                assert_eq!(completion.tool_call_id, "tool-0");
+                assert_eq!(request.tool_call_id, "tool-0");
+                assert_eq!(message.content, "tool history 0");
+            }
+            other => panic!("older page should contain one complete tool turn, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_completed_stream_replays_post_end_tool_events_after_stream_end() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::TypingStatusChanged(true),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamStart(StreamStartData {
+                message_id: Some("message-1".to_owned()),
+                agent: "mock".to_owned(),
+                model: Some("mock-model".to_owned()),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &tool_request("pre-end-tool"),
+        )
+        .await;
+        let mut message = assistant_message("finished before tools");
+        message.message_id = Some(ChatMessageId("message-1".to_owned()));
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData { message }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &tool_completed("pre-end-tool"),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &tool_request("post-end-tool"),
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(tx),
+        );
+
+        let events = recv_agent_bootstrap_events(&mut rx, "agent bootstrap").await;
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentBootstrapEvent::HasPriorHistory { .. })),
+            "filtered completed-stream history must not create a false prior-history gate: {events:?}"
+        );
+        let chat_events = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(event) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            chat_events
+                .iter()
+                .all(|event| !matches!(event, ChatEvent::MessageAdded(_))),
+            "completed stream history should be replayed through active events only: {chat_events:?}"
+        );
+        let stream_end_index = chat_events
+            .iter()
+            .position(|event| matches!(event, ChatEvent::StreamEnd(_)))
+            .expect("active replay should include StreamEnd");
+        let pre_request_index = chat_events
+            .iter()
+            .position(|event| matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == "pre-end-tool"))
+            .expect("active replay should include the pre-end tool request");
+        let pre_completion_index = chat_events
+            .iter()
+            .position(|event| matches!(event, ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == "pre-end-tool"))
+            .expect("active replay should include the post-end tool completion");
+        let post_request_index = chat_events
+            .iter()
+            .position(|event| matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == "post-end-tool"))
+            .expect("active replay should include the post-end tool request");
+        assert!(
+            pre_request_index < stream_end_index,
+            "pre-end request should replay before StreamEnd: {chat_events:?}"
+        );
+        assert!(
+            stream_end_index < pre_completion_index,
+            "post-end completion should replay after StreamEnd: {chat_events:?}"
+        );
+        assert!(
+            stream_end_index < post_request_index,
+            "post-end request should replay after StreamEnd: {chat_events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_completed_stream_replays_metadata_updated_stream_end() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::TypingStatusChanged(true),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamStart(StreamStartData {
+                message_id: Some("message-1".to_owned()),
+                agent: "mock".to_owned(),
+                model: Some("mock-model".to_owned()),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData {
+                message: assistant_message("metadata arrives later"),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &metadata_update("message-1", 42),
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(tx),
+        );
+
+        let events = recv_agent_bootstrap_events(&mut rx, "agent bootstrap").await;
+        let chat_events = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(event) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            chat_events
+                .iter()
+                .all(|event| !matches!(event, ChatEvent::MessageAdded(_))),
+            "metadata-updated completed message should not be duplicated in tail: {chat_events:?}"
+        );
+        let stream_end = chat_events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::StreamEnd(data) => Some(data),
+                _ => None,
+            })
+            .expect("active replay should include StreamEnd");
+        assert_eq!(
+            stream_end.message.message_id,
+            Some(ChatMessageId("message-1".to_owned()))
+        );
+        assert_eq!(
+            stream_end
+                .message
+                .token_usage
+                .as_ref()
+                .map(|usage| usage.total_tokens),
+            Some(42)
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_completed_stream_filter_keeps_later_history_entries() {
+        let canonical_stream = "/agent/replay-agent";
+        let mut event_log = Vec::new();
+        let mut replay_state = AgentReplayState::default();
+        let mut subscribers = Vec::new();
+
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::TypingStatusChanged(true),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamStart(StreamStartData {
+                message_id: Some("message-1".to_owned()),
+                agent: "mock".to_owned(),
+                model: Some("mock-model".to_owned()),
+            }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamDelta(StreamTextDeltaData {
+                message_id: Some("message-1".to_owned()),
+                text: "hello".to_owned(),
+            }),
+        )
+        .await;
+        let mut message = assistant_message("hello");
+        message.message_id = Some(ChatMessageId("message-1".to_owned()));
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::StreamEnd(StreamEndData { message }),
+        )
+        .await;
+        append_chat_event(
+            canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            &mut replay_state,
+            &ChatEvent::TaskUpdate(TaskList {
+                title: "after stream".to_owned(),
+                tasks: Vec::new(),
+            }),
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        attach_subscriber(
+            &event_log,
+            Some(&replay_state),
+            &mut subscribers,
+            replay_stream(tx),
+        );
+
+        let events = recv_agent_bootstrap_events(&mut rx, "agent bootstrap").await;
+        let chat_events = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentBootstrapEvent::ChatEvent(event) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            chat_events.iter().all(|event| !matches!(
+                event,
+                ChatEvent::MessageAdded(message) if message.content == "hello"
+            )),
+            "completed stream should not duplicate compacted MessageAdded: {chat_events:?}"
+        );
+        assert!(
+            chat_events.iter().any(|event| matches!(
+                event,
+                ChatEvent::TaskUpdate(tasks) if tasks.title == "after stream"
+            )),
+            "history entries after StreamEnd should remain in the bootstrap tail: {chat_events:?}"
+        );
+        assert!(matches!(
+            chat_events.as_slice(),
+            [
+                ChatEvent::TaskUpdate(_),
+                ChatEvent::TypingStatusChanged(true),
+                ChatEvent::StreamStart(_),
+                ChatEvent::StreamDelta(_),
+                ChatEvent::StreamEnd(_),
+            ]
+        ));
+
+        let task_seq = event_log
+            .iter()
+            .find_map(|envelope| {
+                if envelope.kind != FrameKind::ChatEvent {
+                    return None;
+                }
+                match envelope.parse_payload::<ChatEvent>().ok()? {
+                    ChatEvent::TaskUpdate(tasks) if tasks.title == "after stream" => {
+                        Some(envelope.seq)
+                    }
+                    _ => None,
+                }
+            })
+            .expect("expected TaskUpdate in replay log");
+        let prior_page =
+            session_history_window(&event_log, Some(task_seq), 10, Some(&replay_state));
+        assert!(!prior_page.has_more_before);
+        assert!(
+            prior_page.events.is_empty(),
+            "filtered active completed message must not be fetchable as older history: {:?}",
+            prior_page.events
+        );
     }
 
     #[tokio::test]
@@ -4758,20 +6031,27 @@ mod tests {
         let mut events = recv_agent_bootstrap_events(&mut rx, "agent bootstrap")
             .await
             .into_iter();
-        assert!(matches!(
-            events.next(),
-            Some(AgentBootstrapEvent::HasPriorHistory {
-                message_count: 1,
-                ..
-            })
-        ));
+        match events.next() {
+            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message))) => {
+                assert_eq!(message.content, "hello world");
+                assert_eq!(
+                    message.message_id,
+                    Some(ChatMessageId("message-1".to_owned()))
+                );
+                assert_eq!(
+                    message.token_usage.as_ref().map(|usage| usage.total_tokens),
+                    Some(42)
+                );
+            }
+            other => panic!("expected bootstrap MessageAdded tail, got {other:?}"),
+        }
         assert!(events.next().is_none());
         assert!(
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
-            "bootstrap should not include prior transcript events"
+            "bootstrap tail should stay inside AgentBootstrap"
         );
 
-        let window = session_history_window(&event_log, None, 10);
+        let window = session_history_window(&event_log, None, 10, None);
         assert!(!window.has_more_before);
         assert!(window.oldest_seq.is_some());
         match window.events.as_slice() {
@@ -5224,7 +6504,6 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [
-                AgentBootstrapEvent::HasPriorHistory { .. },
                 AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(true)),
                 AgentBootstrapEvent::ChatEvent(ChatEvent::StreamStart(..)),
                 AgentBootstrapEvent::ChatEvent(ChatEvent::StreamDelta(..)),
@@ -5309,18 +6588,25 @@ mod tests {
             .into_iter();
         assert!(matches!(
             events.next(),
-            Some(AgentBootstrapEvent::HasPriorHistory {
-                message_count: 1,
-                ..
-            })
+            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(_)))
+        ));
+        assert!(matches!(
+            events.next(),
+            Some(AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(_)))
+        ));
+        assert!(matches!(
+            events.next(),
+            Some(AgentBootstrapEvent::ChatEvent(
+                ChatEvent::ToolExecutionCompleted(_)
+            ))
         ));
         assert!(events.next().is_none());
         assert!(
             timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
-            "bootstrap should not include completed stream tool history"
+            "bootstrap tail should stay inside AgentBootstrap"
         );
 
-        let window = session_history_window(&event_log, None, 10);
+        let window = session_history_window(&event_log, None, 10, None);
         assert!(matches!(
             window.events.as_slice(),
             [

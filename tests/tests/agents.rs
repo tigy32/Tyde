@@ -134,7 +134,8 @@ fn agent_bootstrap_event_envelope(
             seq,
             &payload,
         )),
-        AgentBootstrapEvent::HasPriorHistory { .. } => None,
+        AgentBootstrapEvent::AgentActivityStats(_)
+        | AgentBootstrapEvent::HasPriorHistory { .. } => None,
     }
     .map(|result| result.expect("serialize synthetic bootstrap event"))
 }
@@ -152,6 +153,18 @@ fn pop_pending_agent_event(stream: &StreamPath, kind: FrameKind) -> Option<Envel
     env
 }
 
+fn pop_front_pending_agent_event(stream: &StreamPath) -> Option<Envelope> {
+    let mut pending = pending_agent_events()
+        .lock()
+        .expect("pending agent event mutex poisoned");
+    let queue = pending.get_mut(stream)?;
+    let env = queue.pop_front();
+    if queue.is_empty() {
+        pending.remove(stream);
+    }
+    env
+}
+
 fn push_pending_agent_event(env: Envelope) {
     if !env.stream.0.starts_with("/agent/") {
         return;
@@ -162,6 +175,18 @@ fn push_pending_agent_event(env: Envelope) {
         .entry(env.stream.clone())
         .or_default()
         .push_back(env);
+}
+
+fn push_front_pending_agent_event(env: Envelope) {
+    if !env.stream.0.starts_with("/agent/") {
+        return;
+    }
+    pending_agent_events()
+        .lock()
+        .expect("pending agent event mutex poisoned")
+        .entry(env.stream.clone())
+        .or_default()
+        .push_front(env);
 }
 
 /// Wait for the first envelope of a specific kind, skipping noise frames.
@@ -209,7 +234,10 @@ async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: 
 async fn expect_chat_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
         let env = expect_next_event(client, context).await;
-        if env.kind == FrameKind::SessionList {
+        if matches!(
+            env.kind,
+            FrameKind::SessionList | FrameKind::AgentActivityStats
+        ) {
             continue;
         }
         return env;
@@ -279,6 +307,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::SessionList
                             | FrameKind::HostSettings
                             | FrameKind::WorkflowNotify
+                            | FrameKind::AgentActivityStats
                     ) =>
             {
                 continue;
@@ -420,6 +449,19 @@ async fn post_json(url: &str, body: &Value) -> Value {
 }
 
 async fn mcp_spawn_agent(url: &str, prompt: &str, name: &str) -> protocol::AgentId {
+    mcp_spawn_agent_with_arguments(
+        url,
+        json!({
+            "workspace_roots": ["/tmp/agent-control-mcp-parent-url"],
+            "prompt": prompt,
+            "backend_kind": "claude",
+            "name": name
+        }),
+    )
+    .await
+}
+
+async fn mcp_spawn_agent_with_arguments(url: &str, arguments: Value) -> protocol::AgentId {
     let response = post_json(
         url,
         &json!({
@@ -428,12 +470,7 @@ async fn mcp_spawn_agent(url: &str, prompt: &str, name: &str) -> protocol::Agent
             "method": "tools/call",
             "params": {
                 "name": "tyde_spawn_agent",
-                "arguments": {
-                    "workspace_roots": ["/tmp/agent-control-mcp-parent-url"],
-                    "prompt": prompt,
-                    "backend_kind": "claude",
-                    "name": name
-                }
+                "arguments": arguments
             }
         }),
     )
@@ -602,6 +639,15 @@ async fn wait_for_agent_control_status(
     }
 }
 
+fn mcp_listed_agent<'a>(agents: &'a Value, agent_id: &protocol::AgentId) -> &'a Value {
+    agents
+        .as_array()
+        .unwrap_or_else(|| panic!("list agents result was not an array: {agents}"))
+        .iter()
+        .find(|agent| agent.get("agent_id").and_then(Value::as_str) == Some(agent_id.0.as_str()))
+        .unwrap_or_else(|| panic!("agent {} missing from list result: {agents}", agent_id.0))
+}
+
 struct ProgressRecorder {
     tx: tokio::sync::mpsc::UnboundedSender<ProgressNotificationParam>,
 }
@@ -671,6 +717,14 @@ async fn expect_turn_on_stream(
         "expected TypingStatusChanged(true) on {stream}, got {event:?}"
     );
 
+    expect_live_turn_after_typing_true_on_stream(client, stream, expected_text).await;
+}
+
+async fn expect_live_turn_after_typing_true_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_text: &str,
+) {
     let env = expect_chat_event_on_stream(client, stream, "StreamStart").await;
     let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
     assert!(
@@ -705,6 +759,107 @@ async fn expect_turn_on_stream(
         matches!(event, ChatEvent::TypingStatusChanged(false)),
         "expected TypingStatusChanged(false) on {stream}, got {event:?}"
     );
+}
+
+async fn expect_agent_control_child_initial_turn_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_text: &str,
+) {
+    let env = expect_chat_event_on_stream(client, stream, "agent-control child initial turn").await;
+    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    match event {
+        ChatEvent::TypingStatusChanged(true) => {
+            expect_live_turn_after_typing_true_on_stream(client, stream, expected_text).await;
+        }
+        ChatEvent::StreamStart(_) => {
+            expect_agent_control_child_replayed_stream_tail(client, stream, expected_text).await;
+        }
+        ChatEvent::MessageAdded(message) => {
+            assert!(
+                matches!(message.sender, MessageSender::Assistant { .. }),
+                "expected Assistant MessageAdded on {stream}, got {:?}",
+                message.sender
+            );
+            assert!(
+                message.content.contains(expected_text),
+                "unexpected MessageAdded text on {}: {}",
+                stream,
+                message.content
+            );
+            drain_pending_agent_control_child_initial_turn_trailer(stream, expected_text);
+        }
+        other => {
+            panic!("expected agent-control child initial turn on {stream}, got {other:?}");
+        }
+    }
+}
+
+async fn expect_agent_control_child_replayed_stream_tail(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_text: &str,
+) {
+    let mut saw_expected_text = false;
+    loop {
+        let env =
+            expect_chat_event_on_stream(client, stream, "agent-control child stream tail").await;
+        let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+        match event {
+            ChatEvent::StreamDelta(delta) => {
+                if delta.text.contains(expected_text) {
+                    saw_expected_text = true;
+                }
+            }
+            ChatEvent::StreamEnd(end) => {
+                if end.message.content.contains(expected_text) {
+                    saw_expected_text = true;
+                }
+                assert!(
+                    saw_expected_text,
+                    "agent-control child stream on {stream} ended without expected text {expected_text:?}"
+                );
+                drain_pending_agent_control_child_initial_turn_trailer(stream, expected_text);
+                return;
+            }
+            ChatEvent::StreamReasoningDelta(_)
+            | ChatEvent::ToolRequest(_)
+            | ChatEvent::ToolProgress(_)
+            | ChatEvent::ToolExecutionCompleted(_) => {}
+            other => {
+                panic!("unexpected event in agent-control child stream on {stream}: {other:?}");
+            }
+        }
+    }
+}
+
+fn drain_pending_agent_control_child_initial_turn_trailer(
+    stream: &StreamPath,
+    expected_text: &str,
+) {
+    while let Some(env) = pop_front_pending_agent_event(stream) {
+        if env.kind != FrameKind::ChatEvent {
+            push_front_pending_agent_event(env);
+            return;
+        }
+        let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+        if is_agent_control_child_initial_turn_trailer(&event, expected_text) {
+            continue;
+        }
+        push_front_pending_agent_event(env);
+        return;
+    }
+}
+
+fn is_agent_control_child_initial_turn_trailer(event: &ChatEvent, expected_text: &str) -> bool {
+    match event {
+        ChatEvent::TypingStatusChanged(false) => true,
+        ChatEvent::MessageAdded(message) => {
+            matches!(message.sender, MessageSender::Assistant { .. })
+                && message.content.contains(expected_text)
+        }
+        _ => false,
+    }
 }
 
 async fn expect_error_message_on_stream(
@@ -2151,6 +2306,7 @@ async fn agent_control_http_infers_parent_agent_id_from_request_url() {
         child_new.parent_agent_id.as_ref(),
         Some(&parent_new.agent_id)
     );
+    assert_eq!(child_new.project_id, None);
 
     let child_start = expect_agent_start_on_stream(
         &mut fixture.client,
@@ -2162,6 +2318,7 @@ async fn agent_control_http_infers_parent_agent_id_from_request_url() {
         child_start.parent_agent_id.as_ref(),
         Some(&parent_new.agent_id)
     );
+    assert_eq!(child_start.project_id, None);
 }
 
 #[tokio::test]
@@ -2515,6 +2672,12 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
 #[tokio::test]
 async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments() {
     let mut fixture = Fixture::new().await;
+    let parent_project = create_project(
+        &mut fixture.client,
+        "Explicit Parent Project",
+        vec!["/tmp/explicit-parent".to_owned()],
+    )
+    .await;
 
     fixture
         .client
@@ -2522,9 +2685,9 @@ async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments(
             name: Some("explicit-parent".to_owned()),
             custom_agent_id: None,
             parent_agent_id: None,
-            project_id: None,
+            project_id: Some(parent_project.id.clone()),
             params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/explicit-parent".to_owned()],
+                workspace_roots: project_roots(&parent_project),
                 prompt: "parent".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
@@ -2539,8 +2702,15 @@ async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments(
     let env = expect_next_event(&mut fixture.client, "explicit parent NewAgent").await;
     assert_eq!(env.kind, FrameKind::NewAgent);
     let parent_new: NewAgentPayload = env.parse_payload().expect("parse explicit parent NewAgent");
+    assert_eq!(parent_new.project_id.as_ref(), Some(&parent_project.id));
 
-    let _ = expect_next_event(&mut fixture.client, "explicit parent AgentStart").await;
+    let parent_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "explicit parent AgentStart",
+    )
+    .await;
+    assert_eq!(parent_start.project_id.as_ref(), Some(&parent_project.id));
     expect_turn_on_stream(
         &mut fixture.client,
         &parent_new.instance_stream,
@@ -2600,6 +2770,11 @@ async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments(
         Some(&parent_new.agent_id),
         "child spawned with explicit parent_agent_id must have that parent set"
     );
+    assert_eq!(
+        child_new.project_id.as_ref(),
+        Some(&parent_project.id),
+        "child spawned with explicit parent_agent_id and no caller must inherit parent project_id"
+    );
 
     let child_start = expect_agent_start_on_stream(
         &mut fixture.client,
@@ -2611,6 +2786,251 @@ async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments(
         child_start.parent_agent_id.as_ref(),
         Some(&parent_new.agent_id),
         "AgentStart must reflect explicit parent_agent_id"
+    );
+    assert_eq!(
+        child_start.project_id.as_ref(),
+        Some(&parent_project.id),
+        "AgentStart must inherit explicit parent's project_id"
+    );
+    expect_agent_control_child_initial_turn_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "mock backend response to: child with explicit parent",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn agent_control_http_unknown_parent_does_not_fabricate_project_id() {
+    let mut fixture = Fixture::new().await;
+    let base_url = fixture.agent_control_http_url().await;
+    let unknown_parent_id = protocol::AgentId("11111111-1111-1111-1111-111111111111".to_owned());
+    let child_agent_id = mcp_spawn_agent_with_arguments(
+        &base_url,
+        json!({
+            "workspace_roots": ["/tmp/unknown-parent-child"],
+            "prompt": "child with unknown parent",
+            "backend_kind": "claude",
+            "name": "unknown-parent-child",
+            "parent_agent_id": unknown_parent_id.0.clone()
+        }),
+    )
+    .await;
+
+    let child_new = expect_replayed_new_agent(
+        &mut fixture.client,
+        &child_agent_id,
+        "unknown parent child NewAgent",
+    )
+    .await;
+    assert_eq!(child_new.parent_agent_id.as_ref(), Some(&unknown_parent_id));
+    assert_eq!(child_new.project_id, None);
+
+    let child_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "unknown parent child AgentStart",
+    )
+    .await;
+    assert_eq!(
+        child_start.parent_agent_id.as_ref(),
+        Some(&unknown_parent_id)
+    );
+    assert_eq!(child_start.project_id, None);
+    expect_agent_control_child_initial_turn_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "mock backend response to: child with unknown parent",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() {
+    let mut fixture = Fixture::new().await;
+    let parent_project = create_project(
+        &mut fixture.client,
+        "Agent Control Parent Project",
+        vec!["/tmp/agent-control-parent-project".to_owned()],
+    )
+    .await;
+    let override_project = create_project(
+        &mut fixture.client,
+        "Agent Control Override Project",
+        vec!["/tmp/agent-control-override-project".to_owned()],
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("project-parent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(parent_project.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: project_roots(&parent_project),
+                prompt: "parent project".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn project parent failed");
+
+    let env = expect_next_event(&mut fixture.client, "project parent NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let parent_new: NewAgentPayload = env.parse_payload().expect("parse project parent NewAgent");
+    assert_eq!(parent_new.project_id.as_ref(), Some(&parent_project.id));
+
+    let parent_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "project parent AgentStart",
+    )
+    .await;
+    assert_eq!(parent_start.project_id.as_ref(), Some(&parent_project.id));
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "mock backend response to: parent project",
+    )
+    .await;
+
+    let base_url = fixture.agent_control_http_url().await;
+    let caller_url = format!("{base_url}?agent_id={}", parent_new.agent_id.0);
+    let inherited_child_root = "/tmp/agent-control-inherited-child";
+    let inherited_child_id = mcp_spawn_agent_with_arguments(
+        &caller_url,
+        json!({
+            "workspace_roots": [inherited_child_root],
+            "prompt": "child inherits project",
+            "backend_kind": "claude",
+            "name": "inherited-project-child"
+        }),
+    )
+    .await;
+
+    let inherited_child_new = expect_replayed_new_agent(
+        &mut fixture.client,
+        &inherited_child_id,
+        "inherited project child NewAgent",
+    )
+    .await;
+    assert_eq!(
+        inherited_child_new.parent_agent_id.as_ref(),
+        Some(&parent_new.agent_id)
+    );
+    assert_eq!(
+        inherited_child_new.project_id.as_ref(),
+        Some(&parent_project.id)
+    );
+
+    let inherited_child_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &inherited_child_new.instance_stream,
+        "inherited project child AgentStart",
+    )
+    .await;
+    assert_eq!(
+        inherited_child_start.parent_agent_id.as_ref(),
+        Some(&parent_new.agent_id)
+    );
+    assert_eq!(
+        inherited_child_start.project_id.as_ref(),
+        Some(&parent_project.id)
+    );
+    expect_agent_control_child_initial_turn_on_stream(
+        &mut fixture.client,
+        &inherited_child_new.instance_stream,
+        "mock backend response to: child inherits project",
+    )
+    .await;
+
+    let override_child_root = "/tmp/agent-control-override-child";
+    let override_child_id = mcp_spawn_agent_with_arguments(
+        &caller_url,
+        json!({
+            "workspace_roots": [override_child_root],
+            "prompt": "child overrides project",
+            "backend_kind": "claude",
+            "name": "override-project-child",
+            "project_id": override_project.id.0.clone()
+        }),
+    )
+    .await;
+
+    let override_child_new = expect_replayed_new_agent(
+        &mut fixture.client,
+        &override_child_id,
+        "override project child NewAgent",
+    )
+    .await;
+    assert_eq!(
+        override_child_new.parent_agent_id.as_ref(),
+        Some(&parent_new.agent_id)
+    );
+    assert_eq!(
+        override_child_new.project_id.as_ref(),
+        Some(&override_project.id)
+    );
+
+    let override_child_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &override_child_new.instance_stream,
+        "override project child AgentStart",
+    )
+    .await;
+    assert_eq!(
+        override_child_start.parent_agent_id.as_ref(),
+        Some(&parent_new.agent_id)
+    );
+    assert_eq!(
+        override_child_start.project_id.as_ref(),
+        Some(&override_project.id)
+    );
+    expect_agent_control_child_initial_turn_on_stream(
+        &mut fixture.client,
+        &override_child_new.instance_stream,
+        "mock backend response to: child overrides project",
+    )
+    .await;
+
+    let listed = mcp_list_agents(&base_url).await;
+    assert_eq!(
+        mcp_listed_agent(&listed, &inherited_child_id)
+            .get("project_id")
+            .and_then(Value::as_str),
+        Some(parent_project.id.0.as_str())
+    );
+    assert_eq!(
+        mcp_listed_agent(&listed, &override_child_id)
+            .get("project_id")
+            .and_then(Value::as_str),
+        Some(override_project.id.0.as_str())
+    );
+
+    let (_fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let inherited_session = fresh_bootstrap
+        .sessions
+        .iter()
+        .find(|session| session.workspace_roots == vec![inherited_child_root.to_owned()])
+        .expect("inherited child session missing from fresh host bootstrap");
+    assert_eq!(
+        inherited_session.project_id.as_ref(),
+        Some(&parent_project.id)
+    );
+    let override_session = fresh_bootstrap
+        .sessions
+        .iter()
+        .find(|session| session.workspace_roots == vec![override_child_root.to_owned()])
+        .expect("override child session missing from fresh host bootstrap");
+    assert_eq!(
+        override_session.project_id.as_ref(),
+        Some(&override_project.id)
     );
 }
 
@@ -3086,7 +3506,7 @@ async fn interrupting_parent_keeps_agent_control_children_running() {
         Some(&parent_new.agent_id)
     );
 
-    expect_turn_on_stream(
+    expect_agent_control_child_initial_turn_on_stream(
         &mut fixture.client,
         &child_new.instance_stream,
         "mock backend response to: __mock_slow__ agent-control child first",
@@ -3819,6 +4239,7 @@ async fn multiple_agents() {
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList
+                | FrameKind::AgentActivityStats
         ) {
             continue;
         }
@@ -3851,7 +4272,11 @@ async fn multiple_agents() {
     for stream in &streams {
         let stream_events: Vec<_> = events
             .iter()
-            .filter(|e| e.stream.0 == *stream && e.kind != FrameKind::NewAgent)
+            .filter(|e| {
+                e.stream.0 == *stream
+                    && e.kind != FrameKind::NewAgent
+                    && e.kind != FrameKind::AgentActivityStats
+            })
             .collect();
 
         assert_eq!(

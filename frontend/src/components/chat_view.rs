@@ -865,24 +865,24 @@ pub fn ChatView(
                                             return String::new();
                                         };
                                         if history.loading {
-                                            return "Loading previous conversation history…".to_owned();
+                                            return "Loading earlier messages…".to_owned();
                                         }
                                         if history.message_count > 0 {
                                             if history.message_count == 1 {
-                                                "Load previous conversation history (1 message)".to_owned()
+                                                "Load earlier messages (1 message)".to_owned()
                                             } else {
                                                 format!(
-                                                    "Load previous conversation history ({} messages)",
+                                                    "Load earlier messages ({} messages)",
                                                     history.message_count
                                                 )
                                             }
                                         } else {
-                                            "Load older conversation history".to_owned()
+                                            "Load earlier messages".to_owned()
                                         }
                                     }}
                                 </button>
                                 <p class="chat-history-collapsed-note">
-                                    "Earlier messages are available on demand and are not loaded until requested."
+                                    "Earlier messages are available on demand."
                                 </p>
                             </div>
                         </Show>
@@ -1587,11 +1587,11 @@ mod wasm_tests {
         );
         let text = container.text_content().unwrap_or_default();
         assert!(
-            text.contains("Load previous conversation history (25 messages)"),
-            "collapsed history must offer the load-previous control: {text}"
+            text.contains("Load earlier messages (25 messages)"),
+            "collapsed history must offer the load-earlier control: {text}"
         );
         assert!(
-            text.contains("not loaded until requested"),
+            text.contains("available on demand"),
             "history note must explain on-demand loading: {text}"
         );
         let buttons = container.query_selector_all("button").unwrap();
@@ -1599,9 +1599,9 @@ mod wasm_tests {
             buttons
                 .item(i)
                 .and_then(|node| node.text_content())
-                .is_some_and(|label| label.contains("Load previous conversation history"))
+                .is_some_and(|label| label.contains("Load earlier messages"))
         });
-        assert!(has_load_button, "load-previous control must be a button");
+        assert!(has_load_button, "load-earlier control must be a button");
 
         // Tear the view down inside this test: unmount (runs ChatView's
         // `on_cleanup`, disconnecting its ResizeObservers and clearing the

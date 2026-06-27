@@ -178,7 +178,8 @@ fn agent_bootstrap_event_envelope(
             seq,
             &payload,
         )),
-        AgentBootstrapEvent::HasPriorHistory { .. } => None,
+        AgentBootstrapEvent::AgentActivityStats(_)
+        | AgentBootstrapEvent::HasPriorHistory { .. } => None,
     }
     .map(|result| result.expect("serialize synthetic bootstrap event"))
 }

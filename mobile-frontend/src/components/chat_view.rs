@@ -677,20 +677,20 @@ pub fn ChatView() -> impl IntoView {
                                         on:click=on_load_previous
                                     >
                                         {if history.loading {
-                                            "Loading previous conversation history…".to_owned()
+                                            "Loading earlier messages…".to_owned()
                                         } else if history.message_count == 1 {
-                                            "Load previous conversation history (1 message)".to_owned()
+                                            "Load earlier messages (1 message)".to_owned()
                                         } else if history.message_count > 1 {
                                             format!(
-                                                "Load previous conversation history ({} messages)",
+                                                "Load earlier messages ({} messages)",
                                                 history.message_count
                                             )
                                         } else {
-                                            "Load older conversation history".to_owned()
+                                            "Load earlier messages".to_owned()
                                         }}
                                     </button>
                                     <p class="chat-history-collapsed-note">
-                                        "Earlier messages are available on demand and are not loaded until requested."
+                                        "Earlier messages are available on demand."
                                     </p>
                                 </div>
                             })}
@@ -1107,11 +1107,11 @@ mod wasm_tests {
         );
         let text = container.text_content().unwrap_or_default();
         assert!(
-            text.contains("Load previous conversation history (25 messages)"),
-            "banner must offer the load-previous control: {text}"
+            text.contains("Load earlier messages (25 messages)"),
+            "banner must offer the load-earlier control: {text}"
         );
         assert!(
-            text.contains("not loaded until requested"),
+            text.contains("available on demand"),
             "history note must explain on-demand loading: {text}"
         );
     }

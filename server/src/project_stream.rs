@@ -7,14 +7,15 @@ use std::time::Duration;
 
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use protocol::{
-    CommandErrorCode, CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project,
-    ProjectDiffScope, ProjectEventPayload, ProjectFileContentsPayload, ProjectFileEntry,
-    ProjectFileKind, ProjectFileListPayload, ProjectFileVersion, ProjectGitChangeKind,
-    ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind,
-    ProjectGitDiffPayload, ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing,
-    ProjectRootPath, ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload,
-    ReviewSummary, StreamPath,
+    CodeIntelOverviewHeadline, CodeIntelOverviewPayload, CodeIntelOverviewSummary,
+    CodeIntelProviderStatus, CodeIntelRootOverview, CodeIntelState, CommandErrorCode,
+    CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project, ProjectDiffScope,
+    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileEntry, ProjectFileKind,
+    ProjectFileListPayload, ProjectFileVersion, ProjectGitChangeKind, ProjectGitDiffFile,
+    ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
+    ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
+    ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload, ReviewSummary, StreamPath,
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -65,12 +66,13 @@ enum GitAccessMode {
     Mutating,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ProjectSnapshotState {
     /// Previous file entries per root, used to decide whether a new full snapshot is needed.
     pub file_entries: BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
     pub git_status: Option<Value>,
     pub diff_context_modes: HashMap<(StreamPath, ProjectDiffRequestKey), DiffContextMode>,
+    pub code_intel_overview: CodeIntelOverviewPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -124,6 +126,10 @@ enum ProjectStreamCommand {
     EmitProjectEvent {
         payload: ProjectEventPayload,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    UpdateCodeIntelProviderStatus {
+        root: ProjectRootPath,
+        status: CodeIntelProviderStatus,
     },
     /// Read a file's contents, assigning it the next value of the centralized
     /// per-file version counter. This is the single bump point for the *read*
@@ -249,6 +255,16 @@ impl ProjectStreamHandle {
         response
             .await
             .map_err(|_| "project stream subscription stopped".to_owned())?
+    }
+
+    pub(crate) fn update_code_intel_provider_status(
+        &self,
+        root: ProjectRootPath,
+        status: CodeIntelProviderStatus,
+    ) -> Result<(), String> {
+        self.tx
+            .send(ProjectStreamCommand::UpdateCodeIntelProviderStatus { root, status })
+            .map_err(|_| "project stream subscription stopped".to_owned())
     }
 
     pub(crate) async fn read_file(
@@ -401,7 +417,9 @@ fn create_project_watcher(
 fn initialize_snapshot(project: &Project) -> Result<ProjectSnapshotState, String> {
     let mut snapshot = ProjectSnapshotState {
         file_entries: scan_raw_entries(project)?,
-        ..Default::default()
+        git_status: None,
+        diff_context_modes: HashMap::new(),
+        code_intel_overview: initial_code_intel_overview(project.root_paths()),
     };
     let git_status = build_git_status(project)?;
     snapshot.git_status = Some(serialize_git_status(&git_status)?);
@@ -504,6 +522,35 @@ async fn run_project_subscription(
                     ProjectStreamCommand::EmitProjectEvent { payload, reply } => {
                         let result = broadcast_project_event(&mut subscribers, &payload).await;
                         let _ = reply.send(result);
+                    }
+                    ProjectStreamCommand::UpdateCodeIntelProviderStatus { root, status } => {
+                        let provider = status.provider.clone();
+                        let language = status.language.clone();
+                        let state = status.state;
+                        let resource_mode = status.resource_mode;
+                        if update_code_intel_provider_status(
+                            &mut snapshot.code_intel_overview,
+                            &project,
+                            root.clone(),
+                            status,
+                        ) && let Err(error) = fan_out_payload(
+                            &mut subscribers,
+                            FrameKind::CodeIntelOverview,
+                            &snapshot.code_intel_overview,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                project_id = %project_id,
+                                root = %root,
+                                provider = %provider,
+                                language = %language,
+                                ?state,
+                                ?resource_mode,
+                                error = %error,
+                                "failed to fan out code-intel overview update"
+                            );
+                        }
                     }
                     ProjectStreamCommand::ReadFile { payload, reply } => {
                         let result = read_file(&project, payload).map(|mut contents| {
@@ -708,9 +755,19 @@ async fn refresh_full(
     *project = latest_project;
     snapshot.file_entries = raw_entries;
     snapshot.git_status = Some(git_json);
+    let code_intel_roots_changed =
+        sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths());
 
     fan_out_payload(subscribers, FrameKind::ProjectFileList, &file_list).await?;
     fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
+    if code_intel_roots_changed {
+        fan_out_payload(
+            subscribers,
+            FrameKind::CodeIntelOverview,
+            &snapshot.code_intel_overview,
+        )
+        .await?;
+    }
     reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &git_status).await;
     refresh_remembered_diffs(project, snapshot, subscribers).await;
     Ok(())
@@ -733,9 +790,19 @@ async fn refresh_full_unwatched(
     *project = latest_project;
     snapshot.file_entries = raw_entries;
     snapshot.git_status = Some(git_json);
+    let code_intel_roots_changed =
+        sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths());
 
     fan_out_payload(subscribers, FrameKind::ProjectFileList, &file_list).await?;
     fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
+    if code_intel_roots_changed {
+        fan_out_payload(
+            subscribers,
+            FrameKind::CodeIntelOverview,
+            &snapshot.code_intel_overview,
+        )
+        .await?;
+    }
     reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &git_status).await;
     refresh_remembered_diffs(project, snapshot, subscribers).await;
     Ok(())
@@ -762,6 +829,8 @@ async fn refresh_incremental(
     let latest_project = load_subscription_project(project_store, project_id).await?;
     ensure_watched_roots(&latest_project, watcher, watched_roots, watch_tx)?;
     *project = latest_project;
+    let code_intel_roots_changed =
+        sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths());
 
     if files_changed {
         let current_raw = scan_raw_entries(project)?;
@@ -783,6 +852,15 @@ async fn refresh_incremental(
         }
     }
 
+    if code_intel_roots_changed {
+        fan_out_payload(
+            subscribers,
+            FrameKind::CodeIntelOverview,
+            &snapshot.code_intel_overview,
+        )
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -800,6 +878,132 @@ fn ensure_watched_roots(
     *watcher = create_project_watcher(project, watch_tx)?;
     *watched_roots = roots;
     Ok(())
+}
+
+fn initial_code_intel_overview(roots: Vec<ProjectRootPath>) -> CodeIntelOverviewPayload {
+    let roots = roots
+        .into_iter()
+        .map(|root| CodeIntelRootOverview {
+            root,
+            providers: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    code_intel_overview_with_summary(roots)
+}
+
+fn code_intel_overview_with_summary(roots: Vec<CodeIntelRootOverview>) -> CodeIntelOverviewPayload {
+    let summary = summarize_code_intel_overview(&roots);
+    CodeIntelOverviewPayload { roots, summary }
+}
+
+fn sync_code_intel_overview_roots(
+    overview: &mut CodeIntelOverviewPayload,
+    roots: Vec<ProjectRootPath>,
+) -> bool {
+    let previous = overview.clone();
+    let mut synced = Vec::with_capacity(roots.len());
+    for root in roots {
+        let providers = overview
+            .roots
+            .iter()
+            .find(|entry| entry.root == root)
+            .map(|entry| entry.providers.clone())
+            .unwrap_or_default();
+        synced.push(CodeIntelRootOverview { root, providers });
+    }
+    *overview = code_intel_overview_with_summary(synced);
+    *overview != previous
+}
+
+fn update_code_intel_provider_status(
+    overview: &mut CodeIntelOverviewPayload,
+    project: &Project,
+    root: ProjectRootPath,
+    status: CodeIntelProviderStatus,
+) -> bool {
+    if !project.root_paths().contains(&root) {
+        tracing::debug!(
+            root = %root,
+            provider = %status.provider,
+            language = %status.language,
+            "ignoring code-intel status for root no longer in project"
+        );
+        return false;
+    }
+
+    sync_code_intel_overview_roots(overview, project.root_paths());
+    let previous = overview.clone();
+    let Some(root_entry) = overview.roots.iter_mut().find(|entry| entry.root == root) else {
+        return false;
+    };
+    match root_entry.providers.iter_mut().find(|provider| {
+        provider.provider == status.provider && provider.language == status.language
+    }) {
+        Some(existing) => *existing = status,
+        None => root_entry.providers.push(status),
+    }
+    root_entry.providers.sort_by(|left, right| {
+        provider_status_sort_key(left).cmp(&provider_status_sort_key(right))
+    });
+    overview.summary = summarize_code_intel_overview(&overview.roots);
+    *overview != previous
+}
+
+fn provider_status_sort_key(status: &CodeIntelProviderStatus) -> (&str, &str) {
+    (status.provider.0.as_str(), status.language.0.as_str())
+}
+
+fn summarize_code_intel_overview(roots: &[CodeIntelRootOverview]) -> CodeIntelOverviewSummary {
+    let mut ready = 0;
+    let mut indexing = 0;
+    let mut starting = 0;
+    let mut unavailable = 0;
+    let mut failed = 0;
+    for provider in roots.iter().flat_map(|root| root.providers.iter()) {
+        match provider.state {
+            CodeIntelState::Ready => ready += 1,
+            CodeIntelState::Indexing => indexing += 1,
+            CodeIntelState::Starting => starting += 1,
+            CodeIntelState::Unavailable => unavailable += 1,
+            CodeIntelState::Failed => failed += 1,
+            CodeIntelState::Unsupported => {}
+        }
+    }
+
+    let provider_count = ready + indexing + starting + unavailable + failed;
+    let headline = if provider_count == 0 {
+        CodeIntelOverviewHeadline::NotStarted
+    } else if failed > 0 {
+        CodeIntelOverviewHeadline::Failed
+    } else if unavailable > 0 {
+        CodeIntelOverviewHeadline::Unavailable
+    } else if indexing > 0 {
+        CodeIntelOverviewHeadline::Indexing
+    } else if starting > 0 {
+        CodeIntelOverviewHeadline::Starting
+    } else {
+        CodeIntelOverviewHeadline::Ready
+    };
+    let message = match headline {
+        CodeIntelOverviewHeadline::NotStarted => {
+            Some("No language server running — open a file to index".to_owned())
+        }
+        CodeIntelOverviewHeadline::Failed => Some("Code intelligence failed".to_owned()),
+        CodeIntelOverviewHeadline::Unavailable => Some("Language server unavailable".to_owned()),
+        CodeIntelOverviewHeadline::Indexing => Some("Indexing code intelligence".to_owned()),
+        CodeIntelOverviewHeadline::Starting => Some("Starting language server".to_owned()),
+        CodeIntelOverviewHeadline::Ready => Some("Code intelligence ready".to_owned()),
+    };
+
+    CodeIntelOverviewSummary {
+        headline,
+        ready,
+        indexing,
+        starting,
+        unavailable,
+        failed,
+        message,
+    }
 }
 
 fn current_file_version(
@@ -1026,7 +1230,13 @@ async fn emit_snapshot_to_stream(
         git_status,
         review_summaries,
     };
-    send_payload(stream, FrameKind::ProjectBootstrap, &bootstrap).await
+    send_payload(stream, FrameKind::ProjectBootstrap, &bootstrap).await?;
+    send_payload(
+        stream,
+        FrameKind::CodeIntelOverview,
+        &snapshot.code_intel_overview,
+    )
+    .await
 }
 
 async fn fan_out_payload<T: serde::Serialize>(
@@ -2537,6 +2747,36 @@ mod tests {
         }
     }
 
+    fn test_project_with_roots(roots: &[&str]) -> Project {
+        Project {
+            id: ProjectId("project-1".to_owned()),
+            name: "Project".to_owned(),
+            sort_order: 0,
+            source: ProjectSource::Standalone {
+                roots: roots
+                    .iter()
+                    .map(|root| ProjectRootPath((*root).to_owned()))
+                    .collect(),
+            },
+        }
+    }
+
+    fn provider_status(
+        provider: &str,
+        language: &str,
+        state: CodeIntelState,
+    ) -> CodeIntelProviderStatus {
+        CodeIntelProviderStatus {
+            provider: protocol::CodeIntelProviderId(provider.to_owned()),
+            language: protocol::CodeIntelLanguageId(language.to_owned()),
+            state,
+            resource_mode: protocol::CodeIntelResourceMode::Full,
+            work_done: None,
+            total_work: None,
+            message: None,
+        }
+    }
+
     fn git(root: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
             .arg("-C")
@@ -2582,6 +2822,108 @@ mod tests {
         assert_eq!(status.roots.len(), 1);
         assert_eq!(status.roots[0].branch.as_deref(), Some("main"));
         assert!(status.roots[0].clean);
+    }
+
+    #[test]
+    fn code_intel_overview_starts_idle_for_every_root() {
+        let overview = initial_code_intel_overview(vec![
+            ProjectRootPath("/repo-a".to_owned()),
+            ProjectRootPath("/repo-b".to_owned()),
+        ]);
+
+        assert_eq!(overview.roots.len(), 2);
+        assert_eq!(
+            overview.roots[0].root,
+            ProjectRootPath("/repo-a".to_owned())
+        );
+        assert!(overview.roots[0].providers.is_empty());
+        assert_eq!(
+            overview.roots[1].root,
+            ProjectRootPath("/repo-b".to_owned())
+        );
+        assert!(overview.roots[1].providers.is_empty());
+        assert_eq!(
+            overview.summary.headline,
+            CodeIntelOverviewHeadline::NotStarted
+        );
+        assert_eq!(overview.summary.ready, 0);
+        assert_eq!(overview.summary.indexing, 0);
+        assert_eq!(
+            overview.summary.message.as_deref(),
+            Some("No language server running — open a file to index")
+        );
+    }
+
+    #[test]
+    fn code_intel_overview_replaces_provider_status_and_summarizes() {
+        let project = test_project_with_roots(&["/repo-a", "/repo-b"]);
+        let mut overview = initial_code_intel_overview(project.root_paths());
+
+        assert!(update_code_intel_provider_status(
+            &mut overview,
+            &project,
+            ProjectRootPath("/repo-a".to_owned()),
+            provider_status("rust-analyzer", "rust", CodeIntelState::Starting),
+        ));
+        assert_eq!(
+            overview.summary.headline,
+            CodeIntelOverviewHeadline::Starting
+        );
+        assert_eq!(overview.summary.starting, 1);
+
+        assert!(update_code_intel_provider_status(
+            &mut overview,
+            &project,
+            ProjectRootPath("/repo-a".to_owned()),
+            provider_status("rust-analyzer", "rust", CodeIntelState::Ready),
+        ));
+        assert_eq!(overview.roots[0].providers.len(), 1);
+        assert_eq!(overview.roots[0].providers[0].state, CodeIntelState::Ready);
+        assert_eq!(overview.summary.headline, CodeIntelOverviewHeadline::Ready);
+        assert_eq!(overview.summary.ready, 1);
+        assert_eq!(overview.summary.starting, 0);
+
+        assert!(update_code_intel_provider_status(
+            &mut overview,
+            &project,
+            ProjectRootPath("/repo-b".to_owned()),
+            provider_status("pyright", "python", CodeIntelState::Indexing),
+        ));
+        assert_eq!(
+            overview.summary.headline,
+            CodeIntelOverviewHeadline::Indexing
+        );
+        assert_eq!(overview.summary.ready, 1);
+        assert_eq!(overview.summary.indexing, 1);
+    }
+
+    #[test]
+    fn code_intel_overview_root_sync_prunes_removed_roots() {
+        let project = test_project_with_roots(&["/repo-a", "/repo-b"]);
+        let mut overview = initial_code_intel_overview(project.root_paths());
+        assert!(update_code_intel_provider_status(
+            &mut overview,
+            &project,
+            ProjectRootPath("/repo-b".to_owned()),
+            provider_status("pyright", "python", CodeIntelState::Failed),
+        ));
+
+        assert!(sync_code_intel_overview_roots(
+            &mut overview,
+            vec![ProjectRootPath("/repo-a".to_owned())],
+        ));
+
+        assert_eq!(overview.roots.len(), 1);
+        assert_eq!(
+            overview.roots[0].root,
+            ProjectRootPath("/repo-a".to_owned())
+        );
+        assert!(overview.roots[0].providers.is_empty());
+        assert_eq!(overview.summary.failed, 0);
+        assert_eq!(
+            overview.summary.headline,
+            CodeIntelOverviewHeadline::NotStarted
+        );
     }
 
     #[test]

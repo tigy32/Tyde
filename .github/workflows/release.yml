@@ -16,6 +16,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   create-release:
@@ -460,11 +461,85 @@ jobs:
         if: startsWith(matrix.platform, 'macos') && always()
         run: security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" 2>/dev/null || true
 
-  publish-release:
+  deploy-mobile-web:
     needs: build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: mobile-web-manifest
+      cancel-in-progress: false
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Verify release version matches tag
+        run: python tools/check_release_version.py "${{ env.RELEASE_TAG }}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@0.21.14
+
+      - name: Test web release tooling
+        run: |
+          node --test web/deploy/*.test.mjs
+          python3 -m unittest tools/test_check_mobile_web_manifest.py
+          bash -n web/deploy/deploy.sh
+          cd web/loader
+          node --test
+
+      - name: Validate AWS deploy role
+        env:
+          AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_TYDE_WEB_DEPLOY_ROLE_ARN || vars.AWS_TYDE_WEB_DEPLOY_ROLE_ARN }}
+        run: |
+          if [[ -z "$AWS_DEPLOY_ROLE_ARN" ]]; then
+            echo "::error::Set AWS_TYDE_WEB_DEPLOY_ROLE_ARN as a GitHub secret or variable"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TYDE_WEB_DEPLOY_ROLE_ARN || vars.AWS_TYDE_WEB_DEPLOY_ROLE_ARN }}
+          aws-region: us-west-2
+
+      - name: Deploy mobile web bundle
+        run: web/deploy/deploy.sh "${RELEASE_TAG}" --confirm --live-manifest-base
+
+      - name: Verify deployed mobile web manifest
+        run: |
+          aws s3 cp s3://tycode-static/tyde/manifest.json "$RUNNER_TEMP/tyde-manifest.json" --region us-west-2
+          python3 tools/check_mobile_web_manifest.py \
+            --manifest "$RUNNER_TEMP/tyde-manifest.json" \
+            "$RELEASE_TAG"
+
+  publish-release:
+    needs:
+      - build
+      - deploy-mobile-web
     if: |
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')) ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish)
+      always() &&
+      needs.build.result == 'success' &&
+      needs.deploy-mobile-web.result == 'success' &&
+      (
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')) ||
+        (github.event_name == 'workflow_dispatch' && inputs.publish)
+      )
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}

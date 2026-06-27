@@ -23,6 +23,8 @@ base64 = { workspace = true }
 web-sys = { version = "0.3", features = [
     "Clipboard",
     "CanvasRenderingContext2d",
+    "CustomEvent",
+    "CustomEventInit",
     "Document",
     "Event",
     "Element",

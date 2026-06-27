@@ -29,6 +29,31 @@ export const STORAGE_KEY = "tyde.loader.version"; // last successfully-paired ve
 // the PSK-bearing URI never enters history/referrer; the app reads, validates,
 // and clears it. MUST match `PENDING_PAIRING_URI_KEY` in the Rust web bridge.
 export const PAIR_URI_KEY = "tyde.pair.uri";
+// Self-heal handoff: a stale booted bundle that hit a protocol mismatch during
+// in-app pairing dispatches `tyde:repair-needed` carrying the host's raw pairing
+// URI. The loader stashes it here, reloads (tearing down the stale WASM), and
+// the fresh `init()` re-routes it through `handlePairingUri` to boot the
+// version-matched bundle. sessionStorage (not the URL) keeps the PSK-bearing URI
+// out of history/referrer, same as PAIR_URI_KEY.
+export const REPAIR_URI_KEY = "tyde.repair.uri";
+// Session-scoped counter of self-heal reboots already processed, so a corrupt
+// manifest that stamps a matching protocol but serves a bundle whose COMPILED
+// protocol differs (the booted bundle re-dispatches `tyde:repair-needed`
+// forever) can't wedge the PWA in an infinite reload loop. Capped by
+// MAX_REPAIR_ATTEMPTS; on exceed the loader clears repair state and shows an
+// explicit error instead of reloading again. Session-scoped so closing/
+// reopening the PWA — or a clean (non-repair) load — starts fresh.
+export const REPAIR_ATTEMPTS_KEY = "tyde.repair.attempts";
+export const MAX_REPAIR_ATTEMPTS = 2;
+// In-flight pairing fragment captured from the URL. The PSK fragment is cleared
+// from the URL IMMEDIATELY (no-leak invariant), but a failure before pairing
+// commits — most importantly a failed manifest fetch, whose retry is a full
+// `window.location.reload()` — would otherwise lose the QR and force a rescan.
+// So we mirror it here in sessionStorage (same PSK-in-sessionStorage exposure as
+// PAIR_URI_KEY/REPAIR_URI_KEY, session-scoped, never in the URL) and recover it
+// on the next load. Consumed (cleared) once a URI is committed to a boot attempt
+// in `handlePairingUri`.
+export const PENDING_FRAGMENT_KEY = "tyde.pending.fragment";
 const BUNDLE_CACHE = "tyde-bundle-v1"; // shared with sw.js
 const WEB_DB_NAME = "tyde-mobile";
 const WEB_DB_VERSION = 1;
@@ -84,11 +109,18 @@ function reasonToMessage(reason) {
       return "This host is too old for the current web client. Update the host, then re-pair.";
     case "not-in-manifest":
       return "No matching client build is published for this host version yet. Try again later or re-pair after updating the host.";
+    case "protocol-unpublished":
+      return "This host build's mobile client has not been published yet. Try again after the release finishes, or report this if it persists.";
+    case "protocol-mismatch":
+      return "This host does not match its published mobile client (protocol mismatch). The web client needs re-publishing for this host build — please report this.";
+    case "repair-loop":
+      return "The Tyde client could not start after several attempts — the published release looks misconfigured. Please report this, then update the host and re-pair.";
     case "invalid-version":
       return "The pairing code carried an invalid version. Scan a fresh QR code.";
     case "bad-policy":
     case "bad-entry-path":
     case "bad-integrity":
+    case "bad-protocol-version":
       return "The release manifest is malformed. Please report this.";
     case "no-manifest":
       return "Could not load the release manifest. Check your connection and retry.";
@@ -461,6 +493,123 @@ export function isStandaloneContext(win, nav) {
   return false;
 }
 
+// Cross-checks the host QR's protocol version against the resolved manifest
+// entry's stamped `protocolVersion` BEFORE booting. Fails closed: an entry with
+// no stamped protocol (packaging drift — the host build's bundle was not
+// published with metadata) and a true mismatch both abort the boot rather than
+// launching a bundle the WASM would only strict-reject deep inside. This keeps
+// the strict equality check intact and adds an explicit, pre-boot failure so the
+// user never sees a raw "expected N" from the wrong bundle. Pure; exported for
+// unit testing. Returns `{ ok: true }` or `{ ok: false, reason, detail }`.
+export function checkProtocolCompatibility(qrProtocolVersion, target) {
+  const entryProtocol =
+    target && typeof target === "object" ? target.protocolVersion : null;
+  if (entryProtocol === null || entryProtocol === undefined) {
+    return {
+      ok: false,
+      reason: "protocol-unpublished",
+      detail: `host protocol ${
+        Number.isInteger(qrProtocolVersion) ? qrProtocolVersion : "?"
+      }, published bundle has no protocol metadata`,
+    };
+  }
+  if (!Number.isInteger(qrProtocolVersion)) {
+    return {
+      ok: false,
+      reason: "protocol-mismatch",
+      detail: `pairing code carried no usable protocol version (bundle protocol ${entryProtocol})`,
+    };
+  }
+  if (qrProtocolVersion !== entryProtocol) {
+    return {
+      ok: false,
+      reason: "protocol-mismatch",
+      detail: `host protocol ${qrProtocolVersion}, published bundle protocol ${entryProtocol}`,
+    };
+  }
+  return { ok: true };
+}
+
+// Reads and CLEARS the self-heal repair URI a stale bundle stashed before it
+// asked the loader to reload (see REPAIR_URI_KEY / onRepairNeeded). Returns the
+// raw URI string or null. Always clears so a stale URI cannot replay.
+export function takeRepairUri() {
+  try {
+    const uri = sessionStorage.getItem(REPAIR_URI_KEY);
+    if (uri !== null && uri !== undefined) sessionStorage.removeItem(REPAIR_URI_KEY);
+    return uri && uri.length > 0 ? uri : null;
+  } catch {
+    return null;
+  }
+}
+
+// Increments and returns the session-scoped self-heal reboot counter. `init()`
+// calls this once per repair reboot it processes and breaks the loop when the
+// count exceeds MAX_REPAIR_ATTEMPTS. If sessionStorage is unavailable the repair
+// stash in `onRepairNeeded` also fails (so no reload loop is possible); we then
+// report 1 so the single in-memory attempt still proceeds.
+export function registerRepairAttempt() {
+  try {
+    const raw = sessionStorage.getItem(REPAIR_ATTEMPTS_KEY);
+    const current = Number.parseInt(raw || "0", 10);
+    const next = (Number.isInteger(current) && current >= 0 ? current : 0) + 1;
+    sessionStorage.setItem(REPAIR_ATTEMPTS_KEY, String(next));
+    return next;
+  } catch {
+    return 1;
+  }
+}
+
+// Resets the self-heal reboot counter — called on a clean (non-repair) load and
+// when the loop guard trips, so a later genuine drift can self-heal again.
+export function clearRepairAttempts() {
+  try {
+    sessionStorage.removeItem(REPAIR_ATTEMPTS_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+// Handles a `tyde:repair-needed` event. The booted mobile bundle dispatches it
+// when it detects, during in-app pairing, that its OWN compiled protocol no
+// longer matches the host's QR (see mobile-frontend `request_loader_repair`).
+// With the carried pairing URI: forget the stale remembered version, stash the
+// URI, and reload so the stale WASM is torn down and the fresh loader re-routes
+// the URI through the version-matched boot path. Without a URI: just forget and
+// return to the pair screen. Returns true when it routed to a repair-reload.
+//
+// NOTE: only a bundle that CONTAINS this dispatch code self-heals — a bundle
+// built before the dispatch was added (e.g. an already-running older beta)
+// cannot retroactively gain it, so it still surfaces its own raw error. The
+// loop guard in `init()` (REPAIR_ATTEMPTS_KEY) bounds repeated reboots.
+// Exported for unit testing; `reload` is injectable so tests don't navigate.
+export function onRepairNeeded(detail, reload) {
+  forgetVersion();
+  const uri = typeof detail === "string" && detail.length > 0 ? detail : null;
+  if (!uri) {
+    show("pair");
+    return false;
+  }
+  try {
+    sessionStorage.setItem(REPAIR_URI_KEY, uri);
+  } catch {
+    // No sessionStorage (private mode): can't hand off across reload, so fall
+    // back to the pair screen for a manual re-scan rather than silently nothing.
+    show("pair");
+    return false;
+  }
+  const doReload =
+    typeof reload === "function"
+      ? reload
+      : typeof window !== "undefined" &&
+          window.location &&
+          typeof window.location.reload === "function"
+        ? () => window.location.reload()
+        : null;
+  if (doReload) doReload();
+  return true;
+}
+
 // Stash the raw pairing URI for the booted app to consume (see PAIR_URI_KEY).
 function stashPairingUri(uri) {
   try {
@@ -471,11 +620,67 @@ function stashPairingUri(uri) {
   }
 }
 
+// Persist the in-flight pairing fragment so a retry after a pre-commit failure
+// (e.g. a failed manifest fetch whose retry reloads the page) can recover it
+// without a rescan. PSK stays in sessionStorage, never the URL.
+function stashPendingFragment(fragment) {
+  try {
+    sessionStorage.setItem(PENDING_FRAGMENT_KEY, fragment);
+  } catch {
+    // No sessionStorage: retry after a failure will need a rescan — degraded,
+    // not broken, and never a silent wrong-host pairing.
+  }
+}
+
+function readPendingFragment() {
+  try {
+    const value = sessionStorage.getItem(PENDING_FRAGMENT_KEY);
+    return value && value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearPendingFragment() {
+  try {
+    sessionStorage.removeItem(PENDING_FRAGMENT_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+// Resolves the pairing fragment for this init from the URL hash the caller has
+// ALREADY captured and cleared (no-leak invariant). A `tyde-pair://…` fragment
+// in the URL is the source of truth: it is returned AND mirrored to
+// sessionStorage so a retry after a pre-commit failure can recover it. When the
+// URL has no pairing fragment (e.g. a retry reload after we cleared it), we
+// recover the previously-stashed one. Returns the fragment string or null.
+// Exported for unit testing; only reads/writes sessionStorage (no DOM).
+export function resolvePairingFragment(urlHash) {
+  let fragment = null;
+  if (typeof urlHash === "string" && urlHash.length > 0) {
+    const f = urlHash.startsWith("#") ? urlHash.slice(1) : urlHash;
+    if (f.includes("tyde-pair://")) fragment = f;
+  }
+  if (fragment) {
+    stashPendingFragment(fragment);
+    return fragment;
+  }
+  return readPendingFragment();
+}
+
 // Handles a raw pairing URI (from scan or paste): parse -> validate -> resolve
 // against the manifest -> stash URI for the app -> boot. Surfaces a friendly
 // error otherwise. The loader trusts ONLY release_version for its own decision;
 // the app re-parses the stashed URI authoritatively.
 export async function handlePairingUri(uri, manifest) {
+  // We are committing to processing a specific URI now, so the in-flight
+  // pending-fragment recovery copy has served its purpose — consume it. (A
+  // manifest-FETCH failure happens before we ever reach here, so the pending
+  // copy survives that and its retry can still recover it; a failure FROM here
+  // is a property of the URI itself, so a retry returns to the pair screen for a
+  // fresh scan rather than replaying the same explicit error forever.)
+  clearPendingFragment();
   // The QR is now a generic HTTPS link whose fragment carries the
   // `tyde-pair://…` URI; normalize to that inner URI so everything downstream
   // (parse + the stashed value the WASM app's `take_pending_pairing_uri`
@@ -501,6 +706,16 @@ export async function handlePairingUri(uri, manifest) {
   const resolved = resolveBootTarget(parsed.releaseVersion, manifest);
   if (!resolved.ok) {
     setError(reasonToMessage(resolved.reason), `version ${parsed.releaseVersion}`);
+    return;
+  }
+  // Fail closed on protocol drift BEFORE booting: if the host's QR protocol does
+  // not match the published bundle's stamped protocol (or the bundle has none),
+  // surface an explicit packaging-drift error instead of booting a bundle the
+  // WASM would only reject deep inside. No stash, no remember, no boot — and no
+  // fallback to "latest".
+  const protocolCheck = checkProtocolCompatibility(parsed.protocolVersion, resolved);
+  if (!protocolCheck.ok) {
+    setError(reasonToMessage(protocolCheck.reason), protocolCheck.detail);
     return;
   }
   // Hand the normalized `tyde-pair://…` URI to the booted app so first-time
@@ -653,8 +868,10 @@ async function startScan(manifest) {
 // --- Safari-guard for in-app-browser pairing links -------------------------
 //
 // Shows #view-pair-guard for a pairing link opened in a non-persistent context.
-// The pairing URI is held ONLY in this closure (never re-written to the URL —
-// the fragment was already cleared by init() before any await), so dismissing
+// The pairing URI lives in this closure and is mirrored in sessionStorage under
+// PENDING_FRAGMENT_KEY (so a retry can recover it without a rescan), but it is
+// NEVER re-written to the URL/history/referrer — init() cleared the fragment
+// before any await, and sessionStorage is not sent to the origin. So dismissing
 // the in-app sheet doesn't leak it and "Pair here anyway" still has it.
 function showPairGuard(pairingUri, manifest) {
   showLoaderShell();
@@ -772,13 +989,35 @@ async function init() {
 
   registerServiceWorker();
 
-  // A backgrounded host that upgrades will reject the old client at handshake;
-  // the WASM app then dispatches this event so the loader forgets the stale
-  // version and returns to pairing (self-healing re-pair flow).
-  window.addEventListener("tyde:repair-needed", () => {
-    forgetVersion();
-    show("pair");
+  // The booted mobile bundle dispatches this when an IN-APP pairing attempt hits
+  // a protocol mismatch against the host's QR (mobile-frontend
+  // `request_loader_repair`). When it carries the host's pairing URI
+  // (`event.detail`), self-heal by rebooting into the version-matched bundle;
+  // otherwise return to pairing. (Only bundles that ship this dispatch can
+  // self-heal — an older bundle without it just shows its own error.)
+  window.addEventListener("tyde:repair-needed", (event) => {
+    const detail =
+      event && typeof event.detail === "string" ? event.detail : null;
+    onRepairNeeded(detail);
   });
+
+  // Capture + IMMEDIATELY clear any URL fragment BEFORE the first await or early
+  // return below, so the PSK-bearing `tyde-pair://…` fragment can never leak
+  // into a later navigation/referrer regardless of which path init() takes
+  // (manifest fetch, self-heal repair, startup boot). The host's QR is a generic
+  // HTTPS link (`https://tycode.dev/tyde/#tyde-pair://v1?<payload>`); the secret
+  // rides in the FRAGMENT, which browsers never send to the origin.
+  // `resolvePairingFragment` mirrors the captured fragment into sessionStorage
+  // (never the URL) so a retry after a pre-commit failure — e.g. a failed
+  // manifest fetch, whose retry button reloads the page — can recover it without
+  // a rescan, and recovers a previously-stashed one when this load has no hash.
+  // `history.replaceState` runs only when a hash was present, preserving the
+  // no-rewrite-on-clean-load behavior.
+  const hash = window.location.hash;
+  if (hash) {
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+  }
+  const pairingFragment = resolvePairingFragment(hash);
 
   show("loading");
 
@@ -790,26 +1029,39 @@ async function init() {
     return;
   }
 
-  // Auto-pair from the URL fragment. The host's QR is a generic HTTPS link
-  // (`https://tycode.dev/tyde/#tyde-pair://v1?<payload>`) so the native iOS/
-  // Android Camera can open it.
+  // Self-heal re-pair: a booted bundle dispatched `tyde:repair-needed` with the
+  // host's pairing URI on an in-app protocol mismatch, which we stashed before
+  // reloading. Re-route it through the version-matched boot path so the MATCHING
+  // bundle authoritatively pairs (and if none is published, the user sees an
+  // explicit failure — never a silent downgrade). Runs before the fragment/
+  // startup fast paths.
   //
-  // SECURITY: the PSK-bearing `tyde-pair://…` URI rides in the FRAGMENT (after
-  // `#`), which browsers never send to the origin — so the secret never
-  // reaches S3/CloudFront. We clear the fragment IMMEDIATELY (before any await
-  // that could let it leak into a later navigation/referrer) via
-  // `history.replaceState`, then pair from the in-memory copy.
-  const hash = window.location.hash;
-  if (hash) {
-    const fragment = hash.startsWith("#") ? hash.slice(1) : hash;
-    // Clear the fragment BEFORE any await so the PSK-bearing URI can never leak
-    // into a later navigation/referrer. From here on the URI lives only in
-    // memory (the `fragment` local).
-    history.replaceState(null, "", window.location.pathname + window.location.search);
-    if (fragment.includes("tyde-pair://")) {
-      await routePairingFragment(fragment, manifest);
+  // LOOP BREAKER: a corrupt manifest could stamp a protocol matching the QR yet
+  // serve a bundle whose compiled protocol differs, so the booted bundle
+  // re-dispatches repair every reload. Cap the reboots: after MAX_REPAIR_ATTEMPTS
+  // clear repair state and show an explicit error instead of reloading again.
+  const repairUri = takeRepairUri();
+  if (repairUri) {
+    const attempts = registerRepairAttempt();
+    if (attempts > MAX_REPAIR_ATTEMPTS) {
+      clearRepairAttempts();
+      setError(
+        reasonToMessage("repair-loop"),
+        `gave up after ${MAX_REPAIR_ATTEMPTS} self-heal attempt(s)`,
+      );
       return;
     }
+    await handlePairingUri(repairUri, manifest);
+    return;
+  }
+  // Clean (non-repair) entry: reset the loop guard so a later genuine drift can
+  // self-heal again.
+  clearRepairAttempts();
+
+  // Auto-pair from the URL fragment captured/cleared above.
+  if (pairingFragment) {
+    await routePairingFragment(pairingFragment, manifest);
+    return;
   }
 
   // Startup fast path. If there are paired hosts, prefer the remembered

@@ -8,8 +8,9 @@ use protocol::{
     AgentGroupAssignment, AgentGroupId, AgentGroupMode, AgentGroupsUpdate, AgentId,
     AgentListDensity, AgentManualTagId, AgentOrderKey, AgentPinsUpdate, AgentSortMode,
     AgentStartPayload, AgentStatusFilter, AgentSystemTagId, AgentTagColor, AgentTagRef,
-    AgentTagsUpdate, AgentsSmartViewsSnapshot, AgentsSmartViewsUpdate, AgentsViewFilters,
-    AgentsViewPreferences, AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesStoreErrorKind,
+    AgentTagsUpdate, AgentsSidebarPreferences, AgentsSidebarProjectVisibility,
+    AgentsSmartViewsSnapshot, AgentsSmartViewsUpdate, AgentsViewFilters, AgentsViewPreferences,
+    AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesStoreErrorKind,
     AgentsViewPreferencesUpdate, BackendKind, BuiltInSmartViewId, CloseAgentPayload,
     CommandErrorCode, CommandErrorPayload, DeleteSessionPayload, Envelope, FrameKind,
     HostBootstrapPayload, HostFilterId, LOCAL_HOST_ID, NewAgentPayload, ProjectCreatePayload,
@@ -827,6 +828,10 @@ async fn agents_view_preferences_update_notifies_and_persists_to_bootstrap() {
     assert!(bootstrap_snapshot.tags.system.is_empty());
     assert!(bootstrap_snapshot.tags.system_assignments.is_empty());
     assert!(bootstrap_snapshot.pins.pinned.is_empty());
+    assert_eq!(
+        bootstrap_snapshot.sidebar,
+        AgentsSidebarPreferences::default()
+    );
 
     let filters = AgentsViewFilters {
         host_ids: vec![HostFilterId(LOCAL_HOST_ID.to_owned())],
@@ -864,6 +869,41 @@ async fn agents_view_preferences_update_notifies_and_persists_to_bootstrap() {
             .expect("fresh bootstrap preferences")
             .preferences,
         notify.snapshot.preferences
+    );
+}
+
+#[tokio::test]
+async fn agents_sidebar_preferences_update_notifies_and_persists_to_bootstrap() {
+    let mut fixture = Fixture::new().await;
+    let sidebar = AgentsSidebarPreferences {
+        hide_inactive: true,
+        hide_sub_agents: true,
+        project_visibility: AgentsSidebarProjectVisibility::CurrentProjectOnly,
+    };
+
+    send_set_agents_view_preferences(
+        &mut fixture.client,
+        AgentsViewPreferencesUpdate::SetSidebarPreferences {
+            sidebar: sidebar.clone(),
+        },
+    )
+    .await;
+
+    let notify = expect_preferences_notify(&mut fixture.client, "sidebar preferences notify").await;
+    assert_eq!(notify.snapshot.sidebar, sidebar);
+    assert_eq!(
+        notify.snapshot.preferences,
+        AgentsViewPreferences::default(),
+        "sidebar update must not mutate existing view query preferences"
+    );
+
+    let (_fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert_eq!(
+        fresh_bootstrap
+            .agents_view_preferences
+            .expect("fresh bootstrap preferences")
+            .sidebar,
+        sidebar
     );
 }
 
@@ -2106,6 +2146,7 @@ async fn agents_view_preferences_smart_views_migrates_legacy_store() {
     assert_eq!(snapshot.preferences.group_mode, AgentGroupMode::Status);
     assert_eq!(snapshot.preferences.density, AgentListDensity::Compact);
     assert!(snapshot.preferences.hide_finished);
+    assert_eq!(snapshot.sidebar, AgentsSidebarPreferences::default());
     assert_built_in_smart_views(&snapshot.smart_views);
     assert!(snapshot.smart_views.user.is_empty());
     assert_eq!(
@@ -2129,7 +2170,7 @@ async fn agents_view_preferences_smart_views_migrates_legacy_store() {
     assert!(
         std::fs::read_to_string(preferences_path)
             .expect("read migrated preferences store")
-            .contains("\"version\": 4")
+            .contains("\"version\": 5")
     );
 }
 
@@ -2207,6 +2248,7 @@ async fn agents_view_preferences_smart_views_v2_store_migrates_to_v3_with_user_v
     assert_eq!(view.sort_mode, AgentSortMode::NameAsc);
     assert_eq!(view.group_mode, AgentGroupMode::Backend);
     assert!(view.hide_finished);
+    assert_eq!(snapshot.sidebar, AgentsSidebarPreferences::default());
     assert!(snapshot.tags.manual.is_empty());
     assert!(snapshot.tags.manual_assignments.is_empty());
     assert!(snapshot.tags.system.is_empty());
@@ -2232,7 +2274,7 @@ async fn agents_view_preferences_smart_views_v2_store_migrates_to_v3_with_user_v
     assert!(
         std::fs::read_to_string(preferences_path)
             .expect("read migrated preferences store")
-            .contains("\"version\": 4")
+            .contains("\"version\": 5")
     );
 }
 

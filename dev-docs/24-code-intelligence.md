@@ -78,9 +78,10 @@ Code intelligence is part of a project, so it uses the existing
 
 New frames are `CodeIntel*` `FrameKind` variants. They are **not** `Lsp*` —
 the wire protocol is about Tyde's code-intelligence model, not about LSP, which
-is an implementation detail of one provider. Adding these variants bumps
-`PROTOCOL_VERSION` from its current value `13` to `14`
-(`protocol/src/types.rs:10`).
+is an implementation detail of one provider. The project-level
+`code_intel_overview` footer contract was introduced in protocol version 22 and
+remains current under protocol version 23, which adds unrelated
+server-owned Agents sidebar preferences and agent activity stats frames.
 
 **Positions on the wire are byte offsets.** This matches
 `ProjectSearchMatch.ranges` (byte offsets, `protocol/src/types.rs:2607`) and the
@@ -254,6 +255,62 @@ pub struct CodeIntelStatusPayload {
 }
 ```
 
+Files-panel status uses a separate **project-stream overview** frame instead of
+asking the frontend to infer project health from file-scoped statuses. The
+overview is full-replacement state, emitted on `/project/<project_id>` after
+`ProjectBootstrap` and after each provider status change.
+
+```rust
+pub struct CodeIntelOverviewPayload {
+    pub roots: Vec<CodeIntelRootOverview>,
+    pub summary: CodeIntelOverviewSummary,
+}
+
+pub struct CodeIntelRootOverview {
+    pub root: ProjectRootPath,
+    pub providers: Vec<CodeIntelProviderStatus>,
+}
+
+pub struct CodeIntelProviderStatus {
+    pub provider: CodeIntelProviderId,
+    pub language: CodeIntelLanguageId,
+    pub state: CodeIntelState,
+    pub resource_mode: CodeIntelResourceMode,
+    pub work_done: Option<u32>,
+    pub total_work: Option<u32>,
+    pub message: Option<String>,
+}
+
+pub enum CodeIntelOverviewHeadline {
+    NotStarted,
+    Starting,
+    Indexing,
+    Ready,
+    Unavailable,
+    Failed,
+}
+
+pub struct CodeIntelOverviewSummary {
+    pub headline: CodeIntelOverviewHeadline,
+    pub ready: u32,
+    pub indexing: u32,
+    pub starting: u32,
+    pub unavailable: u32,
+    pub failed: u32,
+    pub message: Option<String>,
+}
+```
+
+Lazy v1 behavior is explicit: subscribing to a project does **not** start any
+language server. The initial overview contains every project root with empty
+`providers` and a server-authored summary message such as "No language server
+running — open a file to index"; its summary headline is
+`CodeIntelOverviewHeadline::NotStarted`. Opening a supported file starts the
+provider for that root/language and the server replaces the overview as it moves
+through `Starting` → `Indexing` → `Ready`, or to `Unavailable` / `Failed`.
+File-scoped `CodeIntelStatusPayload.state` continues to use `CodeIntelState`;
+only the overview summary uses the footer-specific headline enum.
+
 `work_done` / `total_work` are mapped from rust-analyzer's `$/progress`
 notifications. `resource_mode` reflects host capability — the **only** host
 variable in this design (local == remote otherwise). While the provider is
@@ -327,6 +384,7 @@ pub struct ByteRange {
 
 | Frame | Purpose |
 |-------|---------|
+| `code_intel_overview` | full replacement project/root/provider status for Files footer (§3) |
 | `code_intel_status` | typed scoped status (§3) |
 | `code_intel_file_model` | the pushed semantic model (occurrences + targets) |
 | `code_intel_navigate_result` | answer to a miss-fill `code_intel_navigate` |
@@ -577,9 +635,11 @@ provider actor (owns one subprocess for this root)
     rust_analyzer.rs  →  subprocess.rs (group spawn)  →  lsp_codec.rs (Content-Length)
 ```
 
-- The **project-stream actor** owns the version counter and routes `CodeIntel*`
-  input frames to the project's thin router. All `CodeIntel*` output frames flow
-  back out on the same `/project/<project_id>` stream.
+- The **project-stream actor** owns the version counter and the full-replacement
+  `CodeIntelOverviewPayload`. It routes `CodeIntel*` input frames to the
+  project's thin router and fans out overview replacements to every project
+  subscriber. All `CodeIntel*` output frames flow back out on the same
+  `/project/<project_id>` stream.
 - The **project router** is plumbing only — it holds no provider state, picks
   the target root from the frame's `ProjectPath`, and delegates to that root's
   `CodeIntelService` actor.
@@ -648,7 +708,7 @@ The frontend renders pushed state. It never asks "what is a definition."
 Each milestone is independently shippable.
 
 - **M0 — Protocol + skeleton.** `CodeIntel*` `FrameKind` variants, payloads, and
-  serde; bump `PROTOCOL_VERSION` `13` → `14`; **introduce** the
+  serde; **introduce** the
   `ProjectFileVersion(u64)` newtype **and add a `version` field to
   `ProjectFileContentsPayload`** (neither exists today), with the centralized
   per-file counter in the project-stream actor; the per-root `CodeIntelService`

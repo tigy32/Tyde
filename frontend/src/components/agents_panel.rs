@@ -6,7 +6,8 @@ use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
     AgentAnnotationTarget, AgentGroup, AgentGroupId, AgentGroupsSnapshot, AgentGroupsUpdate,
-    AgentId, FrameKind, HostFilterId, ProjectId, SetAgentNamePayload,
+    AgentId, AgentsSidebarPreferences, AgentsSidebarProjectVisibility, AgentsViewPreferencesUpdate,
+    FrameKind, HostFilterId, ProjectId, SetAgentNamePayload,
 };
 
 use crate::send::{close_agent, compact_agent, send_frame};
@@ -51,6 +52,59 @@ pub fn agent_passes_filters(
         return false;
     }
     true
+}
+
+/// Resolve the effective "show other projects" value from the server-owned
+/// project-visibility preference and the active project. `ContextualDefault`
+/// keeps today's behavior (Home shows all, in-project shows current only); the
+/// two pinned modes are absolute everywhere.
+fn effective_show_other_projects(
+    visibility: AgentsSidebarProjectVisibility,
+    active_project: Option<&ActiveProjectRef>,
+) -> bool {
+    match visibility {
+        AgentsSidebarProjectVisibility::ContextualDefault => active_project.is_none(),
+        AgentsSidebarProjectVisibility::AllProjects => true,
+        AgentsSidebarProjectVisibility::CurrentProjectOnly => false,
+    }
+}
+
+/// Project the server-owned sidebar preferences into the predicate input the
+/// filter memo consumes. This is a pure derivation, not stored state.
+fn sidebar_to_panel_filters(
+    sidebar: &AgentsSidebarPreferences,
+    active_project: Option<&ActiveProjectRef>,
+) -> AgentsPanelFilters {
+    AgentsPanelFilters {
+        hide_sub_agents: sidebar.hide_sub_agents,
+        hide_inactive: sidebar.hide_inactive,
+        show_other_projects: effective_show_other_projects(
+            sidebar.project_visibility,
+            active_project,
+        ),
+    }
+}
+
+/// Install the optimistic overlay for the new sidebar preferences, then send the
+/// durable `SetSidebarPreferences` update to the primary local host. The server
+/// fans out a full snapshot that reconciles (drops) the overlay.
+fn persist_sidebar(state: &AppState, sidebar: AgentsSidebarPreferences) {
+    state.set_agents_view_overlay(|overlay| overlay.sidebar = Some(sidebar.clone()));
+    let Some(host_id) = state.agents_view_preferences_host.get_untracked() else {
+        log::warn!("sidebar preference change with no primary host; overlay only");
+        return;
+    };
+    let Some(stream) = state.host_stream_untracked(&host_id) else {
+        log::warn!("primary host {host_id} has no stream; sidebar preference overlay only");
+        return;
+    };
+    let update = AgentsViewPreferencesUpdate::SetSidebarPreferences { sidebar };
+    spawn_local(async move {
+        if let Err(error) = crate::send::set_agents_view_preferences(&host_id, stream, update).await
+        {
+            log::error!("failed to send sidebar preference update: {error}");
+        }
+    });
 }
 
 pub(crate) fn backend_class(kind: protocol::BackendKind) -> &'static str {
@@ -746,37 +800,18 @@ pub fn AgentsPanel() -> impl IntoView {
         }
     });
 
-    // Sidebar-only view toggles (hide sub-agents / inactive / other projects)
-    // are ephemeral interaction state, like the search box — they have no
-    // server-owned representation. This per-project override map is
-    // component-local: it is created fresh on every mount and is never stored
-    // in `AppState` or pruned on host cleanup, so unlike the removed durable
-    // `agents_panel_filters` signal it cannot be a flicker source. It exists
-    // only to restore per-project reactivity — `current_filters` re-derives
-    // through `active_project`, so switching projects re-applies that project's
-    // defaults while remembering in-session overrides.
-    let local_filters: RwSignal<HashMap<Option<ActiveProjectRef>, AgentsPanelFilters>> =
-        RwSignal::new(HashMap::new());
+    // Sidebar selectors (hide inactive / hide sub-agents / project visibility)
+    // are server-owned preferences (dev-docs/26 §12.1). The effective predicate
+    // input is derived per render from the durable snapshot plus the optimistic
+    // overlay (`effective_agents_sidebar_preferences`) and the active project —
+    // no component-local persistence, so it can never become a second source of
+    // truth or a flicker source.
     let filters_state = state.clone();
     let current_filters = Memo::new(move |_| {
+        let sidebar = filters_state.effective_agents_sidebar_preferences();
         let active = filters_state.active_project.get();
-        local_filters
-            .get()
-            .get(&active)
-            .cloned()
-            .unwrap_or_else(|| AgentsPanelFilters::defaults_for(active.as_ref()))
+        sidebar_to_panel_filters(&sidebar, active.as_ref())
     });
-
-    let update_state = state.clone();
-    let update_filters = move |mutate: Box<dyn FnOnce(&mut AgentsPanelFilters)>| {
-        let active = update_state.active_project.get_untracked();
-        local_filters.update(|map| {
-            let entry = map
-                .entry(active.clone())
-                .or_insert_with(|| AgentsPanelFilters::defaults_for(active.as_ref()));
-            mutate(entry);
-        });
-    };
 
     let filter_state = state.clone();
     let filtered_agents = Memo::new(move |_| {
@@ -826,22 +861,41 @@ pub fn AgentsPanel() -> impl IntoView {
         search.set(val);
     };
 
-    let toggle_inactive = move |_| {
-        update_filters(Box::new(|f: &mut AgentsPanelFilters| {
-            f.hide_inactive = !f.hide_inactive;
-        }));
+    let toggle_inactive = {
+        let state = state.clone();
+        move |_| {
+            let mut sidebar = state.effective_agents_sidebar_preferences();
+            sidebar.hide_inactive = !sidebar.hide_inactive;
+            persist_sidebar(&state, sidebar);
+        }
     };
 
-    let toggle_sub = move |_| {
-        update_filters(Box::new(|f: &mut AgentsPanelFilters| {
-            f.hide_sub_agents = !f.hide_sub_agents;
-        }));
+    let toggle_sub = {
+        let state = state.clone();
+        move |_| {
+            let mut sidebar = state.effective_agents_sidebar_preferences();
+            sidebar.hide_sub_agents = !sidebar.hide_sub_agents;
+            persist_sidebar(&state, sidebar);
+        }
     };
 
-    let toggle_other_projects = move |_| {
-        update_filters(Box::new(|f: &mut AgentsPanelFilters| {
-            f.show_other_projects = !f.show_other_projects;
-        }));
+    // The button reflects the *effective* visibility; a click pins an explicit
+    // durable value (the opposite of what is shown) rather than toggling a
+    // local bool — so the choice persists across project switches via the
+    // server snapshot.
+    let toggle_other_projects = {
+        let state = state.clone();
+        move |_| {
+            let active = state.active_project.get_untracked();
+            let mut sidebar = state.effective_agents_sidebar_preferences();
+            sidebar.project_visibility =
+                if effective_show_other_projects(sidebar.project_visibility, active.as_ref()) {
+                    AgentsSidebarProjectVisibility::CurrentProjectOnly
+                } else {
+                    AgentsSidebarProjectVisibility::AllProjects
+                };
+            persist_sidebar(&state, sidebar);
+        }
     };
 
     view! {
@@ -2172,7 +2226,7 @@ mod wasm_tests {
             .into_iter()
             .filter(|(kind, _, _)| kind == "set_agent_groups")
             .map(|(_, payload, _)| payload["update"].clone())
-            .last()
+            .next_back()
             .expect("expected a set_agent_groups frame")
     }
 
@@ -2361,6 +2415,7 @@ mod wasm_tests {
             "local",
             AgentsViewPreferencesSnapshot {
                 preferences: AgentsViewPreferences::default(),
+                sidebar: Default::default(),
                 load_error: None,
                 smart_views: Default::default(),
                 tags: Default::default(),
@@ -3905,6 +3960,192 @@ mod wasm_tests {
         assert!(
             err.contains("team compaction aborted"),
             "fallback must use the team-level message, got {err:?}"
+        );
+    }
+
+    // ── Sidebar selector persistence (server-owned) ──────────────────────────
+
+    fn sidebar_snapshot(sidebar: AgentsSidebarPreferences) -> AgentsViewPreferencesSnapshot {
+        AgentsViewPreferencesSnapshot {
+            preferences: AgentsViewPreferences::default(),
+            sidebar,
+            load_error: None,
+            smart_views: Default::default(),
+            tags: Default::default(),
+            pins: Default::default(),
+            groups: Default::default(),
+        }
+    }
+
+    /// Prime an AppState as the primary local host with a server sidebar
+    /// preference snapshot, ready to mount the panel and drive selectors.
+    fn primed_sidebar_state(sidebar: AgentsSidebarPreferences) -> AppState {
+        let state = make_app_state("local");
+        state.apply_agents_view_snapshot("local", sidebar_snapshot(sidebar));
+        state
+    }
+
+    fn filter_button(container: &HtmlElement, label: &str) -> HtmlElement {
+        let buttons = container
+            .query_selector_all(".panel-filters button")
+            .unwrap();
+        for i in 0..buttons.length() {
+            let el = buttons.item(i).unwrap().dyn_into::<HtmlElement>().unwrap();
+            if el.text_content().unwrap_or_default().contains(label) {
+                return el;
+            }
+        }
+        panic!("filter button {label:?} not found");
+    }
+
+    fn button_active(container: &HtmlElement, label: &str) -> bool {
+        filter_button(container, label)
+            .class_name()
+            .contains("active")
+    }
+
+    /// The most recent `set_agents_view_preferences` update payload on the wire.
+    fn last_view_pref_update(calls: &js_sys::Array) -> JsonValue {
+        recorded_frames(calls)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "set_agents_view_preferences")
+            .map(|(_, payload, _)| payload["update"].clone())
+            .next_back()
+            .expect("expected a set_agents_view_preferences frame")
+    }
+
+    /// ContextualDefault: at Home the "Show other projects" selector reads as
+    /// effective-on; inside a project it reads as effective-off — all derived
+    /// from the server snapshot, with no component-local persistence.
+    #[wasm_bindgen_test]
+    async fn sidebar_contextual_default_reflects_active_project() {
+        let container = make_container();
+        let state = primed_sidebar_state(AgentsSidebarPreferences::default());
+        let _handle = mount_panel(&container, state.clone());
+        next_tick().await;
+
+        assert!(
+            button_active(&container, "Show other projects"),
+            "ContextualDefault at Home shows all projects (effective-on)"
+        );
+
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: "local".to_owned(),
+            project_id: ProjectId("p1".to_owned()),
+        }));
+        next_tick().await;
+        assert!(
+            !button_active(&container, "Show other projects"),
+            "ContextualDefault inside a project shows current only (effective-off)"
+        );
+    }
+
+    /// Clicking a selector pins an explicit durable value through the server
+    /// update path (`set_sidebar_preferences`) rather than mutating local state.
+    #[wasm_bindgen_test]
+    async fn sidebar_toggle_emits_typed_set_sidebar_preferences() {
+        let calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        // At Home, ContextualDefault is effective-on, so a click pins the
+        // opposite explicit value: current_project_only.
+        let state = primed_sidebar_state(AgentsSidebarPreferences::default());
+        let _handle = mount_panel(&container, state.clone());
+        next_tick().await;
+
+        filter_button(&container, "Show other projects").click();
+        next_tick().await;
+
+        let update = last_view_pref_update(&calls);
+        assert_eq!(
+            update["kind"], "set_sidebar_preferences",
+            "typed sidebar update emitted: {update}"
+        );
+        assert_eq!(
+            update["sidebar"]["project_visibility"], "current_project_only",
+            "click pins the explicit opposite of the effective value: {update}"
+        );
+        // Optimistic overlay flips the button immediately.
+        assert!(
+            !button_active(&container, "Show other projects"),
+            "overlay reflects the pinned current_project_only immediately"
+        );
+    }
+
+    /// A pinned selector persists across active-project switches (the overlay is
+    /// not project-keyed), and an authoritative server snapshot then carries the
+    /// same value so it stays after the overlay is dropped.
+    #[wasm_bindgen_test]
+    async fn sidebar_hide_inactive_persists_across_project_switch_and_snapshot() {
+        let _calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = primed_sidebar_state(AgentsSidebarPreferences::default());
+        let _handle = mount_panel(&container, state.clone());
+        next_tick().await;
+        assert!(!button_active(&container, "Hide inactive"));
+
+        filter_button(&container, "Hide inactive").click();
+        next_tick().await;
+        assert!(
+            button_active(&container, "Hide inactive"),
+            "overlay reflects hide_inactive immediately"
+        );
+
+        // Switch project: the selector is server-owned, not project-local, so it
+        // stays pinned.
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: "local".to_owned(),
+            project_id: ProjectId("p1".to_owned()),
+        }));
+        next_tick().await;
+        assert!(
+            button_active(&container, "Hide inactive"),
+            "pinned hide_inactive survives a project switch"
+        );
+
+        // Authoritative snapshot confirms the value and drops the overlay.
+        state.apply_agents_view_snapshot(
+            "local",
+            sidebar_snapshot(AgentsSidebarPreferences {
+                hide_inactive: true,
+                ..Default::default()
+            }),
+        );
+        next_tick().await;
+        assert!(
+            button_active(&container, "Hide inactive"),
+            "server snapshot keeps hide_inactive after the overlay is reconciled"
+        );
+    }
+
+    /// An authoritative server snapshot overrides an in-flight optimistic
+    /// overlay even when the server value disagrees.
+    #[wasm_bindgen_test]
+    async fn sidebar_server_snapshot_overrides_overlay() {
+        let _calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = primed_sidebar_state(AgentsSidebarPreferences::default());
+        let _handle = mount_panel(&container, state.clone());
+        next_tick().await;
+
+        filter_button(&container, "Hide sub-agents").click();
+        next_tick().await;
+        assert!(
+            button_active(&container, "Hide sub-agents"),
+            "overlay turns hide_sub_agents on optimistically"
+        );
+
+        // Server says it is off; the snapshot wins and drops the overlay.
+        state.apply_agents_view_snapshot(
+            "local",
+            sidebar_snapshot(AgentsSidebarPreferences {
+                hide_sub_agents: false,
+                ..Default::default()
+            }),
+        );
+        next_tick().await;
+        assert!(
+            !button_active(&container, "Hide sub-agents"),
+            "server snapshot overrides the optimistic overlay"
         );
     }
 }

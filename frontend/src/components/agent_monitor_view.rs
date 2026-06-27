@@ -3071,6 +3071,7 @@ mod wasm_tests {
     fn snapshot(prefs: AgentsViewPreferences) -> AgentsViewPreferencesSnapshot {
         AgentsViewPreferencesSnapshot {
             preferences: prefs,
+            sidebar: Default::default(),
             load_error: None,
             smart_views: Default::default(),
             tags: Default::default(),
@@ -3397,6 +3398,7 @@ mod wasm_tests {
     ) -> AgentsViewPreferencesSnapshot {
         AgentsViewPreferencesSnapshot {
             preferences: prefs,
+            sidebar: Default::default(),
             load_error: None,
             smart_views: views,
             tags: Default::default(),
@@ -3765,6 +3767,7 @@ mod wasm_tests {
     ) -> AgentsViewPreferencesSnapshot {
         AgentsViewPreferencesSnapshot {
             preferences: prefs,
+            sidebar: Default::default(),
             load_error: None,
             smart_views: Default::default(),
             tags,

@@ -138,6 +138,9 @@ export const EXAMPLE_MANIFEST = {
       path: "/tyde/v0.8.19-beta.2/",
       entry: "/tyde/v0.8.19-beta.2/tyde-mobile.js",
       integrity: "sha384-" + "A".repeat(64),
+      // Matches the REAL_* fixture QRs (protocol_version 13) so the loader's
+      // QR↔bundle protocol cross-check passes on the happy path.
+      protocolVersion: 13,
       artifacts: {
         "/tyde/v0.8.19-beta.2/tyde-mobile_bg.wasm": "sha384-" + "C".repeat(64),
       },
@@ -146,6 +149,7 @@ export const EXAMPLE_MANIFEST = {
       path: "/tyde/v0.8.19/",
       entry: "/tyde/v0.8.19/tyde-mobile.js",
       integrity: "sha384-" + "B".repeat(64),
+      protocolVersion: 13,
       artifacts: {
         "/tyde/v0.8.19/tyde-mobile_bg.wasm": "sha384-" + "D".repeat(64),
       },

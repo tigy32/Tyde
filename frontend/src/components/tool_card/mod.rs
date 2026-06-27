@@ -16,13 +16,14 @@ use std::sync::Arc;
 
 use leptos::prelude::*;
 use protocol::{
-    AgentActivitySummary, AgentActivitySummaryStaleReason, AgentActivitySummaryState,
-    AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind, SubAgentProgress,
-    ToolExecutionResult, ToolProgressData, ToolProgressUpdate, ToolRequestType, WorkflowRunState,
-    WorkflowRunStatus,
+    AgentActivityStats, AgentActivitySummary, AgentActivitySummaryStaleReason,
+    AgentActivitySummaryState, AgentControlAgentRef, AgentControlProgress,
+    AgentControlProgressKind, SubAgentProgress, ToolExecutionResult, ToolProgressData,
+    ToolProgressUpdate, ToolRequestType, WorkflowRunState, WorkflowRunStatus,
 };
 use wasm_bindgen::JsCast;
 
+use crate::components::chat_message::token_badge_data;
 use crate::components::workflow_view::{WorkflowRunPanel, run_status_label};
 use crate::state::{
     ActiveAgentRef, AppState, StreamingToolRequest, TabContent, ToolCallId, ToolOutputMode,
@@ -735,6 +736,11 @@ fn AgentControlAgentRow(
     // `AppState::agents` so it re-renders when an `AgentActivitySummary` frame
     // updates the record. The frontend renders this state verbatim — it never
     // infers a summary from streaming text or tool cards.
+    //
+    // Only the Await card surfaces the summary/stats. The Spawn card shares this
+    // row but shows the live streaming preview instead, so rendering the same
+    // summary/stats in both would duplicate one agent's progress across cards.
+    let is_await = progress_kind == AgentControlProgressKind::Await;
     let activity_summary = Signal::derive({
         let state = state.clone();
         let agent_id = agent_id.clone();
@@ -746,6 +752,25 @@ fn AgentControlAgentRow(
                     .find(|agent| agent.host_id == parent.host_id && agent.agent_id == agent_id)
                     .map(|agent| agent.activity_summary.clone())
             })
+        }
+    });
+
+    // Server-owned activity stats (await only): running tool-call count, token
+    // usage, and the last output line. Looked up reactively by the owning
+    // `(host_id, agent_id)` — the child agent lives on the parent chat's host —
+    // never derived from chat rows or streaming text.
+    let activity_stats: Signal<Option<AgentActivityStats>> = Signal::derive({
+        let state = state.clone();
+        let agent_id = agent_id.clone();
+        move || {
+            let parent = parent_ref.get()?;
+            let key = ActiveAgentRef {
+                host_id: parent.host_id,
+                agent_id: agent_id.clone(),
+            };
+            state
+                .agent_activity_stats
+                .with(|map| map.get(&key).cloned())
         }
     });
 
@@ -775,18 +800,97 @@ fn AgentControlAgentRow(
                 </span>
             </div>
             <button class="tool-live-link" on:click=on_open>"Open agent"</button>
-            {move || preview.get().map(|text| view! {
-                <div class="tool-live-agent-preview">{text}</div>
-            })}
-            {move || activity_summary.get().and_then(agent_activity_summary_view)}
+            // Spawn shows the live streaming preview. The Await card derives its
+            // output line from server stats instead (below), never streaming.
+            {move || {
+                (!is_await)
+                    .then(|| {
+                        preview.get().map(|text| {
+                            view! { <div class="tool-live-agent-preview">{text}</div> }
+                        })
+                    })
+                    .flatten()
+            }}
+            // Await: summary XOR output. When summaries are enabled (any state
+            // other than `Disabled`) the card shows only the summary/status and
+            // never the output line. Only `Disabled` surfaces the server-owned
+            // last output line.
+            {move || {
+                is_await
+                    .then(|| match activity_summary.get().unwrap_or_default() {
+                        AgentActivitySummaryState::Disabled => activity_stats
+                            .get()
+                            .and_then(|stats| stats.last_output_line)
+                            .filter(|line| !line.trim().is_empty())
+                            .map(|line| {
+                                view! { <div class="tool-live-agent-output">{line}</div> }
+                                    .into_any()
+                            }),
+                        enabled => agent_activity_summary_view(enabled),
+                    })
+                    .flatten()
+            }}
+            // Await: stats line (tool calls + tokens), independent of the
+            // summary/output choice above. Suppressed while everything is zero
+            // so a just-started agent doesn't show "0 tool calls · ↑0 · ↓0".
+            {move || {
+                is_await
+                    .then(|| {
+                        activity_stats
+                            .get()
+                            .filter(stats_has_content)
+                            .map(agent_control_stats_line)
+                    })
+                    .flatten()
+            }}
         </div>
     }
 }
 
-/// Render the server-owned activity summary for an agent row, or `None` when
-/// there is nothing to show (disabled / empty / a pending state with no prior
-/// text). The freshness/stale/error framing comes straight from the server
-/// enum; the frontend only formats the timestamp for display.
+/// Whether activity stats carry anything worth showing. Used to suppress an
+/// all-zero stats line (no tool calls and no token usage yet).
+fn stats_has_content(stats: &AgentActivityStats) -> bool {
+    let tokens = &stats.token_usage;
+    stats.tool_calls > 0
+        || tokens.input_tokens > 0
+        || tokens.output_tokens > 0
+        || tokens.total_tokens > 0
+        || tokens.cached_prompt_tokens.unwrap_or(0) > 0
+        || tokens.cache_creation_input_tokens.unwrap_or(0) > 0
+        || tokens.reasoning_tokens.unwrap_or(0) > 0
+}
+
+/// Render the await card's server-owned stats line: the running tool-call count
+/// and token usage, formatted with the shared token badge helper so it reads
+/// identically to the chat token UI (`↑input (cached) · ↓output (reasoning)`).
+fn agent_control_stats_line(stats: AgentActivityStats) -> AnyView {
+    let (input_text, output_text, tooltip) = token_badge_data(&stats.token_usage);
+    let tool_label = if stats.tool_calls == 1 {
+        "1 tool call".to_owned()
+    } else {
+        format!("{} tool calls", stats.tool_calls)
+    };
+    view! {
+        <div class="tool-live-agent-stats" title=tooltip>
+            <span class="tool-live-agent-stats-tools">{tool_label}</span>
+            <span class="token-sep">"\u{00b7}"</span>
+            <span class="token-stat token-stat-input">{input_text}</span>
+            <span class="token-sep">"\u{00b7}"</span>
+            <span class="token-stat token-stat-output">{output_text}</span>
+        </div>
+    }
+    .into_any()
+}
+
+/// Render the server-owned activity summary/status for an enabled agent row.
+/// Returns `Some` for every enabled state that has something to show — summary
+/// text (`Fresh`, `Stale`, `Pending`/`Error` with a previous summary) or a
+/// status placeholder (`Pending` → "summarizing…", `Error` → "summary
+/// unavailable"). Only `Disabled` and `Empty` return `None`. Crucially, when
+/// summaries are enabled the await card shows this and *never* the output line,
+/// so a no-text state must surface a status here rather than leaking the output.
+/// The freshness/stale/error framing comes straight from the server enum; the
+/// frontend only formats the timestamp for display.
 fn agent_activity_summary_view(state: AgentActivitySummaryState) -> Option<AnyView> {
     match state {
         AgentActivitySummaryState::Disabled | AgentActivitySummaryState::Empty => None,
@@ -839,8 +943,10 @@ fn agent_activity_summary_view(state: AgentActivitySummaryState) -> Option<AnyVi
         AgentActivitySummaryState::Error { previous, .. } => Some(
             view! {
                 <div class="tool-live-agent-summary">
-                    {previous.map(|summary| view! {
-                        <span class="tool-live-agent-summary-text">{summary.text}</span>
+                    {previous.map(|summary| {
+                        view! {
+                            <span class="tool-live-agent-summary-text">{summary.text}</span>
+                        }
                     })}
                     <span class="tool-live-agent-summary-meta error">"summary unavailable"</span>
                 </div>
@@ -1542,6 +1648,52 @@ mod live_card_wasm_tests {
             .unwrap_or_default()
     }
 
+    fn activity_stats(
+        last_output_line: Option<&str>,
+        tool_calls: u64,
+        token_usage: protocol::TokenUsage,
+    ) -> protocol::AgentActivityStats {
+        protocol::AgentActivityStats {
+            last_output_line: last_output_line.map(|s| s.to_owned()),
+            tool_calls,
+            token_usage,
+            source_through_seq: None,
+        }
+    }
+
+    fn token_usage(input: u64, cached: u64, output: u64, reasoning: u64) -> protocol::TokenUsage {
+        protocol::TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            cached_prompt_tokens: (cached > 0).then_some(cached),
+            cache_creation_input_tokens: None,
+            reasoning_tokens: (reasoning > 0).then_some(reasoning),
+        }
+    }
+
+    fn seed_stats(state: &AppState, agent_id: &str, stats: protocol::AgentActivityStats) {
+        // Child agents in these fixtures live on the parent chat's host.
+        seed_stats_on_host(state, "host-1", agent_id, stats);
+    }
+
+    fn seed_stats_on_host(
+        state: &AppState,
+        host_id: &str,
+        agent_id: &str,
+        stats: protocol::AgentActivityStats,
+    ) {
+        state.agent_activity_stats.update(|map| {
+            map.insert(
+                ActiveAgentRef {
+                    host_id: host_id.to_owned(),
+                    agent_id: AgentId(agent_id.to_owned()),
+                },
+                stats,
+            );
+        });
+    }
+
     fn workflow_state(status: WorkflowRunStatus) -> WorkflowRunState {
         WorkflowRunState {
             workflow_name: "wfprobe".to_owned(),
@@ -1735,9 +1887,21 @@ mod live_card_wasm_tests {
         state.agent_turn_active.update(|map| {
             map.insert(agent_id.clone(), true);
         });
+        // The await card's output line is server-owned (stats.last_output_line),
+        // not derived from streaming text. Seed streaming too to prove the card
+        // ignores it for the output line.
         state.streaming_text.update(|map| {
-            map.insert(agent_id, streaming_state("Still finishing follow-up work"));
+            map.insert(agent_id, streaming_state("raw streaming should be ignored"));
         });
+        seed_stats(
+            &state,
+            "agent-sub",
+            activity_stats(
+                Some("Still finishing follow-up work"),
+                0,
+                token_usage(0, 0, 0, 0),
+            ),
+        );
         next_tick().await;
 
         let body = text(&container);
@@ -1747,7 +1911,11 @@ mod live_card_wasm_tests {
         );
         assert!(
             body.contains("Still finishing follow-up work"),
-            "awaited agent preview remains live: {body}"
+            "awaited output line comes from server stats: {body}"
+        );
+        assert!(
+            !body.contains("raw streaming should be ignored"),
+            "await card must not derive its output from streaming text: {body}"
         );
         assert!(
             body.contains("Running"),
@@ -1761,9 +1929,10 @@ mod live_card_wasm_tests {
     }
 
     /// The await-agents card surfaces the server-owned activity summary so the
-    /// user can glance at "what is this agent doing?". The summary text, the
-    /// pending hint, and the disabled (render-nothing) state all come straight
-    /// from `AgentInfo.activity_summary` — the frontend never infers them.
+    /// user can glance at "what is this agent doing?". A summary with text shows
+    /// verbatim; an enabled no-text state shows a status placeholder and NEVER
+    /// the output line; only `Disabled` surfaces the server output line (summary
+    /// XOR output). The frontend never infers either.
     #[wasm_bindgen_test]
     async fn agent_control_await_card_renders_server_activity_summary() {
         let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
@@ -1796,7 +1965,14 @@ mod live_card_wasm_tests {
             "fresh summary shows a freshness label: {body}"
         );
 
-        // Pending with no previous: a subtle summarizing hint, no stale text.
+        // Pending with no previous: summaries are enabled, so the card shows a
+        // status placeholder and must NOT show the output line, even though a
+        // server output line exists.
+        seed_stats(
+            &state,
+            "agent-sub",
+            activity_stats(Some("Running cargo test"), 0, token_usage(0, 0, 0, 0)),
+        );
         state.agents.update(|agents| {
             if let Some(agent) = agents.iter_mut().find(|agent| agent.agent_id == agent_id) {
                 agent.activity_summary = AgentActivitySummaryState::Pending {
@@ -1809,14 +1985,18 @@ mod live_card_wasm_tests {
         let body = text(&container);
         assert!(
             body.contains("summarizing"),
-            "pending state shows a summarizing hint: {body}"
+            "pending-without-text shows a summarizing status: {body}"
+        );
+        assert!(
+            !body.contains("Running cargo test"),
+            "enabled summaries must not show the output line: {body}"
         );
         assert!(
             !body.contains("Refactoring the auth module"),
             "no stale summary text once pending with no previous: {body}"
         );
 
-        // Disabled: nothing summary-related renders.
+        // Disabled: no summary renders; the server output line is what shows.
         state.agents.update(|agents| {
             if let Some(agent) = agents.iter_mut().find(|agent| agent.agent_id == agent_id) {
                 agent.activity_summary = AgentActivitySummaryState::Disabled;
@@ -1825,8 +2005,327 @@ mod live_card_wasm_tests {
         next_tick().await;
         let body = text(&container);
         assert!(
-            !body.contains("summarizing") && !body.contains("updated"),
+            !body.contains("updated") && !body.contains("Refactoring"),
             "disabled renders no summary line: {body}"
+        );
+        assert!(
+            body.contains("Running cargo test"),
+            "disabled summaries show the server output line: {body}"
+        );
+    }
+
+    /// Regression: the server-owned activity summary belongs to the Await card
+    /// only. With the same agent surfaced in both a Spawn and an Await card, the
+    /// summary text must appear exactly once — in Await, never in Spawn —
+    /// otherwise the spawn and await cards duplicate the same child summary.
+    #[wasm_bindgen_test]
+    async fn activity_summary_renders_in_await_card_not_spawn_card() {
+        const SUMMARY: &str = "Refactoring the auth module and adding tests";
+
+        fn fresh_summary_info() -> AgentInfo {
+            let mut info = agent_info("agent-sub", "Worker", true);
+            info.activity_summary = AgentActivitySummaryState::Fresh {
+                summary: AgentActivitySummary {
+                    text: SUMMARY.to_owned(),
+                    generated_at_ms: js_sys::Date::now() as u64,
+                    source_from_seq: Some(1),
+                    source_through_seq: Some(9),
+                },
+            };
+            info
+        }
+
+        let spawn_entry = completed_other_request("toolu_agent_control", "tyde_spawn_agent");
+        let (spawn_container, spawn_state) = mount_card(
+            spawn_entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Spawn)),
+        );
+        spawn_state
+            .agents
+            .update(|agents| agents.push(fresh_summary_info()));
+        next_tick().await;
+
+        let await_entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let (await_container, await_state) = mount_card(
+            await_entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+        );
+        await_state
+            .agents
+            .update(|agents| agents.push(fresh_summary_info()));
+        next_tick().await;
+
+        let spawn_body = text(&spawn_container);
+        let await_body = text(&await_container);
+        assert!(
+            !spawn_body.contains(SUMMARY),
+            "spawn card must not render the activity summary: {spawn_body}"
+        );
+        assert!(
+            await_body.contains(SUMMARY),
+            "await card must render the activity summary: {await_body}"
+        );
+
+        let total = spawn_body.matches(SUMMARY).count() + await_body.matches(SUMMARY).count();
+        assert_eq!(
+            total, 1,
+            "the same agent's summary must appear exactly once across spawn + await"
+        );
+    }
+
+    /// Summary XOR output: when an enabled summary has renderable text, the
+    /// await card shows the summary and NOT the server output line.
+    #[wasm_bindgen_test]
+    async fn await_summary_hides_output_line() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+        );
+        let mut info = agent_info("agent-sub", "Awaited Worker", true);
+        info.activity_summary = AgentActivitySummaryState::Fresh {
+            summary: AgentActivitySummary {
+                text: "Writing the migration".to_owned(),
+                generated_at_ms: js_sys::Date::now() as u64,
+                source_from_seq: Some(1),
+                source_through_seq: Some(9),
+            },
+        };
+        state.agents.update(|agents| agents.push(info));
+        seed_stats(
+            &state,
+            "agent-sub",
+            activity_stats(
+                Some("output line that must hide"),
+                3,
+                token_usage(0, 0, 0, 0),
+            ),
+        );
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("Writing the migration"),
+            "summary text shows: {body}"
+        );
+        assert!(
+            !body.contains("output line that must hide"),
+            "output line must be hidden while a summary has text: {body}"
+        );
+    }
+
+    /// Disabled summaries: the await card shows the server-owned output line, and
+    /// it comes from stats — not streaming text.
+    #[wasm_bindgen_test]
+    async fn await_disabled_summary_shows_server_output_not_streaming() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+        );
+        let mut info = agent_info("agent-sub", "Awaited Worker", true);
+        info.activity_summary = AgentActivitySummaryState::Disabled;
+        state.agents.update(|agents| agents.push(info));
+        state.streaming_text.update(|map| {
+            map.insert(
+                AgentId("agent-sub".to_owned()),
+                streaming_state("streaming text not used"),
+            );
+        });
+        seed_stats(
+            &state,
+            "agent-sub",
+            activity_stats(Some("Compiling crate"), 1, token_usage(0, 0, 0, 0)),
+        );
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("Compiling crate"),
+            "disabled summary shows server output line: {body}"
+        );
+        assert!(
+            !body.contains("streaming text not used"),
+            "await output must not come from streaming text: {body}"
+        );
+    }
+
+    /// Enabled-but-empty summary: summaries are enabled, so the output line must
+    /// NOT show (summary XOR output). Replaces the earlier test that incorrectly
+    /// locked in output-fallback for enabled no-text states.
+    #[wasm_bindgen_test]
+    async fn await_enabled_empty_summary_hides_output() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+        );
+        let mut info = agent_info("agent-sub", "Awaited Worker", true);
+        info.activity_summary = AgentActivitySummaryState::Empty;
+        state.agents.update(|agents| agents.push(info));
+        seed_stats(
+            &state,
+            "agent-sub",
+            activity_stats(Some("Reading files"), 2, token_usage(0, 0, 0, 0)),
+        );
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            !body.contains("Reading files"),
+            "enabled (Empty) summary must not show the output line: {body}"
+        );
+    }
+
+    /// The await stats line renders the running tool-call count and token usage
+    /// using the shared token badge format (input/cached + output/reasoning),
+    /// independent of the summary/output choice.
+    #[wasm_bindgen_test]
+    async fn await_stats_line_renders_tool_calls_and_tokens() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+        );
+        let mut info = agent_info("agent-sub", "Awaited Worker", true);
+        // A summary with text is shown, but the stats line is independent.
+        info.activity_summary = AgentActivitySummaryState::Fresh {
+            summary: AgentActivitySummary {
+                text: "Doing work".to_owned(),
+                generated_at_ms: js_sys::Date::now() as u64,
+                source_from_seq: Some(1),
+                source_through_seq: Some(9),
+            },
+        };
+        state.agents.update(|agents| agents.push(info));
+        seed_stats(
+            &state,
+            "agent-sub",
+            activity_stats(None, 5, token_usage(1200, 300, 800, 64)),
+        );
+        next_tick().await;
+
+        let stats_line = container
+            .query_selector(".tool-live-agent-stats")
+            .expect("query stats")
+            .expect("await stats line present")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            stats_line.contains("5 tool calls"),
+            "stats line shows running tool-call count: {stats_line}"
+        );
+        assert!(
+            stats_line.contains("cached"),
+            "stats line shows cached-token detail like the chat token badge: {stats_line}"
+        );
+        assert!(
+            stats_line.contains("reasoning"),
+            "stats line shows reasoning-token detail like the chat token badge: {stats_line}"
+        );
+    }
+
+    /// The Spawn card shows neither the summary nor the stats line, even when the
+    /// server has both for the agent — that progress belongs to the Await card.
+    #[wasm_bindgen_test]
+    async fn spawn_card_shows_no_summary_or_stats() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_spawn_agent");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Spawn)),
+        );
+        let mut info = agent_info("agent-sub", "Worker", true);
+        info.activity_summary = AgentActivitySummaryState::Fresh {
+            summary: AgentActivitySummary {
+                text: "Summary should not appear in spawn".to_owned(),
+                generated_at_ms: js_sys::Date::now() as u64,
+                source_from_seq: Some(1),
+                source_through_seq: Some(9),
+            },
+        };
+        state.agents.update(|agents| agents.push(info));
+        seed_stats(
+            &state,
+            "agent-sub",
+            activity_stats(
+                Some("output should not appear in spawn"),
+                7,
+                token_usage(10, 0, 5, 0),
+            ),
+        );
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            !body.contains("Summary should not appear in spawn"),
+            "spawn card must not render the summary: {body}"
+        );
+        assert!(
+            !body.contains("7 tool calls"),
+            "spawn card must not render the stats line: {body}"
+        );
+        assert!(
+            container
+                .query_selector(".tool-live-agent-stats")
+                .expect("query stats")
+                .is_none(),
+            "spawn card must not contain a stats line element"
+        );
+    }
+
+    /// Stats are keyed by (host_id, agent_id): a stats frame for the same agent
+    /// id on a *different* host must not leak into this card. Only the matching
+    /// host's stats render.
+    #[wasm_bindgen_test]
+    async fn await_stats_are_scoped_to_owning_host() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+        );
+        // Summaries disabled so the output line is what surfaces.
+        let mut info = agent_info("agent-sub", "Awaited Worker", true);
+        info.activity_summary = AgentActivitySummaryState::Disabled;
+        state.agents.update(|agents| agents.push(info));
+
+        // Wrong-host stats for the same agent id must be ignored.
+        seed_stats_on_host(
+            &state,
+            "other-host",
+            "agent-sub",
+            activity_stats(
+                Some("stats from another host"),
+                9,
+                token_usage(50, 0, 50, 0),
+            ),
+        );
+        next_tick().await;
+        let body = text(&container);
+        assert!(
+            !body.contains("stats from another host"),
+            "stats for the same agent id on another host must not leak: {body}"
+        );
+        assert!(
+            !body.contains("9 tool calls"),
+            "wrong-host stats line must not render: {body}"
+        );
+
+        // Correct-host stats render.
+        seed_stats_on_host(
+            &state,
+            "host-1",
+            "agent-sub",
+            activity_stats(Some("stats from this host"), 4, token_usage(10, 0, 10, 0)),
+        );
+        next_tick().await;
+        let body = text(&container);
+        assert!(
+            body.contains("stats from this host"),
+            "owning-host output line renders: {body}"
+        );
+        assert!(
+            body.contains("4 tool calls"),
+            "owning-host stats line renders: {body}"
         );
     }
 }

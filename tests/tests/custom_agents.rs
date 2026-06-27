@@ -82,9 +82,11 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionList
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
+                | FrameKind::AgentActivityStats
                 | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
+                | FrameKind::CodeIntelOverview
                 | FrameKind::ProjectEvent
         ) {
             continue;
@@ -119,6 +121,7 @@ fn bootstrap_event_envelope(
         )),
         AgentBootstrapEvent::SessionSettings(_)
         | AgentBootstrapEvent::QueuedMessages(_)
+        | AgentBootstrapEvent::AgentActivityStats(_)
         | AgentBootstrapEvent::HasPriorHistory { .. } => None,
     }
     .map(|result| result.expect("serialize AgentBootstrap event"))
@@ -231,9 +234,11 @@ async fn expect_session_list(
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
+                | FrameKind::AgentActivityStats
                 | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
+                | FrameKind::CodeIntelOverview
                 | FrameKind::ProjectEvent
         ) {
             continue;
@@ -288,9 +293,11 @@ async fn wait_for_session_list(
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
+                | FrameKind::AgentActivityStats
                 | FrameKind::ProjectBootstrap
                 | FrameKind::ProjectGitStatus
                 | FrameKind::ProjectFileList
+                | FrameKind::CodeIntelOverview
         ) {
             continue;
         }

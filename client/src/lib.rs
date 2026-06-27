@@ -8,9 +8,10 @@ mod runtime;
 
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
-    AgentActivitySummaryPayload, AgentBootstrapPayload, AgentErrorPayload, AgentId,
-    AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
-    BackendSetupPayload, BrowseBootstrapPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
+    AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
+    AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
+    AgentsViewPreferencesNotifyPayload, BackendSetupPayload, BrowseBootstrapPayload,
+    CancelQueuedMessagePayload, CancelWorkflowPayload, CodeIntelOverviewPayload,
     CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
     CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload,
     FrameError, FrameKind, HelloPayload, HostBootstrapPayload, HostBrowseStartPayload,
@@ -1020,6 +1021,21 @@ impl Connection {
                         envelope.stream
                     );
                 }
+                FrameKind::AgentActivityStats => {
+                    let payload: AgentActivityStatsPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    let stream_parts = parse_agent_stream(&envelope.stream);
+                    assert_eq!(
+                        payload.agent_id, stream_parts.agent_id,
+                        "agent_activity_stats payload agent_id {} does not match stream {}",
+                        payload.agent_id, envelope.stream
+                    );
+                    assert!(
+                        self.outgoing_seq.contains_key(&envelope.stream),
+                        "AgentActivityStats on stream {} before NewAgent",
+                        envelope.stream
+                    );
+                }
                 FrameKind::ChatEvent => {
                     assert!(
                         self.outgoing_seq.contains_key(&envelope.stream),
@@ -1075,6 +1091,10 @@ impl Connection {
                 }
                 FrameKind::ProjectGitStatus => {
                     let _: ProjectGitStatusPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::CodeIntelOverview => {
+                    let _: CodeIntelOverviewPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::ProjectFileContents => {

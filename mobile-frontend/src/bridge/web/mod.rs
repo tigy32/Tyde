@@ -254,6 +254,19 @@ fn parse_and_validate(qr_uri: &str) -> Result<MobilePairingQrPayload, String> {
         ));
     }
     if payload.protocol_version != PROTOCOL_VERSION {
+        // Web self-heal: this PWA bundle's compiled protocol no longer matches
+        // the host. Ask the loader to forget the stale bundle and reboot into the
+        // version-matched one, carrying the raw pairing URI so it can re-pair
+        // without a second scan. The strict check is preserved — we STILL return
+        // Err so this bundle never proceeds; the matching bundle the loader boots
+        // re-runs this exact validation authoritatively.
+        //
+        // This self-heal exists only because THIS bundle ships the dispatch
+        // below. A bundle built before this change (e.g. an already-running older
+        // beta) has no such code, so it cannot retroactively self-heal — it just
+        // surfaces the returned error. The loader bounds repeated reboots so a
+        // misconfigured release can't spin forever.
+        request_loader_repair(qr_uri);
         return Err(format!(
             "unsupported Tyde protocol version {}, expected {}",
             payload.protocol_version, PROTOCOL_VERSION
@@ -262,6 +275,30 @@ fn parse_and_validate(qr_uri: &str) -> Result<MobilePairingQrPayload, String> {
     let _ = normalize_host_label(payload.host_label.clone())?;
     Ok(payload)
 }
+
+/// Dispatch the PWA loader's `tyde:repair-needed` event with the raw pairing URI
+/// so the loader forgets the stale bundle and reboots into the version-matched
+/// one (see `web/loader/loader.js` `onRepairNeeded`). Best-effort: any failure
+/// (no window, CustomEvent unavailable) just leaves the returned `Err` to be
+/// shown.
+///
+/// wasm-only: `web_sys::window()` is a wasm-bindgen import that panics on a
+/// native target, and `parse_and_validate` runs in native unit tests, so the
+/// non-wasm build gets a no-op stub.
+#[cfg(target_arch = "wasm32")]
+fn request_loader_repair(qr_uri: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let init = web_sys::CustomEventInit::new();
+    init.set_detail(&wasm_bindgen::JsValue::from_str(qr_uri));
+    if let Ok(event) = web_sys::CustomEvent::new_with_event_init_dict("tyde:repair-needed", &init) {
+        let _ = window.dispatch_event(&event);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn request_loader_repair(_qr_uri: &str) {}
 
 fn normalize_host_label(host_label: String) -> Result<String, String> {
     let trimmed = host_label.trim().to_owned();
@@ -367,5 +404,82 @@ mod wasm_tests {
         let payload = parse_and_validate(&wrapped).expect("https fragment pairing uri");
         assert_eq!(payload.host_label, "Living Room");
         assert_eq!(payload.protocol_version, PROTOCOL_VERSION);
+    }
+
+    fn mismatched_protocol_uri() -> String {
+        MobilePairingQrPayload::new(
+            PROTOCOL_VERSION + 1,
+            default_mobile_broker_endpoint(),
+            RoomId([3_u8; 16]),
+            PreSharedKey::from_slice(&[4_u8; 32]).expect("psk"),
+            "Living Room".to_owned(),
+        )
+        .to_uri()
+        .expect("encode pairing uri")
+    }
+
+    /// On a protocol mismatch the web bridge still rejects (strict check), AND it
+    /// dispatches the loader's `tyde:repair-needed` event carrying the raw URI so
+    /// the PWA loader can reboot into the version-matched bundle.
+    #[wasm_bindgen_test]
+    fn protocol_mismatch_rejects_and_dispatches_repair_needed() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use wasm_bindgen::JsCast;
+        use wasm_bindgen::closure::Closure;
+
+        let window = web_sys::window().expect("window");
+        let uri = mismatched_protocol_uri();
+
+        let captured: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let captured_cb = captured.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            if let Ok(custom) = event.dyn_into::<web_sys::CustomEvent>() {
+                *captured_cb.borrow_mut() = custom.detail().as_string();
+            }
+        });
+        window
+            .add_event_listener_with_callback("tyde:repair-needed", cb.as_ref().unchecked_ref())
+            .expect("add listener");
+
+        let result = parse_and_validate(&uri);
+        assert!(result.is_err(), "strict protocol check still rejects");
+
+        window
+            .remove_event_listener_with_callback("tyde:repair-needed", cb.as_ref().unchecked_ref())
+            .expect("remove listener");
+
+        assert_eq!(
+            captured.borrow().as_deref(),
+            Some(uri.as_str()),
+            "repair-needed must carry the raw pairing URI for the loader to reboot",
+        );
+    }
+
+    /// A protocol-matching URI must NOT dispatch repair-needed.
+    #[wasm_bindgen_test]
+    fn matching_protocol_does_not_dispatch_repair_needed() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use wasm_bindgen::JsCast;
+        use wasm_bindgen::closure::Closure;
+
+        let window = web_sys::window().expect("window");
+        let fired = Rc::new(RefCell::new(false));
+        let fired_cb = fired.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event: web_sys::Event| {
+            *fired_cb.borrow_mut() = true;
+        });
+        window
+            .add_event_listener_with_callback("tyde:repair-needed", cb.as_ref().unchecked_ref())
+            .expect("add listener");
+
+        let _ = parse_and_validate(&valid_uri()).expect("valid uri parses");
+
+        window
+            .remove_event_listener_with_callback("tyde:repair-needed", cb.as_ref().unchecked_ref())
+            .expect("remove listener");
+
+        assert!(!*fired.borrow(), "no repair on a matching protocol");
     }
 }

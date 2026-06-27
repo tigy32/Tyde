@@ -119,6 +119,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionList
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
+                | FrameKind::AgentActivityStats
         ) {
             continue;
         }
@@ -261,16 +262,54 @@ fn assert_bootstrap_prior_history_indicator(
     before_seq.expect("checked above")
 }
 
-fn assert_bootstrap_has_no_prior_chat(payload: &AgentBootstrapPayload) {
+fn assert_bootstrap_has_no_prior_history_indicator(payload: &AgentBootstrapPayload) {
     assert!(
-        payload.events.iter().all(|event| !matches!(
-            event,
-            AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(_))
-                | AgentBootstrapEvent::ChatEvent(ChatEvent::MessageMetadataUpdated(_))
-        )),
-        "AgentBootstrap must not include prior transcript ChatEvents: {:?}",
+        payload
+            .events
+            .iter()
+            .all(|event| !matches!(event, AgentBootstrapEvent::HasPriorHistory { .. })),
+        "AgentBootstrap should not include HasPriorHistory: {:?}",
         payload.events
     );
+}
+
+fn assert_bootstrap_tail_messages(
+    payload: &AgentBootstrapPayload,
+    expected_chronological: &[&str],
+) {
+    let contents = payload
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message)) => {
+                Some(message.content.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        contents.len(),
+        expected_chronological.len(),
+        "unexpected bootstrap tail messages: {:?}",
+        payload.events
+    );
+    for (content, expected) in contents.iter().zip(expected_chronological) {
+        assert!(
+            content.contains(expected),
+            "bootstrap message content {content:?} did not contain {expected:?}",
+        );
+    }
+}
+
+fn bootstrap_agent_start(payload: &AgentBootstrapPayload) -> &AgentStartPayload {
+    payload
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::AgentStart(start) => Some(start),
+            _ => None,
+        })
+        .expect("AgentBootstrap should include AgentStart")
 }
 
 async fn fetch_history_page(
@@ -543,9 +582,17 @@ async fn list_sessions_and_resume_agent() {
     let env = expect_next_event(&mut fixture.client, "resumed NewAgent").await;
     let resumed: NewAgentPayload = env.parse_payload().expect("parse resumed NewAgent");
 
-    let env = expect_next_event(&mut fixture.client, "resumed AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    assert_eq!(env.stream, resumed.instance_stream);
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        FrameKind::AgentBootstrap,
+        "resumed AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env.parse_payload().expect("parse resumed AgentBootstrap");
+    let start = bootstrap_agent_start(&payload);
+    assert_eq!(start.agent_id, resumed.agent_id);
+    assert_bootstrap_tail_messages(&payload, &["hello"]);
 
     expect_turn(
         &mut fixture.client,
@@ -570,7 +617,7 @@ async fn list_sessions_and_resume_agent() {
 }
 
 #[tokio::test]
-async fn opening_agent_bootstrap_gates_prior_history_until_fetch() {
+async fn opening_agent_bootstrap_loads_tail_and_gates_older_history() {
     let mut fixture = Fixture::new().await;
 
     fixture
@@ -598,7 +645,7 @@ async fn opening_agent_bootstrap_gates_prior_history_until_fetch() {
     let _ = expect_next_event(&mut fixture.client, "history AgentStart").await;
     expect_turn(&mut fixture.client, "mock backend response to: history 0").await;
 
-    for index in 1..5 {
+    for index in 1..55 {
         let prompt = format!("history {index}");
         fixture
             .client
@@ -629,15 +676,14 @@ async fn opening_agent_bootstrap_gates_prior_history_until_fetch() {
     .await;
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
     let gate_before_seq = assert_bootstrap_prior_history_indicator(&payload, 5);
-    assert_bootstrap_has_no_prior_chat(&payload);
-    assert!(
-        payload
-            .events
-            .iter()
-            .all(|event| !matches!(event, AgentBootstrapEvent::ChatEvent(_))),
-        "completed prior history must not be sent in AgentBootstrap: {:?}",
-        payload.events
-    );
+    let expected_tail_strings = (5..55)
+        .map(|index| format!("history {index}"))
+        .collect::<Vec<_>>();
+    let expected_tail = expected_tail_strings
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_bootstrap_tail_messages(&payload, &expected_tail);
 
     let first_page = fetch_history_page(
         &mut second_client,
@@ -689,7 +735,7 @@ async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/history-no-dupe".to_owned()],
-                prompt: "prior message".to_owned(),
+                prompt: "prior 0".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 cost_hint: None,
@@ -703,11 +749,20 @@ async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
     let env = expect_next_event(&mut fixture.client, "no-dupe NewAgent").await;
     let new_agent: NewAgentPayload = env.parse_payload().expect("parse no-dupe NewAgent");
     let _ = expect_next_event(&mut fixture.client, "no-dupe AgentStart").await;
-    expect_turn(
-        &mut fixture.client,
-        "mock backend response to: prior message",
-    )
-    .await;
+    expect_turn(&mut fixture.client, "mock backend response to: prior 0").await;
+    for index in 1..51 {
+        let prompt = format!("prior {index}");
+        fixture
+            .client
+            .send_message(&new_agent.instance_stream, prompt.clone())
+            .await
+            .expect("send history no-dupe follow-up failed");
+        expect_turn(
+            &mut fixture.client,
+            &format!("mock backend response to: {prompt}"),
+        )
+        .await;
+    }
 
     let (mut second_client, bootstrap) = fixture.connect_with_bootstrap().await;
     let second_agent_stream = bootstrap
@@ -726,7 +781,14 @@ async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
     .await;
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
     let gate_before_seq = assert_bootstrap_prior_history_indicator(&payload, 1);
-    assert_bootstrap_has_no_prior_chat(&payload);
+    let expected_tail_strings = (1..51)
+        .map(|index| format!("prior {index}"))
+        .collect::<Vec<_>>();
+    let expected_tail = expected_tail_strings
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_bootstrap_tail_messages(&payload, &expected_tail);
 
     second_client
         .send_message(&second_agent_stream, "new visible message".to_owned())
@@ -747,7 +809,7 @@ async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
         10,
     )
     .await;
-    assert_history_page(&first_page, &["prior message"], false);
+    assert_history_page(&first_page, &["prior 0"], false);
     assert!(
         first_page.events.iter().all(|event| {
             !matches!(
@@ -832,8 +894,8 @@ async fn async_resume_replay_history_is_ingested_without_live_broadcast() {
     )
     .await;
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
-    assert_bootstrap_prior_history_indicator(&payload, 1);
-    assert_bootstrap_has_no_prior_chat(&payload);
+    assert_bootstrap_has_no_prior_history_indicator(&payload);
+    assert_bootstrap_tail_messages(&payload, &["original history"]);
 
     expect_no_chat_event_on_stream(
         &mut fixture.client,
@@ -952,7 +1014,8 @@ async fn resume_backend_close_before_barrier_flushes_eager_attach_with_fatal_err
         "unexpected fatal error: {}",
         error.message
     );
-    assert_bootstrap_has_no_prior_chat(&payload);
+    assert_bootstrap_has_no_prior_history_indicator(&payload);
+    assert_bootstrap_tail_messages(&payload, &[]);
 }
 
 #[tokio::test]
@@ -1031,8 +1094,8 @@ async fn tycode_resume_replay_history_is_ingested_without_live_broadcast() {
     )
     .await;
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
-    assert_bootstrap_prior_history_indicator(&payload, 1);
-    assert_bootstrap_has_no_prior_chat(&payload);
+    assert_bootstrap_has_no_prior_history_indicator(&payload);
+    assert_bootstrap_tail_messages(&payload, &["tycode original history"]);
 
     expect_no_chat_event_on_stream(
         &mut fixture.client,
@@ -1059,7 +1122,7 @@ async fn tycode_resume_replay_history_is_ingested_without_live_broadcast() {
 }
 
 #[tokio::test]
-async fn agent_bootstrap_keeps_active_stream_while_history_is_gated() {
+async fn agent_bootstrap_keeps_active_stream_while_recent_history_loads() {
     let mut fixture = Fixture::new().await;
 
     fixture
@@ -1173,12 +1236,8 @@ async fn agent_bootstrap_keeps_active_stream_while_history_is_gated() {
     )
     .await;
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
-    let gate_before_seq = assert_bootstrap_prior_history_indicator(&payload, 1);
-    assert!(
-        gate_before_seq > 0,
-        "history gate cursor should be a real sequence boundary"
-    );
-    assert_bootstrap_has_no_prior_chat(&payload);
+    assert_bootstrap_has_no_prior_history_indicator(&payload);
+    assert_bootstrap_tail_messages(&payload, &["parent ready"]);
     assert!(
         payload.events.iter().any(|event| matches!(
             event,
@@ -1328,9 +1387,19 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
     let env = expect_next_event(&mut fixture.client, "resumed parent NewAgent").await;
     let resumed_parent: NewAgentPayload =
         env.parse_payload().expect("parse resumed parent NewAgent");
-    let env = expect_next_event(&mut fixture.client, "resumed parent AgentStart").await;
-    assert_eq!(env.kind, FrameKind::AgentStart);
-    assert_eq!(env.stream, resumed_parent.instance_stream);
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed_parent.instance_stream,
+        FrameKind::AgentBootstrap,
+        "resumed parent AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env
+        .parse_payload()
+        .expect("parse resumed parent AgentBootstrap");
+    let start = bootstrap_agent_start(&payload);
+    assert_eq!(start.agent_id, resumed_parent.agent_id);
+    assert_bootstrap_tail_messages(&payload, &["parent hello"]);
 
     expect_no_event(
         &mut fixture.client,
@@ -1437,10 +1506,19 @@ async fn session_project_id_persists_and_resume_can_override_it() {
     let env = expect_next_event(&mut fixture.client, "resume same project NewAgent").await;
     let resumed_same: NewAgentPayload = env.parse_payload().expect("parse resumed same NewAgent");
     assert_eq!(resumed_same.project_id.as_ref(), Some(&project_a.id));
-    let env = expect_next_event(&mut fixture.client, "resume same project AgentStart").await;
-    let resumed_same_start: AgentStartPayload =
-        env.parse_payload().expect("parse resumed same AgentStart");
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed_same.instance_stream,
+        FrameKind::AgentBootstrap,
+        "resume same project AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env
+        .parse_payload()
+        .expect("parse resume same AgentBootstrap");
+    let resumed_same_start = bootstrap_agent_start(&payload);
     assert_eq!(resumed_same_start.project_id.as_ref(), Some(&project_a.id));
+    assert_bootstrap_tail_messages(&payload, &["session project"]);
     expect_turn(&mut fixture.client, "mock backend response to: resume same").await;
 
     fixture
@@ -1461,10 +1539,19 @@ async fn session_project_id_persists_and_resume_can_override_it() {
     let env = expect_next_event(&mut fixture.client, "resume other project NewAgent").await;
     let resumed_other: NewAgentPayload = env.parse_payload().expect("parse resumed other NewAgent");
     assert_eq!(resumed_other.project_id.as_ref(), Some(&project_b.id));
-    let env = expect_next_event(&mut fixture.client, "resume other project AgentStart").await;
-    let resumed_other_start: AgentStartPayload =
-        env.parse_payload().expect("parse resumed other AgentStart");
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed_other.instance_stream,
+        FrameKind::AgentBootstrap,
+        "resume other project AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env
+        .parse_payload()
+        .expect("parse resume other AgentBootstrap");
+    let resumed_other_start = bootstrap_agent_start(&payload);
     assert_eq!(resumed_other_start.project_id.as_ref(), Some(&project_b.id));
+    assert_bootstrap_tail_messages(&payload, &["session project", "resume same"]);
     expect_turn(
         &mut fixture.client,
         "mock backend response to: resume other",

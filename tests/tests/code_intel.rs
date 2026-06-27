@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    CodeIntelErrorCode, CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelProviderId,
-    CodeIntelState, CodeIntelStatusPayload, CodeIntelSubscribeFilePayload, Envelope, FrameKind,
-    HostExecutablePath, HostSettingValue, HostSettingsPayload, Project, ProjectCreatePayload,
-    ProjectId, ProjectNotifyPayload, ProjectPath, ProjectRootPath, SetSettingPayload, StreamPath,
-    read_envelope, write_envelope,
+    CodeIntelErrorCode, CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelOverviewHeadline,
+    CodeIntelOverviewPayload, CodeIntelProviderId, CodeIntelState, CodeIntelStatusPayload,
+    CodeIntelSubscribeFilePayload, Envelope, FrameKind, HostExecutablePath, HostSettingValue,
+    HostSettingsPayload, Project, ProjectCreatePayload, ProjectId, ProjectNotifyPayload,
+    ProjectPath, ProjectRootPath, SetSettingPayload, StreamPath, read_envelope, write_envelope,
 };
 
 #[cfg(unix)]
@@ -60,7 +60,7 @@ async fn expect_project_notify(
         }
         if matches!(
             env.kind,
-            FrameKind::ProjectFileList | FrameKind::ProjectGitStatus
+            FrameKind::ProjectFileList | FrameKind::ProjectGitStatus | FrameKind::CodeIntelOverview
         ) {
             continue;
         }
@@ -76,7 +76,7 @@ async fn expect_project_bootstrap(client: &mut client::Connection, context: &str
         }
         if matches!(
             env.kind,
-            FrameKind::ProjectFileList | FrameKind::ProjectGitStatus
+            FrameKind::ProjectFileList | FrameKind::ProjectGitStatus | FrameKind::CodeIntelOverview
         ) {
             continue;
         }
@@ -107,6 +107,7 @@ async fn drain_initial_project_state_pushes(client: &mut client::Connection, con
                             | FrameKind::ProjectBootstrap
                             | FrameKind::ProjectFileList
                             | FrameKind::ProjectGitStatus
+                            | FrameKind::CodeIntelOverview
                     ) =>
             {
                 continue;
@@ -250,6 +251,7 @@ async fn wait_for_code_intel_unavailable(
             }
             FrameKind::ProjectFileList
             | FrameKind::ProjectGitStatus
+            | FrameKind::CodeIntelOverview
             | FrameKind::ProjectEvent
             | FrameKind::HostSettings
             | FrameKind::SessionSchemas
@@ -262,6 +264,73 @@ async fn wait_for_code_intel_unavailable(
         }
     }
     (unavailable.unwrap(), error.unwrap())
+}
+
+async fn wait_for_code_intel_unavailable_with_overview(
+    client: &mut client::Connection,
+    root: &ProjectRootPath,
+    provider: &CodeIntelProviderId,
+) -> (
+    CodeIntelStatusPayload,
+    CodeIntelErrorPayload,
+    CodeIntelOverviewPayload,
+) {
+    let mut unavailable = None;
+    let mut error = None;
+    let mut overview = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while unavailable.is_none() || error.is_none() || overview.is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for code-intel unavailable/error/overview frames"
+        );
+        let env = next_raw_event(client, "code-intel unavailable overview").await;
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        match env.kind {
+            FrameKind::CodeIntelStatus => {
+                let payload: CodeIntelStatusPayload =
+                    env.parse_payload().expect("parse CodeIntelStatusPayload");
+                if payload.state == CodeIntelState::Unavailable {
+                    unavailable = Some(payload);
+                }
+            }
+            FrameKind::CodeIntelError => {
+                error = Some(env.parse_payload().expect("parse CodeIntelErrorPayload"));
+            }
+            FrameKind::CodeIntelOverview => {
+                let payload: CodeIntelOverviewPayload =
+                    env.parse_payload().expect("parse CodeIntelOverviewPayload");
+                let provider_unavailable = payload.summary.headline
+                    == CodeIntelOverviewHeadline::Unavailable
+                    && payload.roots.iter().any(|root_overview| {
+                        &root_overview.root == root
+                            && root_overview.providers.iter().any(|provider_status| {
+                                &provider_status.provider == provider
+                                    && provider_status.state == CodeIntelState::Unavailable
+                            })
+                    });
+                if provider_unavailable {
+                    overview = Some(payload);
+                }
+            }
+            FrameKind::ProjectFileList
+            | FrameKind::ProjectGitStatus
+            | FrameKind::ProjectEvent
+            | FrameKind::HostSettings
+            | FrameKind::SessionSchemas
+            | FrameKind::BackendSetup
+            | FrameKind::QueuedMessages
+            | FrameKind::SessionSettings
+            | FrameKind::TeamPresetCatalogNotify
+            | FrameKind::SessionList
+            | FrameKind::WorkflowNotify
+            | FrameKind::AgentsViewPreferencesNotify => {}
+            other => panic!("unexpected frame while waiting for code-intel overview: {other}"),
+        }
+    }
+    (unavailable.unwrap(), error.unwrap(), overview.unwrap())
 }
 
 async fn wait_for_code_intel_status_matching(
@@ -289,6 +358,7 @@ async fn wait_for_code_intel_status_matching(
             }
             FrameKind::ProjectFileList
             | FrameKind::ProjectGitStatus
+            | FrameKind::CodeIntelOverview
             | FrameKind::ProjectEvent
             | FrameKind::HostSettings
             | FrameKind::SessionSchemas
@@ -303,6 +373,96 @@ async fn wait_for_code_intel_status_matching(
             other => panic!("unexpected frame while waiting for code-intel status: {other}"),
         }
     }
+}
+
+async fn wait_for_code_intel_overview_matching(
+    client: &mut client::Connection,
+    context: &str,
+    mut predicate: impl FnMut(&CodeIntelOverviewPayload) -> bool,
+) -> CodeIntelOverviewPayload {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for code-intel overview matching {context}"
+        );
+        let env = next_raw_event(client, context).await;
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        match env.kind {
+            FrameKind::CodeIntelOverview => {
+                let payload: CodeIntelOverviewPayload =
+                    env.parse_payload().expect("parse CodeIntelOverviewPayload");
+                if predicate(&payload) {
+                    return payload;
+                }
+            }
+            FrameKind::ProjectFileList
+            | FrameKind::ProjectGitStatus
+            | FrameKind::ProjectEvent
+            | FrameKind::HostSettings
+            | FrameKind::SessionSchemas
+            | FrameKind::BackendSetup
+            | FrameKind::QueuedMessages
+            | FrameKind::SessionSettings
+            | FrameKind::TeamPresetCatalogNotify
+            | FrameKind::SessionList
+            | FrameKind::WorkflowNotify
+            | FrameKind::AgentsViewPreferencesNotify
+            | FrameKind::CodeIntelStatus
+            | FrameKind::CodeIntelError => {}
+            other => panic!("unexpected frame while waiting for code-intel overview: {other}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn project_subscribe_emits_idle_code_intel_overview_for_all_roots() {
+    let mut fixture = Fixture::new().await;
+    let root_a = tempfile::tempdir().expect("create root a");
+    let root_b = tempfile::tempdir().expect("create root b");
+    let root_a_path = ProjectRootPath(root_a.path().to_string_lossy().into_owned());
+    let root_b_path = ProjectRootPath(root_b.path().to_string_lossy().into_owned());
+
+    fixture
+        .client
+        .project_create(ProjectCreatePayload {
+            name: "Code Intel Multi Root".to_owned(),
+            roots: vec![root_a_path.clone(), root_b_path.clone()],
+        })
+        .await
+        .expect("project_create failed");
+
+    let project = match expect_project_notify(&mut fixture.client, "project create").await {
+        ProjectNotifyPayload::Upsert { project } => project,
+        other => panic!("expected upsert project notification, got {other:?}"),
+    };
+    expect_project_bootstrap(&mut fixture.client, "initial project bootstrap").await;
+    let overview = wait_for_code_intel_overview_matching(
+        &mut fixture.client,
+        "initial idle overview",
+        |overview| {
+            overview.roots.len() == 2 && overview.roots.iter().all(|root| root.providers.is_empty())
+        },
+    )
+    .await;
+
+    assert_eq!(project.root_paths(), vec![root_a_path, root_b_path]);
+    assert_eq!(overview.roots.len(), 2);
+    assert_eq!(overview.roots[0].root, project.root_paths()[0]);
+    assert_eq!(overview.roots[1].root, project.root_paths()[1]);
+    assert_eq!(
+        overview.summary.headline,
+        CodeIntelOverviewHeadline::NotStarted
+    );
+    assert_eq!(overview.summary.ready, 0);
+    assert_eq!(overview.summary.indexing, 0);
+    assert_eq!(overview.summary.starting, 0);
+    assert_eq!(
+        overview.summary.message.as_deref(),
+        Some("No language server running — open a file to index")
+    );
 }
 
 #[cfg(unix)]
@@ -446,15 +606,35 @@ async fn configured_invalid_rust_analyzer_path_fails_without_fallback() {
     fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("write main.rs");
 
     let project = create_project_with_root(&mut fixture.client, workspace.path()).await;
+    let root = ProjectRootPath(workspace.path().to_string_lossy().into_owned());
     let path = ProjectPath {
-        root: ProjectRootPath(workspace.path().to_string_lossy().into_owned()),
+        root: root.clone(),
         relative_path: "src/main.rs".to_owned(),
     };
 
     send_code_intel_subscribe(&mut fixture.client, &project.id, path).await;
-    let (status, error) = wait_for_code_intel_unavailable(&mut fixture.client).await;
+    let provider = CodeIntelProviderId("rust-analyzer".to_owned());
+    let (status, error, overview) =
+        wait_for_code_intel_unavailable_with_overview(&mut fixture.client, &root, &provider).await;
 
     assert_eq!(status.state, CodeIntelState::Unavailable);
+    assert_eq!(
+        overview.summary.headline,
+        CodeIntelOverviewHeadline::Unavailable
+    );
+    assert_eq!(overview.summary.unavailable, 1);
+    let overview_provider = overview
+        .roots
+        .iter()
+        .find(|root_overview| root_overview.root == root)
+        .and_then(|root_overview| {
+            root_overview
+                .providers
+                .iter()
+                .find(|provider_status| provider_status.provider == provider)
+        })
+        .expect("unavailable provider status in overview");
+    assert_eq!(overview_provider.state, CodeIntelState::Unavailable);
     let status_message = status
         .message
         .as_deref()

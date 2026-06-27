@@ -7,16 +7,17 @@ use protocol::{
     AgentGroupsSnapshot, AgentGroupsUpdate, AgentId, AgentManualTagAssignment,
     AgentManualTagDescriptor, AgentManualTagId, AgentOrderKey, AgentOrigin, AgentPinsSnapshot,
     AgentPinsUpdate, AgentSortMode, AgentStatusFilter, AgentTagColor, AgentTagRef,
-    AgentTagsSnapshot, AgentTagsUpdate, AgentsSmartViewsSnapshot, AgentsSmartViewsUpdate,
-    AgentsViewFilters, AgentsViewPreferences, AgentsViewPreferencesSnapshot,
-    AgentsViewPreferencesStoreError, AgentsViewPreferencesStoreErrorKind,
-    AgentsViewPreferencesUpdate, BackendKind, BuiltInSmartViewId, HostFilterId, SessionId,
-    SmartView, SmartViewId, UserSmartViewId,
+    AgentTagsSnapshot, AgentTagsUpdate, AgentsSidebarPreferences, AgentsSmartViewsSnapshot,
+    AgentsSmartViewsUpdate, AgentsViewFilters, AgentsViewPreferences,
+    AgentsViewPreferencesSnapshot, AgentsViewPreferencesStoreError,
+    AgentsViewPreferencesStoreErrorKind, AgentsViewPreferencesUpdate, BackendKind,
+    BuiltInSmartViewId, HostFilterId, SessionId, SmartView, SmartViewId, UserSmartViewId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const STORE_VERSION: u32 = 4;
+const STORE_VERSION: u32 = 5;
+const GROUPS_STORE_VERSION: u32 = 4;
 const TAGS_PINS_STORE_VERSION: u32 = 3;
 const SMART_VIEWS_STORE_VERSION: u32 = 2;
 const LEGACY_STORE_VERSION: u32 = 1;
@@ -25,6 +26,8 @@ const LEGACY_STORE_VERSION: u32 = 1;
 struct StoreFile {
     version: u32,
     preferences: AgentsViewPreferences,
+    #[serde(default)]
+    sidebar: AgentsSidebarPreferences,
     #[serde(default)]
     smart_views: PersistedSmartViews,
     #[serde(default)]
@@ -59,6 +62,7 @@ struct PersistedTags {
 #[derive(Debug, Clone)]
 struct StoreState {
     preferences: AgentsViewPreferences,
+    sidebar: AgentsSidebarPreferences,
     user_smart_views: Vec<SmartView>,
     active_view_id: Option<SmartViewId>,
     manual_tags: Vec<AgentManualTagDescriptor>,
@@ -71,6 +75,7 @@ impl Default for StoreState {
     fn default() -> Self {
         Self {
             preferences: AgentsViewPreferences::default(),
+            sidebar: AgentsSidebarPreferences::default(),
             user_smart_views: Vec::new(),
             active_view_id: Some(SmartViewId::BuiltIn(BuiltInSmartViewId::All)),
             manual_tags: Vec::new(),
@@ -93,6 +98,7 @@ struct SmartViewQuery {
 pub struct AgentsViewPreferencesStore {
     path: PathBuf,
     preferences: AgentsViewPreferences,
+    sidebar: AgentsSidebarPreferences,
     user_smart_views: Vec<SmartView>,
     active_view_id: Option<SmartViewId>,
     manual_tags: Vec<AgentManualTagDescriptor>,
@@ -108,6 +114,7 @@ impl AgentsViewPreferencesStore {
             Ok(state) => Self {
                 path,
                 preferences: state.preferences,
+                sidebar: state.sidebar,
                 user_smart_views: state.user_smart_views,
                 active_view_id: state.active_view_id,
                 manual_tags: state.manual_tags,
@@ -121,6 +128,7 @@ impl AgentsViewPreferencesStore {
                 Self {
                     path,
                     preferences: state.preferences,
+                    sidebar: state.sidebar,
                     user_smart_views: state.user_smart_views,
                     active_view_id: state.active_view_id,
                     manual_tags: state.manual_tags,
@@ -149,6 +157,7 @@ impl AgentsViewPreferencesStore {
     pub fn snapshot(&self) -> AgentsViewPreferencesSnapshot {
         AgentsViewPreferencesSnapshot {
             preferences: self.preferences.clone(),
+            sidebar: self.sidebar.clone(),
             load_error: self.load_error.clone(),
             smart_views: self.smart_views_snapshot(),
             tags: self.tags_snapshot(),
@@ -309,6 +318,7 @@ impl AgentsViewPreferencesStore {
 
     fn set_state(&mut self, state: StoreState) {
         self.preferences = state.preferences;
+        self.sidebar = state.sidebar;
         self.user_smart_views = state.user_smart_views;
         self.active_view_id = state.active_view_id;
         self.manual_tags = state.manual_tags;
@@ -386,6 +396,7 @@ impl AgentsViewPreferencesStore {
                 })?;
                 validate_state(StoreState {
                     preferences: store.preferences,
+                    sidebar: AgentsSidebarPreferences::default(),
                     user_smart_views: Vec::new(),
                     active_view_id: Some(SmartViewId::BuiltIn(BuiltInSmartViewId::All)),
                     manual_tags: Vec::new(),
@@ -406,6 +417,7 @@ impl AgentsViewPreferencesStore {
             matched_version
                 if matched_version == u64::from(SMART_VIEWS_STORE_VERSION)
                     || matched_version == u64::from(TAGS_PINS_STORE_VERSION)
+                    || matched_version == u64::from(GROUPS_STORE_VERSION)
                     || matched_version == u64::from(STORE_VERSION) =>
             {
                 let active_view_id_was_present = value
@@ -428,6 +440,7 @@ impl AgentsViewPreferencesStore {
                 };
                 validate_state(StoreState {
                     preferences: store.preferences,
+                    sidebar: store.sidebar,
                     user_smart_views: store.smart_views.user,
                     active_view_id,
                     manual_tags: store.tags.manual,
@@ -459,6 +472,7 @@ impl AgentsViewPreferencesStore {
         let json = serde_json::to_string_pretty(&StoreFile {
             version: STORE_VERSION,
             preferences: state.preferences.clone(),
+            sidebar: state.sidebar.clone(),
             smart_views: PersistedSmartViews {
                 user: state.user_smart_views.clone(),
                 active_view_id: state.active_view_id.clone(),
@@ -542,6 +556,9 @@ fn apply_update(state: &mut StoreState, update: AgentsViewPreferencesUpdate) -> 
         AgentsViewPreferencesUpdate::SetManualOrder { manual_order } => {
             state.preferences.manual_order = manual_order;
         }
+        AgentsViewPreferencesUpdate::SetSidebarPreferences { sidebar } => {
+            state.sidebar = sidebar;
+        }
         AgentsViewPreferencesUpdate::Reset => {
             let default_preferences = AgentsViewPreferences::default();
             if query_from_preferences(&state.preferences)
@@ -550,6 +567,7 @@ fn apply_update(state: &mut StoreState, update: AgentsViewPreferencesUpdate) -> 
                 state.active_view_id = None;
             }
             state.preferences = default_preferences;
+            state.sidebar = AgentsSidebarPreferences::default();
         }
     }
     Ok(())
@@ -633,6 +651,7 @@ fn validate_state(state: StoreState) -> Result<StoreState, String> {
     validate_active_view_id(state.active_view_id.as_ref(), &user_ids)?;
     Ok(StoreState {
         preferences,
+        sidebar: state.sidebar,
         user_smart_views,
         active_view_id: state.active_view_id,
         manual_tags,
@@ -1736,8 +1755,8 @@ fn ensure_non_empty(field: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use protocol::{
-        AgentId, AgentListDensity, AgentOrderKey, AgentsViewPreferencesUpdate, HostFilterId,
-        SessionId,
+        AgentId, AgentListDensity, AgentOrderKey, AgentsSidebarPreferences,
+        AgentsSidebarProjectVisibility, AgentsViewPreferencesUpdate, HostFilterId, SessionId,
     };
 
     use super::*;
@@ -1767,6 +1786,7 @@ mod tests {
         assert!(snapshot.pins.pinned.is_empty());
         assert!(snapshot.groups.groups.is_empty());
         assert!(snapshot.groups.assignments.is_empty());
+        assert_eq!(snapshot.sidebar, AgentsSidebarPreferences::default());
     }
 
     #[test]
@@ -1794,7 +1814,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(path)
                 .expect("read rewritten store")
-                .contains("\"version\": 4")
+                .contains("\"version\": 5")
         );
     }
 
@@ -1862,5 +1882,57 @@ mod tests {
         assert!(snapshot.pins.pinned.is_empty());
         assert!(snapshot.groups.groups.is_empty());
         assert!(snapshot.groups.assignments.is_empty());
+        assert_eq!(snapshot.sidebar, AgentsSidebarPreferences::default());
+    }
+
+    #[test]
+    fn sidebar_preferences_persist_and_v4_migrates_to_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agents_view_preferences.json");
+        let v4_store = serde_json::json!({
+            "version": 4,
+            "preferences": {
+                "filters": {},
+                "sort_mode": "manual_then_activity",
+                "group_mode": "flat",
+                "density": "comfortable",
+                "hide_finished": false,
+                "manual_order": []
+            },
+            "smart_views": {},
+            "tags": {},
+            "pins": {},
+            "groups": {}
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&v4_store).expect("serialize v4 store"),
+        )
+        .expect("write v4 store");
+
+        let mut store = AgentsViewPreferencesStore::load(path.clone());
+        assert_eq!(
+            store.snapshot().sidebar,
+            AgentsSidebarPreferences::default()
+        );
+
+        let sidebar = AgentsSidebarPreferences {
+            hide_inactive: true,
+            hide_sub_agents: true,
+            project_visibility: AgentsSidebarProjectVisibility::AllProjects,
+        };
+        let snapshot = store
+            .apply(AgentsViewPreferencesUpdate::SetSidebarPreferences {
+                sidebar: sidebar.clone(),
+            })
+            .expect("apply sidebar update");
+        assert_eq!(snapshot.sidebar, sidebar);
+
+        let contents = std::fs::read_to_string(&path).expect("read rewritten store");
+        assert!(contents.contains("\"version\": 5"));
+        assert!(contents.contains("\"sidebar\""));
+
+        let reloaded = AgentsViewPreferencesStore::load(path);
+        assert_eq!(reloaded.snapshot().sidebar, sidebar);
     }
 }

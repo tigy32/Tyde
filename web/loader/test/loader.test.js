@@ -161,6 +161,49 @@ test("resolveBootTarget boots a version present in the manifest", () => {
   assert.match(r.integrity, /^sha384-/);
 });
 
+test("resolveBootTarget exposes a stamped protocolVersion", () => {
+  const r = resolveBootTarget("0.8.19-beta.2", EXAMPLE_MANIFEST);
+  assert.equal(r.ok, true);
+  assert.equal(r.protocolVersion, 13);
+});
+
+test("resolveBootTarget exposes protocolVersion=null when the entry predates the field", () => {
+  const manifest = {
+    versions: {
+      "1.2.3": {
+        path: "/tyde/v1.2.3/",
+        entry: "/tyde/v1.2.3/app.js",
+        integrity: "sha384-" + "A".repeat(64),
+        artifacts: { "/tyde/v1.2.3/app_bg.wasm": "sha384-" + "B".repeat(64) },
+      },
+    },
+  };
+  const r = resolveBootTarget("1.2.3", manifest);
+  assert.equal(r.ok, true);
+  assert.equal(r.protocolVersion, null);
+});
+
+test("resolveBootTarget fails closed on a present-but-malformed protocolVersion", () => {
+  const bad = (pv) => ({
+    versions: {
+      "1.2.3": {
+        path: "/tyde/v1.2.3/",
+        entry: "/tyde/v1.2.3/app.js",
+        integrity: "sha384-" + "A".repeat(64),
+        protocolVersion: pv,
+        artifacts: { "/tyde/v1.2.3/app_bg.wasm": "sha384-" + "B".repeat(64) },
+      },
+    },
+  });
+  for (const pv of ["13", 1.5, -1, null, {}, NaN]) {
+    assert.equal(
+      resolveBootTarget("1.2.3", bad(pv)).reason,
+      "bad-protocol-version",
+      `expected bad-protocol-version for ${JSON.stringify(pv)}`,
+    );
+  }
+});
+
 test("resolveBootTarget gates booting on manifest membership", () => {
   // Valid semver, but not published -> rejected.
   assert.deepEqual(resolveBootTarget("99.99.99", EXAMPLE_MANIFEST), {

@@ -7,13 +7,14 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    AgentId, AgentOrigin, BackendAccessMode, BackendKind, CancelWorkflowPayload, ChatEvent,
-    CommandErrorCode, CommandErrorPayload, Envelope, FrameKind, HostBootstrapPayload,
-    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeleteRootPayload, ProjectNotifyPayload, ProjectRootPath, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath, TriggerWorkflowPayload, WorkflowId, WorkflowNotifyPayload,
-    WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus,
-    WorkflowSaveResponse, WorkflowStepRunSnapshotStatus, WorkflowTargetsResponse,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentOrigin, BackendAccessMode,
+    BackendKind, CancelWorkflowPayload, ChatEvent, CommandErrorCode, CommandErrorPayload, Envelope,
+    FrameKind, HostBootstrapPayload, NewAgentPayload, Project, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeleteRootPayload, ProjectNotifyPayload, ProjectRootPath,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath, TriggerWorkflowPayload, WorkflowId,
+    WorkflowNotifyPayload, WorkflowRunId, WorkflowRunNotifyPayload, WorkflowRunSnapshot,
+    WorkflowRunSnapshotStatus, WorkflowSaveResponse, WorkflowStepRunSnapshotStatus,
+    WorkflowTargetsResponse,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -823,7 +824,7 @@ async fn workflow_child_agents_inherit_context_and_backend_allowlist() {
         .expect("workflow_refresh failed");
     wait_for_workflow_catalog(&mut fixture.client).await;
     let (run_id, coordinator) =
-        trigger_workflow_and_wait_for_coordinator(&mut fixture.client, project.id).await;
+        trigger_workflow_and_wait_for_coordinator(&mut fixture.client, project.id.clone()).await;
     assert_eq!(coordinator.backend_kind, BackendKind::Codex);
 
     let agent_control_url = fixture.agent_control_http_url().await;
@@ -870,7 +871,7 @@ async fn workflow_child_agents_inherit_context_and_backend_allowlist() {
             .to_owned(),
     );
 
-    loop {
+    let child_new = loop {
         let env = next_event(&mut fixture.client, "workflow child NewAgent").await;
         if env.kind != FrameKind::NewAgent {
             continue;
@@ -881,9 +882,44 @@ async fn workflow_child_agents_inherit_context_and_backend_allowlist() {
         }
         assert_eq!(child.origin, AgentOrigin::Workflow);
         assert_eq!(child.parent_agent_id, Some(coordinator.agent_id.clone()));
-        let metadata = child.workflow.expect("child workflow metadata missing");
+        assert_eq!(child.project_id.as_ref(), Some(&project.id));
+        let metadata = child
+            .workflow
+            .as_ref()
+            .expect("child workflow metadata missing");
         assert_eq!(metadata.workflow_id, WorkflowId("build".to_owned()));
         assert_eq!(metadata.workflow_run_id, run_id);
+        break child;
+    };
+
+    loop {
+        let env = next_event(&mut fixture.client, "workflow child AgentStart").await;
+        if env.stream != child_new.instance_stream {
+            continue;
+        }
+        let start = match env.kind {
+            FrameKind::AgentStart => env.parse_payload().expect("AgentStart"),
+            FrameKind::AgentBootstrap => {
+                let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
+                let Some(start) = bootstrap.events.into_iter().find_map(|event| match event {
+                    AgentBootstrapEvent::AgentStart(start) => Some(start),
+                    AgentBootstrapEvent::AgentError(_)
+                    | AgentBootstrapEvent::SessionSettings(_)
+                    | AgentBootstrapEvent::QueuedMessages(_)
+                    | AgentBootstrapEvent::AgentActivityStats(_)
+                    | AgentBootstrapEvent::ChatEvent(_)
+                    | AgentBootstrapEvent::HasPriorHistory { .. } => None,
+                }) else {
+                    continue;
+                };
+                start
+            }
+            _ => continue,
+        };
+        assert_eq!(start.agent_id, child_agent_id);
+        assert_eq!(start.origin, AgentOrigin::Workflow);
+        assert_eq!(start.parent_agent_id, Some(coordinator.agent_id.clone()));
+        assert_eq!(start.project_id.as_ref(), Some(&project.id));
         break;
     }
 }

@@ -6,19 +6,20 @@ use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 use protocol::MobileAccessErrorCode;
 use protocol::types::{AgentCompactNotifyPayload, AgentCompactStatus};
 use protocol::{
-    AgentActivitySummaryPayload, AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload,
-    AgentErrorPayload, AgentId, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
-    BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent,
-    ClientErrorCode, CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind,
-    HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HostBrowseOpenedPayload, HostSettingsPayload, McpServerNotifyPayload, NewAgentPayload,
-    ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectNotifyPayload, ProtocolValidator, QueuedMessagesPayload, RejectPayload,
-    ReviewBootstrapPayload, ReviewEventPayload, ReviewId, SeqMismatch, SessionHistoryPayload,
-    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload,
-    SteeringNotifyPayload, StreamPath, TeamCompactNotifyPayload, TeamCompactStatus,
-    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
+    AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapEvent,
+    AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin,
+    AgentRenamedPayload, AgentStartPayload, BackendSetupPayload, BrowseBootstrapListing,
+    BrowseBootstrapPayload, ChatEvent, ClientErrorCode, CodeIntelOverviewPayload,
+    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
+    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
+    McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
+    QueuedMessagesPayload, RejectPayload, ReviewBootstrapPayload, ReviewEventPayload, ReviewId,
+    SeqMismatch, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
+    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
+    TeamCompactNotifyPayload, TeamCompactStatus, TeamDraftNotifyPayload,
+    TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
 };
 
@@ -896,6 +897,32 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
         FrameKind::AgentCompactNotify => {
             if let Ok(payload) = envelope.parse_payload::<AgentCompactNotifyPayload>() {
                 apply_agent_compact_notify(state, host, payload);
+            }
+        }
+        // Desktop-only surfaces (the await progress card and the Files-explorer
+        // code-intel footer). Mobile has no UI for these, so parse to validate
+        // the wire shape and intentionally drop them — quietly, without the
+        // "unhandled frame kind" warning below.
+        FrameKind::AgentActivityStats => {
+            if let Err(error) = envelope.parse_payload::<AgentActivityStatsPayload>() {
+                log::error!(
+                    "failed to parse AgentActivityStats host={} stream={} seq={}: {}",
+                    host,
+                    envelope.stream,
+                    envelope.seq,
+                    error
+                );
+            }
+        }
+        FrameKind::CodeIntelOverview => {
+            if let Err(error) = envelope.parse_payload::<CodeIntelOverviewPayload>() {
+                log::error!(
+                    "failed to parse CodeIntelOverview host={} stream={} seq={}: {}",
+                    host,
+                    envelope.stream,
+                    envelope.seq,
+                    error
+                );
             }
         }
         _ => {
@@ -2017,6 +2044,10 @@ fn apply_agent_bootstrap(
             AgentBootstrapEvent::ChatEvent(event) => {
                 apply_chat_event(state, &agent_ref, event);
             }
+            // Mobile does not surface the agent-control activity stats line
+            // (no await progress card UX), mirroring how it drops the
+            // `AgentActivitySummary` frame above.
+            AgentBootstrapEvent::AgentActivityStats(_) => {}
         }
     }
 }

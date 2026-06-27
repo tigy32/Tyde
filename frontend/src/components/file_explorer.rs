@@ -9,7 +9,8 @@ use crate::send::send_frame;
 use crate::state::{AppState, display_path_name, root_display_name};
 
 use protocol::{
-    FrameKind, ProjectFileEntry, ProjectFileKind, ProjectId, ProjectListDirPayload, ProjectPath,
+    CodeIntelOverviewHeadline, CodeIntelOverviewSummary, CodeIntelState, FrameKind,
+    ProjectFileEntry, ProjectFileKind, ProjectId, ProjectListDirPayload, ProjectPath,
     ProjectRootPath, StreamPath,
 };
 
@@ -259,6 +260,196 @@ pub fn FileExplorer() -> impl IntoView {
                     }
                 }}
             </div>
+            <CodeIntelFooter />
+        </div>
+    }
+}
+
+/// Maps a server-authored provider state to its short display label. This is a
+/// pure rendering of the enum, not an inference about provider behavior.
+fn state_label(state: CodeIntelState) -> &'static str {
+    match state {
+        CodeIntelState::Ready => "Ready",
+        CodeIntelState::Indexing => "Indexing",
+        CodeIntelState::Starting => "Starting",
+        CodeIntelState::Unavailable => "Unavailable",
+        CodeIntelState::Failed => "Failed",
+        CodeIntelState::Unsupported => "Not started",
+    }
+}
+
+fn state_dot_class(state: CodeIntelState) -> &'static str {
+    match state {
+        CodeIntelState::Ready => "ready",
+        CodeIntelState::Indexing => "indexing",
+        CodeIntelState::Starting => "starting",
+        CodeIntelState::Unavailable => "unavailable",
+        CodeIntelState::Failed => "failed",
+        CodeIntelState::Unsupported => "idle",
+    }
+}
+
+fn headline_dot_class(headline: CodeIntelOverviewHeadline) -> &'static str {
+    match headline {
+        CodeIntelOverviewHeadline::NotStarted => "idle",
+        CodeIntelOverviewHeadline::Starting => "starting",
+        CodeIntelOverviewHeadline::Indexing => "indexing",
+        CodeIntelOverviewHeadline::Ready => "ready",
+        CodeIntelOverviewHeadline::Unavailable => "unavailable",
+        CodeIntelOverviewHeadline::Failed => "failed",
+    }
+}
+
+/// Renders the server-authored overview headline into a collapsed aggregate
+/// label + dot class. The headline is authoritative (including `NotStarted`);
+/// the counts are only used to enrich the indexing progress text.
+fn aggregate_label(summary: &CodeIntelOverviewSummary) -> (String, &'static str) {
+    let class = headline_dot_class(summary.headline);
+    let label = match summary.headline {
+        CodeIntelOverviewHeadline::NotStarted => "Not started".to_owned(),
+        CodeIntelOverviewHeadline::Starting => "Starting".to_owned(),
+        CodeIntelOverviewHeadline::Indexing => {
+            let total = summary.ready
+                + summary.indexing
+                + summary.starting
+                + summary.unavailable
+                + summary.failed;
+            format!("Indexing · {} of {total} servers", summary.indexing)
+        }
+        CodeIntelOverviewHeadline::Ready => "Ready".to_owned(),
+        CodeIntelOverviewHeadline::Unavailable => "Unavailable".to_owned(),
+        CodeIntelOverviewHeadline::Failed => "Failed".to_owned(),
+    };
+    (label, class)
+}
+
+/// Sticky footer at the bottom of the Files panel that renders the server's
+/// code-intelligence overview for the active project. Collapsed view shows the
+/// aggregate state and the server-authored message; multi-root/provider detail
+/// lives behind an expander to avoid clutter.
+#[component]
+fn CodeIntelFooter() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let expanded = RwSignal::new(false);
+
+    let overview = Memo::new(move |_| {
+        // Key by the full active-project ref (host + project) so a code-intel
+        // overview from one host can't render under a same-id project on another.
+        let active = state.active_project.get()?;
+        state.code_intel_overview.get().get(&active).cloned()
+    });
+    let has_project = move || state.active_project.get().is_some();
+
+    view! {
+        {move || {
+            if !has_project() {
+                return ().into_any();
+            }
+            match overview.get() {
+                None => view! {
+                    <div class="fe-codeintel" data-test="fe-codeintel-footer">
+                        <div class="fe-ci-summary">
+                            <span class="fe-ci-dot fe-ci-idle"></span>
+                            <span
+                                class="fe-ci-label"
+                                data-test="fe-codeintel-label"
+                            >
+                                "Code Intel: Loading…"
+                            </span>
+                        </div>
+                    </div>
+                }
+                .into_any(),
+                Some(ov) => {
+                    let (label, dot_class) = aggregate_label(&ov.summary);
+                    let roots = ov.roots.clone();
+                    let can_expand = !roots.is_empty();
+                    let is_expanded = move || can_expand && expanded.get();
+                    let toggle = move |_| {
+                        if can_expand {
+                            expanded.update(|v| *v = !*v);
+                        }
+                    };
+
+                    view! {
+                        <div class="fe-codeintel" data-test="fe-codeintel-footer">
+                            <button
+                                class="fe-ci-summary"
+                                class:fe-ci-clickable=move || can_expand
+                                on:click=toggle
+                                disabled=move || !can_expand
+                                aria-expanded=move || if is_expanded() { "true" } else { "false" }
+                                title="Code Intel status"
+                            >
+                                <span class=format!("fe-ci-dot fe-ci-{dot_class}")></span>
+                                <span class="fe-ci-label" data-test="fe-codeintel-label">
+                                    {format!("Code Intel: {label}")}
+                                </span>
+                                {can_expand.then(|| view! {
+                                    <span class="fe-ci-chevron">
+                                        {move || if is_expanded() { "\u{25be}" } else { "\u{25b8}" }}
+                                    </span>
+                                })}
+                            </button>
+                            {ov.summary.message.clone().map(|msg| view! {
+                                <div class="fe-ci-message" data-test="fe-codeintel-message">
+                                    {msg}
+                                </div>
+                            })}
+                            {move || is_expanded().then(|| {
+                                roots
+                                    .iter()
+                                    .cloned()
+                                    .map(render_root_overview)
+                                    .collect::<Vec<_>>()
+                            })}
+                        </div>
+                    }
+                    .into_any()
+                }
+            }
+        }}
+    }
+}
+
+fn render_root_overview(root: protocol::CodeIntelRootOverview) -> impl IntoView {
+    let root_label = root_display_name(&root.root);
+    let root_title = root.root.0.clone();
+    let providers = if root.providers.is_empty() {
+        vec![
+            view! {
+                <div class="fe-ci-provider fe-ci-provider--idle">"Idle"</div>
+            }
+            .into_any(),
+        ]
+    } else {
+        root.providers
+            .iter()
+            .map(|provider| {
+                let dot_class = state_dot_class(provider.state);
+                let name = format!("{} · {}", provider.provider, provider.language);
+                let mut detail = state_label(provider.state).to_owned();
+                if let (CodeIntelState::Indexing, Some(done), Some(total)) =
+                    (provider.state, provider.work_done, provider.total_work)
+                {
+                    detail = format!("{detail} {done}/{total}");
+                }
+                view! {
+                    <div class="fe-ci-provider" data-test="fe-codeintel-provider">
+                        <span class=format!("fe-ci-dot fe-ci-{dot_class}")></span>
+                        <span class="fe-ci-provider-name">{name}</span>
+                        <span class="fe-ci-provider-state">{detail}</span>
+                    </div>
+                }
+                .into_any()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    view! {
+        <div class="fe-ci-root" data-test="fe-codeintel-root">
+            <div class="fe-ci-root-name" title=root_title>{root_label}</div>
+            {providers}
         </div>
     }
 }
@@ -487,4 +678,397 @@ fn node_matches_filter(node: &TreeNode, filter: &str, show_hidden: bool) -> bool
     node.children
         .iter()
         .any(|child| node_matches_filter(child, filter, show_hidden))
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use crate::state::ActiveProjectRef;
+    use leptos::mount::mount_to;
+    use protocol::{
+        CodeIntelLanguageId, CodeIntelOverviewHeadline, CodeIntelOverviewPayload,
+        CodeIntelProviderId, CodeIntelProviderStatus, CodeIntelResourceMode, CodeIntelRootOverview,
+        CodeIntelState,
+    };
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn provider(
+        id: &str,
+        language: &str,
+        state: CodeIntelState,
+        progress: Option<(u32, u32)>,
+    ) -> CodeIntelProviderStatus {
+        CodeIntelProviderStatus {
+            provider: CodeIntelProviderId(id.to_owned()),
+            language: CodeIntelLanguageId(language.to_owned()),
+            state,
+            resource_mode: CodeIntelResourceMode::Full,
+            work_done: progress.map(|(d, _)| d),
+            total_work: progress.map(|(_, t)| t),
+            message: None,
+        }
+    }
+
+    fn root(path: &str, providers: Vec<CodeIntelProviderStatus>) -> CodeIntelRootOverview {
+        CodeIntelRootOverview {
+            root: ProjectRootPath(path.to_owned()),
+            providers,
+        }
+    }
+
+    fn summary(
+        headline: CodeIntelOverviewHeadline,
+        counts: [u32; 5],
+        message: Option<&str>,
+    ) -> protocol::CodeIntelOverviewSummary {
+        protocol::CodeIntelOverviewSummary {
+            headline,
+            ready: counts[0],
+            indexing: counts[1],
+            starting: counts[2],
+            unavailable: counts[3],
+            failed: counts[4],
+            message: message.map(|m| m.to_owned()),
+        }
+    }
+
+    fn mount_footer(
+        container: HtmlElement,
+        overview: Option<CodeIntelOverviewPayload>,
+    ) -> Rc<RefCell<Option<AppState>>> {
+        let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let handle = mount_to(container, move || {
+            let state = AppState::new();
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "h1".to_owned(),
+                project_id: ProjectId("proj-1".to_owned()),
+            }));
+            if let Some(overview) = overview.clone() {
+                state.code_intel_overview.update(|m| {
+                    m.insert(
+                        ActiveProjectRef {
+                            host_id: "h1".to_owned(),
+                            project_id: ProjectId("proj-1".to_owned()),
+                        },
+                        overview,
+                    );
+                });
+            }
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <FileExplorer /> }
+        });
+        std::mem::forget(handle);
+        holder
+    }
+
+    fn label_text(container: &HtmlElement) -> String {
+        container
+            .query_selector("[data-test=\"fe-codeintel-label\"]")
+            .unwrap()
+            .expect("code-intel label present")
+            .text_content()
+            .unwrap_or_default()
+    }
+
+    /// No overview received yet ⇒ neutral "Loading…" rather than a guessed state.
+    #[wasm_bindgen_test]
+    async fn footer_shows_loading_without_overview() {
+        let container = make_container();
+        let _ = mount_footer(container.clone(), None);
+        next_tick().await;
+        assert_eq!(label_text(&container), "Code Intel: Loading…");
+    }
+
+    /// Lazy-v1 idle: server-authored `NotStarted` headline renders as
+    /// "Not started" with the server message shown verbatim.
+    #[wasm_bindgen_test]
+    async fn footer_shows_not_started_with_server_message() {
+        let container = make_container();
+        let overview = CodeIntelOverviewPayload {
+            roots: vec![root("/repo", vec![])],
+            summary: summary(
+                CodeIntelOverviewHeadline::NotStarted,
+                [0, 0, 0, 0, 0],
+                Some("No language server running — open a file to index"),
+            ),
+        };
+        let _ = mount_footer(container.clone(), Some(overview));
+        next_tick().await;
+
+        assert_eq!(label_text(&container), "Code Intel: Not started");
+        let message = container
+            .query_selector("[data-test=\"fe-codeintel-message\"]")
+            .unwrap()
+            .expect("server message present")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            message.contains("open a file to index"),
+            "server message must render verbatim; got: {message}"
+        );
+    }
+
+    /// Multi-root indexing collapses to an "Indexing · N of M servers" aggregate,
+    /// and the collapsed view does not list per-root provider rows.
+    #[wasm_bindgen_test]
+    async fn footer_indexing_aggregate_collapsed() {
+        let container = make_container();
+        let overview = CodeIntelOverviewPayload {
+            roots: vec![
+                root(
+                    "/repo/api",
+                    vec![provider(
+                        "rust-analyzer",
+                        "rust",
+                        CodeIntelState::Indexing,
+                        Some((30, 100)),
+                    )],
+                ),
+                root(
+                    "/repo/web",
+                    vec![provider("pyright", "python", CodeIntelState::Ready, None)],
+                ),
+                root(
+                    "/repo/tools",
+                    vec![provider(
+                        "tsserver",
+                        "typescript",
+                        CodeIntelState::Starting,
+                        None,
+                    )],
+                ),
+            ],
+            summary: summary(
+                CodeIntelOverviewHeadline::Indexing,
+                [1, 1, 1, 0, 0],
+                Some("Indexing code intelligence"),
+            ),
+        };
+        let _ = mount_footer(container.clone(), Some(overview));
+        next_tick().await;
+
+        assert_eq!(
+            label_text(&container),
+            "Code Intel: Indexing · 1 of 3 servers"
+        );
+        // Collapsed: no per-root or provider detail visible yet.
+        assert_eq!(
+            container
+                .query_selector_all("[data-test=\"fe-codeintel-root\"]")
+                .unwrap()
+                .length(),
+            0,
+            "collapsed footer must not render per-root detail"
+        );
+    }
+
+    /// Expanding the footer reveals one section per root and a row per provider,
+    /// including indexing progress.
+    #[wasm_bindgen_test]
+    async fn footer_expands_to_per_root_providers() {
+        let container = make_container();
+        let overview = CodeIntelOverviewPayload {
+            roots: vec![
+                root(
+                    "/repo/api",
+                    vec![provider(
+                        "rust-analyzer",
+                        "rust",
+                        CodeIntelState::Indexing,
+                        Some((30, 100)),
+                    )],
+                ),
+                root(
+                    "/repo/web",
+                    vec![provider("pyright", "python", CodeIntelState::Ready, None)],
+                ),
+            ],
+            summary: summary(CodeIntelOverviewHeadline::Indexing, [1, 1, 0, 0, 0], None),
+        };
+        let _ = mount_footer(container.clone(), Some(overview));
+        next_tick().await;
+
+        let toggle = container
+            .query_selector("[data-test=\"fe-codeintel-footer\"] button")
+            .unwrap()
+            .expect("summary toggle present")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        toggle.click();
+        next_tick().await;
+
+        assert_eq!(
+            container
+                .query_selector_all("[data-test=\"fe-codeintel-root\"]")
+                .unwrap()
+                .length(),
+            2,
+            "expanded footer must render one section per root"
+        );
+        let providers = container
+            .query_selector_all("[data-test=\"fe-codeintel-provider\"]")
+            .unwrap();
+        assert_eq!(providers.length(), 2, "one row per provider");
+        let mut found_progress = false;
+        for i in 0..providers.length() {
+            let text = providers
+                .item(i)
+                .unwrap()
+                .text_content()
+                .unwrap_or_default();
+            if text.contains("30/100") {
+                found_progress = true;
+            }
+        }
+        assert!(
+            found_progress,
+            "indexing provider row must show work progress"
+        );
+    }
+
+    /// The footer is a pure projection of the `code_intel_overview` signal:
+    /// mutating it after mount must rerender live, with no remount and without
+    /// reopening the panel.
+    #[wasm_bindgen_test]
+    async fn footer_rerenders_live_on_overview_update() {
+        let container = make_container();
+        let initial = CodeIntelOverviewPayload {
+            roots: vec![root("/repo", vec![])],
+            summary: summary(
+                CodeIntelOverviewHeadline::NotStarted,
+                [0, 0, 0, 0, 0],
+                Some("No language server running — open a file to index"),
+            ),
+        };
+        let holder = mount_footer(container.clone(), Some(initial));
+        next_tick().await;
+        assert_eq!(label_text(&container), "Code Intel: Not started");
+
+        // Drive a new server-authored overview through the signal, exactly as the
+        // dispatcher would on a fresh `code_intel_overview` frame.
+        let state = holder.borrow().clone().expect("state captured at mount");
+        state.code_intel_overview.update(|m| {
+            m.insert(
+                ActiveProjectRef {
+                    host_id: "h1".to_owned(),
+                    project_id: ProjectId("proj-1".to_owned()),
+                },
+                CodeIntelOverviewPayload {
+                    roots: vec![root(
+                        "/repo",
+                        vec![provider(
+                            "rust-analyzer",
+                            "rust",
+                            CodeIntelState::Ready,
+                            None,
+                        )],
+                    )],
+                    summary: summary(
+                        CodeIntelOverviewHeadline::Ready,
+                        [1, 0, 0, 0, 0],
+                        Some("Code intelligence ready"),
+                    ),
+                },
+            );
+        });
+        next_tick().await;
+
+        assert_eq!(label_text(&container), "Code Intel: Ready");
+        let message = container
+            .query_selector("[data-test=\"fe-codeintel-message\"]")
+            .unwrap()
+            .expect("updated server message present")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            message.contains("Code intelligence ready"),
+            "footer message must reflect the updated overview; got: {message}"
+        );
+    }
+
+    /// The overview is keyed by (host_id, project_id): an overview for the same
+    /// project id on a *different* host must not render under the active project.
+    /// Only the owning host's overview shows.
+    #[wasm_bindgen_test]
+    async fn footer_overview_is_scoped_to_owning_host() {
+        let container = make_container();
+        // Active project is (h1, proj-1); mount with no overview yet.
+        let holder = mount_footer(container.clone(), None);
+        next_tick().await;
+        assert_eq!(label_text(&container), "Code Intel: Loading…");
+
+        let state = holder.borrow().clone().expect("state captured at mount");
+        // Wrong-host overview for the same project id must be ignored.
+        state.code_intel_overview.update(|m| {
+            m.insert(
+                ActiveProjectRef {
+                    host_id: "other-host".to_owned(),
+                    project_id: ProjectId("proj-1".to_owned()),
+                },
+                CodeIntelOverviewPayload {
+                    roots: vec![root(
+                        "/repo",
+                        vec![provider(
+                            "rust-analyzer",
+                            "rust",
+                            CodeIntelState::Ready,
+                            None,
+                        )],
+                    )],
+                    summary: summary(CodeIntelOverviewHeadline::Ready, [1, 0, 0, 0, 0], None),
+                },
+            );
+        });
+        next_tick().await;
+        assert_eq!(
+            label_text(&container),
+            "Code Intel: Loading…",
+            "an overview from another host must not render under the active project"
+        );
+
+        // Owning-host overview renders.
+        state.code_intel_overview.update(|m| {
+            m.insert(
+                ActiveProjectRef {
+                    host_id: "h1".to_owned(),
+                    project_id: ProjectId("proj-1".to_owned()),
+                },
+                CodeIntelOverviewPayload {
+                    roots: vec![root("/repo", vec![])],
+                    summary: summary(
+                        CodeIntelOverviewHeadline::NotStarted,
+                        [0, 0, 0, 0, 0],
+                        Some("No language server running — open a file to index"),
+                    ),
+                },
+            );
+        });
+        next_tick().await;
+        assert_eq!(label_text(&container), "Code Intel: Not started");
+    }
 }
