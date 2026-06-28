@@ -13302,6 +13302,29 @@ for raw_line in sys.stdin:
             .and_then(|usage| usage.get("total_tokens"))
             .and_then(Value::as_u64)
             .expect("Expected cumulative usage.total_tokens from result event");
+        eprintln!(
+            "LIVE_CLAUDE_TOKEN_USAGE first_usage={} first_cumulative={} second_usage={} second_cumulative={}",
+            first_summary
+                .usage
+                .as_ref()
+                .map(Value::to_string)
+                .unwrap_or_else(|| "null".to_string()),
+            first_summary
+                .result_cumulative_usage
+                .as_ref()
+                .map(Value::to_string)
+                .unwrap_or_else(|| "null".to_string()),
+            second_summary
+                .usage
+                .as_ref()
+                .map(Value::to_string)
+                .unwrap_or_else(|| "null".to_string()),
+            second_summary
+                .result_cumulative_usage
+                .as_ref()
+                .map(Value::to_string)
+                .unwrap_or_else(|| "null".to_string())
+        );
         assert!(
             cumulative_total >= turn_total,
             "Expected cumulative session usage ({cumulative_total}) to be >= per-turn usage ({turn_total})"

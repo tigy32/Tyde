@@ -8,13 +8,15 @@ use std::time::{Duration, Instant};
 
 use fixture::Fixture;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode, AgentOrigin, AgentStartPayload,
-    BackendKind, ChatEvent, CommandErrorPayload, CustomAgentId, Envelope, FrameKind,
-    HostSettingValue, ImageData, ListSessionsPayload, MessageMetadataUpdateData, MessageSender,
-    NewAgentPayload, ProtocolValidator, SessionId, SessionListPayload, SessionSchemaEntry,
-    SessionSchemasPayload, SessionSettingFieldType, SessionSettingValue, SessionSettingsValues,
-    SessionSummary, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint,
-    StreamPath, ToolExecutionCompletedData, ToolRequest, ToolRequestType,
+    AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorCode,
+    AgentOrigin, AgentStartPayload, BackendKind, ChatEvent, ChatMessage, CommandErrorPayload,
+    CustomAgentId, Envelope, FrameKind, HostSettingValue, ImageData, ListSessionsPayload,
+    MessageMetadataUpdateData, MessageSender, NewAgentPayload, ProtocolValidator, SessionId,
+    SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsValues, SessionSummary, SetSettingPayload,
+    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, TokenUsage,
+    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolRequest, ToolRequestType,
+    TurnTokenUsage,
 };
 use server::backend::Backend;
 use uuid::Uuid;
@@ -1922,6 +1924,530 @@ struct AssistantTurn {
     delta_count: usize,
 }
 
+#[derive(Debug)]
+struct FoldedTokenTurn {
+    message: ChatMessage,
+    stats_total: TokenUsage,
+}
+
+#[derive(Debug)]
+struct KnownTokenTurn {
+    this_turn: TokenUsage,
+    agent_total: TokenUsage,
+    stats_total: TokenUsage,
+}
+
+fn token_sum(first: &TokenUsage, second: &TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: first.input_tokens.saturating_add(second.input_tokens),
+        output_tokens: first.output_tokens.saturating_add(second.output_tokens),
+        total_tokens: first.total_tokens.saturating_add(second.total_tokens),
+        cached_prompt_tokens: optional_token_sum(
+            first.cached_prompt_tokens,
+            second.cached_prompt_tokens,
+        ),
+        cache_creation_input_tokens: optional_token_sum(
+            first.cache_creation_input_tokens,
+            second.cache_creation_input_tokens,
+        ),
+        reasoning_tokens: optional_token_sum(first.reasoning_tokens, second.reasoning_tokens),
+    }
+}
+
+fn optional_token_sum(first: Option<u64>, second: Option<u64>) -> Option<u64> {
+    match (first, second) {
+        (None, None) => None,
+        (first, second) => Some(first.unwrap_or(0).saturating_add(second.unwrap_or(0))),
+    }
+}
+
+fn format_token_usage(usage: &TokenUsage) -> String {
+    format!(
+        "input={} output={} total={} cached={} cache_creation={} reasoning={}",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.total_tokens,
+        usage.cached_prompt_tokens.unwrap_or(0),
+        usage.cache_creation_input_tokens.unwrap_or(0),
+        usage.reasoning_tokens.unwrap_or(0)
+    )
+}
+
+fn assert_token_usage_sane(context: &str, usage: &TokenUsage) {
+    assert!(
+        usage.total_tokens >= usage.input_tokens,
+        "{context}: total tokens must be >= input tokens: {usage:?}"
+    );
+    assert!(
+        usage.total_tokens >= usage.output_tokens,
+        "{context}: total tokens must be >= output tokens: {usage:?}"
+    );
+    if let Some(reasoning_tokens) = usage.reasoning_tokens {
+        assert!(
+            usage.total_tokens >= reasoning_tokens,
+            "{context}: total tokens must be >= reasoning tokens: {usage:?}"
+        );
+    }
+}
+
+fn fold_metadata_update_into_message(message: &mut ChatMessage, update: MessageMetadataUpdateData) {
+    assert_eq!(
+        message.message_id.as_ref(),
+        Some(&update.message_id),
+        "metadata update must target the folded assistant message"
+    );
+
+    if let Some(model_info) = update.model_info {
+        message.model_info = Some(model_info);
+    }
+    if let Some(token_usage) = update.token_usage {
+        message.token_usage = Some(token_usage);
+    }
+    if let Some(turn_token_usage) = update.turn_token_usage {
+        message.turn_token_usage = Some(turn_token_usage);
+    }
+    if let Some(context_breakdown) = update.context_breakdown {
+        message.context_breakdown = Some(context_breakdown);
+    }
+}
+
+fn fold_pending_metadata_updates(
+    message: &mut ChatMessage,
+    pending_metadata_updates: &mut Vec<MessageMetadataUpdateData>,
+) {
+    let mut still_pending = Vec::new();
+    for update in pending_metadata_updates.drain(..) {
+        if message.message_id.as_ref() == Some(&update.message_id) {
+            fold_metadata_update_into_message(message, update);
+        } else {
+            still_pending.push(update);
+        }
+    }
+    *pending_metadata_updates = still_pending;
+}
+
+fn known_turn_from_folded(
+    backend_kind: BackendKind,
+    turn_index: usize,
+    folded: &FoldedTokenTurn,
+) -> KnownTokenTurn {
+    let TurnTokenUsage::Known {
+        this_turn,
+        agent_total,
+    } = folded.message.turn_token_usage.as_ref().unwrap_or_else(|| {
+        panic!(
+            "{} turn {turn_index} missing turn_token_usage on folded message: {:?}",
+            backend_label(backend_kind),
+            folded.message
+        )
+    })
+    else {
+        panic!(
+            "{} turn {turn_index} reported unavailable token usage on folded message: {:?}",
+            backend_label(backend_kind),
+            folded.message
+        );
+    };
+
+    let this_turn = (**this_turn).clone();
+    let agent_total = (**agent_total).clone();
+    assert_eq!(
+        folded.message.token_usage.as_ref(),
+        Some(&this_turn),
+        "{} turn {turn_index}: ChatMessage.token_usage must match TurnTokenUsage::Known.this_turn",
+        backend_label(backend_kind)
+    );
+    assert!(
+        this_turn.total_tokens > 0,
+        "{} turn {turn_index}: this_turn.total_tokens must be positive: {:?}",
+        backend_label(backend_kind),
+        this_turn
+    );
+    assert_token_usage_sane(
+        &format!(
+            "{} turn {turn_index} this_turn",
+            backend_label(backend_kind)
+        ),
+        &this_turn,
+    );
+    assert_token_usage_sane(
+        &format!(
+            "{} turn {turn_index} agent_total",
+            backend_label(backend_kind)
+        ),
+        &agent_total,
+    );
+    assert_eq!(
+        folded.stats_total,
+        agent_total,
+        "{} turn {turn_index}: AgentActivityStats.token_usage must mirror agent_total",
+        backend_label(backend_kind)
+    );
+
+    eprintln!(
+        "TOKEN_USAGE {} turn {} this_turn={} agent_total={} stats_total={}",
+        backend_label(backend_kind),
+        turn_index,
+        format_token_usage(&this_turn),
+        format_token_usage(&agent_total),
+        format_token_usage(&folded.stats_total)
+    );
+
+    KnownTokenTurn {
+        this_turn,
+        agent_total,
+        stats_total: folded.stats_total.clone(),
+    }
+}
+
+fn assert_unavailable_folded_turn(
+    backend_kind: BackendKind,
+    turn_index: usize,
+    folded: &FoldedTokenTurn,
+) {
+    assert!(
+        folded.message.token_usage.is_none(),
+        "{} turn {turn_index}: non-reporting backend should not fabricate ChatMessage.token_usage: {:?}",
+        backend_label(backend_kind),
+        folded.message.token_usage
+    );
+    match folded.message.turn_token_usage.as_ref() {
+        Some(TurnTokenUsage::Unavailable {
+            reason: TokenUsageUnavailableReason::BackendDidNotReport,
+        }) => {}
+        other => panic!(
+            "{} turn {turn_index}: expected TurnTokenUsage::Unavailable(BackendDidNotReport), got {other:?}",
+            backend_label(backend_kind)
+        ),
+    }
+    assert_eq!(
+        folded.stats_total,
+        TokenUsage::default(),
+        "{} turn {turn_index}: non-reporting backend should leave AgentActivityStats.token_usage at zero",
+        backend_label(backend_kind)
+    );
+    eprintln!(
+        "TOKEN_USAGE {} turn {} unavailable reason=BackendDidNotReport stats_total={}",
+        backend_label(backend_kind),
+        turn_index,
+        format_token_usage(&folded.stats_total)
+    );
+}
+
+async fn expect_folded_token_turn_after_user_echo(
+    client: &mut ValidatedConnection,
+    agent_stream: &StreamPath,
+    prompt: &str,
+    backend_kind: BackendKind,
+    turn_index: usize,
+) -> FoldedTokenTurn {
+    let mut got_user_message_echo = false;
+    let mut got_stream_start = false;
+    let mut saw_typing_false = false;
+    let mut streamed_text = String::new();
+    let mut final_message = None::<ChatMessage>;
+    let mut pending_metadata_updates = Vec::new();
+    let mut latest_stats = None::<TokenUsage>;
+
+    while !saw_typing_false {
+        let context = format!(
+            "{} cumulative token turn {turn_index} event",
+            backend_label(backend_kind)
+        );
+        let env = expect_next_event(client, &context).await;
+        if env.stream != *agent_stream {
+            continue;
+        }
+
+        match env.kind {
+            FrameKind::AgentActivityStats => {
+                let payload: AgentActivityStatsPayload = env
+                    .parse_payload()
+                    .expect("parse AgentActivityStats payload");
+                latest_stats = Some(payload.stats.token_usage);
+            }
+            FrameKind::ChatEvent => {
+                let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+                match event {
+                    ChatEvent::MessageAdded(message) => {
+                        if matches!(message.sender, MessageSender::User)
+                            && message.content == prompt
+                        {
+                            got_user_message_echo = true;
+                        } else if got_user_message_echo
+                            && matches!(message.sender, MessageSender::Error)
+                        {
+                            panic!(
+                                "{} returned error instead of assistant response for prompt {:?}: {}",
+                                backend_label(backend_kind),
+                                prompt,
+                                message.content
+                            );
+                        }
+                    }
+                    ChatEvent::StreamStart(_) => {
+                        if got_user_message_echo {
+                            got_stream_start = true;
+                            streamed_text.clear();
+                        }
+                    }
+                    ChatEvent::StreamDelta(delta) => {
+                        if got_stream_start {
+                            streamed_text.push_str(&delta.text);
+                        }
+                    }
+                    ChatEvent::StreamEnd(data) => {
+                        if !got_user_message_echo {
+                            continue;
+                        }
+                        assert!(
+                            got_stream_start,
+                            "{} turn {turn_index}: received StreamEnd before StreamStart",
+                            backend_label(backend_kind)
+                        );
+                        let mut message = data.message;
+                        if message.content.trim().is_empty() {
+                            message.content = streamed_text.clone();
+                        }
+                        fold_pending_metadata_updates(&mut message, &mut pending_metadata_updates);
+                        final_message = Some(message);
+                    }
+                    ChatEvent::MessageMetadataUpdated(update) => {
+                        if !got_user_message_echo {
+                            continue;
+                        }
+                        if let Some(message) = final_message.as_mut() {
+                            if message.message_id.as_ref() == Some(&update.message_id) {
+                                fold_metadata_update_into_message(message, update);
+                            } else {
+                                pending_metadata_updates.push(update);
+                            }
+                        } else {
+                            pending_metadata_updates.push(update);
+                        }
+                    }
+                    ChatEvent::TypingStatusChanged(false) => {
+                        if got_user_message_echo {
+                            saw_typing_false = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            FrameKind::AgentError => {
+                panic!(
+                    "{} turn {turn_index}: received AgentError: {:?}",
+                    backend_label(backend_kind),
+                    env.payload
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let message = final_message.unwrap_or_else(|| {
+        panic!(
+            "{} turn {turn_index}: typing stopped before assistant StreamEnd",
+            backend_label(backend_kind)
+        )
+    });
+    assert!(
+        !message.content.trim().is_empty(),
+        "{} turn {turn_index}: expected non-empty assistant response",
+        backend_label(backend_kind)
+    );
+    let stats_total = latest_stats.unwrap_or_else(|| {
+        panic!(
+            "{} turn {turn_index}: expected AgentActivityStats before typing stopped",
+            backend_label(backend_kind)
+        )
+    });
+
+    FoldedTokenTurn {
+        message,
+        stats_total,
+    }
+}
+
+async fn backend_ready_or_skip(backend_kind: BackendKind) -> bool {
+    if !backend_binary_available(backend_kind) {
+        eprintln!("SKIPPED: {} not installed", backend_label(backend_kind));
+        return false;
+    }
+    if !backend_runtime_available(backend_kind) {
+        eprintln!(
+            "SKIPPED: {} not runnable in current environment",
+            backend_label(backend_kind)
+        );
+        return false;
+    }
+    if let Err(reason) = probe_backend_runtime(backend_kind).await {
+        eprintln!(
+            "SKIPPED: {} failed readiness probe: {}",
+            backend_label(backend_kind),
+            reason
+        );
+        return false;
+    }
+    true
+}
+
+async fn assert_backend_reports_cumulative_turn_token_usage(backend_kind: BackendKind) {
+    let mut fixture = RealBackendFixture::new().await;
+    let workspace_roots = fixture.workspace_roots();
+    let first_prompt = "Say hi in one word.";
+    let agent_stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "cumulative-token-usage",
+        first_prompt,
+    )
+    .await;
+    let first = expect_folded_token_turn_after_user_echo(
+        &mut fixture.client,
+        &agent_stream,
+        first_prompt,
+        backend_kind,
+        1,
+    )
+    .await;
+    let first = known_turn_from_folded(backend_kind, 1, &first);
+    assert_eq!(
+        first.agent_total,
+        first.this_turn,
+        "{} first turn agent_total must equal this_turn across all token fields",
+        backend_label(backend_kind)
+    );
+    assert_eq!(
+        first.stats_total,
+        first.agent_total,
+        "{} first turn stats_total must equal agent_total",
+        backend_label(backend_kind)
+    );
+
+    let second_prompt = "Say bye in one word.";
+    fixture
+        .client
+        .send_message(&agent_stream, second_prompt.to_owned())
+        .await
+        .expect("send second cumulative token prompt");
+    let second = expect_folded_token_turn_after_user_echo(
+        &mut fixture.client,
+        &agent_stream,
+        second_prompt,
+        backend_kind,
+        2,
+    )
+    .await;
+    let second = known_turn_from_folded(backend_kind, 2, &second);
+    let expected_total = token_sum(&first.this_turn, &second.this_turn);
+    assert_eq!(
+        second.agent_total,
+        expected_total,
+        "{} second turn agent_total must equal the sum of per-turn deltas",
+        backend_label(backend_kind)
+    );
+    assert!(
+        second.agent_total.total_tokens > first.agent_total.total_tokens,
+        "{} second cumulative total must grow beyond the first turn: first={}, second={}",
+        backend_label(backend_kind),
+        first.agent_total.total_tokens,
+        second.agent_total.total_tokens
+    );
+    assert!(
+        second.agent_total.total_tokens > second.this_turn.total_tokens,
+        "{} second agent_total must be cumulative, not a raw per-turn leak: this_turn={}, agent_total={}",
+        backend_label(backend_kind),
+        second.this_turn.total_tokens,
+        second.agent_total.total_tokens
+    );
+}
+
+async fn assert_backend_turn_usage_contract_if_reported(backend_kind: BackendKind) {
+    let mut fixture = RealBackendFixture::new().await;
+    let workspace_roots = fixture.workspace_roots();
+    let first_prompt = "Say hi in one word.";
+    let agent_stream = spawn_agent_via_protocol(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "optional-cumulative-token-usage",
+        first_prompt,
+    )
+    .await;
+    let first = expect_folded_token_turn_after_user_echo(
+        &mut fixture.client,
+        &agent_stream,
+        first_prompt,
+        backend_kind,
+        1,
+    )
+    .await;
+
+    let second_prompt = "Say bye in one word.";
+    fixture
+        .client
+        .send_message(&agent_stream, second_prompt.to_owned())
+        .await
+        .expect("send second optional token prompt");
+    let second = expect_folded_token_turn_after_user_echo(
+        &mut fixture.client,
+        &agent_stream,
+        second_prompt,
+        backend_kind,
+        2,
+    )
+    .await;
+
+    match (
+        first.message.turn_token_usage.as_ref(),
+        second.message.turn_token_usage.as_ref(),
+    ) {
+        (Some(TurnTokenUsage::Known { .. }), Some(TurnTokenUsage::Known { .. })) => {
+            let first = known_turn_from_folded(backend_kind, 1, &first);
+            let second = known_turn_from_folded(backend_kind, 2, &second);
+            assert_eq!(
+                first.agent_total,
+                first.this_turn,
+                "{} first turn agent_total must equal this_turn across all token fields",
+                backend_label(backend_kind)
+            );
+            assert_eq!(
+                second.agent_total,
+                token_sum(&first.this_turn, &second.this_turn),
+                "{} second turn agent_total must equal the sum of per-turn deltas",
+                backend_label(backend_kind)
+            );
+            assert!(
+                second.agent_total.total_tokens > first.agent_total.total_tokens,
+                "{} second cumulative total must grow beyond the first turn",
+                backend_label(backend_kind)
+            );
+            assert!(
+                second.agent_total.total_tokens > second.this_turn.total_tokens,
+                "{} second agent_total must be cumulative",
+                backend_label(backend_kind)
+            );
+        }
+        (
+            Some(TurnTokenUsage::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport,
+            }),
+            Some(TurnTokenUsage::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport,
+            }),
+        ) => {
+            assert_unavailable_folded_turn(backend_kind, 1, &first);
+            assert_unavailable_folded_turn(backend_kind, 2, &second);
+        }
+        other => panic!(
+            "{} reported inconsistent token usage availability across two turns: {other:?}",
+            backend_label(backend_kind)
+        ),
+    }
+}
+
 struct AssistantTurnWithTyping {
     final_text: String,
     delta_count: usize,
@@ -2994,6 +3520,50 @@ async fn assert_backend_interrupts_long_running_command(
 // ---------------------------------------------------------------------------
 // Real backend tests — opt-in because they can make real AI calls
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+async fn real_claude_cumulative_turn_token_usage() {
+    let backend_kind = BackendKind::Claude;
+    if !backend_ready_or_skip(backend_kind).await {
+        return;
+    }
+
+    assert_backend_reports_cumulative_turn_token_usage(backend_kind).await;
+}
+
+#[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+async fn real_codex_cumulative_turn_token_usage() {
+    let backend_kind = BackendKind::Codex;
+    if !backend_ready_or_skip(backend_kind).await {
+        return;
+    }
+
+    assert_backend_reports_cumulative_turn_token_usage(backend_kind).await;
+}
+
+#[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+async fn real_kiro_turn_token_usage_contract_if_reported() {
+    let backend_kind = BackendKind::Kiro;
+    if !backend_ready_or_skip(backend_kind).await {
+        return;
+    }
+
+    assert_backend_turn_usage_contract_if_reported(backend_kind).await;
+}
+
+#[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+async fn real_tycode_cumulative_turn_token_usage() {
+    let backend_kind = BackendKind::Tycode;
+    if !backend_ready_or_skip(backend_kind).await {
+        return;
+    }
+
+    assert_backend_reports_cumulative_turn_token_usage(backend_kind).await;
+}
 
 #[tokio::test]
 #[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
