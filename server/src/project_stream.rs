@@ -985,9 +985,10 @@ fn summarize_code_intel_overview(roots: &[CodeIntelRootOverview]) -> CodeIntelOv
         CodeIntelOverviewHeadline::Ready
     };
     let message = match headline {
-        CodeIntelOverviewHeadline::NotStarted => {
-            Some("No language server running — open a file to index".to_owned())
-        }
+        CodeIntelOverviewHeadline::NotStarted => Some(
+            "No language server running — select the project or launch an agent to index"
+                .to_owned(),
+        ),
         CodeIntelOverviewHeadline::Failed => Some("Code intelligence failed".to_owned()),
         CodeIntelOverviewHeadline::Unavailable => Some("Language server unavailable".to_owned()),
         CodeIntelOverviewHeadline::Indexing => Some("Indexing code intelligence".to_owned()),
@@ -2850,7 +2851,7 @@ mod tests {
         assert_eq!(overview.summary.indexing, 0);
         assert_eq!(
             overview.summary.message.as_deref(),
-            Some("No language server running — open a file to index")
+            Some("No language server running — select the project or launch an agent to index")
         );
     }
 

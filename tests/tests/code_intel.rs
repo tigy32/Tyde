@@ -6,12 +6,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fixture::Fixture;
+use protocol::BackendKind;
 use protocol::{
-    CodeIntelErrorCode, CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelOverviewHeadline,
-    CodeIntelOverviewPayload, CodeIntelProviderId, CodeIntelState, CodeIntelStatusPayload,
+    CodeIntelErrorCode, CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelLanguageId,
+    CodeIntelOverviewHeadline, CodeIntelOverviewPayload, CodeIntelProviderId,
+    CodeIntelProviderStatus, CodeIntelState, CodeIntelStatusPayload, CodeIntelStatusScope,
     CodeIntelSubscribeFilePayload, Envelope, FrameKind, HostExecutablePath, HostSettingValue,
-    HostSettingsPayload, Project, ProjectCreatePayload, ProjectId, ProjectNotifyPayload,
-    ProjectPath, ProjectRootPath, SetSettingPayload, StreamPath, read_envelope, write_envelope,
+    HostSettingsPayload, Project, ProjectCreatePayload, ProjectFileVersion, ProjectId,
+    ProjectNotifyPayload, ProjectPath, ProjectRootPath, SetSettingPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamPath, read_envelope, write_envelope,
 };
 
 #[cfg(unix)]
@@ -254,6 +257,13 @@ async fn wait_for_code_intel_unavailable(
             | FrameKind::CodeIntelOverview
             | FrameKind::ProjectEvent
             | FrameKind::HostSettings
+            | FrameKind::NewAgent
+            | FrameKind::AgentBootstrap
+            | FrameKind::AgentStart
+            | FrameKind::AgentError
+            | FrameKind::AgentActivitySummary
+            | FrameKind::AgentActivityStats
+            | FrameKind::ChatEvent
             | FrameKind::SessionSchemas
             | FrameKind::BackendSetup
             | FrameKind::QueuedMessages
@@ -319,6 +329,13 @@ async fn wait_for_code_intel_unavailable_with_overview(
             | FrameKind::ProjectGitStatus
             | FrameKind::ProjectEvent
             | FrameKind::HostSettings
+            | FrameKind::NewAgent
+            | FrameKind::AgentBootstrap
+            | FrameKind::AgentStart
+            | FrameKind::AgentError
+            | FrameKind::AgentActivitySummary
+            | FrameKind::AgentActivityStats
+            | FrameKind::ChatEvent
             | FrameKind::SessionSchemas
             | FrameKind::BackendSetup
             | FrameKind::QueuedMessages
@@ -331,6 +348,82 @@ async fn wait_for_code_intel_unavailable_with_overview(
         }
     }
     (unavailable.unwrap(), error.unwrap(), overview.unwrap())
+}
+
+fn overview_provider_status<'a>(
+    overview: &'a CodeIntelOverviewPayload,
+    root: &ProjectRootPath,
+    provider: &CodeIntelProviderId,
+) -> Option<&'a CodeIntelProviderStatus> {
+    overview
+        .roots
+        .iter()
+        .find(|root_overview| &root_overview.root == root)
+        .and_then(|root_overview| {
+            root_overview
+                .providers
+                .iter()
+                .find(|provider_status| &provider_status.provider == provider)
+        })
+}
+
+async fn wait_for_code_intel_warm_unavailable_overview(
+    client: &mut client::Connection,
+    root: &ProjectRootPath,
+    provider: &CodeIntelProviderId,
+) -> CodeIntelOverviewPayload {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for code-intel warm unavailable overview"
+        );
+        let env = next_raw_event(client, "code-intel warm overview").await;
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        match env.kind {
+            FrameKind::CodeIntelOverview => {
+                let payload: CodeIntelOverviewPayload =
+                    env.parse_payload().expect("parse CodeIntelOverviewPayload");
+                let provider_unavailable = payload.summary.headline
+                    == CodeIntelOverviewHeadline::Unavailable
+                    && overview_provider_status(&payload, root, provider).is_some_and(
+                        |provider_status| provider_status.state == CodeIntelState::Unavailable,
+                    );
+                if provider_unavailable {
+                    return payload;
+                }
+            }
+            FrameKind::CodeIntelStatus | FrameKind::CodeIntelError => {
+                panic!(
+                    "warm without file subscription must surface through CodeIntelOverview only, got {} on {}",
+                    env.kind, env.stream
+                );
+            }
+            FrameKind::ProjectBootstrap
+            | FrameKind::ProjectFileList
+            | FrameKind::ProjectGitStatus
+            | FrameKind::ProjectEvent
+            | FrameKind::HostSettings
+            | FrameKind::NewAgent
+            | FrameKind::AgentBootstrap
+            | FrameKind::AgentStart
+            | FrameKind::AgentError
+            | FrameKind::AgentActivitySummary
+            | FrameKind::AgentActivityStats
+            | FrameKind::ChatEvent
+            | FrameKind::SessionSchemas
+            | FrameKind::BackendSetup
+            | FrameKind::QueuedMessages
+            | FrameKind::SessionSettings
+            | FrameKind::TeamPresetCatalogNotify
+            | FrameKind::SessionList
+            | FrameKind::WorkflowNotify
+            | FrameKind::AgentsViewPreferencesNotify => {}
+            other => panic!("unexpected frame while waiting for warm overview: {other}"),
+        }
+    }
 }
 
 async fn wait_for_code_intel_status_matching(
@@ -417,6 +510,74 @@ async fn wait_for_code_intel_overview_matching(
     }
 }
 
+async fn assert_no_code_intel_warm_events(client: &mut client::Connection, context: &str) {
+    loop {
+        match tokio::time::timeout(
+            Duration::from_millis(250),
+            read_envelope(&mut client.reader),
+        )
+        .await
+        {
+            Err(_) => return,
+            Ok(Ok(None)) => return,
+            Ok(Err(err)) => panic!("read_envelope failed while checking {context}: {err:?}"),
+            Ok(Ok(Some(env))) => {
+                client
+                    .incoming_seq
+                    .validate(&env.stream, env.seq, env.kind)
+                    .expect("incoming sequence must be valid");
+                if fixture::is_builtin_team_custom_agent_notify(&env) {
+                    continue;
+                }
+                match env.kind {
+                    FrameKind::CodeIntelOverview
+                    | FrameKind::CodeIntelStatus
+                    | FrameKind::CodeIntelError => {
+                        panic!(
+                            "unexpected code-intel warm event while checking {context}: kind={} stream={}",
+                            env.kind, env.stream
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn assert_no_direct_code_intel_warm_frames(client: &mut client::Connection, context: &str) {
+    loop {
+        match tokio::time::timeout(
+            Duration::from_millis(250),
+            read_envelope(&mut client.reader),
+        )
+        .await
+        {
+            Err(_) => return,
+            Ok(Ok(None)) => return,
+            Ok(Err(err)) => panic!("read_envelope failed while checking {context}: {err:?}"),
+            Ok(Ok(Some(env))) => {
+                client
+                    .incoming_seq
+                    .validate(&env.stream, env.seq, env.kind)
+                    .expect("incoming sequence must be valid");
+                if fixture::is_builtin_team_custom_agent_notify(&env) {
+                    continue;
+                }
+                match env.kind {
+                    FrameKind::CodeIntelStatus | FrameKind::CodeIntelError => {
+                        panic!(
+                            "unexpected direct code-intel warm frame while checking {context}: kind={} stream={}",
+                            env.kind, env.stream
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn project_subscribe_emits_idle_code_intel_overview_for_all_roots() {
     let mut fixture = Fixture::new().await;
@@ -461,8 +622,215 @@ async fn project_subscribe_emits_idle_code_intel_overview_for_all_roots() {
     assert_eq!(overview.summary.starting, 0);
     assert_eq!(
         overview.summary.message.as_deref(),
-        Some("No language server running — open a file to index")
+        Some("No language server running — select the project or launch an agent to index")
     );
+}
+
+#[tokio::test]
+async fn project_bootstrap_with_markers_does_not_start_code_intel() {
+    let mut fixture = Fixture::new().await;
+    let missing_path = tempfile::tempdir()
+        .expect("create configured path tempdir")
+        .path()
+        .join("missing-rust-analyzer");
+    set_rust_analyzer_path(
+        &mut fixture.client,
+        Some(HostExecutablePath(
+            missing_path.to_string_lossy().into_owned(),
+        )),
+    )
+    .await;
+
+    let root = tempfile::tempdir().expect("create root");
+    fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"ci_lazy_bootstrap\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    let root_path = ProjectRootPath(root.path().to_string_lossy().into_owned());
+
+    fixture
+        .client
+        .project_create(ProjectCreatePayload {
+            name: "Code Intel Lazy Bootstrap".to_owned(),
+            roots: vec![root_path.clone()],
+        })
+        .await
+        .expect("project_create failed");
+    let _ = expect_project_notify(&mut fixture.client, "project create").await;
+    expect_project_bootstrap(&mut fixture.client, "initial project bootstrap").await;
+    let overview = wait_for_code_intel_overview_matching(
+        &mut fixture.client,
+        "bootstrap-only overview",
+        |overview| {
+            overview.summary.headline == CodeIntelOverviewHeadline::NotStarted
+                && overview
+                    .roots
+                    .iter()
+                    .any(|root| root.root == root_path && root.providers.is_empty())
+        },
+    )
+    .await;
+    assert_eq!(overview.summary.ready, 0);
+    assert_eq!(overview.summary.starting, 0);
+    assert_eq!(overview.summary.unavailable, 0);
+    assert_no_code_intel_warm_events(&mut fixture.client, "bootstrap-only project").await;
+}
+
+#[tokio::test]
+async fn project_accessed_warms_code_intel_without_file_subscribe_and_is_idempotent() {
+    let mut fixture = Fixture::new().await;
+    let missing_path = tempfile::tempdir()
+        .expect("create configured path tempdir")
+        .path()
+        .join("missing-rust-analyzer");
+    let missing_path_text = missing_path.to_string_lossy().into_owned();
+    set_rust_analyzer_path(
+        &mut fixture.client,
+        Some(HostExecutablePath(missing_path_text.clone())),
+    )
+    .await;
+
+    let workspace = tempfile::tempdir().expect("create workspace");
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"ci_project_accessed\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    fs::create_dir_all(workspace.path().join("src")).expect("create src");
+    fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("write main.rs");
+    let project = create_project_with_root(&mut fixture.client, workspace.path()).await;
+    let root = ProjectRootPath(workspace.path().to_string_lossy().into_owned());
+    let provider = CodeIntelProviderId("rust-analyzer".to_owned());
+    let file_path = ProjectPath {
+        root: root.clone(),
+        relative_path: "src/main.rs".to_owned(),
+    };
+
+    fixture
+        .client
+        .project_accessed(&project.id)
+        .await
+        .expect("project_accessed failed");
+    let overview =
+        wait_for_code_intel_warm_unavailable_overview(&mut fixture.client, &root, &provider).await;
+    let overview_provider = overview_provider_status(&overview, &root, &provider)
+        .expect("warm provider status in overview");
+    assert_eq!(
+        overview_provider.language,
+        CodeIntelLanguageId("rust".to_owned())
+    );
+    assert_eq!(overview_provider.state, CodeIntelState::Unavailable);
+    let overview_message = overview_provider
+        .message
+        .as_deref()
+        .expect("warm provider overview message");
+    assert!(
+        overview_message.contains(&missing_path_text),
+        "warm overview should name configured path, got {overview_provider:?}"
+    );
+    assert_eq!(
+        overview.summary.headline,
+        CodeIntelOverviewHeadline::Unavailable
+    );
+    assert_no_direct_code_intel_warm_frames(&mut fixture.client, "first project access").await;
+
+    fixture
+        .client
+        .project_accessed(&project.id)
+        .await
+        .expect("second project_accessed failed");
+    assert_no_code_intel_warm_events(&mut fixture.client, "second project access").await;
+
+    send_code_intel_subscribe(&mut fixture.client, &project.id, file_path.clone()).await;
+    let status = wait_for_code_intel_status_matching(
+        &mut fixture.client,
+        "post-warm file subscribe",
+        |status| {
+            status.state == CodeIntelState::Unavailable
+                && matches!(
+                    &status.scope,
+                    CodeIntelStatusScope::File { path, version }
+                        if path == &file_path && *version == ProjectFileVersion(0)
+                )
+        },
+    )
+    .await;
+    assert!(
+        status
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains(&missing_path_text)),
+        "post-warm file status should carry unavailable provider message, got {status:?}"
+    );
+}
+
+#[tokio::test]
+async fn agent_launch_with_project_id_warms_code_intel() {
+    let mut fixture = Fixture::new().await;
+    let missing_path = tempfile::tempdir()
+        .expect("create configured path tempdir")
+        .path()
+        .join("missing-rust-analyzer");
+    let missing_path_text = missing_path.to_string_lossy().into_owned();
+    set_rust_analyzer_path(
+        &mut fixture.client,
+        Some(HostExecutablePath(missing_path_text.clone())),
+    )
+    .await;
+
+    let workspace = tempfile::tempdir().expect("create workspace");
+    fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"ci_agent_launch\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write Cargo.toml");
+    let project = create_project_with_root(&mut fixture.client, workspace.path()).await;
+    let root = ProjectRootPath(workspace.path().to_string_lossy().into_owned());
+    let provider = CodeIntelProviderId("rust-analyzer".to_owned());
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("code-intel-warm".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(project.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![workspace.path().to_string_lossy().into_owned()],
+                prompt: "warm code intelligence".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent failed");
+
+    let overview =
+        wait_for_code_intel_warm_unavailable_overview(&mut fixture.client, &root, &provider).await;
+    let overview_provider = overview_provider_status(&overview, &root, &provider)
+        .expect("agent-launch warm provider status in overview");
+    assert_eq!(
+        overview_provider.language,
+        CodeIntelLanguageId("rust".to_owned())
+    );
+    assert_eq!(overview_provider.state, CodeIntelState::Unavailable);
+    let overview_message = overview_provider
+        .message
+        .as_deref()
+        .expect("agent-launch warm provider overview message");
+    assert!(
+        overview_message.contains(&missing_path_text),
+        "agent-launch warm overview should name configured path, got {overview_provider:?}"
+    );
+    assert_eq!(
+        overview.summary.headline,
+        CodeIntelOverviewHeadline::Unavailable
+    );
+    assert_no_direct_code_intel_warm_frames(&mut fixture.client, "agent-launch warm").await;
 }
 
 #[cfg(unix)]

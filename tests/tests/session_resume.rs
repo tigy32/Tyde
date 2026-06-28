@@ -675,8 +675,8 @@ async fn opening_agent_bootstrap_loads_tail_and_gates_older_history() {
     )
     .await;
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
-    let gate_before_seq = assert_bootstrap_prior_history_indicator(&payload, 5);
-    let expected_tail_strings = (5..55)
+    let gate_before_seq = assert_bootstrap_prior_history_indicator(&payload, 40);
+    let expected_tail_strings = (40..55)
         .map(|index| format!("history {index}"))
         .collect::<Vec<_>>();
     let expected_tail = expected_tail_strings
@@ -693,7 +693,7 @@ async fn opening_agent_bootstrap_loads_tail_and_gates_older_history() {
         2,
     )
     .await;
-    assert_history_page(&first_page, &["history 4", "history 3"], true);
+    assert_history_page(&first_page, &["history 39", "history 38"], true);
     let first_cursor = first_page
         .oldest_seq
         .expect("first history page should include an oldest_seq cursor");
@@ -706,7 +706,7 @@ async fn opening_agent_bootstrap_loads_tail_and_gates_older_history() {
         2,
     )
     .await;
-    assert_history_page(&second_page, &["history 2", "history 1"], true);
+    assert_history_page(&second_page, &["history 37", "history 36"], true);
     let second_cursor = second_page
         .oldest_seq
         .expect("second history page should include an oldest_seq cursor");
@@ -716,10 +716,18 @@ async fn opening_agent_bootstrap_loads_tail_and_gates_older_history() {
         &second_agent_stream,
         new_agent.agent_id.clone(),
         Some(second_cursor),
-        2,
+        50,
     )
     .await;
-    assert_history_page(&third_page, &["history 0"], false);
+    let expected_final_strings = (0..=35)
+        .rev()
+        .map(|index| format!("history {index}"))
+        .collect::<Vec<_>>();
+    let expected_final = expected_final_strings
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_history_page(&third_page, &expected_final, false);
 }
 
 #[tokio::test]
@@ -780,8 +788,8 @@ async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
     )
     .await;
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
-    let gate_before_seq = assert_bootstrap_prior_history_indicator(&payload, 1);
-    let expected_tail_strings = (1..51)
+    let gate_before_seq = assert_bootstrap_prior_history_indicator(&payload, 36);
+    let expected_tail_strings = (36..51)
         .map(|index| format!("prior {index}"))
         .collect::<Vec<_>>();
     let expected_tail = expected_tail_strings
@@ -809,7 +817,14 @@ async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
         10,
     )
     .await;
-    assert_history_page(&first_page, &["prior 0"], false);
+    assert_history_page(
+        &first_page,
+        &[
+            "prior 35", "prior 34", "prior 33", "prior 32", "prior 31", "prior 30", "prior 29",
+            "prior 28", "prior 27", "prior 26",
+        ],
+        true,
+    );
     assert!(
         first_page.events.iter().all(|event| {
             !matches!(

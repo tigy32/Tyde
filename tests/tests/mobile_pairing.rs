@@ -7,7 +7,7 @@ use mqtt_transport::{
     host_to_client_topic,
 };
 use protocol::{
-    BackendKind, BrokerUrl, ChatEvent, CommandErrorPayload, Envelope, FrameKind,
+    BackendKind, BrokerUrl, ChatEvent, CommandErrorCode, CommandErrorPayload, Envelope, FrameKind,
     HostBootstrapPayload, HostSettingValue, ListSessionsPayload, LoadAgentPayload,
     MobileAccessErrorCode, MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState,
     MobilePairingOfferPayload, MobilePairingStartPayload, MobilePairingState, NewAgentPayload,
@@ -236,6 +236,76 @@ async fn load_mobile_agent(client: &mut client::Connection, agent: &NewAgentPayl
     )
     .await;
     let _ = wait_for_kind(client, FrameKind::AgentBootstrap, "mobile AgentBootstrap").await;
+}
+
+#[tokio::test]
+async fn mqtt_mobile_duplicate_load_agent_reports_command_error() {
+    let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
+    let harness = Harness::new().await;
+    let mut desktop = harness.connect_desktop().await;
+    expect_initial_replay(&mut desktop).await;
+
+    desktop
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("mobile duplicate load agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: Vec::new(),
+                prompt: "initial mobile duplicate load prompt".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn duplicate load agent");
+    let _ = wait_for_kind(&mut desktop, FrameKind::NewAgent, "desktop NewAgent").await;
+    let _ = wait_for_chat_stream_end(&mut desktop, "desktop initial StreamEnd").await;
+
+    set_mobile_broker_url(&mut desktop, Some(broker.broker_url.clone())).await;
+    set_mobile_enabled(&mut desktop, true).await;
+    let _ = wait_for_mobile_state(
+        &mut desktop,
+        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
+        "MobileBrokerStatus::Online",
+    )
+    .await;
+    send_mobile_pairing_start(&mut desktop).await;
+
+    let offer_env = wait_for_kind(
+        &mut desktop,
+        FrameKind::MobilePairingOffer,
+        "MobilePairingOffer",
+    )
+    .await;
+    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
+    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
+    let mut mobile = connect_mobile_client(&qr).await;
+    let replayed_agent = expect_mobile_replay(&mut mobile, 0, "mobile duplicate load replay").await;
+
+    load_mobile_agent(&mut mobile, &replayed_agent).await;
+    send_stream_payload(
+        &mut mobile,
+        replayed_agent.instance_stream.clone(),
+        FrameKind::LoadAgent,
+        &LoadAgentPayload {},
+    )
+    .await;
+
+    let error = wait_for_command_error(&mut mobile, "duplicate mobile LoadAgent").await;
+    assert_eq!(error.stream, replayed_agent.instance_stream);
+    assert_eq!(error.request_kind, FrameKind::LoadAgent);
+    assert_eq!(error.operation, "load_agent");
+    assert_eq!(error.code, CommandErrorCode::Conflict);
+    assert!(
+        error.message.contains("already attached"),
+        "unexpected duplicate LoadAgent message: {}",
+        error.message
+    );
 }
 
 #[tokio::test]

@@ -244,7 +244,9 @@ pub fn ChatMessageView(
                     MessageSender::Assistant { agent } => agent.clone(),
                     _ => String::new(),
                 };
-                let badge = e.message.token_usage.as_ref().map(token_badge_data);
+                let badge = this_turn_token_usage(&e.message)
+                    .as_ref()
+                    .map(token_badge_data);
                 let badge_tooltip = badge.as_ref().map(|(_, _, t)| t.clone()).unwrap_or_default();
                 let footer_time = format_relative_time(e.message.timestamp);
                 let footer_content_empty = e.message.content.is_empty();
@@ -291,6 +293,21 @@ pub fn ChatMessageView(
                 })
             }}
         </div>
+    }
+}
+
+/// Resolve the THIS-TURN token usage for a chat row. `token_usage` is the
+/// authoritative this-turn figure; `turn_token_usage` refines it: `Known`
+/// carries the same this-turn figure explicitly (never the cumulative
+/// `agent_total`), and `Unavailable` means the backend reported nothing, so
+/// the row renders no badge rather than a fake-zero one.
+pub(crate) fn this_turn_token_usage(
+    message: &protocol::ChatMessage,
+) -> Option<protocol::TokenUsage> {
+    match &message.turn_token_usage {
+        Some(protocol::TurnTokenUsage::Unavailable { .. }) => None,
+        Some(protocol::TurnTokenUsage::Known { this_turn, .. }) => Some((**this_turn).clone()),
+        None => message.token_usage.clone(),
     }
 }
 
@@ -366,5 +383,171 @@ pub(crate) fn format_compact(n: u64) -> String {
         format!("{:.1}K", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use crate::state::{AppState, ChatMessageEntry, ChatRowHandle};
+    use leptos::mount::mount_to;
+    use protocol::{ChatMessage, TokenUsage, TokenUsageUnavailableReason, TurnTokenUsage};
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        container
+            .set_attribute(
+                "style",
+                "position: fixed; top: 0; left: 0; width: 800px; height: 600px; \
+                 z-index: 2147483647; background: white; \
+                 display: flex; flex-direction: column;",
+            )
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    fn usage(input: u64, output: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            cached_prompt_tokens: None,
+            cache_creation_input_tokens: None,
+            reasoning_tokens: None,
+        }
+    }
+
+    fn assistant_msg(
+        token_usage: Option<TokenUsage>,
+        turn_token_usage: Option<TurnTokenUsage>,
+    ) -> ChatMessageEntry {
+        ChatMessageEntry {
+            message: ChatMessage {
+                message_id: None,
+                timestamp: 0,
+                sender: MessageSender::Assistant {
+                    agent: "codex".to_owned(),
+                },
+                content: "hello".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage,
+                turn_token_usage,
+                context_breakdown: None,
+                images: None,
+            },
+            tool_requests: Vec::new(),
+        }
+    }
+
+    fn mount_message(entry: ChatMessageEntry) -> HtmlElement {
+        let container = make_container();
+        // Leak the mount handle so the component stays mounted after this
+        // helper returns; dropping it would unmount and clear the container.
+        mount_to(container.clone(), move || {
+            let state = AppState::new();
+            provide_context(state);
+            let agent_ref: Signal<Option<crate::state::ActiveAgentRef>> =
+                RwSignal::new(None).into();
+            let row = ChatRowHandle::new(entry.clone());
+            view! { <ChatMessageView agent_ref=agent_ref row=row /> }
+        })
+        .forget();
+        container
+    }
+
+    fn input_stat(container: &HtmlElement) -> Option<String> {
+        container
+            .query_selector(".token-stat-input")
+            .unwrap()
+            .map(|el| el.text_content().unwrap_or_default())
+    }
+
+    fn output_stat(container: &HtmlElement) -> Option<String> {
+        container
+            .query_selector(".token-stat-output")
+            .unwrap()
+            .map(|el| el.text_content().unwrap_or_default())
+    }
+
+    /// The chat row's token badge shows the THIS-TURN figure, never the
+    /// cumulative `agent_total` carried alongside it in `TurnTokenUsage::Known`.
+    #[wasm_bindgen_test]
+    async fn chat_row_shows_this_turn_not_cumulative_total() {
+        // This turn is small; the agent's cumulative total is huge and distinct.
+        let this_turn = usage(1200, 300);
+        let agent_total = usage(999_000, 888_000);
+        let entry = assistant_msg(
+            Some(this_turn.clone()),
+            Some(TurnTokenUsage::Known {
+                this_turn: Box::new(this_turn),
+                agent_total: Box::new(agent_total),
+            }),
+        );
+        let container = mount_message(entry);
+        next_tick().await;
+
+        let input = input_stat(&container).expect("input token stat present");
+        let output = output_stat(&container).expect("output token stat present");
+        assert!(
+            input.contains("1.2K"),
+            "row must show the this-turn input figure: {input}"
+        );
+        assert!(
+            output.contains("300"),
+            "row must show the this-turn output figure: {output}"
+        );
+        // The large cumulative total must not leak into the per-turn badge.
+        assert!(
+            !input.contains("999") && !output.contains("888"),
+            "row must not render the cumulative agent_total: in={input} out={output}"
+        );
+    }
+
+    /// `TurnTokenUsage::Unavailable` means the backend reported nothing this
+    /// turn; the row must render no token badge rather than a fake-zero one,
+    /// even though `token_usage` carries zeros for backward compatibility.
+    #[wasm_bindgen_test]
+    async fn chat_row_unavailable_renders_no_fake_zero_badge() {
+        let entry = assistant_msg(
+            Some(usage(0, 0)),
+            Some(TurnTokenUsage::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport,
+            }),
+        );
+        let container = mount_message(entry);
+        next_tick().await;
+
+        assert!(
+            input_stat(&container).is_none(),
+            "Unavailable turn must not render an input token stat"
+        );
+        assert!(
+            output_stat(&container).is_none(),
+            "Unavailable turn must not render an output token stat"
+        );
+        let body = container.text_content().unwrap_or_default();
+        assert!(
+            !body.contains("\u{2191}0") && !body.contains("\u{2193}0"),
+            "Unavailable turn must not show a fake-zero token badge: {body}"
+        );
     }
 }

@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -540,6 +540,7 @@ pub enum FrameKind {
     ProjectReadFile,
     ProjectSearch,
     ProjectSearchCancel,
+    ProjectAccessed,
     CodeIntelSubscribeFile,
     CodeIntelUnsubscribeFile,
     CodeIntelSetVisibleRange,
@@ -704,6 +705,7 @@ impl fmt::Display for FrameKind {
             Self::ProjectReadFile => f.write_str("project_read_file"),
             Self::ProjectSearch => f.write_str("project_search"),
             Self::ProjectSearchCancel => f.write_str("project_search_cancel"),
+            Self::ProjectAccessed => f.write_str("project_accessed"),
             Self::CodeIntelSubscribeFile => f.write_str("code_intel_subscribe_file"),
             Self::CodeIntelUnsubscribeFile => f.write_str("code_intel_unsubscribe_file"),
             Self::CodeIntelSetVisibleRange => f.write_str("code_intel_set_visible_range"),
@@ -3370,6 +3372,12 @@ pub struct ProjectSearchCancelPayload {
     pub search_id: u64,
 }
 
+/// Client → Server notification that the project backing this `/project/<id>`
+/// stream was selected/accessed by the user. The project id is carried by the
+/// stream path, not duplicated in the payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectAccessedPayload {}
+
 /// A single matching line within a file. `ranges` are byte offsets into
 /// `line_text` (which the server sends verbatim) so the client can slice the
 /// exact same bytes when highlighting — no UTF-8/UTF-16 mismatch.
@@ -4630,6 +4638,8 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolUseData>,
     pub model_info: Option<ModelInfo>,
     pub token_usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_token_usage: Option<TurnTokenUsage>,
     pub context_breakdown: Option<ContextBreakdown>,
     pub images: Option<Vec<ImageData>>,
 }
@@ -4639,6 +4649,8 @@ pub struct MessageMetadataUpdateData {
     pub message_id: ChatMessageId,
     pub model_info: Option<ModelInfo>,
     pub token_usage: Option<TokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_token_usage: Option<TurnTokenUsage>,
     pub context_breakdown: Option<ContextBreakdown>,
 }
 
@@ -4670,6 +4682,24 @@ pub struct TokenUsage {
     pub cached_prompt_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnTokenUsage {
+    Known {
+        this_turn: Box<TokenUsage>,
+        agent_total: Box<TokenUsage>,
+    },
+    Unavailable {
+        reason: TokenUsageUnavailableReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenUsageUnavailableReason {
+    BackendDidNotReport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5027,8 +5057,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_three() {
-        assert_eq!(PROTOCOL_VERSION, 23);
+    fn protocol_version_is_twenty_four() {
+        assert_eq!(PROTOCOL_VERSION, 24);
     }
 
     #[test]
@@ -5131,6 +5161,7 @@ mod search_serde_tests {
             FrameKind::ProjectSearchCancel.to_string(),
             "project_search_cancel"
         );
+        assert_eq!(FrameKind::ProjectAccessed.to_string(), "project_accessed");
         assert_eq!(
             FrameKind::ProjectSearchResults.to_string(),
             "project_search_results"
@@ -5220,6 +5251,20 @@ mod search_serde_tests {
     fn project_search_cancel_round_trip() {
         let payload = ProjectSearchCancelPayload { search_id: 42 };
         assert_eq!(round_trip(&payload), payload);
+    }
+
+    #[test]
+    fn project_accessed_payload_round_trip_empty_payload() {
+        let payload = ProjectAccessedPayload {};
+        let json = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(json, serde_json::json!({}));
+        assert_eq!(round_trip(&payload), payload);
+        let kind_json = serde_json::to_string(&FrameKind::ProjectAccessed).expect("serialize");
+        assert_eq!(kind_json, "\"project_accessed\"");
+        assert_eq!(
+            serde_json::from_str::<FrameKind>(&kind_json).expect("deserialize"),
+            FrameKind::ProjectAccessed
+        );
     }
 
     #[test]

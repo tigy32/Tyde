@@ -181,6 +181,21 @@ pub async fn set_agent_groups(
     .await
 }
 
+/// Tell the host the user opened/selected a project so the server can warm its
+/// code intelligence and restore recent history for that project. Routed on the
+/// project stream (`/project/<project_id>`). The server owns idempotency, so
+/// re-sending on re-selection is harmless.
+#[cfg(target_arch = "wasm32")]
+pub async fn project_accessed(host_id: &str, project_stream: StreamPath) -> Result<(), String> {
+    send_frame(
+        host_id,
+        project_stream,
+        FrameKind::ProjectAccessed,
+        &protocol::ProjectAccessedPayload::default(),
+    )
+    .await
+}
+
 pub async fn close_agent(host_id: &str, agent_stream: StreamPath) -> Result<(), String> {
     send_frame(
         host_id,

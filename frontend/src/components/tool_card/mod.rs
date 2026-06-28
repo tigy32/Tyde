@@ -2225,6 +2225,45 @@ mod live_card_wasm_tests {
         );
     }
 
+    /// The await card's stats line renders `AgentActivityStats.token_usage`
+    /// verbatim — the server-authoritative cumulative agent total. The figure is
+    /// shown exactly as the server reports it, with no client-side summing or
+    /// inference. Seed a cumulative that is far larger than any single turn and
+    /// assert the formatted server value appears as-is.
+    #[wasm_bindgen_test]
+    async fn await_stats_line_shows_server_cumulative_verbatim() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+        );
+        let mut info = agent_info("agent-sub", "Awaited Worker", true);
+        info.activity_summary = AgentActivitySummaryState::Disabled;
+        state.agents.update(|agents| agents.push(info));
+        // Authoritative cumulative total from the server: 900_000 in / 30_000 out.
+        seed_stats(
+            &state,
+            "agent-sub",
+            activity_stats(None, 12, token_usage(900_000, 0, 30_000, 0)),
+        );
+        next_tick().await;
+
+        let stats_line = container
+            .query_selector(".tool-live-agent-stats")
+            .expect("query stats")
+            .expect("await stats line present")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            stats_line.contains("900.0K"),
+            "stats line shows the server cumulative input verbatim: {stats_line}"
+        );
+        assert!(
+            stats_line.contains("30.0K"),
+            "stats line shows the server cumulative output verbatim: {stats_line}"
+        );
+    }
+
     /// The Spawn card shows neither the summary nor the stats line, even when the
     /// server has both for the agent — that progress belongs to the Await card.
     #[wasm_bindgen_test]

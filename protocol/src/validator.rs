@@ -1912,6 +1912,7 @@ mod tests {
             tool_calls: vec![],
             model_info: None,
             token_usage: None,
+            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         }
@@ -1942,6 +1943,7 @@ mod tests {
             tool_calls: vec![],
             model_info: None,
             token_usage: None,
+            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         }
@@ -1972,6 +1974,7 @@ mod tests {
                 cache_creation_input_tokens: Some(0),
                 reasoning_tokens: Some(0),
             }),
+            turn_token_usage: None,
             context_breakdown: None,
         })
     }

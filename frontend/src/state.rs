@@ -2363,6 +2363,9 @@ impl AppState {
             if let Some(token_usage) = update.token_usage {
                 entry.message.token_usage = Some(token_usage);
             }
+            if let Some(turn_token_usage) = update.turn_token_usage {
+                entry.message.turn_token_usage = Some(turn_token_usage);
+            }
             if let Some(context_breakdown) = update.context_breakdown {
                 entry.message.context_breakdown = Some(context_breakdown);
             }
@@ -2533,6 +2536,22 @@ impl AppState {
         });
 
         self.active_project.set(next.clone());
+
+        // Notify the host that this project became active so the server can warm
+        // code intelligence and restore recent history. This is the one central
+        // switch path, so every selection route (rail click, resume, team open,
+        // new-chat prefill) is covered. Home/None never notifies. Duplicate
+        // sends on switch are fine — the server owns idempotency.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(accessed) = next.as_ref() {
+            let host_id = accessed.host_id.clone();
+            let stream = StreamPath(format!("/project/{}", accessed.project_id.0));
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(error) = crate::send::project_accessed(&host_id, stream).await {
+                    log::error!("failed to send ProjectAccessed: {error}");
+                }
+            });
+        }
 
         // active_agent is a Memo derived from center_zone — restoring center_zone
         // implicitly restores it. Tab LRU is reset and re-seeded with the
@@ -4289,6 +4308,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     model_info: None,
                     token_usage: None,
+                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 },
@@ -4902,6 +4922,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     model_info: None,
                     token_usage: None,
+                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 },
@@ -4923,6 +4944,7 @@ mod tests {
                     cache_creation_input_tokens: None,
                     reasoning_tokens: None,
                 }),
+                turn_token_usage: None,
                 context_breakdown: None,
             };
             state.apply_chat_message_metadata(&agent_id, update);
@@ -4973,6 +4995,7 @@ mod tests {
                     message_id: message_id.clone(),
                     model_info: None,
                     token_usage: None,
+                    turn_token_usage: None,
                     context_breakdown: Some(breakdown),
                 },
             );
@@ -5009,6 +5032,7 @@ mod tests {
                     message_id: protocol::ChatMessageId("missing".to_owned()),
                     model_info: None,
                     token_usage: None,
+                    turn_token_usage: None,
                     context_breakdown: None,
                 },
             );

@@ -2,6 +2,19 @@ use leptos::prelude::*;
 
 use crate::state::ChatMessageEntry;
 
+/// Resolve the THIS-TURN token usage for a chat row. `token_usage` is the
+/// authoritative this-turn figure; `turn_token_usage` refines it: `Known`
+/// carries the same this-turn figure explicitly (never the cumulative
+/// `agent_total`), and `Unavailable` means the backend reported nothing, so
+/// the row renders no token line rather than a fake-zero one.
+fn this_turn_token_usage(message: &protocol::ChatMessage) -> Option<protocol::TokenUsage> {
+    match &message.turn_token_usage {
+        Some(protocol::TurnTokenUsage::Unavailable { .. }) => None,
+        Some(protocol::TurnTokenUsage::Known { this_turn, .. }) => Some((**this_turn).clone()),
+        None => message.token_usage.clone(),
+    }
+}
+
 /// Renders one message in the transcript.
 ///
 /// `data-mobile-test` exposes the sender role for tests
@@ -45,7 +58,7 @@ pub fn ChatMessageView(entry: ChatMessageEntry) -> impl IntoView {
         .map(|m| m.model.clone())
         .unwrap_or_default();
 
-    let token_usage = entry.message.token_usage.clone();
+    let token_usage = this_turn_token_usage(&entry.message);
 
     let tool_requests = entry.tool_requests;
 

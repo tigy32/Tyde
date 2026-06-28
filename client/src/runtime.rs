@@ -5,13 +5,16 @@ use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
     AgentErrorPayload, AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
-    BackendSetupPayload, CancelWorkflowPayload, ChatEvent, CodeIntelOverviewPayload,
-    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FetchSessionHistoryPayload,
-    FrameError, FrameKind, HostBootstrapPayload, HostSettingsPayload, InterruptPayload,
-    ListSessionsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
-    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, ProjectAddRootPayload,
-    ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
-    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    BackendSetupPayload, CancelWorkflowPayload, ChatEvent, CodeIntelDiagnosticsPayload,
+    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
+    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    CustomAgentNotifyPayload, Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
+    HostBootstrapPayload, HostSettingsPayload, InterruptPayload, ListSessionsPayload,
+    McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload,
+    NewTerminalPayload, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
     ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload, SessionHistoryPayload,
@@ -168,6 +171,14 @@ pub enum ProjectEvent {
     FileList(ProjectFileListPayload),
     GitStatus(ProjectGitStatusPayload),
     CodeIntelOverview(CodeIntelOverviewPayload),
+    CodeIntelStatus(CodeIntelStatusPayload),
+    CodeIntelFileModel(CodeIntelFileModelPayload),
+    CodeIntelDiagnostics(CodeIntelDiagnosticsPayload),
+    CodeIntelHoverResult(CodeIntelHoverResultPayload),
+    CodeIntelNavigateResult(CodeIntelNavigateResultPayload),
+    CodeIntelReferencesResults(CodeIntelReferencesResultsPayload),
+    CodeIntelReferencesComplete(CodeIntelReferencesCompletePayload),
+    CodeIntelError(CodeIntelErrorPayload),
     FileContents(ProjectFileContentsPayload),
     GitDiff(ProjectGitDiffPayload),
     Notify(ProjectEventPayload),
@@ -329,7 +340,7 @@ impl HostCommands {
     ) -> Result<ProjectEndpoint, ClientError> {
         let stream = project_stream(&project_id);
         if let Some(rx) = self.shared.take_pending_project_events(&project_id) {
-            return Ok(ProjectEndpoint {
+            let endpoint = ProjectEndpoint {
                 project_id,
                 events: ProjectEvents {
                     stream: stream.clone(),
@@ -340,7 +351,9 @@ impl HostCommands {
                     stream,
                     shared: self.shared.clone(),
                 },
-            });
+            };
+            endpoint.commands.accessed().await?;
+            return Ok(endpoint);
         }
 
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -350,7 +363,7 @@ impl HostCommands {
             .register_writable_stream(stream.clone(), 0)
             .await?;
 
-        Ok(ProjectEndpoint {
+        let endpoint = ProjectEndpoint {
             project_id,
             events: ProjectEvents {
                 stream: stream.clone(),
@@ -361,7 +374,9 @@ impl HostCommands {
                 stream,
                 shared: self.shared.clone(),
             },
-        })
+        };
+        endpoint.commands.accessed().await?;
+        Ok(endpoint)
     }
 
     async fn send<T: Serialize>(&self, kind: FrameKind, payload: &T) -> Result<(), ClientError> {
@@ -430,6 +445,16 @@ impl AgentCommands {
 }
 
 impl ProjectCommands {
+    pub async fn accessed(&self) -> Result<(), ClientError> {
+        self.shared
+            .send(
+                self.stream.clone(),
+                FrameKind::ProjectAccessed,
+                &ProjectAccessedPayload::default(),
+            )
+            .await
+    }
+
     pub async fn read_file(&self, payload: ProjectReadFilePayload) -> Result<(), ClientError> {
         self.shared
             .send(self.stream.clone(), FrameKind::ProjectReadFile, &payload)
@@ -1271,6 +1296,62 @@ async fn handle_project_envelope(envelope: Envelope, shared: &Arc<Shared>) {
                 Err(_) => return,
             };
             ProjectEvent::CodeIntelOverview(payload)
+        }
+        FrameKind::CodeIntelStatus => {
+            let payload: CodeIntelStatusPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            ProjectEvent::CodeIntelStatus(payload)
+        }
+        FrameKind::CodeIntelFileModel => {
+            let payload: CodeIntelFileModelPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            ProjectEvent::CodeIntelFileModel(payload)
+        }
+        FrameKind::CodeIntelDiagnostics => {
+            let payload: CodeIntelDiagnosticsPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            ProjectEvent::CodeIntelDiagnostics(payload)
+        }
+        FrameKind::CodeIntelHoverResult => {
+            let payload: CodeIntelHoverResultPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            ProjectEvent::CodeIntelHoverResult(payload)
+        }
+        FrameKind::CodeIntelNavigateResult => {
+            let payload: CodeIntelNavigateResultPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            ProjectEvent::CodeIntelNavigateResult(payload)
+        }
+        FrameKind::CodeIntelReferencesResults => {
+            let payload: CodeIntelReferencesResultsPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            ProjectEvent::CodeIntelReferencesResults(payload)
+        }
+        FrameKind::CodeIntelReferencesComplete => {
+            let payload: CodeIntelReferencesCompletePayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            ProjectEvent::CodeIntelReferencesComplete(payload)
+        }
+        FrameKind::CodeIntelError => {
+            let payload: CodeIntelErrorPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            ProjectEvent::CodeIntelError(payload)
         }
         FrameKind::ProjectFileContents => {
             let payload: ProjectFileContentsPayload = match envelope.parse_payload() {

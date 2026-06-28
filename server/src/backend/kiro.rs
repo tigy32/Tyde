@@ -3647,6 +3647,7 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
                     tool_calls: Vec::new(),
                     model_info: model.map(|m| ModelInfo { model: m }),
                     token_usage: None,
+                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 },

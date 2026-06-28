@@ -312,10 +312,20 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     payload.operation, payload.stream, payload.message
                 );
                 log::error!("command error on {host}: {message}");
-                state.command_errors_by_host.update(|map| {
-                    map.insert(host.clone(), message);
-                });
-                clear_session_history_loading_on_error(state, host, &payload);
+                if matches!(payload.request_kind, FrameKind::LoadAgent) {
+                    // A failed LoadAgent leaves the chat spinning forever
+                    // because the bootstrap snapshot never arrives. Surface a
+                    // chat-local error row (which retires the spinner) instead
+                    // of a host-level banner, so the failure is visible exactly
+                    // where the user opened the chat. The load latch is kept so
+                    // the auto-load effect does not retry on its next run.
+                    surface_load_agent_error(state, host, &payload);
+                } else {
+                    state.command_errors_by_host.update(|map| {
+                        map.insert(host.clone(), message);
+                    });
+                    clear_session_history_loading_on_error(state, host, &payload);
+                }
             }
         }
         FrameKind::HostSettings => {
@@ -534,6 +544,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                         tool_calls: Vec::new(),
                         model_info: None,
                         token_usage: None,
+                        turn_token_usage: None,
                         context_breakdown: None,
                         images: None,
                     },
@@ -1266,6 +1277,57 @@ fn clear_session_history_loading_on_error(
             history.loading = false;
         }
     });
+}
+
+/// Handle a `CommandError` whose `request_kind` is `LoadAgent`. The mobile
+/// chat shows a spinner while `agent_load_requests` holds the stream and
+/// `agent_loaded` does not and the transcript has no content; a failed load
+/// would otherwise spin forever. Push a visible error row into the transcript:
+/// that makes `no_content` false in `ChatView`, so the spinner is replaced by
+/// the error rather than hanging.
+///
+/// Deliberately keep the `agent_load_requests` latch set (and leave
+/// `agent_loaded` unset, since no snapshot arrived). `ChatView`'s auto-load
+/// effect re-sends `LoadAgent` whenever the active agent is *absent* from
+/// `agent_load_requests`. That effect re-runs on `active_agent`/`agents`
+/// changes, so clearing the latch here would let the next run re-send:
+/// `LoadAgent` -> conflict -> another error row, with the latch cleared each
+/// time. The retained latch is the thing that stops the retry whenever the
+/// effect runs.
+fn surface_load_agent_error(state: &AppState, host: &LocalHostId, payload: &CommandErrorPayload) {
+    let Some(agent_ref) = resolve_agent_ref(state, host, &payload.stream) else {
+        log::warn!(
+            "load_agent error on unknown stream host={} stream={}",
+            host,
+            payload.stream
+        );
+        // The agent isn't known locally, so there's no transcript to attach to.
+        // Fall back to a host-level error so the failure is still visible.
+        state.command_errors_by_host.update(|map| {
+            map.insert(
+                host.clone(),
+                format!("Failed to load conversation: {}", payload.message),
+            );
+        });
+        return;
+    };
+    let entry = ChatMessageEntry {
+        message: protocol::ChatMessage {
+            message_id: None,
+            timestamp: js_sys::Date::now() as u64,
+            sender: protocol::MessageSender::Error,
+            content: format!("Failed to load conversation: {}", payload.message),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            turn_token_usage: None,
+            context_breakdown: None,
+            images: None,
+        },
+        tool_requests: Vec::new(),
+    };
+    state.push_chat_message_entry(&agent_ref, entry);
 }
 
 fn clear_session_history_loading_for_host(state: &AppState, host: &LocalHostId) {
@@ -2004,6 +2066,7 @@ fn apply_agent_bootstrap(
                         tool_calls: Vec::new(),
                         model_info: None,
                         token_usage: None,
+                        turn_token_usage: None,
                         context_breakdown: None,
                         images: None,
                     },
@@ -2212,6 +2275,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     model_info: None,
                     token_usage: None,
+                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 };
@@ -2990,6 +3054,7 @@ mod wasm_tests {
             tool_calls: Vec::new(),
             model_info: None,
             token_usage: None,
+            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         });
@@ -3033,6 +3098,222 @@ mod wasm_tests {
         assert_eq!(msgs[0].message.content, "Hello");
     }
 
+    /// Register an agent on `host` whose `LoadAgent` instance stream is
+    /// `instance_stream`, returning its `AgentRef`.
+    fn register_agent(
+        state: &AppState,
+        host: &LocalHostId,
+        host_stream: &str,
+        seq: u64,
+        agent_id: &str,
+        instance_stream: &StreamPath,
+    ) -> AgentRef {
+        dispatch_envelope(
+            state,
+            host,
+            envelope(
+                host_stream,
+                FrameKind::NewAgent,
+                seq,
+                &protocol::NewAgentPayload {
+                    agent_id: AgentId(agent_id.to_owned()),
+                    name: "Agent One".to_owned(),
+                    origin: protocol::AgentOrigin::User,
+                    backend_kind: protocol::BackendKind::Codex,
+                    workspace_roots: Vec::new(),
+                    custom_agent_id: None,
+                    team_id: None,
+                    team_member_id: None,
+                    project_id: None,
+                    parent_agent_id: None,
+                    session_id: None,
+                    workflow: None,
+                    created_at_ms: 1,
+                    instance_stream: instance_stream.clone(),
+                    activity_summary: Default::default(),
+                },
+            ),
+        );
+        AgentRef {
+            local_host_id: host.clone(),
+            agent_id: AgentId(agent_id.to_owned()),
+        }
+    }
+
+    /// A `CommandError(LoadAgent)` must surface a visible error row (which
+    /// retires the spinner) while keeping the pending load latch set so the
+    /// auto-load effect does not retry, and leaving `agent_loaded` unset.
+    #[wasm_bindgen_test]
+    fn command_error_load_agent_keeps_latch_and_surfaces_error() {
+        let state = AppState::new();
+        let host = primed_host(&state, "mobile-load-error");
+        let instance_stream = StreamPath("/agent/a-1/inst".to_owned());
+        let agent_ref = register_agent(
+            &state,
+            &host,
+            "/host/mobile-load-error",
+            0,
+            "a-1",
+            &instance_stream,
+        );
+
+        // The chat view latched the load the moment it sent LoadAgent.
+        state.agent_load_requests.update(|m| {
+            m.insert(agent_ref.clone());
+        });
+
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/host/mobile-load-error",
+                FrameKind::CommandError,
+                1,
+                &CommandErrorPayload {
+                    stream: instance_stream.clone(),
+                    request_kind: FrameKind::LoadAgent,
+                    operation: "load_agent".to_owned(),
+                    code: protocol::CommandErrorCode::Conflict,
+                    message: "agent already attached".to_owned(),
+                    fatal: false,
+                },
+            ),
+        );
+
+        assert!(
+            state
+                .agent_load_requests
+                .with_untracked(|m| m.contains(&agent_ref)),
+            "load latch must stay set so the auto-load effect does not retry"
+        );
+        assert!(
+            !state
+                .agent_loaded
+                .with_untracked(|m| m.contains(&agent_ref)),
+            "agent_loaded must stay unset — no snapshot ever arrived"
+        );
+        let msgs = state
+            .chat_messages
+            .with_untracked(|m| m.get(&agent_ref).cloned())
+            .unwrap_or_default();
+        assert_eq!(msgs.len(), 1, "a visible error row must be surfaced");
+        assert!(
+            matches!(msgs[0].message.sender, protocol::MessageSender::Error),
+            "error row must be tagged as an error message"
+        );
+        assert!(
+            msgs[0].message.content.contains("agent already attached"),
+            "error row must carry the server message: {}",
+            msgs[0].message.content
+        );
+        assert!(
+            state
+                .command_errors_by_host
+                .with_untracked(|m| m.get(&host).cloned())
+                .is_none(),
+            "a chat-local LoadAgent error must not also raise a host-level banner"
+        );
+
+        // A second LoadAgent error (the loop the retained latch guards
+        // against would deliver more) appends one more row but never clears
+        // the latch — the spinner stays gone and there is no runaway.
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/host/mobile-load-error",
+                FrameKind::CommandError,
+                2,
+                &CommandErrorPayload {
+                    stream: instance_stream.clone(),
+                    request_kind: FrameKind::LoadAgent,
+                    operation: "load_agent".to_owned(),
+                    code: protocol::CommandErrorCode::Conflict,
+                    message: "agent already attached".to_owned(),
+                    fatal: false,
+                },
+            ),
+        );
+        assert!(
+            state
+                .agent_load_requests
+                .with_untracked(|m| m.contains(&agent_ref)),
+            "load latch must remain set across repeated errors"
+        );
+    }
+
+    /// A `CommandError(FetchSessionHistory)` keeps its existing behavior:
+    /// clear the per-agent history loading flag and raise a host-level error,
+    /// without pushing a chat error row.
+    #[wasm_bindgen_test]
+    fn command_error_fetch_session_history_clears_loading_only() {
+        let state = AppState::new();
+        let host = primed_host(&state, "mobile-history-error");
+        let instance_stream = StreamPath("/agent/a-1/inst".to_owned());
+        let agent_ref = register_agent(
+            &state,
+            &host,
+            "/host/mobile-history-error",
+            0,
+            "a-1",
+            &instance_stream,
+        );
+
+        state.session_history.update(|m| {
+            m.insert(
+                agent_ref.clone(),
+                SessionHistoryState {
+                    message_count: 3,
+                    oldest_seq: Some(5),
+                    has_more_before: true,
+                    loading: true,
+                },
+            );
+        });
+
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/host/mobile-history-error",
+                FrameKind::CommandError,
+                1,
+                &CommandErrorPayload {
+                    stream: instance_stream.clone(),
+                    request_kind: FrameKind::FetchSessionHistory,
+                    operation: "fetch_session_history".to_owned(),
+                    code: protocol::CommandErrorCode::Internal,
+                    message: "history read failed".to_owned(),
+                    fatal: false,
+                },
+            ),
+        );
+
+        let loading = state
+            .session_history
+            .with_untracked(|m| m.get(&agent_ref).map(|h| h.loading));
+        assert_eq!(
+            loading,
+            Some(false),
+            "FetchSessionHistory error must clear the history loading flag"
+        );
+        assert!(
+            state
+                .chat_messages
+                .with_untracked(|m| m.get(&agent_ref).cloned())
+                .unwrap_or_default()
+                .is_empty(),
+            "FetchSessionHistory error must not push a chat error row"
+        );
+        assert!(
+            state
+                .command_errors_by_host
+                .with_untracked(|m| m.get(&host).cloned())
+                .is_some(),
+            "FetchSessionHistory error must still raise a host-level error"
+        );
+    }
+
     #[wasm_bindgen_test]
     fn message_metadata_updated_patches_existing_row_in_place() {
         let state = AppState::new();
@@ -3053,6 +3334,7 @@ mod wasm_tests {
             tool_calls: Vec::new(),
             model_info: None,
             token_usage: None,
+            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         };
@@ -3075,6 +3357,7 @@ mod wasm_tests {
                 cache_creation_input_tokens: None,
                 reasoning_tokens: None,
             }),
+            turn_token_usage: None,
             context_breakdown: None,
         };
         apply_chat_event(
@@ -3128,6 +3411,7 @@ mod wasm_tests {
                 message_id: message_id.clone(),
                 model_info: None,
                 token_usage: None,
+                turn_token_usage: None,
                 context_breakdown: Some(breakdown),
             }),
         );
@@ -3168,6 +3452,7 @@ mod wasm_tests {
                 message_id: protocol::ChatMessageId("missing".to_owned()),
                 model_info: None,
                 token_usage: None,
+                turn_token_usage: None,
                 context_breakdown: None,
             }),
         );
@@ -3207,6 +3492,7 @@ mod wasm_tests {
             tool_calls: Vec::new(),
             model_info: None,
             token_usage: None,
+            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         };
@@ -3239,6 +3525,7 @@ mod wasm_tests {
                     cache_creation_input_tokens: None,
                     reasoning_tokens: None,
                 }),
+                turn_token_usage: None,
                 context_breakdown: None,
             }),
         );

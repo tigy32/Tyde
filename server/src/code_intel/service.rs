@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 
 use super::lsp_provider::LspProvider;
 use super::provider::CodeIntelProvider;
-use super::{Language, detect_language, emit, host_resource_mode};
+use super::{Language, detect_language, detect_project_languages, emit, host_resource_mode};
 use crate::project_stream::{FileVersionChange, ProjectStreamHandle};
 use crate::stream::Stream;
 
@@ -60,6 +60,7 @@ enum CodeIntelCommand {
     CancelReferences {
         payload: CodeIntelCancelReferencesPayload,
     },
+    Warm,
     UpdateSettings {
         settings: CodeIntelSettings,
     },
@@ -224,6 +225,28 @@ impl CodeIntelService {
         self.providers.get_mut(&language)
     }
 
+    fn provider_for_language(&mut self, language: Language) -> &mut Box<dyn CodeIntelProvider> {
+        let root = self.root.clone();
+        let resource_mode = self.resource_mode;
+        let config = language.config(&self.code_intel_settings);
+        let provider_status_tx = self.provider_status_tx.clone();
+        self.providers.entry(language).or_insert_with(|| {
+            Box::new(LspProvider::with_status_updates(
+                config,
+                root,
+                resource_mode,
+                Some(provider_status_tx),
+            ))
+        })
+    }
+
+    fn warm_project_root(&mut self) {
+        let root_entries = read_root_entries(&self.root);
+        for language in detect_project_languages(&root_entries) {
+            self.provider_for_language(language).warm();
+        }
+    }
+
     async fn handle(&mut self, command: CodeIntelCommand) {
         match command {
             CodeIntelCommand::Subscribe { path, output } => {
@@ -239,24 +262,14 @@ impl CodeIntelService {
                 match detect_language(&path.relative_path, &root_entries) {
                     Some(language) => {
                         let root = self.root.clone();
-                        let resource_mode = self.resource_mode;
-                        let config = language.config(&self.code_intel_settings);
-                        let provider_status_tx = self.provider_status_tx.clone();
-                        let provider = self.providers.entry(language).or_insert_with(|| {
-                            Box::new(LspProvider::with_status_updates(
-                                config,
-                                root,
-                                resource_mode,
-                                Some(provider_status_tx),
-                            ))
-                        });
+                        self.subscriptions.insert(path.clone());
+                        let provider = self.provider_for_language(language);
                         tracing::debug!(
                             provider = %provider.provider_id(),
-                            root = %self.root,
+                            root = %root,
                             ?language,
                             "code-intel: routing file to provider"
                         );
-                        self.subscriptions.insert(path.clone());
                         provider.subscribe(path, version, output);
                     }
                     None => {
@@ -355,6 +368,9 @@ impl CodeIntelService {
                 for provider in self.providers.values_mut() {
                     provider.cancel_references(payload.references_id);
                 }
+            }
+            CodeIntelCommand::Warm => {
+                self.warm_project_root();
             }
             CodeIntelCommand::UpdateSettings { settings } => {
                 for (language, provider) in &mut self.providers {
@@ -467,6 +483,13 @@ impl CodeIntelRouter {
             let _ = handle.tx.send(CodeIntelCommand::UpdateSettings {
                 settings: settings.clone(),
             });
+        }
+    }
+
+    pub(crate) fn warm_project(&mut self, roots: Vec<ProjectRootPath>) {
+        for root in roots {
+            let handle = self.service_for(&root);
+            let _ = handle.tx.send(CodeIntelCommand::Warm);
         }
     }
 

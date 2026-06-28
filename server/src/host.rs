@@ -2693,6 +2693,18 @@ impl HostHandle {
             fan_out_current_agents_view_preferences(&mut state).await;
         }
 
+        if let Some(project_id) = start.project_id.clone()
+            && let Err(error) = self
+                .warm_code_intel_project(project_id.clone(), "agent_start")
+                .await
+        {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %error,
+                "failed to warm code intelligence after agent launch"
+            );
+        }
+
         let agent_id = start.agent_id.clone();
         self.schedule_agent_session_registration(agent_id.clone(), startup_rx);
         tracing::info!(
@@ -2845,6 +2857,18 @@ impl HostHandle {
             for path in dead_paths {
                 state.host_streams.remove(&path);
             }
+        }
+
+        if let Some(project_id) = start.project_id.clone()
+            && let Err(error) = self
+                .warm_code_intel_project(project_id.clone(), "agent_start")
+                .await
+        {
+            tracing::warn!(
+                project_id = %project_id,
+                error = %error,
+                "failed to warm code intelligence after agent launch"
+            );
         }
 
         let agent_id = start.agent_id.clone();
@@ -5074,7 +5098,13 @@ impl HostHandle {
                 ));
             }
             if subscriber.attached_agent_streams.contains(&agent_stream) {
-                return Ok(());
+                return Err(AppError::conflict(
+                    "load_agent",
+                    format!(
+                        "agent stream {} is already attached; reconnect to retry loading the agent",
+                        agent_stream
+                    ),
+                ));
             }
             subscriber
                 .attached_agent_streams
@@ -6933,6 +6963,56 @@ impl HostHandle {
             .await
             .map_err(|error| project_command_error(operation, error))?;
         Ok(handle)
+    }
+
+    pub(crate) async fn project_accessed(
+        &self,
+        connection_host_stream: &StreamPath,
+        project_output_stream: &Stream,
+        project_id: ProjectId,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_accessed";
+        self.ensure_host_project_subscription(
+            connection_host_stream,
+            project_output_stream,
+            project_id.clone(),
+            OPERATION,
+        )
+        .await?;
+        self.warm_code_intel_project(project_id, OPERATION).await
+    }
+
+    async fn warm_code_intel_project(
+        &self,
+        project_id: ProjectId,
+        operation: &'static str,
+    ) -> AppResult<()> {
+        let mut state = self.state.lock().await;
+        let project = state
+            .project_store
+            .lock()
+            .await
+            .get(&project_id)
+            .ok_or_else(|| {
+                AppError::not_found(operation, format!("project {} not found", project_id))
+            })?;
+        let roots = project.root_paths();
+        let handle = ensure_project_actor(&mut state, project_id.clone())
+            .await
+            .map_err(|error| project_command_error(operation, error))?;
+        let code_intel_settings = state
+            .settings_store
+            .lock()
+            .await
+            .get()
+            .map_err(|error| AppError::internal(operation, anyhow!(error)))?
+            .code_intel;
+        state
+            .code_intel_routers
+            .entry(project_id)
+            .or_insert_with(|| CodeIntelRouter::new(handle, code_intel_settings))
+            .warm_project(roots);
+        Ok(())
     }
 
     pub(crate) async fn code_intel_subscribe_file(

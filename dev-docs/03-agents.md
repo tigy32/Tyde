@@ -540,6 +540,7 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolUseData>,
     pub model_info: Option<ModelInfo>,
     pub token_usage: Option<TokenUsage>,
+    pub turn_token_usage: Option<TurnTokenUsage>,
     pub context_breakdown: Option<ContextBreakdown>,
     pub images: Option<Vec<ImageData>>,
 }
@@ -549,6 +550,7 @@ pub struct MessageMetadataUpdateData {
     pub message_id: ChatMessageId,
     pub model_info: Option<ModelInfo>,
     pub token_usage: Option<TokenUsage>,
+    pub turn_token_usage: Option<TurnTokenUsage>,
     pub context_breakdown: Option<ContextBreakdown>,
 }
 
@@ -580,6 +582,22 @@ pub struct TokenUsage {
     pub cached_prompt_tokens: Option<u64>,
     pub cache_creation_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnTokenUsage {
+    Known {
+        this_turn: Box<TokenUsage>,
+        agent_total: Box<TokenUsage>,
+    },
+    Unavailable { reason: TokenUsageUnavailableReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenUsageUnavailableReason {
+    BackendDidNotReport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -749,6 +767,15 @@ pub struct TaskList {
     pub tasks: Vec<Task>,
 }
 ```
+
+`ChatMessage.token_usage` remains the backend-normalized token usage for this
+one assistant turn. The server agent actor owns the running per-agent
+cumulative total. It stamps `turn_token_usage` on assistant turn-end messages
+and on `MessageMetadataUpdated` patches as either `Known { this_turn,
+agent_total }` or `Unavailable { BackendDidNotReport }`; clients must not infer
+zero when a backend did not report usage. `AgentActivityStats.token_usage` is
+the same `agent_total` snapshot so reconnecting clients can render the current
+total without waiting for another turn.
 
 ---
 

@@ -34,6 +34,10 @@ pub(crate) trait CodeIntelProvider: Send {
     /// at the given version onto `output`.
     fn subscribe(&mut self, path: ProjectPath, version: ProjectFileVersion, output: Stream);
 
+    /// Start the root/language provider without subscribing a UI file. This is
+    /// used for project-level lazy warmup; it must not synthesize `didOpen`.
+    fn warm(&mut self);
+
     /// Stop pushing for a file.
     fn unsubscribe(&mut self, path: &ProjectPath);
 
@@ -178,6 +182,8 @@ mod mock {
                 emit(&output, FrameKind::CodeIntelFileModel, &model);
             }
         }
+
+        fn warm(&mut self) {}
 
         fn unsubscribe(&mut self, _path: &ProjectPath) {}
 

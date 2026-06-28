@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, MessageSender, ModelInfo,
-    OperationCancelledData, SessionId, StreamEndData, StreamStartData, StreamTextDeltaData,
-    TokenUsage, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequest,
-    ToolRequestType,
+    AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
+    MessageMetadataUpdateData, MessageSender, ModelInfo, OperationCancelledData, SessionId,
+    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData,
+    ToolExecutionResult, ToolPolicy, ToolRequest, ToolRequestType,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,6 +55,8 @@ const MOCK_EXIT_PLAN_MODE_STREAM_END_FIRST_SENTINEL: &str =
 const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
 const MOCK_HISTORY_SENTINEL: &str = "__mock_history__";
 const MOCK_CLOSE_RESUME_BEFORE_BARRIER_SENTINEL: &str = "__mock_close_resume_before_barrier__";
+const MOCK_LATE_USAGE_SENTINEL: &str = "__mock_late_usage__";
+const MOCK_NO_USAGE_SENTINEL: &str = "__mock_no_usage__";
 const MOCK_FAILED_TOOL_CALL_ID: &str = "mock-failed-tool";
 const MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID: &str = "mock-exit-plan-tool";
 const MOCK_EXIT_PLAN_MODE_PLAN: &str = "# Plan\n\nApprove the mock plan.";
@@ -96,6 +98,17 @@ struct MockSessionRecord {
 fn session_store() -> &'static Mutex<HashMap<String, MockSessionRecord>> {
     static STORE: OnceLock<Mutex<HashMap<String, MockSessionRecord>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mock_turn_token_usage() -> TokenUsage {
+    TokenUsage {
+        input_tokens: 1250,
+        output_tokens: 340,
+        total_tokens: 1590,
+        cached_prompt_tokens: Some(800),
+        cache_creation_input_tokens: Some(50),
+        reasoning_tokens: Some(120),
+    }
 }
 
 fn agent_control_mcp_url(startup_mcp_servers: &[StartupMcpServer]) -> Option<String> {
@@ -677,6 +690,7 @@ async fn emit_held_turn(
                         model: MOCK_MODEL.to_owned(),
                     }),
                     token_usage: None,
+                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 },
@@ -728,6 +742,7 @@ fn emit_mock_resume_history(
                 model: MOCK_MODEL.to_owned(),
             }),
             token_usage: None,
+            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         }));
@@ -785,6 +800,7 @@ async fn emit_turn(
                 tool_calls: Vec::new(),
                 model_info: None,
                 token_usage: None,
+                turn_token_usage: None,
                 context_breakdown: None,
                 images: None,
             }))
@@ -808,6 +824,7 @@ async fn emit_turn(
                         model: MOCK_MODEL.to_owned(),
                     }),
                     token_usage: None,
+                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 },
@@ -843,8 +860,11 @@ async fn emit_turn(
         return false;
     }
 
+    let delayed_usage = user_message.contains(MOCK_LATE_USAGE_SENTINEL);
+    let omit_usage = user_message.contains(MOCK_NO_USAGE_SENTINEL);
+    let message_id_for_metadata = message_id.clone();
     let message = ChatMessage {
-        message_id: message_id.clone().map(protocol::ChatMessageId),
+        message_id: message_id.clone().map(ChatMessageId),
         timestamp: now_ms(),
         sender: MessageSender::Assistant {
             agent: "mock".to_owned(),
@@ -855,14 +875,8 @@ async fn emit_turn(
         model_info: Some(ModelInfo {
             model: MOCK_MODEL.to_owned(),
         }),
-        token_usage: Some(TokenUsage {
-            input_tokens: 1250,
-            output_tokens: 340,
-            total_tokens: 1590,
-            cached_prompt_tokens: Some(800),
-            cache_creation_input_tokens: Some(50),
-            reasoning_tokens: Some(120),
-        }),
+        token_usage: (!delayed_usage && !omit_usage).then(mock_turn_token_usage),
+        turn_token_usage: None,
         context_breakdown: None,
         images: None,
     };
@@ -870,6 +884,23 @@ async fn emit_turn(
     if events_tx
         .send(ChatEvent::StreamEnd(StreamEndData { message }))
         .is_err()
+    {
+        return false;
+    }
+
+    if delayed_usage
+        && let Some(message_id) = message_id_for_metadata
+        && events_tx
+            .send(ChatEvent::MessageMetadataUpdated(
+                MessageMetadataUpdateData {
+                    message_id: ChatMessageId(message_id),
+                    model_info: None,
+                    token_usage: Some(mock_turn_token_usage()),
+                    turn_token_usage: None,
+                    context_breakdown: None,
+                },
+            ))
+            .is_err()
     {
         return false;
     }
@@ -1009,6 +1040,7 @@ async fn emit_mock_agent_control_await(
                     model: MOCK_MODEL.to_owned(),
                 }),
                 token_usage: None,
+                turn_token_usage: None,
                 context_breakdown: None,
                 images: None,
             },
@@ -1163,6 +1195,7 @@ async fn emit_exit_plan_mode_request(
                         model: MOCK_MODEL.to_owned(),
                     }),
                     token_usage: None,
+                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 },
@@ -1185,6 +1218,7 @@ async fn emit_exit_plan_mode_request(
                 model: MOCK_MODEL.to_owned(),
             }),
             token_usage: None,
+            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         }))
@@ -1315,6 +1349,7 @@ fn emit_mock_error(events_tx: &mpsc::UnboundedSender<ChatEvent>, message: &str) 
         tool_calls: Vec::new(),
         model_info: None,
         token_usage: None,
+        turn_token_usage: None,
         context_breakdown: None,
         images: None,
     }));
@@ -1448,6 +1483,7 @@ fn emit_native_child_turn(event_tx: &mpsc::UnboundedSender<ChatEvent>, prompt: &
                 cache_creation_input_tokens: Some(0),
                 reasoning_tokens: Some(0),
             }),
+            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         },

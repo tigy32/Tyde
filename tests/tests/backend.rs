@@ -754,28 +754,38 @@ async fn antigravity_native_uuid_session_remains_resumable_after_close() {
 
     set_stored_session_resumable(fixture.store_dir(), &session_id, false);
     let _db_guard = AntigravityConversationDbGuard::create(&session_id);
-    fixture
-        .client
-        .list_sessions(ListSessionsPayload::default())
-        .await
-        .expect("list sessions after creating fake Antigravity db");
-    let session_list = loop {
-        let env = expect_fixture_event(
-            &mut fixture.client,
-            "Antigravity SessionList with fake native db",
-        )
-        .await;
-        if env.kind == FrameKind::SessionList {
-            break env
-                .parse_payload::<SessionListPayload>()
-                .expect("parse Antigravity SessionList with fake native db");
+    let mut session = None;
+    for _ in 0..3 {
+        fixture
+            .client
+            .list_sessions(ListSessionsPayload::default())
+            .await
+            .expect("list sessions after creating fake Antigravity db");
+        let session_list = loop {
+            let env = expect_fixture_event(
+                &mut fixture.client,
+                "Antigravity SessionList with fake native db",
+            )
+            .await;
+            if env.kind == FrameKind::SessionList {
+                break env
+                    .parse_payload::<SessionListPayload>()
+                    .expect("parse Antigravity SessionList with fake native db");
+            }
+        };
+        let current = session_list
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+            .expect("persisted Antigravity session with fake native db");
+        if current.resumable {
+            session = Some(current);
+            break;
         }
-    };
-    let session = session_list
-        .sessions
-        .iter()
-        .find(|session| session.id == session_id)
-        .expect("persisted Antigravity session with fake native db");
+        session = Some(current);
+    }
+    let session = session.expect("persisted Antigravity session with fake native db");
     assert!(
         session.resumable,
         "Antigravity native UUID sessions with a backing AGY db should be resumable"

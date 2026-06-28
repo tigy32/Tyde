@@ -5110,6 +5110,23 @@ fn backend_error_message(content: String) -> ChatEvent {
         tool_calls: Vec::new(),
         model_info: None,
         token_usage: None,
+        turn_token_usage: None,
+        context_breakdown: None,
+        images: None,
+    })
+}
+
+fn backend_warning_message(content: String) -> ChatEvent {
+    ChatEvent::MessageAdded(ChatMessage {
+        message_id: None,
+        timestamp: unix_now_ms(),
+        sender: MessageSender::Warning,
+        content,
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        turn_token_usage: None,
         context_breakdown: None,
         images: None,
     })
@@ -5378,29 +5395,123 @@ fn spawn_codex_subagent_event_bridge(
 ) {
     tokio::spawn(async move {
         while let Some(raw) = raw_rx.recv().await {
-            let event = match raw_chat_event(&raw) {
-                Some(event) => event,
-                None => match raw.get("kind").and_then(Value::as_str).unwrap_or_default() {
-                    "Error" => {
-                        let message = raw
-                            .get("data")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Codex backend error")
-                            .to_string();
-                        backend_error_message(message)
-                    }
-                    _ => continue,
-                },
-            };
-            if event_tx.send(event).is_err() {
+            if !forward_codex_backend_event(raw, &event_tx) {
                 break;
             }
         }
     });
 }
 
-fn raw_chat_event(value: &Value) -> Option<ChatEvent> {
-    serde_json::from_value::<ChatEvent>(value.clone()).ok()
+fn forward_codex_backend_event(raw: Value, events_tx: &mpsc::UnboundedSender<ChatEvent>) -> bool {
+    let Some(event) = codex_backend_event_from_raw(&raw) else {
+        return true;
+    };
+    if events_tx.send(event.chat_event).is_err() {
+        return false;
+    }
+    !event.terminal
+}
+
+struct CodexForwardedBackendEvent {
+    chat_event: ChatEvent,
+    terminal: bool,
+}
+
+fn codex_backend_event_from_raw(value: &Value) -> Option<CodexForwardedBackendEvent> {
+    match serde_json::from_value::<ChatEvent>(value.clone()) {
+        Ok(event) => Some(CodexForwardedBackendEvent {
+            chat_event: event,
+            terminal: false,
+        }),
+        Err(err) => {
+            let Some(kind) = value.get("kind").and_then(Value::as_str) else {
+                tracing::warn!(raw = %value, error = %err, "Ignoring Codex raw event without kind");
+                return None;
+            };
+
+            match kind {
+                "Error" => Some(CodexForwardedBackendEvent {
+                    chat_event: backend_error_message(codex_raw_event_message(
+                        value,
+                        "Codex backend error",
+                    )),
+                    terminal: false,
+                }),
+                "SubprocessStderr" => {
+                    let message = codex_raw_event_message(value, "Codex subprocess stderr");
+                    tracing::warn!(message = %message, "Codex subprocess stderr");
+                    if codex_stderr_is_visible_warning(&message) {
+                        Some(CodexForwardedBackendEvent {
+                            chat_event: backend_warning_message(message),
+                            terminal: false,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                "SubprocessExit" => {
+                    let message = codex_subprocess_exit_message(value);
+                    tracing::error!(message = %message, "Codex subprocess exited");
+                    Some(CodexForwardedBackendEvent {
+                        chat_event: backend_error_message(message),
+                        terminal: true,
+                    })
+                }
+                other => {
+                    tracing::warn!(
+                        kind = %other,
+                        raw = %value,
+                        error = %err,
+                        "Ignoring unsupported Codex raw event"
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn codex_stderr_is_visible_warning(message: &str) -> bool {
+    message.trim_start().starts_with("Codex warning:")
+}
+
+fn codex_subprocess_exit_message(value: &Value) -> String {
+    match value
+        .get("data")
+        .and_then(|data| data.get("exit_code"))
+        .and_then(Value::as_i64)
+    {
+        Some(exit_code) => format!("Codex subprocess exited with code {exit_code}"),
+        None => "Codex subprocess exited".to_string(),
+    }
+}
+
+fn codex_raw_event_message(value: &Value, default_message: &str) -> String {
+    value
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+        .or_else(|| {
+            value
+                .get("data")
+                .and_then(|data| data.get("message"))
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+        })
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+        })
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("data")
+                .filter(|data| !data.is_null())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| default_message.to_string())
 }
 
 impl Backend for CodexBackend {
@@ -6675,9 +6786,7 @@ impl Backend for CodexBackend {
             }
 
             while let Ok(raw) = raw_events.try_recv() {
-                if let Some(event) = raw_chat_event(&raw)
-                    && events_tx.send(event).is_err()
-                {
+                if !forward_codex_backend_event(raw, &events_tx) {
                     session.shutdown().await;
                     return;
                 }
@@ -6690,10 +6799,9 @@ impl Backend for CodexBackend {
                         let Some(raw) = incoming else {
                             break;
                         };
-                        if let Some(event) = raw_chat_event(&raw)
-                            && events_tx.send(event).is_err() {
-                                break;
-                            }
+                        if !forward_codex_backend_event(raw, &events_tx) {
+                            break;
+                        }
                     }
                     input = input_rx.recv() => {
                         let Some(input) = input else {
@@ -6881,10 +6989,9 @@ impl Backend for CodexBackend {
                         let Some(raw) = incoming else {
                             break;
                         };
-                        if let Some(event) = raw_chat_event(&raw)
-                            && events_tx.send(event).is_err() {
-                                break;
-                            }
+                        if !forward_codex_backend_event(raw, &events_tx) {
+                            break;
+                        }
                     }
                     input = input_rx.recv() => {
                         let Some(input) = input else {
@@ -8077,6 +8184,96 @@ for line in sys.stdin:
             .iter()
             .filter_map(|event| event.get("kind").and_then(Value::as_str))
             .collect()
+    }
+
+    fn forwarded_codex_event(raw: Value) -> (bool, Option<ChatEvent>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let keep_open = forward_codex_backend_event(raw, &tx);
+        (keep_open, rx.try_recv().ok())
+    }
+
+    fn forwarded_visible_codex_event(raw: Value) -> (bool, ChatEvent) {
+        let (keep_open, event) = forwarded_codex_event(raw);
+        (
+            keep_open,
+            event.expect("raw Codex event should become a ChatEvent"),
+        )
+    }
+
+    #[test]
+    fn forward_codex_backend_event_passes_valid_chat_event_unchanged() {
+        let raw = json!({
+            "kind": "TypingStatusChanged",
+            "data": true,
+        });
+
+        let (keep_open, event) = forwarded_visible_codex_event(raw.clone());
+
+        assert!(keep_open);
+        assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
+        assert_eq!(
+            serde_json::to_value(event).expect("serialize forwarded event"),
+            raw
+        );
+    }
+
+    #[test]
+    fn forward_codex_backend_event_converts_raw_error_to_visible_message() {
+        let (keep_open, event) = forwarded_visible_codex_event(json!({
+            "kind": "Error",
+            "data": "backend exploded",
+        }));
+
+        assert!(keep_open);
+        let ChatEvent::MessageAdded(message) = event else {
+            panic!("raw Error should become MessageAdded, got {event:?}");
+        };
+        assert!(matches!(message.sender, MessageSender::Error));
+        assert_eq!(message.content, "backend exploded");
+    }
+
+    #[test]
+    fn forward_codex_backend_event_converts_warning_stderr_to_visible_message() {
+        let (keep_open, event) = forwarded_visible_codex_event(json!({
+            "kind": "SubprocessStderr",
+            "data": "Codex warning: Tool warning",
+        }));
+
+        assert!(keep_open);
+        let ChatEvent::MessageAdded(message) = event else {
+            panic!("stderr should become MessageAdded, got {event:?}");
+        };
+        assert!(matches!(message.sender, MessageSender::Warning));
+        assert_eq!(message.content, "Codex warning: Tool warning");
+    }
+
+    #[test]
+    fn forward_codex_backend_event_logs_generic_stderr_without_chat_event() {
+        let (keep_open, event) = forwarded_codex_event(json!({
+            "kind": "SubprocessStderr",
+            "data": "debug noise",
+        }));
+
+        assert!(keep_open);
+        assert!(
+            event.is_none(),
+            "generic stderr should be logged but not forwarded to chat"
+        );
+    }
+
+    #[test]
+    fn forward_codex_backend_event_converts_subprocess_exit_to_terminal_error() {
+        let (keep_open, event) = forwarded_visible_codex_event(json!({
+            "kind": "SubprocessExit",
+            "data": { "exit_code": 7 },
+        }));
+
+        assert!(!keep_open);
+        let ChatEvent::MessageAdded(message) = event else {
+            panic!("subprocess exit should become MessageAdded, got {event:?}");
+        };
+        assert!(matches!(message.sender, MessageSender::Error));
+        assert_eq!(message.content, "Codex subprocess exited with code 7");
     }
 
     #[tokio::test]

@@ -1133,7 +1133,7 @@ impl ClaudeInner {
                 model_hint: result_model_hint,
             } => {
                 let mut summary = summary;
-                let _ = self
+                let turn_usage = self
                     .normalize_usage_for_turn(summary.result_cumulative_usage.clone())
                     .await;
                 let known_context_window = summary.result_context_window;
@@ -1143,6 +1143,7 @@ impl ClaudeInner {
                         conversation_history_bytes,
                         known_context_window,
                         result_model_hint.or(model_hint),
+                        turn_usage,
                     )
                     .await
                     && summary.emitted_phase_count == 0
@@ -1152,7 +1153,7 @@ impl ClaudeInner {
             }
             TurnOutcome::Cancelled { summary } => {
                 let mut summary = summary;
-                let _ = self
+                let turn_usage = self
                     .normalize_usage_for_turn(summary.result_cumulative_usage.clone())
                     .await;
                 let known_context_window = summary.result_context_window;
@@ -1161,6 +1162,7 @@ impl ClaudeInner {
                     conversation_history_bytes,
                     known_context_window,
                     None,
+                    turn_usage,
                 )
                 .await;
                 let quiesced_waiters = self.clear_active_turn(turn_id).await;
@@ -1173,7 +1175,7 @@ impl ClaudeInner {
             }
             TurnOutcome::Failed { summary, error } => {
                 let mut summary = summary;
-                let _ = self
+                let turn_usage = self
                     .normalize_usage_for_turn(summary.result_cumulative_usage.take())
                     .await;
                 let known_context_window = summary.result_context_window;
@@ -1183,6 +1185,7 @@ impl ClaudeInner {
                         conversation_history_bytes,
                         known_context_window,
                         None,
+                        turn_usage,
                     )
                     .await;
                 let detail = summary.error_message().unwrap_or(error);
@@ -2169,11 +2172,16 @@ impl ClaudeInner {
         });
     }
 
-    fn emit_placeholder_stream_end(&self, model: Option<String>, context_breakdown: Option<Value>) {
+    fn emit_placeholder_stream_end(
+        &self,
+        model: Option<String>,
+        usage: Option<Value>,
+        context_breakdown: Option<Value>,
+    ) {
         self.emit_stream_end(
             String::new(),
             model,
-            None,
+            usage,
             None,
             Vec::new(),
             context_breakdown,
@@ -2260,10 +2268,12 @@ impl ClaudeInner {
         conversation_history_bytes: u64,
         known_context_window: Option<u64>,
         model_hint: Option<String>,
+        turn_usage: Option<Value>,
     ) -> bool {
         if let Some(phase) = take_phase_emission(summary) {
             let text = phase.text;
             let selected_model = phase.model.clone().or(model_hint);
+            let usage = turn_usage.or(phase.usage);
             let tool_calls = phase
                 .tool_calls
                 .iter()
@@ -2276,7 +2286,7 @@ impl ClaudeInner {
                 })
                 .collect::<Vec<_>>();
             let context_breakdown = estimate_context_breakdown(
-                phase.usage.as_ref(),
+                usage.as_ref(),
                 conversation_history_bytes,
                 phase.tool_io_bytes,
                 phase.reasoning_bytes,
@@ -2289,7 +2299,7 @@ impl ClaudeInner {
             self.emit_stream_end(
                 text,
                 selected_model,
-                phase.usage,
+                usage,
                 phase.reasoning,
                 tool_calls,
                 Some(context_breakdown),
@@ -2309,7 +2319,7 @@ impl ClaudeInner {
             if summary.emitted_phase_count == 0 {
                 let selected_model = summary.model.clone().or(model_hint);
                 let context_breakdown = estimate_context_breakdown(
-                    None,
+                    turn_usage.as_ref(),
                     conversation_history_bytes,
                     summary.tool_io_bytes,
                     summary.reasoning_bytes,
@@ -2321,7 +2331,11 @@ impl ClaudeInner {
                         self.emit_system_message(CLAUDE_CONVERSATION_COMPACTED_NOTICE);
                     }
                 }
-                self.emit_placeholder_stream_end(selected_model, Some(context_breakdown));
+                self.emit_placeholder_stream_end(
+                    selected_model,
+                    turn_usage,
+                    Some(context_breakdown),
+                );
             }
             auto_close_unresolved_tool_requests(
                 summary,
@@ -2339,14 +2353,14 @@ impl ClaudeInner {
         if summary.emitted_phase_count == 0 || self.emitter.is_stream_open() {
             let selected_model = summary.model.clone().or(model_hint);
             let context_breakdown = estimate_context_breakdown(
-                None,
+                turn_usage.as_ref(),
                 conversation_history_bytes,
                 summary.tool_io_bytes,
                 summary.reasoning_bytes,
                 known_context_window,
                 selected_model.as_deref(),
             );
-            self.emit_placeholder_stream_end(selected_model, Some(context_breakdown));
+            self.emit_placeholder_stream_end(selected_model, turn_usage, Some(context_breakdown));
         }
 
         if !summary.unresolved_tool_requests.is_empty() {
@@ -4624,12 +4638,10 @@ fn maybe_emit_next_stream_start(
 }
 
 fn phase_usage_for_emission(summary: &mut ClaudeStdoutSummary) -> Option<Value> {
-    // Return the raw usage from stream events as-is.  These values are
-    // session-cumulative (they grow across API calls within a process
-    // invocation), which is exactly what the token badge and context
-    // breakdown need — they should reflect what the latest API call
-    // actually consumed, not a delta from the previous call.
-    summary.usage.clone()
+    // Stream-event usage is session-cumulative. The terminal turn emitter
+    // attaches the normalized per-turn delta from the result event instead.
+    summary.usage.take();
+    None
 }
 
 fn take_phase_emission(summary: &mut ClaudeStdoutSummary) -> Option<ClaudePhaseEmission> {
@@ -4701,6 +4713,7 @@ fn close_current_phase(
         inner.emit_stream_end(
             phase.text,
             phase.model,
+            // Intermediate phases omit raw cumulative usage; terminal carries the per-turn delta.
             phase.usage,
             phase.reasoning,
             tool_calls,
@@ -7790,6 +7803,7 @@ fn backend_error_message(content: String) -> ChatEvent {
         tool_calls: Vec::new(),
         model_info: None,
         token_usage: None,
+        turn_token_usage: None,
         context_breakdown: None,
         images: None,
     })
@@ -8462,7 +8476,7 @@ mod tests {
 
         // Cancel fires the terminal path.
         inner
-            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None)
+            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None, None)
             .await;
         inner.emit_operation_cancelled("Claude turn cancelled.");
 
@@ -8732,6 +8746,16 @@ mod tests {
                 .remove(tool_use_id)
                 .expect("sub-agent event receiver should exist")
         }
+    }
+
+    async fn recv_child_chat_event(
+        rx: &mut mpsc::UnboundedReceiver<protocol::ChatEvent>,
+        context: &str,
+    ) -> protocol::ChatEvent {
+        timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{context} should arrive"))
+            .unwrap_or_else(|| panic!("{context} channel closed"))
     }
 
     impl SubAgentEmitter for TestSubAgentEmitter {
@@ -11912,7 +11936,8 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn top_level_assistant_boundaries_emit_separate_stream_ends_with_cumulative_usage() {
+    async fn top_level_assistant_boundaries_emit_separate_stream_ends_without_raw_cumulative_usage()
+    {
         let (inner, mut rx) = make_test_inner();
         let mut summary = ClaudeStdoutSummary::default();
         let mut segment = SegmentState::default();
@@ -11982,7 +12007,7 @@ for raw_line in sys.stdin:
                 .and_then(Value::as_str),
             Some("First answer")
         );
-        assert_eq!(stream_end_total_tokens(&first_end), Some(120));
+        assert_eq!(stream_end_total_tokens(&first_end), None);
 
         let second_start = rx.recv().await.expect("second stream start");
         assert_eq!(event_kind(&second_start), Some("StreamStart"));
@@ -12003,7 +12028,7 @@ for raw_line in sys.stdin:
                 .and_then(Value::as_str),
             Some("Second answer")
         );
-        assert_eq!(stream_end_total_tokens(&second_end), Some(300));
+        assert_eq!(stream_end_total_tokens(&second_end), None);
     }
 
     #[tokio::test]
@@ -12123,7 +12148,7 @@ for raw_line in sys.stdin:
             stream_end_tool_call_ids(&stream_end),
             vec!["toolu_edit".to_string()]
         );
-        assert_eq!(stream_end_total_tokens(&stream_end), Some(80));
+        assert_eq!(stream_end_total_tokens(&stream_end), None);
 
         let tool_request = rx.recv().await.expect("tool request after stream end");
         assert_eq!(event_kind(&tool_request), Some("ToolRequest"));
@@ -12790,10 +12815,7 @@ for raw_line in sys.stdin:
         assert!(streams.contains_key("toolu_123"));
 
         let mut child_events = emitter.take_event_rx("toolu_123");
-        let prompt_event = timeout(Duration::from_millis(500), child_events.recv())
-            .await
-            .expect("task prompt event should arrive")
-            .expect("task prompt chat event");
+        let prompt_event = recv_child_chat_event(&mut child_events, "task prompt event").await;
         let protocol::ChatEvent::MessageAdded(prompt_message) = prompt_event else {
             panic!("expected initial child MessageAdded event");
         };
@@ -12813,10 +12835,7 @@ for raw_line in sys.stdin:
             }),
         );
 
-        let stream_start = timeout(Duration::from_millis(500), child_events.recv())
-            .await
-            .expect("child stream start should arrive")
-            .expect("child stream start event");
+        let stream_start = recv_child_chat_event(&mut child_events, "child stream start").await;
         let protocol::ChatEvent::StreamStart(start) = stream_start else {
             panic!("expected child StreamStart event");
         };
@@ -12825,10 +12844,7 @@ for raw_line in sys.stdin:
             "child stream start should carry a message id"
         );
 
-        let stream_delta = timeout(Duration::from_millis(500), child_events.recv())
-            .await
-            .expect("child stream delta should arrive")
-            .expect("child stream delta event");
+        let stream_delta = recv_child_chat_event(&mut child_events, "child stream delta").await;
         let protocol::ChatEvent::StreamDelta(delta) = stream_delta else {
             panic!("expected child StreamDelta event");
         };
@@ -12851,10 +12867,7 @@ for raw_line in sys.stdin:
         )
         .await;
 
-        let stream_end = timeout(Duration::from_millis(500), child_events.recv())
-            .await
-            .expect("child stream end should arrive")
-            .expect("child stream end event");
+        let stream_end = recv_child_chat_event(&mut child_events, "child stream end").await;
         let protocol::ChatEvent::StreamEnd(end) = stream_end else {
             panic!("expected child StreamEnd event");
         };
@@ -12916,10 +12929,8 @@ for raw_line in sys.stdin:
         .await;
 
         let mut child_events = emitter.take_event_rx("toolu_123");
-        let prompt_event = timeout(Duration::from_millis(500), child_events.recv())
-            .await
-            .expect("initial task prompt event should arrive")
-            .expect("initial task prompt chat event");
+        let prompt_event =
+            recv_child_chat_event(&mut child_events, "initial task prompt event").await;
         let protocol::ChatEvent::MessageAdded(prompt_message) = prompt_event else {
             panic!("expected initial child MessageAdded event");
         };
@@ -12971,7 +12982,7 @@ for raw_line in sys.stdin:
         };
 
         let emitted = inner
-            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None)
+            .emit_terminal_phase_or_placeholder(&mut summary, 0, None, None, None)
             .await;
         assert!(
             emitted,
@@ -13793,6 +13804,72 @@ for raw_line in sys.stdin:
     }
 
     #[test]
+    fn derive_turn_token_usage_deltas_cumulative_snapshots_and_reset() {
+        let first = json!({
+            "input_tokens": 400,
+            "output_tokens": 100,
+            "total_tokens": 500,
+            "cached_prompt_tokens": 250,
+            "cache_creation_input_tokens": 20,
+            "reasoning_tokens": 15,
+            "context_window": 200_000
+        });
+        let second = json!({
+            "input_tokens": 900,
+            "output_tokens": 180,
+            "total_tokens": 1_080,
+            "cached_prompt_tokens": 650,
+            "cache_creation_input_tokens": 35,
+            "reasoning_tokens": 45,
+            "context_window": 200_000
+        });
+        let reset = json!({
+            "input_tokens": 120,
+            "output_tokens": 25,
+            "total_tokens": 145,
+            "cached_prompt_tokens": 80,
+            "cache_creation_input_tokens": 5,
+            "reasoning_tokens": 7,
+            "context_window": 200_000
+        });
+
+        let first_turn = derive_turn_token_usage(&first, None).expect("first turn usage");
+        assert_eq!(first_turn, first);
+
+        let second_turn =
+            derive_turn_token_usage(&second, Some(&first)).expect("second turn usage");
+        assert_eq!(
+            second_turn,
+            json!({
+                "input_tokens": 500,
+                "output_tokens": 80,
+                "total_tokens": 580,
+                "cached_prompt_tokens": 400,
+                "cache_creation_input_tokens": 15,
+                "reasoning_tokens": 30,
+                "context_window": 200_000
+            })
+        );
+
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "cached_prompt_tokens",
+            "cache_creation_input_tokens",
+            "reasoning_tokens",
+        ] {
+            assert!(
+                second_turn.get(key).and_then(Value::as_u64).is_some(),
+                "{key} should be a non-negative token count"
+            );
+        }
+
+        let reset_turn = derive_turn_token_usage(&reset, Some(&second)).expect("reset turn usage");
+        assert_eq!(reset_turn, reset);
+    }
+
+    #[test]
     fn derive_turn_token_usage_handles_counter_reset() {
         let previous = json!({
             "input_tokens": 10_000,
@@ -14096,10 +14173,7 @@ for raw_line in sys.stdin:
     }
 
     #[test]
-    fn phase_usage_returns_raw_usage() {
-        // phase_usage_for_emission returns summary.usage as-is (no
-        // differential math) so the token badge and context breakdown
-        // reflect what the latest API call actually consumed.
+    fn phase_usage_drops_raw_cumulative_usage() {
         let mut summary = ClaudeStdoutSummary::default();
 
         // No usage set → None.
@@ -14114,19 +14188,8 @@ for raw_line in sys.stdin:
             "reasoning_tokens": 0
         }));
 
-        let phase1 = phase_usage_for_emission(&mut summary).expect("should return usage");
-        assert_eq!(
-            phase1.get("input_tokens").and_then(Value::as_u64),
-            Some(150_000)
-        );
-        assert_eq!(
-            phase1.get("output_tokens").and_then(Value::as_u64),
-            Some(500)
-        );
-        assert_eq!(
-            phase1.get("cached_prompt_tokens").and_then(Value::as_u64),
-            Some(120_000)
-        );
+        assert!(phase_usage_for_emission(&mut summary).is_none());
+        assert!(summary.usage.is_none());
     }
 
     #[test]
@@ -14173,7 +14236,7 @@ for raw_line in sys.stdin:
     async fn pending_subagent_prompt_is_emitted_on_content_block_stop() {
         let (relay_event_tx, mut relay_event_rx) = mpsc::unbounded_channel();
         let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
-        spawn_claude_subagent_event_bridge(raw_event_rx, relay_event_tx);
+        spawn_claude_subagent_event_bridge(raw_event_rx, relay_event_tx.clone());
         let mut streams = HashMap::new();
         streams.insert(
             "toolu_spawn".to_string(),

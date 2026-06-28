@@ -11,6 +11,11 @@ summarizes a live agent's recent activity using a cheap model. The frontend only
 renders typed server state. There are no frontend-only caches, no inferred
 summaries, and no silent fallback text when summarization fails.
 
+The same server-owned activity snapshot also carries token totals:
+`AgentActivityStats.token_usage` is the authoritative per-agent cumulative
+`agent_total` stamped on `ChatMessage.turn_token_usage`. It is not a frontend
+roll-up and it does not include sub-agent tokens.
+
 Goals:
 
 - Show a short, human-readable "what is this agent doing?" summary for active

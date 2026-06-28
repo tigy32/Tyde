@@ -3460,10 +3460,21 @@ mod wasm_tests {
         open_member_chat(&state, host_id.to_owned(), manager_id.clone());
         next_tick().await;
 
-        // No send yet (this is the fresh case — case 3).
+        // No team activation yet (this is the fresh case — case 3). Opening
+        // the draft switches project context, which now sends the intentional
+        // ProjectAccessed warmup before any user message.
+        let frames_before_message = recorded_frames(&calls);
+        let project_accessed_kind = FrameKind::ProjectAccessed.to_string();
         assert!(
-            recorded_frames(&calls).is_empty(),
-            "no frames should have been sent before first message"
+            frames_before_message
+                .iter()
+                .all(|(kind, _)| kind == &project_accessed_kind),
+            "only ProjectAccessed may be sent before first message: {frames_before_message:?}"
+        );
+        assert_eq!(
+            frames_before_message.len(),
+            1,
+            "opening the draft should send exactly one ProjectAccessed warmup: {frames_before_message:?}"
         );
 
         // Type a message and submit via the chat input's submit path.

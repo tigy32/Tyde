@@ -635,6 +635,7 @@ impl AppState {
             message_id,
             model_info,
             token_usage,
+            turn_token_usage,
             context_breakdown,
         } = update;
         let mut patched = false;
@@ -648,6 +649,9 @@ impl AppState {
                 }
                 if let Some(token_usage) = token_usage {
                     entry.message.token_usage = Some(token_usage);
+                }
+                if let Some(turn_token_usage) = turn_token_usage {
+                    entry.message.turn_token_usage = Some(turn_token_usage);
                 }
                 if let Some(context_breakdown) = context_breakdown {
                     entry.message.context_breakdown = Some(context_breakdown);

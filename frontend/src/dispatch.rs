@@ -1113,6 +1113,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         tool_calls: Vec::new(),
                         model_info: None,
                         token_usage: None,
+                        turn_token_usage: None,
                         context_breakdown: None,
                         images: None,
                     },
@@ -4734,6 +4735,7 @@ fn apply_agent_bootstrap(
                         tool_calls: Vec::new(),
                         model_info: None,
                         token_usage: None,
+                        turn_token_usage: None,
                         context_breakdown: None,
                         images: None,
                     },
@@ -5186,6 +5188,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 model_info: None,
                 token_usage: None,
+                turn_token_usage: None,
                 context_breakdown: None,
                 images: None,
             };
@@ -5220,6 +5223,7 @@ mod tests {
                         cache_creation_input_tokens: None,
                         reasoning_tokens: None,
                     }),
+                    turn_token_usage: None,
                     context_breakdown: None,
                 }),
             );
@@ -5298,6 +5302,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     model_info: None,
                     token_usage: None,
+                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 };
@@ -5402,6 +5407,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 model_info: None,
                 token_usage: None,
+                turn_token_usage: None,
                 context_breakdown: None,
                 images: None,
             };

@@ -1594,6 +1594,112 @@ mod wasm_tests {
             "orphan workbench delete should fall back to home, got {active:?}"
         );
     }
+
+    /// Capture outbound `send_host_line` Tauri invokes so a test can inspect
+    /// which frames were put on the wire.
+    fn install_send_stub() {
+        js_sys::eval(
+            r#"
+            (function() {
+                window.__test_send_calls = [];
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    return Promise.resolve();
+                };
+                window.__TAURI__.event = window.__TAURI__.event || {};
+                window.__TAURI__.event.listen = function() { return Promise.resolve(null); };
+            })();
+            "#,
+        )
+        .expect("install send stub");
+    }
+
+    fn clear_send_calls() {
+        js_sys::eval("window.__test_send_calls = [];").expect("clear send calls");
+    }
+
+    /// Stream paths of every `project_accessed` frame on the wire, in send order.
+    fn project_accessed_streams() -> Vec<String> {
+        let joined = js_sys::eval(
+            r#"
+            (function() {
+                let streams = [];
+                for (const [cmd, args] of (window.__test_send_calls || [])) {
+                    if (cmd !== "send_host_line") continue;
+                    const env = JSON.parse(JSON.parse(args).line);
+                    if (env.kind === "project_accessed") streams.push(env.stream);
+                }
+                return streams.join(",");
+            })()
+            "#,
+        )
+        .expect("probe send calls")
+        .as_string()
+        .unwrap_or_default();
+        if joined.is_empty() {
+            Vec::new()
+        } else {
+            joined.split(',').map(|s| s.to_owned()).collect()
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn selecting_project_via_rail_click_sends_project_accessed() {
+        install_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = make_state_with_fixture();
+            provide_context(state);
+            view! { <ProjectRail /> }
+        });
+        next_tick().await;
+
+        let button = container
+            .query_selector(".rail-project-row button")
+            .unwrap()
+            .expect("a project row should render a clickable button")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        button.click();
+        next_tick().await;
+
+        let streams = project_accessed_streams();
+        assert!(
+            streams.contains(&"/project/p-tyde".to_owned()),
+            "clicking the first project row should send project_accessed on \
+             /project/p-tyde, got {streams:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn navigating_home_does_not_send_project_accessed() {
+        install_send_stub();
+        let state = make_state_with_fixture();
+
+        // Selecting a project emits exactly one project_accessed frame.
+        state.switch_active_project(Some(ActiveProjectRef {
+            host_id: "host-a".to_owned(),
+            project_id: ProjectId("p-tyde".to_owned()),
+        }));
+        next_tick().await;
+        assert_eq!(
+            project_accessed_streams(),
+            vec!["/project/p-tyde".to_owned()],
+            "selecting a project should send one project_accessed frame"
+        );
+
+        // Switching to home (None) must not put any project_accessed on the wire.
+        clear_send_calls();
+        state.switch_active_project(None);
+        next_tick().await;
+        assert!(
+            project_accessed_streams().is_empty(),
+            "navigating home must not send project_accessed, got {:?}",
+            project_accessed_streams()
+        );
+    }
 }
 
 #[cfg(test)]

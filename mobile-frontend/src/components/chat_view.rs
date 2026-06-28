@@ -637,9 +637,13 @@ pub fn ChatView() -> impl IntoView {
                         // `agent_load_requests` the moment it's sent and only
                         // lands in `agent_loaded` once the bootstrap snapshot
                         // arrives; the gap is where a blank flash would
-                        // otherwise read as an empty conversation. On a load
-                        // send failure the request is cleared, so the spinner
-                        // falls back to the empty state rather than hanging.
+                        // otherwise read as an empty conversation. If the local
+                        // `LoadAgent` send itself fails, this effect clears the
+                        // request so the spinner falls back to the empty state
+                        // rather than hanging. A server `CommandError(LoadAgent)`
+                        // is different: it keeps the latch set and pushes an
+                        // error row, so `no_content` is false and that path
+                        // never reaches this spinner branch.
                         let load_pending = s_body
                             .agent_load_requests
                             .with(|loads| loads.contains(&key))
@@ -909,6 +913,7 @@ mod wasm_tests {
                 tool_calls: Vec::new(),
                 model_info: None,
                 token_usage: None,
+                turn_token_usage: None,
                 context_breakdown: None,
                 images: None,
             },
@@ -1203,6 +1208,104 @@ mod wasm_tests {
                 .unwrap()
                 .is_some(),
             "loaded-but-empty conversation must show the empty state"
+        );
+    }
+
+    /// Regression for the LoadAgent-failure loop: when a load fails the
+    /// dispatcher keeps the `agent_load_requests` latch set and pushes one
+    /// error row. The chat must show that error (no spinner), and the
+    /// auto-load effect must NOT re-send LoadAgent or stack a second error
+    /// when it runs — the retained latch is what blocks the retry. Here the
+    /// host stream is present so the only guard left standing is the latch.
+    #[wasm_bindgen_test]
+    async fn failed_load_keeps_latch_and_does_not_stack_errors() {
+        let host = LocalHostId("host-1".to_owned());
+        let host_for_mount = host.clone();
+        let container = make_container();
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let state_handle_for_mount = state_handle.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            let agent = make_agent(&host_for_mount, "Coder");
+            state.agents.set(vec![agent]);
+            // Give the host a stream so the auto-load effect's host-stream
+            // guard passes; the retained latch is then the only thing
+            // preventing a re-send.
+            state.host_streams.update(|m| {
+                m.insert(
+                    host_for_mount.clone(),
+                    StreamPath("/host/host-1".to_owned()),
+                );
+            });
+            let agent_ref = AgentRef {
+                local_host_id: host_for_mount.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            };
+            state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                local_host_id: host_for_mount.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            }));
+            // Post-failed-load state: latch retained, snapshot never arrived,
+            // a single error row already surfaced by the dispatcher.
+            state.agent_load_requests.update(|m| {
+                m.insert(agent_ref.clone());
+            });
+            state.chat_messages.update(|m| {
+                m.insert(
+                    agent_ref,
+                    vec![make_message(
+                        MessageSender::Error,
+                        "Failed to load conversation: agent already attached",
+                    )],
+                );
+            });
+            *state_handle_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <ChatView /> }
+        });
+        std::mem::forget(handle);
+        let state = state_handle.borrow().as_ref().unwrap().clone();
+        settle_autoscroll().await;
+
+        // Error row retires the spinner.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-loading']")
+                .unwrap()
+                .is_none(),
+            "error row must replace the loading spinner"
+        );
+        // Exactly one error row rendered — no stacked duplicates.
+        let error_rows = container
+            .query_selector_all("[data-mobile-test='chat-message-error']")
+            .unwrap();
+        assert_eq!(
+            error_rows.length(),
+            1,
+            "exactly one error row must render, got {}",
+            error_rows.length()
+        );
+
+        let agent_ref = AgentRef {
+            local_host_id: host.clone(),
+            agent_id: AgentId("agent-1".to_owned()),
+        };
+        // The auto-load effect saw the new chat content but must not have
+        // cleared the latch nor appended another error row.
+        assert!(
+            state
+                .agent_load_requests
+                .with_untracked(|m| m.contains(&agent_ref)),
+            "load latch must stay set so the auto-load effect does not retry"
+        );
+        assert_eq!(
+            state
+                .chat_messages
+                .with_untracked(|m| m.get(&agent_ref).map(|v| v.len())),
+            Some(1),
+            "the effect must not append a duplicate error row"
         );
     }
 

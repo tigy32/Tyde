@@ -8,12 +8,13 @@ use protocol::{
     AgentRenamedPayload, AgentStartPayload, BackendKind, BackgroundAgentFeature, ChatEvent,
     ClientErrorCode, ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope,
     FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload, HostSettingValue,
-    HostSettingsPayload, ListSessionsPayload, MessageSender, NewAgentPayload, Project,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectId,
-    ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SendMessagePayload,
+    HostSettingsPayload, ListSessionsPayload, MessageMetadataUpdateData, MessageSender,
+    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectId, ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SendMessagePayload,
     SendMessageToolResponse, SessionHistoryPayload, SessionListPayload, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath, ToolExecutionCompletedData,
-    ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
+    SpawnAgentParams, SpawnAgentPayload, StreamEndData, StreamPath, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType, TurnTokenUsage,
+    write_envelope,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -704,6 +705,171 @@ const MOCK_NATIVE_CHILD_AND_DROP_SENTINEL: &str = "__mock_spawn_native_child_and
 const MOCK_ERROR_WITHOUT_IDLE_SENTINEL: &str = "__mock_error_without_idle__";
 const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str = "__mock_tool_failure_without_idle__";
 const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
+const MOCK_LATE_USAGE_SENTINEL: &str = "__mock_late_usage__";
+const MOCK_NO_USAGE_SENTINEL: &str = "__mock_no_usage__";
+const MOCK_TURN_TOKEN_TOTAL: u64 = 1590;
+const MOCK_NATIVE_CHILD_TOKEN_TOTAL: u64 = 330;
+
+fn assert_known_turn_usage(
+    usage: &Option<TurnTokenUsage>,
+    expected_this_turn_total: u64,
+    expected_agent_total: u64,
+) {
+    match usage {
+        Some(TurnTokenUsage::Known {
+            this_turn,
+            agent_total,
+        }) => {
+            assert_eq!(this_turn.total_tokens, expected_this_turn_total);
+            assert_eq!(agent_total.total_tokens, expected_agent_total);
+        }
+        other => panic!("expected known turn token usage, got {other:?}"),
+    }
+}
+
+fn assert_unavailable_turn_usage(usage: &Option<TurnTokenUsage>) {
+    match usage {
+        Some(TurnTokenUsage::Unavailable {
+            reason: TokenUsageUnavailableReason::BackendDidNotReport,
+        }) => {}
+        other => panic!("expected unavailable turn token usage, got {other:?}"),
+    }
+}
+
+async fn spawn_token_usage_agent(
+    client: &mut client::Connection,
+    name: &str,
+    prompt: &str,
+) -> NewAgentPayload {
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![format!("/tmp/{name}")],
+                prompt: prompt.to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .unwrap_or_else(|error| panic!("spawn {name} failed: {error:?}"));
+
+    let env = expect_next_event(client, &format!("{name} NewAgent")).await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+    expect_agent_start_on_stream(client, &new_agent.instance_stream, &format!("{name} start"))
+        .await;
+    new_agent
+}
+
+async fn expect_turn_stream_end_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_text: &str,
+) -> StreamEndData {
+    let env = expect_chat_event_on_stream(client, stream, "TypingStatusChanged(true)").await;
+    let event: ChatEvent = env
+        .parse_payload()
+        .expect("parse TypingStatusChanged(true)");
+    assert!(
+        matches!(event, ChatEvent::TypingStatusChanged(true)),
+        "expected TypingStatusChanged(true) on {stream}, got {event:?}"
+    );
+
+    let env = expect_chat_event_on_stream(client, stream, "StreamStart").await;
+    let event: ChatEvent = env.parse_payload().expect("parse StreamStart");
+    assert!(
+        matches!(event, ChatEvent::StreamStart(..)),
+        "expected StreamStart on {stream}, got {event:?}"
+    );
+
+    let env = expect_chat_event_on_stream(client, stream, "StreamDelta").await;
+    let event: ChatEvent = env.parse_payload().expect("parse StreamDelta");
+    match event {
+        ChatEvent::StreamDelta(delta) => assert!(
+            delta.text.contains(expected_text),
+            "unexpected delta text on {stream}: {}",
+            delta.text
+        ),
+        other => panic!("expected StreamDelta on {stream}, got {other:?}"),
+    }
+
+    let env = expect_chat_event_on_stream(client, stream, "StreamEnd").await;
+    let event: ChatEvent = env.parse_payload().expect("parse StreamEnd");
+    match event {
+        ChatEvent::StreamEnd(data) => {
+            assert!(
+                data.message.content.contains(expected_text),
+                "unexpected stream end content on {stream}: {}",
+                data.message.content
+            );
+            data
+        }
+        other => panic!("expected StreamEnd on {stream}, got {other:?}"),
+    }
+}
+
+async fn expect_completed_turn_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected_text: &str,
+) -> StreamEndData {
+    let end = expect_turn_stream_end_on_stream(client, stream, expected_text).await;
+    expect_typing_false_on_stream(client, stream).await;
+    end
+}
+
+async fn expect_metadata_update_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+) -> MessageMetadataUpdateData {
+    loop {
+        let env = expect_chat_event_on_stream(client, stream, "MessageMetadataUpdated").await;
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        if let ChatEvent::MessageMetadataUpdated(update) = event {
+            return update;
+        }
+    }
+}
+
+async fn expect_raw_agent_bootstrap_on_stream(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    context: &str,
+) -> AgentBootstrapPayload {
+    loop {
+        let env = match tokio::time::timeout(Duration::from_secs(5), client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
+        if fixture::is_builtin_team_custom_agent_notify(&env)
+            || matches!(
+                env.kind,
+                FrameKind::SessionSettings
+                    | FrameKind::AgentsViewPreferencesNotify
+                    | FrameKind::TeamPresetCatalogNotify
+                    | FrameKind::SessionSchemas
+                    | FrameKind::BackendSetup
+                    | FrameKind::QueuedMessages
+                    | FrameKind::SessionList
+                    | FrameKind::WorkflowNotify
+            )
+        {
+            continue;
+        }
+        if env.kind == FrameKind::AgentBootstrap && env.stream == *stream {
+            return env.parse_payload().expect("parse AgentBootstrap");
+        }
+    }
+}
 
 async fn expect_turn_on_stream(
     client: &mut client::Connection,
@@ -1355,6 +1521,213 @@ async fn spawn_parent_with_native_child(
     .await;
 
     (parent_new, parent_start, child_new, child_start)
+}
+
+#[tokio::test]
+async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
+    let mut fixture = Fixture::new().await;
+    let new_agent =
+        spawn_token_usage_agent(&mut fixture.client, "token-usage-agent", "first usage").await;
+
+    let first = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "mock backend response to: first usage",
+    )
+    .await;
+    assert_eq!(
+        first
+            .message
+            .token_usage
+            .as_ref()
+            .expect("first turn usage")
+            .total_tokens,
+        MOCK_TURN_TOKEN_TOTAL
+    );
+    assert_known_turn_usage(
+        &first.message.turn_token_usage,
+        MOCK_TURN_TOKEN_TOTAL,
+        MOCK_TURN_TOKEN_TOTAL,
+    );
+
+    fixture
+        .client
+        .send_message(&new_agent.instance_stream, "second usage".to_owned())
+        .await
+        .expect("send second usage message");
+    let second = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "mock backend response to: second usage",
+    )
+    .await;
+    assert_known_turn_usage(
+        &second.message.turn_token_usage,
+        MOCK_TURN_TOKEN_TOTAL,
+        MOCK_TURN_TOKEN_TOTAL * 2,
+    );
+
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let late_agent = bootstrapped_agent(&bootstrap, &new_agent.agent_id);
+    let agent_bootstrap = expect_raw_agent_bootstrap_on_stream(
+        &mut late_client,
+        &late_agent.instance_stream,
+        "late client AgentBootstrap",
+    )
+    .await;
+    let stats = agent_bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::AgentActivityStats(payload) => Some(payload),
+            _ => None,
+        })
+        .expect("AgentBootstrap should carry AgentActivityStats");
+    assert_eq!(
+        stats.stats.token_usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL * 2
+    );
+}
+
+#[tokio::test]
+async fn late_metadata_usage_updates_cumulative_without_double_counting() {
+    let mut fixture = Fixture::new().await;
+    let new_agent = spawn_token_usage_agent(
+        &mut fixture.client,
+        "late-token-usage-agent",
+        &format!("first late {MOCK_LATE_USAGE_SENTINEL}"),
+    )
+    .await;
+
+    let stream_end = expect_turn_stream_end_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "mock backend response to: first late",
+    )
+    .await;
+    assert!(stream_end.message.token_usage.is_none());
+    assert_unavailable_turn_usage(&stream_end.message.turn_token_usage);
+
+    let update =
+        expect_metadata_update_on_stream(&mut fixture.client, &new_agent.instance_stream).await;
+    assert_eq!(
+        update
+            .token_usage
+            .as_ref()
+            .expect("late metadata token usage")
+            .total_tokens,
+        MOCK_TURN_TOKEN_TOTAL
+    );
+    assert_known_turn_usage(
+        &update.turn_token_usage,
+        MOCK_TURN_TOKEN_TOTAL,
+        MOCK_TURN_TOKEN_TOTAL,
+    );
+    expect_typing_false_on_stream(&mut fixture.client, &new_agent.instance_stream).await;
+
+    fixture
+        .client
+        .send_message(&new_agent.instance_stream, "after late usage".to_owned())
+        .await
+        .expect("send follow-up after late metadata");
+    let second = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "mock backend response to: after late usage",
+    )
+    .await;
+    assert_known_turn_usage(
+        &second.message.turn_token_usage,
+        MOCK_TURN_TOKEN_TOTAL,
+        MOCK_TURN_TOKEN_TOTAL * 2,
+    );
+}
+
+#[tokio::test]
+async fn subagent_turn_token_usage_is_strictly_self() {
+    let mut fixture = Fixture::new().await;
+    let parent_prompt = format!("parent prompt {MOCK_NATIVE_CHILD_SENTINEL}");
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("strict-self-parent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/token-sub-agent-parent".to_owned()],
+                prompt: parent_prompt,
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn parent with native child failed");
+
+    let env = expect_next_event(&mut fixture.client, "strict-self parent NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let parent_new: NewAgentPayload = env.parse_payload().expect("parse parent NewAgent");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "strict-self parent start",
+    )
+    .await;
+    let parent_end = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &parent_new.instance_stream,
+        "mock backend response to: parent prompt",
+    )
+    .await;
+    assert_known_turn_usage(
+        &parent_end.message.turn_token_usage,
+        MOCK_TURN_TOKEN_TOTAL,
+        MOCK_TURN_TOKEN_TOTAL,
+    );
+
+    let env = expect_next_event(&mut fixture.client, "strict-self native child NewAgent").await;
+    assert_eq!(env.kind, FrameKind::NewAgent);
+    let child_new: NewAgentPayload = env.parse_payload().expect("parse child NewAgent");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "strict-self child start",
+    )
+    .await;
+    let child_end = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &child_new.instance_stream,
+        "mock native child response to: parent prompt",
+    )
+    .await;
+    assert_known_turn_usage(
+        &child_end.message.turn_token_usage,
+        MOCK_NATIVE_CHILD_TOKEN_TOTAL,
+        MOCK_NATIVE_CHILD_TOKEN_TOTAL,
+    );
+}
+
+#[tokio::test]
+async fn missing_backend_usage_is_unavailable_not_zero() {
+    let mut fixture = Fixture::new().await;
+    let new_agent = spawn_token_usage_agent(
+        &mut fixture.client,
+        "unavailable-token-usage-agent",
+        &format!("missing usage {MOCK_NO_USAGE_SENTINEL}"),
+    )
+    .await;
+
+    let stream_end = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "mock backend response to: missing usage",
+    )
+    .await;
+    assert!(stream_end.message.token_usage.is_none());
+    assert_unavailable_turn_usage(&stream_end.message.turn_token_usage);
 }
 
 #[tokio::test]

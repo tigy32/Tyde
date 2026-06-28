@@ -121,10 +121,13 @@ pub fn ProjectsView() -> impl IntoView {
                                 let host_for_click = host_id.clone();
                                 let pid_for_click = project_id.clone();
                                 let on_select = Callback::new(move |_: ()| {
-                                    s_click.active_project.set(Some(ActiveProjectRef {
-                                        local_host_id: host_for_click.clone(),
-                                        project_id: pid_for_click.clone(),
-                                    }));
+                                    crate::actions::select_project(
+                                        &s_click,
+                                        ActiveProjectRef {
+                                            local_host_id: host_for_click.clone(),
+                                            project_id: pid_for_click.clone(),
+                                        },
+                                    );
                                 });
 
                                 let test = if is_active {
@@ -413,6 +416,80 @@ mod wasm_tests {
                 sort_order: 0,
             },
         }
+    }
+
+    /// Capture `send_host_line` invokes so a test can inspect the wire.
+    fn record_bridge() {
+        let _ = js_sys::eval(
+            "(function(){ \
+               window.__sent_lines = []; \
+               window.__TAURI__ = window.__TAURI__ || {}; \
+               window.__TAURI__.core = window.__TAURI__.core || {}; \
+               window.__TAURI__.core.invoke = function(cmd, args){ \
+                 try { \
+                   if (cmd === 'send_host_line' && args) { \
+                     var line = (args.line !== undefined) ? args.line \
+                       : (args.get ? args.get('line') : undefined); \
+                     if (line !== undefined) { window.__sent_lines.push(line); } \
+                   } \
+                 } catch (e) {} \
+                 return Promise.resolve(); }; \
+               window.__TAURI__.event = window.__TAURI__.event || {}; \
+               window.__TAURI__.event.listen = function(){ return Promise.resolve(function(){}); }; \
+             })();",
+        );
+    }
+
+    fn sent_lines_joined() -> String {
+        js_sys::eval("(window.__sent_lines||[]).join('\\n')")
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default()
+    }
+
+    /// Tapping a project row selects it and notifies the host with a
+    /// `project_accessed` frame on the project stream. Before any selection
+    /// nothing is sent.
+    #[wasm_bindgen_test]
+    async fn selecting_project_sends_project_accessed() {
+        record_bridge();
+        let host = LocalHostId("host-1".to_owned());
+        let host_clone = host.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_clone.clone()));
+            state
+                .projects
+                .set(vec![make_project(&host_clone, "p-1", "Proj", vec!["/x"])]);
+            provide_context(state);
+            view! { <ProjectsView /> }
+        });
+        next_tick().await;
+
+        // No project is active yet → nothing on the wire.
+        assert!(
+            !sent_lines_joined().contains("project_accessed"),
+            "no project_accessed should be sent before a selection; sent: {}",
+            sent_lines_joined()
+        );
+
+        let row = container
+            .query_selector("[data-mobile-test='project-row']")
+            .unwrap()
+            .expect("a project row must render");
+        row.dyn_ref::<HtmlElement>().unwrap().click();
+        next_tick().await;
+
+        let sent = sent_lines_joined();
+        assert!(
+            sent.contains("project_accessed"),
+            "selecting a project must send a project_accessed frame; sent: {sent}"
+        );
+        assert!(
+            sent.contains("/project/p-1"),
+            "project_accessed must target the project stream /project/p-1; sent: {sent}"
+        );
     }
 
     /// Empty list shows the structured empty state.

@@ -98,12 +98,19 @@ host's perspective:
 
 1. append `AgentStart`
 2. forward each `ChatEvent` into the canonical event log
-3. fan those events out to attached subscribers
-4. terminate when the sub-agent event channel closes
+3. stamp per-turn and agent-cumulative token usage from the child's own
+   `ChatEvent`s
+4. fan those events out to attached subscribers
+5. terminate when the sub-agent event channel closes
 
 This is the key architectural move. The host registry remains the single source
 of truth, and late subscribers get replay for native children exactly the same
 way they do for regular agents.
+
+Token accounting is strict-self: the relay child owns its cumulative total, and
+the parent agent's total does not include child tokens. Backends forward normal
+child `ChatEvent`s only; there is no separate sub-agent activity-stats usage
+side channel.
 
 ### 2.3 HostSubAgentEmitter
 

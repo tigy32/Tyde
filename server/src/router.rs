@@ -13,24 +13,24 @@ use protocol::{
     HostBrowseStartPayload, InterruptPayload, ListSessionsPayload, LoadAgentPayload,
     McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceRenamePayload,
     MobileDeviceRevokePayload, MobilePairingCancelPayload, MobilePairingStartPayload,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
-    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId, ProjectListDirPayload,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload,
-    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
-    ReviewActionPayload, ReviewCreatePayload, ReviewId, ReviewSubscribePayload,
-    RunBackendSetupPayload, SendMessagePayload, SendQueuedMessageNowPayload, SetAgentGroupsPayload,
-    SetAgentNamePayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
-    SetAgentsViewPreferencesPayload, SetSessionSettingsPayload, SetSettingPayload,
-    SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringUpsertPayload, StreamPath, TeamCompactPayload, TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
-    TeamMemberActivatePayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
-    TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload,
-    TerminalClosePayload, TerminalCreatePayload, TerminalId, TerminalResizePayload,
-    TerminalSendPayload, TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
-    WorkflowRefreshPayload,
+    ProjectAccessedPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
+    ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload,
+    ProjectSearchPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewId,
+    ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
+    SendQueuedMessageNowPayload, SetAgentGroupsPayload, SetAgentNamePayload, SetAgentPinsPayload,
+    SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
+    SetSessionSettingsPayload, SetSettingPayload, SkillRefreshPayload, SpawnAgentParams,
+    SpawnAgentPayload, SteeringDeletePayload, SteeringUpsertPayload, StreamPath,
+    TeamCompactPayload, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
+    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
+    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
+    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberShufflePayload,
+    TeamMemberUpdatePayload, TeamRenamePayload, TeamSetManagerPayload, TerminalClosePayload,
+    TerminalCreatePayload, TerminalId, TerminalResizePayload, TerminalSendPayload,
+    TriggerWorkflowPayload, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowRefreshPayload,
 };
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -658,6 +658,11 @@ pub(crate) async fn route_client_envelope(
         let project_output_stream = host_output_stream.with_path(stream_path.clone());
 
         match envelope.kind {
+            FrameKind::ProjectAccessed => {
+                let _: ProjectAccessedPayload = parse_payload(&envelope, "project_accessed")?;
+                host.project_accessed(connection_host_stream, &project_output_stream, project_id)
+                    .await?;
+            }
             FrameKind::ProjectListDir => {
                 let payload: ProjectListDirPayload = parse_payload(&envelope, "project_list_dir")?;
                 ensure_non_empty("project_list_dir", "root", payload.root.0.as_str())?;

@@ -308,6 +308,27 @@ pub async fn compact_agent(
     .await
 }
 
+/// Select (open) a project: make it the active project and notify the host so
+/// the server can warm code intelligence and restore recent history. This is the
+/// one central project-open path for mobile, so every selection route flows
+/// through it. Home/none must not route here. Duplicate sends on re-selection
+/// are fine — the server owns idempotency.
+pub fn select_project(state: &AppState, project: crate::state::ActiveProjectRef) {
+    state.active_project.set(Some(project.clone()));
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(error) = send_frame(
+            &project.local_host_id,
+            project_stream(&project.project_id),
+            protocol::FrameKind::ProjectAccessed,
+            &protocol::ProjectAccessedPayload::default(),
+        )
+        .await
+        {
+            log::error!("failed to send ProjectAccessed: {error}");
+        }
+    });
+}
+
 pub async fn request_project_file(
     project: &crate::state::ActiveProjectRef,
     path: protocol::ProjectPath,

@@ -273,6 +273,10 @@ impl CodeIntelProvider for LspProvider {
         });
     }
 
+    fn warm(&mut self) {
+        let _ = self.tx.send(RaCommand::Warm);
+    }
+
     fn unsubscribe(&mut self, path: &ProjectPath) {
         let _ = self.tx.send(RaCommand::Unsubscribe { path: path.clone() });
     }
@@ -314,6 +318,7 @@ enum RaCommand {
         version: ProjectFileVersion,
         output: Stream,
     },
+    Warm,
     Unsubscribe {
         path: ProjectPath,
     },
@@ -449,6 +454,7 @@ struct RaActor {
     /// (the only host variable; see [`super::host_resource_mode`]).
     resource_mode: CodeIntelResourceMode,
     provider_status_tx: Option<mpsc::UnboundedSender<CodeIntelProviderStatus>>,
+    warmed: bool,
     phase: Phase,
     message: Option<String>,
     client: Option<LspClient>,
@@ -492,6 +498,7 @@ impl RaActor {
             root,
             resource_mode,
             provider_status_tx,
+            warmed: false,
             phase: Phase::Cold,
             message: None,
             client: None,
@@ -601,6 +608,17 @@ impl RaActor {
                         }
                         self.ensure_file_models();
                     }
+                }
+            }
+            RaCommand::Warm => {
+                self.warmed = true;
+                match self.phase {
+                    Phase::Cold => match self.start().await {
+                        Ok(()) => {}
+                        Err(failure) => self.emit_start_failure(failure, true),
+                    },
+                    Phase::Starting | Phase::Indexing | Phase::Ready => {}
+                    Phase::Unavailable | Phase::Failed => {}
                 }
             }
             RaCommand::Unsubscribe { path } => {
@@ -723,7 +741,7 @@ impl RaActor {
             file.model_version = None;
         }
 
-        if self.files.is_empty() {
+        if self.files.is_empty() && !self.warmed {
             return;
         }
 
@@ -742,12 +760,12 @@ impl RaActor {
     /// Bounded crash recovery (spec §M7): after the backoff elapsed, bring the
     /// provider back up from cold — re-bootstrap, re-spawn, re-initialize — then
     /// re-`didOpen` every still-subscribed file and restart its model push. A
-    /// crash that left no subscribed files is a no-op (nothing to serve). A
-    /// re-spawn that itself fails transiently schedules a further backed-off
-    /// attempt until the budget is spent, at which point we surface a fatal
-    /// `ProviderCrashed`.
+    /// crash that left no subscribed files or project warmup to serve is a
+    /// no-op. A re-spawn that itself fails transiently schedules a further
+    /// backed-off attempt until the budget is spent, at which point we surface a
+    /// fatal `ProviderCrashed`.
     async fn restart(&mut self) {
-        if self.files.is_empty() {
+        if self.files.is_empty() && !self.warmed {
             return;
         }
         // Cold restart: the new child has nothing open and no legend yet.
@@ -778,10 +796,12 @@ impl RaActor {
     }
 
     /// Schedule a backed-off `Restart` onto ourselves if the budget allows and
-    /// there are still files to serve. Returns whether one was scheduled (so the
-    /// caller can decide between a recoverable and a fatal crash error).
+    /// there are still files or a warmed project to serve. Returns whether one
+    /// was scheduled (so the caller can decide between a recoverable and a
+    /// fatal crash error).
     fn schedule_restart(&mut self) -> bool {
-        if self.files.is_empty() || self.restart_attempts >= MAX_RESTART_ATTEMPTS {
+        if (self.files.is_empty() && !self.warmed) || self.restart_attempts >= MAX_RESTART_ATTEMPTS
+        {
             return false;
         }
         self.restart_attempts += 1;

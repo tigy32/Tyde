@@ -301,15 +301,28 @@ pub struct CodeIntelOverviewSummary {
 }
 ```
 
-Lazy v1 behavior is explicit: subscribing to a project does **not** start any
-language server. The initial overview contains every project root with empty
-`providers` and a server-authored summary message such as "No language server
-running — open a file to index"; its summary headline is
-`CodeIntelOverviewHeadline::NotStarted`. Opening a supported file starts the
-provider for that root/language and the server replaces the overview as it moves
-through `Starting` → `Indexing` → `Ready`, or to `Unavailable` / `Failed`.
-File-scoped `CodeIntelStatusPayload.state` continues to use `CodeIntelState`;
-only the overview summary uses the footer-specific headline enum.
+Lazy v1 behavior is explicit: host bootstrap, project creation, project-stream
+subscription, and `ProjectBootstrap` do **not** start any language server. The
+initial overview contains every project root with empty `providers` and a
+server-authored summary message such as "No language server running — select
+the project or launch an agent to index"; its summary headline is
+`CodeIntelOverviewHeadline::NotStarted`.
+
+Startup is still lazy, but it is project/root-level rather than file-only. The
+client reports a typed `project_accessed` input frame on `/project/<project_id>`
+when the user selects/accesses that project, and the server also warms code
+intelligence when an agent launch resolves to `AgentStartPayload.project_id =
+Some(...)`. Either path starts providers for each project root/language detected
+from existing root markers/config (for example `Cargo.toml` for Rust) without
+synthesizing UI file subscriptions, fake file models, or `didOpen` for a UI
+file. Later file subscribe events reuse the warmed provider and behave normally.
+Project-level warm status and startup failures surface through the existing
+`CodeIntelOverview` provider entries only; warmup does not synthesize
+file-scoped `CodeIntelStatus` / `CodeIntelError` frames or project streams for
+clients that have not received `ProjectBootstrap`. Once a file is explicitly
+subscribed, file-scoped `CodeIntelStatus` / `CodeIntelError` frames continue to
+report that file's provider state. Both surfaces use `CodeIntelState`; only the
+overview summary uses the footer-specific headline enum.
 
 `work_done` / `total_work` are mapped from rust-analyzer's `$/progress`
 notifications. `resource_mode` reflects host capability — the **only** host
@@ -328,6 +341,7 @@ the wire.
 
 | Frame | Purpose |
 |-------|---------|
+| `project_accessed` | user accessed the project; server lazily warms root/language providers |
 | `code_intel_subscribe_file` | start pushing the semantic model for one file |
 | `code_intel_unsubscribe_file` | stop pushing for one file |
 | `code_intel_set_visible_range` | reprioritize resolution (hint, not a gate) |
@@ -337,6 +351,8 @@ the wire.
 | `code_intel_cancel_references` | cancel / supersede a references query |
 
 ```rust
+pub struct ProjectAccessedPayload {}
+
 pub struct CodeIntelSubscribeFilePayload {
     pub path: ProjectPath,
 }
@@ -636,10 +652,13 @@ provider actor (owns one subprocess for this root)
 ```
 
 - The **project-stream actor** owns the version counter and the full-replacement
-  `CodeIntelOverviewPayload`. It routes `CodeIntel*` input frames to the
-  project's thin router and fans out overview replacements to every project
-  subscriber. All `CodeIntel*` output frames flow back out on the same
-  `/project/<project_id>` stream.
+  `CodeIntelOverviewPayload`. It routes `project_accessed`/`CodeIntel*` input
+  frames to the project's thin router and fans out overview replacements to
+  every project subscriber. Warm provider status is published through that
+  overview path so the bootstrap-first project stream invariant is preserved;
+  file/query `CodeIntel*` output frames flow back out on the same
+  `/project/<project_id>` stream once the client has subscribed to the file or
+  sent the query.
 - The **project router** is plumbing only — it holds no provider state, picks
   the target root from the frame's `ProjectPath`, and delegates to that root's
   `CodeIntelService` actor.

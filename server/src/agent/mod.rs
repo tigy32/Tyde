@@ -11,8 +11,8 @@ use protocol::{
     ChatMessageId, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin, MessageSender,
     QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext,
     SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues, SpawnCostHint,
-    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData,
-    ToolExecutionResult,
+    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionResult, TurnTokenUsage,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -45,7 +45,7 @@ use self::registry::{
 const IMAGE_ONLY_AGENT_NAME: &str = "Image Review Task";
 const BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const RESUME_REPLAY_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
-const INITIAL_HISTORY_TAIL_LIMIT: usize = 50;
+const INITIAL_HISTORY_TAIL_LIMIT: usize = 15;
 pub(crate) const DEFAULT_COMPACTION_SUMMARY_MAX_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_COMPACTION_SUMMARY_BYTES: usize = 128 * 1024;
 
@@ -310,6 +310,9 @@ impl AgentReplayState {
         if update.token_usage.is_some() {
             completed.end.message.token_usage = update.token_usage.clone();
         }
+        if update.turn_token_usage.is_some() {
+            completed.end.message.turn_token_usage = update.turn_token_usage.clone();
+        }
         if update.context_breakdown.is_some() {
             completed.end.message.context_breakdown = update.context_breakdown.clone();
         }
@@ -408,6 +411,7 @@ struct AgentActivityStatsTracker {
     stats: AgentActivityStats,
     seen_tool_calls: HashSet<String>,
     token_usage_by_source: HashMap<TokenUsageSource, TokenUsage>,
+    active_reasoning: String,
 }
 
 impl AgentActivityStatsTracker {
@@ -417,7 +421,7 @@ impl AgentActivityStatsTracker {
 
     fn observe_chat_event(
         &mut self,
-        event: &ChatEvent,
+        event: &mut ChatEvent,
         source_seq: u64,
         active_stream_text: &str,
     ) -> bool {
@@ -426,19 +430,11 @@ impl AgentActivityStatsTracker {
             ChatEvent::MessageAdded(message) => {
                 if matches!(message.sender, MessageSender::Assistant { .. }) {
                     self.update_last_output(&message.content, source_seq);
+                    self.stamp_message_turn_token_usage(message, source_seq);
                 }
-                self.update_token_usage(
-                    token_usage_source_for_message(message, source_seq),
-                    message.token_usage.clone(),
-                    source_seq,
-                );
             }
             ChatEvent::MessageMetadataUpdated(update) => {
-                self.update_token_usage(
-                    TokenUsageSource::Message(update.message_id.clone()),
-                    update.token_usage.clone(),
-                    source_seq,
-                );
+                self.stamp_metadata_turn_token_usage(update, source_seq);
             }
             ChatEvent::StreamDelta(delta) => {
                 if !delta.text.trim().is_empty() {
@@ -446,15 +442,14 @@ impl AgentActivityStatsTracker {
                 }
             }
             ChatEvent::StreamReasoningDelta(delta) => {
-                self.update_last_output(&delta.text, source_seq);
+                self.active_reasoning.push_str(&delta.text);
+                let active_reasoning = self.active_reasoning.clone();
+                self.update_last_output(&active_reasoning, source_seq);
             }
             ChatEvent::StreamEnd(data) => {
                 self.update_last_output(&data.message.content, source_seq);
-                self.update_token_usage(
-                    token_usage_source_for_message(&data.message, source_seq),
-                    data.message.token_usage.clone(),
-                    source_seq,
-                );
+                self.stamp_message_turn_token_usage(&mut data.message, source_seq);
+                self.active_reasoning.clear();
             }
             ChatEvent::ToolRequest(request) => {
                 if self.seen_tool_calls.insert(request.tool_call_id.clone()) {
@@ -467,8 +462,10 @@ impl AgentActivityStatsTracker {
             | ChatEvent::ToolExecutionCompleted(_)
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::OperationCancelled(_)
-            | ChatEvent::RetryAttempt(_)
-            | ChatEvent::StreamStart(_) => {}
+            | ChatEvent::RetryAttempt(_) => {}
+            ChatEvent::StreamStart(_) => {
+                self.active_reasoning.clear();
+            }
         }
         self.stats != previous
     }
@@ -483,18 +480,50 @@ impl AgentActivityStatsTracker {
         }
     }
 
-    fn update_token_usage(
+    fn stamp_message_turn_token_usage(&mut self, message: &mut ChatMessage, source_seq: u64) {
+        let source = token_usage_source_for_message(message, source_seq);
+        message.turn_token_usage =
+            Some(self.turn_token_usage_for_source(source, message.token_usage.clone(), source_seq));
+    }
+
+    fn stamp_metadata_turn_token_usage(
+        &mut self,
+        update: &mut MessageMetadataUpdateData,
+        source_seq: u64,
+    ) {
+        if update.token_usage.is_none() {
+            return;
+        }
+        update.turn_token_usage = Some(self.turn_token_usage_for_source(
+            TokenUsageSource::Message(update.message_id.clone()),
+            update.token_usage.clone(),
+            source_seq,
+        ));
+    }
+
+    fn turn_token_usage_for_source(
         &mut self,
         source: TokenUsageSource,
         token_usage: Option<TokenUsage>,
         source_seq: u64,
-    ) {
+    ) -> TurnTokenUsage {
         let Some(token_usage) = token_usage else {
-            return;
+            return TurnTokenUsage::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport,
+            };
         };
-        self.token_usage_by_source.insert(source, token_usage);
-        self.stats.token_usage = total_token_usage(self.token_usage_by_source.values());
+        self.token_usage_by_source
+            .insert(source, token_usage.clone());
+        self.refresh_token_usage();
         self.stats.source_through_seq = Some(source_seq);
+        TurnTokenUsage::Known {
+            this_turn: Box::new(token_usage),
+            agent_total: Box::new(self.stats.token_usage.clone()),
+        }
+    }
+
+    fn refresh_token_usage(&mut self) {
+        self.stats.token_usage = total_token_usage(self.token_usage_by_source.values());
     }
 }
 
@@ -1621,7 +1650,7 @@ pub(crate) fn spawn_agent_actor(
         loop {
             tokio::select! {
                 maybe_event = events.recv() => {
-                    let Some(event) = maybe_event else {
+                    let Some(mut event) = maybe_event else {
                         if let Some(compaction) = active_compaction.take() {
                             let _ = compaction
                                 .reply
@@ -1726,7 +1755,7 @@ pub(crate) fn spawn_agent_actor(
                         let source_seq = activity_event_seq;
                         activity_event_seq = activity_event_seq.saturating_add(1);
                         if activity_stats.observe_chat_event(
-                            &event,
+                            &mut event,
                             source_seq,
                             &active_stream_text,
                         ) {
@@ -1934,7 +1963,11 @@ pub(crate) fn spawn_agent_actor(
                     .await;
                     let source_seq = activity_event_seq;
                     activity_event_seq = activity_event_seq.saturating_add(1);
-                    if activity_stats.observe_chat_event(&event, source_seq, &active_stream_text) {
+                    if activity_stats.observe_chat_event(
+                        &mut event,
+                        source_seq,
+                        &active_stream_text,
+                    ) {
                         upsert_activity_stats_snapshot(
                             &canonical_stream,
                             &mut event_log,
@@ -2979,7 +3012,7 @@ pub(crate) fn spawn_relay_agent_actor(
         loop {
             tokio::select! {
                 maybe_event = events.recv() => {
-                    let Some(event) = maybe_event else {
+                    let Some(mut event) = maybe_event else {
                         if matches!(lifecycle, ActorLifecycle::Closing) {
                             let reply = close_reply
                                 .take()
@@ -3104,7 +3137,11 @@ pub(crate) fn spawn_relay_agent_actor(
                     apply_runtime_session_updates(&session_store, &session_id, &event).await;
                     let source_seq = activity_event_seq;
                     activity_event_seq = activity_event_seq.saturating_add(1);
-                    if activity_stats.observe_chat_event(&event, source_seq, &active_stream_text) {
+                    if activity_stats.observe_chat_event(
+                        &mut event,
+                        source_seq,
+                        &active_stream_text,
+                    ) {
                         upsert_activity_stats_snapshot(
                             &canonical_stream,
                             &mut event_log,
@@ -4700,6 +4737,9 @@ fn fold_message_metadata_update_into_history_events(
         if update.token_usage.is_some() {
             message.token_usage = update.token_usage.clone();
         }
+        if update.turn_token_usage.is_some() {
+            message.turn_token_usage = update.turn_token_usage.clone();
+        }
         if update.context_breakdown.is_some() {
             message.context_breakdown = update.context_breakdown.clone();
         }
@@ -4975,22 +5015,24 @@ mod tests {
     use std::time::Duration;
 
     use protocol::{
-        AgentActivityStats, AgentBootstrapEvent, AgentBootstrapPayload, AgentId, AgentInput,
-        AgentStartPayload, ChatEvent, ChatMessage, ChatMessageId, FrameKind,
-        MessageMetadataUpdateData, MessageSender, ModelInfo, StreamEndData, StreamPath,
+        AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
+        AgentId, AgentInput, AgentStartPayload, ChatEvent, ChatMessage, ChatMessageId, FrameKind,
+        MessageMetadataUpdateData, MessageSender, ModelInfo, SessionId, StreamEndData, StreamPath,
         StreamStartData, StreamTextDeltaData, TaskList, TokenUsage, ToolExecutionCompletedData,
         ToolExecutionResult, ToolRequest, ToolRequestType,
     };
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
 
     use super::{
         AgentActivityStatsTracker, AgentCommand, AgentHandle, AgentReplayState, InterruptOutcome,
         activity_history_snapshot, append_chat_event, append_event, attach_subscriber,
         generate_mock_name, name_generation_fallback, output_events_since,
-        sanitize_generated_agent_name, session_history_window, upsert_activity_stats_snapshot,
+        sanitize_generated_agent_name, session_history_window, spawn_relay_agent_actor,
+        upsert_activity_stats_snapshot,
     };
     use crate::agent::registry::AgentStatusHandle;
+    use crate::store::session::SessionStore;
     use crate::stream::Stream;
 
     fn spawn_failed_agent_actor(
@@ -5103,6 +5145,7 @@ mod tests {
             tool_calls: Vec::new(),
             model_info: None,
             token_usage: None,
+            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         }
@@ -5122,6 +5165,7 @@ mod tests {
                 cache_creation_input_tokens: Some(0),
                 reasoning_tokens: Some(0),
             }),
+            turn_token_usage: None,
             context_breakdown: None,
         })
     }
@@ -5162,6 +5206,30 @@ mod tests {
         }
     }
 
+    fn stream_start(message_id: &str) -> ChatEvent {
+        ChatEvent::StreamStart(StreamStartData {
+            message_id: Some(message_id.to_owned()),
+            agent: "mock".to_owned(),
+            model: None,
+        })
+    }
+
+    fn stream_end_with_usage(message_id: &str, content: &str, total_tokens: u64) -> ChatEvent {
+        let mut message = assistant_message(content);
+        message.message_id = Some(ChatMessageId(message_id.to_owned()));
+        message.token_usage = Some(token_usage(total_tokens));
+        ChatEvent::StreamEnd(StreamEndData { message })
+    }
+
+    fn observe_stats(
+        stats: &mut AgentActivityStatsTracker,
+        mut event: ChatEvent,
+        source_seq: u64,
+        active_stream_text: &str,
+    ) -> bool {
+        stats.observe_chat_event(&mut event, source_seq, active_stream_text)
+    }
+
     fn test_agent_start(agent_id: &str) -> AgentStartPayload {
         AgentStartPayload {
             agent_id: AgentId(agent_id.to_owned()),
@@ -5184,8 +5252,9 @@ mod tests {
     fn activity_stats_tracks_latest_output_without_stream_start_or_end_clearing() {
         let mut stats = AgentActivityStatsTracker::default();
 
-        assert!(!stats.observe_chat_event(
-            &ChatEvent::StreamStart(StreamStartData {
+        assert!(!observe_stats(
+            &mut stats,
+            ChatEvent::StreamStart(StreamStartData {
                 message_id: Some("message-1".to_owned()),
                 agent: "mock".to_owned(),
                 model: None,
@@ -5195,8 +5264,9 @@ mod tests {
         ));
         assert_eq!(stats.snapshot().last_output_line, None);
 
-        assert!(stats.observe_chat_event(
-            &ChatEvent::StreamDelta(StreamTextDeltaData {
+        assert!(observe_stats(
+            &mut stats,
+            ChatEvent::StreamDelta(StreamTextDeltaData {
                 message_id: Some("message-1".to_owned()),
                 text: "first line".to_owned(),
             }),
@@ -5210,8 +5280,9 @@ mod tests {
 
         let mut empty_end = assistant_message("");
         empty_end.message_id = Some(ChatMessageId("message-1".to_owned()));
-        assert!(!stats.observe_chat_event(
-            &ChatEvent::StreamEnd(StreamEndData { message: empty_end }),
+        assert!(!observe_stats(
+            &mut stats,
+            ChatEvent::StreamEnd(StreamEndData { message: empty_end }),
             2,
             "",
         ));
@@ -5220,8 +5291,9 @@ mod tests {
             Some("first line")
         );
 
-        assert!(!stats.observe_chat_event(
-            &ChatEvent::StreamStart(StreamStartData {
+        assert!(!observe_stats(
+            &mut stats,
+            ChatEvent::StreamStart(StreamStartData {
                 message_id: Some("message-2".to_owned()),
                 agent: "mock".to_owned(),
                 model: None,
@@ -5236,8 +5308,9 @@ mod tests {
 
         let mut final_message = assistant_message("second line\nfinal line");
         final_message.message_id = Some(ChatMessageId("message-2".to_owned()));
-        assert!(stats.observe_chat_event(
-            &ChatEvent::StreamEnd(StreamEndData {
+        assert!(observe_stats(
+            &mut stats,
+            ChatEvent::StreamEnd(StreamEndData {
                 message: final_message
             }),
             4,
@@ -5251,14 +5324,51 @@ mod tests {
     }
 
     #[test]
+    fn activity_stats_accumulates_reasoning_deltas() {
+        let mut stats = AgentActivityStatsTracker::default();
+
+        assert!(!observe_stats(&mut stats, stream_start("message-1"), 0, ""));
+        for (seq, text) in ["Thi", "nking", " abo", "ut x"].into_iter().enumerate() {
+            observe_stats(
+                &mut stats,
+                ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
+                    message_id: Some("message-1".to_owned()),
+                    text: text.to_owned(),
+                }),
+                seq as u64 + 1,
+                "",
+            );
+        }
+        assert_eq!(
+            stats.snapshot().last_output_line.as_deref(),
+            Some("Thinking about x")
+        );
+
+        assert!(!observe_stats(&mut stats, stream_start("message-2"), 5, ""));
+        assert!(observe_stats(
+            &mut stats,
+            ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
+                message_id: Some("message-2".to_owned()),
+                text: "Fresh thought".to_owned(),
+            }),
+            6,
+            "",
+        ));
+        assert_eq!(
+            stats.snapshot().last_output_line.as_deref(),
+            Some("Fresh thought")
+        );
+    }
+
+    #[test]
     fn activity_stats_counts_unique_tool_requests() {
         let mut stats = AgentActivityStatsTracker::default();
 
-        assert!(stats.observe_chat_event(&tool_request("tool-1"), 0, ""));
+        assert!(observe_stats(&mut stats, tool_request("tool-1"), 0, ""));
         assert_eq!(stats.snapshot().tool_calls, 1);
-        assert!(!stats.observe_chat_event(&tool_request("tool-1"), 1, ""));
+        assert!(!observe_stats(&mut stats, tool_request("tool-1"), 1, ""));
         assert_eq!(stats.snapshot().tool_calls, 1);
-        assert!(stats.observe_chat_event(&tool_request("tool-2"), 2, ""));
+        assert!(observe_stats(&mut stats, tool_request("tool-2"), 2, ""));
         assert_eq!(stats.snapshot().tool_calls, 2);
         assert_eq!(stats.snapshot().source_through_seq, Some(2));
     }
@@ -5270,9 +5380,19 @@ mod tests {
         message.message_id = Some(ChatMessageId("message-1".to_owned()));
         message.token_usage = Some(token_usage(10));
 
-        assert!(stats.observe_chat_event(&ChatEvent::MessageAdded(message), 0, ""));
+        assert!(observe_stats(
+            &mut stats,
+            ChatEvent::MessageAdded(message),
+            0,
+            ""
+        ));
         assert_eq!(stats.snapshot().token_usage.total_tokens, 10);
-        assert!(stats.observe_chat_event(&metadata_update("message-1", 22), 1, ""));
+        assert!(observe_stats(
+            &mut stats,
+            metadata_update("message-1", 22),
+            1,
+            ""
+        ));
         assert_eq!(stats.snapshot().token_usage.total_tokens, 22);
         assert_eq!(stats.snapshot().source_through_seq, Some(1));
     }
@@ -5285,10 +5405,81 @@ mod tests {
         let mut second = assistant_message("second");
         second.token_usage = Some(token_usage(8));
 
-        assert!(stats.observe_chat_event(&ChatEvent::MessageAdded(first), 7, ""));
-        assert!(stats.observe_chat_event(&ChatEvent::MessageAdded(second), 8, ""));
+        assert!(observe_stats(
+            &mut stats,
+            ChatEvent::MessageAdded(first),
+            7,
+            ""
+        ));
+        assert!(observe_stats(
+            &mut stats,
+            ChatEvent::MessageAdded(second),
+            8,
+            ""
+        ));
         assert_eq!(stats.snapshot().token_usage.total_tokens, 14);
         assert_eq!(stats.snapshot().source_through_seq, Some(8));
+    }
+
+    #[tokio::test]
+    async fn relay_activity_stats_accumulate_subagent_turn_usage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session_store_path = dir.path().join("sessions.json");
+        let session_store = Arc::new(Mutex::new(
+            SessionStore::load(session_store_path).expect("load session store"),
+        ));
+        let start = test_agent_start("relay-stats-agent");
+        let (status_handle, _status_rx) = AgentStatusHandle::new();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_relay_agent_actor(
+            start.agent_id.clone(),
+            start,
+            event_rx,
+            session_store,
+            SessionId("relay-session".to_owned()),
+            status_handle,
+        );
+        let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+        assert!(handle.attach(replay_stream(output_tx)).await);
+        let _ = recv_agent_bootstrap_events(&mut output_rx, "relay stats bootstrap").await;
+
+        event_tx
+            .send(stream_start("message-1"))
+            .expect("relay event channel should be open");
+        event_tx
+            .send(stream_end_with_usage("message-1", "first", 10))
+            .expect("relay event channel should be open");
+        event_tx
+            .send(stream_start("message-2"))
+            .expect("relay event channel should be open");
+        event_tx
+            .send(stream_end_with_usage("message-2", "second", 7))
+            .expect("relay event channel should be open");
+
+        let stats = timeout(Duration::from_secs(1), async {
+            loop {
+                let event = output_rx
+                    .recv()
+                    .await
+                    .expect("relay output stream should stay open");
+                if event.kind == FrameKind::AgentActivityStats
+                    && let Ok(payload) = event.parse_payload::<AgentActivityStatsPayload>()
+                    && payload.stats.token_usage.total_tokens == 17
+                    && payload.stats.last_output_line.as_deref() == Some("second")
+                {
+                    return payload.stats;
+                }
+            }
+        })
+        .await
+        .expect("relay token stats should be emitted");
+
+        assert_eq!(stats.token_usage.total_tokens, 17);
+        assert_eq!(stats.token_usage.input_tokens, 8);
+        assert_eq!(stats.token_usage.output_tokens, 9);
+        assert_eq!(stats.last_output_line.as_deref(), Some("second"));
+        drop(event_tx);
+        assert!(handle.close().await);
     }
 
     #[tokio::test]
@@ -5479,7 +5670,7 @@ mod tests {
             "tool history 1",
         )
         .await;
-        for index in 2..=50 {
+        for index in 2..=15 {
             let mut message = assistant_message(&format!("history {index}"));
             message.message_id = Some(ChatMessageId(format!("message-{index}")));
             append_chat_event(
@@ -5523,7 +5714,7 @@ mod tests {
                 .iter()
                 .filter(|event| matches!(event, ChatEvent::MessageAdded(_)))
                 .count(),
-            50
+            15
         );
         match chat_events.as_slice() {
             [

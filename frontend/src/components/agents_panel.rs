@@ -1180,7 +1180,9 @@ pub fn AgentsPanel() -> impl IntoView {
                                     {move || group_live_status.get()}
                                 </div>
                                 {move || {
-                                    if has_custom_groups || keyboard_agent.get().is_some() {
+                                    let dragging_or_picking =
+                                        dragged_agent.get().is_some() || keyboard_agent.get().is_some();
+                                    if dragging_or_picking && has_custom_groups {
                                         render_ungroup_drop_target(
                                             ungroup_target_state.clone(),
                                             dragged_agent,
@@ -2456,6 +2458,7 @@ mod wasm_tests {
                         tool_calls: Vec::new(),
                         model_info: None,
                         token_usage: None,
+                        turn_token_usage: None,
                         context_breakdown: None,
                         images: None,
                     },
@@ -2660,7 +2663,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn ungroup_target_appears_for_keyboard_pickup_without_groups() {
+    async fn ungroup_target_stays_hidden_for_keyboard_pickup_without_groups() {
         let _calls = install_send_stub_with_dialog_ok();
         let container = make_container();
         let state = make_app_state("local");
@@ -2693,8 +2696,9 @@ mod wasm_tests {
             container
                 .query_selector(".agent-ungroup-drop-target")
                 .unwrap()
-                .is_some(),
-            "Ungroup target should remain reachable during keyboard pickup"
+                .is_none(),
+            "Ungroup target has nothing to ungroup into without groups, so a \
+             keyboard pickup must not reveal it"
         );
     }
 
@@ -2717,8 +2721,8 @@ mod wasm_tests {
             container
                 .query_selector(".agent-ungroup-drop-target")
                 .unwrap()
-                .is_some(),
-            "Ungroup target should render when custom groups exist"
+                .is_none(),
+            "Ungroup target should stay hidden when groups exist but no move is active"
         );
 
         let move_button: HtmlElement = container
@@ -2728,6 +2732,9 @@ mod wasm_tests {
             .dyn_into()
             .unwrap();
         dispatch_key(&move_button, " ");
+        for _ in 0..4 {
+            next_tick().await;
+        }
         let ungroup_target: HtmlElement = container
             .query_selector(".agent-ungroup-drop-target")
             .unwrap()
@@ -2743,6 +2750,97 @@ mod wasm_tests {
         assert_eq!(update["kind"], "move_targets");
         assert!(update["group_id"].is_null());
         assert_eq!(update["targets"].as_array().expect("targets").len(), 1);
+    }
+
+    /// The dashed "Ungroup" drop target is an interaction affordance: it must
+    /// appear only while an agent is actively being moved (mouse drag or
+    /// keyboard pickup) AND there is a custom group to ungroup out of. A
+    /// permanently-visible target that can't accept a drop is the regression
+    /// this guards.
+    #[wasm_bindgen_test]
+    async fn ungroup_drop_target_gated_by_active_interaction() {
+        let _calls = install_send_stub_with_dialog_ok();
+
+        // Groups present, but no drag and no keyboard pickup.
+        let container = make_container();
+        let state = make_app_state("local");
+        seed_sidebar_group_fixture(&state);
+        apply_group_snapshot(
+            &state,
+            assigned_group("review", "Review Group", &["beta-agent"]),
+        );
+        let _handle = mount_panel(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let count = |container: &HtmlElement| {
+            container
+                .query_selector_all(".agent-ungroup-drop-target")
+                .unwrap()
+                .length()
+        };
+
+        // Case 1 (the regression): groups exist, no interaction -> 0 targets.
+        assert_eq!(
+            count(&container),
+            0,
+            "Ungroup target must stay hidden when groups exist but nothing is being moved"
+        );
+
+        // Case 2: an active mouse drag with groups present -> exactly 1 target.
+        // Drag a default-tree (ungrouped) agent so the card is draggable.
+        let parent_card: HtmlElement = container
+            .query_selector("[data-agent-id='parent-alpha'] .agent-card")
+            .unwrap()
+            .expect("parent card")
+            .dyn_into()
+            .unwrap();
+        dispatch_drag_event(&parent_card, "dragstart");
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert_eq!(
+            count(&container),
+            1,
+            "an active drag with groups present should reveal exactly one Ungroup target"
+        );
+
+        // Ending the drag tears the target back down.
+        dispatch_drag_event(&parent_card, "dragend");
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert_eq!(
+            count(&container),
+            0,
+            "Ungroup target must disappear once the drag ends"
+        );
+
+        // Case 3: keyboard pickup active but NO custom groups -> 0 targets.
+        let container_no_groups = make_container();
+        let state_no_groups = make_app_state("local");
+        seed_sidebar_group_fixture(&state_no_groups);
+        apply_group_snapshot(&state_no_groups, AgentGroupsSnapshot::default());
+        let _handle_no_groups = mount_panel(&container_no_groups, state_no_groups);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let move_button: HtmlElement = container_no_groups
+            .query_selector("[data-agent-id='beta-agent'] .agent-card-move")
+            .unwrap()
+            .expect("move handle")
+            .dyn_into()
+            .unwrap();
+        dispatch_key(&move_button, " ");
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert_eq!(
+            count(&container_no_groups),
+            0,
+            "a keyboard pickup with no custom groups has nothing to ungroup into"
+        );
     }
 
     #[wasm_bindgen_test]

@@ -11,29 +11,32 @@ use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
     AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
     AgentsViewPreferencesNotifyPayload, BackendSetupPayload, BrowseBootstrapPayload,
-    CancelQueuedMessagePayload, CancelWorkflowPayload, CodeIntelOverviewPayload,
-    CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
-    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload,
-    FrameError, FrameKind, HelloPayload, HostBootstrapPayload, HostBrowseStartPayload,
-    HostSettingsPayload, InterruptPayload, ListSessionsPayload, McpServerDeletePayload,
-    McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
-    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, PROTOCOL_VERSION,
-    ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectListDirPayload, ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload,
-    ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
-    QueuedMessagesPayload, RejectPayload, ReviewActionPayload, ReviewBootstrapPayload,
-    ReviewCreatePayload, ReviewEventPayload, ReviewId, ReviewSubscribePayload, SendMessagePayload,
-    SendQueuedMessageNowPayload, SeqValidator, SessionHistoryPayload, SessionListPayload,
-    SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload,
-    SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentPayload,
-    SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload, StreamPath, TYDE_VERSION,
-    TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
-    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
-    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
-    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
-    TeamMemberNotifyPayload, TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    CancelQueuedMessagePayload, CancelWorkflowPayload, CodeIntelDiagnosticsPayload,
+    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
+    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
+    HelloPayload, HostBootstrapPayload, HostBrowseStartPayload, HostSettingsPayload,
+    InterruptPayload, ListSessionsPayload, McpServerDeletePayload, McpServerNotifyPayload,
+    McpServerUpsertPayload, MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload,
+    NewTerminalPayload, PROTOCOL_VERSION, ProjectAccessedPayload, ProjectAddRootPayload,
+    ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload, RejectPayload,
+    ReviewActionPayload, ReviewBootstrapPayload, ReviewCreatePayload, ReviewEventPayload, ReviewId,
+    ReviewSubscribePayload, SendMessagePayload, SendQueuedMessageNowPayload, SeqValidator,
+    SessionHistoryPayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
+    SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload,
+    SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
+    SteeringUpsertPayload, StreamPath, TYDE_VERSION, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
+    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
+    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
+    TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamNotifyPayload,
     TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
@@ -432,6 +435,15 @@ impl Connection {
     ) -> Result<(), FrameError> {
         self.send_project_payload(project_id, FrameKind::ProjectReadFile, &payload)
             .await
+    }
+
+    pub async fn project_accessed(&mut self, project_id: &ProjectId) -> Result<(), FrameError> {
+        self.send_project_payload(
+            project_id,
+            FrameKind::ProjectAccessed,
+            &ProjectAccessedPayload::default(),
+        )
+        .await
     }
 
     pub async fn project_read_diff(
@@ -1095,6 +1107,38 @@ impl Connection {
                 }
                 FrameKind::CodeIntelOverview => {
                     let _: CodeIntelOverviewPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::CodeIntelStatus => {
+                    let _: CodeIntelStatusPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::CodeIntelFileModel => {
+                    let _: CodeIntelFileModelPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::CodeIntelDiagnostics => {
+                    let _: CodeIntelDiagnosticsPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::CodeIntelHoverResult => {
+                    let _: CodeIntelHoverResultPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::CodeIntelNavigateResult => {
+                    let _: CodeIntelNavigateResultPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::CodeIntelReferencesResults => {
+                    let _: CodeIntelReferencesResultsPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::CodeIntelReferencesComplete => {
+                    let _: CodeIntelReferencesCompletePayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::CodeIntelError => {
+                    let _: CodeIntelErrorPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::ProjectFileContents => {

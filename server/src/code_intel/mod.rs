@@ -77,6 +77,10 @@ impl Language {
     /// new variant must be added here too — the single registry detection walks.
     const ALL: [Language; 2] = [Language::Rust, Language::Python];
 
+    pub(crate) fn all() -> impl Iterator<Item = Self> {
+        Self::ALL.into_iter()
+    }
+
     /// The per-language [`LanguageServerConfig`] driving the generic provider.
     /// The one place a `Language` resolves to its config (ids, extensions,
     /// markers, discovery, init options); the compiler forces a new variant to
@@ -134,6 +138,17 @@ pub(crate) fn detect_language(
         .iter()
         .any(|marker| root_entries.contains(*marker))
         .then_some(language)
+}
+
+pub(crate) fn detect_project_languages(root_entries: &HashSet<String>) -> Vec<Language> {
+    Language::all()
+        .filter(|language| {
+            language
+                .workspace_markers()
+                .iter()
+                .any(|marker| root_entries.contains(*marker))
+        })
+        .collect()
 }
 
 /// The absolute on-disk path of a project file: `root` is already an absolute
@@ -228,5 +243,22 @@ mod tests {
             detect_language("notes.txt", &entries(&["Cargo.toml"])),
             None
         );
+    }
+
+    #[test]
+    fn project_language_detection_uses_root_markers_without_files() {
+        assert_eq!(
+            detect_project_languages(&entries(&["Cargo.toml"])),
+            vec![Language::Rust]
+        );
+        assert_eq!(
+            detect_project_languages(&entries(&["pyproject.toml"])),
+            vec![Language::Python]
+        );
+        assert_eq!(
+            detect_project_languages(&entries(&["Cargo.toml", "pyproject.toml"])),
+            vec![Language::Rust, Language::Python]
+        );
+        assert!(detect_project_languages(&entries(&["src"])).is_empty());
     }
 }
