@@ -6,6 +6,7 @@
 //! [`protocol_driver`](crate::protocol_driver). A future wasm backend will live
 //! beside this one (`link_wasm.rs`) behind `cfg(target_arch = "wasm32")`.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use rand::RngCore;
@@ -15,7 +16,7 @@ use rumqttc::v5::mqttbytes::v5::{
     Packet, PubAckProperties, PubAckReason, SubAck, SubAckProperties, SubscribeReasonCode,
 };
 use rumqttc::v5::{AsyncClient, Event, EventLoop, MqttOptions};
-use rumqttc::{TlsConfiguration, Transport};
+use rumqttc::{Outgoing, TlsConfiguration, Transport};
 #[cfg(feature = "test-support")]
 use std::net::IpAddr;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -23,7 +24,9 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use crate::chunking::MAX_PLAINTEXT_CHUNK_LEN;
 use crate::config::ParticipantRole;
 use crate::error::{MqttTransportError, PublishRejection};
-use crate::link::{IncomingPublish, LinkEvent, MqttLink};
+use crate::link::{
+    IncomingPublish, LinkEvent, MAX_QOS1_INFLIGHT, MqttLink, PublishAck, PublishToken,
+};
 use crate::types::{BrokerAuth, BrokerEndpoint};
 use protocol::BrokerUrl;
 use std::time::Duration;
@@ -37,6 +40,9 @@ const MAX_MQTT_PACKET_SIZE: u32 = (MAX_PLAINTEXT_CHUNK_LEN as u32) + 1024;
 pub(crate) struct NativeMqttLink {
     client: AsyncClient,
     eventloop: EventLoop,
+    next_publish_token: u64,
+    pending_publish_tokens: VecDeque<PublishToken>,
+    publish_tokens_by_pkid: HashMap<u16, PublishToken>,
 }
 
 impl NativeMqttLink {
@@ -47,7 +53,71 @@ impl NativeMqttLink {
     ) -> Result<Self, MqttTransportError> {
         let options = mqtt_options(&endpoint.url, &endpoint.auth, role, tls_ca_pem)?;
         let (client, eventloop) = AsyncClient::new(options, EVENTLOOP_REQUEST_CAPACITY);
-        Ok(Self { client, eventloop })
+        Ok(Self {
+            client,
+            eventloop,
+            next_publish_token: 0,
+            pending_publish_tokens: VecDeque::new(),
+            publish_tokens_by_pkid: HashMap::new(),
+        })
+    }
+
+    fn allocate_publish_token(&mut self) -> Result<PublishToken, MqttTransportError> {
+        let token = PublishToken::new(self.next_publish_token);
+        self.next_publish_token = self.next_publish_token.checked_add(1).ok_or_else(|| {
+            MqttTransportError::Configuration {
+                message: "MQTT publish token counter exhausted".to_string(),
+            }
+        })?;
+        Ok(token)
+    }
+
+    fn translate_event(&mut self, event: Event) -> Result<LinkEvent, MqttTransportError> {
+        match event {
+            Event::Incoming(Packet::Publish(publish)) => Ok(LinkEvent::Publish(IncomingPublish {
+                topic: publish.topic.to_vec(),
+                payload: publish.payload.to_vec(),
+                retain: publish.retain,
+            })),
+            Event::Incoming(Packet::PubAck(puback)) => {
+                let token = self.publish_tokens_by_pkid.remove(&puback.pkid).ok_or(
+                    MqttTransportError::PublishAckMismatch {
+                        packet_id: Some(puback.pkid),
+                        token: None,
+                    },
+                )?;
+                Ok(LinkEvent::PubAck(PublishAck {
+                    token,
+                    result: validate_puback(puback.reason, puback.properties.as_ref()),
+                }))
+            }
+            Event::Incoming(Packet::SubAck(suback)) => {
+                let debug = format!("{suback:?}");
+                Ok(LinkEvent::SubAck {
+                    result: validate_suback(suback),
+                    debug,
+                })
+            }
+            Event::Incoming(Packet::Disconnect(disconnect)) => Ok(LinkEvent::Disconnect {
+                reason: format!("{disconnect:?}"),
+            }),
+            Event::Outgoing(Outgoing::Publish(pkid)) => {
+                let token = self.pending_publish_tokens.pop_front().ok_or(
+                    MqttTransportError::PublishAckMismatch {
+                        packet_id: Some(pkid),
+                        token: None,
+                    },
+                )?;
+                if self.publish_tokens_by_pkid.insert(pkid, token).is_some() {
+                    return Err(MqttTransportError::PublishAckMismatch {
+                        packet_id: Some(pkid),
+                        token: Some(token.value()),
+                    });
+                }
+                Ok(LinkEvent::Other)
+            }
+            Event::Incoming(_) | Event::Outgoing(_) => Ok(LinkEvent::Other),
+        }
     }
 }
 
@@ -61,13 +131,20 @@ impl MqttLink for NativeMqttLink {
             })
     }
 
-    async fn publish(&mut self, topic: &str, payload: Vec<u8>) -> Result<(), MqttTransportError> {
+    async fn publish(
+        &mut self,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> Result<PublishToken, MqttTransportError> {
+        let token = self.allocate_publish_token()?;
         self.client
             .publish(topic.to_owned(), QoS::AtLeastOnce, false, payload)
             .await
             .map_err(|source| MqttTransportError::Publish {
                 source: Box::new(source),
-            })
+            })?;
+        self.pending_publish_tokens.push_back(token);
+        Ok(token)
     }
 
     async fn poll(&mut self) -> Result<LinkEvent, MqttTransportError> {
@@ -78,38 +155,11 @@ impl MqttLink for NativeMqttLink {
                 .map_err(|source| MqttTransportError::BrokerConnect {
                     source: Box::new(source),
                 })?;
-        Ok(translate_event(event))
+        self.translate_event(event)
     }
 
     async fn disconnect(&mut self) {
         let _disconnect_result = self.client.disconnect().await;
-    }
-}
-
-/// Translate a rumqttc event into the transport-neutral [`LinkEvent`]. The
-/// reason-code validation that depends on rumqttc enums happens here so the
-/// driver never sees them.
-fn translate_event(event: Event) -> LinkEvent {
-    match event {
-        Event::Incoming(Packet::Publish(publish)) => LinkEvent::Publish(IncomingPublish {
-            topic: publish.topic.to_vec(),
-            payload: publish.payload.to_vec(),
-            retain: publish.retain,
-        }),
-        Event::Incoming(Packet::PubAck(puback)) => {
-            LinkEvent::PubAck(validate_puback(puback.reason, puback.properties.as_ref()))
-        }
-        Event::Incoming(Packet::SubAck(suback)) => {
-            let debug = format!("{suback:?}");
-            LinkEvent::SubAck {
-                result: validate_suback(suback),
-                debug,
-            }
-        }
-        Event::Incoming(Packet::Disconnect(disconnect)) => LinkEvent::Disconnect {
-            reason: format!("{disconnect:?}"),
-        },
-        Event::Incoming(_) | Event::Outgoing(_) => LinkEvent::Other,
     }
 }
 
@@ -237,6 +287,8 @@ pub(crate) fn mqtt_options(
     options.set_clean_start(true);
     options.set_session_expiry_interval(Some(0));
     options.set_max_packet_size(Some(MAX_MQTT_PACKET_SIZE));
+    options.set_outgoing_inflight_upper_limit(MAX_QOS1_INFLIGHT as u16);
+    options.set_receive_maximum(Some(MAX_QOS1_INFLIGHT as u16));
 
     match auth {
         BrokerAuth::Anonymous => {}

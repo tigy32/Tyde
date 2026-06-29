@@ -13,7 +13,7 @@
 //! is used directly on both targets. tokio's `sync` channels are portable to
 //! wasm32, so they are used directly as well.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::str;
 #[cfg(test)]
 use std::sync::Arc;
@@ -35,7 +35,9 @@ use crate::error::{FramingError, MqttTransportError};
 use crate::framing::{
     SESSION_SALT_LEN, TransportFrame, decode_frame, encode_data_frame, encode_handshake_frame,
 };
-use crate::link::{IncomingPublish, LinkEvent, MqttLink};
+use crate::link::{
+    IncomingPublish, LinkEvent, MAX_QOS1_INFLIGHT, MqttLink, PublishAck, PublishToken,
+};
 use crate::rendezvous::{
     ConnectionId, OpenAccept, OpenRequest, decode_open_accept, decode_open_request,
     derive_ephemeral_psk, encode_open_accept, encode_open_request, random_nonce,
@@ -165,7 +167,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
                         }
                     }
                 }
-                LinkEvent::PubAck(result) => result?,
+                LinkEvent::PubAck(ack) => ack.result?,
                 LinkEvent::Disconnect { reason } => {
                     return Err(MqttTransportError::BrokerDisconnected {
                         reason: format!("disconnect during salt exchange: {reason}"),
@@ -229,8 +231,8 @@ impl<L: MqttLink> ProtocolDriver<L> {
                     }
                 }
             }
-            LinkEvent::PubAck(result) => {
-                result?;
+            LinkEvent::PubAck(ack) => {
+                ack.result?;
                 Ok(None)
             }
             LinkEvent::Disconnect { reason } => Err(MqttTransportError::BrokerDisconnected {
@@ -245,80 +247,94 @@ impl<L: MqttLink> ProtocolDriver<L> {
 
     async fn run_stream(mut self, mut cipher: SessionCipher) {
         let mut deferred_outbound: Option<OutboundChunk> = None;
+        let mut in_flight = InflightPublishes::new();
+        let mut outbound_closed = false;
         loop {
-            if let Some(outbound) = deferred_outbound.take() {
+            if in_flight.has_capacity()
+                && let Some(outbound) = deferred_outbound.take()
+            {
                 match self
-                    .boxcar_outbound(outbound, &mut cipher, &mut deferred_outbound)
+                    .boxcar_outbound(
+                        outbound,
+                        &mut cipher,
+                        &mut deferred_outbound,
+                        &mut in_flight,
+                    )
                     .await
                 {
                     Ok(batch) => {
-                        if let Err(error) =
-                            self.publish_plaintext(&mut cipher, &batch.plaintext).await
+                        if let Err(failure) = self
+                            .publish_boxcar_batch(&mut cipher, batch, &mut in_flight)
+                            .await
                         {
-                            batch.ack_error(&error);
-                            send_inbound_error(self.inbound_tx.clone(), error).await;
+                            failure.batch.ack_error(&failure.error);
+                            self.fail_stream(&mut in_flight, failure.error).await;
                             return;
                         }
-                        batch.ack_success();
                     }
-                    Err(error) => {
-                        send_inbound_error(self.inbound_tx.clone(), error).await;
+                    Err(failure) => {
+                        failure.batch.ack_error(&failure.error);
+                        self.fail_stream(&mut in_flight, failure.error).await;
                         return;
                     }
                 }
                 continue;
             }
 
+            if outbound_closed && in_flight.is_empty() {
+                self.link.disconnect().await;
+                let _send_result = self.inbound_tx.send(InboundEvent::Eof).await;
+                return;
+            }
+
+            let can_accept_outbound = !outbound_closed && in_flight.has_capacity();
             tokio::select! {
                 event = self.link.poll() => {
                     match event {
                         Ok(event) => {
-                            if let Err(error) = self.handle_ready_event(event, &mut cipher).await {
-                                send_inbound_error(self.inbound_tx.clone(), error).await;
+                            if let Err(error) = self.handle_stream_event(
+                                event,
+                                &mut cipher,
+                                &mut in_flight,
+                            ).await {
+                                self.fail_stream(&mut in_flight, error).await;
                                 return;
                             }
                         }
                         Err(error) => {
-                            // The link wraps a poll failure as `BrokerConnect`; the
-                            // original code formatted the bare `ConnectionError` here,
-                            // so unwrap the source to avoid double-prefixing the
-                            // resulting `BrokerDisconnected` reason string.
-                            let reason = match error {
-                                MqttTransportError::BrokerConnect { source } => source.to_string(),
-                                other => other.to_string(),
-                            };
-                            send_inbound_error(self.inbound_tx.clone(), MqttTransportError::BrokerDisconnected {
-                                reason,
-                            }).await;
+                            self.fail_stream(&mut in_flight, poll_error_to_disconnect(error)).await;
                             return;
                         }
                     }
                 }
-                outbound = self.outbound_rx.next() => {
+                outbound = self.outbound_rx.next(), if can_accept_outbound => {
                     match outbound {
                         Some(outbound) => {
                             let batch = match self.boxcar_outbound(
                                 outbound,
                                 &mut cipher,
                                 &mut deferred_outbound,
+                                &mut in_flight,
                             ).await {
                                 Ok(batch) => batch,
-                                Err(error) => {
-                                    send_inbound_error(self.inbound_tx.clone(), error).await;
+                                Err(failure) => {
+                                    failure.batch.ack_error(&failure.error);
+                                    self.fail_stream(&mut in_flight, failure.error).await;
                                     return;
                                 }
                             };
-                            if let Err(error) = self.publish_plaintext(&mut cipher, &batch.plaintext).await {
-                                batch.ack_error(&error);
-                                send_inbound_error(self.inbound_tx.clone(), error).await;
+                            if let Err(failure) = self.publish_boxcar_batch(
+                                &mut cipher,
+                                batch,
+                                &mut in_flight,
+                            ).await {
+                                failure.batch.ack_error(&failure.error);
+                                self.fail_stream(&mut in_flight, failure.error).await;
                                 return;
                             }
-                            batch.ack_success();
                         }
                         None => {
-                            self.link.disconnect().await;
-                            let _send_result = self.inbound_tx.send(InboundEvent::Eof).await;
-                            return;
+                            outbound_closed = true;
                         }
                     }
                 }
@@ -331,7 +347,8 @@ impl<L: MqttLink> ProtocolDriver<L> {
         first: OutboundChunk,
         cipher: &mut SessionCipher,
         deferred_outbound: &mut Option<OutboundChunk>,
-    ) -> Result<BoxcarBatch, MqttTransportError> {
+        in_flight: &mut InflightPublishes,
+    ) -> Result<BoxcarBatch, BoxcarFailure> {
         let mut batch = BoxcarBatch::new(first);
         let delay = sleep(OUTBOUND_BOXCAR_DELAY);
         tokio::pin!(delay);
@@ -355,7 +372,21 @@ impl<L: MqttLink> ProtocolDriver<L> {
             tokio::select! {
                 _ = &mut delay => return Ok(batch),
                 event = self.link.poll() => {
-                    self.handle_ready_event(event?, cipher).await?;
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(error) => {
+                            return Err(BoxcarFailure {
+                                batch,
+                                error: poll_error_to_disconnect(error),
+                            });
+                        }
+                    };
+                    if let Err(error) = self.handle_stream_event(event, cipher, in_flight).await {
+                        return Err(BoxcarFailure {
+                            batch,
+                            error,
+                        });
+                    }
                 }
                 outbound = self.outbound_rx.next() => {
                     match outbound {
@@ -369,6 +400,33 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 }
             }
         }
+    }
+
+    async fn publish_boxcar_batch(
+        &mut self,
+        cipher: &mut SessionCipher,
+        batch: BoxcarBatch,
+        in_flight: &mut InflightPublishes,
+    ) -> Result<(), PublishBatchFailure> {
+        let published = match self.publish_plaintext(cipher, &batch.plaintext).await {
+            Ok(published) => published,
+            Err(error) => {
+                return Err(PublishBatchFailure { batch, error });
+            }
+        };
+        in_flight.insert(InflightPublish {
+            token: published.token,
+            counter: published.counter,
+            plaintext_len: published.plaintext_len,
+            batch,
+        });
+        Ok(())
+    }
+
+    async fn fail_stream(&mut self, in_flight: &mut InflightPublishes, error: MqttTransportError) {
+        in_flight.ack_error_all(&error);
+        self.link.disconnect().await;
+        send_inbound_error(self.inbound_tx.clone(), error).await;
     }
 
     async fn handle_ready_event(
@@ -390,11 +448,61 @@ impl<L: MqttLink> ProtocolDriver<L> {
                     }
                 }
             }
-            LinkEvent::PubAck(result) => result,
+            LinkEvent::PubAck(ack) => ack.result,
             LinkEvent::Disconnect { reason } => Err(MqttTransportError::BrokerDisconnected {
                 reason: format!("disconnect after session established: {reason}"),
             }),
             LinkEvent::SubAck { .. } | LinkEvent::Other => Ok(()),
+        }
+    }
+
+    async fn handle_stream_event(
+        &mut self,
+        event: LinkEvent,
+        cipher: &mut SessionCipher,
+        in_flight: &mut InflightPublishes,
+    ) -> Result<(), MqttTransportError> {
+        match event {
+            LinkEvent::PubAck(ack) => self.handle_publish_ack(ack, in_flight),
+            other => self.handle_ready_event(other, cipher).await,
+        }
+    }
+
+    fn handle_publish_ack(
+        &mut self,
+        ack: PublishAck,
+        in_flight: &mut InflightPublishes,
+    ) -> Result<(), MqttTransportError> {
+        if !in_flight.contains(ack.token) {
+            return Err(MqttTransportError::PublishAckMismatch {
+                packet_id: None,
+                token: Some(ack.token.value()),
+            });
+        }
+
+        match ack.result {
+            Ok(()) => {
+                let publish =
+                    in_flight
+                        .remove(ack.token)
+                        .ok_or(MqttTransportError::PublishAckMismatch {
+                            packet_id: None,
+                            token: Some(ack.token.value()),
+                        })?;
+                self.publish_pacer.record_success();
+                tracing::info!(
+                    role = ?self.config.role,
+                    counter = publish.counter,
+                    plaintext_len = publish.plaintext_len,
+                    "MQTT data publish accepted"
+                );
+                publish.batch.ack_success();
+                Ok(())
+            }
+            Err(error) => {
+                self.publish_pacer.record_rejection(&error);
+                Err(error)
+            }
         }
     }
 
@@ -448,62 +556,44 @@ impl<L: MqttLink> ProtocolDriver<L> {
         &mut self,
         cipher: &mut SessionCipher,
         plaintext: &[u8],
-    ) -> Result<(), MqttTransportError> {
+    ) -> Result<PublishedFrame, MqttTransportError> {
         let encrypted = cipher.encrypt_next(plaintext)?;
         let counter = encrypted.counter;
         let plaintext_len = plaintext.len();
         let frame = encode_data_frame(encrypted.counter, &encrypted.ciphertext_with_tag);
-        let mut retry = PublishRetryBackoff::new();
-        loop {
-            if let Err(error) = self.publish_frame(frame.clone()).await {
-                if retryable_publish_error(&error) {
-                    retry.sleep_after("enqueue data publish", &error).await;
-                    continue;
-                }
-                return Err(error);
-            }
-
-            // This driver owns the connection event loop, so drive it until the
-            // QoS 1 publish is acknowledged instead of leaving queued chunks
-            // behind a keep-alive wakeup. Reuse the same encrypted frame and
-            // counter on broker rejections; the receiver's counter validator
-            // deduplicates any frame that was actually forwarded before the
-            // rejection surfaced.
-            match self.await_publish_ack(cipher).await {
-                Ok(()) => {
-                    self.publish_pacer.record_success();
-                    tracing::info!(
-                        role = ?self.config.role,
-                        counter,
-                        plaintext_len,
-                        "MQTT data publish accepted"
-                    );
-                    return Ok(());
-                }
-                Err(error) if retryable_publish_error(&error) => {
-                    self.publish_pacer.record_rejection(&error);
-                    retry.sleep_after("ack data publish", &error).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        let token = self.publish_frame(frame).await?;
+        tracing::debug!(
+            role = ?self.config.role,
+            counter,
+            plaintext_len,
+            in_flight_limit = MAX_QOS1_INFLIGHT,
+            "MQTT data publish enqueued"
+        );
+        Ok(PublishedFrame {
+            token,
+            counter,
+            plaintext_len,
+        })
     }
 
     async fn publish_local_salt(&mut self) -> Result<(), MqttTransportError> {
         let handshake = encode_handshake_frame(&self.local_salt);
         let mut retry = PublishRetryBackoff::new();
         loop {
-            if let Err(error) = self.publish_frame(handshake.clone()).await {
-                if retryable_publish_error(&error) {
-                    retry.sleep_after("enqueue handshake publish", &error).await;
-                    continue;
+            let token = match self.publish_frame(handshake.clone()).await {
+                Ok(token) => token,
+                Err(error) => {
+                    if retryable_publish_error(&error) {
+                        retry.sleep_after("enqueue handshake publish", &error).await;
+                        continue;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
+            };
 
             // Keep session readiness behind the handshake PUBACK so the first data
             // chunk does not race an outstanding handshake publish.
-            match self.await_publish_ack_before_session().await {
+            match self.await_publish_ack_before_session(token).await {
                 Ok(()) => {
                     self.publish_pacer.record_success();
                     return Ok(());
@@ -517,33 +607,27 @@ impl<L: MqttLink> ProtocolDriver<L> {
         }
     }
 
-    async fn publish_frame(&mut self, frame: Vec<u8>) -> Result<(), MqttTransportError> {
+    async fn publish_frame(&mut self, frame: Vec<u8>) -> Result<PublishToken, MqttTransportError> {
         self.publish_pacer.wait_until_ready().await;
         let topic = self.outbound_topic.clone();
         self.link.publish(&topic, frame).await
     }
 
-    async fn await_publish_ack(
+    async fn await_publish_ack_before_session(
         &mut self,
-        cipher: &mut SessionCipher,
+        expected: PublishToken,
     ) -> Result<(), MqttTransportError> {
         loop {
             match self.link.poll().await? {
-                LinkEvent::PubAck(result) => {
-                    result?;
+                LinkEvent::PubAck(ack) if ack.token == expected => {
+                    ack.result?;
                     return Ok(());
                 }
-                event => self.handle_ready_event(event, cipher).await?,
-            }
-        }
-    }
-
-    async fn await_publish_ack_before_session(&mut self) -> Result<(), MqttTransportError> {
-        loop {
-            match self.link.poll().await? {
-                LinkEvent::PubAck(result) => {
-                    result?;
-                    return Ok(());
+                LinkEvent::PubAck(ack) => {
+                    return Err(MqttTransportError::PublishAckMismatch {
+                        packet_id: None,
+                        token: Some(ack.token.value()),
+                    });
                 }
                 LinkEvent::Disconnect { reason } => {
                     return Err(MqttTransportError::BrokerDisconnected {
@@ -629,6 +713,78 @@ impl<L: MqttLink> ProtocolDriver<L> {
 pub(crate) struct PendingDataFrame {
     counter: u64,
     ciphertext_with_tag: Vec<u8>,
+}
+
+struct PublishedFrame {
+    token: PublishToken,
+    counter: u64,
+    plaintext_len: usize,
+}
+
+struct InflightPublish {
+    token: PublishToken,
+    counter: u64,
+    plaintext_len: usize,
+    batch: BoxcarBatch,
+}
+
+struct InflightPublishes {
+    order: VecDeque<PublishToken>,
+    by_token: HashMap<PublishToken, InflightPublish>,
+}
+
+impl InflightPublishes {
+    fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+            by_token: HashMap::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_token.is_empty()
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.by_token.len() < MAX_QOS1_INFLIGHT
+    }
+
+    fn contains(&self, token: PublishToken) -> bool {
+        self.by_token.contains_key(&token)
+    }
+
+    fn insert(&mut self, publish: InflightPublish) {
+        self.order.push_back(publish.token);
+        let replaced = self.by_token.insert(publish.token, publish);
+        debug_assert!(replaced.is_none());
+    }
+
+    fn remove(&mut self, token: PublishToken) -> Option<InflightPublish> {
+        let publish = self.by_token.remove(&token)?;
+        self.order.retain(|queued| *queued != token);
+        Some(publish)
+    }
+
+    fn ack_error_all(&mut self, error: &MqttTransportError) {
+        while let Some(token) = self.order.pop_front() {
+            if let Some(publish) = self.by_token.remove(&token) {
+                publish.batch.ack_error(error);
+            }
+        }
+        for (_, publish) in self.by_token.drain() {
+            publish.batch.ack_error(error);
+        }
+    }
+}
+
+struct BoxcarFailure {
+    batch: BoxcarBatch,
+    error: MqttTransportError,
+}
+
+struct PublishBatchFailure {
+    batch: BoxcarBatch,
+    error: MqttTransportError,
 }
 
 struct PublishRetryBackoff {
@@ -813,6 +969,18 @@ async fn send_inbound_error(inbound_tx: mpsc::Sender<InboundEvent>, error: MqttT
     let _send_result = inbound_tx.send(InboundEvent::Error(Box::new(error))).await;
 }
 
+fn poll_error_to_disconnect(error: MqttTransportError) -> MqttTransportError {
+    // The link wraps a poll failure as `BrokerConnect`; the original code
+    // formatted the bare `ConnectionError` here, so unwrap the source to avoid
+    // double-prefixing the resulting `BrokerDisconnected` reason string.
+    match error {
+        MqttTransportError::BrokerConnect { source } => MqttTransportError::BrokerDisconnected {
+            reason: source.to_string(),
+        },
+        other => other,
+    }
+}
+
 fn publish_topic_string(topic: &[u8]) -> Result<String, MqttTransportError> {
     str::from_utf8(topic)
         .map(|topic| topic.to_string())
@@ -903,7 +1071,7 @@ async fn await_open_and_accept<L: MqttLink>(
                     psk,
                 });
             }
-            LinkEvent::PubAck(result) => result?,
+            LinkEvent::PubAck(ack) => ack.result?,
             LinkEvent::Disconnect { reason } => {
                 return Err(MqttTransportError::BrokerDisconnected {
                     reason: format!("disconnect during rendezvous accept: {reason}"),
@@ -926,7 +1094,7 @@ async fn open_and_await_accept<L: MqttLink>(
         proposed_data_room: RoomId::random(),
     };
     let open_frame = encode_open_request(&config.room, &config.psk, &request)?;
-    link.publish(outbound_topic, open_frame.clone()).await?;
+    let mut open_token = Some(link.publish(outbound_topic, open_frame.clone()).await?);
     let mut retry = interval_at(
         Instant::now() + RENDEZVOUS_RETRY_INTERVAL,
         RENDEZVOUS_RETRY_INTERVAL,
@@ -935,7 +1103,9 @@ async fn open_and_await_accept<L: MqttLink>(
     loop {
         tokio::select! {
             _ = retry.tick() => {
-                link.publish(outbound_topic, open_frame.clone()).await?;
+                if open_token.is_none() {
+                    open_token = Some(link.publish(outbound_topic, open_frame.clone()).await?);
+                }
             }
             event = link.poll() => {
                 match event? {
@@ -976,7 +1146,16 @@ async fn open_and_await_accept<L: MqttLink>(
                             psk,
                         });
                     }
-                    LinkEvent::PubAck(result) => result?,
+                    LinkEvent::PubAck(ack) if open_token == Some(ack.token) => {
+                        ack.result?;
+                        open_token = None;
+                    }
+                    LinkEvent::PubAck(ack) => {
+                        return Err(MqttTransportError::PublishAckMismatch {
+                            packet_id: None,
+                            token: Some(ack.token.value()),
+                        });
+                    }
                     LinkEvent::Disconnect { reason } => {
                         return Err(MqttTransportError::BrokerDisconnected {
                             reason: format!("disconnect during rendezvous open: {reason}"),
@@ -994,18 +1173,25 @@ async fn publish_control_frame<L: MqttLink>(
     topic: &str,
     frame: Vec<u8>,
 ) -> Result<(), MqttTransportError> {
-    link.publish(topic, frame).await?;
-    await_publish_ack_before_stream(link).await
+    let token = link.publish(topic, frame).await?;
+    await_publish_ack_before_stream(link, token).await
 }
 
 async fn await_publish_ack_before_stream<L: MqttLink>(
     link: &mut L,
+    expected: PublishToken,
 ) -> Result<(), MqttTransportError> {
     loop {
         match link.poll().await? {
-            LinkEvent::PubAck(result) => {
-                result?;
+            LinkEvent::PubAck(ack) if ack.token == expected => {
+                ack.result?;
                 return Ok(());
+            }
+            LinkEvent::PubAck(ack) => {
+                return Err(MqttTransportError::PublishAckMismatch {
+                    packet_id: None,
+                    token: Some(ack.token.value()),
+                });
             }
             LinkEvent::Disconnect { reason } => {
                 return Err(MqttTransportError::BrokerDisconnected {
@@ -1042,8 +1228,432 @@ async fn await_suback<L: MqttLink>(
                     unexpected_publish_before_suback(&publish.topic),
                 ));
             }
-            LinkEvent::PubAck(result) => result?,
+            LinkEvent::PubAck(ack) => ack.result?,
             LinkEvent::Other => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::time::Duration;
+
+    use futures_channel::mpsc::{Sender, channel};
+    use futures_util::SinkExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc as tokio_mpsc;
+    use tokio::task::JoinHandle;
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::stream::EnvelopeStream;
+    use crate::types::{BrokerAuth, BrokerEndpoint};
+    use protocol::BrokerUrl;
+
+    struct PublishRecord {
+        token: PublishToken,
+    }
+
+    struct ScriptedLink {
+        poll_rx: tokio_mpsc::UnboundedReceiver<Result<LinkEvent, MqttTransportError>>,
+        publish_tx: tokio_mpsc::UnboundedSender<PublishRecord>,
+        next_token: u64,
+    }
+
+    impl MqttLink for ScriptedLink {
+        async fn subscribe(&mut self, _topic: &str) -> Result<(), MqttTransportError> {
+            Ok(())
+        }
+
+        async fn publish(
+            &mut self,
+            _topic: &str,
+            _payload: Vec<u8>,
+        ) -> Result<PublishToken, MqttTransportError> {
+            let token = PublishToken::new(self.next_token);
+            self.next_token += 1;
+            self.publish_tx
+                .send(PublishRecord { token })
+                .map_err(|_| MqttTransportError::ActorClosed)?;
+            Ok(token)
+        }
+
+        async fn poll(&mut self) -> Result<LinkEvent, MqttTransportError> {
+            self.poll_rx
+                .recv()
+                .await
+                .ok_or(MqttTransportError::ActorClosed)?
+        }
+
+        async fn disconnect(&mut self) {}
+    }
+
+    struct DriverHarness {
+        outbound_tx: Sender<OutboundChunk>,
+        inbound_rx: mpsc::Receiver<InboundEvent>,
+        poll_tx: tokio_mpsc::UnboundedSender<Result<LinkEvent, MqttTransportError>>,
+        publish_rx: tokio_mpsc::UnboundedReceiver<PublishRecord>,
+        driver: JoinHandle<()>,
+    }
+
+    fn spawn_stream_driver() -> Result<DriverHarness, MqttTransportError> {
+        let (outbound_tx, outbound_rx) = channel::<OutboundChunk>(64);
+        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEvent>(64);
+        let (poll_tx, poll_rx) =
+            tokio_mpsc::unbounded_channel::<Result<LinkEvent, MqttTransportError>>();
+        let (publish_tx, publish_rx) = tokio_mpsc::unbounded_channel::<PublishRecord>();
+        let room = RoomId([0x44; 16]);
+        let psk = PreSharedKey([0x55; 32]);
+        let config = MqttConnectConfig {
+            endpoint: BrokerEndpoint {
+                url: BrokerUrl::new("wss://broker.example.test/mqtt").map_err(|error| {
+                    MqttTransportError::Configuration {
+                        message: error.to_string(),
+                    }
+                })?,
+                auth: BrokerAuth::Anonymous,
+            },
+            room,
+            psk: psk.clone(),
+            role: ParticipantRole::Host,
+        };
+        let cipher = SessionCipher::new(
+            &room,
+            &psk,
+            ParticipantRole::Host,
+            &[0x11; SESSION_SALT_LEN],
+            &[0x22; SESSION_SALT_LEN],
+        )?;
+        let driver = ProtocolDriver {
+            config,
+            link: ScriptedLink {
+                poll_rx,
+                publish_tx,
+                next_token: 0,
+            },
+            inbound_topic: ParticipantRole::Host.inbound_topic(&room),
+            outbound_topic: ParticipantRole::Host.outbound_topic(&room),
+            local_salt: [0x11; SESSION_SALT_LEN],
+            pending_peer_salt: None,
+            established_peer_salt: Some([0x22; SESSION_SALT_LEN]),
+            pending_data_frames: VecDeque::new(),
+            outbound_rx,
+            inbound_tx,
+            ready_tx: None,
+            publish_pacer: PublishPacer::new(),
+            subscribe_barrier: None,
+        };
+        let driver = tokio::spawn(driver.run_stream(cipher));
+        Ok(DriverHarness {
+            outbound_tx,
+            inbound_rx,
+            poll_tx,
+            publish_rx,
+            driver,
+        })
+    }
+
+    fn full_chunk(byte: u8) -> (OutboundChunk, oneshot::Receiver<Result<(), String>>) {
+        let (ack, ack_rx) = oneshot::channel();
+        (
+            OutboundChunk {
+                bytes: vec![byte; MAX_PLAINTEXT_CHUNK_LEN],
+                ack,
+            },
+            ack_rx,
+        )
+    }
+
+    async fn send_full_chunk(
+        outbound_tx: &mut Sender<OutboundChunk>,
+        byte: u8,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, Box<dyn Error>> {
+        let (chunk, ack_rx) = full_chunk(byte);
+        outbound_tx.send(chunk).await?;
+        Ok(ack_rx)
+    }
+
+    async fn next_publish(
+        publish_rx: &mut tokio_mpsc::UnboundedReceiver<PublishRecord>,
+    ) -> PublishRecord {
+        timeout(Duration::from_secs(1), publish_rx.recv())
+            .await
+            .expect("timed out waiting for publish")
+            .expect("publish channel closed")
+    }
+
+    fn send_link_event(
+        poll_tx: &tokio_mpsc::UnboundedSender<Result<LinkEvent, MqttTransportError>>,
+        event: LinkEvent,
+    ) {
+        poll_tx.send(Ok(event)).expect("send link event");
+    }
+
+    fn send_poll_error(
+        poll_tx: &tokio_mpsc::UnboundedSender<Result<LinkEvent, MqttTransportError>>,
+        error: MqttTransportError,
+    ) {
+        poll_tx.send(Err(error)).expect("send poll error");
+    }
+
+    fn ack_success(
+        poll_tx: &tokio_mpsc::UnboundedSender<Result<LinkEvent, MqttTransportError>>,
+        token: PublishToken,
+    ) {
+        send_link_event(
+            poll_tx,
+            LinkEvent::PubAck(PublishAck {
+                token,
+                result: Ok(()),
+            }),
+        );
+    }
+
+    fn quota_rejection() -> MqttTransportError {
+        MqttTransportError::PublishRejected {
+            reason: crate::error::PublishRejection {
+                code: crate::error::PUBACK_QUOTA_EXCEEDED,
+                code_name: "QuotaExceeded".to_string(),
+                reason_string: Some("test quota".to_string()),
+            },
+        }
+    }
+
+    async fn expect_ack_error(ack_rx: oneshot::Receiver<Result<(), String>>, expected: &str) {
+        let result = timeout(Duration::from_secs(1), ack_rx)
+            .await
+            .expect("timed out waiting for ack")
+            .expect("ack sender dropped");
+        let message = result.expect_err("ack unexpectedly succeeded");
+        assert!(
+            message.contains(expected),
+            "expected ack error to contain {expected:?}, got {message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn qos1_data_publishes_fill_window_before_first_puback() -> Result<(), Box<dyn Error>> {
+        let mut harness = spawn_stream_driver()?;
+        let mut ack_receivers = Vec::new();
+        for index in 0..=MAX_QOS1_INFLIGHT {
+            ack_receivers.push(send_full_chunk(&mut harness.outbound_tx, index as u8).await?);
+        }
+
+        let mut published = Vec::new();
+        for _ in 0..MAX_QOS1_INFLIGHT {
+            published.push(next_publish(&mut harness.publish_rx).await.token);
+        }
+        assert!(
+            timeout(Duration::from_millis(25), harness.publish_rx.recv())
+                .await
+                .is_err(),
+            "driver exceeded the configured in-flight window before any PUBACK"
+        );
+
+        ack_success(&harness.poll_tx, published[0]);
+        let after_ack = next_publish(&mut harness.publish_rx).await.token;
+        published.push(after_ack);
+
+        for token in published.into_iter().skip(1) {
+            ack_success(&harness.poll_tx, token);
+        }
+        for ack_rx in ack_receivers {
+            timeout(Duration::from_secs(1), ack_rx)
+                .await
+                .expect("timed out waiting for ack")
+                .expect("ack sender dropped")
+                .expect("ack failed");
+        }
+
+        drop(harness.outbound_tx);
+        timeout(Duration::from_secs(1), harness.driver)
+            .await
+            .expect("driver did not stop")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn out_of_order_pubacks_complete_matching_batches() -> Result<(), Box<dyn Error>> {
+        let mut harness = spawn_stream_driver()?;
+        let mut first_ack = Box::pin(send_full_chunk(&mut harness.outbound_tx, 1).await?);
+        let mut second_ack = Box::pin(send_full_chunk(&mut harness.outbound_tx, 2).await?);
+        let first = next_publish(&mut harness.publish_rx).await.token;
+        let second = next_publish(&mut harness.publish_rx).await.token;
+
+        ack_success(&harness.poll_tx, second);
+        timeout(Duration::from_secs(1), &mut second_ack)
+            .await
+            .expect("second ack timed out")
+            .expect("second ack sender dropped")
+            .expect("second ack failed");
+        assert!(
+            timeout(Duration::from_millis(25), &mut first_ack)
+                .await
+                .is_err(),
+            "first batch completed from the second batch's PUBACK"
+        );
+
+        ack_success(&harness.poll_tx, first);
+        timeout(Duration::from_secs(1), &mut first_ack)
+            .await
+            .expect("first ack timed out")
+            .expect("first ack sender dropped")
+            .expect("first ack failed");
+
+        drop(harness.outbound_tx);
+        timeout(Duration::from_secs(1), harness.driver)
+            .await
+            .expect("driver did not stop")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn puback_rejection_fails_all_inflight_and_closes() -> Result<(), Box<dyn Error>> {
+        let mut harness = spawn_stream_driver()?;
+        let ack_a = send_full_chunk(&mut harness.outbound_tx, 1).await?;
+        let ack_b = send_full_chunk(&mut harness.outbound_tx, 2).await?;
+        let ack_c = send_full_chunk(&mut harness.outbound_tx, 3).await?;
+        let _first = next_publish(&mut harness.publish_rx).await.token;
+        let second = next_publish(&mut harness.publish_rx).await.token;
+        let _third = next_publish(&mut harness.publish_rx).await.token;
+
+        send_link_event(
+            &harness.poll_tx,
+            LinkEvent::PubAck(PublishAck {
+                token: second,
+                result: Err(quota_rejection()),
+            }),
+        );
+
+        expect_ack_error(ack_a, "QuotaExceeded").await;
+        expect_ack_error(ack_b, "QuotaExceeded").await;
+        expect_ack_error(ack_c, "QuotaExceeded").await;
+        match timeout(Duration::from_secs(1), harness.inbound_rx.recv()).await? {
+            Some(InboundEvent::Error(error)) => {
+                assert!(
+                    error.to_string().contains("QuotaExceeded"),
+                    "unexpected inbound error: {error}"
+                );
+            }
+            other => panic!("expected inbound error, got {other:?}"),
+        }
+        timeout(Duration::from_secs(1), harness.driver)
+            .await
+            .expect("driver did not stop")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_fails_all_inflight_and_closes() -> Result<(), Box<dyn Error>> {
+        let mut harness = spawn_stream_driver()?;
+        let ack_a = send_full_chunk(&mut harness.outbound_tx, 1).await?;
+        let ack_b = send_full_chunk(&mut harness.outbound_tx, 2).await?;
+        let _first = next_publish(&mut harness.publish_rx).await.token;
+        let _second = next_publish(&mut harness.publish_rx).await.token;
+
+        send_link_event(
+            &harness.poll_tx,
+            LinkEvent::Disconnect {
+                reason: "test disconnect".to_string(),
+            },
+        );
+
+        expect_ack_error(ack_a, "test disconnect").await;
+        expect_ack_error(ack_b, "test disconnect").await;
+        match timeout(Duration::from_secs(1), harness.inbound_rx.recv()).await? {
+            Some(InboundEvent::Error(error)) => {
+                assert!(
+                    error.to_string().contains("test disconnect"),
+                    "unexpected inbound error: {error}"
+                );
+            }
+            other => panic!("expected inbound error, got {other:?}"),
+        }
+        timeout(Duration::from_secs(1), harness.driver)
+            .await
+            .expect("driver did not stop")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wasm_unknown_puback_mismatch_fails_all_inflight_flush_acks()
+    -> Result<(), Box<dyn Error>> {
+        let mut harness = spawn_stream_driver()?;
+        let mut stream = EnvelopeStream::new(harness.outbound_tx, harness.inbound_rx);
+        stream
+            .write_all(&vec![0x5b; MAX_PLAINTEXT_CHUNK_LEN * 2])
+            .await?;
+        let mut flush_task = tokio::spawn(async move { stream.flush().await });
+
+        let _first = next_publish(&mut harness.publish_rx).await.token;
+        let _second = next_publish(&mut harness.publish_rx).await.token;
+        assert!(
+            timeout(Duration::from_millis(25), &mut flush_task)
+                .await
+                .is_err(),
+            "flush completed before PUBACKs"
+        );
+
+        send_poll_error(
+            &harness.poll_tx,
+            MqttTransportError::PublishAckMismatch {
+                packet_id: Some(99),
+                token: None,
+            },
+        );
+        let error = timeout(Duration::from_secs(1), &mut flush_task)
+            .await
+            .expect("flush timed out")
+            .expect("flush task failed")
+            .expect_err("flush unexpectedly succeeded");
+        let message = error.to_string();
+        assert!(
+            message.contains("packet id Some(99)"),
+            "unexpected flush error: {message}"
+        );
+
+        timeout(Duration::from_secs(1), harness.driver)
+            .await
+            .expect("driver did not stop")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flush_waits_for_all_pipelined_pubacks() -> Result<(), Box<dyn Error>> {
+        let mut harness = spawn_stream_driver()?;
+        let mut stream = EnvelopeStream::new(harness.outbound_tx, harness.inbound_rx);
+        let payload = vec![0x5a; MAX_PLAINTEXT_CHUNK_LEN * 3];
+        stream.write_all(&payload).await?;
+        let mut flush_task = tokio::spawn(async move { stream.flush().await });
+
+        let first = next_publish(&mut harness.publish_rx).await.token;
+        let second = next_publish(&mut harness.publish_rx).await.token;
+        let third = next_publish(&mut harness.publish_rx).await.token;
+        assert!(
+            timeout(Duration::from_millis(25), &mut flush_task)
+                .await
+                .is_err(),
+            "flush completed before any PUBACK"
+        );
+
+        ack_success(&harness.poll_tx, first);
+        ack_success(&harness.poll_tx, second);
+        assert!(
+            timeout(Duration::from_millis(25), &mut flush_task)
+                .await
+                .is_err(),
+            "flush completed before every in-flight PUBACK"
+        );
+
+        ack_success(&harness.poll_tx, third);
+        timeout(Duration::from_secs(1), &mut flush_task)
+            .await
+            .expect("flush timed out")
+            .expect("flush task failed")?;
+        timeout(Duration::from_secs(1), harness.driver)
+            .await
+            .expect("driver did not stop")?;
+        Ok(())
     }
 }

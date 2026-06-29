@@ -1164,9 +1164,9 @@ fn mobile_error_code_for_transport(error: &MqttTransportError) -> MobileAccessEr
         MqttTransportError::Publish { .. } | MqttTransportError::PublishRejected { .. } => {
             MobileAccessErrorCode::BrokerProtocol
         }
-        MqttTransportError::Framing(_) | MqttTransportError::RetainedMessage { .. } => {
-            MobileAccessErrorCode::TransportFailed
-        }
+        MqttTransportError::Framing(_)
+        | MqttTransportError::RetainedMessage { .. }
+        | MqttTransportError::PublishAckMismatch { .. } => MobileAccessErrorCode::TransportFailed,
         MqttTransportError::Crypto(_) => MobileAccessErrorCode::CryptoFailed,
         MqttTransportError::ActorClosed => MobileAccessErrorCode::TransportFailed,
     }
@@ -1365,6 +1365,17 @@ mod tests {
             error_code(&error),
             MobileAccessErrorCode::BrokerConnectionFailed
         );
+    }
+
+    #[test]
+    fn io_error_carrying_publish_ack_mismatch_is_transport_failed() {
+        let error = ConnectionError::Io(std::io::Error::other(
+            MqttTransportError::PublishAckMismatch {
+                packet_id: Some(9),
+                token: None,
+            },
+        ));
+        assert_eq!(error_code(&error), MobileAccessErrorCode::TransportFailed);
     }
 
     #[tokio::test]

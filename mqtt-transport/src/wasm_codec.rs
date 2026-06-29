@@ -17,17 +17,19 @@ use mqttbytes::v5::{
 };
 
 use crate::error::{MqttTransportError, PublishRejection};
+use crate::link::PublishToken;
 
 /// MQTT5 PUBACK reason code for "Quota exceeded" (0x97).
 const PUBACK_QUOTA_EXCEEDED: u8 = 0x97;
 
 /// Classification of an incoming PUBACK against the outstanding publish pkid.
+#[derive(Debug)]
 pub(crate) enum PubAckMatch {
     /// pkid matched the outstanding publish; consume it and surface this result.
-    Matched(Result<(), MqttTransportError>),
-    /// Stray/duplicate/unknown ack — deliberately ignored so it cannot satisfy a
-    /// publish the driver is still waiting on.
-    Ignored,
+    Matched {
+        token: PublishToken,
+        result: Result<(), MqttTransportError>,
+    },
 }
 
 /// Classification of an incoming SUBACK against the pending subscribe pkid.
@@ -91,14 +93,26 @@ pub(crate) fn incoming_publish_puback(
     }
 }
 
-/// Classify an incoming PUBACK against the pkid of the publish the backend is
-/// awaiting. Only an ack whose pkid matches consumes the outstanding publish.
-pub(crate) fn classify_puback(outstanding: Option<u16>, puback: PubAck) -> PubAckMatch {
-    if outstanding == Some(puback.pkid) {
-        PubAckMatch::Matched(validate_puback(puback))
-    } else {
-        PubAckMatch::Ignored
+/// Classify an incoming PUBACK against the publish token already looked up by
+/// packet identifier. The backend must reject unknown packet identifiers before
+/// calling this helper so a stray PUBACK cannot be silently swallowed.
+pub(crate) fn classify_puback(token: PublishToken, puback: PubAck) -> PubAckMatch {
+    PubAckMatch::Matched {
+        token,
+        result: validate_puback(puback),
     }
+}
+
+pub(crate) fn classify_known_puback(
+    packet_id: u16,
+    token: Option<PublishToken>,
+    puback: PubAck,
+) -> Result<PubAckMatch, MqttTransportError> {
+    let token = token.ok_or(MqttTransportError::PublishAckMismatch {
+        packet_id: Some(packet_id),
+        token: None,
+    })?;
+    Ok(classify_puback(token, puback))
 }
 
 /// Classify an incoming SUBACK against the pending subscribe pkid.
@@ -214,27 +228,37 @@ mod tests {
     }
 
     #[test]
-    fn matching_puback_pkid_is_accepted_mismatch_is_ignored() {
+    fn looked_up_puback_token_is_accepted() {
+        let token = PublishToken::new(17);
         assert!(matches!(
-            classify_puback(Some(7), PubAck::new(7)),
-            PubAckMatch::Matched(Ok(()))
+            classify_puback(token, PubAck::new(7)),
+            PubAckMatch::Matched {
+                token: matched,
+                result: Ok(())
+            } if matched == token
         ));
-        assert!(matches!(
-            classify_puback(Some(7), PubAck::new(8)),
-            PubAckMatch::Ignored
-        ));
-        assert!(matches!(
-            classify_puback(None, PubAck::new(7)),
-            PubAckMatch::Ignored
-        ));
+    }
+
+    #[test]
+    fn unknown_puback_pkid_is_fatal_mismatch() {
+        match classify_known_puback(9, None, PubAck::new(9)) {
+            Err(MqttTransportError::PublishAckMismatch { packet_id, token }) => {
+                assert_eq!(packet_id, Some(9));
+                assert_eq!(token, None);
+            }
+            other => panic!("expected publish ack mismatch, got {other:?}"),
+        }
     }
 
     #[test]
     fn quota_exceeded_puback_is_classified_for_pacing() {
         let mut puback = PubAck::new(3);
         puback.reason = PubAckReason::QuotaExceeded;
-        match classify_puback(Some(3), puback) {
-            PubAckMatch::Matched(Err(MqttTransportError::PublishRejected { reason })) => {
+        match classify_puback(PublishToken::new(3), puback) {
+            PubAckMatch::Matched {
+                result: Err(MqttTransportError::PublishRejected { reason }),
+                ..
+            } => {
                 assert!(reason.is_quota_exceeded(), "quota code must drive pacing");
             }
             _ => panic!("expected a matched quota rejection"),

@@ -194,6 +194,7 @@ mod tests {
     use crate::config::ParticipantRole;
     use crate::error::{CryptoError, FramingError};
     use crate::framing::{SESSION_SALT_LEN, encode_data_frame, encode_handshake_frame};
+    use crate::link::MAX_QOS1_INFLIGHT;
     use crate::link_native::{default_root_cert_store, mqtt_options, validate_puback};
     use crate::protocol_driver::validate_post_session_handshake;
     use crate::session::SessionCipher;
@@ -663,6 +664,22 @@ mod tests {
         };
         let message = error.to_string();
         assert!(message.contains("NotAuthorized"));
+    }
+
+    #[test]
+    fn mqtt5_options_advertise_qos1_inflight_window() -> Result<(), Box<dyn Error>> {
+        let options = mqtt_options(
+            &BrokerUrl::new("mqtts://broker.example.test")?,
+            &BrokerAuth::Anonymous,
+            ParticipantRole::Client,
+            None,
+        )?;
+        assert_eq!(
+            options.get_outgoing_inflight_upper_limit(),
+            Some(MAX_QOS1_INFLIGHT as u16)
+        );
+        assert_eq!(options.receive_maximum(), Some(MAX_QOS1_INFLIGHT as u16));
+        Ok(())
     }
 
     async fn connect_pair(

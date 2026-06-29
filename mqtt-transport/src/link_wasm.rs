@@ -13,6 +13,7 @@
 //! The pure codec/ack-decision helpers live in [`crate::wasm_codec`] so they can
 //! be unit-tested on the native target (this module is wasm-only).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -29,12 +30,14 @@ use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
 use crate::chunking::MAX_PLAINTEXT_CHUNK_LEN;
 use crate::config::ParticipantRole;
 use crate::error::MqttTransportError;
-use crate::link::{IncomingPublish, LinkEvent, MqttLink};
+use crate::link::{
+    IncomingPublish, LinkEvent, MAX_QOS1_INFLIGHT, MqttLink, PublishAck, PublishToken,
+};
 use crate::time::{Instant, Interval, interval_at};
 use crate::types::{BrokerAuth, BrokerEndpoint};
 use crate::wasm_codec::{
-    PubAckMatch, SubAckMatch, classify_puback, classify_suback, encode_disconnect, encode_pingreq,
-    incoming_publish_puback,
+    PubAckMatch, SubAckMatch, classify_known_puback, classify_suback, encode_disconnect,
+    encode_pingreq, incoming_publish_puback,
 };
 
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
@@ -85,9 +88,10 @@ pub(crate) struct WasmMqttLink {
     incoming: BytesMut,
     ping: Interval,
     next_pkid: u16,
-    /// pkid of the QoS1 PUBLISH currently awaiting its PUBACK (the driver is
-    /// strictly sequential, so at most one is outstanding).
-    outstanding_publish_pkid: Option<u16>,
+    next_publish_token: u64,
+    /// QoS1 PUBLISH packet identifiers currently awaiting PUBACK, mapped to the
+    /// driver token that owns the corresponding batch.
+    outstanding_publish_pkids: HashMap<u16, PublishToken>,
     /// pkid of the SUBSCRIBE currently awaiting its SUBACK.
     pending_subscribe_pkid: Option<u16>,
     // Closures must outlive the socket; dropping them detaches the callbacks.
@@ -166,7 +170,8 @@ impl WasmMqttLink {
             incoming: BytesMut::new(),
             ping,
             next_pkid: 0,
-            outstanding_publish_pkid: None,
+            next_publish_token: 0,
+            outstanding_publish_pkids: HashMap::new(),
             pending_subscribe_pkid: None,
             _on_open: on_open,
             _on_message: on_message,
@@ -237,7 +242,7 @@ impl WasmMqttLink {
         connect.clean_session = true;
         connect.properties = Some(ConnectProperties {
             session_expiry_interval: Some(0),
-            receive_maximum: None,
+            receive_maximum: Some(MAX_QOS1_INFLIGHT as u16),
             max_packet_size: Some(MAX_MQTT_PACKET_SIZE as u32),
             topic_alias_max: None,
             request_response_info: None,
@@ -290,12 +295,12 @@ impl WasmMqttLink {
                 }))
             }
             Packet::PubAck(puback) => {
-                match classify_puback(self.outstanding_publish_pkid, puback) {
-                    PubAckMatch::Matched(result) => {
-                        self.outstanding_publish_pkid = None;
-                        Ok(LinkEvent::PubAck(result))
+                let pkid = puback.pkid;
+                let token = self.outstanding_publish_pkids.remove(&pkid);
+                match classify_known_puback(pkid, token, puback)? {
+                    PubAckMatch::Matched { token, result } => {
+                        Ok(LinkEvent::PubAck(PublishAck { token, result }))
                     }
-                    PubAckMatch::Ignored => Ok(LinkEvent::Other),
                 }
             }
             Packet::SubAck(suback) => match classify_suback(self.pending_subscribe_pkid, suback) {
@@ -321,11 +326,23 @@ impl WasmMqttLink {
 
     fn allocate_pkid(&mut self) -> u16 {
         // QoS 1 packet identifiers must be non-zero.
-        self.next_pkid = self.next_pkid.wrapping_add(1);
-        if self.next_pkid == 0 {
-            self.next_pkid = 1;
+        loop {
+            self.next_pkid = self.next_pkid.wrapping_add(1);
+            if self.next_pkid != 0 && !self.outstanding_publish_pkids.contains_key(&self.next_pkid)
+            {
+                return self.next_pkid;
+            }
         }
-        self.next_pkid
+    }
+
+    fn allocate_publish_token(&mut self) -> Result<PublishToken, MqttTransportError> {
+        let token = PublishToken::new(self.next_publish_token);
+        self.next_publish_token = self.next_publish_token.checked_add(1).ok_or_else(|| {
+            MqttTransportError::Configuration {
+                message: "MQTT publish token counter exhausted".to_string(),
+            }
+        })?;
+        Ok(token)
     }
 
     fn send_pingreq(&self) -> Result<(), MqttTransportError> {
@@ -352,9 +369,14 @@ impl MqttLink for WasmMqttLink {
         Ok(())
     }
 
-    async fn publish(&mut self, topic: &str, payload: Vec<u8>) -> Result<(), MqttTransportError> {
+    async fn publish(
+        &mut self,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> Result<PublishToken, MqttTransportError> {
         let mut publish = Publish::new(topic.to_owned(), QoS::AtLeastOnce, payload);
         let pkid = self.allocate_pkid();
+        let token = self.allocate_publish_token()?;
         publish.pkid = pkid;
         let mut buffer = BytesMut::new();
         publish
@@ -362,8 +384,8 @@ impl MqttLink for WasmMqttLink {
             .map_err(|err| publish_err(format!("failed to encode PUBLISH: {err:?}")))?;
         self.send_bytes(&buffer)
             .map_err(|err| publish_err(format!("failed to send PUBLISH: {err}")))?;
-        self.outstanding_publish_pkid = Some(pkid);
-        Ok(())
+        self.outstanding_publish_pkids.insert(pkid, token);
+        Ok(token)
     }
 
     async fn poll(&mut self) -> Result<LinkEvent, MqttTransportError> {

@@ -12,6 +12,29 @@
 
 use crate::error::MqttTransportError;
 
+/// Maximum QoS 1 publishes the Tyde driver will keep in flight on one MQTT
+/// connection. Keep this well below broker caps such as AWS IoT's 100
+/// in-flight publishes per connection.
+pub(crate) const MAX_QOS1_INFLIGHT: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct PublishToken(u64);
+
+impl PublishToken {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+pub(crate) struct PublishAck {
+    pub(crate) token: PublishToken,
+    pub(crate) result: Result<(), MqttTransportError>,
+}
+
 /// A protocol-relevant event surfaced by an [`MqttLink`].
 ///
 /// The backend translates its library-specific incoming packets into these
@@ -23,9 +46,11 @@ use crate::error::MqttTransportError;
 pub(crate) enum LinkEvent {
     /// An application PUBLISH arrived.
     Publish(IncomingPublish),
-    /// A PUBACK arrived; the backend has already mapped its reason code to a
-    /// neutral result (`Ok` on success, `Err(PublishRejected)` otherwise).
-    PubAck(Result<(), MqttTransportError>),
+    /// A PUBACK arrived; the backend has already matched the packet identifier
+    /// back to the publish token returned by [`MqttLink::publish`] and mapped
+    /// its reason code to a neutral result (`Ok` on success,
+    /// `Err(PublishRejected)` otherwise).
+    PubAck(PublishAck),
     /// A SUBACK arrived. `result` is the validated outcome, used where a SUBACK
     /// is expected; `debug` is the backend's debug rendering of the SUBACK, used
     /// to describe an *unexpected* duplicate SUBACK.
@@ -64,9 +89,14 @@ pub(crate) trait MqttLink {
     /// Enqueue a SUBSCRIBE for `topic` at QoS 1. Does not await the SUBACK.
     async fn subscribe(&mut self, topic: &str) -> Result<(), MqttTransportError>;
 
-    /// Enqueue a PUBLISH of `payload` to `topic` at QoS 1, retain=false. Does
-    /// not await the PUBACK.
-    async fn publish(&mut self, topic: &str, payload: Vec<u8>) -> Result<(), MqttTransportError>;
+    /// Enqueue a PUBLISH of `payload` to `topic` at QoS 1, retain=false and
+    /// return the token that will be carried by its eventual PUBACK. Does not
+    /// await the PUBACK.
+    async fn publish(
+        &mut self,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> Result<PublishToken, MqttTransportError>;
 
     /// Drive the connection and return the next protocol-relevant event.
     async fn poll(&mut self) -> Result<LinkEvent, MqttTransportError>;

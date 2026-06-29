@@ -29,6 +29,14 @@ pub enum MqttTransportError {
     #[error("MQTT publish was rejected: {reason}")]
     PublishRejected { reason: PublishRejection },
 
+    #[error(
+        "MQTT PUBACK did not match an outstanding publish (packet id {packet_id:?}, token {token:?})"
+    )]
+    PublishAckMismatch {
+        packet_id: Option<u16>,
+        token: Option<u64>,
+    },
+
     #[error("transport framing error: {0}")]
     Framing(#[from] FramingError),
 
