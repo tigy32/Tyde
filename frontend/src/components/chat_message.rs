@@ -391,7 +391,10 @@ mod wasm_tests {
     use super::*;
     use crate::state::{AppState, ChatMessageEntry, ChatRowHandle};
     use leptos::mount::mount_to;
-    use protocol::{ChatMessage, TokenUsage, TokenUsageUnavailableReason, TurnTokenUsage};
+    use protocol::{
+        AgentId, ChatMessage, ChatMessageId, MessageMetadataUpdateData, TokenUsage,
+        TokenUsageUnavailableReason, TurnTokenUsage,
+    };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
@@ -548,6 +551,101 @@ mod wasm_tests {
         assert!(
             !body.contains("\u{2191}0") && !body.contains("\u{2193}0"),
             "Unavailable turn must not show a fake-zero token badge: {body}"
+        );
+    }
+
+    /// A live `MessageMetadataUpdated` patch that flips a row's
+    /// `turn_token_usage` from `Unavailable` to `Known` must reactively update
+    /// the mounted row to show the real this-turn figure — no badge before,
+    /// the real numbers after. This exercises both the reactive projection and
+    /// the live patch reducer (`apply_chat_message_metadata`).
+    #[wasm_bindgen_test]
+    async fn chat_row_live_patch_unavailable_to_known_updates_badge() {
+        let container = make_container();
+        let agent_id = AgentId("a-live-patch".to_owned());
+        let message_id = ChatMessageId("msg-live".to_owned());
+
+        // Stash the state created inside the reactive owner so the test body
+        // can drive the live patch after mounting.
+        let shared: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let shared_for_mount = shared.clone();
+        let agent_id_mount = agent_id.clone();
+        let message_id_mount = message_id.clone();
+
+        mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let entry = ChatMessageEntry {
+                message: ChatMessage {
+                    message_id: Some(message_id_mount.clone()),
+                    timestamp: 0,
+                    sender: protocol::MessageSender::Assistant {
+                        agent: "codex".to_owned(),
+                    },
+                    content: "hello".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: Some(usage(0, 0)),
+                    turn_token_usage: Some(TurnTokenUsage::Unavailable {
+                        reason: TokenUsageUnavailableReason::BackendDidNotReport,
+                    }),
+                    context_breakdown: None,
+                    images: None,
+                },
+                tool_requests: Vec::new(),
+            };
+            let row = state.push_chat_entry(agent_id_mount.clone(), entry);
+            *shared_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            let agent_ref: Signal<Option<crate::state::ActiveAgentRef>> =
+                RwSignal::new(None).into();
+            view! { <ChatMessageView agent_ref=agent_ref row=row /> }
+        })
+        .forget();
+        next_tick().await;
+
+        // Before the patch the turn is Unavailable: no badge at all.
+        assert!(
+            input_stat(&container).is_none(),
+            "Unavailable turn renders no input stat before the patch"
+        );
+        assert!(
+            output_stat(&container).is_none(),
+            "Unavailable turn renders no output stat before the patch"
+        );
+
+        // Live patch: the backend reports the turn's real usage.
+        let state = shared.borrow().clone().expect("state captured at mount");
+        state.apply_chat_message_metadata(
+            &agent_id,
+            MessageMetadataUpdateData {
+                message_id: message_id.clone(),
+                model_info: None,
+                token_usage: Some(usage(0, 0)),
+                turn_token_usage: Some(TurnTokenUsage::Known {
+                    this_turn: Box::new(usage(4200, 1300)),
+                    agent_total: Box::new(usage(50_000, 20_000)),
+                }),
+                context_breakdown: None,
+            },
+        );
+        next_tick().await;
+
+        let input = input_stat(&container).expect("badge appears after the live patch");
+        let output = output_stat(&container).expect("output stat appears after the live patch");
+        assert!(
+            input.contains("4.2K"),
+            "row updates to the real this-turn input figure: {input}"
+        );
+        assert!(
+            output.contains("1.3K"),
+            "row updates to the real this-turn output figure: {output}"
+        );
+        // The cumulative agent_total must never leak into the per-turn badge.
+        assert!(
+            !input.contains("50") && !output.contains("20"),
+            "cumulative agent_total must not leak: in={input} out={output}"
         );
     }
 }

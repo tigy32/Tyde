@@ -3964,6 +3964,9 @@ impl HistoryReplay {
                     if data.token_usage.is_some() {
                         entry.message.token_usage = data.token_usage.clone();
                     }
+                    if data.turn_token_usage.is_some() {
+                        entry.message.turn_token_usage = data.turn_token_usage.clone();
+                    }
                     if data.context_breakdown.is_some() {
                         entry.message.context_breakdown = data.context_breakdown.clone();
                     }

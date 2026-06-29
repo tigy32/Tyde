@@ -77,6 +77,16 @@ impl LspError {
         }
     }
 
+    fn transport_with_exit(message: impl Into<String>, exit: &LspServerExit) -> Self {
+        Self {
+            kind: LspErrorKind::Transport,
+            code: None,
+            message: message.into(),
+            exit_status: exit.exit_status.clone(),
+            stderr: exit.stderr.clone(),
+        }
+    }
+
     fn transport_from_exit(exit: &LspServerExit) -> Self {
         Self {
             kind: LspErrorKind::Transport,
@@ -576,9 +586,16 @@ async fn actor_loop<W: AsyncWrite + Unpin>(
                         let _ = started.send(Ok(id));
                     }
                     Err(error) => {
-                        let error = LspError::transport(error);
+                        let error = fail_after_write_error(
+                            error,
+                            process.as_ref(),
+                            &mut pending,
+                            &event_tx,
+                        )
+                        .await;
                         let _ = started.send(Err(error.clone()));
                         let _ = reply.send(Err(error));
+                        break;
                     }
                 }
             }
@@ -593,10 +610,16 @@ async fn actor_loop<W: AsyncWrite + Unpin>(
                 });
                 if let Err(error) = write_message(&mut writer, &message).await {
                     tracing::warn!(%error, id, "failed to write LSP cancel notification");
+                    let error =
+                        fail_after_write_error(error, process.as_ref(), &mut pending, &event_tx)
+                            .await;
+                    let _ = reply.send(Err(error));
+                    break;
+                } else {
+                    let _ = reply.send(Err(LspError::transport(format!(
+                        "LSP request {id} cancelled"
+                    ))));
                 }
-                let _ = reply.send(Err(LspError::transport(format!(
-                    "LSP request {id} cancelled"
-                ))));
             }
             #[cfg(test)]
             LspCommand::PendingCount { reply } => {
@@ -610,10 +633,24 @@ async fn actor_loop<W: AsyncWrite + Unpin>(
                 });
                 if let Err(error) = write_message(&mut writer, &message).await {
                     tracing::warn!(%error, %method, "failed to write LSP notification");
+                    let _ =
+                        fail_after_write_error(error, process.as_ref(), &mut pending, &event_tx)
+                            .await;
+                    break;
                 }
             }
             LspCommand::Incoming(value) => {
-                handle_incoming(value, &mut writer, &mut pending, &event_tx).await;
+                if !handle_incoming(
+                    value,
+                    &mut writer,
+                    &mut pending,
+                    &event_tx,
+                    process.as_ref(),
+                )
+                .await
+                {
+                    break;
+                }
             }
             LspCommand::ReaderClosed => {
                 let exit = collect_server_exit(process.as_ref()).await;
@@ -631,6 +668,21 @@ async fn actor_loop<W: AsyncWrite + Unpin>(
     for (_, reply) in pending.drain() {
         let _ = reply.send(Err(LspError::transport("LSP client stopped")));
     }
+}
+
+async fn fail_after_write_error(
+    write_error: String,
+    process: Option<&LspProcessDiagnostics>,
+    pending: &mut HashMap<i64, oneshot::Sender<Result<Value, LspError>>>,
+    event_tx: &mpsc::UnboundedSender<LspEvent>,
+) -> LspError {
+    let exit = collect_server_exit(process).await;
+    let error = LspError::transport_with_exit(write_error, &exit);
+    for (_, reply) in pending.drain() {
+        let _ = reply.send(Err(error.clone()));
+    }
+    let _ = event_tx.send(LspEvent::ServerExited(exit));
+    error
 }
 
 async fn collect_server_exit(process: Option<&LspProcessDiagnostics>) -> LspServerExit {
@@ -686,7 +738,8 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
     writer: &mut W,
     pending: &mut HashMap<i64, oneshot::Sender<Result<Value, LspError>>>,
     event_tx: &mpsc::UnboundedSender<LspEvent>,
-) {
+    process: Option<&LspProcessDiagnostics>,
+) -> bool {
     // A `method` field means request (with id) or notification (without id).
     if let Some(method) = value.get("method").and_then(Value::as_str) {
         let method = method.to_owned();
@@ -702,13 +755,15 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
                 });
                 if let Err(error) = write_message(writer, &response).await {
                     tracing::warn!(%error, %method, "failed to answer server-initiated request");
+                    let _ = fail_after_write_error(error, process, pending, event_tx).await;
+                    return false;
                 }
             }
             None => {
                 let _ = event_tx.send(LspEvent::Notification(LspNotification { method, params }));
             }
         }
-        return;
+        return true;
     }
 
     // Otherwise it's a response to one of our requests.
@@ -717,11 +772,11 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
             ?value,
             "unrecognized LSP message (no method, no numeric id)"
         );
-        return;
+        return true;
     };
     let Some(reply) = pending.remove(&id) else {
         tracing::debug!(id, "LSP response for unknown/expired request id");
-        return;
+        return true;
     };
     if let Some(error) = value.get("error") {
         let code = error.get("code").and_then(Value::as_i64);
@@ -741,6 +796,7 @@ async fn handle_incoming<W: AsyncWrite + Unpin>(
         let result = value.get("result").cloned().unwrap_or(Value::Null);
         let _ = reply.send(Ok(result));
     }
+    true
 }
 
 /// Default result for an auto-answered server→client request. `workspace/

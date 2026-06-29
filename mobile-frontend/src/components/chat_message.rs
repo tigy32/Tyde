@@ -113,3 +113,136 @@ pub fn ChatMessageView(entry: ChatMessageEntry) -> impl IntoView {
         </div>
     }
 }
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use leptos::mount::mount_to;
+    use protocol::{
+        ChatMessage, MessageSender, TokenUsage, TokenUsageUnavailableReason, TurnTokenUsage,
+    };
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+    use web_sys::HtmlElement;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_container() -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn usage(input: u64, output: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            cached_prompt_tokens: None,
+            cache_creation_input_tokens: None,
+            reasoning_tokens: None,
+        }
+    }
+
+    fn assistant_entry(
+        token_usage: Option<TokenUsage>,
+        turn_token_usage: Option<TurnTokenUsage>,
+    ) -> ChatMessageEntry {
+        ChatMessageEntry {
+            message: ChatMessage {
+                message_id: None,
+                timestamp: 0,
+                sender: MessageSender::Assistant {
+                    agent: "codex".to_owned(),
+                },
+                content: "hello".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage,
+                turn_token_usage,
+                context_breakdown: None,
+                images: None,
+            },
+            tool_requests: Vec::new(),
+        }
+    }
+
+    fn mount(entry: ChatMessageEntry) -> HtmlElement {
+        let container = make_container();
+        mount_to(container.clone(), move || {
+            view! { <ChatMessageView entry=entry.clone() /> }
+        })
+        .forget();
+        container
+    }
+
+    /// `TurnTokenUsage::Known` renders the THIS-TURN figure, never the
+    /// cumulative `agent_total` carried alongside it.
+    #[wasm_bindgen_test]
+    async fn mobile_chat_known_shows_per_turn_figure() {
+        let entry = assistant_entry(
+            Some(usage(4200, 1300)),
+            Some(TurnTokenUsage::Known {
+                this_turn: Box::new(usage(4200, 1300)),
+                agent_total: Box::new(usage(999_000, 888_000)),
+            }),
+        );
+        let container = mount(entry);
+        next_tick().await;
+
+        let tokens = container
+            .query_selector("[data-mobile-test='chat-message-tokens']")
+            .unwrap()
+            .expect("Known turn renders a token line")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            tokens.contains("in:4200") && tokens.contains("out:1300"),
+            "Known turn shows the this-turn figure: {tokens}"
+        );
+        assert!(
+            !tokens.contains("999000") && !tokens.contains("888000"),
+            "cumulative agent_total must not leak into the per-turn line: {tokens}"
+        );
+    }
+
+    /// `TurnTokenUsage::Unavailable` means the backend reported nothing this
+    /// turn; the mobile row must render no token line rather than a fake-zero
+    /// one, even though `token_usage` carries zeros for compatibility.
+    #[wasm_bindgen_test]
+    async fn mobile_chat_unavailable_renders_no_fake_zero() {
+        let entry = assistant_entry(
+            Some(usage(0, 0)),
+            Some(TurnTokenUsage::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport,
+            }),
+        );
+        let container = mount(entry);
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-message-tokens']")
+                .unwrap()
+                .is_none(),
+            "Unavailable turn must not render a token line"
+        );
+        let body = container.text_content().unwrap_or_default();
+        assert!(
+            !body.contains("in:0 out:0"),
+            "Unavailable turn must not show a fake-zero token figure: {body}"
+        );
+    }
+}

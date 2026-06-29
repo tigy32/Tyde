@@ -1693,6 +1693,9 @@ impl MobileHistoryReplay {
                 if data.token_usage.is_some() {
                     row.message.token_usage = data.token_usage;
                 }
+                if data.turn_token_usage.is_some() {
+                    row.message.turn_token_usage = data.turn_token_usage;
+                }
                 if data.context_breakdown.is_some() {
                     row.message.context_breakdown = data.context_breakdown;
                 }

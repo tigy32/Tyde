@@ -847,36 +847,55 @@ fn AgentControlAgentRow(
     }
 }
 
-/// Whether activity stats carry anything worth showing. Used to suppress an
-/// all-zero stats line (no tool calls and no token usage yet).
-fn stats_has_content(stats: &AgentActivityStats) -> bool {
-    let tokens = &stats.token_usage;
-    stats.tool_calls > 0
-        || tokens.input_tokens > 0
+/// Whether a `TokenUsage` carries a non-zero figure that `token_badge_data`
+/// would actually render. That helper displays input (`input_tokens` plus the
+/// cache-derived hits/writes) and output (`output_tokens`, with reasoning in
+/// the tooltip) — it never renders `total_tokens`. So the gate must mirror
+/// exactly those counters: a usage whose only non-zero field is `total_tokens`
+/// would still produce `↑0 · ↓0`, so it must NOT pass. Backends that don't
+/// report usage (e.g. Kiro/Antigravity, or an agent before its first turn)
+/// leave every counter at zero; in that case we render no token badge rather
+/// than a fake `↑0 · ↓0`.
+fn token_usage_has_content(tokens: &protocol::TokenUsage) -> bool {
+    tokens.input_tokens > 0
         || tokens.output_tokens > 0
-        || tokens.total_tokens > 0
         || tokens.cached_prompt_tokens.unwrap_or(0) > 0
         || tokens.cache_creation_input_tokens.unwrap_or(0) > 0
         || tokens.reasoning_tokens.unwrap_or(0) > 0
 }
 
+/// Whether activity stats carry anything worth showing. Used to suppress an
+/// all-zero stats line (no tool calls and no token usage yet).
+fn stats_has_content(stats: &AgentActivityStats) -> bool {
+    stats.tool_calls > 0 || token_usage_has_content(&stats.token_usage)
+}
+
 /// Render the await card's server-owned stats line: the running tool-call count
 /// and token usage, formatted with the shared token badge helper so it reads
 /// identically to the chat token UI (`↑input (cached) · ↓output (reasoning)`).
+///
+/// The token spans (and their reasoning/cache tooltip) are only rendered when
+/// the agent has actually reported non-zero usage — a tool-call-only agent
+/// shows just its tool-call count, never a fake `↑0 · ↓0` badge.
 fn agent_control_stats_line(stats: AgentActivityStats) -> AnyView {
-    let (input_text, output_text, tooltip) = token_badge_data(&stats.token_usage);
     let tool_label = if stats.tool_calls == 1 {
         "1 tool call".to_owned()
     } else {
         format!("{} tool calls", stats.tool_calls)
     };
-    view! {
-        <div class="tool-live-agent-stats" title=tooltip>
-            <span class="tool-live-agent-stats-tools">{tool_label}</span>
+    let token_spans = token_usage_has_content(&stats.token_usage).then(|| {
+        let (input_text, output_text, tooltip) = token_badge_data(&stats.token_usage);
+        view! {
             <span class="token-sep">"\u{00b7}"</span>
-            <span class="token-stat token-stat-input">{input_text}</span>
+            <span class="token-stat token-stat-input" title=tooltip>{input_text}</span>
             <span class="token-sep">"\u{00b7}"</span>
             <span class="token-stat token-stat-output">{output_text}</span>
+        }
+    });
+    view! {
+        <div class="tool-live-agent-stats">
+            <span class="tool-live-agent-stats-tools">{tool_label}</span>
+            {token_spans}
         </div>
     }
     .into_any()
@@ -2261,6 +2280,162 @@ mod live_card_wasm_tests {
         assert!(
             stats_line.contains("30.0K"),
             "stats line shows the server cumulative output verbatim: {stats_line}"
+        );
+    }
+
+    /// A tool-call-only agent — tool calls recorded but every token counter
+    /// still zero (non-reporting backends like Kiro/Antigravity, or an agent
+    /// before its first turn) — must show its tool-call count with NO token
+    /// badge. A fake `↑0 · ↓0` would misrepresent the backend as reporting
+    /// zero usage when it reported nothing at all.
+    #[wasm_bindgen_test]
+    async fn await_stats_line_tool_calls_only_shows_no_token_badge() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+        );
+        let mut info = agent_info("agent-sub", "Awaited Worker", true);
+        info.activity_summary = AgentActivitySummaryState::Disabled;
+        state.agents.update(|agents| agents.push(info));
+        // 12 tool calls, but the backend reported no token usage at all.
+        seed_stats(
+            &state,
+            "agent-sub",
+            activity_stats(None, 12, token_usage(0, 0, 0, 0)),
+        );
+        next_tick().await;
+
+        let stats_line = container
+            .query_selector(".tool-live-agent-stats")
+            .expect("query stats")
+            .expect("await stats line present")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            stats_line.contains("12 tool calls"),
+            "tool-call count is still shown: {stats_line}"
+        );
+        assert!(
+            !stats_line.contains('\u{2191}'),
+            "no up-arrow token span when every counter is zero: {stats_line}"
+        );
+        assert!(
+            !stats_line.contains('\u{2193}'),
+            "no down-arrow token span when every counter is zero: {stats_line}"
+        );
+        assert!(
+            container
+                .query_selector(".token-stat-input")
+                .expect("query input span")
+                .is_none(),
+            "no input token span element for an all-zero usage"
+        );
+        assert!(
+            container
+                .query_selector(".token-stat-output")
+                .expect("query output span")
+                .is_none(),
+            "no output token span element for an all-zero usage"
+        );
+
+        // Total-only edge case: `token_badge_data` displays input/output
+        // (+cache/reasoning), never `total_tokens`. A usage whose ONLY non-zero
+        // field is `total_tokens` would still produce a fake `↑0 · ↓0`, so the
+        // gate must reject it too. Re-seed the same card and re-assert — reusing
+        // this mount rather than adding another leaked card to the suite.
+        let total_only = protocol::TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 123,
+            cached_prompt_tokens: None,
+            cache_creation_input_tokens: None,
+            reasoning_tokens: None,
+        };
+        seed_stats(&state, "agent-sub", activity_stats(None, 5, total_only));
+        next_tick().await;
+
+        let stats_line = container
+            .query_selector(".tool-live-agent-stats")
+            .expect("query stats")
+            .expect("await stats line present")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            stats_line.contains("5 tool calls"),
+            "total-only: tool-call count is still shown: {stats_line}"
+        );
+        assert!(
+            !stats_line.contains('\u{2191}') && !stats_line.contains('\u{2193}'),
+            "total-only usage must render no token arrows: {stats_line}"
+        );
+        assert!(
+            container
+                .query_selector(".token-stat-input")
+                .expect("query input span")
+                .is_none()
+                && container
+                    .query_selector(".token-stat-output")
+                    .expect("query output span")
+                    .is_none(),
+            "total-only usage must render no token span elements"
+        );
+    }
+
+    /// A later `AgentActivityStats` frame for the same agent must re-render the
+    /// mounted await card in place with the new cumulative total — the
+    /// post-turn update path. The figure must replace, not accumulate.
+    #[wasm_bindgen_test]
+    async fn await_stats_line_replaces_cumulative_on_new_frame() {
+        let entry = completed_other_request("toolu_agent_control", "tyde_await_agents");
+        let (container, state) = mount_card(
+            entry,
+            Some(agent_control_progress_data(AgentControlProgressKind::Await)),
+        );
+        let mut info = agent_info("agent-sub", "Awaited Worker", true);
+        info.activity_summary = AgentActivitySummaryState::Disabled;
+        state.agents.update(|agents| agents.push(info));
+        seed_stats(
+            &state,
+            "agent-sub",
+            activity_stats(None, 3, token_usage(100_000, 0, 5_000, 0)),
+        );
+        next_tick().await;
+        let stats_line = container
+            .query_selector(".tool-live-agent-stats")
+            .expect("query stats")
+            .expect("await stats line present")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            stats_line.contains("100.0K"),
+            "initial cumulative input renders: {stats_line}"
+        );
+
+        // A later, larger cumulative frame must replace the figure live.
+        seed_stats(
+            &state,
+            "agent-sub",
+            activity_stats(None, 7, token_usage(250_000, 0, 9_000, 0)),
+        );
+        next_tick().await;
+        let stats_line = container
+            .query_selector(".tool-live-agent-stats")
+            .expect("query stats")
+            .expect("await stats line present")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            stats_line.contains("250.0K"),
+            "cumulative updates live to the new total: {stats_line}"
+        );
+        assert!(
+            stats_line.contains("7 tool calls"),
+            "tool-call count updates live: {stats_line}"
+        );
+        assert!(
+            !stats_line.contains("100.0K"),
+            "old cumulative is replaced, not appended: {stats_line}"
         );
     }
 
