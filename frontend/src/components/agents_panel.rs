@@ -1285,6 +1285,29 @@ fn render_agent_tree_group(
     }
 }
 
+/// Switch the active project (and host) to the project the clicked agent
+/// belongs to, then open (and activate) its chat tab. Ordering is
+/// load-bearing: `switch_active_project` replaces `center_zone`, so it MUST
+/// run before `open_tab` or the new tab lands in the old project's zone and is
+/// discarded. A `None` project switches to Home; the chat tab still carries the
+/// agent's `host_id` so host context stays correct. Switching to the already-
+/// active project is a no-op (early-returns inside `switch_active_project`).
+fn open_agent_chat(state: &AppState, agent: &AgentInfo) {
+    let target_project = agent.project_id.clone().map(|project_id| ActiveProjectRef {
+        host_id: agent.host_id.clone(),
+        project_id,
+    });
+    state.switch_active_project(target_project);
+    state.open_tab(
+        TabContent::chat_with_agent(ActiveAgentRef {
+            host_id: agent.host_id.clone(),
+            agent_id: agent.agent_id.clone(),
+        }),
+        agent.name.clone(),
+        true,
+    );
+}
+
 fn agent_card(
     state: AppState,
     agent: AgentInfo,
@@ -1326,42 +1349,22 @@ fn agent_card(
         truncated
     });
 
-    let click_id = agent_id.clone();
-    let click_host_id = agent.host_id.clone();
-    let state_for_click = state.clone();
-    let click_name = name.clone();
+    let click_state = state.clone();
+    let click_agent = agent.clone();
     let on_click = move |_: web_sys::MouseEvent| {
-        let agent_ref = ActiveAgentRef {
-            host_id: click_host_id.clone(),
-            agent_id: click_id.clone(),
-        };
-        // Opening (and activating) the chat tab drives `active_agent` to this
-        // agent via the Memo derived from `center_zone`.
-        state_for_click.open_tab(
-            TabContent::chat_with_agent(agent_ref),
-            click_name.clone(),
-            true,
-        );
+        // Switch to the agent's own project/host first, then open (and
+        // activate) its chat tab; `active_agent` follows from the Memo over
+        // `center_zone`. See `open_agent_chat` for the load-bearing ordering.
+        open_agent_chat(&click_state, &click_agent);
     };
 
-    let kd_id = agent_id.clone();
-    let kd_host = agent.host_id.clone();
     let kd_state = state.clone();
-    let kd_name = name.clone();
+    let kd_agent = agent.clone();
     let on_keydown_card = move |ev: web_sys::KeyboardEvent| {
         if matches!(ev.key().as_str(), "Enter" | " ") {
             ev.prevent_default();
-            let agent_ref = ActiveAgentRef {
-                host_id: kd_host.clone(),
-                agent_id: kd_id.clone(),
-            };
-            // active_agent is a Memo over center_zone; opening the tab drives
-            // it.
-            kd_state.open_tab(
-                TabContent::chat_with_agent(agent_ref),
-                kd_name.clone(),
-                true,
-            );
+            // Identical behavior to the mouse handler so the two can't drift.
+            open_agent_chat(&kd_state, &kd_agent);
         }
     };
 
@@ -4244,6 +4247,238 @@ mod wasm_tests {
         assert!(
             !button_active(&container, "Hide sub-agents"),
             "server snapshot overrides the optimistic overlay"
+        );
+    }
+
+    // ── Sidebar agent click routes to the agent's own project ────────────────
+
+    /// Pin the sidebar to "all projects" so an agent that lives outside the
+    /// active project is still rendered (and therefore clickable).
+    fn apply_show_all_projects(state: &AppState) {
+        state.apply_agents_view_snapshot(
+            "local",
+            sidebar_snapshot(AgentsSidebarPreferences {
+                project_visibility: AgentsSidebarProjectVisibility::AllProjects,
+                ..Default::default()
+            }),
+        );
+    }
+
+    fn agent_card_el(container: &HtmlElement, agent_id: &str) -> HtmlElement {
+        container
+            .query_selector(&format!("[data-agent-id='{agent_id}'] .agent-card"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("agent card for {agent_id} should be rendered"))
+            .dyn_into()
+            .unwrap()
+    }
+
+    fn project_accessed_streams(calls: &js_sys::Array) -> Vec<String> {
+        recorded_frames(calls)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "project_accessed")
+            .map(|(_, _, stream)| stream)
+            .collect()
+    }
+
+    /// Clicking an agent that belongs to a different project than the active one
+    /// switches the active project to the agent's project FIRST, then opens its
+    /// chat tab — so the tab lands in the agent's project center zone instead of
+    /// the previously-active project's.
+    #[wasm_bindgen_test]
+    async fn clicking_agent_switches_to_its_project_then_opens_chat() {
+        let calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = make_app_state("local");
+        state
+            .configured_hosts
+            .set(vec![configured_host("local", "Local Host")]);
+        state.projects.set(vec![
+            project_info("local", "abc", "ABC Project", 0),
+            project_info("local", "xyz", "XYZ Project", 1),
+        ]);
+        push_agent_with_scope(
+            &state,
+            "local",
+            "agent-abc",
+            "ABC Agent",
+            true,
+            Some("abc"),
+            None,
+        );
+        // Start on a different project; pin "all projects" so the abc agent is
+        // visible even though it is outside the active project.
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: "local".to_owned(),
+            project_id: ProjectId("xyz".to_owned()),
+        }));
+        apply_show_all_projects(&state);
+
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        agent_card_el(&container, "agent-abc").click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+
+        let active_project = state
+            .active_project
+            .get_untracked()
+            .expect("active project should be set after click");
+        assert_eq!(active_project.host_id, "local");
+        assert_eq!(
+            active_project.project_id,
+            ProjectId("abc".to_owned()),
+            "click must switch the active project to the clicked agent's project"
+        );
+
+        let active_agent = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent should be set after the chat tab opens");
+        assert_eq!(active_agent.host_id, "local");
+        assert_eq!(
+            active_agent.agent_id,
+            AgentId("agent-abc".to_owned()),
+            "the clicked agent's chat tab must be the active tab"
+        );
+
+        // The switch notifies the server on the agent's project stream exactly
+        // once (no ProjectAccessed is sent merely by setting up the fixture).
+        assert_eq!(
+            project_accessed_streams(&calls),
+            vec!["/project/abc".to_owned()],
+            "exactly one ProjectAccessed, targeting the agent's project stream"
+        );
+    }
+
+    /// A sub-agent / cross-host click switches BOTH the active host and project
+    /// to the clicked agent's own, and the opened chat tab carries that host.
+    #[wasm_bindgen_test]
+    async fn clicking_agent_on_another_host_switches_host_and_project() {
+        let _calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = make_app_state("local");
+        state.configured_hosts.set(vec![
+            configured_host("local", "Local Host"),
+            configured_host("remote", "Remote Host"),
+        ]);
+        state.projects.set(vec![
+            project_info("local", "alpha", "Alpha Project", 0),
+            project_info("remote", "gamma", "Gamma Project", 0),
+        ]);
+        push_agent_with_scope(
+            &state,
+            "remote",
+            "agent-gamma",
+            "Gamma Agent",
+            true,
+            Some("gamma"),
+            None,
+        );
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: "local".to_owned(),
+            project_id: ProjectId("alpha".to_owned()),
+        }));
+        apply_show_all_projects(&state);
+
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        agent_card_el(&container, "agent-gamma").click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+
+        let active_project = state
+            .active_project
+            .get_untracked()
+            .expect("active project should be set after click");
+        assert_eq!(
+            active_project.host_id, "remote",
+            "cross-host click must switch the active host"
+        );
+        assert_eq!(active_project.project_id, ProjectId("gamma".to_owned()));
+
+        let active_agent = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent should be set after click");
+        assert_eq!(
+            active_agent.host_id, "remote",
+            "the opened chat tab must carry the agent's own host"
+        );
+        assert_eq!(active_agent.agent_id, AgentId("agent-gamma".to_owned()));
+    }
+
+    /// Clicking an agent that is already in the active project still opens its
+    /// chat tab, but `switch_active_project` early-returns so no redundant
+    /// project switch (and no ProjectAccessed frame) is emitted.
+    #[wasm_bindgen_test]
+    async fn clicking_agent_already_on_its_project_opens_chat_without_reswitch() {
+        let calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = make_app_state("local");
+        state
+            .configured_hosts
+            .set(vec![configured_host("local", "Local Host")]);
+        state
+            .projects
+            .set(vec![project_info("local", "abc", "ABC Project", 0)]);
+        push_agent_with_scope(
+            &state,
+            "local",
+            "agent-abc",
+            "ABC Agent",
+            true,
+            Some("abc"),
+            None,
+        );
+        // Already on the agent's project (ContextualDefault keeps it visible).
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: "local".to_owned(),
+            project_id: ProjectId("abc".to_owned()),
+        }));
+
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        agent_card_el(&container, "agent-abc").click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+
+        let active_project = state
+            .active_project
+            .get_untracked()
+            .expect("active project should remain set");
+        assert_eq!(active_project.host_id, "local");
+        assert_eq!(
+            active_project.project_id,
+            ProjectId("abc".to_owned()),
+            "active project must be unchanged when already on the agent's project"
+        );
+
+        let active_agent = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent should be set after the chat tab opens");
+        assert_eq!(
+            active_agent.agent_id,
+            AgentId("agent-abc".to_owned()),
+            "the clicked agent's chat tab must be active"
+        );
+
+        assert!(
+            project_accessed_streams(&calls).is_empty(),
+            "no project switch (and no ProjectAccessed) when already on the project"
         );
     }
 }
