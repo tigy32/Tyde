@@ -14,8 +14,13 @@ use crate::error::MqttTransportError;
 
 /// Maximum QoS 1 publishes the Tyde driver will keep in flight on one MQTT
 /// connection. Keep this well below broker caps such as AWS IoT's 100
-/// in-flight publishes per connection.
-pub(crate) const MAX_QOS1_INFLIGHT: usize = 16;
+/// in-flight publishes per connection, and below the 16 chunks produced by a
+/// 1 MiB write so a full-size burst always has to make observable ACK progress.
+pub(crate) const MAX_QOS1_INFLIGHT: usize = 15;
+
+/// MQTT peer-facing windows need headroom above Tyde's data window so broker
+/// control flow cannot couple a full data burst to handshake/control publishes.
+pub(crate) const MQTT_QOS1_WINDOW: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PublishToken(u64);

@@ -45,6 +45,10 @@ use crate::backend::subprocess::reap_group_child_slot;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+#[cfg(not(test))]
+const INITIALIZE_REQUEST_TIMEOUT: Duration = REQUEST_TIMEOUT;
+#[cfg(test)]
+const INITIALIZE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_EXIT_WAIT: Duration = Duration::from_millis(250);
 const STDERR_CAPTURE_LIMIT: usize = 16 * 1024;
 
@@ -97,11 +101,11 @@ impl LspError {
         }
     }
 
-    fn timeout(id: i64) -> Self {
+    fn timeout(id: i64, timeout: Duration) -> Self {
         Self {
             kind: LspErrorKind::Timeout,
             code: None,
-            message: format!("LSP request {id} timed out after {REQUEST_TIMEOUT:?}"),
+            message: format!("LSP request {id} timed out after {timeout:?}"),
             exit_status: None,
             stderr: None,
         }
@@ -227,6 +231,7 @@ impl LspRequester {
         method: &str,
         params: Value,
     ) -> Result<LspPendingRequest, LspError> {
+        let timeout = request_timeout(method);
         let (started, assigned) = oneshot::channel();
         let (reply, response) = oneshot::channel();
         self.cmd_tx
@@ -245,6 +250,7 @@ impl LspRequester {
             cmd_tx: self.cmd_tx.clone(),
             response: Some(response),
             done: false,
+            timeout,
         })
     }
 
@@ -271,6 +277,7 @@ pub(crate) struct LspPendingRequest {
     cmd_tx: mpsc::UnboundedSender<LspCommand>,
     response: Option<oneshot::Receiver<Result<Value, LspError>>>,
     done: bool,
+    timeout: Duration,
 }
 
 impl LspPendingRequest {
@@ -283,7 +290,7 @@ impl LspPendingRequest {
             .response
             .take()
             .ok_or_else(|| LspError::transport("LSP request response already consumed"))?;
-        match tokio::time::timeout(REQUEST_TIMEOUT, response).await {
+        match tokio::time::timeout(self.timeout, response).await {
             Ok(result) => {
                 self.done = true;
                 result.map_err(|_| LspError::transport("LSP client dropped before responding"))?
@@ -291,9 +298,16 @@ impl LspPendingRequest {
             Err(_) => {
                 let _ = self.cmd_tx.send(LspCommand::CancelRequest { id: self.id });
                 self.done = true;
-                Err(LspError::timeout(self.id))
+                Err(LspError::timeout(self.id, self.timeout))
             }
         }
+    }
+}
+
+fn request_timeout(method: &str) -> Duration {
+    match method {
+        "initialize" => INITIALIZE_REQUEST_TIMEOUT,
+        _ => REQUEST_TIMEOUT,
     }
 }
 
@@ -998,7 +1012,8 @@ mod tests {
         });
 
         let (client, _notes) = LspClient::from_io(client_to_server_w, server_to_client_r, None);
-        let result = client.request("initialize", json!({})).await;
+        let method = "textDocument/hover";
+        let result = client.request(method, json!({})).await;
         let error = result.expect_err("silent server should time out the request");
         assert!(error.is_timeout(), "expected timeout error, got {error}");
 
@@ -1017,10 +1032,10 @@ mod tests {
         let messages = captured.lock().expect("captured mutex poisoned");
         let request_id = messages
             .iter()
-            .find(|msg| msg.get("method").and_then(Value::as_str) == Some("initialize"))
+            .find(|msg| msg.get("method").and_then(Value::as_str) == Some(method))
             .and_then(|msg| msg.get("id"))
             .and_then(Value::as_i64)
-            .expect("initialize request was sent with an id");
+            .expect("hover request was sent with an id");
         let cancelled_id = messages
             .iter()
             .find(|msg| msg.get("method").and_then(Value::as_str) == Some("$/cancelRequest"))

@@ -2850,6 +2850,9 @@ impl AppState {
         self.session_schemas.update(|schemas| {
             schemas.remove(host_id);
         });
+        self.backend_config_schemas.update(|schemas| {
+            schemas.remove(host_id);
+        });
         self.schemas_loaded_for_host.update(|loaded| {
             loaded.remove(host_id);
         });
@@ -4415,6 +4418,47 @@ mod tests {
                     .task_lists
                     .with_untracked(|m| m.contains_key(&agent_b1)),
                 "host_b agent's task_lists must survive"
+            );
+        });
+    }
+
+    #[test]
+    fn clear_host_runtime_drops_backend_config_schemas_for_host() {
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            let host_a = "host-a";
+            let host_b = "host-b";
+
+            let schema = |backend_kind: BackendKind| protocol::BackendConfigSchema {
+                backend_kind,
+                fields: Vec::new(),
+            };
+
+            state.backend_config_schemas.update(|schemas| {
+                schemas.insert(
+                    host_a.to_owned(),
+                    HashMap::from([(BackendKind::Claude, schema(BackendKind::Claude))]),
+                );
+                schemas.insert(
+                    host_b.to_owned(),
+                    HashMap::from([(BackendKind::Hermes, schema(BackendKind::Hermes))]),
+                );
+            });
+
+            state.clear_host_runtime(host_a);
+
+            assert!(
+                !state
+                    .backend_config_schemas
+                    .with_untracked(|schemas| schemas.contains_key(host_a)),
+                "host_a backend config schemas must be dropped"
+            );
+            assert!(
+                state
+                    .backend_config_schemas
+                    .with_untracked(|schemas| schemas.contains_key(host_b)),
+                "host_b backend config schemas must survive"
             );
         });
     }

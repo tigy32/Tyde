@@ -8,6 +8,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -25,7 +27,7 @@ use crate::chunking::MAX_PLAINTEXT_CHUNK_LEN;
 use crate::config::ParticipantRole;
 use crate::error::{MqttTransportError, PublishRejection};
 use crate::link::{
-    IncomingPublish, LinkEvent, MAX_QOS1_INFLIGHT, MqttLink, PublishAck, PublishToken,
+    IncomingPublish, LinkEvent, MQTT_QOS1_WINDOW, MqttLink, PublishAck, PublishToken,
 };
 use crate::types::{BrokerAuth, BrokerEndpoint};
 use protocol::BrokerUrl;
@@ -43,6 +45,8 @@ pub(crate) struct NativeMqttLink {
     next_publish_token: u64,
     pending_publish_tokens: VecDeque<PublishToken>,
     publish_tokens_by_pkid: HashMap<u16, PublishToken>,
+    #[cfg(test)]
+    accepted_publish_count: Option<Arc<AtomicUsize>>,
 }
 
 impl NativeMqttLink {
@@ -59,7 +63,17 @@ impl NativeMqttLink {
             next_publish_token: 0,
             pending_publish_tokens: VecDeque::new(),
             publish_tokens_by_pkid: HashMap::new(),
+            #[cfg(test)]
+            accepted_publish_count: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_accepted_publish_count_for_test(
+        &mut self,
+        accepted_publish_count: Option<Arc<AtomicUsize>>,
+    ) {
+        self.accepted_publish_count = accepted_publish_count;
     }
 
     fn allocate_publish_token(&mut self) -> Result<PublishToken, MqttTransportError> {
@@ -81,10 +95,16 @@ impl NativeMqttLink {
             })),
             Event::Incoming(Packet::PubAck(puback)) => {
                 match self.publish_tokens_by_pkid.remove(&puback.pkid) {
-                    Some(token) => Ok(LinkEvent::PubAck(PublishAck {
-                        token,
-                        result: validate_puback(puback.reason, puback.properties.as_ref()),
-                    })),
+                    Some(token) => {
+                        let result = validate_puback(puback.reason, puback.properties.as_ref());
+                        #[cfg(test)]
+                        if result.is_ok()
+                            && let Some(accepted_publish_count) = &self.accepted_publish_count
+                        {
+                            accepted_publish_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(LinkEvent::PubAck(PublishAck { token, result }))
+                    }
                     None => {
                         // We never retransmit, so a PUBACK for a pkid we are not
                         // awaiting is a stray or duplicate ack from the broker.
@@ -294,8 +314,8 @@ pub(crate) fn mqtt_options(
     options.set_clean_start(true);
     options.set_session_expiry_interval(Some(0));
     options.set_max_packet_size(Some(MAX_MQTT_PACKET_SIZE));
-    options.set_outgoing_inflight_upper_limit(MAX_QOS1_INFLIGHT as u16);
-    options.set_receive_maximum(Some(MAX_QOS1_INFLIGHT as u16));
+    options.set_outgoing_inflight_upper_limit(MQTT_QOS1_WINDOW as u16);
+    options.set_receive_maximum(Some(MQTT_QOS1_WINDOW as u16));
 
     match auth {
         BrokerAuth::Anonymous => {}

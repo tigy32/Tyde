@@ -259,7 +259,7 @@ pub fn worker_main() {
 pub mod client {
     use super::*;
     use std::cell::{Cell, RefCell};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::rc::Rc;
     use wasm_bindgen::JsCast;
     use wasm_bindgen::prelude::*;
@@ -347,12 +347,77 @@ pub mod client {
         on_done: Option<DoneCb>,
     }
 
+    /// `on_chunk` may synchronously cancel its own task. The dispatch
+    /// tombstone prevents reinserting that task after the callback returns.
+    #[derive(Clone)]
+    struct ActiveTasks {
+        active: Rc<RefCell<HashMap<u64, Pending>>>,
+        dispatching: Rc<RefCell<HashSet<u64>>>,
+        cancelled_during_dispatch: Rc<RefCell<HashSet<u64>>>,
+    }
+
+    impl ActiveTasks {
+        fn new() -> Self {
+            Self {
+                active: Rc::new(RefCell::new(HashMap::new())),
+                dispatching: Rc::new(RefCell::new(HashSet::new())),
+                cancelled_during_dispatch: Rc::new(RefCell::new(HashSet::new())),
+            }
+        }
+
+        fn insert(&self, task_id: u64, pending: Pending) {
+            self.cancelled_during_dispatch.borrow_mut().remove(&task_id);
+            self.active.borrow_mut().insert(task_id, pending);
+        }
+
+        fn cancel(&self, task_id: u64) {
+            let is_dispatching = self.dispatching.borrow().contains(&task_id);
+            self.active.borrow_mut().remove(&task_id);
+            if is_dispatching {
+                self.cancelled_during_dispatch.borrow_mut().insert(task_id);
+            } else {
+                self.cancelled_during_dispatch.borrow_mut().remove(&task_id);
+            }
+        }
+
+        fn drop_task(&self, task_id: u64) {
+            self.active.borrow_mut().remove(&task_id);
+            self.dispatching.borrow_mut().remove(&task_id);
+            self.cancelled_during_dispatch.borrow_mut().remove(&task_id);
+        }
+
+        fn handle_chunk(&self, task_id: u64, start: usize, tokens: Vec<LineTokens>) {
+            let Some(mut pending) = self.active.borrow_mut().remove(&task_id) else {
+                return;
+            };
+            self.dispatching.borrow_mut().insert(task_id);
+            (pending.on_chunk)(start, tokens);
+            self.dispatching.borrow_mut().remove(&task_id);
+            let cancelled = self.cancelled_during_dispatch.borrow_mut().remove(&task_id);
+            if !cancelled {
+                self.active.borrow_mut().insert(task_id, pending);
+            }
+        }
+
+        fn take_done(&self, task_id: u64) -> Option<DoneCb> {
+            self.cancelled_during_dispatch.borrow_mut().remove(&task_id);
+            self.dispatching.borrow_mut().remove(&task_id);
+            self.active
+                .borrow_mut()
+                .remove(&task_id)
+                .and_then(|mut pending| pending.on_done.take())
+        }
+
+        #[cfg(test)]
+        fn contains_active(&self, task_id: u64) -> bool {
+            self.active.borrow().contains_key(&task_id)
+        }
+    }
+
     pub struct HighlightClient {
         worker: web_sys::Worker,
         next_task_id: Cell<u64>,
-        // Active task callbacks, keyed by task id. Cancelled tasks are
-        // removed here so any late worker chunks are ignored.
-        active: Rc<RefCell<HashMap<u64, Pending>>>,
+        tasks: ActiveTasks,
         // Closure pinned for the worker's `message` listener.
         _on_message: Closure<dyn FnMut(web_sys::MessageEvent)>,
     }
@@ -382,8 +447,8 @@ pub mod client {
                 .map_err(|e| log::error!("Worker::new failed: {e:?}"))
                 .ok()?;
 
-            let active: Rc<RefCell<HashMap<u64, Pending>>> = Rc::new(RefCell::new(HashMap::new()));
-            let active_for_handler = active.clone();
+            let tasks = ActiveTasks::new();
+            let tasks_for_handler = tasks.clone();
             let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
                 move |evt: web_sys::MessageEvent| {
                     let value = evt.data();
@@ -400,19 +465,10 @@ pub mod client {
                             start,
                             tokens,
                         } => {
-                            // Look up by task id. If the task has been
-                            // cancelled the entry is gone and the chunk
-                            // is silently dropped.
-                            if let Some(pending) = active_for_handler.borrow_mut().get_mut(&task_id)
-                            {
-                                (pending.on_chunk)(start, tokens);
-                            }
+                            tasks_for_handler.handle_chunk(task_id, start, tokens);
                         }
                         Response::Done { task_id } => {
-                            let removed = active_for_handler.borrow_mut().remove(&task_id);
-                            if let Some(mut pending) = removed
-                                && let Some(done) = pending.on_done.take()
-                            {
+                            if let Some(done) = tasks_for_handler.take_done(task_id) {
                                 done();
                             }
                         }
@@ -424,7 +480,7 @@ pub mod client {
             Some(Self {
                 worker,
                 next_task_id: Cell::new(1),
-                active,
+                tasks,
                 _on_message: on_message,
             })
         }
@@ -434,7 +490,7 @@ pub mod client {
         /// running, which is essential when multiple tabs or diff files
         /// are mounted at the same time.
         pub fn cancel_task(self: &Rc<Self>, task_id: u64) {
-            self.active.borrow_mut().remove(&task_id);
+            self.tasks.cancel(task_id);
             if let Ok(v) = serde_wasm_bindgen::to_value(&Request::CancelTask { task_id })
                 && let Err(e) = self.worker.post_message(&v)
             {
@@ -467,7 +523,7 @@ pub mod client {
         ) -> u64 {
             let task_id = self.next_task_id.get();
             self.next_task_id.set(task_id + 1);
-            self.active.borrow_mut().insert(
+            self.tasks.insert(
                 task_id,
                 Pending {
                     on_chunk,
@@ -487,15 +543,56 @@ pub mod client {
                         log::error!("[hl-client] post_message failed: {e:?}");
                         // Roll back the registration so the slot
                         // doesn't leak forever.
-                        self.active.borrow_mut().remove(&task_id);
+                        self.tasks.drop_task(task_id);
                     }
                 }
                 Err(e) => {
                     log::error!("[hl-client] serialize request: {e}");
-                    self.active.borrow_mut().remove(&task_id);
+                    self.tasks.drop_task(task_id);
                 }
             }
             task_id
+        }
+    }
+
+    #[cfg(all(test, target_arch = "wasm32"))]
+    mod wasm_tests {
+        use super::*;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use wasm_bindgen_test::*;
+
+        wasm_bindgen_test_configure!(run_in_browser);
+
+        #[wasm_bindgen_test]
+        fn chunk_callback_can_cancel_without_resurrection() {
+            let tasks = ActiveTasks::new();
+            let task_id = 42;
+            let calls = Rc::new(Cell::new(0));
+            let calls_for_chunk = calls.clone();
+            let tasks_for_chunk = tasks.clone();
+
+            tasks.insert(
+                task_id,
+                Pending {
+                    on_chunk: Box::new(move |start, tokens| {
+                        assert_eq!(start, 0);
+                        assert!(tokens.is_empty());
+                        calls_for_chunk.set(calls_for_chunk.get() + 1);
+                        tasks_for_chunk.cancel(task_id);
+                    }),
+                    on_done: Some(Box::new(|| panic!("cancelled task must not finish"))),
+                },
+            );
+
+            tasks.handle_chunk(task_id, 0, Vec::new());
+
+            assert_eq!(calls.get(), 1);
+            assert!(!tasks.contains_active(task_id));
+
+            tasks.handle_chunk(task_id, 50, Vec::new());
+            assert_eq!(calls.get(), 1);
+            assert!(tasks.take_done(task_id).is_none());
         }
     }
 }

@@ -15,6 +15,8 @@ use futures_channel::mpsc::channel;
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
 use tokio::sync::Barrier;
 use tokio::sync::{mpsc, oneshot};
 
@@ -38,6 +40,8 @@ struct ConnectOverrides {
     fixed_session_salt: Option<[u8; SESSION_SALT_LEN]>,
     #[cfg(test)]
     subscribe_barrier: Option<Arc<Barrier>>,
+    #[cfg(test)]
+    accepted_publish_count: Option<Arc<AtomicUsize>>,
 }
 
 pub async fn connect(config: MqttConnectConfig) -> Result<EnvelopeStream, MqttTransportError> {
@@ -56,6 +60,7 @@ pub(crate) async fn connect_with_test_overrides(
     tls_ca_pem: Vec<u8>,
     fixed_session_salt: Option<[u8; SESSION_SALT_LEN]>,
     subscribe_barrier: Option<Arc<Barrier>>,
+    accepted_publish_count: Option<Arc<AtomicUsize>>,
 ) -> Result<EnvelopeStream, MqttTransportError> {
     connect_inner(
         config,
@@ -63,6 +68,7 @@ pub(crate) async fn connect_with_test_overrides(
             tls_ca_pem: Some(tls_ca_pem),
             fixed_session_salt,
             subscribe_barrier,
+            accepted_publish_count,
         },
     )
     .await
@@ -74,6 +80,7 @@ pub(crate) async fn connect_ephemeral_with_test_overrides(
     tls_ca_pem: Vec<u8>,
     fixed_session_salt: Option<[u8; SESSION_SALT_LEN]>,
     subscribe_barrier: Option<Arc<Barrier>>,
+    accepted_publish_count: Option<Arc<AtomicUsize>>,
 ) -> Result<EnvelopeStream, MqttTransportError> {
     connect_ephemeral_inner(
         config,
@@ -81,6 +88,7 @@ pub(crate) async fn connect_ephemeral_with_test_overrides(
             tls_ca_pem: Some(tls_ca_pem),
             fixed_session_salt,
             subscribe_barrier,
+            accepted_publish_count,
         },
     )
     .await
@@ -98,6 +106,12 @@ async fn connect_inner(
     let inbound_topic = config.role.inbound_topic(&config.room);
     let outbound_topic = config.role.outbound_topic(&config.room);
     let link = NativeMqttLink::connect(&config.endpoint, config.role, overrides.tls_ca_pem)?;
+    #[cfg(test)]
+    let link = {
+        let mut link = link;
+        link.set_accepted_publish_count_for_test(overrides.accepted_publish_count.clone());
+        link
+    };
 
     let (outbound_tx, outbound_rx) = channel::<OutboundChunk>(OUTBOUND_CHUNK_CAPACITY);
     let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEvent>(INBOUND_EVENT_CAPACITY);
@@ -165,6 +179,8 @@ async fn negotiate_ephemeral_data_room_native(
     let outbound_topic = config.role.outbound_topic(&config.room);
     let mut link =
         NativeMqttLink::connect(&config.endpoint, config.role, overrides.tls_ca_pem.clone())?;
+    #[cfg(test)]
+    link.set_accepted_publish_count_for_test(overrides.accepted_publish_count.clone());
     negotiate_ephemeral_data_room(config, &inbound_topic, &outbound_topic, &mut link).await
 }
 
@@ -183,9 +199,7 @@ mod tests {
     use rumqttc::v5::mqttbytes::QoS;
     use rumqttc::v5::mqttbytes::v5::Packet;
     use rumqttc::v5::{AsyncClient, Event};
-    use rumqttd::{
-        Broker, Config, ConnectionSettings, Notification, RouterConfig, ServerSettings, TlsConfig,
-    };
+    use rumqttd::{Broker, Config, ConnectionSettings, RouterConfig, ServerSettings, TlsConfig};
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::timeout;
@@ -194,7 +208,7 @@ mod tests {
     use crate::config::ParticipantRole;
     use crate::error::{CryptoError, FramingError};
     use crate::framing::{SESSION_SALT_LEN, encode_data_frame, encode_handshake_frame};
-    use crate::link::MAX_QOS1_INFLIGHT;
+    use crate::link::{MAX_QOS1_INFLIGHT, MQTT_QOS1_WINDOW};
     use crate::link_native::{default_root_cert_store, mqtt_options, validate_puback};
     use crate::protocol_driver::validate_post_session_handshake;
     use crate::session::SessionCipher;
@@ -209,10 +223,9 @@ mod tests {
     struct TestBroker {
         endpoint: BrokerEndpoint,
         ca_pem: Vec<u8>,
-        publish_count: Arc<AtomicUsize>,
+        accepted_publish_count: Arc<AtomicUsize>,
         _temp_dir: TempDir,
         _broker_thread: thread::JoinHandle<()>,
-        _observer_thread: thread::JoinHandle<()>,
     }
 
     #[test]
@@ -314,7 +327,7 @@ mod tests {
         let psk = PreSharedKey([0xb1; 32]);
         let (mut host, mut client) = connect_pair(&broker, room, psk.clone(), psk).await?;
 
-        let before = broker.publish_count.load(Ordering::SeqCst);
+        let before = broker.accepted_publish_count.load(Ordering::SeqCst);
         for index in 0_u8..10 {
             host.write_all(&[index]).await?;
         }
@@ -324,7 +337,7 @@ mod tests {
         timeout(Duration::from_secs(5), client.read_exact(&mut received)).await??;
         assert_eq!(received, (0_u8..10).collect::<Vec<_>>());
 
-        let published = broker.publish_count.load(Ordering::SeqCst) - before;
+        let published = broker.accepted_publish_count.load(Ordering::SeqCst) - before;
         assert!(
             published <= 2,
             "expected boxcarred writes to use at most 2 publishes, got {published}"
@@ -357,11 +370,17 @@ mod tests {
             broker.ca_pem.clone(),
             Some(CLIENT_SALT),
             None,
+            Some(broker.accepted_publish_count.clone()),
         ));
-        wait_for_publish_count(&broker, 1).await?;
+        wait_for_accepted_publish_count(&broker, 1).await?;
 
-        let host =
-            connect_with_test_overrides(host_config, broker.ca_pem.clone(), Some(HOST_SALT), None);
+        let host = connect_with_test_overrides(
+            host_config,
+            broker.ca_pem.clone(),
+            Some(HOST_SALT),
+            None,
+            Some(broker.accepted_publish_count.clone()),
+        );
         let (mut host, mut client) = timeout(Duration::from_secs(10), async {
             let host = host.await?;
             let client = client.await??;
@@ -442,6 +461,7 @@ mod tests {
             broker.ca_pem.clone(),
             Some(HOST_SALT),
             Some(host_subscribed.clone()),
+            Some(broker.accepted_publish_count.clone()),
         ));
 
         host_subscribed.wait().await;
@@ -491,6 +511,7 @@ mod tests {
             broker.ca_pem.clone(),
             Some(HOST_SALT),
             Some(host_subscribed.clone()),
+            Some(broker.accepted_publish_count.clone()),
         ));
 
         host_subscribed.wait().await;
@@ -555,9 +576,9 @@ mod tests {
                 .await
                 .map_err(|_| {
                     format!(
-                        "timed out after receiving {offset} of {} bytes; publishes observed: {}",
+                        "timed out after receiving {offset} of {} bytes; publishes accepted: {}",
                         received.len(),
-                        broker.publish_count.load(Ordering::SeqCst)
+                        broker.accepted_publish_count.load(Ordering::SeqCst)
                     )
                 })??;
             if read == 0 {
@@ -568,7 +589,7 @@ mod tests {
 
         assert_eq!(received, payload);
         assert!(
-            broker.publish_count.load(Ordering::SeqCst) > 2,
+            broker.accepted_publish_count.load(Ordering::SeqCst) > 2,
             "expected more than one MQTT publish"
         );
         Ok(())
@@ -638,10 +659,15 @@ mod tests {
             role: ParticipantRole::Client,
         };
 
-        let err =
-            connect_with_test_overrides(config, broker.ca_pem.clone(), Some(CLIENT_SALT), None)
-                .await
-                .err();
+        let err = connect_with_test_overrides(
+            config,
+            broker.ca_pem.clone(),
+            Some(CLIENT_SALT),
+            None,
+            Some(broker.accepted_publish_count.clone()),
+        )
+        .await
+        .err();
         match err {
             Some(MqttTransportError::BrokerConnect { source }) => {
                 let reason = source.to_string();
@@ -674,11 +700,16 @@ mod tests {
             ParticipantRole::Client,
             None,
         )?;
-        assert_eq!(
-            options.get_outgoing_inflight_upper_limit(),
-            Some(MAX_QOS1_INFLIGHT as u16)
-        );
-        assert_eq!(options.receive_maximum(), Some(MAX_QOS1_INFLIGHT as u16));
+        let outgoing_limit = options
+            .get_outgoing_inflight_upper_limit()
+            .ok_or_else(|| std::io::Error::other("missing outgoing in-flight limit"))?;
+        assert_eq!(outgoing_limit, MQTT_QOS1_WINDOW as u16);
+        assert!(usize::from(outgoing_limit) > MAX_QOS1_INFLIGHT);
+
+        let receive_maximum = options
+            .receive_maximum()
+            .ok_or_else(|| std::io::Error::other("missing receive maximum"))?;
+        assert_eq!(receive_maximum, MQTT_QOS1_WINDOW as u16);
         Ok(())
     }
 
@@ -706,12 +737,14 @@ mod tests {
             broker.ca_pem.clone(),
             Some(HOST_SALT),
             Some(barrier.clone()),
+            Some(broker.accepted_publish_count.clone()),
         );
         let client = connect_with_test_overrides(
             client_config,
             broker.ca_pem.clone(),
             Some(CLIENT_SALT),
             Some(barrier),
+            Some(broker.accepted_publish_count.clone()),
         );
         let connected = timeout(Duration::from_secs(10), async {
             tokio::try_join!(host, client)
@@ -745,12 +778,14 @@ mod tests {
                     broker.ca_pem.clone(),
                     Some(HOST_SALT),
                     None,
+                    Some(broker.accepted_publish_count.clone()),
                 ),
                 connect_ephemeral_with_test_overrides(
                     client_config,
                     broker.ca_pem.clone(),
                     Some(CLIENT_SALT),
                     None,
+                    Some(broker.accepted_publish_count.clone()),
                 )
             )
         })
@@ -852,21 +887,7 @@ mod tests {
         };
 
         let broker = Broker::new(config);
-        let (mut link_tx, mut link_rx) = broker.link("mqtt-transport-test-observer")?;
-        link_tx.subscribe("#")?;
-        let publish_count = Arc::new(AtomicUsize::new(0));
-        let observer_count = publish_count.clone();
-        let observer_thread = thread::spawn(move || {
-            loop {
-                match link_rx.recv() {
-                    Ok(Some(Notification::Forward(_))) => {
-                        observer_count.fetch_add(1, Ordering::SeqCst);
-                    }
-                    Ok(Some(_)) | Ok(None) => {}
-                    Err(_) => return,
-                }
-            }
-        });
+        let accepted_publish_count = Arc::new(AtomicUsize::new(0));
 
         let broker_thread = thread::spawn(move || {
             let mut broker = broker;
@@ -881,10 +902,9 @@ mod tests {
                 auth: BrokerAuth::Anonymous,
             },
             ca_pem: cert_pem.into_bytes(),
-            publish_count,
+            accepted_publish_count,
             _temp_dir: temp_dir,
             _broker_thread: broker_thread,
-            _observer_thread: observer_thread,
         })
     }
 
@@ -898,13 +918,13 @@ mod tests {
         Err(format!("broker did not listen on port {port}").into())
     }
 
-    async fn wait_for_publish_count(
+    async fn wait_for_accepted_publish_count(
         broker: &TestBroker,
         minimum: usize,
     ) -> Result<(), Box<dyn Error>> {
         timeout(Duration::from_secs(2), async {
             loop {
-                if broker.publish_count.load(Ordering::SeqCst) >= minimum {
+                if broker.accepted_publish_count.load(Ordering::SeqCst) >= minimum {
                     return Ok::<(), Box<dyn Error>>(());
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;

@@ -31,7 +31,7 @@ use crate::chunking::MAX_PLAINTEXT_CHUNK_LEN;
 use crate::config::ParticipantRole;
 use crate::error::MqttTransportError;
 use crate::link::{
-    IncomingPublish, LinkEvent, MAX_QOS1_INFLIGHT, MqttLink, PublishAck, PublishToken,
+    IncomingPublish, LinkEvent, MQTT_QOS1_WINDOW, MqttLink, PublishAck, PublishToken,
 };
 use crate::time::{Instant, Interval, interval_at};
 use crate::types::{BrokerAuth, BrokerEndpoint};
@@ -242,7 +242,7 @@ impl WasmMqttLink {
         connect.clean_session = true;
         connect.properties = Some(ConnectProperties {
             session_expiry_interval: Some(0),
-            receive_maximum: Some(MAX_QOS1_INFLIGHT as u16),
+            receive_maximum: Some(MQTT_QOS1_WINDOW as u16),
             max_packet_size: Some(MAX_MQTT_PACKET_SIZE as u32),
             topic_alias_max: None,
             request_response_info: None,
