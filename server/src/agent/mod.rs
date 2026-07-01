@@ -1767,38 +1767,18 @@ pub(crate) fn spawn_agent_actor(
                         return;
                     };
                     if resume_replay_gate_pending {
-                        match &event {
-                            ChatEvent::StreamStart(_) => active_stream_text.clear(),
-                            ChatEvent::StreamDelta(delta) => {
-                                active_stream_text.push_str(&delta.text)
-                            }
-                            _ => {}
-                        }
-                        let source_seq = activity_event_seq;
-                        activity_event_seq = activity_event_seq.saturating_add(1);
-                        if activity_stats.observe_chat_event(
+                        ingest_gated_replay_event(
                             &mut event,
-                            source_seq,
-                            &active_stream_text,
-                        ) {
-                            upsert_activity_stats_snapshot(
-                                &canonical_stream,
-                                &mut event_log,
-                                &mut subscribers,
-                                &current_start.agent_id,
-                                activity_stats.snapshot(),
-                            )
-                            .await;
-                        }
-                        if matches!(event, ChatEvent::StreamEnd(_)) {
-                            active_stream_text.clear();
-                        }
-                        record_chat_event_for_replay(
                             &canonical_stream,
+                            &current_start.agent_id,
                             &mut event_log,
+                            &mut subscribers,
                             &mut replay_state,
-                            &event,
-                        );
+                            &mut activity_stats,
+                            &mut active_stream_text,
+                            &mut activity_event_seq,
+                        )
+                        .await;
                         continue;
                     }
                     let mut real_idle_transition = false;
@@ -2174,6 +2154,27 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::ResumeReplayBarrier { result } => {
                             if !resume_replay_gate_pending {
                                 continue;
+                            }
+                            // Drain any replay events already buffered on the
+                            // backend stream before closing the gate. The
+                            // select! is unbiased, so the barrier command can be
+                            // selected while replay events are still queued;
+                            // ingesting them here (rather than leaving them for a
+                            // now-ungated `events.recv()`) keeps the full resume
+                            // transcript off the live broadcast path.
+                            while let Ok(mut event) = events.try_recv() {
+                                ingest_gated_replay_event(
+                                    &mut event,
+                                    &canonical_stream,
+                                    &current_start.agent_id,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    &mut replay_state,
+                                    &mut activity_stats,
+                                    &mut active_stream_text,
+                                    &mut activity_event_seq,
+                                )
+                                .await;
                             }
                             resume_replay_gate_pending = false;
                             match result {
@@ -4049,6 +4050,51 @@ async fn send_initial_follow_up_or_park(
     )
     .await;
     false
+}
+
+/// Ingest a backend event that arrived while the resume-replay gate is still
+/// pending: update activity stats and record it into the event log via the
+/// replay state, but never broadcast it to subscribers as a live event.
+///
+/// Shared by the gated `events.recv()` branch and the drain that runs when the
+/// resume-replay barrier fires. The resume loop's `select!` is unbiased, so the
+/// barrier command can be handled while replay events are still buffered on the
+/// backend stream; routing both paths through here guarantees a buffered replay
+/// event can never leak onto the live broadcast just because the gate closed
+/// first.
+#[allow(clippy::too_many_arguments)]
+async fn ingest_gated_replay_event(
+    event: &mut ChatEvent,
+    canonical_stream: &str,
+    agent_id: &AgentId,
+    event_log: &mut Vec<Envelope>,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+    activity_stats: &mut AgentActivityStatsTracker,
+    active_stream_text: &mut String,
+    activity_event_seq: &mut u64,
+) {
+    match &*event {
+        ChatEvent::StreamStart(_) => active_stream_text.clear(),
+        ChatEvent::StreamDelta(delta) => active_stream_text.push_str(&delta.text),
+        _ => {}
+    }
+    let source_seq = *activity_event_seq;
+    *activity_event_seq = activity_event_seq.saturating_add(1);
+    if activity_stats.observe_chat_event(event, source_seq, active_stream_text) {
+        upsert_activity_stats_snapshot(
+            canonical_stream,
+            event_log,
+            subscribers,
+            agent_id,
+            activity_stats.snapshot(),
+        )
+        .await;
+    }
+    if matches!(&*event, ChatEvent::StreamEnd(_)) {
+        active_stream_text.clear();
+    }
+    record_chat_event_for_replay(canonical_stream, event_log, replay_state, &*event);
 }
 
 fn record_chat_event_for_replay(

@@ -11,11 +11,12 @@ use protocol::{
     CodeIntelProviderStatus, CodeIntelRootOverview, CodeIntelState, CommandErrorCode,
     CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project, ProjectDiffScope,
     ProjectEventPayload, ProjectFileContentsPayload, ProjectFileEntry, ProjectFileKind,
-    ProjectFileListPayload, ProjectFileVersion, ProjectGitChangeKind, ProjectGitDiffFile,
-    ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
-    ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
-    ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload, ReviewSummary, StreamPath,
+    ProjectFileListPayload, ProjectFileVersion, ProjectFileVersionChange, ProjectGitChangeKind,
+    ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind,
+    ProjectGitDiffPayload, ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing,
+    ProjectRootPath, ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload,
+    ReviewSummary, StreamPath,
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -553,9 +554,22 @@ async fn run_project_subscription(
                         }
                     }
                     ProjectStreamCommand::ReadFile { payload, reply } => {
+                        // A read never changes the file, so it must NOT advance
+                        // the version. Stamp the contents with the *current*
+                        // centralized version (peek) — the value the last real
+                        // change (watcher event / write) produced. Bumping here
+                        // would inflate the counter far past the number of
+                        // actual edits (every panel read, agent Read tool, etc.
+                        // counted as a "change"), so the version a watcher event
+                        // later broadcasts to the code-intel provider would jump
+                        // arbitrarily high while the client's rendered version
+                        // — set from this reply — stayed behind, and every
+                        // code-intel query would be rejected as stale.
                         let result = read_file(&project, payload).map(|mut contents| {
-                            contents.version =
-                                bump_file_version(&mut file_versions, &contents.path);
+                            contents.version = file_versions
+                                .get(&contents.path)
+                                .copied()
+                                .unwrap_or(ProjectFileVersion(0));
                             contents
                         });
                         let _ = reply.send(result);
@@ -649,6 +663,33 @@ async fn run_project_subscription(
                         // there is no second counter and no double-bump.
                         let changes = bump_watched_paths(&project, &event, &mut file_versions);
                         notify_file_version_listeners(&mut file_version_listeners, &changes);
+                        // §M4: also tell the *frontend* which files advanced, so
+                        // it can re-read any it has open and keep its rendered
+                        // version (and the version it stamps on code-intel
+                        // queries) in step with the server. The internal
+                        // listener broadcast above only reaches the code-intel
+                        // services; nothing else re-syncs the client's copy.
+                        if !changes.is_empty() {
+                            let files = changes
+                                .iter()
+                                .map(|change| ProjectFileVersionChange {
+                                    path: change.path.clone(),
+                                    version: change.version,
+                                })
+                                .collect();
+                            if let Err(error) = broadcast_project_event(
+                                &mut subscribers,
+                                &ProjectEventPayload::FilesChanged { files },
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    project_id = %project_id,
+                                    error = %error,
+                                    "failed to broadcast file-version changes to subscribers"
+                                );
+                            }
+                        }
                         let refresh = classify_watch_event(&event);
                         if !refresh.is_empty() {
                             pending_update.merge(refresh);
@@ -3798,9 +3839,14 @@ new mode 100755\n";
     }
 
     #[test]
-    fn read_and_watcher_share_one_counter_no_double_bump() {
-        // A read bump and a watcher bump funnel through the *same* counter, so
-        // versions advance 1, 2, 3 across mixed sources — never two counters.
+    fn reads_peek_the_counter_only_the_watcher_bumps_it() {
+        // A read never advances the counter: `ProjectStreamCommand::ReadFile`
+        // stamps contents with the *current* version (peek), the value the last
+        // real change produced. Only a watched change (a write reaches us the
+        // same way, via the watcher) bumps it. This keeps a file's version
+        // equal to the number of actual edits, so the client's rendered version
+        // can track it instead of falling behind a read-inflated counter and
+        // getting every code-intel query rejected as stale.
         let project = test_project("/repo");
         let mut versions = HashMap::new();
         let key = ProjectPath {
@@ -3808,22 +3854,30 @@ new mode 100755\n";
             relative_path: "lib.rs".to_owned(),
         };
 
-        // Read path (as `ProjectStreamCommand::ReadFile` does).
+        // The read path peeks (as `ProjectStreamCommand::ReadFile` now does).
+        // Before any change it reads the 0 default and creates no entry.
         assert_eq!(
-            bump_file_version(&mut versions, &key),
-            ProjectFileVersion(1)
+            versions.get(&key).copied().unwrap_or(ProjectFileVersion(0)),
+            ProjectFileVersion(0)
         );
-        // Watcher path.
+        assert!(versions.is_empty(), "a peek never creates a counter entry");
+
+        // The watcher is what advances the counter.
         let changes = bump_watched_paths(
             &project,
             &watch_event(vec!["/repo/lib.rs".into()]),
             &mut versions,
         );
-        assert_eq!(changes[0].version, ProjectFileVersion(2));
-        // Read again.
+        assert_eq!(changes[0].version, ProjectFileVersion(1));
+
+        // Any number of subsequent reads peek that same version — no bump.
         assert_eq!(
-            bump_file_version(&mut versions, &key),
-            ProjectFileVersion(3)
+            versions.get(&key).copied().unwrap_or(ProjectFileVersion(0)),
+            ProjectFileVersion(1)
+        );
+        assert_eq!(
+            versions.get(&key).copied().unwrap_or(ProjectFileVersion(0)),
+            ProjectFileVersion(1)
         );
         assert_eq!(versions.len(), 1, "one authoritative counter per file");
     }

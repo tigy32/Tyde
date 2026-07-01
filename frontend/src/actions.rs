@@ -372,17 +372,46 @@ pub fn open_project_path(state: &AppState, path: ProjectPath) {
     crate::perf::mark_start(&perf_key);
     crate::perf::log_phase("file_open", "click", &perf_key, "");
 
+    send_read_and_subscribe(
+        active_project.host_id.clone(),
+        active_project.project_id.0.clone(),
+        path,
+    );
+}
+
+/// Re-read an already-open file in the background after the server reports its
+/// version advanced (`ProjectEventPayload::FilesChanged`). Marks the path in
+/// `pending_file_refreshes` so the `ProjectFileContents` handler updates it in
+/// place — without `open_tab` stealing focus — then issues the same
+/// read + subscribe an open does. Re-reading (rather than just bumping the
+/// tracked version) is required for correctness: code-intel results are
+/// computed against byte offsets, so the client must hold the *new* text before
+/// its queries can be honored, otherwise offsets would be resolved against
+/// stale content.
+pub fn refresh_open_file(
+    state: &AppState,
+    host_id: String,
+    project_id: ProjectId,
+    path: ProjectPath,
+) {
+    state.pending_file_refreshes.update(|pending| {
+        pending.insert(path.clone());
+    });
+    send_read_and_subscribe(host_id, project_id.0, path);
+}
+
+/// Send `ProjectReadFile` then `CodeIntelSubscribeFile` for `path` on the
+/// project stream. Order matters: the server processes them in arrival order,
+/// so the read resolves the file version the subscribe then peeks — the pushed
+/// semantic model carries the same version as the rendered contents.
+fn send_read_and_subscribe(host_id: String, project_id: String, path: ProjectPath) {
     let read_payload = ProjectReadFilePayload { path: path.clone() };
     let subscribe_payload = CodeIntelSubscribeFilePayload { path };
-    let project_stream = StreamPath(format!("/project/{}", active_project.project_id.0));
+    let project_stream = StreamPath(format!("/project/{project_id}"));
 
     spawn_local(async move {
-        // Send the read first, then the code-intel subscribe, on the same
-        // stream. The server processes them in arrival order, so the read bumps
-        // the file version before the subscribe peeks it — the pushed semantic
-        // model then carries the same version as the rendered contents.
         if let Err(error) = send_frame(
-            &active_project.host_id,
+            &host_id,
             project_stream.clone(),
             FrameKind::ProjectReadFile,
             &read_payload,
@@ -393,7 +422,7 @@ pub fn open_project_path(state: &AppState, path: ProjectPath) {
             return;
         }
         if let Err(error) = send_frame(
-            &active_project.host_id,
+            &host_id,
             project_stream,
             FrameKind::CodeIntelSubscribeFile,
             &subscribe_payload,

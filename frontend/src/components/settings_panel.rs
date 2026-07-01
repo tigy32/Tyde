@@ -2004,7 +2004,11 @@ fn backend_config_rows(state: &AppState) -> Option<AnyView> {
             if schema.fields.is_empty() {
                 return None;
             }
-            let values = settings.backend_config.get(&kind).cloned().unwrap_or_default();
+            let values = settings
+                .backend_config
+                .get(&kind)
+                .cloned()
+                .unwrap_or_default();
             let fields = schema
                 .fields
                 .iter()
@@ -6240,7 +6244,10 @@ mod wasm_tests {
         let mut backend_config = std::collections::HashMap::new();
         backend_config.insert(BackendKind::Hermes, values);
         state.host_settings_by_host.update(|map| {
-            map.insert(host_id.clone(), host_settings_with_hermes_config(backend_config));
+            map.insert(
+                host_id.clone(),
+                host_settings_with_hermes_config(backend_config),
+            );
         });
         state.backend_config_schemas.update(|map| {
             map.entry(host_id.clone())
@@ -6261,7 +6268,10 @@ mod wasm_tests {
             "section heading must render: {text:?}"
         );
         for label in ["Default Model", "Default Provider", "API Base URL"] {
-            assert!(text.contains(label), "field label {label:?} must render: {text:?}");
+            assert!(
+                text.contains(label),
+                "field label {label:?} must render: {text:?}"
+            );
         }
 
         let inputs = container

@@ -301,6 +301,25 @@ details summary:focus:not(:focus-visible) {
     border-color: var(--border-primary);
 }
 
+.center-host-select {
+    height: 26px;
+    padding: 0 8px;
+    font-size: 0.846rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+    max-width: 200px;
+}
+
+.center-host-select:hover {
+    color: var(--text-bright);
+    background: var(--surface-hover);
+}
+
 .new-chat-btn {
     height: 26px;
     padding: 0 10px;
@@ -8320,6 +8339,19 @@ kbd {
     font-size: 0.6rem;
     width: 10px;
     text-align: center;
+    flex-shrink: 0;
+}
+
+/* Cumulative session token usage, pinned to the right of the header row */
+.session-settings-usage {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-tertiary);
     flex-shrink: 0;
 }
 

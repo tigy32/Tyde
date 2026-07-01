@@ -91,6 +91,7 @@ async fn expect_existing_review_create_echo(
                         saw_list_changed = true;
                     }
                     ProjectEventPayload::ReviewListChanged { .. } => {}
+                    ProjectEventPayload::FilesChanged { .. } => {}
                 }
             }
             _ => {}
@@ -110,7 +111,10 @@ async fn expect_review_summary_update(
             && env.stream.0 == format!("/project/{}", project.id.0)
         {
             let ProjectEventPayload::ReviewListChanged { reviews } =
-                env.parse_payload().expect("project event payload");
+                env.parse_payload().expect("project event payload")
+            else {
+                continue;
+            };
             if let Some(summary) = reviews.into_iter().find(|summary| summary.id == *review_id) {
                 return summary;
             }

@@ -7,25 +7,25 @@ use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin,
     AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
-    BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ByteRange, ChatEvent,
-    CodeIntelDiagnosticsPayload, CodeIntelErrorContext, CodeIntelErrorPayload,
-    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelLocation,
-    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferenceLine,
-    CodeIntelReferencesCompletePayload, CodeIntelReferencesFileResult,
-    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CodeIntelStatusScope,
-    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
-    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
-    McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload,
-    MobilePairingState, NewAgentPayload, NewTerminalPayload, ProjectBootstrapPayload,
-    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload,
-    ProjectGitCommitResultPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectNotifyPayload, ProjectPath, ProjectSearchCompletePayload, ProjectSearchResultsPayload,
-    ProtocolValidator, QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload,
-    ReviewCommentSource, ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState,
-    BackendConfigSchemasPayload, SessionHistoryPayload, SessionId, SessionListPayload,
-    SessionSchemasPayload,
-    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
-    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
+    BackendConfigSchemasPayload, BackendSetupPayload, BrowseBootstrapListing,
+    BrowseBootstrapPayload, ByteRange, ChatEvent, CodeIntelDiagnosticsPayload,
+    CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelHoverResultPayload, CodeIntelLocation, CodeIntelNavigateResultPayload,
+    CodeIntelOverviewPayload, CodeIntelReferenceLine, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesFileResult, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
+    CodeIntelStatusScope, CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind,
+    HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    HostBrowseOpenedPayload, HostSettingsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
+    MobilePairingOfferPayload, MobilePairingState, NewAgentPayload, NewTerminalPayload,
+    ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectPath,
+    ProjectSearchCompletePayload, ProjectSearchResultsPayload, ProtocolValidator,
+    QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
+    ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionHistoryPayload,
+    SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
+    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload,
+    TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
     TerminalBootstrapPayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     TerminalStartPayload, WelcomePayload, WorkflowNotifyPayload, WorkflowRunNotifyPayload,
@@ -756,8 +756,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
             match envelope.parse_payload::<BackendConfigSchemasPayload>() {
                 Ok(payload) => {
                     state.backend_config_schemas.update(|schemas_by_host| {
-                        let host_schemas =
-                            schemas_by_host.entry(host_id.to_string()).or_default();
+                        let host_schemas = schemas_by_host.entry(host_id.to_string()).or_default();
                         host_schemas.clear();
                         for schema in payload.schemas {
                             host_schemas.insert(schema.backend_kind, schema);
@@ -1246,6 +1245,34 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         });
                     }
                 }
+                Ok(ProjectEventPayload::FilesChanged { files }) => {
+                    // A watched change advanced these files' versions. Re-read
+                    // any the user has open whose version moved past what we
+                    // hold, so the rendered version — and the version stamped on
+                    // code-intel queries — catches up to the server's instead of
+                    // freezing at open time. Skip files that aren't open, didn't
+                    // actually advance, or already have a refresh in flight (the
+                    // marker clears when its contents arrive, so a later bump
+                    // re-triggers) — that bounds it to one outstanding re-read
+                    // per file during a burst of writes.
+                    for change in files {
+                        let needs_refresh = state.open_files.with_untracked(|open| {
+                            open.get(&change.path)
+                                .is_some_and(|file| change.version > file.version)
+                        });
+                        let already_pending = state
+                            .pending_file_refreshes
+                            .with_untracked(|pending| pending.contains(&change.path));
+                        if needs_refresh && !already_pending {
+                            crate::actions::refresh_open_file(
+                                state,
+                                host_id.to_owned(),
+                                project_id.clone(),
+                                change.path,
+                            );
+                        }
+                    }
+                }
                 Err(error) => report_dispatch_error(
                     state,
                     host_id,
@@ -1549,7 +1576,22 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                             refresh_code_intel_subscription(host_id, &project_id, &path);
                         }
                     }
-                    state.open_tab(TabContent::File { path }, label, true);
+                    // A background refresh (server reported this already-open
+                    // file's version advanced, see `ProjectEventPayload::
+                    // FilesChanged`) updates contents + code-intel in place;
+                    // opening a tab here would steal focus (or hijack the active
+                    // pane in single-pane mode). A normal user open has no
+                    // pending-refresh marker and falls through to `open_tab`.
+                    let was_refresh = state
+                        .pending_file_refreshes
+                        .with_untracked(|pending| pending.contains(&path));
+                    if was_refresh {
+                        state.pending_file_refreshes.update(|pending| {
+                            pending.remove(&path);
+                        });
+                    } else {
+                        state.open_tab(TabContent::File { path }, label, true);
+                    }
                 }
                 Err(error) => report_dispatch_error(
                     state,

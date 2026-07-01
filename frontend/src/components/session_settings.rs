@@ -364,6 +364,30 @@ pub fn SessionSettingsBar() -> impl IntoView {
         })
     };
 
+    // Cumulative token usage for the active session: the running `agent_total`
+    // carried on the most recent assistant message that reported usage. Keyed
+    // per-message and summed server-side, so the latest one is the session total.
+    let cumulative_usage = {
+        let state = state.clone();
+        Signal::derive(move || -> Option<protocol::TokenUsage> {
+            let agent_ref = state.active_agent.get()?;
+            state.chat_rows.with(|rows| {
+                rows.get(&agent_ref.agent_id).and_then(|handles| {
+                    handles.iter().rev().find_map(|handle| {
+                        handle
+                            .entry
+                            .with(|entry| match &entry.message.turn_token_usage {
+                                Some(protocol::TurnTokenUsage::Known { agent_total, .. }) => {
+                                    Some((**agent_total).clone())
+                                }
+                                _ => None,
+                            })
+                    })
+                })
+            })
+        })
+    };
+
     let on_change_state = state.clone();
     let on_change = Callback::new(move |new_values: SessionSettingsValues| {
         if on_change_state.active_agent.get_untracked().is_some() {
@@ -391,6 +415,16 @@ pub fn SessionSettingsBar() -> impl IntoView {
                                 {move || if expanded.get() { "▼" } else { "▶" }}
                             </span>
                             {label}
+                            {move || cumulative_usage.get().map(|tu| {
+                                let (input_text, output_text, tooltip) =
+                                    crate::components::chat_message::token_badge_data(&tu);
+                                view! {
+                                    <span class="session-settings-usage" title=tooltip>
+                                        <span class="token-stat token-stat-input">{input_text}</span>
+                                        <span class="token-stat token-stat-output">{output_text}</span>
+                                    </span>
+                                }
+                            })}
                         </button>
                         <Show when=move || expanded.get()>
                             <SessionSettingsControls

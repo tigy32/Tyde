@@ -182,6 +182,12 @@ impl EventStream {
         self.rx.recv().await
     }
 
+    /// Non-blocking receive used to drain already-buffered backend events
+    /// (e.g. queued resume-replay events) without awaiting new ones.
+    pub fn try_recv(&mut self) -> Result<ChatEvent, mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
+
     pub fn take_resume_replay_complete(&mut self) -> Option<oneshot::Receiver<()>> {
         self.resume_replay_complete.take()
     }
@@ -376,14 +382,14 @@ fn validate_backend_config_value(
     match (value, field_type) {
         (SessionSettingValue::String(_), BackendConfigFieldType::Text { .. }) => Ok(()),
         (SessionSettingValue::String(_), BackendConfigFieldType::Secret { .. }) => Ok(()),
-        (
-            SessionSettingValue::String(actual),
-            BackendConfigFieldType::Select { options, .. },
-        ) => {
+        (SessionSettingValue::String(actual), BackendConfigFieldType::Select { options, .. }) => {
             if options.iter().any(|option| option.value == *actual) {
                 Ok(())
             } else {
-                Err(format!("invalid backend config '{}' value '{}'", key, actual))
+                Err(format!(
+                    "invalid backend config '{}' value '{}'",
+                    key, actual
+                ))
             }
         }
         (SessionSettingValue::Bool(_), BackendConfigFieldType::Toggle { .. }) => Ok(()),
@@ -401,9 +407,7 @@ pub(crate) fn backend_config_text<'a>(
     key: &str,
 ) -> Option<&'a str> {
     match values.0.get(key) {
-        Some(SessionSettingValue::String(value)) if !value.trim().is_empty() => {
-            Some(value.trim())
-        }
+        Some(SessionSettingValue::String(value)) if !value.trim().is_empty() => Some(value.trim()),
         _ => None,
     }
 }

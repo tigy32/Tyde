@@ -839,6 +839,118 @@ async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
 }
 
 #[tokio::test]
+async fn resume_long_replay_history_stays_capped_without_live_broadcast() {
+    // Regression: restoring a long stored session must bootstrap the resuming
+    // client with only the 15-message tail (plus the prior-history indicator),
+    // never live-broadcast the entire replayed transcript. The single-message
+    // sibling test below drains one event before the resume-replay barrier is
+    // selected, so it cannot catch the race where the barrier closes the gate
+    // while many replay events are still buffered on the backend stream.
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("resume-long-source".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/resume-long".to_owned()],
+                prompt: "history 0".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn resume long source failed");
+
+    let env = expect_next_event(&mut fixture.client, "resume long source NewAgent").await;
+    let source: NewAgentPayload = env
+        .parse_payload()
+        .expect("parse resume long source NewAgent");
+    let _ = expect_next_event(&mut fixture.client, "resume long source AgentStart").await;
+    expect_turn(&mut fixture.client, "mock backend response to: history 0").await;
+
+    // Build a 30-message transcript so many replay events are buffered at once.
+    for index in 1..30 {
+        let prompt = format!("history {index}");
+        fixture
+            .client
+            .send_message(&source.instance_stream, prompt.clone())
+            .await
+            .expect("send resume long follow-up failed");
+        expect_turn(
+            &mut fixture.client,
+            &format!("mock backend response to: {prompt}"),
+        )
+        .await;
+    }
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list_sessions before long resume failed");
+    let list = wait_for_session_list(&mut fixture.client, "SessionList before long resume").await;
+    let session_id = list
+        .sessions
+        .first()
+        .expect("expected source session")
+        .id
+        .clone();
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("resume-long".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id,
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume long agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "resume long NewAgent").await;
+    let resumed: NewAgentPayload = env.parse_payload().expect("parse resume long NewAgent");
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        FrameKind::AgentBootstrap,
+        "resume long AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
+
+    // 30 replayed messages -> 15 gated behind the prior-history indicator, 15 in the tail.
+    assert_bootstrap_prior_history_indicator(&payload, 15);
+    let expected_tail_strings = (15..30)
+        .map(|index| format!("history {index}"))
+        .collect::<Vec<_>>();
+    let expected_tail = expected_tail_strings
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_bootstrap_tail_messages(&payload, &expected_tail);
+
+    // The gated (older) portion of the transcript must not leak as live events.
+    expect_no_chat_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        Duration::from_millis(300),
+        "replayed history must not live-broadcast",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn async_resume_replay_history_is_ingested_without_live_broadcast() {
     let mut fixture = Fixture::new().await;
 

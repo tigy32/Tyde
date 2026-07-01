@@ -300,6 +300,16 @@ fn review_payload_structs_round_trip() {
     round_trip(&ProjectEventPayload::ReviewListChanged {
         reviews: vec![review_summary()],
     });
+
+    round_trip(&ProjectEventPayload::FilesChanged {
+        files: vec![ProjectFileVersionChange {
+            path: ProjectPath {
+                root: root_path(),
+                relative_path: "src/lib.rs".to_owned(),
+            },
+            version: ProjectFileVersion(30499),
+        }],
+    });
 }
 
 #[test]

@@ -5,6 +5,8 @@ use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::actions::begin_new_chat;
+use crate::app::refresh_configured_hosts;
+use crate::bridge::{self, SetSelectedHostRequest};
 use crate::components::agent_monitor_view::AgentMonitorView;
 use crate::components::chat_view::ChatView;
 use crate::components::diff_view::ReviewableDiffView;
@@ -616,12 +618,43 @@ pub fn CenterZone() -> impl IntoView {
     };
 
     let state_for_agent_monitor = state.clone();
-    let on_agent_monitor = move |_| {
-        state_for_agent_monitor.open_tab(
-            TabContent::AgentMonitor,
-            "Agent Monitor".to_owned(),
-            true,
-        );
+
+    // On the Home context (no active agent and no active project) a new chat's
+    // host comes from `selected_host_id` — the same value the Settings host
+    // picker controls. Surfacing that picker here makes the otherwise-hidden
+    // choice explicit. For project/agent contexts the host is pinned by the
+    // project or the existing agent, so we keep the Agents button instead.
+    let is_home_state = state.clone();
+    let is_home = Memo::new(move |_| {
+        is_home_state.active_agent.get().is_none() && is_home_state.active_project.get().is_none()
+    });
+
+    let hosts_state = state.clone();
+    let configured_hosts = Memo::new(move |_| hosts_state.configured_hosts.get());
+
+    let selected_host_state = state.clone();
+    let selected_host_id = Memo::new(move |_| {
+        selected_host_state
+            .selected_host_id
+            .get()
+            .unwrap_or_default()
+    });
+
+    let state_for_host_change = state.clone();
+    let on_host_change = move |ev: web_sys::Event| {
+        let select: web_sys::HtmlSelectElement = ev.target().unwrap().unchecked_into();
+        let host_id = select.value();
+        let state = state_for_host_change.clone();
+        spawn_local(async move {
+            match bridge::set_selected_host(SetSelectedHostRequest {
+                host_id: Some(host_id),
+            })
+            .await
+            {
+                Ok(_) => refresh_configured_hosts(&state).await,
+                Err(e) => log::error!("failed to set selected host: {e}"),
+            }
+        });
     };
 
     let on_toggle_menu = move |ev: web_sys::MouseEvent| {
@@ -768,14 +801,41 @@ pub fn CenterZone() -> impl IntoView {
 
                 <div class="pinned-tab-actions">
                     <span class="tab-bar-divider" aria-hidden="true"></span>
-                    <button
-                        class="center-tool-btn"
-                        title="Open Agent Monitor"
-                        aria-label="Open Agent Monitor"
-                        on:click=on_agent_monitor
+                    <Show
+                        when=move || is_home.get()
+                        fallback=move || {
+                            let state_am = state_for_agent_monitor.clone();
+                            let on_agent_monitor = move |_| {
+                                state_am.open_tab(
+                                    TabContent::AgentMonitor,
+                                    "Agent Monitor".to_owned(),
+                                    true,
+                                );
+                            };
+                            view! {
+                                <button
+                                    class="center-tool-btn"
+                                    title="Open Agent Monitor"
+                                    aria-label="Open Agent Monitor"
+                                    on:click=on_agent_monitor
+                                >
+                                    "Agents"
+                                </button>
+                            }
+                        }
                     >
-                        "Agents"
-                    </button>
+                        <select
+                            class="center-host-select"
+                            title="Host for new chats"
+                            aria-label="Host for new chats"
+                            prop:value=move || selected_host_id.get()
+                            on:change=on_host_change.clone()
+                        >
+                            {move || configured_hosts.get().into_iter().map(|host| {
+                                view! { <option value=host.id>{host.label}</option> }
+                            }).collect_view()}
+                        </select>
+                    </Show>
                     <div class="new-chat-split">
                         <button
                             class="new-chat-btn"

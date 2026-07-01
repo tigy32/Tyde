@@ -3227,7 +3227,32 @@ pub struct WorkbenchRemovePayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProjectEventPayload {
-    ReviewListChanged { reviews: Vec<ReviewSummary> },
+    ReviewListChanged {
+        reviews: Vec<ReviewSummary>,
+    },
+    /// One or more files advanced their centralized version because a change
+    /// reached the filesystem watcher (external edit, agent write, branch
+    /// switch, save-on-format, …). The frontend re-reads any of these it
+    /// currently has open so its rendered version — and thus the version it
+    /// stamps onto code-intel queries — tracks the server's instead of
+    /// freezing at open time. Without this, a subscribed file's server-side
+    /// version races ahead on every watch event while the client stays pinned
+    /// to the version it opened at, so every hover / go-to-def / find-refs is
+    /// rejected as `stale code-intel request` until the file is manually
+    /// reopened.
+    FilesChanged {
+        files: Vec<ProjectFileVersionChange>,
+    },
+}
+
+/// A single per-file version advance carried to the frontend on
+/// [`ProjectEventPayload::FilesChanged`]. This is the wire mirror of the
+/// server-internal `FileVersionChange`: "the file at `path` is now at
+/// `version`".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectFileVersionChange {
+    pub path: ProjectPath,
+    pub version: ProjectFileVersion,
 }
 
 #[derive(

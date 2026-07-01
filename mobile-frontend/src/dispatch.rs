@@ -698,6 +698,11 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                             map.insert((host.clone(), project_id), reviews);
                         });
                     }
+                    // Per-file version advances drive the desktop editor's
+                    // in-place reload of open files; the mobile client doesn't
+                    // track open-file versions for code-intel, so there is
+                    // nothing to refresh here.
+                    ProjectEventPayload::FilesChanged { .. } => {}
                 }
             }
         }

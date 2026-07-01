@@ -1304,6 +1304,14 @@ pub struct AppState {
     /// infers provider state from open files or extensions.
     pub code_intel_overview: RwSignal<HashMap<ActiveProjectRef, CodeIntelOverviewPayload>>,
     pub open_files: RwSignal<HashMap<ProjectPath, OpenFile>>,
+    /// Paths whose contents are being re-read in the background after the
+    /// server reported their version advanced (`ProjectEventPayload::
+    /// FilesChanged`). The `ProjectFileContents` handler consults this to
+    /// refresh an already-open file *in place* — updating contents and
+    /// re-subscribing code-intel — without calling `open_tab`, which would
+    /// steal focus (or, in single-pane mode, hijack the active view). Entries
+    /// are consumed when the refreshed contents arrive.
+    pub pending_file_refreshes: RwSignal<HashSet<ProjectPath>>,
     /// Server-pushed code-intelligence state, keyed by `(host_id, project_id,
     /// path)`. Kept separate from `Token`/syntax data on purpose (spec §6): the
     /// per-row token path has a wasm test guarding against text mangling, and
@@ -1659,6 +1667,7 @@ impl AppState {
             git_status: RwSignal::new(HashMap::new()),
             code_intel_overview: RwSignal::new(HashMap::new()),
             open_files: RwSignal::new(HashMap::new()),
+            pending_file_refreshes: RwSignal::new(HashSet::new()),
             code_intel: RwSignal::new(HashMap::new()),
             diff_contents: RwSignal::new(HashMap::new()),
             terminals: RwSignal::new(Vec::new()),

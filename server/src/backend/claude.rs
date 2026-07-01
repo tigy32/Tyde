@@ -2904,7 +2904,10 @@ async fn read_claude_stdout_persistent(
 /// CLI-initiated output as a new turn. Deliberately excludes lone `result`
 /// and `user` frames so a stray terminal frame never spawns an empty turn.
 fn is_cli_turn_start_event(value: &Value) -> bool {
-    let event_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     match event_type {
         "assistant" | "stream_event" | "event" => true,
         "system" => value.get("subtype").and_then(Value::as_str) == Some("init"),
@@ -12207,15 +12210,17 @@ for raw_line in sys.stdin:
         // overflows the window (e.g. 14.5M against a 1M window pins the bar
         // to 100%).
         let (inner, mut rx) = make_test_inner();
-        let mut summary = ClaudeStdoutSummary::default();
-        summary.streamed_text = "Final answer".to_string();
-        summary.model = Some("claude-opus-4-6".to_string());
         // Last API call actually consumed 250 input tokens (the context fill).
-        summary.usage = Some(json!({
-            "input_tokens": 250,
-            "output_tokens": 50,
-            "total_tokens": 300,
-        }));
+        let mut summary = ClaudeStdoutSummary {
+            streamed_text: "Final answer".to_string(),
+            model: Some("claude-opus-4-6".to_string()),
+            usage: Some(json!({
+                "input_tokens": 250,
+                "output_tokens": 50,
+                "total_tokens": 300,
+            })),
+            ..Default::default()
+        };
 
         inner.emit_stream_start("claude-msg-1", None);
         assert_eq!(
@@ -13119,7 +13124,9 @@ for raw_line in sys.stdin:
         assert!(!is_cli_turn_start_event(
             &json!({"type": "system", "subtype": "task_notification"})
         ));
-        assert!(!is_cli_turn_start_event(&json!({"type": "rate_limit_event"})));
+        assert!(!is_cli_turn_start_event(
+            &json!({"type": "rate_limit_event"})
+        ));
     }
 
     #[tokio::test]

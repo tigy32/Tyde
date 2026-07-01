@@ -2714,11 +2714,16 @@ for line in sys.stdin:
         let schema = hermes_backend_config_schema();
         assert_eq!(schema.backend_kind, BackendKind::Hermes);
         let keys: Vec<&str> = schema.fields.iter().map(|f| f.key.as_str()).collect();
-        assert_eq!(keys, vec!["default_model", "default_provider", "api_base_url"]);
-        assert!(schema.fields.iter().all(|f| matches!(
-            f.field_type,
-            BackendConfigFieldType::Text { .. }
-        )));
+        assert_eq!(
+            keys,
+            vec!["default_model", "default_provider", "api_base_url"]
+        );
+        assert!(
+            schema
+                .fields
+                .iter()
+                .all(|f| matches!(f.field_type, BackendConfigFieldType::Text { .. }))
+        );
     }
 
     #[test]
@@ -2738,8 +2743,8 @@ for line in sys.stdin:
         assert_eq!(parsed.provider, None);
 
         // Legacy packed string still parses for previously persisted values.
-        let legacy = parse_hermes_model_setting("legacy/model --provider anthropic")
-            .expect("legacy parses");
+        let legacy =
+            parse_hermes_model_setting("legacy/model --provider anthropic").expect("legacy parses");
         assert_eq!(legacy.model, "legacy/model");
         assert_eq!(legacy.provider.as_deref(), Some("anthropic"));
     }

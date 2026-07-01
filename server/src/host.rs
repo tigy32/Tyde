@@ -4869,8 +4869,9 @@ impl HostHandle {
             // resuming an already-working session).
             let prev_hermes_ready = match &state.hermes_session_schema {
                 HermesSessionSchemaState::Ready(schema) => Some(schema.clone()),
-                HermesSessionSchemaState::Pending
-                | HermesSessionSchemaState::Unavailable(_) => None,
+                HermesSessionSchemaState::Pending | HermesSessionSchemaState::Unavailable(_) => {
+                    None
+                }
             };
             state.kiro_session_schema = KiroSessionSchemaState::Pending;
             state.hermes_session_schema = HermesSessionSchemaState::Pending;
