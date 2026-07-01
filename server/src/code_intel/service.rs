@@ -35,6 +35,7 @@ use crate::stream::Stream;
 /// `CodeIntel*` input frames. Each command that produces output carries the
 /// project output `Stream` to push on.
 enum CodeIntelCommand {
+    Shutdown,
     Subscribe {
         path: ProjectPath,
         output: Stream,
@@ -66,11 +67,17 @@ enum CodeIntelCommand {
     },
 }
 
-/// Clonable handle to a per-root service actor. Dropping every handle closes
-/// the command channel and the actor task exits.
+/// Clonable handle to a per-root service actor. Shutdown is explicit because
+/// providers below the service can own self-senders for internal timers.
 #[derive(Clone)]
 struct CodeIntelServiceHandle {
     tx: mpsc::UnboundedSender<CodeIntelCommand>,
+}
+
+impl CodeIntelServiceHandle {
+    fn shutdown(&self) {
+        let _ = self.tx.send(CodeIntelCommand::Shutdown);
+    }
 }
 
 /// The authoritative per-root code-intelligence service. Owns the root's
@@ -125,6 +132,7 @@ impl CodeIntelService {
                 tokio::select! {
                     command = rx.recv() => {
                         match command {
+                            Some(CodeIntelCommand::Shutdown) => break,
                             Some(command) => service.handle(command).await,
                             None => break, // all handles dropped
                         }
@@ -146,6 +154,7 @@ impl CodeIntelService {
                     }
                 }
             }
+            service.shutdown_providers();
         });
         CodeIntelServiceHandle { tx }
     }
@@ -247,8 +256,17 @@ impl CodeIntelService {
         }
     }
 
+    fn shutdown_providers(&mut self) {
+        for provider in self.providers.values_mut() {
+            provider.shutdown();
+        }
+        self.providers.clear();
+        self.subscriptions.clear();
+    }
+
     async fn handle(&mut self, command: CodeIntelCommand) {
         match command {
+            CodeIntelCommand::Shutdown => {}
             CodeIntelCommand::Subscribe { path, output } => {
                 let Some(version) = self.subscribe_version(&path, &output).await else {
                     return;
@@ -493,6 +511,23 @@ impl CodeIntelRouter {
         }
     }
 
+    pub(crate) fn retain_roots(&mut self, roots: &[ProjectRootPath]) {
+        let roots = roots.iter().cloned().collect::<HashSet<_>>();
+        self.services.retain(|root, handle| {
+            let keep = roots.contains(root);
+            if !keep {
+                handle.shutdown();
+            }
+            keep
+        });
+    }
+
+    pub(crate) fn shutdown_all(&mut self) {
+        for (_, handle) in self.services.drain() {
+            handle.shutdown();
+        }
+    }
+
     pub(crate) fn subscribe(&mut self, payload: CodeIntelSubscribeFilePayload, output: Stream) {
         let handle = self.service_for(&payload.path.root);
         let _ = handle.tx.send(CodeIntelCommand::Subscribe {
@@ -545,5 +580,94 @@ impl CodeIntelRouter {
                 payload: payload.clone(),
             });
         }
+    }
+}
+
+impl Drop for CodeIntelRouter {
+    fn drop(&mut self) {
+        self.shutdown_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root(path: &str) -> ProjectRootPath {
+        ProjectRootPath(path.to_owned())
+    }
+
+    fn service_handle() -> (
+        CodeIntelServiceHandle,
+        mpsc::UnboundedReceiver<CodeIntelCommand>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (CodeIntelServiceHandle { tx }, rx)
+    }
+
+    fn router_with_services(
+        services: HashMap<ProjectRootPath, CodeIntelServiceHandle>,
+    ) -> CodeIntelRouter {
+        CodeIntelRouter {
+            services,
+            project_handle: ProjectStreamHandle::disconnected_for_test(),
+            resource_mode: CodeIntelResourceMode::Full,
+            code_intel_settings: CodeIntelSettings::default(),
+        }
+    }
+
+    #[test]
+    fn retain_roots_shuts_down_retired_services_before_settings_fanout() {
+        let live_root = root("/repo/live");
+        let retired_root = root("/repo/retired");
+        let (live_handle, mut live_rx) = service_handle();
+        let (retired_handle, mut retired_rx) = service_handle();
+        let mut services = HashMap::new();
+        services.insert(live_root.clone(), live_handle);
+        services.insert(retired_root.clone(), retired_handle);
+        let mut router = router_with_services(services);
+
+        router.retain_roots(std::slice::from_ref(&live_root));
+
+        assert!(router.services.contains_key(&live_root));
+        assert!(!router.services.contains_key(&retired_root));
+        assert!(matches!(
+            retired_rx.try_recv(),
+            Ok(CodeIntelCommand::Shutdown)
+        ));
+        assert!(live_rx.try_recv().is_err());
+
+        router.update_settings(CodeIntelSettings::default());
+
+        assert!(matches!(
+            live_rx.try_recv(),
+            Ok(CodeIntelCommand::UpdateSettings { .. })
+        ));
+        assert!(
+            retired_rx.try_recv().is_err(),
+            "retired services must not receive settings fanout"
+        );
+    }
+
+    #[test]
+    fn shutdown_all_drains_services_and_sends_shutdown() {
+        let (first_handle, mut first_rx) = service_handle();
+        let (second_handle, mut second_rx) = service_handle();
+        let mut services = HashMap::new();
+        services.insert(root("/repo/a"), first_handle);
+        services.insert(root("/repo/b"), second_handle);
+        let mut router = router_with_services(services);
+
+        router.shutdown_all();
+
+        assert!(router.services.is_empty());
+        assert!(matches!(
+            first_rx.try_recv(),
+            Ok(CodeIntelCommand::Shutdown)
+        ));
+        assert!(matches!(
+            second_rx.try_recv(),
+            Ok(CodeIntelCommand::Shutdown)
+        ));
     }
 }

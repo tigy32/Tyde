@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use protocol::{
     CodeIntelOverviewHeadline, CodeIntelOverviewPayload, CodeIntelOverviewSummary,
     CodeIntelProviderStatus, CodeIntelRootOverview, CodeIntelState, CommandErrorCode,
@@ -189,6 +189,12 @@ impl PendingProjectUpdate {
 }
 
 impl ProjectStreamHandle {
+    #[cfg(test)]
+    pub(crate) fn disconnected_for_test() -> Self {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Self { tx }
+    }
+
     pub(crate) async fn add_subscriber(
         &self,
         host_path: StreamPath,
@@ -1111,16 +1117,19 @@ fn bump_file_version(
 /// version through the single bump point. Paths inside `.git` are ignored — git
 /// bookkeeping is not a source file change. Returns one [`FileVersionChange`]
 /// per bumped file (in event order) so the caller can broadcast them to the
-/// code-intel services (§M4). A path that maps to several... no: each changed
-/// path bumps exactly once here, so a file that appears twice in one event
-/// (rare) advances twice and yields two changes — monotonic and harmless, the
-/// listener simply re-resolves at the latest.
+/// code-intel services (§M4). Access and metadata-only events are not content
+/// changes, and duplicate paths inside one notify event are coalesced so a
+/// single filesystem change advances the counter once.
 fn bump_watched_paths(
     project: &Project,
     event: &Event,
     versions: &mut HashMap<ProjectPath, ProjectFileVersion>,
 ) -> Vec<FileVersionChange> {
+    if !watch_event_changes_contents(event) {
+        return Vec::new();
+    }
     let mut changes = Vec::new();
+    let mut seen = HashSet::new();
     for path in &event.paths {
         if is_inside_git(path) {
             continue;
@@ -1129,6 +1138,9 @@ fn bump_watched_paths(
             continue;
         };
         if let Some(project_path) = project_path_from_absolute(project, absolute) {
+            if !seen.insert(project_path.clone()) {
+                continue;
+            }
             let version = bump_file_version(versions, &project_path);
             changes.push(FileVersionChange {
                 path: project_path,
@@ -1159,6 +1171,9 @@ fn notify_file_version_listeners(
 
 fn classify_watch_event(event: &Event) -> PendingProjectUpdate {
     let mut refresh = PendingProjectUpdate::default();
+    if !watch_event_changes_contents(event) {
+        return refresh;
+    }
     for path in &event.paths {
         if is_git_head_or_index(path) {
             refresh.git = true;
@@ -1168,6 +1183,18 @@ fn classify_watch_event(event: &Event) -> PendingProjectUpdate {
         }
     }
     refresh
+}
+
+fn watch_event_changes_contents(event: &Event) -> bool {
+    match event.kind {
+        EventKind::Access(_) => false,
+        EventKind::Modify(notify::event::ModifyKind::Metadata(_)) => false,
+        EventKind::Any
+        | EventKind::Create(_)
+        | EventKind::Modify(_)
+        | EventKind::Remove(_)
+        | EventKind::Other => true,
+    }
 }
 
 fn is_inside_git(path: &Path) -> bool {
@@ -3813,6 +3840,14 @@ new mode 100755\n";
         }
     }
 
+    fn watch_event_kind(kind: EventKind, paths: Vec<PathBuf>) -> Event {
+        Event {
+            kind,
+            paths,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn watched_change_bumps_version_exactly_once_and_is_monotonic() {
         // Each watcher event for a file advances the *single* counter by exactly
@@ -3895,6 +3930,76 @@ new mode 100755\n";
         );
         assert!(changes.is_empty());
         assert!(versions.is_empty());
+    }
+
+    #[test]
+    fn access_and_metadata_watch_events_do_not_bump_versions() {
+        let project = test_project("/repo");
+        let mut versions = HashMap::new();
+        let file = PathBuf::from("/repo/src/main.rs");
+
+        let access = bump_watched_paths(
+            &project,
+            &watch_event_kind(
+                EventKind::Access(notify::event::AccessKind::Read),
+                vec![file.clone()],
+            ),
+            &mut versions,
+        );
+        assert!(access.is_empty());
+
+        let metadata = bump_watched_paths(
+            &project,
+            &watch_event_kind(
+                EventKind::Modify(notify::event::ModifyKind::Metadata(
+                    notify::event::MetadataKind::WriteTime,
+                )),
+                vec![file],
+            ),
+            &mut versions,
+        );
+        assert!(metadata.is_empty());
+        assert!(versions.is_empty());
+    }
+
+    #[test]
+    fn content_watch_events_bump_versions_and_coalesce_duplicate_paths() {
+        let project = test_project("/repo");
+        let mut versions = HashMap::new();
+        let file = PathBuf::from("/repo/src/main.rs");
+
+        let create = bump_watched_paths(
+            &project,
+            &watch_event_kind(
+                EventKind::Create(notify::event::CreateKind::File),
+                vec![file.clone(), file.clone()],
+            ),
+            &mut versions,
+        );
+        assert_eq!(create.len(), 1, "duplicate paths in one event coalesce");
+        assert_eq!(create[0].version, ProjectFileVersion(1));
+
+        let modify = bump_watched_paths(
+            &project,
+            &watch_event_kind(
+                EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )),
+                vec![file.clone()],
+            ),
+            &mut versions,
+        );
+        assert_eq!(modify[0].version, ProjectFileVersion(2));
+
+        let remove = bump_watched_paths(
+            &project,
+            &watch_event_kind(
+                EventKind::Remove(notify::event::RemoveKind::File),
+                vec![file],
+            ),
+            &mut versions,
+        );
+        assert_eq!(remove[0].version, ProjectFileVersion(3));
     }
 
     #[test]

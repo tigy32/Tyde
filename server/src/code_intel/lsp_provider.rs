@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use protocol::{
     ByteRange, CodeIntelCompleteness, CodeIntelDiagnostic, CodeIntelDiagnosticsPayload,
@@ -79,6 +79,11 @@ const RESOLUTION_BATCH: usize = 32;
 /// …or once this long has elapsed since the first un-flushed resolution, so a
 /// trailing handful still ships promptly rather than waiting for a full batch.
 const RESOLUTION_FLUSH: Duration = Duration::from_millis(50);
+
+/// Minimum interval for high-volume `$/progress` report status updates. Phase
+/// transitions and terminal errors still emit immediately through the same
+/// typed status path; progress payload changes are emitted at this cadence.
+const PROGRESS_STATUS_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Poll interval for detached provider jobs whose only cancellation signal is
 /// an atomic active-id. It bounds how long a superseded/cancelled LSP request
@@ -260,6 +265,10 @@ impl CodeIntelProvider for LspProvider {
         self.provider_id.clone()
     }
 
+    fn shutdown(&mut self) {
+        let _ = self.tx.send(RaCommand::Shutdown);
+    }
+
     fn reconfigure(&mut self, config: LanguageServerConfig) {
         self.provider_id = config.provider_id.clone();
         let _ = self.tx.send(RaCommand::Reconfigure { config });
@@ -309,7 +318,14 @@ impl CodeIntelProvider for LspProvider {
     }
 }
 
+impl Drop for LspProvider {
+    fn drop(&mut self) {
+        let _ = self.tx.send(RaCommand::Shutdown);
+    }
+}
+
 enum RaCommand {
+    Shutdown,
     Reconfigure {
         config: LanguageServerConfig,
     },
@@ -481,6 +497,15 @@ struct RaActor {
     /// Latest on-demand hover id seen by this provider. A newer hover request
     /// supersedes an older in-flight `textDocument/hover`.
     hover_active: Arc<AtomicU64>,
+    /// Last provider-level status sent to the project overview. Exact repeats
+    /// are dropped before they reach the project stream.
+    last_provider_status: Option<CodeIntelProviderStatus>,
+    /// Last file-scoped status sent per subscribed file. Exact repeats are
+    /// dropped; version changes naturally produce a distinct payload.
+    last_file_statuses: HashMap<ProjectPath, CodeIntelStatusPayload>,
+    /// Last non-forced progress report emission. `$/progress` reports can arrive
+    /// much faster than the UI can render, so they are coalesced here.
+    last_progress_status_at: Option<StdInstant>,
 }
 
 impl RaActor {
@@ -511,6 +536,9 @@ impl RaActor {
             references_active: Arc::new(AtomicU64::new(0)),
             navigate_active: Arc::new(AtomicU64::new(0)),
             hover_active: Arc::new(AtomicU64::new(0)),
+            last_provider_status: None,
+            last_file_statuses: HashMap::new(),
+            last_progress_status_at: None,
         }
     }
 
@@ -519,6 +547,7 @@ impl RaActor {
             tokio::select! {
                 command = rx.recv() => {
                     match command {
+                        Some(RaCommand::Shutdown) => break,
                         Some(command) => self.handle_command(command).await,
                         None => break, // provider handle dropped
                     }
@@ -545,6 +574,7 @@ impl RaActor {
 
     async fn handle_command(&mut self, command: RaCommand) {
         match command {
+            RaCommand::Shutdown => {}
             RaCommand::Reconfigure { config } => self.reconfigure(config).await,
             RaCommand::Subscribe {
                 path,
@@ -627,6 +657,7 @@ impl RaActor {
                 // tracking the file so stale diagnostics aren't forwarded.
                 self.files.remove(&path);
                 self.opened.remove(&path);
+                self.last_file_statuses.remove(&path);
                 // Cancel any in-flight whole-file resolution (dropping the
                 // handle drops its `_cancel_tx`, which the driver awaits).
                 self.resolutions.remove(&path);
@@ -732,6 +763,7 @@ impl RaActor {
         self.legend = SemanticLegend::default();
         self.opened.clear();
         self.active_progress.clear();
+        self.last_progress_status_at = None;
         self.resolutions.clear();
         self.references_active.store(0, Ordering::SeqCst);
         self.navigate_active.store(0, Ordering::SeqCst);
@@ -773,6 +805,7 @@ impl RaActor {
         self.legend = SemanticLegend::default();
         self.opened.clear();
         self.active_progress.clear();
+        self.last_progress_status_at = None;
         self.resolutions.clear();
         match self.start().await {
             Ok(()) => {
@@ -1468,10 +1501,6 @@ impl RaActor {
     }
 
     fn on_progress(&mut self, params: Value) {
-        // M1-acceptable: each progress begin/report re-emits a File-scoped
-        // status for every subscribed file (`emit_status_all`). Fine for the
-        // typical one-file case; could be throttled/coalesced if many files are
-        // open under one root.
         let token = match params.get("token") {
             Some(Value::String(token)) => token.clone(),
             Some(Value::Number(token)) => token.to_string(),
@@ -1483,13 +1512,15 @@ impl RaActor {
         match value.get("kind").and_then(Value::as_str) {
             Some("begin") => {
                 self.active_progress.insert(token);
+                let phase_changed = self.phase != Phase::Indexing;
                 self.phase = Phase::Indexing;
+                self.message = None;
                 let (done, total) = progress_amounts(value);
-                self.emit_status_all(done, total);
+                self.emit_status_all(done, total, phase_changed);
             }
             Some("report") => {
                 let (done, total) = progress_amounts(value);
-                self.emit_status_all(done, total);
+                self.emit_status_all(done, total, false);
             }
             Some("end") => {
                 self.active_progress.remove(&token);
@@ -1604,7 +1635,7 @@ impl RaActor {
     fn set_phase(&mut self, phase: Phase, message: Option<String>) {
         self.phase = phase;
         self.message = message;
-        self.emit_status_all(None, None);
+        self.emit_status_all(None, None, true);
         // Becoming Ready is the trigger to push whole-file models for any
         // opened files that haven't been pushed at their current version, and to
         // refresh the crash-restart budget (the provider proved healthy again).
@@ -1614,18 +1645,41 @@ impl RaActor {
         }
     }
 
-    fn emit_status_all(&self, work_done: Option<u32>, total_work: Option<u32>) {
+    fn emit_status_all(&mut self, work_done: Option<u32>, total_work: Option<u32>, force: bool) {
+        if !force && self.progress_status_is_throttled(work_done, total_work) {
+            return;
+        }
         self.emit_provider_status(work_done, total_work);
-        for (path, file) in &self.files {
-            self.emit_one_status(path, file, work_done, total_work);
+        let paths = self.files.keys().cloned().collect::<Vec<_>>();
+        for path in paths {
+            self.emit_one_status_for_path(&path, work_done, total_work);
         }
     }
 
-    fn emit_provider_status(&self, work_done: Option<u32>, total_work: Option<u32>) {
+    fn progress_status_is_throttled(
+        &mut self,
+        work_done: Option<u32>,
+        total_work: Option<u32>,
+    ) -> bool {
+        if work_done.is_none() && total_work.is_none() {
+            return false;
+        }
+        let now = StdInstant::now();
+        if self
+            .last_progress_status_at
+            .is_some_and(|last| now.duration_since(last) < PROGRESS_STATUS_MIN_INTERVAL)
+        {
+            return true;
+        }
+        self.last_progress_status_at = Some(now);
+        false
+    }
+
+    fn emit_provider_status(&mut self, work_done: Option<u32>, total_work: Option<u32>) {
         let Some(tx) = &self.provider_status_tx else {
             return;
         };
-        let _ = tx.send(CodeIntelProviderStatus {
+        let status = CodeIntelProviderStatus {
             provider: self.config.provider_id.clone(),
             language: self.config.language.clone(),
             state: self.phase.wire_state(),
@@ -1633,26 +1687,33 @@ impl RaActor {
             work_done,
             total_work,
             message: self.message.clone(),
-        });
-    }
-
-    fn emit_status_for(&self, path: &ProjectPath) {
-        if let Some(file) = self.files.get(path) {
-            self.emit_one_status(path, file, None, None);
+        };
+        if self.last_provider_status.as_ref() == Some(&status) {
+            return;
         }
+        self.last_provider_status = Some(status.clone());
+        let _ = tx.send(status);
     }
 
-    fn emit_one_status(
-        &self,
+    fn emit_status_for(&mut self, path: &ProjectPath) {
+        self.emit_one_status_for_path(path, None, None);
+    }
+
+    fn emit_one_status_for_path(
+        &mut self,
         path: &ProjectPath,
-        file: &SubscribedFile,
         work_done: Option<u32>,
         total_work: Option<u32>,
     ) {
+        let Some(file) = self.files.get(path) else {
+            return;
+        };
+        let version = file.version;
+        let output = file.output.clone();
         let status = CodeIntelStatusPayload {
             scope: CodeIntelStatusScope::File {
                 path: path.clone(),
-                version: file.version,
+                version,
             },
             state: self.phase.wire_state(),
             resource_mode: self.resource_mode,
@@ -1660,7 +1721,11 @@ impl RaActor {
             total_work,
             message: self.message.clone(),
         };
-        emit(&file.output, FrameKind::CodeIntelStatus, &status);
+        if self.last_file_statuses.get(path) == Some(&status) {
+            return;
+        }
+        self.last_file_statuses.insert(path.clone(), status.clone());
+        emit(&output, FrameKind::CodeIntelStatus, &status);
     }
 }
 
@@ -2923,16 +2988,62 @@ mod tests {
         )
     }
 
+    fn add_subscribed_file(
+        actor: &mut RaActor,
+        relative_path: &str,
+    ) -> (ProjectPath, mpsc::UnboundedReceiver<protocol::Envelope>) {
+        let path = ProjectPath {
+            root: actor.root.clone(),
+            relative_path: relative_path.to_owned(),
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let stream = Stream::new(StreamPath("/project/p".to_owned()), tx);
+        actor.files.insert(
+            path.clone(),
+            SubscribedFile {
+                version: ProjectFileVersion(1),
+                version_cell: Arc::new(AtomicU64::new(1)),
+                output: stream,
+                text: String::new(),
+                absolute: absolute_path(&path),
+                model_version: None,
+            },
+        );
+        (path, rx)
+    }
+
+    fn drain_status_frames(
+        rx: &mut mpsc::UnboundedReceiver<protocol::Envelope>,
+    ) -> Vec<CodeIntelStatusPayload> {
+        let mut statuses = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            if envelope.kind == FrameKind::CodeIntelStatus {
+                statuses.push(serde_json::from_value(envelope.payload).expect("status payload"));
+            }
+        }
+        statuses
+    }
+
+    fn drain_provider_statuses(
+        rx: &mut mpsc::UnboundedReceiver<CodeIntelProviderStatus>,
+    ) -> Vec<CodeIntelProviderStatus> {
+        let mut statuses = Vec::new();
+        while let Ok(status) = rx.try_recv() {
+            statuses.push(status);
+        }
+        statuses
+    }
+
     #[test]
     fn provider_status_updates_include_provider_language_and_progress() {
         let (status_tx, mut status_rx) = mpsc::unbounded_channel();
-        let actor = test_actor_with_status_tx(
+        let mut actor = test_actor_with_status_tx(
             ProjectRootPath("/repo".to_owned()),
             CodeIntelResourceMode::Limited,
             status_tx,
         );
 
-        actor.emit_status_all(Some(25), Some(100));
+        actor.emit_status_all(Some(25), Some(100), true);
 
         let status = status_rx.try_recv().expect("provider status update");
         assert_eq!(
@@ -2944,6 +3055,70 @@ mod tests {
         assert_eq!(status.resource_mode, CodeIntelResourceMode::Limited);
         assert_eq!(status.work_done, Some(25));
         assert_eq!(status.total_work, Some(100));
+    }
+
+    #[test]
+    fn repeated_identical_status_is_deduped() {
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        let mut actor = test_actor_with_status_tx(
+            ProjectRootPath("/repo".to_owned()),
+            CodeIntelResourceMode::Full,
+            status_tx,
+        );
+        let (_path, mut file_rx) = add_subscribed_file(&mut actor, "src/main.rs");
+
+        actor.emit_status_all(Some(1), Some(10), true);
+        actor.emit_status_all(Some(1), Some(10), true);
+        actor.emit_status_all(Some(1), Some(10), true);
+
+        assert_eq!(
+            drain_provider_statuses(&mut status_rx).len(),
+            1,
+            "provider overview status should drop exact repeats"
+        );
+        assert_eq!(
+            drain_status_frames(&mut file_rx).len(),
+            1,
+            "file status should drop exact repeats"
+        );
+    }
+
+    #[test]
+    fn progress_reports_are_coalesced_but_phase_changes_emit() {
+        let mut actor = test_actor(
+            ProjectRootPath("/repo".to_owned()),
+            CodeIntelResourceMode::Full,
+        );
+        let (_path, mut file_rx) = add_subscribed_file(&mut actor, "src/main.rs");
+        actor.phase = Phase::Indexing;
+
+        actor.emit_status_all(Some(0), Some(100), false);
+        let _ = drain_status_frames(&mut file_rx);
+        for done in 1..=100 {
+            actor.on_progress(json!({
+                "token": "index",
+                "value": {
+                    "kind": "report",
+                    "percentage": done
+                }
+            }));
+        }
+        let coalesced = drain_status_frames(&mut file_rx);
+        assert!(
+            coalesced.len() < 100,
+            "progress report storm should be throttled before emission"
+        );
+
+        actor.set_phase(Phase::Ready, None);
+        let ready = drain_status_frames(&mut file_rx);
+        assert_eq!(ready.len(), 1, "phase transition emits immediately");
+        assert_eq!(ready[0].state, CodeIntelState::Ready);
+
+        actor.set_phase(Phase::Ready, None);
+        assert!(
+            drain_status_frames(&mut file_rx).is_empty(),
+            "unchanged phase/status is still deduped"
+        );
     }
 
     #[test]
@@ -3264,6 +3439,48 @@ mod tests {
         );
         actor.opened.insert(path.clone());
         (actor, captured, stream, rx)
+    }
+
+    #[tokio::test]
+    async fn shutdown_command_terminates_actor_and_lsp_client() {
+        let (c2s_w, c2s_r) = tokio::io::duplex(64 * 1024);
+        let (s2c_w, s2c_r) = tokio::io::duplex(64 * 1024);
+        let captured = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        tokio::spawn(fake_lsp(c2s_r, s2c_w, HashMap::new(), captured.clone()));
+        let (client, _events) = LspClient::from_io(c2s_w, s2c_r, None);
+
+        let root = ProjectRootPath("/repo".to_owned());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut actor = RaActor::new(
+            test_config(),
+            root,
+            CodeIntelResourceMode::Full,
+            tx.clone(),
+            None,
+        );
+        actor.client = Some(client);
+        let (done_tx, done_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            actor.run(rx).await;
+            let _ = done_tx.send(());
+        });
+
+        tx.send(RaCommand::Shutdown).expect("send shutdown");
+        tokio::time::timeout(Duration::from_secs(2), done_rx)
+            .await
+            .expect("actor exits after shutdown")
+            .expect("done sender should report exit");
+
+        let methods = captured
+            .lock()
+            .expect("captured mutex poisoned")
+            .iter()
+            .map(|(method, _)| method.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            methods.iter().any(|method| method == "shutdown"),
+            "shutdown command must drive LSP shutdown request, got {methods:?}"
+        );
     }
 
     /// Drain the receiver for the first frame of `kind`, deserializing it.

@@ -214,12 +214,21 @@ where
     let seq = outgoing_seq.get(&envelope.stream).copied().unwrap_or(0);
     outgoing_seq.insert(envelope.stream.clone(), seq + 1);
     envelope.seq = seq;
-    tracing::info!(
-        stream = %envelope.stream,
-        seq = envelope.seq,
-        kind = %envelope.kind,
-        "server sending envelope"
-    );
+    if is_high_volume_code_intel_frame(envelope.kind) {
+        tracing::debug!(
+            stream = %envelope.stream,
+            seq = envelope.seq,
+            kind = %envelope.kind,
+            "server sending high-volume code-intel envelope"
+        );
+    } else {
+        tracing::info!(
+            stream = %envelope.stream,
+            seq = envelope.seq,
+            kind = %envelope.kind,
+            "server sending envelope"
+        );
+    }
     let mut bytes = serde_json::to_vec(envelope)?;
     bytes.push(b'\n');
     writer.write_all(&bytes).await?;
@@ -243,12 +252,21 @@ async fn app_loop(
                     return Ok(());
                 };
 
-                tracing::info!(
-                    stream = %envelope.stream,
-                    seq = envelope.seq,
-                    kind = %envelope.kind,
-                    "server received envelope"
-                );
+                if is_high_volume_code_intel_frame(envelope.kind) {
+                    tracing::debug!(
+                        stream = %envelope.stream,
+                        seq = envelope.seq,
+                        kind = %envelope.kind,
+                        "server received high-volume code-intel envelope"
+                    );
+                } else {
+                    tracing::info!(
+                        stream = %envelope.stream,
+                        seq = envelope.seq,
+                        kind = %envelope.kind,
+                        "server received envelope"
+                    );
+                }
 
                 if let Err(error) =
                     incoming_seq.validate(&envelope.stream, envelope.seq, envelope.kind)
@@ -308,6 +326,27 @@ fn is_terminal_control_command(kind: FrameKind) -> bool {
             | FrameKind::TerminalSend
             | FrameKind::TerminalResize
             | FrameKind::TerminalClose
+    )
+}
+
+fn is_high_volume_code_intel_frame(kind: FrameKind) -> bool {
+    matches!(
+        kind,
+        FrameKind::CodeIntelSubscribeFile
+            | FrameKind::CodeIntelUnsubscribeFile
+            | FrameKind::CodeIntelSetVisibleRange
+            | FrameKind::CodeIntelHover
+            | FrameKind::CodeIntelNavigate
+            | FrameKind::CodeIntelFindReferences
+            | FrameKind::CodeIntelCancelReferences
+            | FrameKind::CodeIntelOverview
+            | FrameKind::CodeIntelStatus
+            | FrameKind::CodeIntelFileModel
+            | FrameKind::CodeIntelDiagnostics
+            | FrameKind::CodeIntelHoverResult
+            | FrameKind::CodeIntelNavigateResult
+            | FrameKind::CodeIntelReferencesResults
+            | FrameKind::CodeIntelReferencesComplete
     )
 }
 

@@ -356,6 +356,9 @@ pub(crate) struct HostState {
 
 impl Drop for HostState {
     fn drop(&mut self) {
+        for router in self.code_intel_routers.values_mut() {
+            router.shutdown_all();
+        }
         self.mobile_access.shutdown();
     }
 }
@@ -3019,7 +3022,11 @@ impl HostHandle {
                 .map_err(|error| project_store_error(OPERATION, error))?
         };
         let project_id = project.id.clone();
+        let roots = project.root_paths();
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
+        if let Some(router) = state.code_intel_routers.get_mut(&project_id) {
+            router.retain_roots(&roots);
+        }
         let handle = match ensure_project_actor(&mut state, project_id.clone()).await {
             Ok(handle) => Some(handle),
             Err(error) => {
@@ -3061,7 +3068,11 @@ impl HostHandle {
                 .map_err(|error| project_store_error(OPERATION, error))?
         };
         let project_id = project.id.clone();
+        let roots = project.root_paths();
         fan_out_project_notify(&mut state, ProjectNotifyPayload::Upsert { project }).await;
+        if let Some(router) = state.code_intel_routers.get_mut(&project_id) {
+            router.retain_roots(&roots);
+        }
         let handle = match ensure_project_actor(&mut state, project_id.clone()).await {
             Ok(handle) => Some(handle),
             Err(error) => {
@@ -3145,6 +3156,9 @@ impl HostHandle {
                 .map_err(|error| project_store_error(OPERATION, error))?
         };
         cleanup_reviews_for_deleted_project(&state.review_registry, &payload.id).await;
+        if let Some(mut router) = state.code_intel_routers.remove(&payload.id) {
+            router.shutdown_all();
+        }
         if let Some(subscription) = state.project_streams.remove(&payload.id) {
             subscription.task.abort();
         }
@@ -3347,6 +3361,9 @@ impl HostHandle {
 
         {
             let mut state = self.state.lock().await;
+            if let Some(mut router) = state.code_intel_routers.remove(&payload.id) {
+                router.shutdown_all();
+            }
             if let Some(subscription) = state.project_streams.remove(&payload.id) {
                 subscription.task.abort();
             }
@@ -3393,6 +3410,9 @@ impl HostHandle {
 
         let mut state = self.state.lock().await;
         cleanup_reviews_for_deleted_project(&state.review_registry, &payload.id).await;
+        if let Some(mut router) = state.code_intel_routers.remove(&payload.id) {
+            router.shutdown_all();
+        }
         if let Some(subscription) = state.project_streams.remove(&payload.id) {
             subscription.task.abort();
         }
@@ -7111,11 +7131,12 @@ impl HostHandle {
             .get()
             .map_err(|error| AppError::internal(operation, anyhow!(error)))?
             .code_intel;
-        state
+        let router = state
             .code_intel_routers
             .entry(project_id)
-            .or_insert_with(|| CodeIntelRouter::new(handle, code_intel_settings))
-            .warm_project(roots);
+            .or_insert_with(|| CodeIntelRouter::new(handle, code_intel_settings));
+        router.retain_roots(&roots);
+        router.warm_project(roots);
         Ok(())
     }
 
@@ -11281,8 +11302,18 @@ async fn emit_review_list_changed_for_project(
 }
 
 async fn fan_out_host_settings(state: &mut HostState, settings: protocol::HostSettings) {
-    for router in state.code_intel_routers.values_mut() {
-        router.update_settings(settings.code_intel.clone());
+    match sync_code_intel_router_roots(state).await {
+        Ok(()) => {
+            for router in state.code_intel_routers.values_mut() {
+                router.update_settings(settings.code_intel.clone());
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "skipping code-intel settings fanout after router pruning failed"
+            );
+        }
     }
 
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
@@ -11303,6 +11334,39 @@ async fn fan_out_host_settings(state: &mut HostState, settings: protocol::HostSe
     for path in dead_paths {
         state.host_streams.remove(&path);
     }
+}
+
+async fn sync_code_intel_router_roots(state: &mut HostState) -> Result<(), String> {
+    let projects = state
+        .project_store
+        .lock()
+        .await
+        .list()
+        .map_err(|error| error.to_string())?;
+    let roots_by_project = projects
+        .into_iter()
+        .map(|project| (project.id.clone(), project.root_paths()))
+        .collect::<HashMap<_, _>>();
+    let stale_projects = state
+        .code_intel_routers
+        .keys()
+        .filter(|project_id| !roots_by_project.contains_key(*project_id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for (project_id, roots) in roots_by_project {
+        if let Some(router) = state.code_intel_routers.get_mut(&project_id) {
+            router.retain_roots(&roots);
+        }
+    }
+
+    for project_id in stale_projects {
+        if let Some(mut router) = state.code_intel_routers.remove(&project_id) {
+            router.shutdown_all();
+        }
+    }
+
+    Ok(())
 }
 
 async fn apply_agent_activity_summary_setting(
@@ -12294,6 +12358,62 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn delete_project_removes_code_intel_router() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_root = dir.path().join("project-root");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        let host = spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("spawn host");
+
+        host.create_project(ProjectCreatePayload {
+            name: "Code Intel Router".to_owned(),
+            roots: vec![ProjectRootPath(project_root.to_string_lossy().into_owned())],
+        })
+        .await
+        .expect("create project");
+        let project_id = {
+            let state = host.state.lock().await;
+            state
+                .project_store
+                .lock()
+                .await
+                .list()
+                .expect("list projects")
+                .into_iter()
+                .find(|project| project.name == "Code Intel Router")
+                .expect("created project")
+                .id
+        };
+
+        host.warm_code_intel_project(project_id.clone(), "test")
+            .await
+            .expect("warm code-intel project");
+        {
+            let state = host.state.lock().await;
+            assert!(
+                state.code_intel_routers.contains_key(&project_id),
+                "warmup should create the per-project router"
+            );
+        }
+
+        host.delete_project(ProjectDeletePayload {
+            id: project_id.clone(),
+        })
+        .await
+        .expect("delete project");
+
+        let state = host.state.lock().await;
+        assert!(
+            !state.code_intel_routers.contains_key(&project_id),
+            "project deletion must drop the code-intel router"
+        );
     }
 
     #[test]

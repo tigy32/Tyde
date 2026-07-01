@@ -26,6 +26,11 @@ pub(crate) trait CodeIntelProvider: Send {
     /// Open wire identifier, e.g. `"rust-analyzer"`.
     fn provider_id(&self) -> CodeIntelProviderId;
 
+    /// Stop the provider actor and any backing language-server process. This is
+    /// explicit because provider actors can own self-senders for internal timers;
+    /// dropping the external handle is not a reliable shutdown signal.
+    fn shutdown(&mut self);
+
     /// Replace the language-server configuration for this provider and restart
     /// discovery/spawn for any already-subscribed files.
     fn reconfigure(&mut self, config: LanguageServerConfig);
@@ -172,6 +177,8 @@ mod mock {
         fn provider_id(&self) -> CodeIntelProviderId {
             CodeIntelProviderId("mock".to_owned())
         }
+
+        fn shutdown(&mut self) {}
 
         fn reconfigure(&mut self, _config: LanguageServerConfig) {}
 
