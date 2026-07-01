@@ -93,26 +93,15 @@ pub(crate) fn incoming_publish_puback(
     }
 }
 
-/// Classify an incoming PUBACK against the publish token already looked up by
-/// packet identifier. The backend must reject unknown packet identifiers before
-/// calling this helper so a stray PUBACK cannot be silently swallowed.
+/// Classify an incoming PUBACK against the publish token the backend already
+/// looked up by packet identifier. A PUBACK whose packet id is not outstanding
+/// is dropped by the caller before reaching here (we never retransmit, so a
+/// stray or duplicate ack is benign and must not fail the link).
 pub(crate) fn classify_puback(token: PublishToken, puback: PubAck) -> PubAckMatch {
     PubAckMatch::Matched {
         token,
         result: validate_puback(puback),
     }
-}
-
-pub(crate) fn classify_known_puback(
-    packet_id: u16,
-    token: Option<PublishToken>,
-    puback: PubAck,
-) -> Result<PubAckMatch, MqttTransportError> {
-    let token = token.ok_or(MqttTransportError::PublishAckMismatch {
-        packet_id: Some(packet_id),
-        token: None,
-    })?;
-    Ok(classify_puback(token, puback))
 }
 
 /// Classify an incoming SUBACK against the pending subscribe pkid.
@@ -237,17 +226,6 @@ mod tests {
                 result: Ok(())
             } if matched == token
         ));
-    }
-
-    #[test]
-    fn unknown_puback_pkid_is_fatal_mismatch() {
-        match classify_known_puback(9, None, PubAck::new(9)) {
-            Err(MqttTransportError::PublishAckMismatch { packet_id, token }) => {
-                assert_eq!(packet_id, Some(9));
-                assert_eq!(token, None);
-            }
-            other => panic!("expected publish ack mismatch, got {other:?}"),
-        }
     }
 
     #[test]

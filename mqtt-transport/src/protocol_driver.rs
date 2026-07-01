@@ -685,26 +685,26 @@ impl<L: MqttLink> ProtocolDriver<L> {
         ciphertext_with_tag: Vec<u8>,
         cipher: &mut SessionCipher,
     ) -> Result<(), MqttTransportError> {
-        match cipher.decrypt_received(counter, &ciphertext_with_tag)? {
-            Some(plaintext) => {
-                tracing::info!(
-                    role = ?self.config.role,
-                    counter,
-                    plaintext_len = plaintext.len(),
-                    "MQTT data frame decrypted"
-                );
-                self.inbound_tx
-                    .send(InboundEvent::Data(plaintext))
-                    .await
-                    .map_err(|_| MqttTransportError::ActorClosed)?;
-            }
-            None => {
-                tracing::info!(
-                    role = ?self.config.role,
-                    counter,
-                    "MQTT duplicate data frame ignored"
-                );
-            }
+        let delivered = cipher.decrypt_received(counter, &ciphertext_with_tag)?;
+        if delivered.is_empty() {
+            tracing::info!(
+                role = ?self.config.role,
+                counter,
+                "MQTT data frame withheld (duplicate or awaiting earlier frame)"
+            );
+            return Ok(());
+        }
+        for plaintext in delivered {
+            tracing::info!(
+                role = ?self.config.role,
+                counter,
+                plaintext_len = plaintext.len(),
+                "MQTT data frame decrypted"
+            );
+            self.inbound_tx
+                .send(InboundEvent::Data(plaintext))
+                .await
+                .map_err(|_| MqttTransportError::ActorClosed)?;
         }
         Ok(())
     }

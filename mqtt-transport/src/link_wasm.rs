@@ -36,8 +36,8 @@ use crate::link::{
 use crate::time::{Instant, Interval, interval_at};
 use crate::types::{BrokerAuth, BrokerEndpoint};
 use crate::wasm_codec::{
-    PubAckMatch, SubAckMatch, classify_known_puback, classify_suback, encode_disconnect,
-    encode_pingreq, incoming_publish_puback,
+    PubAckMatch, SubAckMatch, classify_puback, classify_suback, encode_disconnect, encode_pingreq,
+    incoming_publish_puback,
 };
 
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
@@ -296,10 +296,21 @@ impl WasmMqttLink {
             }
             Packet::PubAck(puback) => {
                 let pkid = puback.pkid;
-                let token = self.outstanding_publish_pkids.remove(&pkid);
-                match classify_known_puback(pkid, token, puback)? {
-                    PubAckMatch::Matched { token, result } => {
+                match self.outstanding_publish_pkids.remove(&pkid) {
+                    Some(token) => {
+                        let PubAckMatch::Matched { token, result } = classify_puback(token, puback);
                         Ok(LinkEvent::PubAck(PublishAck { token, result }))
+                    }
+                    None => {
+                        // We never retransmit, so a PUBACK for a pkid we are not
+                        // awaiting is a stray or duplicate ack from the broker.
+                        // Dropping it keeps a healthy link alive; the driver's
+                        // own in-flight bookkeeping still catches real desync.
+                        tracing::warn!(
+                            pkid,
+                            "ignoring MQTT PUBACK for unknown packet id (stray or duplicate)"
+                        );
+                        Ok(LinkEvent::Other)
                     }
                 }
             }

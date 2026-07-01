@@ -80,16 +80,23 @@ impl NativeMqttLink {
                 retain: publish.retain,
             })),
             Event::Incoming(Packet::PubAck(puback)) => {
-                let token = self.publish_tokens_by_pkid.remove(&puback.pkid).ok_or(
-                    MqttTransportError::PublishAckMismatch {
-                        packet_id: Some(puback.pkid),
-                        token: None,
-                    },
-                )?;
-                Ok(LinkEvent::PubAck(PublishAck {
-                    token,
-                    result: validate_puback(puback.reason, puback.properties.as_ref()),
-                }))
+                match self.publish_tokens_by_pkid.remove(&puback.pkid) {
+                    Some(token) => Ok(LinkEvent::PubAck(PublishAck {
+                        token,
+                        result: validate_puback(puback.reason, puback.properties.as_ref()),
+                    })),
+                    None => {
+                        // We never retransmit, so a PUBACK for a pkid we are not
+                        // awaiting is a stray or duplicate ack from the broker.
+                        // Dropping it keeps a healthy link alive; the driver's
+                        // own in-flight bookkeeping still catches real desync.
+                        tracing::warn!(
+                            pkid = puback.pkid,
+                            "ignoring MQTT PUBACK for unknown packet id (stray or duplicate)"
+                        );
+                        Ok(LinkEvent::Other)
+                    }
+                }
             }
             Event::Incoming(Packet::SubAck(suback)) => {
                 let debug = format!("{suback:?}");
