@@ -53,6 +53,12 @@ struct SubAgentStream {
     /// Emitter of the PARENT agent, used for the progress updates above.
     parent_emitter: Arc<TurnEmitter>,
     last_progress_emit: std::time::Instant,
+    /// True when the parent spawned this sub-agent with `run_in_background`.
+    /// Background agents keep streaming their own output *after* the parent
+    /// receives the synthetic "launched" tool_result, so their stream must
+    /// be finalized on the `task_notification` completion frame rather than
+    /// torn down early when that placeholder tool_result arrives.
+    background: bool,
 }
 
 #[derive(Default)]
@@ -1201,6 +1207,61 @@ impl ClaudeInner {
         }
     }
 
+    /// Open a turn for output the Claude CLI produced on its own initiative,
+    /// with no pending user message — e.g. when the model resumes after a
+    /// background sub-agent finishes. Mirrors the scaffolding `start_turn`
+    /// builds (allocate a turn id, emit typing + stream start, spawn the
+    /// finalizer that awaits the outcome) so the unsolicited turn flows
+    /// through the exact same completion path as a user-initiated one.
+    /// Returns `None` if a turn is somehow already active.
+    async fn begin_cli_initiated_turn(self: &Arc<Self>) -> Option<u64> {
+        let (turn_id, ephemeral, conversation_history_bytes, model_hint, outcome_rx) = {
+            let mut state = self.state.lock().await;
+            if state.active_turn.is_some() {
+                return None;
+            }
+            let turn_id = CLAUDE_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let (outcome_tx, outcome_rx) = oneshot::channel();
+            state.active_turn = Some(ActiveTurn {
+                id: turn_id,
+                outcome_tx: Some(outcome_tx),
+                interrupt_requested: false,
+                pending_ask_user_question: None,
+                pending_exit_plan_mode: None,
+                quiesced_waiters: Vec::new(),
+            });
+            (
+                turn_id,
+                state.ephemeral,
+                state.conversation_bytes_total,
+                state.model.clone(),
+                outcome_rx,
+            )
+        };
+
+        let message_id = format!("claude-msg-{turn_id}");
+        self.emit_typing_status(true);
+        self.emit_stream_start(&message_id, model_hint.clone());
+
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
+                summary: ClaudeStdoutSummary::default(),
+                error: "Claude turn ended before returning a result".to_string(),
+            });
+            this.finalize_turn(
+                turn_id,
+                outcome,
+                ephemeral,
+                conversation_history_bytes,
+                model_hint,
+            )
+            .await;
+        });
+
+        Some(turn_id)
+    }
+
     async fn write_turn_to_persistent_process(
         self: &Arc<Self>,
         turn_id: u64,
@@ -2270,10 +2331,18 @@ impl ClaudeInner {
         model_hint: Option<String>,
         turn_usage: Option<Value>,
     ) -> bool {
+        // The Context Usage breakdown must reflect the context-window fill — the
+        // last API call's prompt footprint — which lives on `summary.usage`
+        // (per-API-call usage from assistant stream events, bounded by the
+        // window). It is NOT `turn_usage`: that is the per-turn delta of Claude's
+        // session-cumulative counter, i.e. the sum of input tokens across every
+        // API call in the turn, which overflows the window on multi-step turns
+        // (a turn re-sends its growing context on each request). Capture the
+        // per-call value before `take_phase_emission` consumes `summary.usage`.
+        let context_usage = summary.usage.clone();
         if let Some(phase) = take_phase_emission(summary) {
             let text = phase.text;
             let selected_model = phase.model.clone().or(model_hint);
-            let usage = turn_usage.or(phase.usage);
             let tool_calls = phase
                 .tool_calls
                 .iter()
@@ -2286,7 +2355,7 @@ impl ClaudeInner {
                 })
                 .collect::<Vec<_>>();
             let context_breakdown = estimate_context_breakdown(
-                usage.as_ref(),
+                context_usage.as_ref(),
                 conversation_history_bytes,
                 phase.tool_io_bytes,
                 phase.reasoning_bytes,
@@ -2299,7 +2368,7 @@ impl ClaudeInner {
             self.emit_stream_end(
                 text,
                 selected_model,
-                usage,
+                turn_usage,
                 phase.reasoning,
                 tool_calls,
                 Some(context_breakdown),
@@ -2319,7 +2388,7 @@ impl ClaudeInner {
             if summary.emitted_phase_count == 0 {
                 let selected_model = summary.model.clone().or(model_hint);
                 let context_breakdown = estimate_context_breakdown(
-                    turn_usage.as_ref(),
+                    context_usage.as_ref(),
                     conversation_history_bytes,
                     summary.tool_io_bytes,
                     summary.reasoning_bytes,
@@ -2353,7 +2422,7 @@ impl ClaudeInner {
         if summary.emitted_phase_count == 0 || self.emitter.is_stream_open() {
             let selected_model = summary.model.clone().or(model_hint);
             let context_breakdown = estimate_context_breakdown(
-                turn_usage.as_ref(),
+                context_usage.as_ref(),
                 conversation_history_bytes,
                 summary.tool_io_bytes,
                 summary.reasoning_bytes,
@@ -2593,6 +2662,15 @@ fn extract_parent_tool_use_id(value: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// Whether a Task/Agent tool_use block requested background execution.
+fn extract_run_in_background(block: &Value) -> bool {
+    block
+        .get("input")
+        .and_then(|input| input.get("run_in_background"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Extract sub-agent spawn info from a tool_use content block.
 fn extract_spawn_description(input: Option<&Value>) -> String {
     let Some(input) = input else {
@@ -2709,6 +2787,10 @@ async fn read_claude_stdout_persistent(
                 &mut subagent_streams,
             )
             .await;
+            // A background sub-agent completes via `task_notification`, which
+            // arrives on the parent stream after the parent's turn `result`.
+            // Handle it pre-gate so it lands even with no active turn.
+            finalize_background_subagent_completion(&value, &mut subagent_streams);
         }
 
         if let Some(parent_id) = extract_parent_tool_use_id(&value) {
@@ -2730,11 +2812,28 @@ async fn read_claude_stdout_persistent(
         }
 
         let _turn_event_guard = inner.turn_event_gate.lock().await;
-        let Some((turn_id, model_hint)) =
-            prepare_persistent_stdout_turn(&inner, &mut turn_state).await
-        else {
-            continue;
-        };
+        let (turn_id, model_hint) =
+            match prepare_persistent_stdout_turn(&inner, &mut turn_state).await {
+                Some(turn) => turn,
+                None => {
+                    // No user-initiated turn is active, yet the CLI is emitting
+                    // fresh turn output. This happens when the model resumes on
+                    // its own after a background sub-agent finishes: the parent
+                    // turn's `result` already completed, then a new `init` +
+                    // assistant + `result` sequence arrives. Adopt it as a
+                    // first-class turn so the follow-up isn't silently dropped.
+                    if !is_cli_turn_start_event(&value) {
+                        continue;
+                    }
+                    if inner.begin_cli_initiated_turn().await.is_none() {
+                        continue;
+                    }
+                    match prepare_persistent_stdout_turn(&inner, &mut turn_state).await {
+                        Some(turn) => turn,
+                        None => continue,
+                    }
+                }
+            };
 
         consume_claude_stream_value(
             &value,
@@ -2798,6 +2897,19 @@ async fn read_claude_stdout_persistent(
             .await;
     }
     inner.mark_process_exited().await;
+}
+
+/// Whether a parent-stream frame (already excluded from sub-agent routing)
+/// marks the start of fresh turn content. Used to decide when to adopt
+/// CLI-initiated output as a new turn. Deliberately excludes lone `result`
+/// and `user` frames so a stray terminal frame never spawns an empty turn.
+fn is_cli_turn_start_event(value: &Value) -> bool {
+    let event_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+    match event_type {
+        "assistant" | "stream_event" | "event" => true,
+        "system" => value.get("subtype").and_then(Value::as_str) == Some("init"),
+        other => is_stream_event_type(other),
+    }
 }
 
 async fn prepare_persistent_stdout_turn(
@@ -3575,6 +3687,7 @@ struct SubAgentSpawnSpec {
     description: String,
     agent_type: String,
     session_id_hint: Option<protocol::SessionId>,
+    background: bool,
 }
 
 async fn ensure_subagent_stream(
@@ -3589,6 +3702,7 @@ async fn ensure_subagent_stream(
         description,
         agent_type,
         session_id_hint,
+        background,
     } = spec;
     if streams.contains_key(&tool_use_id) {
         return;
@@ -3635,6 +3749,7 @@ async fn ensure_subagent_stream(
         agent_name: name,
         parent_emitter: parent_emitter.clone(),
         last_progress_emit: std::time::Instant::now(),
+        background,
     };
     // Unthrottled spawn update: the Task card learns the sub-agent's id
     // (for its "Open agent" link) as soon as the agent exists.
@@ -3937,6 +4052,10 @@ async fn detect_subagent_task_system_spawns(
             description,
             agent_type: task_type,
             session_id_hint: None,
+            // A `task_started` frame alone doesn't reveal `run_in_background`;
+            // the matching tool_use block (processed in `detect_subagent_spawns`)
+            // upgrades the flag when it does.
+            background: false,
         },
     )
     .await;
@@ -4085,6 +4204,7 @@ async fn detect_subagent_spawns(
             "detect_subagent_spawns: found tool_use block: name={block_name} id={block_id}"
         );
         if let Some((tool_use_id, name, description, agent_type)) = extract_spawn_info(&block) {
+            let background = extract_run_in_background(&block);
             ensure_subagent_stream(
                 emitter,
                 parent_emitter,
@@ -4095,10 +4215,15 @@ async fn detect_subagent_spawns(
                     description: description.clone(),
                     agent_type,
                     session_id_hint: None,
+                    background,
                 },
             )
             .await;
             if let Some(stream) = streams.get_mut(&tool_use_id) {
+                // The full tool_use block carries the complete input, so it
+                // upgrades a stream that was first registered from a
+                // `task_started` frame (which lacks `run_in_background`).
+                stream.background |= background;
                 emit_subagent_task_prompt_if_needed(stream, &description);
             }
         }
@@ -4135,16 +4260,57 @@ async fn detect_subagent_completions(value: &Value, streams: &mut HashMap<String
             Some(id) => id,
             None => continue,
         };
-        if let Some(mut stream) = streams.remove(tool_use_id) {
-            flush_pending_tool_uses(&mut stream.summary, &mut stream.segment);
-            if phase_has_pending_output(&stream.summary, &stream.segment) {
-                close_current_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
-            }
-            // Unthrottled final update with the closing stats.
-            stream
-                .parent_emitter
-                .tool_progress(&subagent_progress_data(&stream, true));
+        // A background sub-agent's tool_result is the synthetic "launched"
+        // placeholder — its real output streams *afterwards*. Keep the stream
+        // alive; it is finalized on the `task_notification` completion frame
+        // (see `finalize_background_subagent_completion`).
+        if streams
+            .get(tool_use_id)
+            .is_some_and(|stream| stream.background)
+        {
+            continue;
         }
+        if let Some(stream) = streams.remove(tool_use_id) {
+            finalize_subagent_stream(stream);
+        }
+    }
+}
+
+/// Flush and close out a sub-agent stream, emitting its final progress stats.
+fn finalize_subagent_stream(mut stream: SubAgentStream) {
+    flush_pending_tool_uses(&mut stream.summary, &mut stream.segment);
+    if phase_has_pending_output(&stream.summary, &stream.segment) {
+        close_current_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
+    }
+    // Unthrottled final update with the closing stats.
+    stream
+        .parent_emitter
+        .tool_progress(&subagent_progress_data(&stream, true));
+}
+
+/// Finalize a background sub-agent when its `task_notification` completion
+/// frame arrives. These frames flow on the parent stream (no
+/// `parent_tool_use_id`) and keep coming after the parent's turn `result`,
+/// so this runs pre-gate in `read_claude_stdout_persistent`.
+fn finalize_background_subagent_completion(
+    value: &Value,
+    streams: &mut HashMap<String, SubAgentStream>,
+) {
+    if value.get("type").and_then(Value::as_str) != Some("system") {
+        return;
+    }
+    if value.get("subtype").and_then(Value::as_str) != Some("task_notification") {
+        return;
+    }
+    let Some(tool_use_id) = value
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    if let Some(stream) = streams.remove(tool_use_id) {
+        finalize_subagent_stream(stream);
     }
 }
 
@@ -12032,6 +12198,64 @@ for raw_line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn terminal_context_breakdown_uses_per_call_usage_not_turn_delta() {
+        // Regression: the Context Usage bar derives from `context_breakdown`.
+        // The breakdown must reflect the last API call's prompt footprint
+        // (`summary.usage`, bounded by the context window), NOT `turn_usage`
+        // — the per-turn delta of Claude's session-cumulative counter, which
+        // sums input tokens across every API call in a multi-step turn and
+        // overflows the window (e.g. 14.5M against a 1M window pins the bar
+        // to 100%).
+        let (inner, mut rx) = make_test_inner();
+        let mut summary = ClaudeStdoutSummary::default();
+        summary.streamed_text = "Final answer".to_string();
+        summary.model = Some("claude-opus-4-6".to_string());
+        // Last API call actually consumed 250 input tokens (the context fill).
+        summary.usage = Some(json!({
+            "input_tokens": 250,
+            "output_tokens": 50,
+            "total_tokens": 300,
+        }));
+
+        inner.emit_stream_start("claude-msg-1", None);
+        assert_eq!(
+            event_kind(&rx.recv().await.expect("stream start")),
+            Some("StreamStart")
+        );
+
+        // Per-turn delta summed across the whole agentic turn — must NOT drive
+        // the breakdown.
+        let turn_usage = json!({
+            "input_tokens": 14_000_000,
+            "output_tokens": 500_000,
+            "total_tokens": 14_500_000,
+        });
+        inner
+            .emit_terminal_phase_or_placeholder(
+                &mut summary,
+                0,
+                Some(1_000_000),
+                None,
+                Some(turn_usage),
+            )
+            .await;
+
+        let end = rx.recv().await.expect("stream end");
+        assert_eq!(event_kind(&end), Some("StreamEnd"));
+        let message = stream_end_message(&end);
+
+        // Context breakdown reflects the per-call usage (250), not the 14M delta.
+        let breakdown_input = message
+            .get("context_breakdown")
+            .and_then(|bd| bd.get("input_tokens"))
+            .and_then(Value::as_u64);
+        assert_eq!(breakdown_input, Some(250));
+
+        // The token badge still carries the per-turn delta.
+        assert_eq!(stream_end_total_tokens(&end), Some(14_500_000));
+    }
+
+    #[tokio::test]
     async fn streamed_tool_use_emits_stream_end_then_tool_lifecycle_before_next_stream_start() {
         let (inner, mut rx) = make_test_inner();
         let mut summary = ClaudeStdoutSummary::default();
@@ -12876,6 +13100,120 @@ for raw_line in sys.stdin:
         assert!(
             streams.is_empty(),
             "sub-agent stream should be removed after tool_result completion"
+        );
+    }
+
+    #[test]
+    fn is_cli_turn_start_event_classifies_frames() {
+        // Fresh turn content opens a CLI-initiated turn.
+        assert!(is_cli_turn_start_event(&json!({"type": "assistant"})));
+        assert!(is_cli_turn_start_event(
+            &json!({"type": "system", "subtype": "init"})
+        ));
+        assert!(is_cli_turn_start_event(&json!({"type": "stream_event"})));
+        assert!(is_cli_turn_start_event(&json!({"type": "message_start"})));
+
+        // Terminal / non-content frames must NOT spawn an empty turn.
+        assert!(!is_cli_turn_start_event(&json!({"type": "result"})));
+        assert!(!is_cli_turn_start_event(&json!({"type": "user"})));
+        assert!(!is_cli_turn_start_event(
+            &json!({"type": "system", "subtype": "task_notification"})
+        ));
+        assert!(!is_cli_turn_start_event(&json!({"type": "rate_limit_event"})));
+    }
+
+    #[tokio::test]
+    async fn background_subagent_survives_launch_tool_result_until_task_notification() {
+        // Reproduces the real background-agent event ordering: the parent's
+        // synthetic launch tool_result arrives BEFORE the sub-agent's own
+        // output, so tearing the stream down on that tool_result drops the
+        // real sub-agent output. The stream must instead survive until the
+        // `task_notification` completion frame.
+        let emitter = TestSubAgentEmitter::default();
+        let (parent_emitter, _parent_rx) = test_parent_emitter();
+        let mut streams = HashMap::new();
+        let mut pending_prompts = HashMap::new();
+
+        // Parent spawns a background Agent (run_in_background: true).
+        detect_subagent_spawns(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_bg",
+                        "name": "Agent",
+                        "input": {
+                            "description": "Compute 2+2",
+                            "prompt": "Compute 2+2",
+                            "subagent_type": "general-purpose",
+                            "run_in_background": true
+                        }
+                    }]
+                }
+            }),
+            &emitter,
+            &parent_emitter,
+            &mut streams,
+            &mut pending_prompts,
+        )
+        .await;
+
+        assert!(streams.contains_key("toolu_bg"));
+        assert!(
+            streams.get("toolu_bg").expect("stream").background,
+            "run_in_background tool_use must mark the stream as background"
+        );
+
+        // The synthetic launch tool_result arrives immediately — it must NOT
+        // finalize a background stream.
+        detect_subagent_completions(
+            &json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_bg",
+                        "is_error": false,
+                        "content": "Agent launched in the background"
+                    }]
+                }
+            }),
+            &mut streams,
+        )
+        .await;
+        assert!(
+            streams.contains_key("toolu_bg"),
+            "background sub-agent stream must survive its launch tool_result"
+        );
+
+        // The sub-agent's real output streams afterwards and still routes.
+        let stream = streams.get_mut("toolu_bg").expect("stream");
+        consume_subagent_event(
+            stream,
+            &json!({
+                "type": "content_block_start",
+                "parent_tool_use_id": "toolu_bg",
+                "index": 0,
+                "content_block": { "type": "text", "text": "4" }
+            }),
+        );
+
+        // The task_notification completion frame finalizes the stream.
+        finalize_background_subagent_completion(
+            &json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "tool_use_id": "toolu_bg",
+                "status": "completed"
+            }),
+            &mut streams,
+        );
+        assert!(
+            streams.is_empty(),
+            "background sub-agent stream should be removed on task_notification"
         );
     }
 
@@ -14282,6 +14620,7 @@ for raw_line in sys.stdin:
                 agent_name: "Agent".to_string(),
                 parent_emitter: test_parent_emitter().0,
                 last_progress_emit: std::time::Instant::now(),
+                background: false,
             },
         );
 

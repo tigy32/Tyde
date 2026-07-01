@@ -8,8 +8,9 @@ use crate::send::send_frame;
 use crate::state::{AppState, DiffViewMode, ToolOutputMode};
 
 use protocol::{
-    BackendKind, BackendSetupAction, BackendSetupInfo, BackendSetupStatus, BackgroundAgentFeature,
-    BrokerUrl, CodeIntelProviderId, CustomAgent, CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL,
+    BackendConfigField, BackendConfigFieldType, BackendConfigValues, BackendKind,
+    BackendSetupAction, BackendSetupInfo, BackendSetupStatus, BackgroundAgentFeature, BrokerUrl,
+    CodeIntelProviderId, CustomAgent, CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL,
     DiffContextMode, FrameKind, HostExecutablePath, HostSettingValue, McpServerConfig, McpServerId,
     McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState,
     MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState, ProjectId,
@@ -617,6 +618,9 @@ impl SettingsTab {
                 "Claude",
                 "Codex",
                 "Antigravity",
+                "Hermes",
+                "Nous",
+                "Nous Research",
                 "Anthropic",
                 "OpenAI",
                 "Google",
@@ -1775,6 +1779,7 @@ fn BackendsTab() -> impl IntoView {
         </div>
 
         <ComplexityTiersSection />
+        <BackendConfigSection />
     }
 }
 
@@ -1968,6 +1973,297 @@ fn update_tier_setting(
         HostSettingValue::BackendTiers {
             backend: kind,
             config,
+        },
+    );
+}
+
+/// Per-backend deep configuration (e.g. Hermes default model/provider/base URL).
+/// Rows are generated from each backend's `BackendConfigSchema`, so a backend
+/// controls exactly which fields appear here with no frontend changes.
+#[component]
+fn BackendConfigSection() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let state_for_rows = state.clone();
+    view! {
+        {move || backend_config_rows(&state_for_rows)}
+    }
+}
+
+fn backend_config_rows(state: &AppState) -> Option<AnyView> {
+    let settings = state.selected_host_settings()?;
+    let host_id = state.selected_host_id.get()?;
+    let schemas = state.backend_config_schemas.get();
+    let host_schemas = schemas.get(&host_id)?;
+
+    let cards = settings
+        .enabled_backends
+        .iter()
+        .copied()
+        .filter_map(|kind| {
+            let schema = host_schemas.get(&kind)?;
+            if schema.fields.is_empty() {
+                return None;
+            }
+            let values = settings.backend_config.get(&kind).cloned().unwrap_or_default();
+            let fields = schema
+                .fields
+                .iter()
+                .map(|field| backend_config_field(state, kind, field, &values))
+                .collect::<Vec<_>>();
+            Some(view! {
+                <div class="settings-backend-config-card">
+                    <div class="settings-tier-backend-name">{backend_label(kind)}</div>
+                    {fields}
+                </div>
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if cards.is_empty() {
+        return None;
+    }
+    Some(
+        view! {
+            <div class="settings-field">
+                <label class="settings-label">"Backend Configuration"</label>
+                <p class="settings-description">
+                    "Host-level setup for backends that support it. These apply to every new session on the selected host; per-session settings still override where they overlap."
+                </p>
+                <div class="settings-backend-config-list">{cards}</div>
+            </div>
+        }
+        .into_any(),
+    )
+}
+
+fn backend_config_field(
+    state: &AppState,
+    kind: BackendKind,
+    field: &BackendConfigField,
+    values: &BackendConfigValues,
+) -> AnyView {
+    let key = field.key.clone();
+    let description = field.description.clone();
+
+    let control = match &field.field_type {
+        BackendConfigFieldType::Text {
+            placeholder,
+            multiline,
+            ..
+        } => {
+            let current = string_value(values, &key);
+            let placeholder = placeholder.clone().unwrap_or_default();
+            let state = state.clone();
+            let key_for_change = key.clone();
+            let on_change = move |ev: web_sys::Event| {
+                let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
+                commit_text_value(&state, kind, &key_for_change, el.value());
+            };
+            if *multiline {
+                view! {
+                    <textarea
+                        class="settings-input settings-backend-config-input"
+                        prop:value=current
+                        placeholder=placeholder
+                        on:change=on_change
+                    ></textarea>
+                }
+                .into_any()
+            } else {
+                view! {
+                    <input
+                        type="text"
+                        class="settings-input settings-backend-config-input"
+                        prop:value=current
+                        placeholder=placeholder
+                        autocomplete="off"
+                        spellcheck="false"
+                        on:change=on_change
+                    />
+                }
+                .into_any()
+            }
+        }
+        BackendConfigFieldType::Secret { placeholder } => {
+            // Never pre-fill the stored secret; show whether one is set.
+            let has_value = string_value(values, &key).is_some_and(|value| !value.is_empty());
+            let placeholder = placeholder.clone().unwrap_or_else(|| {
+                if has_value {
+                    "•••••••• (stored — type to replace)".to_owned()
+                } else {
+                    String::new()
+                }
+            });
+            let state = state.clone();
+            let key_for_change = key.clone();
+            let on_change = move |ev: web_sys::Event| {
+                let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
+                // Empty clears the stored secret; non-empty replaces it.
+                commit_text_value(&state, kind, &key_for_change, el.value());
+            };
+            view! {
+                <input
+                    type="password"
+                    class="settings-input settings-backend-config-input"
+                    placeholder=placeholder
+                    autocomplete="off"
+                    on:change=on_change
+                />
+            }
+            .into_any()
+        }
+        BackendConfigFieldType::Select {
+            options,
+            nullable,
+            default,
+        } => {
+            let current = match values.0.get(&key) {
+                Some(SessionSettingValue::String(value)) => value.clone(),
+                _ => default.clone().unwrap_or_default(),
+            };
+            let nullable = *nullable;
+            let option_views = options
+                .iter()
+                .map(|option| {
+                    view! { <option value=option.value.clone()>{option.label.clone()}</option> }
+                })
+                .collect::<Vec<_>>();
+            let state = state.clone();
+            let key_for_change = key.clone();
+            let on_change = move |ev: web_sys::Event| {
+                let el: web_sys::HtmlSelectElement = ev.target().unwrap().unchecked_into();
+                let value = el.value();
+                let update = if value.is_empty() {
+                    None
+                } else {
+                    Some(SessionSettingValue::String(value))
+                };
+                update_backend_config(&state, kind, &key_for_change, update);
+            };
+            view! {
+                <select class="settings-select" prop:value=current on:change=on_change>
+                    {nullable.then(|| view! { <option value="">"Auto"</option> })}
+                    {option_views}
+                </select>
+            }
+            .into_any()
+        }
+        BackendConfigFieldType::Toggle { default } => {
+            let current = match values.0.get(&key) {
+                Some(SessionSettingValue::Bool(value)) => *value,
+                _ => *default,
+            };
+            let state = state.clone();
+            let key_for_change = key.clone();
+            let on_change = move |ev: web_sys::Event| {
+                let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
+                update_backend_config(
+                    &state,
+                    kind,
+                    &key_for_change,
+                    Some(SessionSettingValue::Bool(el.checked())),
+                );
+            };
+            view! {
+                <label class="settings-toggle">
+                    <input type="checkbox" prop:checked=current on:change=on_change />
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            }
+            .into_any()
+        }
+        BackendConfigFieldType::Integer {
+            min,
+            max,
+            step,
+            default,
+        } => {
+            let current = match values.0.get(&key) {
+                Some(SessionSettingValue::Integer(value)) => *value,
+                _ => *default,
+            };
+            let (min, max, step) = (*min, *max, *step);
+            let state = state.clone();
+            let key_for_change = key.clone();
+            let on_change = move |ev: web_sys::Event| {
+                let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
+                if let Ok(parsed) = el.value().parse::<i64>() {
+                    let clamped = parsed.clamp(min, max);
+                    update_backend_config(
+                        &state,
+                        kind,
+                        &key_for_change,
+                        Some(SessionSettingValue::Integer(clamped)),
+                    );
+                }
+            };
+            view! {
+                <input
+                    type="number"
+                    class="settings-input settings-backend-config-input"
+                    prop:value=move || current.to_string()
+                    min=min.to_string()
+                    max=max.to_string()
+                    step=step.to_string()
+                    autocomplete="off"
+                    on:change=on_change
+                />
+            }
+            .into_any()
+        }
+    };
+
+    view! {
+        <div class="settings-backend-config-field">
+            <span class="settings-tier-select-label">{field.label.clone()}</span>
+            {control}
+            {description
+                .map(|text| view! { <p class="settings-description">{text}</p> })}
+        </div>
+    }
+    .into_any()
+}
+
+fn string_value(values: &BackendConfigValues, key: &str) -> Option<String> {
+    match values.0.get(key) {
+        Some(SessionSettingValue::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// Commit a text/secret field edit: a trimmed-empty value clears the key.
+fn commit_text_value(state: &AppState, kind: BackendKind, key: &str, value: String) {
+    let update = if value.trim().is_empty() {
+        None
+    } else {
+        Some(SessionSettingValue::String(value))
+    };
+    update_backend_config(state, kind, key, update);
+}
+
+fn update_backend_config(
+    state: &AppState,
+    kind: BackendKind,
+    key: &str,
+    value: Option<SessionSettingValue>,
+) {
+    let Some(mut settings) = state.selected_host_settings_untracked() else {
+        return;
+    };
+    let mut values = settings.backend_config.remove(&kind).unwrap_or_default();
+    match value {
+        Some(value) => {
+            values.0.insert(key.to_owned(), value);
+        }
+        None => {
+            values.0.remove(key);
+        }
+    }
+    send_host_setting(
+        state,
+        HostSettingValue::BackendConfig {
+            backend: kind,
+            values,
         },
     );
 }
@@ -2797,13 +3093,14 @@ fn send_host_setting(state: &AppState, setting: HostSettingValue) {
     });
 }
 
-fn all_backends() -> [BackendKind; 5] {
+fn all_backends() -> [BackendKind; 6] {
     [
         BackendKind::Tycode,
         BackendKind::Kiro,
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Antigravity,
+        BackendKind::Hermes,
     ]
 }
 
@@ -2814,6 +3111,7 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
         "antigravity" => Some(BackendKind::Antigravity),
+        "hermes" => Some(BackendKind::Hermes),
         _ => None,
     }
 }
@@ -2825,6 +3123,7 @@ fn backend_value(kind: BackendKind) -> &'static str {
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",
+        BackendKind::Hermes => "hermes",
     }
 }
 
@@ -2835,6 +3134,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
+        BackendKind::Hermes => "Hermes",
     }
 }
 
@@ -2845,6 +3145,7 @@ fn backend_description(kind: BackendKind) -> &'static str {
         BackendKind::Claude => "Anthropic Claude — advanced reasoning and coding",
         BackendKind::Codex => "OpenAI Codex — code completion and generation",
         BackendKind::Antigravity => "Google Antigravity CLI — agentic coding assistant",
+        BackendKind::Hermes => "Hermes — native JSON-RPC agent backend",
     }
 }
 
@@ -2855,6 +3156,7 @@ fn backend_badge_class(kind: BackendKind) -> &'static str {
         BackendKind::Claude => "backend-badge claude",
         BackendKind::Codex => "backend-badge codex",
         BackendKind::Antigravity => "backend-badge antigravity",
+        BackendKind::Hermes => "backend-badge hermes",
     }
 }
 
@@ -4407,7 +4709,7 @@ mod wasm_tests {
     use leptos::mount::mount_to;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
-    use web_sys::{HtmlElement, HtmlOptionElement, HtmlSelectElement};
+    use web_sys::{HtmlElement, HtmlInputElement, HtmlOptionElement, HtmlSelectElement};
 
     wasm_bindgen_test_configure!(run_in_browser);
 
@@ -4550,6 +4852,7 @@ mod wasm_tests {
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     code_intel: Default::default(),
+                    backend_config: std::collections::HashMap::new(),
                 },
             );
         });
@@ -5683,6 +5986,7 @@ mod wasm_tests {
                         agent_activity_summaries,
                     },
                     code_intel,
+                    backend_config: std::collections::HashMap::new(),
                 },
             );
         });
@@ -5868,5 +6172,144 @@ mod wasm_tests {
             Some(value) if value.is_null() => {}
             Some(value) => panic!("Clear must send path=None/null; got {value:?}"),
         }
+    }
+
+    fn host_settings_with_hermes_config(
+        backend_config: std::collections::HashMap<BackendKind, BackendConfigValues>,
+    ) -> protocol::HostSettings {
+        protocol::HostSettings {
+            enabled_backends: vec![BackendKind::Hermes],
+            default_backend: Some(BackendKind::Hermes),
+            enable_mobile_connections: false,
+            mobile_broker_url: None,
+            tyde_debug_mcp_enabled: false,
+            tyde_agent_control_mcp_enabled: true,
+            complexity_tiers_enabled: false,
+            backend_tier_configs: std::collections::HashMap::new(),
+            background_agent_features: Default::default(),
+            code_intel: Default::default(),
+            backend_config,
+        }
+    }
+
+    fn hermes_config_schema() -> protocol::BackendConfigSchema {
+        let text = || BackendConfigFieldType::Text {
+            default: None,
+            placeholder: None,
+            multiline: false,
+        };
+        protocol::BackendConfigSchema {
+            backend_kind: BackendKind::Hermes,
+            fields: vec![
+                BackendConfigField {
+                    key: "default_model".to_owned(),
+                    label: "Default Model".to_owned(),
+                    description: None,
+                    field_type: text(),
+                },
+                BackendConfigField {
+                    key: "default_provider".to_owned(),
+                    label: "Default Provider".to_owned(),
+                    description: None,
+                    field_type: text(),
+                },
+                BackendConfigField {
+                    key: "api_base_url".to_owned(),
+                    label: "API Base URL".to_owned(),
+                    description: None,
+                    field_type: text(),
+                },
+            ],
+        }
+    }
+
+    /// The settings-panel deep-config section renders a backend's schema fields
+    /// and seeds each control from the stored host-level value.
+    #[wasm_bindgen_test]
+    async fn backend_config_section_renders_schema_fields_and_seeds_stored_values() {
+        let container = make_container();
+        let state = AppState::new();
+        let host_id = "host-a".to_owned();
+        state.selected_host_id.set(Some(host_id.clone()));
+
+        let mut values = BackendConfigValues::default();
+        values.0.insert(
+            "default_model".to_owned(),
+            SessionSettingValue::String("anthropic/claude-sonnet-5".to_owned()),
+        );
+        let mut backend_config = std::collections::HashMap::new();
+        backend_config.insert(BackendKind::Hermes, values);
+        state.host_settings_by_host.update(|map| {
+            map.insert(host_id.clone(), host_settings_with_hermes_config(backend_config));
+        });
+        state.backend_config_schemas.update(|map| {
+            map.entry(host_id.clone())
+                .or_default()
+                .insert(BackendKind::Hermes, hermes_config_schema());
+        });
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendConfigSection /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Backend Configuration"),
+            "section heading must render: {text:?}"
+        );
+        for label in ["Default Model", "Default Provider", "API Base URL"] {
+            assert!(text.contains(label), "field label {label:?} must render: {text:?}");
+        }
+
+        let inputs = container
+            .query_selector_all("input.settings-backend-config-input")
+            .unwrap();
+        assert_eq!(inputs.length(), 3, "one input rendered per schema field");
+        let first: HtmlInputElement = inputs.item(0).unwrap().dyn_into().unwrap();
+        assert_eq!(
+            first.value(),
+            "anthropic/claude-sonnet-5",
+            "the stored default_model value must seed its input"
+        );
+    }
+
+    /// A backend that exposes no config schema renders nothing (no empty card).
+    #[wasm_bindgen_test]
+    async fn backend_config_section_is_empty_without_schema() {
+        let container = make_container();
+        let state = AppState::new();
+        let host_id = "host-a".to_owned();
+        state.selected_host_id.set(Some(host_id.clone()));
+        state.host_settings_by_host.update(|map| {
+            map.insert(
+                host_id.clone(),
+                host_settings_with_hermes_config(std::collections::HashMap::new()),
+            );
+        });
+        // No schema pushed for this host.
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendConfigSection /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("Backend Configuration"),
+            "no schema means no section: {text:?}"
+        );
+        assert_eq!(
+            container
+                .query_selector_all("input.settings-backend-config-input")
+                .unwrap()
+                .length(),
+            0,
+            "no config inputs without a schema"
+        );
     }
 }

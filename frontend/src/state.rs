@@ -1373,6 +1373,11 @@ pub struct AppState {
     pub draft_custom_agent_id: RwSignal<Option<CustomAgentId>>,
     pub session_schemas: RwSignal<HashMap<String, HashMap<BackendKind, SessionSchemaEntry>>>,
     pub schemas_loaded_for_host: RwSignal<HashMap<String, bool>>,
+    /// Host-level deep-config schemas, keyed by host id then backend kind.
+    /// Backends without deep config are absent. Values live in
+    /// `host_settings_by_host` (`HostSettings.backend_config`).
+    pub backend_config_schemas:
+        RwSignal<HashMap<String, HashMap<BackendKind, protocol::BackendConfigSchema>>>,
     /// Host id for which the next `NewTerminal` should steal focus. Set when the
     /// user clicks Install/Sign-in; consumed in the dispatcher so the new
     /// terminal becomes active even if another terminal was already selected.
@@ -1687,6 +1692,7 @@ impl AppState {
             draft_custom_agent_id: RwSignal::new(None),
             session_schemas: RwSignal::new(HashMap::new()),
             schemas_loaded_for_host: RwSignal::new(HashMap::new()),
+            backend_config_schemas: RwSignal::new(HashMap::new()),
             pending_terminal_focus: RwSignal::new(None),
             agent_session_settings: RwSignal::new(HashMap::new()),
             draft_session_settings: RwSignal::new(SessionSettingsValues::default()),
@@ -4192,6 +4198,7 @@ mod tests {
                         backend_tier_configs: std::collections::HashMap::new(),
                         background_agent_features: Default::default(),
                         code_intel: Default::default(),
+                        backend_config: std::collections::HashMap::new(),
                     },
                 );
                 settings.insert(
@@ -4207,6 +4214,7 @@ mod tests {
                         backend_tier_configs: std::collections::HashMap::new(),
                         background_agent_features: Default::default(),
                         code_intel: Default::default(),
+                        backend_config: std::collections::HashMap::new(),
                     },
                 );
             });

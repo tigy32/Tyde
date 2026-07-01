@@ -566,8 +566,8 @@ fn ExitPlanModeCard(
                 <Show when=move || decision_sent.get().is_some()>
                     <span class="exit-plan-sent-note" data-mobile-test="exit-plan-sent" role="status">
                         {move || match decision_sent.get() {
-                            Some(ExitPlanModeDecision::Approve) => "Approved — Claude will continue.",
-                            Some(ExitPlanModeDecision::Reject) => "Rejected — Claude will revise.",
+                            Some(ExitPlanModeDecision::Approve) => "Approved — the agent will continue.",
+                            Some(ExitPlanModeDecision::Reject) => "Rejected — the agent will revise.",
                             None => "",
                         }}
                     </span>

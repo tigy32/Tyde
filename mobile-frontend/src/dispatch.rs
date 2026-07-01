@@ -145,6 +145,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
             code_intel: Default::default(),
+            backend_config: std::collections::HashMap::new(),
         },
         mobile_access: BootstrapMobileAccess {
             broker_status: BootstrapBrokerStatus::Disabled,
@@ -155,6 +156,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
             backends: Vec::new(),
         },
         session_schemas: Vec::new(),
+        backend_config_schemas: Vec::new(),
         sessions: Vec::new(),
         projects: Vec::new(),
         mcp_servers: Vec::new(),
@@ -2921,6 +2923,7 @@ mod wasm_tests {
                 backend_tier_configs: std::collections::HashMap::new(),
                 background_agent_features: Default::default(),
                 code_intel: Default::default(),
+                backend_config: std::collections::HashMap::new(),
             },
             mobile_access: protocol::MobileAccessStatePayload {
                 broker_status: protocol::MobileBrokerStatus::Disabled,
@@ -2931,6 +2934,7 @@ mod wasm_tests {
                 backends: Vec::new(),
             },
             session_schemas: Vec::new(),
+            backend_config_schemas: Vec::new(),
             sessions: vec![session.clone()],
             projects: vec![project.clone()],
             mcp_servers: Vec::new(),

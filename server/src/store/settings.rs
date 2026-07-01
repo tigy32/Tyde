@@ -7,20 +7,22 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const CANONICAL_BACKENDS: [BackendKind; 5] = [
+const CANONICAL_BACKENDS: [BackendKind; 6] = [
     BackendKind::Tycode,
     BackendKind::Kiro,
     BackendKind::Claude,
     BackendKind::Codex,
     BackendKind::Antigravity,
+    BackendKind::Hermes,
 ];
 
 /// Preference order for choosing the initial default backend when seeding a
 /// brand-new install. Most capable / most widely used first.
-const DEFAULT_BACKEND_PREFERENCE: [BackendKind; 5] = [
+const DEFAULT_BACKEND_PREFERENCE: [BackendKind; 6] = [
     BackendKind::Claude,
     BackendKind::Codex,
     BackendKind::Antigravity,
+    BackendKind::Hermes,
     BackendKind::Kiro,
     BackendKind::Tycode,
 ];
@@ -329,6 +331,16 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
         HostSettingValue::BackendTiers { backend, config } => {
             settings.backend_tier_configs.insert(backend, config);
         }
+        HostSettingValue::BackendConfig { backend, values } => {
+            // Drop keys/values the backend's config schema doesn't accept so a
+            // stale client can't persist junk. An empty result clears the entry.
+            let sanitized = crate::backend::sanitize_backend_config_values(backend, &values);
+            if sanitized.0.is_empty() {
+                settings.backend_config.remove(&backend);
+            } else {
+                settings.backend_config.insert(backend, sanitized);
+            }
+        }
         HostSettingValue::BackgroundAgentFeatureEnabled { feature, enabled } => match feature {
             BackgroundAgentFeature::AutoGenerateAgentNames => {
                 settings.background_agent_features.auto_generate_agent_names = enabled;
@@ -400,6 +412,18 @@ fn strip_unknown_backend_kinds(value: &mut serde_json::Value) -> Vec<String> {
             known
         });
     }
+    if let Some(configs) = settings
+        .get_mut("backend_config")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        configs.retain(|key, _| {
+            let known = is_known_backend_kind(&serde_json::Value::String(key.clone()));
+            if !known {
+                skipped.push(format!("backend_config key \"{key}\""));
+            }
+            known
+        });
+    }
     skipped
 }
 
@@ -419,6 +443,7 @@ fn empty_settings() -> HostSettings {
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
         code_intel: Default::default(),
+        backend_config: std::collections::HashMap::new(),
     }
 }
 
@@ -444,6 +469,18 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
 
     let code_intel = validate_code_intel_settings(settings.code_intel)?;
 
+    // Sanitize each backend's persisted deep config against its current schema
+    // so a value that is no longer valid (renamed key, changed options) is
+    // dropped on load rather than surfacing at spawn time.
+    let backend_config = settings
+        .backend_config
+        .into_iter()
+        .filter_map(|(backend, values)| {
+            let sanitized = crate::backend::sanitize_backend_config_values(backend, &values);
+            (!sanitized.0.is_empty()).then_some((backend, sanitized))
+        })
+        .collect();
+
     Ok(HostSettings {
         enabled_backends,
         default_backend: settings.default_backend,
@@ -455,6 +492,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         backend_tier_configs: settings.backend_tier_configs,
         background_agent_features: settings.background_agent_features,
         code_intel,
+        backend_config,
     })
 }
 

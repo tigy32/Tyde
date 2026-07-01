@@ -22,7 +22,8 @@ use protocol::{
     ProjectNotifyPayload, ProjectPath, ProjectSearchCompletePayload, ProjectSearchResultsPayload,
     ProtocolValidator, QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload,
     ReviewCommentSource, ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState,
-    SessionHistoryPayload, SessionId, SessionListPayload, SessionSchemasPayload,
+    BackendConfigSchemasPayload, SessionHistoryPayload, SessionId, SessionListPayload,
+    SessionSchemasPayload,
     SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
     TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
@@ -182,6 +183,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
             code_intel: Default::default(),
+            backend_config: std::collections::HashMap::new(),
         },
         mobile_access: BootstrapMobileAccess {
             broker_status: BootstrapBrokerStatus::Disabled,
@@ -192,6 +194,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
             backends: Vec::new(),
         },
         session_schemas: Vec::new(),
+        backend_config_schemas: Vec::new(),
         sessions: Vec::new(),
         projects: Vec::new(),
         mcp_servers: Vec::new(),
@@ -749,6 +752,27 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse session_schemas payload: {error}"),
             ),
         },
+        FrameKind::BackendConfigSchemas => {
+            match envelope.parse_payload::<BackendConfigSchemasPayload>() {
+                Ok(payload) => {
+                    state.backend_config_schemas.update(|schemas_by_host| {
+                        let host_schemas =
+                            schemas_by_host.entry(host_id.to_string()).or_default();
+                        host_schemas.clear();
+                        for schema in payload.schemas {
+                            host_schemas.insert(schema.backend_kind, schema);
+                        }
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse backend_config_schemas payload: {error}"),
+                ),
+            }
+        }
         FrameKind::SessionSettings => {
             let Some(agent_id) = resolve_agent_id(state, host_id, &envelope.stream) else {
                 log::warn!("session_settings on unknown stream {}", envelope.stream);
@@ -4497,6 +4521,13 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
     state.schemas_loaded_for_host.update(|loaded| {
         loaded.insert(host_id.to_string(), true);
     });
+    state.backend_config_schemas.update(|schemas_by_host| {
+        let host_schemas = schemas_by_host.entry(host_id.to_string()).or_default();
+        host_schemas.clear();
+        for schema in payload.backend_config_schemas {
+            host_schemas.insert(schema.backend_kind, schema);
+        }
+    });
     state.sessions.update(|sessions| {
         sessions.retain(|session| session.host_id != host_id);
         sessions.extend(payload.sessions.into_iter().map(|summary| SessionInfo {
@@ -4974,6 +5005,7 @@ mod tests {
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     code_intel: Default::default(),
+                    backend_config: std::collections::HashMap::new(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: protocol::MobileBrokerStatus::Disabled,
@@ -4984,6 +5016,7 @@ mod tests {
                     backends: Vec::new(),
                 },
                 session_schemas: Vec::new(),
+                backend_config_schemas: Vec::new(),
                 sessions: Vec::new(),
                 projects: Vec::new(),
                 mcp_servers: Vec::new(),

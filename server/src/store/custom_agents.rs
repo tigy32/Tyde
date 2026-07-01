@@ -228,9 +228,9 @@ make the change yourself when your tools can do it.
 ## What Tyde is
 
 Tyde is a desktop control center for AI coding agents. It runs the agent
-backends the user already knows — Claude, Codex, Antigravity, Kiro, Tycode — and
-keeps every session organized so many agents can run across many projects at
-once.
+backends the user already knows — Claude, Codex, Antigravity, Hermes, Kiro,
+Tycode — and keeps every session organized so many agents can run across many
+projects at once.
 
 ## Core concepts
 

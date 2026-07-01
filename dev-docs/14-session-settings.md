@@ -20,7 +20,10 @@ backend-specific defaults. This is useful for programmatic/orchestrator use
 
 We need per-backend session settings (model selection, reasoning effort, etc.)
 where each backend defines what it supports and the frontend renders controls
-automatically — no frontend changes when a backend adds a setting.
+automatically — no frontend changes when a backend adds a setting. Some
+backends have static schemas; others, including Kiro and Hermes, publish
+server-owned dynamic schema states because their valid model lists come from
+the backend runtime.
 
 ---
 
@@ -40,14 +43,12 @@ automatically — no frontend changes when a backend adds a setting.
    The server validates, applies, and emits the effective settings back. The
    frontend never computes effective settings.
 
-4. **`cost_hint` and session settings coexist. Backends own the mapping.**
-   `cost_hint` is a coarse programmatic hint (for orchestrators, agent-control
-   MCP). The host passes both `cost_hint` and `session_settings` through to
-   the backend without interpreting either. Each backend decides internally
-   how to use `cost_hint` as a fallback for settings the user didn't
-   explicitly set. Resolution order: explicit session setting >
-   `cost_hint`-derived default > schema default — but the `cost_hint` →
-   settings mapping lives inside each backend, not in the host.
+4. **`cost_hint` and session settings coexist.** `cost_hint` is a coarse
+   programmatic hint (for orchestrators, agent-control MCP). When host-level
+   complexity tiers are enabled, the server resolves tier values through the
+   backend schema before spawning. For dynamic schemas, non-empty tier/default
+   settings are not applied while the schema is pending or unavailable; the
+   spawn fails visibly instead of guessing valid values.
 
 5. **Settings are mutable, not part of the birth certificate.** `AgentStart` is
    immutable. Session settings are emitted as a separate event and can change
@@ -159,10 +160,17 @@ keys are backend-defined, but the value side is fully typed.
 
 ```rust
 /// Server → Client on host stream.
-/// Carries session settings schemas for all enabled backends.
+/// Carries session settings schema states for all enabled backends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSchemasPayload {
-    pub schemas: Vec<SessionSettingsSchema>,
+    pub schemas: Vec<SessionSchemaEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SessionSchemaEntry {
+    Ready { schema: SessionSettingsSchema },
+    Pending { backend_kind: BackendKind },
+    Unavailable { backend_kind: BackendKind, message: String },
 }
 
 /// Client → Server on agent stream.
@@ -229,9 +237,12 @@ pub struct BackendSpawnConfig {
 }
 ```
 
-The host passes both `cost_hint` and `session_settings` through without
-interpreting either. Each backend owns the mapping from `cost_hint` to
-setting defaults — the host never needs to know that "Claude Low = haiku."
+When complexity tiers are disabled, the host drops `cost_hint`; backend
+defaults apply. When tiers are enabled, the host validates and merges the
+configured tier values against the backend schema before spawning, or leaves
+the hint for the backend built-in tier fallback when no user tier config
+exists. Dynamic schema backends fail visibly if non-empty tier/default values
+would apply while their schema is unavailable.
 
 **`AgentInput`** — add variant for mid-session setting changes:
 
@@ -248,9 +259,9 @@ pub enum AgentInput {
 
 ```rust
 pub trait Backend: Send + 'static {
-    /// Return the session settings schema for this backend kind.
-    /// Static method — does not require a live session.
-    /// The schema is constant for a given backend implementation.
+    /// Return the static/base session settings schema for this backend kind.
+    /// Dynamic backends can have the host replace this with a probed
+    /// `SessionSchemaEntry::Ready` schema.
     fn session_settings_schema() -> SessionSettingsSchema
     where
         Self: Sized;
@@ -272,6 +283,13 @@ Each backend implements this to declare its supported settings. Examples:
 - `model`: Select — exact `agy models` labels such as
   `Gemini 3.5 Flash (Medium)` (default: `Gemini 3.5 Flash (Medium)`,
   nullable: false)
+
+**Hermes:**
+- `model`: Dynamic Select from Hermes `model.options` authenticated provider
+  models. Labels include provider context and selected values carry the
+  provider override back to Hermes.
+- `reasoning_effort`: Select — Auto, none, minimal, low, medium, high, xhigh.
+- `fast`: Toggle — requests Hermes fast service tier through `config.set fast`
 
 **Mock:**
 - Empty fields (no configurable settings).
@@ -344,14 +362,17 @@ Client                              Server
   │    ...                            │
 ```
 
-The server (host layer) passes both through to the backend without
-interpreting either:
-1. Package `cost_hint` and `session_settings` into `BackendSpawnConfig`.
-2. Call `Backend::spawn()`.
-3. The backend resolves internally: explicit session setting >
-   `cost_hint`-derived default > schema default.
-4. The backend reports the resolved values back to the agent actor.
-5. The agent actor emits the resolved values as `SessionSettings` on the
+The server (host layer) validates settings before spawning:
+1. Validate explicit/stored settings against the server-owned schema.
+2. If complexity tiers are enabled, merge configured tier settings through the
+   same schema or preserve a backend built-in tier fallback hint.
+   If tiers are disabled, drop `cost_hint` so backend defaults apply.
+3. Package the validated `cost_hint` and `session_settings` into
+   `BackendSpawnConfig`.
+4. Call `Backend::spawn()`.
+5. The backend resolves any remaining backend-owned defaults.
+6. The backend reports the resolved values back to the agent actor.
+7. The agent actor emits the resolved values as `SessionSettings` on the
    agent stream.
 
 ### 5.3 Changing Settings Mid-Session
@@ -392,35 +413,49 @@ settings and any subsequent changes in order.
 
 ### 6.1 Schema Collection
 
-The host actor collects schemas from all enabled backends at startup and
-whenever enabled backends change:
+The host actor collects schema entries from all enabled backends at startup and
+whenever enabled backends change. Static backends return `Ready` immediately;
+dynamic backends such as Kiro and Hermes may report `Pending` or `Unavailable`
+while the server probes backend-native model/schema sources.
 
 ```rust
-fn collect_session_schemas(enabled: &[BackendKind]) -> Vec<SessionSettingsSchema> {
+fn collect_session_schemas(enabled: &[BackendKind]) -> Vec<SessionSchemaEntry> {
     enabled.iter().map(|kind| match kind {
-        BackendKind::Claude => ClaudeBackend::session_settings_schema(),
-        BackendKind::Codex => CodexBackend::session_settings_schema(),
-        BackendKind::Antigravity => AntigravityBackend::session_settings_schema(),
-        // ...
+        BackendKind::Claude => SessionSchemaEntry::Ready {
+            schema: ClaudeBackend::session_settings_schema(),
+        },
+        BackendKind::Codex => SessionSchemaEntry::Ready {
+            schema: CodexBackend::session_settings_schema(),
+        },
+        BackendKind::Antigravity => SessionSchemaEntry::Ready {
+            schema: AntigravityBackend::session_settings_schema(),
+        },
+        BackendKind::Tycode => SessionSchemaEntry::Ready {
+            schema: TycodeBackend::session_settings_schema(),
+        },
+        BackendKind::Kiro => probe_kiro_schema_state(),
+        BackendKind::Hermes => probe_hermes_schema_state(),
+        // The test-only mock backend uses an empty static schema.
     }).collect()
 }
 ```
 
 ### 6.2 Settings Resolution (spawn path)
 
-The host does **not** interpret `cost_hint`. It passes both `cost_hint` and
-`session_settings` through to the backend in `BackendSpawnConfig`. The
-resolution happens inside each backend.
+The host validates all explicit, stored, and host-tier-derived session settings
+against the server-owned schema before spawning. When complexity tiers are
+disabled, `cost_hint` is dropped and backend defaults apply. When tiers are
+enabled, the host resolves configured tier values first; if no user tier config
+exists, the backend can apply its built-in tier fallback from the preserved
+hint.
 
 In the host/agent spawn path, before calling `Backend::spawn()`:
 
 ```rust
-// Host layer — no cost_hint interpretation, just pass-through
 let config = BackendSpawnConfig {
-    cost_hint: spawn_params.cost_hint,
+    cost_hint,
     startup_mcp_servers,
-    session_settings: spawn_params.session_settings
-        .unwrap_or_default(),
+    session_settings: validated_session_settings,
 };
 let (backend, event_stream) = Backend::spawn(workspace_roots, config, initial_input).await?;
 ```
@@ -529,7 +564,7 @@ calls the same `resolve_settings()` helper with its own `cost_hint_defaults()`.
 
 ```rust
 // In AppState:
-pub session_schemas: RwSignal<HashMap<BackendKind, SessionSettingsSchema>>,
+pub session_schemas: RwSignal<HashMap<BackendKind, SessionSchemaEntry>>,
 pub agent_session_settings: RwSignal<HashMap<AgentId, SessionSettingsValues>>,
 ```
 
@@ -544,8 +579,10 @@ Handle new frame kinds in `dispatch_envelope()`:
 
 ### 7.3 Chat Input Area
 
-The chat input component reads the selected backend's schema from
-`session_schemas` and renders controls dynamically:
+The chat input component reads the selected backend's `SessionSchemaEntry` from
+`session_schemas`. `Ready` entries render controls dynamically; `Pending` and
+`Unavailable` entries render server-owned status/error state rather than
+frontend fallback controls:
 
 - For `Select` fields: render a dropdown. If `nullable`, include an "Auto"
   option. Pre-select `default` if no value is set.
@@ -650,17 +687,13 @@ changes. This is the same pattern as `HostSettings`.
 
 ### What happens to `cost_hint`?
 
-It stays on both `SpawnAgentParams` and `BackendSpawnConfig`. The host passes
-it through without interpretation. Each backend owns the mapping from
-`cost_hint` to its own setting defaults — Claude knows that Low means haiku,
-Codex knows that Low means low reasoning effort, etc. This keeps
-backend-specific knowledge inside the backend and avoids the host needing a
-centralized mapping table that couples it to every backend's model tiers.
-
-The existing `codex_backend_defaults()` / `claude_backend_defaults()` /
-`antigravity_cost_hint_defaults()` functions evolve into
-`cost_hint_defaults()` methods that return `SessionSettingsValues` instead of
-ad-hoc tuples.
+It stays on both `SpawnAgentParams` and `BackendSpawnConfig`, but it only
+affects spawning when host complexity tiers are enabled. If tiers are disabled,
+the host drops the hint and backend defaults apply. If tiers are enabled, the
+host merges configured tier values after validating them against the schema; if
+no user tier config exists, the backend can use its built-in tier fallback. For
+dynamic schemas, missing schema means non-empty tier/default values fail
+visibly instead of being applied blindly.
 
 ### Why `Integer` in addition to `Select` and `Toggle`?
 
@@ -670,12 +703,12 @@ expose. `Integer { min, max, step, default }` is a single enum variant — not
 a speculative abstraction — and gives the frontend a concrete input widget
 (number input or slider) without needing a protocol change later.
 
-### Why sync `session_settings_schema()` instead of async?
+### Why schema entries instead of only static schemas?
 
-Schemas are static per backend kind — they describe what settings exist, not
-their current values. No I/O, no subprocess queries, no network calls. A
-synchronous function is the natural signature and avoids unnecessary async
-machinery.
+Some backends have static schemas, but Kiro and Hermes need backend-native
+model discovery. `SessionSchemaEntry` lets the server report `Ready`,
+`Pending`, or `Unavailable` as typed state without frontend caches or guessed
+fallback model lists.
 
 ---
 
@@ -694,8 +727,10 @@ machinery.
 - Add `UpdateSessionSettings` variant to `AgentInput`.
 
 ### Server crate
-- Add `session_settings_schema()` to `Backend` trait (sync, static).
-- Implement for each backend (Claude, Codex, Antigravity, Mock, Tycode, Kiro).
+- Add static backend schemas and host-owned dynamic schema refresh for backends
+  that need native model discovery.
+- Implement for each backend (Claude, Codex, Antigravity, Mock, Tycode, Kiro,
+  Hermes).
 - Add `session_settings: SessionSettingsValues` to `BackendSpawnConfig`
   (keep existing `cost_hint`).
 - Evolve `codex_backend_defaults()`, `claude_backend_defaults()`,
@@ -704,10 +739,10 @@ machinery.
   of ad-hoc tuples.
 - Add shared `resolve_settings()` helper (used by each backend in `spawn()`
   to merge cost_hint defaults + explicit session settings + schema defaults).
-- Add schema collection in host actor.
+- Add schema state collection in host actor (`Ready`/`Pending`/`Unavailable`).
 - Emit `SessionSchemas` after handshake and on `enabled_backends` change.
-- Host passes `cost_hint` and `session_settings` through to backend without
-  interpreting either.
+- Host validates explicit, stored, and complexity-tier settings against the
+  available schema before spawning.
 - Add `SessionSettingsValues` tracking in agent actor.
 - Handle `SetSessionSettings` input → validate → forward → emit.
 - Persist session settings in session store on creation and update.

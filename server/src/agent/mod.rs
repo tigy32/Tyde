@@ -21,6 +21,7 @@ use crate::backend::antigravity::AntigravityBackend;
 use crate::backend::antigravity::is_antigravity_native_session_id;
 use crate::backend::claude::ClaudeBackend;
 use crate::backend::codex::CodexBackend;
+use crate::backend::hermes::HermesBackend;
 use crate::backend::kiro::KiroBackend;
 use crate::backend::mock::MockBackend;
 use crate::backend::tycode::TycodeBackend;
@@ -798,6 +799,7 @@ pub(crate) async fn generate_agent_name(
         custom_agent_id: None,
         startup_mcp_servers: request.startup_mcp_servers,
         session_settings: None,
+        backend_config: Default::default(),
         resolved_spawn_config: Default::default(),
     };
     let initial_input = SendMessagePayload {
@@ -917,6 +919,7 @@ pub(crate) async fn generate_agent_activity_summary(
         custom_agent_id: None,
         startup_mcp_servers: Vec::new(),
         session_settings: None,
+        backend_config: Default::default(),
         resolved_spawn_config,
     };
     let initial_input = SendMessagePayload {
@@ -1100,6 +1103,11 @@ async fn spawn_backend(
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
+        BackendKind::Hermes => {
+            let (b, events) = HermesBackend::spawn(workspace_roots, config, initial_input).await?;
+            let session_id = Backend::session_id(&b);
+            Ok((Box::new(b), events, session_id))
+        }
     }
 }
 
@@ -1145,6 +1153,10 @@ async fn resume_backend(
         BackendKind::Antigravity => {
             let (b, events) =
                 AntigravityBackend::resume(workspace_roots, config, session_id).await?;
+            (Box::new(b), events)
+        }
+        BackendKind::Hermes => {
+            let (b, events) = HermesBackend::resume(workspace_roots, config, session_id).await?;
             (Box::new(b), events)
         }
     };
@@ -1211,6 +1223,13 @@ async fn fork_backend(
         BackendKind::Antigravity => {
             let (b, events) =
                 AntigravityBackend::fork(workspace_roots, config, from_session_id, initial_input)
+                    .await?;
+            let session_id = Backend::session_id(&b);
+            Ok((Box::new(b), events, session_id))
+        }
+        BackendKind::Hermes => {
+            let (b, events) =
+                HermesBackend::fork(workspace_roots, config, from_session_id, initial_input)
                     .await?;
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
@@ -1314,6 +1333,7 @@ pub(crate) fn spawn_agent_actor(
             cost_hint,
             session_settings,
             session_settings_schema,
+            backend_config,
             startup_mcp_servers,
             resolved_spawn_config,
             resume_session_id,
@@ -1331,6 +1351,7 @@ pub(crate) fn spawn_agent_actor(
             custom_agent_id: current_start.custom_agent_id.clone(),
             startup_mcp_servers,
             session_settings,
+            backend_config: backend_config.clone(),
             resolved_spawn_config: resolved_spawn_config.clone(),
         };
         let initial_cost_hint = spawn_config.cost_hint;
@@ -1352,6 +1373,7 @@ pub(crate) fn spawn_agent_actor(
                 custom_agent_id: current_start.custom_agent_id.clone(),
                 startup_mcp_servers: Vec::new(),
                 session_settings: initial_session_settings,
+                backend_config,
                 resolved_spawn_config,
             },
         );
@@ -3846,7 +3868,11 @@ async fn persist_agent_session(
 fn backend_session_is_resumable(backend_kind: BackendKind, session_id: &SessionId) -> bool {
     match backend_kind {
         BackendKind::Antigravity => is_antigravity_native_session_id(session_id),
-        BackendKind::Tycode | BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex => true,
+        BackendKind::Tycode
+        | BackendKind::Kiro
+        | BackendKind::Claude
+        | BackendKind::Codex
+        | BackendKind::Hermes => true,
     }
 }
 

@@ -2216,6 +2216,7 @@ pub(crate) fn backend_kind_label(kind: BackendKind) -> &'static str {
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
+        BackendKind::Hermes => "Hermes",
     }
 }
 
@@ -2226,6 +2227,7 @@ fn backend_kind_value(kind: BackendKind) -> &'static str {
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",
+        BackendKind::Hermes => "hermes",
     }
 }
 
@@ -2236,6 +2238,7 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
         "antigravity" => Some(BackendKind::Antigravity),
+        "hermes" => Some(BackendKind::Hermes),
         _ => None,
     }
 }
@@ -2576,6 +2579,7 @@ mod wasm_tests {
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     code_intel: Default::default(),
+                    backend_config: std::collections::HashMap::new(),
                 },
             );
         });

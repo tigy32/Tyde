@@ -152,6 +152,14 @@ Unrestricted Antigravity sessions also pass `--dangerously-skip-permissions` so
 headless print-mode turns do not block on interactive approvals. The difference
 for read-only is the advisory, not an Antigravity sandbox.
 
+### Hermes
+
+Hermes read-only uses the shared advisory seeded into `session.create` as a
+system history message. Tyde does not claim a hard Hermes sandbox or MCP/tool
+policy mapping for read-only mode yet. If a custom agent requires startup MCP
+servers, custom MCP servers, or a non-default tool policy, the Hermes backend
+fails visibly instead of pretending those policies were applied.
+
 ### Mock
 
 The mock backend records `access_mode` in its test session record and includes it

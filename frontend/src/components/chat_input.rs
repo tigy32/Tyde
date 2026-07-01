@@ -284,6 +284,7 @@ fn draft_backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
+        BackendKind::Hermes => "Hermes",
     }
 }
 

@@ -18,7 +18,9 @@ history, without pushing lifecycle inference into the frontend.
 Tyde2 already has most of the pieces needed for sub-agents:
 
 - `ClaudeBackend` and `CodexBackend` already detect native sub-agent spawns and
-  completions.
+  completions. Hermes gateway delegation events exist, but Tyde's Hermes backend
+  currently surfaces them as warnings until their shape is mapped to
+  `SubAgentProgress` or first-class relay agents.
 - The protocol already carries `parent_agent_id` on spawn and birth-certificate
   payloads.
 - The frontend already groups agents by parent and already has

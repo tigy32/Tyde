@@ -28,6 +28,7 @@ const CLAUDE_CLI_CANDIDATES: &[&str] = &["claude"];
 const CODEX_CLI_CANDIDATES: &[&str] = &["codex"];
 const ANTIGRAVITY_CLI_CANDIDATES: &[&str] = &["agy"];
 const KIRO_CLI_CANDIDATES: &[&str] = &["kiro-cli", "kiro-cli-chat"];
+const HERMES_PYTHON_MODULE: &str = "tui_gateway.entry";
 
 pub(crate) async fn collect_backend_setup() -> BackendSetupPayload {
     let platform = host_platform();
@@ -43,6 +44,7 @@ pub(crate) async fn collect_backend_setup() -> BackendSetupPayload {
             BackendKind::Claude,
             BackendKind::Codex,
             BackendKind::Antigravity,
+            BackendKind::Hermes,
         ]
         .into_iter()
         .map(|kind| probe_backend(kind, platform)),
@@ -64,6 +66,7 @@ pub(crate) fn stub_backend_setup() -> BackendSetupPayload {
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Antigravity,
+        BackendKind::Hermes,
     ]
     .into_iter()
     .map(|kind| {
@@ -149,6 +152,7 @@ async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetu
         BackendKind::Claude => probe_candidates(&command_candidates(CLAUDE_CLI_CANDIDATES)).await,
         BackendKind::Codex => probe_candidates(&command_candidates(CODEX_CLI_CANDIDATES)).await,
         BackendKind::Antigravity => probe_candidates(&antigravity_command_candidates()).await,
+        BackendKind::Hermes => probe_hermes_python().await,
     };
 
     if kind == BackendKind::Codex && probe.installed {
@@ -269,6 +273,97 @@ async fn run_version_command(command: &str) -> Option<Option<(String, String)>> 
     Some(Some((stdout, stderr)))
 }
 
+fn hermes_python_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    for key in ["HERMES_PYTHON", "PYTHON"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() && !candidates.contains(&trimmed.to_string()) {
+                candidates.push(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+        let path = Path::new(&venv).join("bin").join("python");
+        if path.is_file() {
+            let value = path.to_string_lossy().to_string();
+            if !candidates.contains(&value) {
+                candidates.push(value);
+            }
+        }
+    }
+
+    for dir in [".venv", "venv"] {
+        let path = Path::new(dir).join("bin").join("python");
+        if path.is_file() {
+            let value = path.to_string_lossy().to_string();
+            if !candidates.contains(&value) {
+                candidates.push(value);
+            }
+        }
+    }
+
+    for candidate in command_candidates(&["python3", "python"]) {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates
+}
+
+async fn probe_hermes_python() -> ProbeResult {
+    for candidate in hermes_python_candidates() {
+        let Some(version) = probe_hermes_python_command(&candidate).await else {
+            continue;
+        };
+        return ProbeResult {
+            installed: true,
+            version,
+        };
+    }
+    ProbeResult {
+        installed: false,
+        version: None,
+    }
+}
+
+async fn probe_hermes_python_command(command: &str) -> Option<Option<String>> {
+    let script = format!(
+        "import importlib.util; import sys; spec=importlib.util.find_spec({module:?}); sys.exit(0 if spec else 1)",
+        module = HERMES_PYTHON_MODULE
+    );
+    let mut command_proc = Command::new(command);
+    command_proc
+        .arg("-c")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(path) = process_env::resolved_child_process_path() {
+        command_proc.env("PATH", path);
+    }
+    let mut child = command_proc.group_spawn().ok()?;
+    let mut stdout_pipe = child.inner().stdout.take()?;
+    let mut stderr_pipe = child.inner().stderr.take()?;
+    let status = match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => return None,
+        Err(_) => {
+            let _ = child.kill().await;
+            return None;
+        }
+    };
+    let mut stdout_bytes = Vec::new();
+    let _ = stdout_pipe.read_to_end(&mut stdout_bytes).await;
+    let mut stderr_bytes = Vec::new();
+    let _ = stderr_pipe.read_to_end(&mut stderr_bytes).await;
+    if !status.success() {
+        return None;
+    }
+    Some(Some(format!("{command} -m {HERMES_PYTHON_MODULE}")))
+}
+
 fn antigravity_command_candidates() -> Vec<String> {
     let mut candidates = Vec::new();
     if let Ok(home) = home_dir() {
@@ -381,6 +476,9 @@ fn docs_url(kind: BackendKind) -> String {
         }
         BackendKind::Codex => "https://help.openai.com/en/articles/11096431".to_string(),
         BackendKind::Antigravity => "https://antigravity.google/cli".to_string(),
+        BackendKind::Hermes => {
+            "https://github.com/NousResearch/hermes-agent/tree/main/ui-tui".to_string()
+        }
     }
 }
 
@@ -422,6 +520,13 @@ fn install_command(kind: BackendKind, platform: HostPlatform) -> Option<BackendS
             display_command: None,
             runnable: true,
         }),
+        BackendKind::Hermes => Some(BackendSetupCommand {
+            title: "Install Hermes".to_string(),
+            description: "Install Hermes Agent, then set HERMES_PYTHON if tui_gateway.entry is not importable from python3.".to_string(),
+            command: "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash".to_string(),
+            display_command: None,
+            runnable: true,
+        }),
     }
 }
 
@@ -454,6 +559,13 @@ fn sign_in_command(kind: BackendKind) -> Option<BackendSetupCommand> {
             description: "Start Antigravity CLI so it can prompt for login on this host."
                 .to_string(),
             command: "agy".to_string(),
+            display_command: None,
+            runnable: true,
+        }),
+        BackendKind::Hermes => Some(BackendSetupCommand {
+            title: "Sign In".to_string(),
+            description: "Run the Hermes setup wizard for provider authentication.".to_string(),
+            command: "hermes setup".to_string(),
             display_command: None,
             runnable: true,
         }),
@@ -628,5 +740,53 @@ mod tests {
             vec!["/tmp/tycode-subprocess".to_string()]
         );
         assert!(tycode_probe_candidates_from_resolved_path(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn hermes_probe_does_not_mark_failed_import_installed() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let command = dir.path().join("python");
+        std::fs::write(&command, "#!/bin/sh\nexit 1\n").expect("write fake python");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&command)
+                .expect("stat fake python")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&command, permissions).expect("chmod fake python");
+        }
+
+        assert!(
+            probe_hermes_python_command(&command.to_string_lossy())
+                .await
+                .is_none(),
+            "failed Hermes import probes must not be treated as installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_probe_timeout_is_not_installed_without_version() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let command = dir.path().join("python");
+        std::fs::write(&command, "#!/bin/sh\nsleep 5\n").expect("write fake python");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&command)
+                .expect("stat fake python")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&command, permissions).expect("chmod fake python");
+        }
+
+        assert!(
+            probe_hermes_python_command(&command.to_string_lossy())
+                .await
+                .is_none(),
+            "timed-out Hermes import probes must not be treated as installed"
+        );
     }
 }

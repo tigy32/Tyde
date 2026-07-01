@@ -114,6 +114,7 @@ pub(crate) fn backend_class(kind: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Claude => "backend-badge claude",
         protocol::BackendKind::Codex => "backend-badge codex",
         protocol::BackendKind::Antigravity => "backend-badge antigravity",
+        protocol::BackendKind::Hermes => "backend-badge hermes",
     }
 }
 
@@ -124,6 +125,7 @@ pub(crate) fn backend_label(kind: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Claude => "Claude",
         protocol::BackendKind::Codex => "Codex",
         protocol::BackendKind::Antigravity => "Antigravity",
+        protocol::BackendKind::Hermes => "Hermes",
     }
 }
 

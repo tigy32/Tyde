@@ -381,11 +381,12 @@ pub enum BackendKind {
     Claude,
     Codex,
     Antigravity,
+    Hermes,
 }
 ```
 
 These variants match the backends currently exposed by Tyde2: `Tycode`,
-`Kiro`, `Claude`, `Codex`, and `Antigravity`.
+`Kiro`, `Claude`, `Codex`, `Antigravity`, and `Hermes`.
 
 ### AgentErrorCode
 
@@ -889,6 +890,9 @@ may map `SpawnCostHint` differently:
 - `Codex`: lower or higher reasoning effort, and eventually model overrides
 - `Antigravity`: exact `agy models` labels and native `agy --conversation=<UUID>`
   resume for sessions whose ID is the Antigravity conversation UUID
+- `Hermes`: native `tui_gateway.entry` JSON-RPC over stdio; Tyde maps gateway
+  events directly to `ChatEvent` and does not use ACP, the dashboard
+  WebSocket, PTY/xterm, or ANSI parsing
 - `Kiro` / others: backend-specific model selection where supported
 
 ### Key design decisions

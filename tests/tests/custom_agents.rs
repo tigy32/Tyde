@@ -1040,6 +1040,13 @@ async fn tool_policy_rejection_for_non_claude_backends() {
                 tools: vec!["Edit".to_string()],
             },
         ),
+        (
+            "hermes-allow",
+            BackendKind::Hermes,
+            ToolPolicy::AllowList {
+                tools: vec!["Read".to_string()],
+            },
+        ),
     ];
 
     for (id, backend_kind, tool_policy) in cases {

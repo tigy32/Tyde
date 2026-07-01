@@ -24,6 +24,9 @@ use uuid::Uuid;
 const REAL_BACKEND_TIMEOUT: Duration = Duration::from_secs(60);
 const REAL_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUN_REAL_AI_TESTS_ENV: &str = "TYDE_RUN_REAL_AI_TESTS";
+const DEFAULT_HERMES_TEST_PYTHON: &str = "/Users/mike/.hermes/tyde-hermes-python";
+const DEFAULT_HERMES_TEST_PROVIDER: &str = "openrouter";
+const DEFAULT_HERMES_TEST_MODEL: &str = "anthropic/claude-haiku-4.5";
 const SOLID_RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC";
 
 fn init_tracing() {
@@ -48,6 +51,11 @@ fn backend_binary_available(backend_kind: BackendKind) -> bool {
         BackendKind::Antigravity => binary_available("agy"),
         BackendKind::Tycode => binary_available("tycode-subprocess"),
         BackendKind::Kiro => binary_available("kiro-cli-chat") || binary_available("kiro-cli"),
+        BackendKind::Hermes => {
+            std::env::var("HERMES_PYTHON").is_ok()
+                || binary_available("python3")
+                || binary_available("python")
+        }
     }
 }
 
@@ -80,6 +88,32 @@ fn real_ai_tests_enabled() -> bool {
     std::env::var(RUN_REAL_AI_TESTS_ENV).ok().as_deref() == Some("1")
 }
 
+struct EnvVarGuard {
+    key: &'static str,
+    old_value: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: String) -> Self {
+        let old_value = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, old_value }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.old_value.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 fn backend_runtime_available(backend_kind: BackendKind) -> bool {
     if !backend_binary_available(backend_kind) {
         return false;
@@ -95,6 +129,7 @@ fn backend_runtime_available(backend_kind: BackendKind) -> bool {
             home_is_writable() && remote_network_is_available()
         }
         BackendKind::Codex => remote_network_is_available(),
+        BackendKind::Hermes => home_is_writable() && remote_network_is_available(),
     }
 }
 
@@ -188,6 +223,7 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
                         custom_agent_id: None,
                         startup_mcp_servers: Vec::new(),
                         session_settings: Default::default(),
+                        backend_config: Default::default(),
                         resolved_spawn_config: Default::default(),
                     },
                     protocol::SendMessagePayload {
@@ -227,6 +263,7 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
                         custom_agent_id: None,
                         startup_mcp_servers: Vec::new(),
                         session_settings: Default::default(),
+                        backend_config: Default::default(),
                         resolved_spawn_config: Default::default(),
                     },
                     protocol::SendMessagePayload {
@@ -253,6 +290,46 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
             .map_err(|_| "Kiro initial turn timed out".to_string())??;
             Ok(())
         }
+        BackendKind::Hermes => {
+            let workspace = tempfile::tempdir().map_err(|err| format!("{err}"))?;
+            std::fs::write(workspace.path().join("README.txt"), "probe workspace")
+                .map_err(|err| format!("failed to seed Hermes probe workspace: {err}"))?;
+            let result = tokio::time::timeout(
+                REAL_BACKEND_PROBE_TIMEOUT,
+                <server::backend::hermes::HermesBackend as Backend>::spawn(
+                    vec![workspace.path().to_string_lossy().to_string()],
+                    server::backend::BackendSpawnConfig {
+                        cost_hint: cost_hint_for(BackendKind::Hermes),
+                        custom_agent_id: None,
+                        startup_mcp_servers: Vec::new(),
+                        session_settings: Default::default(),
+                        backend_config: Default::default(),
+                        resolved_spawn_config: Default::default(),
+                    },
+                    protocol::SendMessagePayload {
+                        message: "Reply exactly with ok".to_owned(),
+                        images: None,
+                        origin: None,
+                        tool_response: None,
+                    },
+                ),
+            )
+            .await
+            .map_err(|_| "Hermes gateway spawn timed out".to_string())?
+            .map_err(|err| format!("Hermes gateway spawn failed: {err}"))?;
+            let (_backend, mut events) = result;
+            tokio::time::timeout(REAL_BACKEND_PROBE_TIMEOUT, async {
+                while let Some(event) = events.recv().await {
+                    if matches!(event, ChatEvent::StreamEnd(_)) {
+                        return Ok(());
+                    }
+                }
+                Err("Hermes probe stream ended before StreamEnd".to_string())
+            })
+            .await
+            .map_err(|_| "Hermes initial turn timed out".to_string())??;
+            Ok(())
+        }
     }
 }
 
@@ -270,6 +347,7 @@ fn backend_label(backend_kind: BackendKind) -> &'static str {
         BackendKind::Antigravity => "antigravity",
         BackendKind::Tycode => "tycode",
         BackendKind::Kiro => "kiro",
+        BackendKind::Hermes => "hermes",
     }
 }
 
@@ -574,6 +652,7 @@ async fn empty_workspace_spawn_is_accepted_for_all_backends() {
         BackendKind::Kiro,
         BackendKind::Tycode,
         BackendKind::Antigravity,
+        BackendKind::Hermes,
     ];
     let mut session_ids = Vec::new();
     for backend_kind in backends {
@@ -1347,6 +1426,228 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
             break;
         }
     }
+}
+
+#[tokio::test]
+async fn hermes_unavailable_dynamic_schema_with_supplied_settings_is_agent_error() {
+    init_tracing();
+
+    let mut fixture = Fixture::new().await;
+    let mut session_settings = SessionSettingsValues::default();
+    session_settings.0.insert(
+        "model".to_string(),
+        SessionSettingValue::String("anthropic/claude-haiku-4.5 --provider openrouter".to_string()),
+    );
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Hermes unavailable schema".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: Vec::new(),
+                prompt: "hello".to_string(),
+                images: None,
+                backend_kind: BackendKind::Hermes,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: Some(session_settings),
+            },
+        })
+        .await
+        .expect("send Hermes spawn with unavailable schema");
+
+    let new_agent = loop {
+        let env =
+            expect_fixture_event(&mut fixture.client, "Hermes unavailable schema NewAgent").await;
+        match env.kind {
+            FrameKind::NewAgent => {
+                let payload: NewAgentPayload = env
+                    .parse_payload()
+                    .expect("parse Hermes unavailable schema NewAgent");
+                if payload.backend_kind == BackendKind::Hermes {
+                    break payload;
+                }
+            }
+            FrameKind::CommandError => {
+                let error = env
+                    .parse_payload::<CommandErrorPayload>()
+                    .expect("parse unexpected Hermes unavailable schema CommandError");
+                panic!(
+                    "Hermes unavailable schema should become agent startup failure, not CommandError: {error:?}"
+                );
+            }
+            _ => {}
+        }
+    };
+
+    let bootstrap: AgentBootstrapPayload = loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "Hermes unavailable schema AgentBootstrap",
+        )
+        .await;
+        if env.kind == FrameKind::AgentBootstrap && env.stream == new_agent.instance_stream {
+            break env
+                .parse_payload()
+                .expect("parse Hermes unavailable schema AgentBootstrap");
+        }
+    };
+    let error = bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::AgentError(error) => Some(error),
+            _ => None,
+        })
+        .expect("Hermes unavailable schema bootstrap must include AgentError");
+    assert_eq!(error.code, AgentErrorCode::BackendFailed);
+    assert!(error.fatal);
+    assert!(
+        error
+            .message
+            .contains("session settings schema unavailable"),
+        "unexpected Hermes unavailable schema error: {error:?}"
+    );
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("connection should remain usable after Hermes schema failure");
+    loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "SessionList after Hermes unavailable schema failure",
+        )
+        .await;
+        if env.kind == FrameKind::SessionList {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn hermes_unavailable_dynamic_schema_with_tier_settings_is_agent_error() {
+    init_tracing();
+
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::ComplexityTiersEnabled { enabled: true },
+        })
+        .await
+        .expect("enable complexity tiers");
+    loop {
+        let env = expect_fixture_event(&mut fixture.client, "complexity tiers HostSettings").await;
+        if env.kind == FrameKind::HostSettings {
+            break;
+        }
+    }
+
+    let mut low = SessionSettingsValues::default();
+    low.0.insert(
+        "model".to_string(),
+        SessionSettingValue::String("anthropic/claude-haiku-4.5 --provider openrouter".to_string()),
+    );
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::BackendTiers {
+                backend: BackendKind::Hermes,
+                config: protocol::BackendTierConfig {
+                    low,
+                    high: SessionSettingsValues::default(),
+                },
+            },
+        })
+        .await
+        .expect("set Hermes tier config");
+    loop {
+        let env = expect_fixture_event(&mut fixture.client, "Hermes tier HostSettings").await;
+        if env.kind == FrameKind::HostSettings {
+            break;
+        }
+    }
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Hermes unavailable tier schema".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: Vec::new(),
+                prompt: "hello".to_string(),
+                images: None,
+                backend_kind: BackendKind::Hermes,
+                cost_hint: Some(SpawnCostHint::Low),
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("send Hermes spawn with tier settings and unavailable schema");
+
+    let new_agent = loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "Hermes unavailable tier schema NewAgent",
+        )
+        .await;
+        match env.kind {
+            FrameKind::NewAgent => {
+                let payload: NewAgentPayload = env
+                    .parse_payload()
+                    .expect("parse Hermes unavailable tier schema NewAgent");
+                if payload.backend_kind == BackendKind::Hermes {
+                    break payload;
+                }
+            }
+            FrameKind::CommandError => {
+                let error = env
+                    .parse_payload::<CommandErrorPayload>()
+                    .expect("parse unexpected Hermes unavailable tier schema CommandError");
+                panic!(
+                    "Hermes unavailable tier schema should become agent startup failure, not CommandError: {error:?}"
+                );
+            }
+            _ => {}
+        }
+    };
+
+    let bootstrap: AgentBootstrapPayload = loop {
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "Hermes unavailable tier schema AgentBootstrap",
+        )
+        .await;
+        if env.kind == FrameKind::AgentBootstrap && env.stream == new_agent.instance_stream {
+            break env
+                .parse_payload()
+                .expect("parse Hermes unavailable tier schema AgentBootstrap");
+        }
+    };
+    let error = bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::AgentError(error) => Some(error),
+            _ => None,
+        })
+        .expect("Hermes unavailable tier schema bootstrap must include AgentError");
+    assert_eq!(error.code, AgentErrorCode::BackendFailed);
+    assert!(error.fatal);
+    assert!(
+        error
+            .message
+            .contains("session settings schema unavailable"),
+        "unexpected Hermes unavailable tier schema error: {error:?}"
+    );
 }
 
 #[tokio::test]
@@ -3404,6 +3705,9 @@ async fn assert_backend_interrupts_long_running_command(
         BackendKind::Tycode => {
             "Use the run_build_test tool exactly once to run the test harness `./interrupt_test.sh` in the current working directory. Start the test immediately. Do not use any other tools."
         }
+        BackendKind::Hermes => {
+            "Run the test harness `./interrupt_test.sh` in the current working directory immediately. Do not ask for clarification, and do not only describe a plan."
+        }
     };
     let agent_stream = spawn_agent_via_protocol(
         &mut fixture.client,
@@ -3532,6 +3836,119 @@ async fn real_claude_cumulative_turn_token_usage() {
     assert_backend_reports_cumulative_turn_token_usage(backend_kind).await;
 }
 
+/// Regression test for the "turn ends and never resumes" bug: when Claude
+/// launches a sub-agent with `run_in_background`, the CLI completes the
+/// parent turn's first `result` immediately, then — once the background
+/// agent finishes — resumes the parent on its own initiative with a fresh
+/// `init` + assistant + `result` sequence. Tyde must adopt that unsolicited
+/// continuation as a first-class turn instead of dropping it, so the model's
+/// final answer (which only exists in the resumed turn) reaches the user.
+#[tokio::test]
+#[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+async fn real_claude_resumes_parent_after_background_subagent() {
+    let backend_kind = BackendKind::Claude;
+    if !backend_ready_or_skip(backend_kind).await {
+        return;
+    }
+
+    // The sub-agent computes 419 + 218 = 637. The parent's initial
+    // "I launched it / waiting" turn cannot contain 637 — only the resumed
+    // turn, produced after the background agent finishes, can. Seeing 637
+    // in assistant output therefore proves the resume was not dropped.
+    const SENTINEL: &str = "637";
+    let prompt = "Use the Task tool to launch a background sub-agent (set \
+         run_in_background to true, subagent_type general-purpose) whose only job \
+         is to compute 419 + 218 and return just the number. Immediately after \
+         launching it, wait for it to finish, then reply with exactly: \
+         'The background agent result is 637.'";
+
+    let mut fixture = RealBackendFixture::new().await;
+    let workspace_roots = fixture.workspace_roots();
+    // Use the backend default model (no low-cost hint): reliable tool use is
+    // required to actually drive a background sub-agent spawn.
+    let agent_stream = spawn_agent_via_protocol_with_options(
+        &mut fixture.client,
+        workspace_roots,
+        backend_kind,
+        "background-subagent-resume",
+        prompt,
+        None,
+        None,
+    )
+    .await;
+
+    // Time budget covers spawn + background sub-agent round-trip + resume.
+    const BG_TIMEOUT: Duration = Duration::from_secs(240);
+    let mut assistant_stream_ends = 0usize;
+    let mut saw_sentinel = false;
+    let mut saw_typing_false_after_sentinel = false;
+    let mut all_assistant_text = String::new();
+
+    tokio::time::timeout(BG_TIMEOUT, async {
+        loop {
+            let env = match fixture.client.next_event().await {
+                Ok(Some(env)) => env,
+                Ok(None) => panic!("event stream closed before background resume completed"),
+                Err(err) => panic!("error reading events: {err}"),
+            };
+            if env.kind != FrameKind::ChatEvent || env.stream != agent_stream {
+                continue;
+            }
+            let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+            match event {
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => panic!("backend returned error: {content}"),
+                ChatEvent::StreamEnd(data) => {
+                    assistant_stream_ends += 1;
+                    all_assistant_text.push_str(&data.message.content);
+                    all_assistant_text.push('\n');
+                    if data.message.content.contains(SENTINEL) {
+                        saw_sentinel = true;
+                    }
+                }
+                ChatEvent::StreamDelta(delta) => {
+                    all_assistant_text.push_str(&delta.text);
+                }
+                ChatEvent::TypingStatusChanged(false) if saw_sentinel => {
+                    saw_typing_false_after_sentinel = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "timed out waiting for parent to resume after background sub-agent; \
+             stream_ends={assistant_stream_ends}, saw_sentinel={saw_sentinel}, \
+             assistant_text so far: {all_assistant_text:?}"
+        )
+    });
+
+    assert!(
+        saw_sentinel,
+        "resumed parent turn (containing {SENTINEL:?}) was never surfaced; \
+         assistant_text={all_assistant_text:?}"
+    );
+    // The background flow always produces at least two assistant turns:
+    // the initial "launched / waiting" turn and the resumed answer turn.
+    // A single turn would mean the model answered inline (no background
+    // spawn) and the regression path was not exercised.
+    assert!(
+        assistant_stream_ends >= 2,
+        "expected the background spawn + resume to produce >=2 assistant turns, \
+         got {assistant_stream_ends}; assistant_text={all_assistant_text:?}"
+    );
+    assert!(
+        saw_typing_false_after_sentinel,
+        "typing status never cleared after the resumed answer"
+    );
+}
+
 #[tokio::test]
 #[ignore = "real AI backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
 async fn real_codex_cumulative_turn_token_usage() {
@@ -3563,6 +3980,136 @@ async fn real_tycode_cumulative_turn_token_usage() {
     }
 
     assert_backend_reports_cumulative_turn_token_usage(backend_kind).await;
+}
+
+#[tokio::test]
+#[ignore = "real Hermes backend test; use --ignored and TYDE_RUN_REAL_AI_TESTS=1"]
+async fn real_hermes_openrouter_emits_visible_content() {
+    if !real_ai_tests_enabled() {
+        eprintln!("SKIPPED: real Hermes test requires {RUN_REAL_AI_TESTS_ENV}=1");
+        return;
+    }
+    let hermes_python = std::env::var("HERMES_PYTHON")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HERMES_TEST_PYTHON.to_string());
+    if !Path::new(&hermes_python).exists() {
+        eprintln!("SKIPPED: HERMES_PYTHON target not found: {hermes_python}");
+        return;
+    }
+    let _hermes_python_guard = EnvVarGuard::set("HERMES_PYTHON", hermes_python);
+
+    let provider = std::env::var("TYDE_HERMES_TEST_PROVIDER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HERMES_TEST_PROVIDER.to_string());
+    let model = std::env::var("TYDE_HERMES_TEST_MODEL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_HERMES_TEST_MODEL.to_string());
+    let reasoning_effort = std::env::var("TYDE_HERMES_TEST_REASONING_EFFORT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "none".to_string());
+    eprintln!(
+        "RUNNING Hermes live test with provider={provider} model={model} reasoning_effort={reasoning_effort}"
+    );
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        workspace.path().join("README.txt"),
+        "Hermes live probe workspace",
+    )
+    .expect("seed Hermes workspace");
+    let mut settings = SessionSettingsValues::default();
+    settings.0.insert(
+        "model".to_string(),
+        SessionSettingValue::String(format!("{model} --provider {provider}")),
+    );
+    settings.0.insert(
+        "reasoning_effort".to_string(),
+        SessionSettingValue::String(reasoning_effort),
+    );
+
+    let (backend, mut events) = <server::backend::hermes::HermesBackend as Backend>::spawn(
+        vec![workspace.path().to_string_lossy().to_string()],
+        server::backend::BackendSpawnConfig {
+            cost_hint: cost_hint_for(BackendKind::Hermes),
+            custom_agent_id: None,
+            startup_mcp_servers: Vec::new(),
+            session_settings: Some(settings),
+            backend_config: Default::default(),
+            resolved_spawn_config: Default::default(),
+        },
+        protocol::SendMessagePayload {
+            message: "Reply exactly with ok.".to_owned(),
+            images: None,
+            origin: None,
+            tool_response: None,
+        },
+    )
+    .await
+    .expect("spawn Hermes backend");
+
+    let mut final_text = String::new();
+    let mut delta_count = 0usize;
+    let mut diagnostics = Vec::new();
+    let mut saw_stream_end = false;
+    let mut saw_typing_false_after_end = false;
+    tokio::time::timeout(REAL_BACKEND_TIMEOUT, async {
+        while let Some(event) = events.recv().await {
+            match event {
+                ChatEvent::StreamDelta(delta) => {
+                    delta_count += 1;
+                    final_text.push_str(&delta.text);
+                }
+                ChatEvent::StreamEnd(end) => {
+                    saw_stream_end = true;
+                    if !end.message.content.trim().is_empty() {
+                        final_text = end.message.content;
+                    }
+                }
+                ChatEvent::TypingStatusChanged(false) if saw_stream_end => {
+                    saw_typing_false_after_end = true;
+                    break;
+                }
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Error,
+                    content,
+                    ..
+                }) => {
+                    panic!("Hermes live test emitted error: {content}");
+                }
+                ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Warning,
+                    content,
+                    ..
+                }) => diagnostics.push(content),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("Hermes live response timed out");
+    backend.shutdown().await;
+
+    assert!(saw_stream_end, "Hermes live test never emitted StreamEnd");
+    assert!(
+        saw_typing_false_after_end,
+        "Hermes live test did not clear typing after StreamEnd"
+    );
+    assert!(
+        !final_text.trim().is_empty(),
+        "Hermes live response had no visible assistant text; diagnostics={diagnostics:?}"
+    );
+    assert!(
+        final_text.to_ascii_lowercase().contains("ok"),
+        "Hermes live response should contain ok, got {final_text:?}"
+    );
+    assert!(
+        delta_count > 0,
+        "Hermes live response should stream at least one visible delta"
+    );
 }
 
 #[tokio::test]

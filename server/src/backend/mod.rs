@@ -3,6 +3,7 @@ pub mod agent_control_progress;
 pub mod antigravity;
 pub mod claude;
 pub mod codex;
+pub mod hermes;
 pub mod kiro;
 pub mod mock;
 pub mod setup;
@@ -13,9 +14,10 @@ pub mod tycode;
 use std::collections::HashMap;
 
 use protocol::{
-    AgentErrorCode, AgentInput, BackendAccessMode, BackendKind, BackendTierConfig, ChatEvent,
-    CustomAgentId, ImageData, SendMessagePayload, SessionId, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
+    AgentErrorCode, AgentInput, BackendAccessMode, BackendConfigFieldType, BackendConfigSchema,
+    BackendConfigValues, BackendKind, BackendTierConfig, ChatEvent, CustomAgentId, ImageData,
+    SendMessagePayload, SessionId, SessionSettingFieldType, SessionSettingValue,
+    SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -142,6 +144,9 @@ pub struct BackendSpawnConfig {
     pub custom_agent_id: Option<CustomAgentId>,
     pub startup_mcp_servers: Vec<StartupMcpServer>,
     pub session_settings: Option<SessionSettingsValues>,
+    /// Host-level deep configuration for this backend (see
+    /// [`protocol::BackendConfigSchema`]). Empty when unconfigured.
+    pub backend_config: BackendConfigValues,
     pub resolved_spawn_config: ResolvedSpawnConfig,
 }
 
@@ -226,6 +231,16 @@ pub trait Backend: Send + 'static {
     where
         Self: Sized;
 
+    /// Optional host-level deep configuration schema for this backend, rendered
+    /// in the settings panel (distinct from the per-session settings bar).
+    /// Backends without deep configuration return `None` (the default).
+    fn backend_config_schema() -> Option<BackendConfigSchema>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     /// Create a new backend session.
     /// Returns a handle to send input and an EventStream to read output.
     /// The backend must start the session with `initial_input` and know the
@@ -305,6 +320,91 @@ pub(crate) fn session_settings_schema_for_backend(
         BackendKind::Claude => claude::ClaudeBackend::session_settings_schema(),
         BackendKind::Codex => codex::CodexBackend::session_settings_schema(),
         BackendKind::Antigravity => antigravity::AntigravityBackend::session_settings_schema(),
+        BackendKind::Hermes => hermes::HermesBackend::session_settings_schema(),
+    }
+}
+
+/// The host-level deep-configuration schema for a backend, if it exposes one.
+pub(crate) fn backend_config_schema_for_backend(
+    backend_kind: BackendKind,
+) -> Option<BackendConfigSchema> {
+    match backend_kind {
+        BackendKind::Hermes => hermes::HermesBackend::backend_config_schema(),
+        BackendKind::Tycode
+        | BackendKind::Kiro
+        | BackendKind::Claude
+        | BackendKind::Codex
+        | BackendKind::Antigravity => None,
+    }
+}
+
+/// Drop keys/values that the backend's config schema does not accept. A backend
+/// with no config schema sanitizes to empty (it stores no deep config).
+pub(crate) fn sanitize_backend_config_values(
+    backend_kind: BackendKind,
+    values: &BackendConfigValues,
+) -> BackendConfigValues {
+    let Some(schema) = backend_config_schema_for_backend(backend_kind) else {
+        return BackendConfigValues::default();
+    };
+    let mut sanitized = BackendConfigValues::default();
+    for (key, value) in &values.0 {
+        let Some(field) = schema.fields.iter().find(|field| field.key == *key) else {
+            continue;
+        };
+        if validate_backend_config_value(key, value, &field.field_type).is_ok() {
+            sanitized.0.insert(key.clone(), value.clone());
+        }
+    }
+    sanitized
+}
+
+fn validate_backend_config_value(
+    key: &str,
+    value: &SessionSettingValue,
+    field_type: &BackendConfigFieldType,
+) -> Result<(), String> {
+    if matches!(value, SessionSettingValue::Null) {
+        if let BackendConfigFieldType::Select {
+            nullable: false, ..
+        } = field_type
+        {
+            return Err(format!("backend config '{}' does not accept null", key));
+        }
+        return Ok(());
+    }
+    match (value, field_type) {
+        (SessionSettingValue::String(_), BackendConfigFieldType::Text { .. }) => Ok(()),
+        (SessionSettingValue::String(_), BackendConfigFieldType::Secret { .. }) => Ok(()),
+        (
+            SessionSettingValue::String(actual),
+            BackendConfigFieldType::Select { options, .. },
+        ) => {
+            if options.iter().any(|option| option.value == *actual) {
+                Ok(())
+            } else {
+                Err(format!("invalid backend config '{}' value '{}'", key, actual))
+            }
+        }
+        (SessionSettingValue::Bool(_), BackendConfigFieldType::Toggle { .. }) => Ok(()),
+        (
+            SessionSettingValue::Integer(actual),
+            BackendConfigFieldType::Integer { min, max, .. },
+        ) if (*min..=*max).contains(actual) => Ok(()),
+        _ => Err(format!("invalid backend config '{}' type", key)),
+    }
+}
+
+/// The effective config value for a text/secret field, trimmed and non-empty.
+pub(crate) fn backend_config_text<'a>(
+    values: &'a BackendConfigValues,
+    key: &str,
+) -> Option<&'a str> {
+    match values.0.get(key) {
+        Some(SessionSettingValue::String(value)) if !value.trim().is_empty() => {
+            Some(value.trim())
+        }
+        _ => None,
     }
 }
 
@@ -318,6 +418,7 @@ pub(crate) fn resolve_backend_session_settings(
         BackendKind::Claude => claude::resolve_session_settings(config),
         BackendKind::Codex => codex::resolve_session_settings(config),
         BackendKind::Antigravity => antigravity::resolve_session_settings(config),
+        BackendKind::Hermes => hermes::resolve_session_settings(config),
     }
 }
 
@@ -385,7 +486,7 @@ pub(crate) fn builtin_tier_config(kind: BackendKind) -> BackendTierConfig {
         BackendKind::Codex => codex::codex_cost_hint_defaults,
         BackendKind::Antigravity => antigravity::antigravity_cost_hint_defaults,
         BackendKind::Kiro => kiro::kiro_cost_hint_defaults,
-        BackendKind::Tycode => |_| SessionSettingsValues::default(),
+        BackendKind::Tycode | BackendKind::Hermes => |_| SessionSettingsValues::default(),
     };
     BackendTierConfig {
         low: defaults(SpawnCostHint::Low),
@@ -525,10 +626,45 @@ fn session_setting_value_to_json(value: &SessionSettingValue) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use protocol::BackendAccessMode;
+    use protocol::{BackendAccessMode, BackendConfigValues, BackendKind, SessionSettingValue};
 
-    use super::{READ_ONLY_ACCESS_MODE_INSTRUCTIONS, render_combined_spawn_instructions};
+    use super::{
+        READ_ONLY_ACCESS_MODE_INSTRUCTIONS, render_combined_spawn_instructions,
+        sanitize_backend_config_values,
+    };
     use crate::agent::customization::ResolvedSpawnConfig;
+
+    #[test]
+    fn backend_config_sanitization_drops_unknown_and_mistyped_values() {
+        let mut good = BackendConfigValues::default();
+        good.0.insert(
+            "default_model".to_string(),
+            SessionSettingValue::String("anthropic/claude-sonnet-5".to_string()),
+        );
+
+        // Unknown keys and wrong-typed values are silently dropped; valid
+        // Text values are kept.
+        let mut mixed = BackendConfigValues::default();
+        mixed.0.insert(
+            "default_model".to_string(),
+            SessionSettingValue::String("x/y".to_string()),
+        );
+        mixed
+            .0
+            .insert("bogus_key".to_string(), SessionSettingValue::Bool(true));
+        mixed.0.insert(
+            "default_provider".to_string(),
+            SessionSettingValue::Integer(3),
+        );
+
+        let sanitized = sanitize_backend_config_values(BackendKind::Hermes, &mixed);
+        assert_eq!(sanitized.0.len(), 1);
+        assert!(sanitized.0.contains_key("default_model"));
+
+        // A backend with no config schema sanitizes everything away.
+        let sanitized = sanitize_backend_config_values(BackendKind::Tycode, &good);
+        assert!(sanitized.0.is_empty());
+    }
 
     #[test]
     fn read_only_spawn_instructions_allow_inspection_and_forbid_mutation() {

@@ -93,6 +93,7 @@ fn expected_empty_settings() -> HostSettings {
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
         code_intel: Default::default(),
+        backend_config: std::collections::HashMap::new(),
     }
 }
 
@@ -193,6 +194,7 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
             code_intel: Default::default(),
+            backend_config: std::collections::HashMap::new(),
         }
     );
 }

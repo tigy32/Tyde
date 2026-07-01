@@ -1604,6 +1604,11 @@ kbd {
     color: #34a853;
 }
 
+.backend-badge.hermes {
+    background: rgba(45, 212, 191, 0.2);
+    color: #2dd4bf;
+}
+
 /* ===== Views ===== */
 
 .placeholder-text {
@@ -7616,6 +7621,37 @@ kbd {
 .settings-tier-select .settings-select {
     flex: 1;
     min-width: 0;
+}
+
+.settings-backend-config-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    margin-top: var(--space-3);
+}
+
+.settings-backend-config-card {
+    padding: var(--space-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+}
+
+.settings-backend-config-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.settings-backend-config-field .settings-description {
+    margin: 0;
+}
+
+.settings-backend-config-input {
+    width: 100%;
 }
 
 .settings-panel-header {

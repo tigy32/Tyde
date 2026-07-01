@@ -143,6 +143,7 @@ struct HostSubscriber {
     attached_agent_streams: HashSet<StreamPath>,
     bootstrapped_agent_streams: HashSet<StreamPath>,
     last_session_schemas: Option<Vec<SessionSchemaEntry>>,
+    last_backend_config_schemas: Option<Vec<protocol::BackendConfigSchema>>,
 }
 
 pub(crate) struct DeferredAgentAttachment {
@@ -293,6 +294,13 @@ enum KiroSessionSchemaState {
     Unavailable(String),
 }
 
+#[derive(Clone, Debug)]
+enum HermesSessionSchemaState {
+    Pending,
+    Ready(SessionSettingsSchema),
+    Unavailable(String),
+}
+
 pub(crate) struct HostState {
     pub registry: AgentRegistry,
     pub review_registry: ReviewRegistryHandle,
@@ -322,6 +330,7 @@ pub(crate) struct HostState {
     pub workflow_run_store: WorkflowRunStore,
     pub mobile_access: MobileAccessHandle,
     kiro_session_schema: KiroSessionSchemaState,
+    hermes_session_schema: HermesSessionSchemaState,
     kiro_probe_program: Option<String>,
     skip_real_backend_probe: bool,
     host_streams: HashMap<StreamPath, HostSubscriber>,
@@ -536,6 +545,7 @@ impl HostHandle {
                 attached_agent_streams: HashSet::new(),
                 bootstrapped_agent_streams: HashSet::new(),
                 last_session_schemas: None,
+                last_backend_config_schemas: None,
             },
         );
         assert!(
@@ -617,10 +627,14 @@ impl HostHandle {
             .await
             .get()
             .unwrap_or_else(|err| panic!("failed to load host settings for registration: {err}"));
-        let refresh_kiro_schema = settings
+        let refresh_dynamic_session_schemas = settings
             .enabled_backends
-            .contains(&protocol::BackendKind::Kiro);
+            .iter()
+            .copied()
+            .any(backend_has_dynamic_session_schema);
         let schemas = session_schemas_for_enabled_backends(&state, &settings.enabled_backends);
+        let backend_config_schemas =
+            backend_config_schemas_for_enabled_backends(&settings.enabled_backends);
 
         let mobile_access = {
             let Some(subscriber) = state.host_streams.get(&host_path) else {
@@ -796,6 +810,7 @@ impl HostHandle {
             mobile_access,
             backend_setup,
             session_schemas: schemas,
+            backend_config_schemas,
             sessions,
             projects,
             mcp_servers,
@@ -833,6 +848,7 @@ impl HostHandle {
             return Vec::new();
         }
         subscriber.last_session_schemas = Some(bootstrap.session_schemas.clone());
+        subscriber.last_backend_config_schemas = Some(bootstrap.backend_config_schemas.clone());
         state
             .mobile_access
             .activate_bootstrap_subscriber(host_path.clone());
@@ -851,7 +867,7 @@ impl HostHandle {
         }
 
         drop(state);
-        if refresh_kiro_schema {
+        if refresh_dynamic_session_schemas {
             self.schedule_session_schema_refresh();
         }
         deferred_attachments
@@ -1888,7 +1904,7 @@ impl HostHandle {
                     let state = self.state.lock().await;
                     session_schema_for_backend(&state, backend_kind)
                 };
-                let session_settings_schema = if backend_kind == protocol::BackendKind::Kiro
+                let session_settings_schema = if backend_has_dynamic_session_schema(backend_kind)
                     && session_settings_schema.is_none()
                 {
                     self.refresh_session_schemas().await;
@@ -1897,23 +1913,15 @@ impl HostHandle {
                 } else {
                     session_settings_schema
                 };
-                if let Some(resolved_session_settings) = session_settings.as_ref()
-                    && !resolved_session_settings.0.is_empty()
-                {
-                    let schema = session_settings_schema.as_ref().unwrap_or_else(|| {
-                        panic!(
-                            "session settings schema unavailable for backend {:?}",
-                            backend_kind
-                        )
-                    });
-                    validate_session_settings_values(schema, resolved_session_settings)
-                        .unwrap_or_else(|err| {
-                            panic!(
-                                "invalid session settings for backend {:?}: {err}",
-                                backend_kind
-                            )
-                        });
-                }
+                let settings_failure = session_settings.as_ref().and_then(|settings| {
+                    session_settings_startup_failure(
+                        backend_kind,
+                        session_settings_schema.as_ref(),
+                        settings,
+                        "supplied",
+                    )
+                });
+                let startup_failure = startup_failure.or(settings_failure);
                 let (resolved_name, initial_alias) = match payload.name.clone() {
                     Some(name) => (
                         name.clone(),
@@ -1969,6 +1977,7 @@ impl HostHandle {
                     cost_hint,
                     session_settings,
                     session_settings_schema,
+                    backend_config: resolve_backend_config_for_spawn(&host_settings, backend_kind),
                     startup_mcp_servers,
                     resolved_spawn_config,
                     resume_session_id: None,
@@ -2017,6 +2026,7 @@ impl HostHandle {
                             cost_hint: None,
                             session_settings: None,
                             session_settings_schema: None,
+                            backend_config: Default::default(),
                             startup_mcp_servers: Vec::new(),
                             resolved_spawn_config: ResolvedSpawnConfig::default(),
                             resume_session_id: Some(session_id.clone()),
@@ -2066,6 +2076,7 @@ impl HostHandle {
                             cost_hint: None,
                             session_settings: None,
                             session_settings_schema: None,
+                            backend_config: Default::default(),
                             startup_mcp_servers: Vec::new(),
                             resolved_spawn_config: ResolvedSpawnConfig::default(),
                             resume_session_id: Some(session_id.clone()),
@@ -2214,15 +2225,16 @@ impl HostHandle {
                     let state = self.state.lock().await;
                     session_schema_for_backend(&state, record.backend_kind)
                 };
-                let session_settings_schema = if record.backend_kind == protocol::BackendKind::Kiro
-                    && session_settings_schema.is_none()
-                {
-                    self.refresh_session_schemas().await;
-                    let state = self.state.lock().await;
-                    session_schema_for_backend(&state, record.backend_kind)
-                } else {
-                    session_settings_schema
-                };
+                let session_settings_schema =
+                    if backend_has_dynamic_session_schema(record.backend_kind)
+                        && session_settings_schema.is_none()
+                    {
+                        self.refresh_session_schemas().await;
+                        let state = self.state.lock().await;
+                        session_schema_for_backend(&state, record.backend_kind)
+                    } else {
+                        session_settings_schema
+                    };
                 let (resolved_name, initial_alias) = match payload.name.clone() {
                     Some(name) => (
                         name.clone(),
@@ -2245,18 +2257,11 @@ impl HostHandle {
                         (effective, None)
                     }
                 };
-                let sanitized_settings = record.session_settings.clone().map(|stored_settings| {
-                    if stored_settings.0.is_empty() {
-                        return stored_settings;
-                    }
-                    let schema = session_settings_schema.as_ref().unwrap_or_else(|| {
-                        panic!(
-                            "session settings schema unavailable for backend {:?}",
-                            record.backend_kind
-                        )
-                    });
-                    sanitize_session_settings_values(schema, &stored_settings)
-                });
+                let (sanitized_settings, settings_failure) = sanitize_stored_session_settings(
+                    record.backend_kind,
+                    session_settings_schema.as_ref(),
+                    record.session_settings.clone(),
+                );
                 let combined_startup_warning = match (startup_warning, missing_project_warning) {
                     (Some(a), Some(b)) => Some(format!("{a}; {b}")),
                     (Some(a), None) => Some(a),
@@ -2286,12 +2291,16 @@ impl HostHandle {
                     cost_hint: None,
                     session_settings: sanitized_settings,
                     session_settings_schema,
+                    backend_config: resolve_backend_config_for_spawn(
+                        &host_settings,
+                        record.backend_kind,
+                    ),
                     startup_mcp_servers,
                     resolved_spawn_config,
                     resume_session_id: Some(session_id),
                     fork_from_session_id: None,
                     startup_warning: combined_startup_warning,
-                    startup_failure,
+                    startup_failure: startup_failure.or(settings_failure),
                     initial_alias,
                     use_mock_backend,
                 }
@@ -2346,6 +2355,7 @@ impl HostHandle {
                             cost_hint: None,
                             session_settings: None,
                             session_settings_schema: None,
+                            backend_config: Default::default(),
                             startup_mcp_servers: Vec::new(),
                             resolved_spawn_config,
                             resume_session_id: None,
@@ -2501,7 +2511,7 @@ impl HostHandle {
                     let state = self.state.lock().await;
                     session_schema_for_backend(&state, backend_kind)
                 };
-                let session_settings_schema = if backend_kind == protocol::BackendKind::Kiro
+                let session_settings_schema = if backend_has_dynamic_session_schema(backend_kind)
                     && session_settings_schema.is_none()
                 {
                     self.refresh_session_schemas().await;
@@ -2510,18 +2520,11 @@ impl HostHandle {
                 } else {
                     session_settings_schema
                 };
-                let sanitized_settings = record.session_settings.clone().map(|stored_settings| {
-                    if stored_settings.0.is_empty() {
-                        return stored_settings;
-                    }
-                    let schema = session_settings_schema.as_ref().unwrap_or_else(|| {
-                        panic!(
-                            "session settings schema unavailable for backend {:?}",
-                            backend_kind
-                        )
-                    });
-                    sanitize_session_settings_values(schema, &stored_settings)
-                });
+                let (sanitized_settings, settings_failure) = sanitize_stored_session_settings(
+                    backend_kind,
+                    session_settings_schema.as_ref(),
+                    record.session_settings.clone(),
+                );
                 let backend_support_failure = (!use_mock_backend
                     && !matches!(
                         backend_kind,
@@ -2551,7 +2554,8 @@ impl HostHandle {
                 let startup_failure = startup_failure
                     .or(parent_agent_mismatch_failure)
                     .or(non_resumable_failure)
-                    .or(backend_support_failure);
+                    .or(backend_support_failure)
+                    .or(settings_failure);
                 let combined_startup_warning = match (startup_warning, missing_project_warning) {
                     (Some(a), Some(b)) => Some(format!("{a}; {b}")),
                     (Some(a), None) => Some(a),
@@ -2598,6 +2602,10 @@ impl HostHandle {
                     cost_hint: None,
                     session_settings: sanitized_settings,
                     session_settings_schema,
+                    backend_config: resolve_backend_config_for_spawn(
+                        &host_settings,
+                        record.backend_kind,
+                    ),
                     startup_mcp_servers,
                     resolved_spawn_config,
                     resume_session_id: None,
@@ -2761,10 +2769,51 @@ impl HostHandle {
             }
             // No user config for this backend: the backend's built-in
             // tier mapping applies via the cost hint as before.
-            (_, None) => return request,
+            (_, None) => {
+                if backend_has_dynamic_session_schema(request.backend_kind)
+                    && request.session_settings_schema.is_none()
+                {
+                    let builtin = crate::backend::builtin_tier_config(request.backend_kind);
+                    let tier_values = tier_values_for_hint(hint, &builtin);
+                    if !tier_values.0.is_empty() {
+                        request.startup_failure = request.startup_failure.or_else(|| {
+                            session_settings_startup_failure(
+                                request.backend_kind,
+                                None,
+                                &tier_values,
+                                "complexity-tier",
+                            )
+                        });
+                        request.session_settings = None;
+                        request.cost_hint = None;
+                    }
+                }
+                return request;
+            }
             (protocol::SpawnCostHint::Low, Some(config)) => config.low.clone(),
             (protocol::SpawnCostHint::High, Some(config)) => config.high.clone(),
         };
+        if backend_has_dynamic_session_schema(request.backend_kind)
+            && request.session_settings_schema.is_none()
+        {
+            let mut merged = tier_values;
+            if let Some(explicit) = request.session_settings.take() {
+                apply_session_settings_update(&mut merged, &explicit);
+            }
+            if !merged.0.is_empty() {
+                request.startup_failure = request.startup_failure.or_else(|| {
+                    session_settings_startup_failure(
+                        request.backend_kind,
+                        None,
+                        &merged,
+                        "complexity-tier",
+                    )
+                });
+            }
+            request.session_settings = None;
+            request.cost_hint = None;
+            return request;
+        }
         let mut merged = match request.session_settings_schema.as_ref() {
             Some(schema) => sanitize_session_settings_values(schema, &tier_values),
             None => tier_values,
@@ -4812,12 +4861,24 @@ impl HostHandle {
     }
 
     pub(crate) async fn refresh_session_schemas(&self) {
-        let (settings_store, kiro_probe_program) = {
+        let (settings_store, kiro_probe_program, skip_real_backend_probe, prev_hermes_ready) = {
             let mut state = self.state.lock().await;
+            // Capture the last-known-good Hermes schema before resetting to
+            // Pending, so a transient probe failure below can fall back to it
+            // instead of marking the backend Unavailable (which would block
+            // resuming an already-working session).
+            let prev_hermes_ready = match &state.hermes_session_schema {
+                HermesSessionSchemaState::Ready(schema) => Some(schema.clone()),
+                HermesSessionSchemaState::Pending
+                | HermesSessionSchemaState::Unavailable(_) => None,
+            };
             state.kiro_session_schema = KiroSessionSchemaState::Pending;
+            state.hermes_session_schema = HermesSessionSchemaState::Pending;
             (
                 Arc::clone(&state.settings_store),
                 state.kiro_probe_program.clone(),
+                state.skip_real_backend_probe,
+                prev_hermes_ready,
             )
         };
         let enabled_backends = settings_store
@@ -4850,9 +4911,50 @@ impl HostHandle {
             KiroSessionSchemaState::Pending
         };
 
+        let hermes_session_schema = if enabled_backends.contains(&protocol::BackendKind::Hermes) {
+            if skip_real_backend_probe {
+                HermesSessionSchemaState::Ready(
+                    <crate::backend::hermes::HermesBackend as crate::backend::Backend>::session_settings_schema(),
+                )
+            } else {
+                let hermes_schema_or_last_good = |err: String| match prev_hermes_ready.clone() {
+                    Some(schema) => {
+                        tracing::warn!(
+                            "Hermes session schema probe failed ({err}); keeping last-known-good schema"
+                        );
+                        HermesSessionSchemaState::Ready(schema)
+                    }
+                    None => HermesSessionSchemaState::Unavailable(err),
+                };
+                match hermes_probe_workspace_root() {
+                    Ok(workspace_root) => {
+                        match crate::backend::hermes::probe_session_settings_schema(&[
+                            workspace_root,
+                        ])
+                        .await
+                        {
+                            Ok(schema) => HermesSessionSchemaState::Ready(schema),
+                            Err(err) => {
+                                tracing::error!("failed to refresh Hermes session schema: {err}");
+                                hermes_schema_or_last_good(err)
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("failed to resolve Hermes probe workspace root: {err}");
+                        hermes_schema_or_last_good(err)
+                    }
+                }
+            }
+        } else {
+            HermesSessionSchemaState::Pending
+        };
+
         let mut state = self.state.lock().await;
         state.kiro_session_schema = kiro_session_schema;
+        state.hermes_session_schema = hermes_session_schema;
         fan_out_session_schemas(&mut state).await;
+        fan_out_backend_config_schemas(&mut state).await;
     }
 
     pub(crate) async fn run_backend_setup(
@@ -6051,6 +6153,7 @@ impl HostHandle {
             cost_hint: None,
             session_settings: None,
             session_settings_schema: None,
+            backend_config: Default::default(),
             startup_mcp_servers,
             resolved_spawn_config,
             resume_session_id: None,
@@ -7841,14 +7944,15 @@ impl HostHandle {
             let state = self.state.lock().await;
             session_schema_for_backend(&state, backend_kind)
         };
-        let session_settings_schema =
-            if backend_kind == protocol::BackendKind::Kiro && session_settings_schema.is_none() {
-                self.refresh_session_schemas().await;
-                let state = self.state.lock().await;
-                session_schema_for_backend(&state, backend_kind)
-            } else {
-                session_settings_schema
-            };
+        let session_settings_schema = if backend_has_dynamic_session_schema(backend_kind)
+            && session_settings_schema.is_none()
+        {
+            self.refresh_session_schemas().await;
+            let state = self.state.lock().await;
+            session_schema_for_backend(&state, backend_kind)
+        } else {
+            session_settings_schema
+        };
         if let Some(instructions) = instructions
             && !instructions.trim().is_empty()
         {
@@ -7877,6 +7981,7 @@ impl HostHandle {
             cost_hint,
             session_settings: None,
             session_settings_schema,
+            backend_config: Default::default(),
             startup_mcp_servers,
             resolved_spawn_config,
             resume_session_id: None,
@@ -9086,6 +9191,7 @@ fn spawn_host_inner(
             workflow_run_store,
             mobile_access: mobile_access.clone(),
             kiro_session_schema: KiroSessionSchemaState::Pending,
+            hermes_session_schema: HermesSessionSchemaState::Pending,
             kiro_probe_program: runtime_config.kiro_probe_program.clone(),
             skip_real_backend_probe: runtime_config.skip_real_backend_probe,
             host_streams: HashMap::new(),
@@ -10660,6 +10766,10 @@ fn backend_system_tag(backend: BackendKind) -> (AgentSystemTagId, String) {
             AgentSystemTagId("system:backend:antigravity".to_owned()),
             "Antigravity".to_owned(),
         ),
+        BackendKind::Hermes => (
+            AgentSystemTagId("system:backend:hermes".to_owned()),
+            "Hermes".to_owned(),
+        ),
     }
 }
 
@@ -11362,6 +11472,64 @@ async fn fan_out_session_schemas(state: &mut HostState) {
     }
 }
 
+fn backend_config_schemas_for_enabled_backends(
+    enabled_backends: &[protocol::BackendKind],
+) -> Vec<protocol::BackendConfigSchema> {
+    enabled_backends
+        .iter()
+        .filter_map(|kind| crate::backend::backend_config_schema_for_backend(*kind))
+        .collect()
+}
+
+async fn fan_out_backend_config_schemas(state: &mut HostState) {
+    let enabled_backends = state
+        .settings_store
+        .lock()
+        .await
+        .get()
+        .unwrap_or_else(|err| {
+            panic!("failed to load host settings for backend config schemas: {err}")
+        })
+        .enabled_backends;
+    let schemas = backend_config_schemas_for_enabled_backends(&enabled_backends);
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_backend_config_schemas_for_subscriber(&schemas, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
+async fn emit_backend_config_schemas_for_subscriber(
+    schemas: &[protocol::BackendConfigSchema],
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    if subscriber.last_backend_config_schemas.as_deref() == Some(schemas) {
+        return Ok(());
+    }
+    let payload = serde_json::to_value(protocol::BackendConfigSchemasPayload {
+        schemas: schemas.to_vec(),
+    })
+    .expect("failed to serialize BackendConfigSchemas payload for host stream fanout");
+    subscriber
+        .stream
+        .send_value(FrameKind::BackendConfigSchemas, payload)?;
+    subscriber.last_backend_config_schemas = Some(schemas.to_vec());
+    Ok(())
+}
+
 async fn fan_out_backend_setup(state: &mut HostState, payload: BackendSetupPayload) {
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
@@ -11587,6 +11755,19 @@ async fn emit_session_schemas_for_subscriber(
     Ok(())
 }
 
+/// The persisted deep-config values to apply for a spawn of `backend_kind`,
+/// re-sanitized against the current schema. Empty when unconfigured.
+fn resolve_backend_config_for_spawn(
+    host_settings: &protocol::HostSettings,
+    backend_kind: protocol::BackendKind,
+) -> protocol::BackendConfigValues {
+    host_settings
+        .backend_config
+        .get(&backend_kind)
+        .map(|values| crate::backend::sanitize_backend_config_values(backend_kind, values))
+        .unwrap_or_default()
+}
+
 fn session_schema_for_backend(
     state: &HostState,
     backend_kind: protocol::BackendKind,
@@ -11596,8 +11777,81 @@ fn session_schema_for_backend(
             KiroSessionSchemaState::Ready(schema) => Some(schema.clone()),
             KiroSessionSchemaState::Pending | KiroSessionSchemaState::Unavailable(_) => None,
         },
+        protocol::BackendKind::Hermes => match &state.hermes_session_schema {
+            HermesSessionSchemaState::Ready(schema) => Some(schema.clone()),
+            HermesSessionSchemaState::Pending | HermesSessionSchemaState::Unavailable(_) => None,
+        },
         _ => Some(session_settings_schema_for_backend(backend_kind)),
     }
+}
+
+fn tier_values_for_hint(
+    hint: protocol::SpawnCostHint,
+    config: &protocol::BackendTierConfig,
+) -> protocol::SessionSettingsValues {
+    match hint {
+        protocol::SpawnCostHint::Low => config.low.clone(),
+        protocol::SpawnCostHint::Medium => protocol::SessionSettingsValues::default(),
+        protocol::SpawnCostHint::High => config.high.clone(),
+    }
+}
+
+fn session_settings_startup_failure(
+    backend_kind: protocol::BackendKind,
+    schema: Option<&SessionSettingsSchema>,
+    settings: &protocol::SessionSettingsValues,
+    source: &str,
+) -> Option<AgentStartupFailure> {
+    if settings.0.is_empty() {
+        return None;
+    }
+    let Some(schema) = schema else {
+        return Some(AgentStartupFailure::backend_failed(format!(
+            "{backend_kind:?} session settings schema unavailable; cannot apply {source} session settings"
+        )));
+    };
+    validate_session_settings_values(schema, settings)
+        .err()
+        .map(|err| {
+            AgentStartupFailure::internal(format!(
+                "invalid {source} session settings for backend {backend_kind:?}: {err}"
+            ))
+        })
+}
+
+fn sanitize_stored_session_settings(
+    backend_kind: protocol::BackendKind,
+    schema: Option<&SessionSettingsSchema>,
+    stored_settings: Option<protocol::SessionSettingsValues>,
+) -> (
+    Option<protocol::SessionSettingsValues>,
+    Option<AgentStartupFailure>,
+) {
+    let Some(stored_settings) = stored_settings else {
+        return (None, None);
+    };
+    if stored_settings.0.is_empty() {
+        return (Some(stored_settings), None);
+    }
+    let Some(schema) = schema else {
+        return (
+            None,
+            Some(AgentStartupFailure::backend_failed(format!(
+                "{backend_kind:?} session settings schema unavailable; cannot apply stored session settings"
+            ))),
+        );
+    };
+    (
+        Some(sanitize_session_settings_values(schema, &stored_settings)),
+        None,
+    )
+}
+
+fn backend_has_dynamic_session_schema(backend_kind: protocol::BackendKind) -> bool {
+    matches!(
+        backend_kind,
+        protocol::BackendKind::Kiro | protocol::BackendKind::Hermes
+    )
 }
 
 fn session_schema_entry_for_backend(
@@ -11611,6 +11865,16 @@ fn session_schema_entry_for_backend(
             },
             KiroSessionSchemaState::Pending => SessionSchemaEntry::Pending { backend_kind },
             KiroSessionSchemaState::Unavailable(message) => SessionSchemaEntry::Unavailable {
+                backend_kind,
+                message: message.clone(),
+            },
+        },
+        protocol::BackendKind::Hermes => match &state.hermes_session_schema {
+            HermesSessionSchemaState::Ready(schema) => SessionSchemaEntry::Ready {
+                schema: schema.clone(),
+            },
+            HermesSessionSchemaState::Pending => SessionSchemaEntry::Pending { backend_kind },
+            HermesSessionSchemaState::Unavailable(message) => SessionSchemaEntry::Unavailable {
                 backend_kind,
                 message: message.clone(),
             },
@@ -11633,6 +11897,10 @@ fn session_schemas_for_enabled_backends(
 }
 
 fn kiro_probe_workspace_root() -> Result<String, String> {
+    Ok(crate::paths::home_dir()?.to_string_lossy().into_owned())
+}
+
+fn hermes_probe_workspace_root() -> Result<String, String> {
     Ok(crate::paths::home_dir()?.to_string_lossy().into_owned())
 }
 
@@ -11906,6 +12174,7 @@ mod tests {
             backend_tier_configs: HashMap::new(),
             background_agent_features: Default::default(),
             code_intel: Default::default(),
+            backend_config: HashMap::new(),
         };
         let debug_mcp = DebugMcpHandle { url: String::new() };
         let agent_control = AgentControlMcpHandle { url: String::new() };
@@ -12024,6 +12293,51 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dynamic_session_schema_unavailable_rejects_explicit_settings() {
+        let mut settings = protocol::SessionSettingsValues::default();
+        settings.0.insert(
+            "model".to_string(),
+            protocol::SessionSettingValue::String("anthropic/claude-haiku-4.5".to_string()),
+        );
+
+        let failure =
+            session_settings_startup_failure(BackendKind::Hermes, None, &settings, "supplied")
+                .expect("non-empty settings without schema should fail");
+
+        assert_eq!(failure.code, protocol::AgentErrorCode::BackendFailed);
+        assert!(
+            failure
+                .message
+                .contains("session settings schema unavailable"),
+            "unexpected failure message: {}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn dynamic_session_schema_unavailable_rejects_stored_settings() {
+        let mut settings = protocol::SessionSettingsValues::default();
+        settings.0.insert(
+            "model".to_string(),
+            protocol::SessionSettingValue::String("anthropic/claude-haiku-4.5".to_string()),
+        );
+
+        let (sanitized, failure) =
+            sanitize_stored_session_settings(BackendKind::Hermes, None, Some(settings));
+
+        assert!(sanitized.is_none());
+        let failure = failure.expect("stored settings without schema should fail");
+        assert_eq!(failure.code, protocol::AgentErrorCode::BackendFailed);
+        assert!(
+            failure
+                .message
+                .contains("session settings schema unavailable"),
+            "unexpected failure message: {}",
+            failure.message
+        );
     }
 
     #[test]

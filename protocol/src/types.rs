@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -395,13 +395,14 @@ pub enum BackendKind {
     Claude,
     Codex,
     Antigravity,
+    Hermes,
 }
 
 impl BackendKind {
     pub const fn supports_image_input(self) -> bool {
         match self {
             Self::Kiro | Self::Claude | Self::Codex => true,
-            Self::Tycode | Self::Antigravity => false,
+            Self::Tycode | Self::Antigravity | Self::Hermes => false,
         }
     }
 }
@@ -633,6 +634,7 @@ pub enum FrameKind {
     CommandError,
     SessionSchemas,
     SessionSettings,
+    BackendConfigSchemas,
     MobileAccessState,
     MobilePairingOffer,
     ReviewCreate,
@@ -797,6 +799,7 @@ impl fmt::Display for FrameKind {
             Self::SetSessionSettings => f.write_str("set_session_settings"),
             Self::SessionSchemas => f.write_str("session_schemas"),
             Self::SessionSettings => f.write_str("session_settings"),
+            Self::BackendConfigSchemas => f.write_str("backend_config_schemas"),
             Self::MobileAccessState => f.write_str("mobile_access_state"),
             Self::MobilePairingOffer => f.write_str("mobile_pairing_offer"),
             Self::ReviewCreate => f.write_str("review_create"),
@@ -1123,6 +1126,8 @@ pub struct HostBootstrapPayload {
     pub mobile_access: MobileAccessStatePayload,
     pub backend_setup: BackendSetupPayload,
     pub session_schemas: Vec<SessionSchemaEntry>,
+    #[serde(default)]
+    pub backend_config_schemas: Vec<BackendConfigSchema>,
     pub sessions: Vec<SessionSummary>,
     pub projects: Vec<Project>,
     pub mcp_servers: Vec<McpServerConfig>,
@@ -1692,6 +1697,12 @@ pub struct HostSettings {
     pub background_agent_features: BackgroundAgentFeaturesSettings,
     #[serde(default)]
     pub code_intel: CodeIntelSettings,
+    /// Per-backend deep configuration (e.g. Hermes default model/provider).
+    /// Host-level and persistent, distinct from lightweight per-session
+    /// settings. Keys/values are described by each backend's
+    /// [`BackendConfigSchema`]. Backends without an entry use their defaults.
+    #[serde(default)]
+    pub backend_config: HashMap<BackendKind, BackendConfigValues>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1798,11 +1809,88 @@ pub enum HostSettingValue {
         provider: CodeIntelProviderId,
         path: Option<HostExecutablePath>,
     },
+    /// Replace the full deep-configuration value set for one backend. An empty
+    /// `values` map clears the backend's configuration.
+    BackendConfig {
+        backend: BackendKind,
+        values: BackendConfigValues,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSettingsPayload {
     pub settings: HostSettings,
+}
+
+/// Deep, host-level configuration schema for one backend. Rendered in the
+/// settings panel (not the per-session settings bar). The frontend
+/// auto-generates form controls from `fields`, exactly like
+/// [`SessionSettingsSchema`], but with a richer field-type set (free text,
+/// secrets) suited to setup/configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendConfigSchema {
+    pub backend_kind: BackendKind,
+    pub fields: Vec<BackendConfigField>,
+}
+
+/// One configurable field in a backend's deep configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendConfigField {
+    /// Machine-readable key, e.g. "default_model".
+    pub key: String,
+    /// Human-readable label for the UI.
+    pub label: String,
+    /// Optional description shown as help text.
+    pub description: Option<String>,
+    /// The type and constraints of this field.
+    pub field_type: BackendConfigFieldType,
+}
+
+/// The type of a backend-config field. Determines how the frontend renders it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BackendConfigFieldType {
+    /// Free-text single- or multi-line input.
+    Text {
+        #[serde(default)]
+        default: Option<String>,
+        #[serde(default)]
+        placeholder: Option<String>,
+        #[serde(default)]
+        multiline: bool,
+    },
+    /// Masked secret input. Never pre-filled with the stored value on render.
+    Secret {
+        #[serde(default)]
+        placeholder: Option<String>,
+    },
+    Select {
+        options: Vec<SelectOption>,
+        default: Option<String>,
+        nullable: bool,
+    },
+    Toggle {
+        default: bool,
+    },
+    Integer {
+        min: i64,
+        max: i64,
+        step: i64,
+        default: i64,
+    },
+}
+
+/// Current deep-configuration values for one backend.
+/// Keys match `BackendConfigField.key`. Values reuse the session-setting value
+/// enum (`String`/`Bool`/`Integer`/`Null`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendConfigValues(pub HashMap<String, SessionSettingValue>);
+
+/// Server → Client on host stream. Carries deep-config schemas for every
+/// enabled backend that exposes one (backends without deep config are omitted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendConfigSchemasPayload {
+    pub schemas: Vec<BackendConfigSchema>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5057,8 +5145,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_four() {
-        assert_eq!(PROTOCOL_VERSION, 24);
+    fn protocol_version_is_twenty_five() {
+        assert_eq!(PROTOCOL_VERSION, 25);
     }
 
     #[test]

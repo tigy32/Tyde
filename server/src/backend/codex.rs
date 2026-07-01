@@ -8398,6 +8398,7 @@ for line in sys.stdin:
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     code_intel: Default::default(),
+                    backend_config: std::collections::HashMap::new(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: MobileBrokerStatus::Disabled,
@@ -8406,6 +8407,7 @@ for line in sys.stdin:
                 },
                 backend_setup: BackendSetupPayload { backends: vec![] },
                 session_schemas: vec![],
+                backend_config_schemas: vec![],
                 sessions: vec![],
                 projects: vec![],
                 mcp_servers: vec![],
