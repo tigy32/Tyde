@@ -11257,6 +11257,10 @@ async fn ensure_project_actor(
         return Ok(subscription.handle.clone());
     }
 
+    if let Some(mut router) = state.code_intel_routers.remove(&project_id) {
+        router.shutdown_all();
+    }
+
     if let Some(subscription) = state.project_streams.remove(&project_id) {
         subscription.task.abort();
     }
@@ -11302,18 +11306,14 @@ async fn emit_review_list_changed_for_project(
 }
 
 async fn fan_out_host_settings(state: &mut HostState, settings: protocol::HostSettings) {
-    match sync_code_intel_router_roots(state).await {
-        Ok(()) => {
-            for router in state.code_intel_routers.values_mut() {
-                router.update_settings(settings.code_intel.clone());
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "skipping code-intel settings fanout after router pruning failed"
-            );
-        }
+    if let Err(error) = sync_code_intel_router_roots(state).await {
+        tracing::warn!(
+            error = %error,
+            "continuing code-intel settings fanout after router pruning failed"
+        );
+    }
+    for router in state.code_intel_routers.values_mut() {
+        router.update_settings(settings.code_intel.clone());
     }
 
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
@@ -12413,6 +12413,118 @@ mod tests {
         assert!(
             !state.code_intel_routers.contains_key(&project_id),
             "project deletion must drop the code-intel router"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_project_stream_recreates_code_intel_router_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_root = dir.path().join("project-root");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        let host = spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("spawn host");
+
+        host.create_project(ProjectCreatePayload {
+            name: "Restarted Project Stream".to_owned(),
+            roots: vec![ProjectRootPath(project_root.to_string_lossy().into_owned())],
+        })
+        .await
+        .expect("create project");
+        let project_id = {
+            let state = host.state.lock().await;
+            state
+                .project_store
+                .lock()
+                .await
+                .list()
+                .expect("list projects")
+                .into_iter()
+                .find(|project| project.name == "Restarted Project Stream")
+                .expect("created project")
+                .id
+        };
+
+        host.warm_code_intel_project(project_id.clone(), "test")
+            .await
+            .expect("warm code-intel project");
+        let old_handle = {
+            let state = host.state.lock().await;
+            let handle = state
+                .project_streams
+                .get(&project_id)
+                .expect("project stream exists")
+                .handle
+                .clone();
+            assert!(
+                state
+                    .code_intel_routers
+                    .get(&project_id)
+                    .expect("router exists")
+                    .uses_project_handle_for_test(&handle),
+                "router should start with the active project stream handle"
+            );
+            state
+                .project_streams
+                .get(&project_id)
+                .expect("project stream exists")
+                .task
+                .abort();
+            handle
+        };
+
+        for _ in 0..100 {
+            let finished = {
+                let state = host.state.lock().await;
+                state
+                    .project_streams
+                    .get(&project_id)
+                    .expect("project stream exists")
+                    .task
+                    .is_finished()
+            };
+            if finished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        {
+            let state = host.state.lock().await;
+            assert!(
+                state
+                    .project_streams
+                    .get(&project_id)
+                    .expect("project stream exists")
+                    .task
+                    .is_finished(),
+                "aborted project stream should finish before restart"
+            );
+        }
+
+        host.warm_code_intel_project(project_id.clone(), "test")
+            .await
+            .expect("warm code-intel project after stream restart");
+
+        let state = host.state.lock().await;
+        let new_handle = &state
+            .project_streams
+            .get(&project_id)
+            .expect("project stream restarted")
+            .handle;
+        assert!(
+            !new_handle.same_channel_for_test(&old_handle),
+            "project stream restart should replace the handle"
+        );
+        assert!(
+            state
+                .code_intel_routers
+                .get(&project_id)
+                .expect("router recreated")
+                .uses_project_handle_for_test(new_handle),
+            "router must use the replacement project stream handle"
         );
     }
 

@@ -585,6 +585,7 @@ impl RaActor {
                 // already-open file: the contents changed under us, so any
                 // in-flight resolution is stale and must restart (M3 version
                 // supersession).
+                let resubscribe = self.files.contains_key(&path);
                 let version_changed = match self.files.get_mut(&path) {
                     // Re-subscribe of an already-tracked file: retarget the
                     // version + output stream. Preserve the `didOpen` text we
@@ -596,6 +597,7 @@ impl RaActor {
                         existing.version = version;
                         existing.version_cell.store(version.0, Ordering::SeqCst);
                         existing.output = output;
+                        existing.model_version = None;
                         changed
                     }
                     None => {
@@ -613,6 +615,9 @@ impl RaActor {
                         false
                     }
                 };
+                if resubscribe {
+                    self.last_file_statuses.remove(&path);
+                }
                 match self.phase {
                     Phase::Cold => match self.start().await {
                         Ok(()) => {
@@ -3480,6 +3485,71 @@ mod tests {
         assert!(
             methods.iter().any(|method| method == "shutdown"),
             "shutdown command must drive LSP shutdown request, got {methods:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resubscribe_same_version_new_stream_replays_status_and_model() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = ProjectRootPath(dir.path().to_string_lossy().into_owned());
+        let path = ProjectPath {
+            root: root.clone(),
+            relative_path: "main.rs".to_owned(),
+        };
+        let text = "fn main() {}\n";
+        std::fs::write(dir.path().join("main.rs"), text).expect("write main.rs");
+        let mut responses = HashMap::new();
+        responses.insert(
+            "textDocument/semanticTokens/full".to_owned(),
+            json!({"data": []}),
+        );
+        let (mut actor, _captured, _old_stream, mut old_rx) =
+            ready_actor_with_fake_lsp(&root, &path, text, responses);
+
+        actor.files.get_mut(&path).expect("file").model_version = Some(ProjectFileVersion(1));
+        actor.last_file_statuses.insert(
+            path.clone(),
+            CodeIntelStatusPayload {
+                scope: CodeIntelStatusScope::File {
+                    path: path.clone(),
+                    version: ProjectFileVersion(1),
+                },
+                state: CodeIntelState::Ready,
+                resource_mode: CodeIntelResourceMode::Full,
+                work_done: None,
+                total_work: None,
+                message: None,
+            },
+        );
+
+        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
+        let new_stream = Stream::new(StreamPath("/project/p".to_owned()), new_tx);
+        actor
+            .handle_command(RaCommand::Subscribe {
+                path: path.clone(),
+                version: ProjectFileVersion(1),
+                output: new_stream,
+            })
+            .await;
+
+        let status: CodeIntelStatusPayload =
+            recv_frame(&mut new_rx, FrameKind::CodeIntelStatus).await;
+        assert_eq!(status.state, CodeIntelState::Ready);
+        assert_eq!(
+            status.scope,
+            CodeIntelStatusScope::File {
+                path: path.clone(),
+                version: ProjectFileVersion(1)
+            }
+        );
+
+        let model: CodeIntelFileModelPayload =
+            recv_frame(&mut new_rx, FrameKind::CodeIntelFileModel).await;
+        assert_eq!(model.path, path);
+        assert_eq!(model.version, ProjectFileVersion(1));
+        assert!(
+            old_rx.try_recv().is_err(),
+            "replay should target the new subscriber stream"
         );
     }
 

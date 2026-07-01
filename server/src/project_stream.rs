@@ -195,6 +195,11 @@ impl ProjectStreamHandle {
         Self { tx }
     }
 
+    #[cfg(test)]
+    pub(crate) fn same_channel_for_test(&self, other: &Self) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+
     pub(crate) async fn add_subscriber(
         &self,
         host_path: StreamPath,
@@ -458,6 +463,7 @@ async fn run_project_subscription(
     // broadcast. The project-stream actor is the single owner of the counter,
     // so this is the one fan-out point for "a watched file's version changed."
     let mut file_version_listeners = Vec::<mpsc::UnboundedSender<FileVersionChange>>::new();
+    let mut pending_file_version_changes = HashMap::<ProjectPath, ProjectFileVersion>::new();
     let mut pending_update = PendingProjectUpdate::default();
     let mut debounce_active = false;
     let mut debounce_sleep = Box::pin(sleep(Duration::from_secs(60 * 60 * 24 * 365)));
@@ -668,36 +674,9 @@ async fn run_project_subscription(
                         // resolution. The counter stays single and authoritative;
                         // there is no second counter and no double-bump.
                         let changes = bump_watched_paths(&project, &event, &mut file_versions);
-                        notify_file_version_listeners(&mut file_version_listeners, &changes);
-                        // §M4: also tell the *frontend* which files advanced, so
-                        // it can re-read any it has open and keep its rendered
-                        // version (and the version it stamps on code-intel
-                        // queries) in step with the server. The internal
-                        // listener broadcast above only reaches the code-intel
-                        // services; nothing else re-syncs the client's copy.
-                        if !changes.is_empty() {
-                            let files = changes
-                                .iter()
-                                .map(|change| ProjectFileVersionChange {
-                                    path: change.path.clone(),
-                                    version: change.version,
-                                })
-                                .collect();
-                            if let Err(error) = broadcast_project_event(
-                                &mut subscribers,
-                                &ProjectEventPayload::FilesChanged { files },
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    project_id = %project_id,
-                                    error = %error,
-                                    "failed to broadcast file-version changes to subscribers"
-                                );
-                            }
-                        }
+                        merge_file_version_changes(&mut pending_file_version_changes, changes);
                         let refresh = classify_watch_event(&event);
-                        if !refresh.is_empty() {
+                        if !refresh.is_empty() || !pending_file_version_changes.is_empty() {
                             pending_update.merge(refresh);
                             debounce_active = true;
                             debounce_sleep.as_mut().reset(Instant::now() + PROJECT_REFRESH_DEBOUNCE);
@@ -742,6 +721,34 @@ async fn run_project_subscription(
                     tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after debounced refresh failure");
                     emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
                     return;
+                }
+                let changes = take_pending_file_version_changes(&mut pending_file_version_changes);
+                notify_file_version_listeners(&mut file_version_listeners, &changes);
+                // §M4: also tell the *frontend* which files advanced, so it can
+                // re-read any it has open and keep its rendered version (and the
+                // version it stamps on code-intel queries) in step with the
+                // server. The internal listener broadcast above only reaches the
+                // code-intel services; nothing else re-syncs the client's copy.
+                if !changes.is_empty() {
+                    let files = changes
+                        .iter()
+                        .map(|change| ProjectFileVersionChange {
+                            path: change.path.clone(),
+                            version: change.version,
+                        })
+                        .collect();
+                    if let Err(error) = broadcast_project_event(
+                        &mut subscribers,
+                        &ProjectEventPayload::FilesChanged { files },
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            project_id = %project_id,
+                            error = %error,
+                            "failed to broadcast file-version changes to subscribers"
+                        );
+                    }
                 }
             }
             _ = git_poll.tick() => {
@@ -1169,15 +1176,38 @@ fn notify_file_version_listeners(
     });
 }
 
+fn merge_file_version_changes(
+    pending: &mut HashMap<ProjectPath, ProjectFileVersion>,
+    changes: Vec<FileVersionChange>,
+) {
+    for change in changes {
+        pending.insert(change.path, change.version);
+    }
+}
+
+fn take_pending_file_version_changes(
+    pending: &mut HashMap<ProjectPath, ProjectFileVersion>,
+) -> Vec<FileVersionChange> {
+    let mut changes = pending
+        .drain()
+        .map(|(path, version)| FileVersionChange { path, version })
+        .collect::<Vec<_>>();
+    changes.sort_by(|left, right| {
+        left.path
+            .root
+            .0
+            .cmp(&right.path.root.0)
+            .then_with(|| left.path.relative_path.cmp(&right.path.relative_path))
+    });
+    changes
+}
+
 fn classify_watch_event(event: &Event) -> PendingProjectUpdate {
     let mut refresh = PendingProjectUpdate::default();
-    if !watch_event_changes_contents(event) {
-        return refresh;
-    }
     for path in &event.paths {
-        if is_git_head_or_index(path) {
+        if is_git_head_or_index(path) && watch_event_refreshes_git_metadata(event) {
             refresh.git = true;
-        } else if !is_inside_git(path) {
+        } else if !is_inside_git(path) && watch_event_changes_contents(event) {
             refresh.files = true;
             refresh.git = true;
         }
@@ -1195,6 +1225,10 @@ fn watch_event_changes_contents(event: &Event) -> bool {
         | EventKind::Remove(_)
         | EventKind::Other => true,
     }
+}
+
+fn watch_event_refreshes_git_metadata(event: &Event) -> bool {
+    !matches!(event.kind, EventKind::Access(_))
 }
 
 fn is_inside_git(path: &Path) -> bool {
@@ -3963,6 +3997,67 @@ new mode 100755\n";
     }
 
     #[test]
+    fn git_index_metadata_event_refreshes_git_without_code_intel_bump() {
+        let project = test_project("/repo");
+        let mut versions = HashMap::new();
+        let event = watch_event_kind(
+            EventKind::Modify(notify::event::ModifyKind::Metadata(
+                notify::event::MetadataKind::WriteTime,
+            )),
+            vec![PathBuf::from("/repo/.git/index")],
+        );
+
+        let changes = bump_watched_paths(&project, &event, &mut versions);
+        let refresh = classify_watch_event(&event);
+
+        assert!(changes.is_empty());
+        assert!(versions.is_empty());
+        assert!(refresh.git, ".git/index metadata should refresh git status");
+        assert!(!refresh.files);
+    }
+
+    #[test]
+    fn git_index_access_event_does_not_refresh_or_bump_code_intel() {
+        let project = test_project("/repo");
+        let mut versions = HashMap::new();
+        let event = watch_event_kind(
+            EventKind::Access(notify::event::AccessKind::Read),
+            vec![
+                PathBuf::from("/repo/.git/index"),
+                PathBuf::from("/repo/.git/HEAD"),
+            ],
+        );
+
+        let changes = bump_watched_paths(&project, &event, &mut versions);
+        let refresh = classify_watch_event(&event);
+
+        assert!(changes.is_empty());
+        assert!(versions.is_empty());
+        assert!(!refresh.git);
+        assert!(!refresh.files);
+    }
+
+    #[test]
+    fn source_metadata_event_does_not_refresh_or_bump_code_intel() {
+        let project = test_project("/repo");
+        let mut versions = HashMap::new();
+        let event = watch_event_kind(
+            EventKind::Modify(notify::event::ModifyKind::Metadata(
+                notify::event::MetadataKind::WriteTime,
+            )),
+            vec![PathBuf::from("/repo/src/main.rs")],
+        );
+
+        let changes = bump_watched_paths(&project, &event, &mut versions);
+        let refresh = classify_watch_event(&event);
+
+        assert!(changes.is_empty());
+        assert!(versions.is_empty());
+        assert!(!refresh.git);
+        assert!(!refresh.files);
+    }
+
+    #[test]
     fn content_watch_events_bump_versions_and_coalesce_duplicate_paths() {
         let project = test_project("/repo");
         let mut versions = HashMap::new();
@@ -4000,6 +4095,48 @@ new mode 100755\n";
             &mut versions,
         );
         assert_eq!(remove[0].version, ProjectFileVersion(3));
+    }
+
+    #[test]
+    fn separate_content_events_coalesce_to_latest_pending_version() {
+        let project = test_project("/repo");
+        let mut versions = HashMap::new();
+        let mut pending = HashMap::new();
+        let file = PathBuf::from("/repo/src/main.rs");
+
+        let first = bump_watched_paths(
+            &project,
+            &watch_event_kind(
+                EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )),
+                vec![file.clone()],
+            ),
+            &mut versions,
+        );
+        merge_file_version_changes(&mut pending, first);
+
+        let second = bump_watched_paths(
+            &project,
+            &watch_event_kind(
+                EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )),
+                vec![file],
+            ),
+            &mut versions,
+        );
+        merge_file_version_changes(&mut pending, second);
+
+        let changes = take_pending_file_version_changes(&mut pending);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path.relative_path, "src/main.rs");
+        assert_eq!(
+            changes[0].version,
+            ProjectFileVersion(2),
+            "both edits advance the counter, but one latest change is broadcast"
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]

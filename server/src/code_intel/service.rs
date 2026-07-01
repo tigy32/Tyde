@@ -481,6 +481,11 @@ impl CodeIntelRouter {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn uses_project_handle_for_test(&self, handle: &ProjectStreamHandle) -> bool {
+        self.project_handle.same_channel_for_test(handle)
+    }
+
     fn service_for(&mut self, root: &ProjectRootPath) -> &CodeIntelServiceHandle {
         let project_handle = self.project_handle.clone();
         let resource_mode = self.resource_mode;
