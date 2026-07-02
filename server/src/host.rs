@@ -4612,6 +4612,31 @@ impl HostHandle {
 
     pub(crate) async fn set_setting(&self, payload: SetSettingPayload) -> AppResult<()> {
         const OPERATION: &str = "set_setting";
+        if let protocol::HostSettingValue::BackendConfig { backend, values } = &payload.setting
+            && *backend == BackendKind::Tycode
+        {
+            let incoming = crate::backend::sanitize_backend_config_values(*backend, values);
+            let settings_store = {
+                let state = self.state.lock().await;
+                Arc::clone(&state.settings_store)
+            };
+            let previous = settings_store
+                .lock()
+                .await
+                .get()
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?
+                .backend_config
+                .get(backend)
+                .map(|values| crate::backend::sanitize_backend_config_values(*backend, values))
+                .unwrap_or_default();
+            let values = crate::backend::tycode::tycode_backend_config_persistence_values(
+                &incoming, &previous,
+            );
+            crate::backend::tycode::persist_backend_config(values)
+                .await
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        }
+
         let mut state = self.state.lock().await;
         let refresh_session_schemas = matches!(
             &payload.setting,

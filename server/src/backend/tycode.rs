@@ -164,7 +164,9 @@ fn tycode_backend_config_schema() -> BackendConfigSchema {
                 description: Some(
                     "Existing Tycode provider name to activate for new sessions. Tyde validates \
                      the name against Tycode's returned providers and never edits provider \
-                     secrets or creates providers."
+                     secrets or creates providers. Blank removes the Tyde-managed provider \
+                     override; Tycode's current setting is preserved unless this field was \
+                     previously saved through Tyde."
                         .to_string(),
                 ),
                 field_type: BackendConfigFieldType::Text {
@@ -177,8 +179,9 @@ fn tycode_backend_config_schema() -> BackendConfigSchema {
                 key: "model_quality".to_string(),
                 label: "Model Quality".to_string(),
                 description: Some(
-                    "Global Tycode model cost/quality ceiling. Auto leaves the Tycode setting \
-                     unchanged."
+                    "Global Tycode model cost/quality ceiling. Auto removes the Tyde-managed \
+                     override; Tycode's current setting is preserved unless this field was \
+                     previously saved through Tyde."
                         .to_string(),
                 ),
                 field_type: BackendConfigFieldType::Select {
@@ -197,7 +200,9 @@ fn tycode_backend_config_schema() -> BackendConfigSchema {
                 key: "reasoning_effort".to_string(),
                 label: "Reasoning Effort".to_string(),
                 description: Some(
-                    "Global Tycode reasoning effort. Auto leaves the Tycode setting unchanged."
+                    "Global Tycode reasoning effort. Auto removes the Tyde-managed override; \
+                     Tycode's current setting is preserved unless this field was previously saved \
+                     through Tyde."
                         .to_string(),
                 ),
                 field_type: BackendConfigFieldType::Select {
@@ -217,7 +222,8 @@ fn tycode_backend_config_schema() -> BackendConfigSchema {
                 label: "Autonomy Level".to_string(),
                 description: Some(
                     "Controls whether Tycode must ask for plan approval before implementing. \
-                     Auto leaves the Tycode setting unchanged."
+                     Auto removes the Tyde-managed override; Tycode's current setting is preserved \
+                     unless this field was previously saved through Tyde."
                         .to_string(),
                 ),
                 field_type: BackendConfigFieldType::Select {
@@ -234,7 +240,8 @@ fn tycode_backend_config_schema() -> BackendConfigSchema {
                 label: "Review Level".to_string(),
                 description: Some(
                     "Controls Tycode's built-in review-agent behavior for completed coder tasks. \
-                     Auto leaves the Tycode setting unchanged."
+                     Auto removes the Tyde-managed override; Tycode's current setting is preserved \
+                     unless this field was previously saved through Tyde."
                         .to_string(),
                 ),
                 field_type: BackendConfigFieldType::Select {
@@ -248,7 +255,8 @@ fn tycode_backend_config_schema() -> BackendConfigSchema {
                 label: "Spawn Context Mode".to_string(),
                 description: Some(
                     "Controls whether spawned Tycode sub-agents inherit parent conversation \
-                     context. Auto leaves the Tycode setting unchanged."
+                     context. Auto removes the Tyde-managed override; Tycode's current setting is \
+                     preserved unless this field was previously saved through Tyde."
                         .to_string(),
                 ),
                 field_type: BackendConfigFieldType::Select {
@@ -277,9 +285,16 @@ struct TycodeSettingsOverlay {
     active_provider_change: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TycodeSettingsOverlayMode {
+    SessionRuntime,
+    PersistentSettingsPanel,
+}
+
 fn apply_tycode_backend_config_overlay(
     current_settings: &Value,
     config: &BackendConfigValues,
+    mode: TycodeSettingsOverlayMode,
 ) -> Result<TycodeSettingsOverlay, String> {
     let mut settings = current_settings.clone();
     let object = settings
@@ -318,6 +333,11 @@ fn apply_tycode_backend_config_overlay(
                     Value::String(provider.to_string()),
                 );
             }
+            ("active_provider", SessionSettingValue::Null) => {
+                if mode == TycodeSettingsOverlayMode::PersistentSettingsPanel {
+                    object.insert("active_provider".to_string(), Value::Null);
+                }
+            }
             ("model_quality", SessionSettingValue::String(model_quality)) => {
                 object.insert(
                     "model_quality".to_string(),
@@ -325,6 +345,9 @@ fn apply_tycode_backend_config_overlay(
                 );
             }
             ("model_quality", SessionSettingValue::Null) => {
+                if mode == TycodeSettingsOverlayMode::PersistentSettingsPanel {
+                    object.insert("model_quality".to_string(), Value::Null);
+                }
                 continue;
             }
             ("reasoning_effort", SessionSettingValue::String(reasoning_effort)) => {
@@ -334,6 +357,9 @@ fn apply_tycode_backend_config_overlay(
                 );
             }
             ("reasoning_effort", SessionSettingValue::Null) => {
+                if mode == TycodeSettingsOverlayMode::PersistentSettingsPanel {
+                    object.insert("reasoning_effort".to_string(), Value::Null);
+                }
                 continue;
             }
             (
@@ -346,10 +372,15 @@ fn apply_tycode_backend_config_overlay(
                 "autonomy_level" | "review_level" | "spawn_context_mode",
                 SessionSettingValue::Null,
             ) => {
+                if mode == TycodeSettingsOverlayMode::PersistentSettingsPanel {
+                    object.insert(key.clone(), tycode_managed_setting_default(key));
+                }
                 continue;
             }
             ("active_provider", _) => {
-                return Err("Tycode active_provider backend config must be a string".to_string());
+                return Err(
+                    "Tycode active_provider backend config must be a string or null".to_string(),
+                );
             }
             ("model_quality" | "reasoning_effort", _) => {
                 return Err(format!(
@@ -371,9 +402,44 @@ fn apply_tycode_backend_config_overlay(
     })
 }
 
+const TYCODE_MANAGED_SETTINGS: &[&str] = &[
+    "active_provider",
+    "model_quality",
+    "reasoning_effort",
+    "autonomy_level",
+    "review_level",
+    "spawn_context_mode",
+];
+
+fn tycode_managed_setting_default(key: &str) -> Value {
+    match key {
+        "active_provider" | "model_quality" | "reasoning_effort" => Value::Null,
+        "autonomy_level" => Value::String("plan_approval_required".to_string()),
+        "review_level" => Value::String("None".to_string()),
+        "spawn_context_mode" => Value::String("Fork".to_string()),
+        _ => unreachable!("unmanaged Tycode setting default requested: {key}"),
+    }
+}
+
+pub(crate) fn tycode_backend_config_persistence_values(
+    incoming: &BackendConfigValues,
+    previous: &BackendConfigValues,
+) -> BackendConfigValues {
+    let mut values = incoming.clone();
+    for key in TYCODE_MANAGED_SETTINGS {
+        if !incoming.0.contains_key(*key) && previous.0.contains_key(*key) {
+            values
+                .0
+                .insert((*key).to_string(), SessionSettingValue::Null);
+        }
+    }
+    values
+}
+
 enum TycodeStartupFollowUp {
     InitialUserInput(String),
     ResumeSession { session_id: String },
+    None,
 }
 
 enum TycodeStartupPhase {
@@ -399,14 +465,20 @@ struct TycodeStartupController {
     backend_config: BackendConfigValues,
     phase: TycodeStartupPhase,
     follow_up: TycodeStartupFollowUp,
+    persist_settings: bool,
 }
 
 impl TycodeStartupController {
-    fn new(backend_config: BackendConfigValues, follow_up: TycodeStartupFollowUp) -> Self {
+    fn new(
+        backend_config: BackendConfigValues,
+        follow_up: TycodeStartupFollowUp,
+        persist_settings: bool,
+    ) -> Self {
         Self {
             backend_config,
             phase: TycodeStartupPhase::AwaitSessionStarted,
             follow_up,
+            persist_settings,
         }
     }
 
@@ -418,7 +490,7 @@ impl TycodeStartupController {
         match &mut self.phase {
             TycodeStartupPhase::AwaitSessionStarted => {
                 if tycode_session_started(value).is_some() {
-                    if self.backend_config.0.is_empty() {
+                    if self.backend_config.0.is_empty() && !self.persist_settings {
                         self.send_follow_up(stdin_tx)?;
                         self.phase = TycodeStartupPhase::Complete;
                         return Ok(TycodeStartupObservation::Completed);
@@ -435,17 +507,22 @@ impl TycodeStartupController {
                     ));
                 }
                 if let Some(settings) = tycode_settings_data(value) {
-                    let overlay =
-                        apply_tycode_backend_config_overlay(settings, &self.backend_config)
-                            .map_err(|err| {
-                                format!("Failed to apply Tycode settings overlay: {err}")
-                            })?;
+                    let overlay = apply_tycode_backend_config_overlay(
+                        settings,
+                        &self.backend_config,
+                        if self.persist_settings {
+                            TycodeSettingsOverlayMode::PersistentSettingsPanel
+                        } else {
+                            TycodeSettingsOverlayMode::SessionRuntime
+                        },
+                    )
+                    .map_err(|err| format!("Failed to apply Tycode settings overlay: {err}"))?;
                     send_tycode_json(
                         stdin_tx,
                         serde_json::json!({
                             "SaveSettings": {
                                 "settings": overlay.settings.clone(),
-                                "persist": false,
+                                "persist": self.persist_settings,
                             }
                         }),
                     )?;
@@ -518,6 +595,7 @@ impl TycodeStartupController {
                 )?;
                 send_tycode_json(stdin_tx, Value::String("ListSessions".to_string()))
             }
+            TycodeStartupFollowUp::None => Ok(()),
         }
     }
 
@@ -568,6 +646,151 @@ async fn await_tycode_startup(
             ))
         }
     }
+}
+
+pub(crate) async fn persist_backend_config(values: BackendConfigValues) -> Result<(), String> {
+    if values.0.is_empty() {
+        return Ok(());
+    }
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
+    let startup_status = new_tycode_startup_status();
+    let startup_status_task = Arc::clone(&startup_status);
+
+    tokio::spawn(async move {
+        let roots_json = serde_json::json!([]).to_string();
+        let subprocess_bin = match subprocess_bin() {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!("{err}");
+                let _ = ready_tx.send(Err(err));
+                return;
+            }
+        };
+        let mut command = Command::new(&subprocess_bin);
+        command.arg("--workspace-roots").arg(&roots_json);
+        if let Some(path) = process_env::resolved_child_process_path() {
+            command.env("PATH", path);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match command.group_spawn() {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::error!("Failed to spawn tycode-subprocess for settings save: {err}");
+                let _ = ready_tx.send(Err(format!("Failed to spawn tycode-subprocess: {err}")));
+                return;
+            }
+        };
+
+        let stdin = match child.inner().stdin.take() {
+            Some(s) => s,
+            None => {
+                tracing::error!("Failed to capture tycode-subprocess stdin for settings save");
+                let _ = ready_tx.send(Err("Failed to capture tycode-subprocess stdin".to_string()));
+                return;
+            }
+        };
+        let stdout = match child.inner().stdout.take() {
+            Some(s) => s,
+            None => {
+                tracing::error!("Failed to capture tycode-subprocess stdout for settings save");
+                let _ =
+                    ready_tx.send(Err("Failed to capture tycode-subprocess stdout".to_string()));
+                return;
+            }
+        };
+        let stderr = match child.inner().stderr.take() {
+            Some(s) => s,
+            None => {
+                tracing::error!("Failed to capture tycode-subprocess stderr for settings save");
+                let _ =
+                    ready_tx.send(Err("Failed to capture tycode-subprocess stderr".to_string()));
+                return;
+            }
+        };
+        let last_stderr_line = spawn_tycode_stderr_logger(stderr);
+
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<TycodeStdinCommand>();
+        tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(command) = stdin_rx.recv().await {
+                let ok = match command {
+                    TycodeStdinCommand::Json(command) => write_command(&mut stdin, &command).await,
+                    TycodeStdinCommand::Cancel => write_cancel(&mut stdin).await,
+                };
+                if !ok {
+                    break;
+                }
+            }
+        });
+
+        let mut startup = TycodeStartupController::new(values, TycodeStartupFollowUp::None, true);
+        set_tycode_startup_status(&startup_status_task, startup.phase_description());
+
+        let mut lines = BufReader::new(stdout).lines();
+        let mut ready_tx = Some(ready_tx);
+        loop {
+            let line = tokio::select! {
+                line = lines.next_line() => line,
+                shutdown = shutdown_rx.recv() => {
+                    if shutdown.is_some() {
+                        let _ = child.kill().await;
+                    }
+                    break;
+                }
+            };
+            let Ok(Some(line)) = line else {
+                break;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to parse tycode-subprocess settings-save event: {err} — line: {trimmed}"
+                    );
+                    continue;
+                }
+            };
+
+            let observation = match startup.observe(&value, &stdin_tx) {
+                Ok(observation) => observation,
+                Err(err) => {
+                    tracing::error!("{err}");
+                    if let Some(ready_tx) = ready_tx.take() {
+                        let _ = ready_tx.send(Err(err));
+                    }
+                    let _ = child.kill().await;
+                    return;
+                }
+            };
+            set_tycode_startup_status(&startup_status_task, startup.phase_description());
+            if matches!(observation, TycodeStartupObservation::Completed) {
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(Ok(()));
+                }
+                continue;
+            }
+        }
+
+        if let Some(ready_tx) = ready_tx.take() {
+            let _ = ready_tx.send(Err(tycode_startup_exit_error(&last_stderr_line)));
+        }
+    });
+
+    let result =
+        await_tycode_startup(ready_rx, &shutdown_tx, "settings save", &startup_status).await;
+    let _ = shutdown_tx.send(());
+    result
 }
 
 fn format_tycode_timeout(timeout: Duration) -> String {
@@ -810,6 +1033,7 @@ impl Backend for TycodeBackend {
             let mut startup = TycodeStartupController::new(
                 config.backend_config.clone(),
                 TycodeStartupFollowUp::InitialUserInput(initial_message),
+                false,
             );
             set_tycode_startup_status(&startup_status_task, startup.phase_description());
 
@@ -1088,6 +1312,7 @@ impl Backend for TycodeBackend {
                 TycodeStartupFollowUp::ResumeSession {
                     session_id: session_id.0.clone(),
                 },
+                false,
             );
             set_tycode_startup_status(&startup_status_task, startup.phase_description());
 
@@ -1782,8 +2007,12 @@ mod tests {
             SessionSettingValue::String("ignored".to_string()),
         );
 
-        let overlay =
-            apply_tycode_backend_config_overlay(&settings, &config).expect("overlay settings");
+        let overlay = apply_tycode_backend_config_overlay(
+            &settings,
+            &config,
+            TycodeSettingsOverlayMode::SessionRuntime,
+        )
+        .expect("overlay settings");
         assert_eq!(overlay.active_provider_change.as_deref(), Some("other"));
         assert_eq!(overlay.settings["providers"], original_providers);
         assert_eq!(
@@ -1824,8 +2053,12 @@ mod tests {
             config.0.insert(key.to_string(), SessionSettingValue::Null);
         }
 
-        let overlay =
-            apply_tycode_backend_config_overlay(&settings, &config).expect("overlay settings");
+        let overlay = apply_tycode_backend_config_overlay(
+            &settings,
+            &config,
+            TycodeSettingsOverlayMode::SessionRuntime,
+        )
+        .expect("overlay settings");
         assert_eq!(overlay.settings, settings);
         assert_eq!(overlay.active_provider_change, None);
     }
@@ -1844,8 +2077,12 @@ mod tests {
             SessionSettingValue::String("missing".to_string()),
         );
 
-        let err =
-            apply_tycode_backend_config_overlay(&settings, &config).expect_err("missing provider");
+        let err = apply_tycode_backend_config_overlay(
+            &settings,
+            &config,
+            TycodeSettingsOverlayMode::SessionRuntime,
+        )
+        .expect_err("missing provider");
         assert!(err.contains("Configured Tycode active_provider 'missing' is absent"));
         assert!(err.contains("available: default"));
     }
@@ -1975,6 +2212,204 @@ mod tests {
         assert_eq!(save["settings"]["spawn_context_mode"], "Fresh");
         assert_eq!(save["settings"]["disable_streaming"], false);
         assert_eq!(save["settings"]["providers"], settings["providers"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tycode_backend_config_persistent_save_uses_persist_true() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" },
+                "other": { "type": "openrouter", "api_key": "secret" }
+            },
+            "model_quality": "high",
+            "reasoning_effort": "Max",
+            "autonomy_level": "fully_autonomous",
+            "review_level": "Task",
+            "spawn_context_mode": "Fresh"
+        });
+        let fake = write_fake_tycode_subprocess(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        let mut values = BackendConfigValues::default();
+        values.0.insert(
+            "active_provider".to_string(),
+            SessionSettingValue::String("other".to_string()),
+        );
+        values.0.insert(
+            "model_quality".to_string(),
+            SessionSettingValue::String("low".to_string()),
+        );
+
+        persist_backend_config(values)
+            .await
+            .expect("persist Tycode backend config");
+
+        let commands = read_fake_commands(&log);
+        assert_eq!(commands.len(), 4, "commands: {commands:#?}");
+        assert_eq!(commands[0], Value::String("GetSettings".to_string()));
+        assert_eq!(commands[2], Value::String("GetSettings".to_string()));
+        assert_eq!(
+            commands[3],
+            serde_json::json!({ "ChangeProvider": "other" })
+        );
+
+        let save = commands[1]
+            .get("SaveSettings")
+            .expect("SaveSettings command");
+        assert_eq!(save["persist"], true);
+        assert_eq!(save["settings"]["active_provider"], "other");
+        assert_eq!(save["settings"]["model_quality"], "low");
+        assert_eq!(save["settings"]["reasoning_effort"], "Max");
+        assert_eq!(save["settings"]["autonomy_level"], "fully_autonomous");
+        assert_eq!(save["settings"]["review_level"], "Task");
+        assert_eq!(save["settings"]["spawn_context_mode"], "Fresh");
+        assert_eq!(save["settings"]["providers"], settings["providers"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tycode_backend_config_persistent_save_empty_without_previous_is_noop() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "other",
+            "providers": {
+                "default": { "type": "mock" },
+                "other": { "type": "openrouter", "api_key": "secret" }
+            },
+            "model_quality": "high",
+            "reasoning_effort": "Max",
+            "autonomy_level": "fully_autonomous",
+            "review_level": "Task",
+            "spawn_context_mode": "Fresh"
+        });
+        let fake = write_fake_tycode_subprocess(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        let incoming = BackendConfigValues::default();
+        let previous = BackendConfigValues::default();
+        let values = tycode_backend_config_persistence_values(&incoming, &previous);
+        assert!(values.0.is_empty());
+
+        persist_backend_config(values)
+            .await
+            .expect("persist empty Tycode backend config");
+        assert!(
+            !log.exists(),
+            "empty config with no previous Tyde-managed keys should not spawn Tycode"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tycode_backend_config_persistent_save_null_resets_only_that_key() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "other",
+            "providers": {
+                "default": { "type": "mock" },
+                "other": { "type": "openrouter", "api_key": "secret" }
+            },
+            "model_quality": "high",
+            "reasoning_effort": "Max",
+            "autonomy_level": "fully_autonomous",
+            "review_level": "Task",
+            "spawn_context_mode": "Fresh",
+            "unmanaged_top_level": { "keep": true }
+        });
+        let fake = write_fake_tycode_subprocess(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        let mut values = BackendConfigValues::default();
+        values
+            .0
+            .insert("review_level".to_string(), SessionSettingValue::Null);
+
+        persist_backend_config(values)
+            .await
+            .expect("persist Tycode backend config with explicit null");
+
+        let commands = read_fake_commands(&log);
+        assert_eq!(commands.len(), 3, "commands: {commands:#?}");
+        assert_eq!(commands[0], Value::String("GetSettings".to_string()));
+        assert_eq!(commands[2], Value::String("GetSettings".to_string()));
+
+        let save = commands[1]
+            .get("SaveSettings")
+            .expect("SaveSettings command");
+        assert_eq!(save["persist"], true);
+        assert_eq!(save["settings"]["active_provider"], "other");
+        assert_eq!(save["settings"]["model_quality"], "high");
+        assert_eq!(save["settings"]["reasoning_effort"], "Max");
+        assert_eq!(save["settings"]["autonomy_level"], "fully_autonomous");
+        assert_eq!(save["settings"]["review_level"], "None");
+        assert_eq!(save["settings"]["spawn_context_mode"], "Fresh");
+        assert_eq!(save["settings"]["providers"], settings["providers"]);
+        assert_eq!(
+            save["settings"]["unmanaged_top_level"],
+            serde_json::json!({ "keep": true })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tycode_backend_config_persistent_save_removed_previous_key_resets_only_that_key() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "other",
+            "providers": {
+                "default": { "type": "mock" },
+                "other": { "type": "openrouter", "api_key": "secret" }
+            },
+            "model_quality": "high",
+            "reasoning_effort": "Max",
+            "autonomy_level": "fully_autonomous",
+            "review_level": "Task",
+            "spawn_context_mode": "Fresh",
+            "unmanaged_top_level": { "keep": true }
+        });
+        let fake = write_fake_tycode_subprocess(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        let incoming = BackendConfigValues::default();
+        let mut previous = BackendConfigValues::default();
+        previous.0.insert(
+            "model_quality".to_string(),
+            SessionSettingValue::String("high".to_string()),
+        );
+        let values = tycode_backend_config_persistence_values(&incoming, &previous);
+        assert_eq!(values.0.len(), 1);
+        assert_eq!(
+            values.0.get("model_quality"),
+            Some(&SessionSettingValue::Null)
+        );
+
+        persist_backend_config(values)
+            .await
+            .expect("persist Tycode backend config with removed key");
+
+        let commands = read_fake_commands(&log);
+        assert_eq!(commands.len(), 3, "commands: {commands:#?}");
+        assert_eq!(commands[0], Value::String("GetSettings".to_string()));
+        assert_eq!(commands[2], Value::String("GetSettings".to_string()));
+
+        let save = commands[1]
+            .get("SaveSettings")
+            .expect("SaveSettings command");
+        assert_eq!(save["persist"], true);
+        assert_eq!(save["settings"]["active_provider"], "other");
+        assert_eq!(save["settings"]["model_quality"], Value::Null);
+        assert_eq!(save["settings"]["reasoning_effort"], "Max");
+        assert_eq!(save["settings"]["autonomy_level"], "fully_autonomous");
+        assert_eq!(save["settings"]["review_level"], "Task");
+        assert_eq!(save["settings"]["spawn_context_mode"], "Fresh");
+        assert_eq!(save["settings"]["providers"], settings["providers"]);
+        assert_eq!(
+            save["settings"]["unmanaged_top_level"],
+            serde_json::json!({ "keep": true })
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
