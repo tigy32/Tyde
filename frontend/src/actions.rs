@@ -11,11 +11,12 @@ use protocol::{
     AgentId, BackendKind, ByteRange, CodeIntelCancelReferencesPayload,
     CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
     CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload, CustomAgentId, FrameKind,
-    GitBranchName, ImageData, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectFileVersion,
-    ProjectId, ProjectPath, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload,
-    SessionId, SessionSettingsValues, SetSessionSettingsPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    GitBranchName, ImageData, LaunchProfile, LaunchProfileEntry, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectFileVersion, ProjectId, ProjectPath, ProjectReadFilePayload,
+    ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope, ProjectRootPath,
+    ProjectSearchCancelPayload, ProjectSearchPayload, SessionId, SessionSettingsValues,
+    SetSessionSettingsPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    WorkbenchCreatePayload, WorkbenchRemovePayload,
 };
 
 /// Resume a session on the given host. Synchronously switches the active
@@ -104,6 +105,33 @@ pub fn begin_new_chat(state: &AppState, backend_override: Option<BackendKind>) {
     begin_new_chat_with(state, backend_override, None);
 }
 
+/// Begin a new chat from the primary "New Chat" button. If the current chat
+/// context host's server-owned catalog names a `default_profile_id` that
+/// resolves to an exact ready entry, start from that profile (backend +
+/// settings come straight from the server). Otherwise open an ordinary draft
+/// with no override, letting the server resolve its own default backend at
+/// spawn time. No id parsing, no guessing — only an exact catalog match is
+/// used.
+pub fn begin_new_chat_default(state: &AppState) {
+    if let Some(host_id) = state.chat_context_host_id_untracked() {
+        let default_profile = state.launch_profile_catalog.with_untracked(|catalogs| {
+            let catalog = catalogs.get(&host_id)?;
+            let default_id = catalog.default_profile_id.as_ref()?;
+            catalog.entries.iter().find_map(|entry| match entry {
+                LaunchProfileEntry::Ready { profile } if &profile.id == default_id => {
+                    Some(profile.clone())
+                }
+                _ => None,
+            })
+        });
+        if let Some(profile) = default_profile {
+            begin_new_chat_with_profile(state, profile, None);
+            return;
+        }
+    }
+    begin_new_chat(state, None);
+}
+
 pub fn begin_new_chat_with(
     state: &AppState,
     backend_override: Option<BackendKind>,
@@ -111,11 +139,33 @@ pub fn begin_new_chat_with(
 ) {
     state.draft_backend_override.set(backend_override);
     state.draft_custom_agent_id.set(custom_agent_id);
+    state.draft_launch_profile_id.set(None);
     state
         .draft_session_settings
         .set(SessionSettingsValues::default());
+    state.draft_session_settings_dirty.set(false);
     // Opening (and activating) the new chat tab drives `active_agent` to None
     // via the Memo derived from `center_zone`.
+    state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true);
+}
+
+/// Begin a new chat from a server-provided ready launch profile. The profile
+/// carries the authoritative backend and session settings, so we set the draft
+/// directly from it — never by parsing the id. `custom_agent_id` composes a
+/// custom agent on top of the selected profile.
+pub fn begin_new_chat_with_profile(
+    state: &AppState,
+    profile: LaunchProfile,
+    custom_agent_id: Option<CustomAgentId>,
+) {
+    state.draft_backend_override.set(Some(profile.backend_kind));
+    state.draft_custom_agent_id.set(custom_agent_id);
+    state.draft_launch_profile_id.set(Some(profile.id));
+    // Show the profile's settings as the effective draft values, but mark them
+    // clean so spawn defers to server-owned profile resolution unless the user
+    // edits them.
+    state.draft_session_settings.set(profile.session_settings);
+    state.draft_session_settings_dirty.set(false);
     state.open_tab(TabContent::empty_chat(), "New Chat".to_string(), true);
 }
 
@@ -146,9 +196,11 @@ pub fn open_new_chat_with_prefill(
     // session settings. Backend selection stays on the host/project default.
     state.draft_backend_override.set(None);
     state.draft_custom_agent_id.set(None);
+    state.draft_launch_profile_id.set(None);
     state
         .draft_session_settings
         .set(SessionSettingsValues::default());
+    state.draft_session_settings_dirty.set(false);
 
     // Open (and activate) the new chat tab, then seed the composer. The composer
     // mirrors `chat_input` into the textarea reactively, so the prefill appears
@@ -228,20 +280,28 @@ pub fn spawn_new_chat(
         }
     };
 
+    let custom_agent_id = state.draft_custom_agent_id.get_untracked();
+    let launch_profile_id = state.draft_launch_profile_id.get_untracked();
+
     let draft_settings = state.draft_session_settings.get_untracked();
-    let session_settings = if draft_settings.0.is_empty() {
+    let settings_dirty = state.draft_session_settings_dirty.get_untracked();
+    // With a launch profile selected and no user edits, defer to server-owned
+    // profile resolution rather than echoing a stale copy of the profile's
+    // settings back as explicit overrides.
+    let defer_to_profile = launch_profile_id.is_some() && !settings_dirty;
+    let session_settings = if defer_to_profile || draft_settings.0.is_empty() {
         None
     } else {
         Some(draft_settings)
     };
 
-    let custom_agent_id = state.draft_custom_agent_id.get_untracked();
-
     state.draft_backend_override.set(None);
     state.draft_custom_agent_id.set(None);
+    state.draft_launch_profile_id.set(None);
     state
         .draft_session_settings
         .set(SessionSettingsValues::default());
+    state.draft_session_settings_dirty.set(false);
 
     spawn_local(async move {
         let payload = SpawnAgentPayload {
@@ -254,6 +314,7 @@ pub fn spawn_new_chat(
                 prompt: initial_message,
                 images: initial_images,
                 backend_kind,
+                launch_profile_id,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings,
@@ -1197,6 +1258,7 @@ pub fn send_set_session_settings(state: &AppState, values: SessionSettingsValues
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use protocol::LaunchProfileId;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -1289,5 +1351,192 @@ mod wasm_tests {
                 })
             );
         });
+    }
+
+    fn install_send_stub() -> js_sys::Array {
+        use wasm_bindgen::JsCast;
+        let code = r#"
+            (function() {
+                window.__test_send_calls = [];
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    return Promise.resolve();
+                };
+                window.__TAURI__.event = window.__TAURI__.event || {};
+                window.__TAURI__.event.listen = function() { return Promise.resolve(null); };
+                return window.__test_send_calls;
+            })();
+        "#;
+        js_sys::eval(code)
+            .expect("install tauri stub")
+            .dyn_into::<js_sys::Array>()
+            .expect("array")
+    }
+
+    async fn tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    /// Parse the `params` object of every `spawn_agent` frame recorded against
+    /// the send stub.
+    fn recorded_spawn_params(calls: &js_sys::Array) -> Vec<serde_json::Value> {
+        use wasm_bindgen::JsCast;
+        let mut out = Vec::new();
+        for entry in calls.iter() {
+            let Ok(arr) = entry.dyn_into::<js_sys::Array>() else {
+                continue;
+            };
+            if arr.get(0).as_string().as_deref() != Some("send_host_line") {
+                continue;
+            }
+            let Some(args_json) = arr.get(1).as_string() else {
+                continue;
+            };
+            let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_json) else {
+                continue;
+            };
+            let Some(line) = args.get("line").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok(envelope) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if envelope.get("kind").and_then(|v| v.as_str()) != Some("spawn_agent") {
+                continue;
+            }
+            if let Some(params) = envelope
+                .get("payload")
+                .and_then(|p| p.get("params"))
+                .cloned()
+            {
+                out.push(params);
+            }
+        }
+        out
+    }
+
+    fn install_profile_host(state: &AppState) {
+        state.selected_host_id.set(Some("host-a".to_owned()));
+        state.host_streams.update(|m| {
+            m.insert("host-a".to_owned(), StreamPath("/host/host-a".to_owned()));
+        });
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                "host-a".to_owned(),
+                protocol::HostSettings {
+                    enabled_backends: vec![BackendKind::Hermes],
+                    default_backend: Some(BackendKind::Hermes),
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
+                    code_intel: Default::default(),
+                    backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Vec::new(),
+                },
+            );
+        });
+    }
+
+    fn profile_with_model(model: &str) -> LaunchProfile {
+        let mut values = std::collections::HashMap::new();
+        values.insert(
+            "model".to_owned(),
+            protocol::SessionSettingValue::String(model.to_owned()),
+        );
+        LaunchProfile {
+            id: LaunchProfileId("hermes:claude".to_owned()),
+            label: "Hermes · Claude".to_owned(),
+            description: None,
+            backend_kind: BackendKind::Hermes,
+            session_settings: SessionSettingsValues(values),
+        }
+    }
+
+    /// A launch profile selected but not edited must NOT re-send its settings as
+    /// explicit `session_settings` overrides — the server owns profile
+    /// resolution. The spawn still carries the `launch_profile_id`.
+    #[wasm_bindgen_test]
+    async fn spawn_omits_session_settings_for_unedited_profile() {
+        let calls = install_send_stub();
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            install_profile_host(&state);
+            begin_new_chat_with_profile(&state, profile_with_model("opus"), None);
+            assert!(spawn_new_chat(&state, "hello".to_owned(), None, |_| {}));
+        });
+        for _ in 0..4 {
+            tick().await;
+        }
+
+        let params = recorded_spawn_params(&calls);
+        let new = params
+            .iter()
+            .find(|p| p.get("kind").and_then(|k| k.as_str()) == Some("new"))
+            .expect("a spawn_agent New frame must be emitted");
+        assert_eq!(
+            new.get("launch_profile_id").and_then(|v| v.as_str()),
+            Some("hermes:claude"),
+            "spawn must carry the selected launch profile id"
+        );
+        assert!(
+            new.get("session_settings").is_none(),
+            "unedited profile settings must not be sent as explicit overrides: {new:?}"
+        );
+    }
+
+    /// Editing the draft settings after selecting a profile marks them dirty, so
+    /// the spawn sends them as explicit `session_settings`.
+    #[wasm_bindgen_test]
+    async fn spawn_sends_session_settings_when_profile_edited() {
+        let calls = install_send_stub();
+        let owner = leptos::reactive::owner::Owner::new();
+        owner.with(|| {
+            let state = AppState::new();
+            install_profile_host(&state);
+            begin_new_chat_with_profile(&state, profile_with_model("opus"), None);
+            // Simulate a user edit in the session-settings bar.
+            let mut edited = std::collections::HashMap::new();
+            edited.insert(
+                "model".to_owned(),
+                protocol::SessionSettingValue::String("sonnet".to_owned()),
+            );
+            state
+                .draft_session_settings
+                .set(SessionSettingsValues(edited));
+            state.draft_session_settings_dirty.set(true);
+            assert!(spawn_new_chat(&state, "hello".to_owned(), None, |_| {}));
+        });
+        for _ in 0..4 {
+            tick().await;
+        }
+
+        let params = recorded_spawn_params(&calls);
+        let new = params
+            .iter()
+            .find(|p| p.get("kind").and_then(|k| k.as_str()) == Some("new"))
+            .expect("a spawn_agent New frame must be emitted");
+        let model = new
+            .get("session_settings")
+            .and_then(|s| s.get("model"))
+            .and_then(|m| m.get("string"))
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            model,
+            Some("sonnet"),
+            "user-edited settings must be sent as explicit overrides: {new:?}"
+        );
     }
 }

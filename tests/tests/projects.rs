@@ -34,6 +34,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             env.kind,
             FrameKind::HostSettings
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
@@ -60,6 +61,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                         env.kind,
                         FrameKind::HostSettings
                             | FrameKind::SessionSchemas
+                            | FrameKind::LaunchProfileCatalogNotify
                             | FrameKind::BackendSetup
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionSettings
@@ -359,6 +361,7 @@ async fn drain_initial_project_state_pushes(client: &mut client::Connection, con
                         env.kind,
                         FrameKind::HostSettings
                             | FrameKind::SessionSchemas
+                            | FrameKind::LaunchProfileCatalogNotify
                             | FrameKind::BackendSetup
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionSettings

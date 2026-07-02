@@ -494,6 +494,7 @@ async fn spawn_mock_agent_and_collect_turn(
                 prompt: prompt.to_string(),
                 images: None,
                 backend_kind,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -594,6 +595,7 @@ async fn antigravity_empty_workspace_spawn_is_accepted() {
                 prompt: "hello antigravity".to_string(),
                 images: None,
                 backend_kind: BackendKind::Antigravity,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -615,6 +617,7 @@ async fn antigravity_empty_workspace_spawn_is_accepted() {
             }
             FrameKind::HostSettings
             | FrameKind::SessionSchemas
+            | FrameKind::LaunchProfileCatalogNotify
             | FrameKind::BackendSetup
             | FrameKind::TeamPresetCatalogNotify => continue,
             FrameKind::CommandError => {
@@ -666,6 +669,7 @@ async fn empty_workspace_spawn_is_accepted_for_all_backends() {
                 params: SpawnAgentParams::New {
                     workspace_roots: Vec::new(),
                     prompt: format!("hello {backend_kind:?}"),
+                    launch_profile_id: None,
                     images: None,
                     backend_kind,
                     cost_hint: None,
@@ -773,6 +777,7 @@ async fn antigravity_native_uuid_session_remains_resumable_after_close() {
                 prompt: "hello antigravity".to_string(),
                 images: None,
                 backend_kind: BackendKind::Antigravity,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -969,6 +974,7 @@ async fn antigravity_direct_resume_missing_native_db_reports_startup_failure() {
                 prompt: "hello antigravity".to_string(),
                 images: None,
                 backend_kind: BackendKind::Antigravity,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1327,7 +1333,13 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
 
     let schemas = loop {
         let env = expect_fixture_event(&mut fixture.client, "Kiro SessionSchemas").await;
-        if env.kind != FrameKind::SessionSchemas {
+        if !matches!(
+            env.kind,
+            FrameKind::SessionSchemas | FrameKind::LaunchProfileCatalogNotify
+        ) {
+            continue;
+        }
+        if env.kind == FrameKind::LaunchProfileCatalogNotify {
             continue;
         }
         let payload: SessionSchemasPayload = env.parse_payload().expect("parse SessionSchemas");
@@ -1396,6 +1408,7 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
                 prompt: "hello".to_string(),
                 images: None,
                 backend_kind: BackendKind::Kiro,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: Some(session_settings),
@@ -1451,6 +1464,7 @@ async fn hermes_unavailable_dynamic_schema_with_supplied_settings_is_agent_error
                 prompt: "hello".to_string(),
                 images: None,
                 backend_kind: BackendKind::Hermes,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: Some(session_settings),
@@ -1585,6 +1599,7 @@ async fn hermes_unavailable_dynamic_schema_with_tier_settings_is_agent_error() {
                 prompt: "hello".to_string(),
                 images: None,
                 backend_kind: BackendKind::Hermes,
+                launch_profile_id: None,
                 cost_hint: Some(SpawnCostHint::Low),
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1690,6 +1705,7 @@ async fn compact_turn_emits_system_message_and_stream_end_without_error() {
                 prompt: "/compact".to_string(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1911,6 +1927,7 @@ async fn expect_next_event(client: &mut ValidatedConnection, context: &str) -> E
             env.kind,
             FrameKind::HostSettings
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
@@ -2032,6 +2049,7 @@ async fn spawn_agent_via_protocol_with_options(
                 prompt: prompt.to_owned(),
                 images,
                 backend_kind,
+                launch_profile_id: None,
                 cost_hint,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -4300,6 +4318,7 @@ async fn real_claude_first_turn_native_subagent_appears_in_host_stream() {
                     prompt: prompt.to_owned(),
                     images: None,
                     backend_kind,
+                    launch_profile_id: None,
                     cost_hint: Some(SpawnCostHint::High),
                     access_mode: Default::default(),
                     session_settings: None,

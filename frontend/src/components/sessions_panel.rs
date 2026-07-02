@@ -417,6 +417,7 @@ mod tests {
             summary: SessionSummary {
                 id: SessionId(id.to_string()),
                 backend_kind: BackendKind::Tycode,
+                launch_profile_id: None,
                 workspace_roots: vec![],
                 project_id: project_id.map(|s| ProjectId(s.to_string())),
                 alias: None,

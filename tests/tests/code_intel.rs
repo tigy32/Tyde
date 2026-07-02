@@ -35,6 +35,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             env.kind,
             FrameKind::HostSettings
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
@@ -99,6 +100,7 @@ async fn drain_initial_project_state_pushes(client: &mut client::Connection, con
                         env.kind,
                         FrameKind::HostSettings
                             | FrameKind::SessionSchemas
+                            | FrameKind::LaunchProfileCatalogNotify
                             | FrameKind::BackendSetup
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionSettings
@@ -265,6 +267,7 @@ async fn wait_for_code_intel_unavailable(
             | FrameKind::AgentActivityStats
             | FrameKind::ChatEvent
             | FrameKind::SessionSchemas
+            | FrameKind::LaunchProfileCatalogNotify
             | FrameKind::BackendSetup
             | FrameKind::QueuedMessages
             | FrameKind::SessionSettings
@@ -337,6 +340,7 @@ async fn wait_for_code_intel_unavailable_with_overview(
             | FrameKind::AgentActivityStats
             | FrameKind::ChatEvent
             | FrameKind::SessionSchemas
+            | FrameKind::LaunchProfileCatalogNotify
             | FrameKind::BackendSetup
             | FrameKind::QueuedMessages
             | FrameKind::SessionSettings
@@ -414,6 +418,7 @@ async fn wait_for_code_intel_warm_unavailable_overview(
             | FrameKind::AgentActivityStats
             | FrameKind::ChatEvent
             | FrameKind::SessionSchemas
+            | FrameKind::LaunchProfileCatalogNotify
             | FrameKind::BackendSetup
             | FrameKind::QueuedMessages
             | FrameKind::SessionSettings
@@ -455,6 +460,7 @@ async fn wait_for_code_intel_status_matching(
             | FrameKind::ProjectEvent
             | FrameKind::HostSettings
             | FrameKind::SessionSchemas
+            | FrameKind::LaunchProfileCatalogNotify
             | FrameKind::BackendSetup
             | FrameKind::QueuedMessages
             | FrameKind::SessionSettings
@@ -496,6 +502,7 @@ async fn wait_for_code_intel_overview_matching(
             | FrameKind::ProjectEvent
             | FrameKind::HostSettings
             | FrameKind::SessionSchemas
+            | FrameKind::LaunchProfileCatalogNotify
             | FrameKind::BackendSetup
             | FrameKind::QueuedMessages
             | FrameKind::SessionSettings
@@ -801,6 +808,7 @@ async fn agent_launch_with_project_id_warms_code_intel() {
                 prompt: "warm code intelligence".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,

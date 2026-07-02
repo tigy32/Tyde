@@ -76,6 +76,7 @@ async fn next_event(client: &mut client::Connection, context: &str) -> Envelope 
             || matches!(
                 env.kind,
                 FrameKind::SessionSchemas
+                    | FrameKind::LaunchProfileCatalogNotify
                     | FrameKind::BackendSetup
                     | FrameKind::AgentsViewPreferencesNotify
                     | FrameKind::TeamPresetCatalogNotify
@@ -357,6 +358,7 @@ async fn spawn_test_agent(
                 prompt: "workflow author".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode,
                 session_settings: None,

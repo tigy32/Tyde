@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    BackendKind, CustomAgentId, ProjectId, SessionId, SessionSettingsValues, SessionSummary,
+    BackendKind, CustomAgentId, LaunchProfileId, ProjectId, SessionId, SessionSettingsValues,
+    SessionSummary,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +22,8 @@ fn default_resumable() -> bool {
 pub struct SessionRecord {
     pub id: SessionId,
     pub backend_kind: BackendKind,
+    #[serde(default)]
+    pub launch_profile_id: Option<LaunchProfileId>,
     pub workspace_roots: Vec<String>,
     #[serde(default)]
     pub project_id: Option<ProjectId>,
@@ -106,6 +109,7 @@ impl SessionStore {
         parent_id: Option<SessionId>,
         project_id: Option<ProjectId>,
         custom_agent_id: Option<CustomAgentId>,
+        launch_profile_id: Option<LaunchProfileId>,
     ) -> Result<SessionRecord, String> {
         let now = now_ms();
         self.read_modify_write(|records| {
@@ -114,6 +118,7 @@ impl SessionStore {
                 .or_insert_with(|| SessionRecord {
                     id: session.id.clone(),
                     backend_kind: session.backend_kind,
+                    launch_profile_id: launch_profile_id.clone(),
                     workspace_roots: session.workspace_roots.clone(),
                     project_id: project_id.clone(),
                     custom_agent_id: custom_agent_id.clone(),
@@ -133,6 +138,9 @@ impl SessionStore {
                 });
 
             entry.backend_kind = session.backend_kind;
+            if launch_profile_id.is_some() {
+                entry.launch_profile_id = launch_profile_id;
+            }
             entry.workspace_roots = session.workspace_roots.clone();
             entry.project_id = project_id;
             entry.custom_agent_id = custom_agent_id;
@@ -356,6 +364,7 @@ impl SessionStore {
                 SessionSummary {
                     id: record.id,
                     backend_kind: record.backend_kind,
+                    launch_profile_id: record.launch_profile_id,
                     workspace_roots: record.workspace_roots,
                     project_id: record.project_id,
                     alias: record.alias,
@@ -787,6 +796,7 @@ mod tests {
         SessionRecord {
             id,
             backend_kind,
+            launch_profile_id: None,
             workspace_roots: Vec::new(),
             project_id: None,
             custom_agent_id: None,

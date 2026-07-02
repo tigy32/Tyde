@@ -8,16 +8,17 @@ use crate::types::{
 };
 use crate::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentClosedPayload, AgentOrigin,
-    AgentStartPayload, AgentsViewPreferencesNotifyPayload, BackendKind, BackendSetupPayload,
-    CancelWorkflowPayload, ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload,
-    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
-    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
-    CommandErrorPayload, CustomAgentDeletePayload, CustomAgentNotifyPayload,
-    CustomAgentUpsertPayload, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload,
-    FrameKind, HostBootstrapPayload, HostBrowseClosePayload, HostBrowseEntriesPayload,
-    HostBrowseErrorPayload, HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload,
-    HostSettingsPayload, ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload,
+    AgentStartPayload, AgentsViewPreferencesNotifyPayload, BackendConfigSchemasPayload,
+    BackendKind, BackendSetupPayload, CancelWorkflowPayload, ChatEvent, ChatMessage, ChatMessageId,
+    ClientErrorPayload, CodeIntelDiagnosticsPayload, CodeIntelErrorPayload,
+    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
+    CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload,
+    HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
+    LaunchProfileCatalogPayload, ListSessionsPayload, LoadAgentPayload, McpServerDeletePayload,
     McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
     MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
     MobilePairingOfferPayload, MobilePairingStartPayload, NewAgentPayload, ProjectAddRootPayload,
@@ -283,9 +284,19 @@ impl ProtocolValidator {
             FrameKind::BackendSetup => {
                 parse_host_payload::<BackendSetupPayload>(self, envelope, "BackendSetup")
             }
+            FrameKind::BackendConfigSchemas => parse_host_payload::<BackendConfigSchemasPayload>(
+                self,
+                envelope,
+                "BackendConfigSchemas",
+            ),
             FrameKind::SessionSchemas => {
                 parse_host_payload::<SessionSchemasPayload>(self, envelope, "SessionSchemas")
             }
+            FrameKind::LaunchProfileCatalogNotify => parse_host_payload::<
+                LaunchProfileCatalogPayload,
+            >(
+                self, envelope, "LaunchProfileCatalogNotify"
+            ),
             FrameKind::SessionList => {
                 parse_host_payload::<SessionListPayload>(self, envelope, "SessionList")
             }
@@ -1774,6 +1785,7 @@ mod tests {
             name: "test".to_owned(),
             origin,
             backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
             workspace_roots: vec![],
             custom_agent_id: None,
             team_id,
@@ -1806,6 +1818,7 @@ mod tests {
                     background_agent_features: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Vec::new(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: crate::MobileBrokerStatus::Disabled,
@@ -1815,6 +1828,7 @@ mod tests {
                 backend_setup: BackendSetupPayload { backends: vec![] },
                 session_schemas: vec![],
                 backend_config_schemas: vec![],
+                launch_profile_catalog: Default::default(),
                 sessions: vec![],
                 projects: vec![],
                 mcp_servers: vec![],
@@ -1852,6 +1866,7 @@ mod tests {
             name: "test".to_owned(),
             origin: AgentOrigin::User,
             backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
             workspace_roots: vec![],
             custom_agent_id: None,
             team_id: None,
@@ -2036,6 +2051,22 @@ mod tests {
     }
 
     #[test]
+    fn live_backend_config_schemas_are_valid_host_frames() {
+        let mut validator = ProtocolValidator::new();
+        let bootstrap = host_bootstrap_with_agents(vec![]);
+        let schemas = Envelope::from_payload(
+            host_stream(),
+            FrameKind::BackendConfigSchemas,
+            1,
+            &BackendConfigSchemasPayload { schemas: vec![] },
+        )
+        .expect("serialize BackendConfigSchemas");
+
+        validator.validate_envelope(&bootstrap).unwrap();
+        validator.validate_envelope(&schemas).unwrap();
+    }
+
+    #[test]
     fn rejects_host_replay_before_host_bootstrap() {
         let mut validator = ProtocolValidator::new();
         let envelope = Envelope::from_payload(
@@ -2055,6 +2086,7 @@ mod tests {
                     background_agent_features: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Vec::new(),
                 },
             },
         )

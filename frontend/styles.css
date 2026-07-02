@@ -8044,6 +8044,13 @@ kbd {
     font-weight: 400;
 }
 
+.settings-form-warning {
+    margin: 0;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    color: var(--warning, var(--accent-primary));
+}
+
 .settings-text-input {
     padding: var(--space-2) var(--space-3);
     font-family: var(--font-sans);

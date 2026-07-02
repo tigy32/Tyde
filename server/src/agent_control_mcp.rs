@@ -4,7 +4,8 @@ use std::time::Duration;
 use axum::{Json, Router, response::IntoResponse, routing::get};
 use protocol::{
     AgentControlStatus, AgentId, AgentInput, AgentOrigin, BackendAccessMode, BackendKind,
-    CustomAgentId, Envelope, ImageData, ProjectId, SendMessagePayload, SpawnAgentParams,
+    CustomAgentId, Envelope, ImageData, LaunchProfileCatalog, LaunchProfileId, ProjectId,
+    SendMessagePayload, SessionSchemaEntry, SessionSettingsValues, SpawnAgentParams,
     SpawnAgentPayload, SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload, TeamMemberId,
     WorkflowSaveRequest, WorkflowSaveResponse, WorkflowTargetsResponse,
 };
@@ -130,7 +131,9 @@ impl From<CostHintInput> for SpawnCostHint {
 struct SpawnAgentToolInput {
     workspace_roots: Vec<String>,
     prompt: String,
+    launch_profile_id: Option<String>,
     backend_kind: Option<BackendKindInput>,
+    session_settings: Option<SessionSettingsValues>,
     parent_agent_id: Option<String>,
     project_id: Option<String>,
     name: Option<String>,
@@ -199,6 +202,13 @@ struct AwaitAgentStatus {
 struct AwaitAgentsResult {
     ready: Vec<AwaitAgentStatus>,
     still_thinking: Vec<AwaitAgentStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListLaunchOptionsResult {
+    catalog: LaunchProfileCatalog,
+    default_backend: Option<BackendKind>,
+    session_schemas: Vec<SessionSchemaEntry>,
 }
 
 #[derive(Clone)]
@@ -356,6 +366,17 @@ impl TydeAgentControlMcpServer {
             Err(err) => return Ok(err_text(err)),
         };
         match do_spawn_agent(&self.host, input.into(), request_agent_id).await {
+            Ok(result) => ok_json(result),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(description = "List server-owned Launch Profiles and backend launch metadata.")]
+    async fn tyde_list_launch_options(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match do_list_launch_options(&self.host).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
         }
@@ -549,7 +570,7 @@ impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Tools for orchestrating Tyde2 coding agents. Spawn agents with tyde_spawn_agent, wait for them with tyde_await_agents, send follow-ups with tyde_send_agent_message, read output only with tyde_read_agent, use tyde_workflow_targets/tyde_workflow_save to author Tyde workflow files, and use tyde_team_describe/tyde_team_message_member when running as an agent-team member."
+                "Tools for orchestrating Tyde2 coding agents. Discover server-owned Launch Profiles with tyde_list_launch_options, spawn agents with tyde_spawn_agent, wait for them with tyde_await_agents, send follow-ups with tyde_send_agent_message, read output only with tyde_read_agent, use tyde_workflow_targets/tyde_workflow_save to author Tyde workflow files, and use tyde_team_describe/tyde_team_message_member when running as an agent-team member."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -685,13 +706,40 @@ async fn do_spawn_agent(
     }
 
     let host_settings = host.read_settings().await?;
-    let backend_kind = input
-        .backend_kind
-        .map(BackendKind::from)
-        .or(host_settings.default_backend)
-        .ok_or_else(|| {
+    let launch_profile_id = input
+        .launch_profile_id
+        .as_deref()
+        .map(parse_launch_profile_id)
+        .transpose()?;
+    let launch_profile_backend = match launch_profile_id.as_ref() {
+        Some(launch_profile_id) => Some(
+            host.resolve_launch_profile(launch_profile_id)
+                .await?
+                .backend_kind,
+        ),
+        None => None,
+    };
+    let backend_kind = match (
+        input.backend_kind.map(BackendKind::from),
+        launch_profile_backend,
+    ) {
+        (Some(explicit), Some(profile_backend)) if explicit != profile_backend => {
+            return Err(format!(
+                "launch_profile_id {} targets {:?}, but backend_kind is {:?}",
+                launch_profile_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                profile_backend,
+                explicit
+            ));
+        }
+        (Some(explicit), _) => explicit,
+        (None, Some(profile_backend)) => profile_backend,
+        (None, None) => host_settings.default_backend.ok_or_else(|| {
             "backend_kind is required because the host has no default_backend".to_string()
-        })?;
+        })?,
+    };
 
     let project_id = input
         .project_id
@@ -717,12 +765,13 @@ async fn do_spawn_agent(
             prompt: input.prompt,
             images: None,
             backend_kind,
+            launch_profile_id,
             cost_hint: input.cost_hint.map(SpawnCostHint::from),
             access_mode: input
                 .access_mode
                 .map(BackendAccessMode::from)
                 .unwrap_or_default(),
-            session_settings: None,
+            session_settings: input.session_settings,
         },
     };
 
@@ -746,6 +795,15 @@ async fn do_spawn_agent(
         agent_id: agent_id.0,
         name,
         status: agent_status,
+    })
+}
+
+async fn do_list_launch_options(host: &HostHandle) -> Result<ListLaunchOptionsResult, String> {
+    let (catalog, default_backend, session_schemas) = host.read_launch_options().await?;
+    Ok(ListLaunchOptionsResult {
+        catalog,
+        default_backend,
+        session_schemas,
     })
 }
 
@@ -1187,7 +1245,9 @@ fn cap_read_events(
 struct SpawnRequestInput {
     workspace_roots: Vec<String>,
     prompt: String,
+    launch_profile_id: Option<String>,
     backend_kind: Option<BackendKindInput>,
+    session_settings: Option<SessionSettingsValues>,
     parent_agent_id: Option<String>,
     project_id: Option<String>,
     name: Option<String>,
@@ -1200,7 +1260,9 @@ impl From<SpawnAgentToolInput> for SpawnRequestInput {
         Self {
             workspace_roots: v.workspace_roots,
             prompt: v.prompt,
+            launch_profile_id: v.launch_profile_id,
             backend_kind: v.backend_kind,
+            session_settings: v.session_settings,
             parent_agent_id: v.parent_agent_id,
             project_id: v.project_id,
             name: v.name,
@@ -1226,6 +1288,14 @@ fn parse_agent_ids(inputs: Vec<String>) -> Result<Vec<AgentId>, String> {
 fn parse_project_id(input: &str) -> Result<ProjectId, String> {
     Uuid::parse_str(input).map_err(|err| format!("invalid project_id '{input}': {err}"))?;
     Ok(ProjectId(input.to_string()))
+}
+
+fn parse_launch_profile_id(input: &str) -> Result<LaunchProfileId, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("launch_profile_id must not be empty".to_string());
+    }
+    Ok(LaunchProfileId(trimmed.to_owned()))
 }
 
 fn parse_team_member_id(input: &str) -> Result<TeamMemberId, String> {
@@ -1373,6 +1443,100 @@ mod tests {
         assert!(capped.omitted_event_bytes > 512);
     }
 
+    fn hermes_claude_session_settings() -> protocol::SessionSettingsValues {
+        let mut settings = protocol::SessionSettingsValues::default();
+        settings.0.insert(
+            "reasoning_effort".to_owned(),
+            protocol::SessionSettingValue::String("high".to_owned()),
+        );
+        settings
+            .0
+            .insert("fast".to_owned(), protocol::SessionSettingValue::Bool(true));
+        settings
+    }
+
+    fn hermes_claude_launch_profile() -> protocol::HostLaunchProfileConfig {
+        protocol::HostLaunchProfileConfig {
+            id: LaunchProfileId("hermes:claude".to_owned()),
+            label: "Hermes: Claude".to_owned(),
+            description: Some("Launch Hermes with an explicit Claude preset.".to_owned()),
+            backend_kind: BackendKind::Hermes,
+            session_settings: hermes_claude_session_settings(),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_accepts_explicit_hermes_launch_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("mock host");
+        host.set_setting(protocol::SetSettingPayload {
+            setting: protocol::HostSettingValue::LaunchProfiles {
+                profiles: vec![hermes_claude_launch_profile()],
+            },
+        })
+        .await
+        .expect("configure Hermes launch profile");
+        host.set_setting(protocol::SetSettingPayload {
+            setting: protocol::HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Hermes],
+            },
+        })
+        .await
+        .expect("enable Hermes");
+        host.refresh_session_schemas().await;
+
+        let options = do_list_launch_options(&host)
+            .await
+            .expect("list launch options");
+        let profile = options
+            .catalog
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                protocol::LaunchProfileEntry::Ready { profile }
+                    if profile.id.0 == "hermes:claude" =>
+                {
+                    Some(profile)
+                }
+                _ => None,
+            })
+            .expect("ready hermes:claude profile");
+        assert_eq!(profile.backend_kind, BackendKind::Hermes);
+        assert_eq!(profile.session_settings, hermes_claude_session_settings());
+
+        let spawned = do_spawn_agent(
+            &host,
+            SpawnAgentToolInput {
+                workspace_roots: vec![dir.path().to_string_lossy().to_string()],
+                prompt: "explicit Hermes profile via MCP core".to_owned(),
+                launch_profile_id: Some("hermes:claude".to_owned()),
+                backend_kind: None,
+                session_settings: None,
+                parent_agent_id: None,
+                project_id: None,
+                name: Some("hermes-profile".to_owned()),
+                cost_hint: None,
+                access_mode: None,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .expect("spawn Hermes profile agent");
+        let result =
+            do_await_agents_with_progress(&host, vec![AgentId(spawned.agent_id)], None, None)
+                .await
+                .expect("await Hermes profile agent");
+        assert!(result.still_thinking.is_empty());
+        assert_eq!(result.ready.len(), 1);
+        assert_eq!(result.ready[0].status, AgentControlStatus::Idle);
+    }
+
     #[tokio::test]
     async fn await_agents_does_not_return_while_still_thinking() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1387,7 +1551,9 @@ mod tests {
             SpawnAgentToolInput {
                 workspace_roots: vec!["/tmp/test".to_string()],
                 prompt: "__mock_hold_until_interrupt__ keep waiting".to_string(),
+                launch_profile_id: None,
                 backend_kind: Some(BackendKindInput::Claude),
+                session_settings: None,
                 parent_agent_id: None,
                 project_id: None,
                 name: Some("held-agent".to_string()),
@@ -1442,7 +1608,9 @@ mod tests {
             SpawnAgentToolInput {
                 workspace_roots: vec!["/tmp/test".to_string()],
                 prompt: crate::backend::mock::MOCK_SLOW_TURN_SENTINEL.to_string(),
+                launch_profile_id: None,
                 backend_kind: Some(BackendKindInput::Claude),
+                session_settings: None,
                 parent_agent_id: None,
                 project_id: None,
                 name: Some("cancel-agent".to_string()),

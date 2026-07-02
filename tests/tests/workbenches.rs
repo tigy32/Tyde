@@ -29,6 +29,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             env.kind,
             FrameKind::HostSettings
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
@@ -676,6 +677,7 @@ async fn workbench_remove_rejects_live_agent_live_terminal_session_and_steering_
                 prompt: "__mock_slow__ hold workbench".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -756,6 +758,7 @@ async fn workbench_remove_rejects_live_agent_live_terminal_session_and_steering_
                 prompt: "persist session".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,

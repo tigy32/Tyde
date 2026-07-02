@@ -15,17 +15,17 @@ use protocol::{
     CodeIntelReferencesFileResult, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
     CodeIntelStatusScope, CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind,
     HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HostBrowseOpenedPayload, HostSettingsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
-    MobilePairingOfferPayload, MobilePairingState, NewAgentPayload, NewTerminalPayload,
-    ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
-    ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectPath,
-    ProjectSearchCompletePayload, ProjectSearchResultsPayload, ProtocolValidator,
-    QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
-    ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionHistoryPayload,
-    SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
-    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload,
-    TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
+    HostBrowseOpenedPayload, HostSettingsPayload, LaunchProfileCatalogPayload,
+    McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload,
+    MobilePairingState, NewAgentPayload, NewTerminalPayload, ProjectBootstrapPayload,
+    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload,
+    ProjectGitCommitResultPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectNotifyPayload, ProjectPath, ProjectSearchCompletePayload, ProjectSearchResultsPayload,
+    ProtocolValidator, QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload,
+    ReviewCommentSource, ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState,
+    SessionHistoryPayload, SessionId, SessionListPayload, SessionSchemasPayload,
+    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
+    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
     TerminalBootstrapPayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     TerminalStartPayload, WelcomePayload, WorkflowNotifyPayload, WorkflowRunNotifyPayload,
@@ -184,6 +184,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
             background_agent_features: Default::default(),
             code_intel: Default::default(),
             backend_config: std::collections::HashMap::new(),
+            launch_profiles: Vec::new(),
         },
         mobile_access: BootstrapMobileAccess {
             broker_status: BootstrapBrokerStatus::Disabled,
@@ -195,6 +196,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
         },
         session_schemas: Vec::new(),
         backend_config_schemas: Vec::new(),
+        launch_profile_catalog: Default::default(),
         sessions: Vec::new(),
         projects: Vec::new(),
         mcp_servers: Vec::new(),
@@ -2050,6 +2052,22 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse host_browse_error payload: {error}"),
             ),
         },
+        FrameKind::LaunchProfileCatalogNotify => {
+            match envelope.parse_payload::<LaunchProfileCatalogPayload>() {
+                Ok(payload) => {
+                    state.launch_profile_catalog.update(|map| {
+                        map.insert(host_id.to_string(), payload.catalog);
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse launch_profile_catalog payload: {error}"),
+                ),
+            }
+        }
         FrameKind::CustomAgentNotify => {
             match envelope.parse_payload::<CustomAgentNotifyPayload>() {
                 Ok(CustomAgentNotifyPayload::Upsert { custom_agent }) => {
@@ -4563,6 +4581,9 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
     state.schemas_loaded_for_host.update(|loaded| {
         loaded.insert(host_id.to_string(), true);
     });
+    state.launch_profile_catalog.update(|map| {
+        map.insert(host_id.to_string(), payload.launch_profile_catalog);
+    });
     state.backend_config_schemas.update(|schemas_by_host| {
         let host_schemas = schemas_by_host.entry(host_id.to_string()).or_default();
         host_schemas.clear();
@@ -5048,6 +5069,7 @@ mod tests {
                     background_agent_features: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Vec::new(),
                 },
                 mobile_access: MobileAccessStatePayload {
                     broker_status: protocol::MobileBrokerStatus::Disabled,
@@ -5059,6 +5081,7 @@ mod tests {
                 },
                 session_schemas: Vec::new(),
                 backend_config_schemas: Vec::new(),
+                launch_profile_catalog: Default::default(),
                 sessions: Vec::new(),
                 projects: Vec::new(),
                 mcp_servers: Vec::new(),

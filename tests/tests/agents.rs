@@ -5,16 +5,17 @@ use protocol::types::AgentClosedPayload;
 use protocol::{
     AgentActivitySummaryPayload, AgentActivitySummaryState, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentControlStatus, AgentErrorCode, AgentErrorPayload, AgentOrigin,
-    AgentRenamedPayload, AgentStartPayload, BackendKind, BackgroundAgentFeature, ChatEvent,
-    ClientErrorCode, ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope,
-    FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload, HostSettingValue,
-    HostSettingsPayload, ListSessionsPayload, MessageMetadataUpdateData, MessageSender,
+    AgentRenamedPayload, AgentStartPayload, BackendConfigSchemasPayload, BackendKind,
+    BackgroundAgentFeature, ChatEvent, ClientErrorCode, ClientErrorPayload, CommandErrorCode,
+    CommandErrorPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload,
+    HostLaunchProfileConfig, HostSettingValue, HostSettingsPayload, LaunchProfileCatalogPayload,
+    LaunchProfileId, ListSessionsPayload, MessageMetadataUpdateData, MessageSender,
     NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
     ProjectId, ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SendMessagePayload,
-    SendMessageToolResponse, SessionHistoryPayload, SessionListPayload, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, StreamEndData, StreamPath, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType, TurnTokenUsage,
-    write_envelope,
+    SendMessageToolResponse, SessionHistoryPayload, SessionListPayload, SessionSettingValue,
+    SessionSettingsValues, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamEndData,
+    StreamPath, TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult,
+    ToolRequest, ToolRequestType, TurnTokenUsage, write_envelope,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -60,7 +61,9 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendConfigSchemas
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList
                 | FrameKind::WorkflowNotify
@@ -220,7 +223,9 @@ async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: 
                 | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendConfigSchemas
                 | FrameKind::QueuedMessages
                 | FrameKind::WorkflowNotify
         ) {
@@ -303,7 +308,9 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::AgentsViewPreferencesNotify
                             | FrameKind::TeamPresetCatalogNotify
                             | FrameKind::SessionSchemas
+                            | FrameKind::LaunchProfileCatalogNotify
                             | FrameKind::BackendSetup
+                            | FrameKind::BackendConfigSchemas
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionList
                             | FrameKind::HostSettings
@@ -568,6 +575,125 @@ async fn mcp_list_agents(url: &str) -> Value {
     serde_json::from_str(text).expect("parse MCP tool payload JSON")
 }
 
+async fn mcp_list_launch_options(url: &str) -> Value {
+    let response = post_json(
+        url,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "tyde_list_launch_options",
+                "arguments": {}
+            }
+        }),
+    )
+    .await;
+    let result = response
+        .get("result")
+        .unwrap_or_else(|| panic!("MCP response missing result: {response}"));
+    let is_error = result
+        .get("isError")
+        .or_else(|| result.get("is_error"))
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| panic!("MCP result missing isError: {response}"));
+    assert!(!is_error, "MCP tool call failed: {response}");
+    let text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|entry| entry.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("MCP response missing content text: {response}"));
+    serde_json::from_str(text).expect("parse MCP tool payload JSON")
+}
+
+fn hermes_claude_session_settings() -> SessionSettingsValues {
+    let mut settings = SessionSettingsValues::default();
+    settings.0.insert(
+        "reasoning_effort".to_owned(),
+        SessionSettingValue::String("high".to_owned()),
+    );
+    settings
+        .0
+        .insert("fast".to_owned(), SessionSettingValue::Bool(true));
+    settings
+}
+
+fn hermes_claude_launch_profile() -> HostLaunchProfileConfig {
+    HostLaunchProfileConfig {
+        id: LaunchProfileId("hermes:claude".to_owned()),
+        label: "Hermes: Claude".to_owned(),
+        description: Some("Launch Hermes with an explicit Claude preset.".to_owned()),
+        backend_kind: BackendKind::Hermes,
+        session_settings: hermes_claude_session_settings(),
+    }
+}
+
+async fn wait_for_ready_launch_profile_after_backend_config_schema(
+    client: &mut client::Connection,
+    profile_id: &str,
+) -> LaunchProfileCatalogPayload {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_backend_config_schemas = false;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            panic!("timed out waiting for ready launch profile {profile_id}");
+        }
+
+        let env = match tokio::time::timeout(deadline - now, client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before launch profile {profile_id} ready"),
+            Ok(Err(err)) => panic!("next_event failed before launch profile {profile_id}: {err:?}"),
+            Err(_) => panic!("timed out waiting for launch profile {profile_id}"),
+        };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+
+        match env.kind {
+            FrameKind::BackendConfigSchemas => {
+                let _: BackendConfigSchemasPayload =
+                    env.parse_payload().expect("BackendConfigSchemas payload");
+                saw_backend_config_schemas = true;
+            }
+            FrameKind::LaunchProfileCatalogNotify => {
+                let payload: LaunchProfileCatalogPayload = env
+                    .parse_payload()
+                    .expect("LaunchProfileCatalogNotify payload");
+                for entry in &payload.catalog.entries {
+                    match entry {
+                        protocol::LaunchProfileEntry::Ready { profile }
+                            if profile.id.0.as_str() == profile_id =>
+                        {
+                            assert!(
+                                saw_backend_config_schemas,
+                                "expected BackendConfigSchemas before ready {profile_id}"
+                            );
+                            return payload;
+                        }
+                        protocol::LaunchProfileEntry::Unavailable { id, .. }
+                            if id.0.as_str() == profile_id => {}
+                        _ => {}
+                    }
+                }
+            }
+            FrameKind::HostSettings
+            | FrameKind::SessionSchemas
+            | FrameKind::BackendSetup
+            | FrameKind::AgentsViewPreferencesNotify
+            | FrameKind::TeamPresetCatalogNotify
+            | FrameKind::SessionList
+            | FrameKind::WorkflowNotify => {}
+            other => panic!(
+                "unexpected event while waiting for launch profile {profile_id}: kind={other} stream={}",
+                env.stream
+            ),
+        }
+    }
+}
+
 async fn expect_project_notify(
     client: &mut client::Connection,
     context: &str,
@@ -752,6 +878,7 @@ async fn spawn_token_usage_agent(
                 prompt: prompt.to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -857,7 +984,9 @@ async fn expect_raw_agent_bootstrap_on_stream(
                     | FrameKind::AgentsViewPreferencesNotify
                     | FrameKind::TeamPresetCatalogNotify
                     | FrameKind::SessionSchemas
+                    | FrameKind::LaunchProfileCatalogNotify
                     | FrameKind::BackendSetup
+                    | FrameKind::BackendConfigSchemas
                     | FrameKind::QueuedMessages
                     | FrameKind::SessionList
                     | FrameKind::WorkflowNotify
@@ -1341,7 +1470,9 @@ async fn expect_no_agent_error_message(
                             | FrameKind::SessionSettings
                             | FrameKind::TeamPresetCatalogNotify
                             | FrameKind::SessionSchemas
+                            | FrameKind::LaunchProfileCatalogNotify
                             | FrameKind::BackendSetup
+                            | FrameKind::BackendConfigSchemas
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionList
                             | FrameKind::WorkflowNotify
@@ -1430,6 +1561,7 @@ async fn spawn_user_child(
                 prompt: prompt.to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1479,6 +1611,7 @@ async fn spawn_parent_with_native_child(
                 prompt: parent_prompt,
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1659,6 +1792,7 @@ async fn subagent_turn_token_usage_is_strictly_self() {
                 prompt: parent_prompt,
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1747,6 +1881,7 @@ async fn agent_lifecycle() {
                 prompt: "hello".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1816,6 +1951,7 @@ async fn agent_recovers_after_backend_error_without_idle() {
                 prompt: "hello".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1884,6 +2020,7 @@ async fn agent_recovers_after_backend_tool_failure_without_idle() {
                 prompt: "hello".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1965,6 +2102,7 @@ async fn client_error_report_is_accepted_before_agent_flow() {
                 prompt: "hello after client error report".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -2011,6 +2149,7 @@ async fn close_agent_emits_agent_closed_and_removes_agent_from_registry() {
                 prompt: "hello".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -2183,6 +2322,7 @@ async fn close_agent_mid_turn_flushes_final_events_before_agent_closed() {
                 prompt: "__mock_slow__ close mid turn".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -2253,14 +2393,36 @@ async fn close_agent_mid_turn_flushes_final_events_before_agent_closed() {
 
 #[tokio::test]
 async fn agent_control_end_to_end_flow_uses_full_stack() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Claude],
+            },
+        })
+        .await
+        .expect("enable Claude for launch-profile catalog");
     let control = fixture.connect_agent_control().await;
+    let options = control.list_launch_options();
+    assert!(
+        options.catalog.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                protocol::LaunchProfileEntry::Ready { profile }
+                    if profile.id.0 == "claude:default"
+            )
+        }),
+        "dev-driver launch options should include claude:default"
+    );
 
     let spawned = control
         .spawn_agent(SpawnRequest {
             workspace_roots: vec!["/tmp/test".to_owned()],
             prompt: "agent control hello".to_owned(),
             backend_kind: BackendKind::Claude,
+            launch_profile_id: Some(LaunchProfileId("claude:default".to_owned())),
+            session_settings: None,
             parent_agent_id: None,
             project_id: None,
             name: Some("agent-control".to_owned()),
@@ -2334,6 +2496,184 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
 }
 
 #[tokio::test]
+async fn agent_control_dev_driver_spawns_explicit_hermes_launch_profile_after_schema_refresh() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::LaunchProfiles {
+                profiles: vec![hermes_claude_launch_profile()],
+            },
+        })
+        .await
+        .expect("configure explicit Hermes launch profile");
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Hermes],
+            },
+        })
+        .await
+        .expect("enable Hermes");
+
+    wait_for_ready_launch_profile_after_backend_config_schema(&mut fixture.client, "hermes:claude")
+        .await;
+
+    let control = fixture.connect_agent_control().await;
+    let options = control.list_launch_options();
+    assert!(
+        options.catalog.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                protocol::LaunchProfileEntry::Ready { profile }
+                    if profile.id.0 == "hermes:claude"
+                        && profile.backend_kind == BackendKind::Hermes
+                        && profile.session_settings == hermes_claude_session_settings()
+            )
+        }),
+        "dev-driver launch options should include ready hermes:claude"
+    );
+
+    let spawned = control
+        .spawn_agent(SpawnRequest {
+            workspace_roots: vec!["/tmp/agent-control-hermes-dev-driver".to_owned()],
+            prompt: "agent control explicit Hermes launch profile".to_owned(),
+            backend_kind: BackendKind::Hermes,
+            launch_profile_id: Some(LaunchProfileId("hermes:claude".to_owned())),
+            session_settings: None,
+            parent_agent_id: None,
+            project_id: None,
+            name: Some("explicit-hermes-dev-driver".to_owned()),
+            cost_hint: None,
+            access_mode: Default::default(),
+        })
+        .await
+        .expect("agent control spawn should succeed");
+
+    let awaited = control
+        .await_agents(
+            Some(vec![protocol::AgentId(spawned.agent_id.clone())]),
+            Some(5_000),
+        )
+        .await
+        .expect("agent control await should succeed");
+    assert!(awaited.still_thinking.is_empty());
+    assert_eq!(awaited.ready.len(), 1);
+    assert_awaited_agent_idle(&awaited.ready[0]);
+}
+
+#[tokio::test]
+async fn agent_control_http_discovers_and_spawns_launch_profiles() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Claude],
+            },
+        })
+        .await
+        .expect("enable Claude");
+
+    let base_url = fixture.agent_control_http_url().await;
+    let options = mcp_list_launch_options(&base_url).await;
+    let entries = options["catalog"]["entries"]
+        .as_array()
+        .expect("launch option entries");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["state"] == "ready" && entry["profile"]["id"] == "claude:default"),
+        "expected claude:default in {options}"
+    );
+
+    let agent_id = mcp_spawn_agent_with_arguments(
+        &base_url,
+        json!({
+            "workspace_roots": ["/tmp/agent-control-launch-profile"],
+            "prompt": "agent control launch profile",
+            "launch_profile_id": "claude:default",
+            "session_settings": {
+                "model": { "string": "haiku" }
+            },
+            "name": "profile child"
+        }),
+    )
+    .await;
+    let awaited = mcp_await_agent(&base_url, &agent_id).await;
+    assert_await_result_ready(&awaited, &agent_id);
+}
+
+#[tokio::test]
+async fn agent_control_http_spawns_explicit_hermes_launch_profile_after_schema_refresh() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::LaunchProfiles {
+                profiles: vec![hermes_claude_launch_profile()],
+            },
+        })
+        .await
+        .expect("configure explicit Hermes launch profile");
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Hermes],
+            },
+        })
+        .await
+        .expect("enable Hermes");
+
+    let catalog = wait_for_ready_launch_profile_after_backend_config_schema(
+        &mut fixture.client,
+        "hermes:claude",
+    )
+    .await;
+    assert!(
+        catalog.catalog.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                protocol::LaunchProfileEntry::Ready { profile }
+                    if profile.id.0 == "hermes:claude"
+                        && profile.backend_kind == BackendKind::Hermes
+                        && profile.session_settings == hermes_claude_session_settings()
+            )
+        }),
+        "expected ready hermes:claude in {catalog:?}"
+    );
+
+    let base_url = fixture.agent_control_http_url().await;
+    let options = mcp_list_launch_options(&base_url).await;
+    let entries = options["catalog"]["entries"]
+        .as_array()
+        .expect("launch option entries");
+    assert!(
+        entries.iter().any(|entry| {
+            entry["state"] == "ready"
+                && entry["profile"]["id"] == "hermes:claude"
+                && entry["profile"]["backend_kind"] == "hermes"
+        }),
+        "expected ready hermes:claude in {options}"
+    );
+
+    let agent_id = mcp_spawn_agent_with_arguments(
+        &base_url,
+        json!({
+            "workspace_roots": ["/tmp/agent-control-hermes-launch-profile"],
+            "prompt": "agent control explicit Hermes launch profile",
+            "launch_profile_id": "hermes:claude",
+            "name": "explicit hermes profile"
+        }),
+    )
+    .await;
+    let awaited = mcp_await_agent(&base_url, &agent_id).await;
+    assert_await_result_ready(&awaited, &agent_id);
+}
+
+#[tokio::test]
 async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
     let mut fixture = Fixture::new().await;
 
@@ -2349,6 +2689,7 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
                 prompt: "__mock_exit_plan_mode__".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -2470,6 +2811,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
                 prompt: "__mock_exit_plan_mode_stream_end_first__".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -2615,6 +2957,8 @@ async fn agent_control_spawn_without_name_returns_generated_name() {
             workspace_roots: vec!["/tmp/test".to_owned()],
             prompt: "review auth logs".to_owned(),
             backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            session_settings: None,
             parent_agent_id: None,
             project_id: None,
             name: None,
@@ -2648,6 +2992,7 @@ async fn agent_control_http_infers_parent_agent_id_from_request_url() {
                 prompt: "__mock_slow__ parent stays active".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -2760,6 +3105,7 @@ async fn agent_control_http_await_emits_progress_notifications() {
                 prompt: "__mock_hold_until_interrupt__ await progress".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -2878,6 +3224,7 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
                 prompt: "parent ready".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -2917,6 +3264,7 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
                 prompt: "__mock_hold_until_interrupt__ child awaited".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -3064,6 +3412,7 @@ async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments(
                 prompt: "parent".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -3246,6 +3595,7 @@ async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() 
                 prompt: "parent project".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -3423,6 +3773,7 @@ async fn agent_origin_is_user_for_normal_spawns() {
                 prompt: "user origin".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -3665,6 +4016,7 @@ async fn backend_native_child_with_closed_event_stream_still_replays_to_late_cli
                 prompt: parent_prompt,
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -3741,6 +4093,7 @@ async fn interrupting_parked_backend_native_child_emits_relay_rejection() {
                 prompt: parent_prompt,
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -3822,6 +4175,7 @@ async fn interrupting_parent_keeps_agent_control_children_running() {
                 prompt: "__mock_hold_until_interrupt__ parent waiting".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -3930,6 +4284,7 @@ async fn backend_spawn_failure_emits_terminal_agent_error_without_panicking_host
                 prompt: "__mock_fail_spawn__".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Tycode,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -4017,6 +4372,7 @@ async fn spawn_without_name_generates_short_name_and_persists_alias() {
                 prompt: "review auth logs".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -4093,6 +4449,7 @@ async fn agent_activity_summaries_default_off_stay_disabled() {
                 prompt: "summaries are disabled".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -4151,6 +4508,7 @@ async fn agent_activity_summaries_emit_fresh_mock_state_and_bootstrap() {
                 prompt: "summarize recent activity".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -4262,6 +4620,7 @@ async fn disabling_activity_summaries_discards_in_flight_result() {
                 prompt: "__mock_slow_activity_summary__ keep working".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -4337,6 +4696,7 @@ async fn agent_activity_summaries_error_state_backs_off_retries() {
                 prompt: "__mock_fail_activity_summary__ keep working".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -4424,6 +4784,7 @@ async fn agent_activity_summaries_unchanged_history_does_not_resummarize() {
                 prompt: "summarize unchanged history".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -4489,6 +4850,7 @@ async fn renaming_agent_updates_live_streams_and_replay() {
                 prompt: "hello".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -4565,6 +4927,7 @@ async fn multiple_agents() {
                 prompt: "agent one".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -4585,6 +4948,7 @@ async fn multiple_agents() {
                 prompt: "agent two".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -4609,7 +4973,9 @@ async fn multiple_agents() {
                 | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
+                | FrameKind::BackendConfigSchemas
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList
                 | FrameKind::AgentActivityStats
@@ -4722,6 +5088,7 @@ async fn late_joining_client_gets_replay() {
                 prompt: "late join replay".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -4973,6 +5340,7 @@ async fn project_replay_happens_before_agent_replay() {
                 prompt: "hello from project".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -5068,6 +5436,7 @@ async fn project_delete_detaches_sessions_that_reference_it() {
                 prompt: "hold project".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -5221,6 +5590,7 @@ async fn spawn_with_missing_project_id_emits_terminal_agent_error() {
                 prompt: "hello".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,

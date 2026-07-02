@@ -2886,6 +2886,7 @@ mod wasm_tests {
                     background_agent_features: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Vec::new(),
                 },
             );
         });
@@ -3293,6 +3294,7 @@ mod wasm_tests {
                     background_agent_features: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Vec::new(),
                 },
             );
         });

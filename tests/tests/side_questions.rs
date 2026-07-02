@@ -136,6 +136,7 @@ fn is_noise(env: &Envelope) -> bool {
             | FrameKind::QueuedMessages
             | FrameKind::SessionList
             | FrameKind::SessionSchemas
+            | FrameKind::LaunchProfileCatalogNotify
             | FrameKind::BackendSetup
             | FrameKind::TeamPresetCatalogNotify
             | FrameKind::HostSettings
@@ -290,6 +291,7 @@ async fn mock_fork_creates_interactive_side_question_with_lineage() {
                 prompt: "parent prompt".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: BackendAccessMode::Unrestricted,
                 session_settings: None,
@@ -528,6 +530,7 @@ async fn fork_rejects_orphan_parent_even_when_source_session_exists() {
             None,
             None,
             None,
+            None,
         )
         .expect("insert source session");
 
@@ -581,6 +584,7 @@ async fn stale_parent_fork_fails_without_touching_source_session() {
                 updated_at_ms: Some(100),
                 resumable: true,
             },
+            None,
             None,
             None,
             None,

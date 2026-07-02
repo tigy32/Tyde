@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 27;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -407,6 +407,81 @@ impl BackendKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct LaunchProfileId(pub String);
+
+impl fmt::Display for LaunchProfileId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchProfileCatalog {
+    #[serde(default)]
+    pub entries: Vec<LaunchProfileEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile_id: Option<LaunchProfileId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchProfile {
+    pub id: LaunchProfileId,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub backend_kind: BackendKind,
+    #[serde(default)]
+    pub session_settings: SessionSettingsValues,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LaunchProfileEntry {
+    Ready {
+        profile: LaunchProfile,
+    },
+    Unavailable {
+        id: LaunchProfileId,
+        backend_kind: BackendKind,
+        label: String,
+        message: String,
+    },
+}
+
+impl LaunchProfileEntry {
+    pub fn id(&self) -> &LaunchProfileId {
+        match self {
+            Self::Ready { profile } => &profile.id,
+            Self::Unavailable { id, .. } => id,
+        }
+    }
+
+    pub fn backend_kind(&self) -> BackendKind {
+        match self {
+            Self::Ready { profile } => profile.backend_kind,
+            Self::Unavailable { backend_kind, .. } => *backend_kind,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchProfileCatalogPayload {
+    pub catalog: LaunchProfileCatalog,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostLaunchProfileConfig {
+    pub id: LaunchProfileId,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub backend_kind: BackendKind,
+    #[serde(default)]
+    pub session_settings: SessionSettingsValues,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendAccessMode {
@@ -635,6 +710,7 @@ pub enum FrameKind {
     SessionSchemas,
     SessionSettings,
     BackendConfigSchemas,
+    LaunchProfileCatalogNotify,
     MobileAccessState,
     MobilePairingOffer,
     ReviewCreate,
@@ -800,6 +876,7 @@ impl fmt::Display for FrameKind {
             Self::SessionSchemas => f.write_str("session_schemas"),
             Self::SessionSettings => f.write_str("session_settings"),
             Self::BackendConfigSchemas => f.write_str("backend_config_schemas"),
+            Self::LaunchProfileCatalogNotify => f.write_str("launch_profile_catalog_notify"),
             Self::MobileAccessState => f.write_str("mobile_access_state"),
             Self::MobilePairingOffer => f.write_str("mobile_pairing_offer"),
             Self::ReviewCreate => f.write_str("review_create"),
@@ -1128,6 +1205,8 @@ pub struct HostBootstrapPayload {
     pub session_schemas: Vec<SessionSchemaEntry>,
     #[serde(default)]
     pub backend_config_schemas: Vec<BackendConfigSchema>,
+    #[serde(default)]
+    pub launch_profile_catalog: LaunchProfileCatalog,
     pub sessions: Vec<SessionSummary>,
     pub projects: Vec<Project>,
     pub mcp_servers: Vec<McpServerConfig>,
@@ -1703,6 +1782,10 @@ pub struct HostSettings {
     /// [`BackendConfigSchema`]. Backends without an entry use their defaults.
     #[serde(default)]
     pub backend_config: HashMap<BackendKind, BackendConfigValues>,
+    /// Explicit server-owned Launch Profiles. These are host-level presets
+    /// over backend session settings; they are never inferred from model names.
+    #[serde(default)]
+    pub launch_profiles: Vec<HostLaunchProfileConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1814,6 +1897,10 @@ pub enum HostSettingValue {
     BackendConfig {
         backend: BackendKind,
         values: BackendConfigValues,
+    },
+    /// Replace all explicit server-owned Launch Profiles.
+    LaunchProfiles {
+        profiles: Vec<HostLaunchProfileConfig>,
     },
 }
 
@@ -2101,6 +2188,8 @@ pub enum SpawnAgentParams {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         images: Option<Vec<ImageData>>,
         backend_kind: BackendKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch_profile_id: Option<LaunchProfileId>,
         cost_hint: Option<SpawnCostHint>,
         #[serde(default)]
         access_mode: BackendAccessMode,
@@ -2272,6 +2361,8 @@ pub struct DeleteSessionPayload {
 pub struct SessionSummary {
     pub id: SessionId,
     pub backend_kind: BackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_profile_id: Option<LaunchProfileId>,
     pub workspace_roots: Vec<String>,
     pub project_id: Option<ProjectId>,
     pub alias: Option<String>,
@@ -2397,7 +2488,7 @@ pub struct SelectOption {
 }
 
 /// A single session setting value. Typed enum — not serde_json::Value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionSettingValue {
     String(String),
@@ -2408,7 +2499,7 @@ pub enum SessionSettingValue {
 
 /// Current session settings values for an agent.
 /// Keys match `SessionSettingField.key` from the schema.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSettingsValues(pub HashMap<String, SessionSettingValue>);
 
 /// Server → Client on host stream.
@@ -2438,6 +2529,8 @@ pub struct AgentStartPayload {
     pub name: String,
     pub origin: AgentOrigin,
     pub backend_kind: BackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_profile_id: Option<LaunchProfileId>,
     pub workspace_roots: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_agent_id: Option<CustomAgentId>,
@@ -2534,6 +2627,8 @@ pub struct NewAgentPayload {
     pub name: String,
     pub origin: AgentOrigin,
     pub backend_kind: BackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_profile_id: Option<LaunchProfileId>,
     pub workspace_roots: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_agent_id: Option<CustomAgentId>,
@@ -5170,8 +5265,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_five() {
-        assert_eq!(PROTOCOL_VERSION, 25);
+    fn protocol_version_is_twenty_seven() {
+        assert_eq!(PROTOCOL_VERSION, 27);
     }
 
     #[test]

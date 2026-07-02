@@ -81,6 +81,7 @@ async fn skip_noise(client: &mut client::Connection, context: &str) -> Envelope 
             FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList
@@ -107,6 +108,7 @@ async fn spawn_and_start(client: &mut client::Connection, name: &str, prompt: &s
                 prompt: prompt.to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -808,6 +810,7 @@ async fn queue_cleared_on_agent_termination() {
             FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList

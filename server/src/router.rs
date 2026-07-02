@@ -118,7 +118,7 @@ pub(crate) async fn route_client_envelope(
             FrameKind::SpawnAgent => {
                 let payload: SpawnAgentPayload = parse_payload(&envelope, "spawn_agent")?;
                 validate_spawn_agent(&payload)?;
-                host.spawn_agent(payload).await;
+                host.spawn_agent(payload).await?;
             }
             FrameKind::ListSessions => {
                 let _: ListSessionsPayload = parse_payload(&envelope, "list_sessions")?;
@@ -1044,10 +1044,18 @@ fn validate_spawn_agent(payload: &SpawnAgentPayload) -> AppResult<()> {
             workspace_roots,
             prompt,
             images,
+            launch_profile_id,
             ..
         } => {
             for root in workspace_roots {
                 ensure_non_empty("spawn_agent", "workspace_root", root)?;
+            }
+            if let Some(launch_profile_id) = launch_profile_id {
+                ensure_non_empty(
+                    "spawn_agent",
+                    "launch_profile_id",
+                    launch_profile_id.0.as_str(),
+                )?;
             }
             if prompt.trim().is_empty() && images.as_ref().is_none_or(|images| images.is_empty()) {
                 return Err(AppError::invalid(

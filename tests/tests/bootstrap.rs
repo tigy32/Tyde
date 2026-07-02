@@ -2,10 +2,13 @@ use std::time::Duration;
 
 use client::ClientConfig;
 use protocol::{
-    BackendAccessMode, BackendKind, FrameKind, HostBootstrapPayload, HostBrowseInitial,
-    HostBrowseStartPayload, HostSettingValue, NewAgentPayload, ProjectBootstrapPayload,
-    ProjectRootPath, ReviewSummaryScope, SessionId, SessionSchemasPayload, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, TerminalCreatePayload, TerminalLaunchTarget,
+    BackendAccessMode, BackendKind, CommandErrorCode, CommandErrorPayload, FrameKind,
+    HostBootstrapPayload, HostBrowseInitial, HostBrowseStartPayload, HostLaunchProfileConfig,
+    HostSettingValue, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
+    LaunchProfileId, NewAgentPayload, ProjectBootstrapPayload, ProjectRootPath, ReviewSummaryScope,
+    SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingValue,
+    SessionSettingsValues, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload,
+    TerminalCreatePayload, TerminalLaunchTarget,
 };
 use server::backend::BackendSession;
 use server::store::project::ProjectStore;
@@ -98,9 +101,26 @@ fn spawn_host(dir: &tempfile::TempDir) -> server::HostHandle {
 }
 
 fn write_enabled_backends_settings(path: &std::path::Path, backends: &[BackendKind]) {
+    write_host_settings(path, backends, None);
+}
+
+fn write_host_settings(
+    path: &std::path::Path,
+    backends: &[BackendKind],
+    default_backend: Option<BackendKind>,
+) {
+    write_host_settings_with_launch_profiles(path, backends, default_backend, Vec::new());
+}
+
+fn write_host_settings_with_launch_profiles(
+    path: &std::path::Path,
+    backends: &[BackendKind],
+    default_backend: Option<BackendKind>,
+    launch_profiles: Vec<HostLaunchProfileConfig>,
+) {
     let settings = protocol::HostSettings {
         enabled_backends: backends.to_vec(),
-        default_backend: None,
+        default_backend,
         enable_mobile_connections: false,
         mobile_broker_url: None,
         tyde_debug_mcp_enabled: false,
@@ -110,6 +130,7 @@ fn write_enabled_backends_settings(path: &std::path::Path, backends: &[BackendKi
         background_agent_features: Default::default(),
         code_intel: Default::default(),
         backend_config: std::collections::HashMap::new(),
+        launch_profiles,
     };
     let json = serde_json::json!({ "settings": settings });
     std::fs::write(
@@ -117,6 +138,47 @@ fn write_enabled_backends_settings(path: &std::path::Path, backends: &[BackendKi
         serde_json::to_vec_pretty(&json).expect("serialize settings"),
     )
     .expect("write settings");
+}
+
+fn ready_launch_profile_ids(catalog: &LaunchProfileCatalog) -> Vec<String> {
+    catalog
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            LaunchProfileEntry::Ready { profile } => Some(profile.id.0.clone()),
+            LaunchProfileEntry::Unavailable { .. } => None,
+        })
+        .collect()
+}
+
+fn launch_profile_entry<'a>(catalog: &'a LaunchProfileCatalog, id: &str) -> &'a LaunchProfileEntry {
+    catalog
+        .entries
+        .iter()
+        .find(|entry| entry.id().0 == id)
+        .unwrap_or_else(|| panic!("missing launch profile {id} in {catalog:?}"))
+}
+
+fn hermes_claude_session_settings() -> SessionSettingsValues {
+    let mut settings = SessionSettingsValues::default();
+    settings.0.insert(
+        "reasoning_effort".to_owned(),
+        SessionSettingValue::String("high".to_owned()),
+    );
+    settings
+        .0
+        .insert("fast".to_owned(), SessionSettingValue::Bool(true));
+    settings
+}
+
+fn hermes_claude_launch_profile() -> HostLaunchProfileConfig {
+    HostLaunchProfileConfig {
+        id: LaunchProfileId("hermes:claude".to_owned()),
+        label: "Hermes: Claude".to_owned(),
+        description: Some("Launch Hermes with an explicit Claude preset.".to_owned()),
+        backend_kind: BackendKind::Hermes,
+        session_settings: hermes_claude_session_settings(),
+    }
 }
 
 #[tokio::test]
@@ -142,6 +204,147 @@ async fn connection_emits_one_host_bootstrap_without_old_initial_spam() {
         "old initial replay spam",
     )
     .await;
+}
+
+#[tokio::test]
+async fn explicit_hermes_launch_profile_is_unavailable_until_schema_refresh() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let settings_path = dir.path().join("settings.json");
+    write_host_settings_with_launch_profiles(
+        &settings_path,
+        &[BackendKind::Hermes],
+        Some(BackendKind::Hermes),
+        vec![hermes_claude_launch_profile()],
+    );
+    let host = server::spawn_host_with_mock_backend(
+        dir.path().join("sessions.json"),
+        dir.path().join("projects.json"),
+        settings_path,
+    )
+    .expect("spawn host");
+    let mut client = connect_raw(host).await;
+
+    let env = next_env(&mut client, "host bootstrap").await;
+    assert_eq!(env.kind, FrameKind::HostBootstrap);
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("host bootstrap payload");
+    match launch_profile_entry(&bootstrap.launch_profile_catalog, "hermes:claude") {
+        LaunchProfileEntry::Unavailable { message, .. } => {
+            assert!(
+                message.contains("still loading"),
+                "unexpected initial Hermes profile message: {message}"
+            );
+        }
+        LaunchProfileEntry::Ready { profile } => {
+            panic!("Hermes profile should wait for dynamic schema refresh: {profile:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn host_bootstrap_includes_launch_profile_catalog() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let settings_path = dir.path().join("settings.json");
+    let mut profile_settings = SessionSettingsValues::default();
+    profile_settings.0.insert(
+        "model".to_owned(),
+        SessionSettingValue::String("haiku".to_owned()),
+    );
+    write_host_settings_with_launch_profiles(
+        &settings_path,
+        &[BackendKind::Claude, BackendKind::Codex],
+        Some(BackendKind::Claude),
+        vec![HostLaunchProfileConfig {
+            id: LaunchProfileId("claude:haiku".to_owned()),
+            label: "Claude Haiku".to_owned(),
+            description: Some("Launch Claude with Haiku.".to_owned()),
+            backend_kind: BackendKind::Claude,
+            session_settings: profile_settings,
+        }],
+    );
+    let host = server::spawn_host_with_mock_backend(
+        dir.path().join("sessions.json"),
+        dir.path().join("projects.json"),
+        settings_path,
+    )
+    .expect("spawn host");
+    let mut client = connect_raw(host).await;
+
+    let env = next_env(&mut client, "host bootstrap").await;
+    assert_eq!(env.kind, FrameKind::HostBootstrap);
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("host bootstrap payload");
+    assert_eq!(
+        bootstrap
+            .launch_profile_catalog
+            .default_profile_id
+            .as_ref()
+            .map(|id| id.0.as_str()),
+        Some("claude:default")
+    );
+    assert_eq!(
+        ready_launch_profile_ids(&bootstrap.launch_profile_catalog),
+        vec![
+            "claude:default".to_owned(),
+            "codex:default".to_owned(),
+            "claude:haiku".to_owned()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn enabled_backend_change_emits_deduped_launch_profile_catalog() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let settings_path = dir.path().join("settings.json");
+    write_enabled_backends_settings(&settings_path, &[BackendKind::Claude]);
+    let host = server::spawn_host_with_mock_backend(
+        dir.path().join("sessions.json"),
+        dir.path().join("projects.json"),
+        settings_path,
+    )
+    .expect("spawn host");
+    let mut client = connect_raw(host).await;
+
+    let bootstrap_env = next_env(&mut client, "host bootstrap").await;
+    assert_eq!(bootstrap_env.kind, FrameKind::HostBootstrap);
+
+    client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Claude, BackendKind::Codex],
+            },
+        })
+        .await
+        .expect("set enabled backends");
+
+    let catalog_env = next_kind(
+        &mut client,
+        FrameKind::LaunchProfileCatalogNotify,
+        "launch profile catalog update",
+    )
+    .await;
+    let payload: LaunchProfileCatalogPayload = catalog_env
+        .parse_payload()
+        .expect("LaunchProfileCatalog payload");
+    assert_eq!(
+        ready_launch_profile_ids(&payload.catalog),
+        vec!["claude:default".to_owned(), "codex:default".to_owned()]
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match tokio::time::timeout(deadline - now, client.next_event()).await {
+            Err(_) => break,
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(env))) if env.kind == FrameKind::LaunchProfileCatalogNotify => {
+                panic!("duplicate launch profile catalog notify: {}", env.payload);
+            }
+            Ok(Ok(Some(_))) => {}
+            Ok(Err(err)) => panic!("next_event failed after launch catalog: {err:?}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -266,6 +469,7 @@ async fn host_bootstrap_includes_session_summaries() {
             None,
             None,
             None,
+            None,
         )
         .expect("insert session");
 
@@ -350,6 +554,7 @@ async fn live_agent_reconnect_starts_with_agent_bootstrap() {
                 prompt: "hello".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: BackendAccessMode::Unrestricted,
                 session_settings: None,
@@ -405,6 +610,157 @@ async fn live_agent_reconnect_starts_with_agent_bootstrap() {
             .any(|event| matches!(event, protocol::AgentBootstrapEvent::AgentStart(_))),
         "AgentBootstrap should carry the replayed AgentStart"
     );
+}
+
+#[tokio::test]
+async fn spawn_agent_accepts_launch_profile_id_and_records_metadata() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let settings_path = dir.path().join("settings.json");
+    write_host_settings(
+        &settings_path,
+        &[BackendKind::Claude],
+        Some(BackendKind::Claude),
+    );
+    let host = server::spawn_host_with_mock_backend(
+        dir.path().join("sessions.json"),
+        dir.path().join("projects.json"),
+        settings_path,
+    )
+    .expect("spawn host");
+    let mut client = connect_raw(host).await;
+    let _ = next_env(&mut client, "host bootstrap").await;
+
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Profile Agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![dir.path().to_string_lossy().to_string()],
+                prompt: "hello from profile".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: Some(LaunchProfileId("claude:default".to_owned())),
+                cost_hint: None,
+                access_mode: BackendAccessMode::Unrestricted,
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent");
+
+    let new_agent_env = next_kind(&mut client, FrameKind::NewAgent, "new agent").await;
+    let new_agent: NewAgentPayload = new_agent_env.parse_payload().expect("new agent");
+    assert_eq!(
+        new_agent.launch_profile_id.as_ref().map(|id| id.0.as_str()),
+        Some("claude:default")
+    );
+
+    let session_list_env = next_kind(&mut client, FrameKind::SessionList, "session list").await;
+    let session_list: SessionListPayload = session_list_env.parse_payload().expect("session list");
+    let summary = session_list
+        .sessions
+        .iter()
+        .find(|summary| summary.user_alias.as_deref() == Some("Profile Agent"))
+        .expect("profile-launched session summary");
+    assert_eq!(
+        summary.launch_profile_id.as_ref().map(|id| id.0.as_str()),
+        Some("claude:default")
+    );
+}
+
+#[tokio::test]
+async fn launch_profile_errors_are_visible_command_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let settings_path = dir.path().join("settings.json");
+    let mut invalid_settings = SessionSettingsValues::default();
+    invalid_settings.0.insert(
+        "not_a_claude_setting".to_owned(),
+        SessionSettingValue::String("x".to_owned()),
+    );
+    write_host_settings_with_launch_profiles(
+        &settings_path,
+        &[BackendKind::Claude, BackendKind::Codex, BackendKind::Hermes],
+        None,
+        vec![HostLaunchProfileConfig {
+            id: LaunchProfileId("claude:invalid".to_owned()),
+            label: "Invalid Claude Profile".to_owned(),
+            description: None,
+            backend_kind: BackendKind::Claude,
+            session_settings: invalid_settings,
+        }],
+    );
+    let host = server::spawn_host_with_mock_backend(
+        dir.path().join("sessions.json"),
+        dir.path().join("projects.json"),
+        settings_path,
+    )
+    .expect("spawn host");
+    let mut client = connect_raw(host).await;
+    let _ = next_env(&mut client, "host bootstrap").await;
+
+    for (profile_id, backend_kind, expected_code, expected_message) in [
+        (
+            "missing:profile",
+            BackendKind::Claude,
+            CommandErrorCode::InvalidInput,
+            "unknown launch_profile_id",
+        ),
+        (
+            "codex:default",
+            BackendKind::Claude,
+            CommandErrorCode::Conflict,
+            "targets Codex",
+        ),
+        (
+            "claude:invalid",
+            BackendKind::Claude,
+            CommandErrorCode::InvalidInput,
+            "unavailable",
+        ),
+        (
+            "hermes:claude",
+            BackendKind::Hermes,
+            CommandErrorCode::InvalidInput,
+            "unknown launch_profile_id",
+        ),
+    ] {
+        client
+            .spawn_agent(SpawnAgentPayload {
+                name: Some(format!("Bad profile {profile_id}")),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::New {
+                    workspace_roots: vec![dir.path().to_string_lossy().to_string()],
+                    prompt: "this should fail".to_owned(),
+                    images: None,
+                    backend_kind,
+                    launch_profile_id: Some(LaunchProfileId(profile_id.to_owned())),
+                    cost_hint: None,
+                    access_mode: BackendAccessMode::Unrestricted,
+                    session_settings: None,
+                },
+            })
+            .await
+            .expect("write spawn");
+
+        let error_env = next_kind(
+            &mut client,
+            FrameKind::CommandError,
+            "profile command error",
+        )
+        .await;
+        let error: CommandErrorPayload = error_env.parse_payload().expect("command error");
+        assert_eq!(error.request_kind, FrameKind::SpawnAgent);
+        assert_eq!(error.code, expected_code);
+        assert!(
+            error.message.contains(expected_message),
+            "expected {expected_message:?} in {}",
+            error.message
+        );
+    }
 }
 
 #[tokio::test]

@@ -393,6 +393,9 @@ pub fn SessionSettingsBar() -> impl IntoView {
         if on_change_state.active_agent.get_untracked().is_some() {
             crate::actions::send_set_session_settings(&on_change_state, new_values);
         } else {
+            // A user edit to the draft: mark dirty so spawn sends these as
+            // explicit overrides even when a launch profile is selected.
+            on_change_state.draft_session_settings_dirty.set(true);
             on_change_state.draft_session_settings.set(new_values);
         }
     });

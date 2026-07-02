@@ -3849,6 +3849,7 @@ async fn persist_agent_session(
             parent_session_id,
             current_start.project_id.clone(),
             current_start.custom_agent_id.clone(),
+            current_start.launch_profile_id.clone(),
         )?;
         store.set_session_settings(session_id, current_session_settings.clone())?;
         if let Some(alias) = pending_alias.take() {
@@ -5308,6 +5309,7 @@ mod tests {
             name: "Test Agent".to_owned(),
             origin: protocol::AgentOrigin::User,
             backend_kind: protocol::BackendKind::Tycode,
+            launch_profile_id: None,
             workspace_roots: vec!["/tmp/test".to_owned()],
             custom_agent_id: None,
             team_id: None,
@@ -6887,6 +6889,7 @@ mod tests {
             name: "Chat".to_string(),
             origin: protocol::AgentOrigin::User,
             backend_kind: protocol::BackendKind::Tycode,
+            launch_profile_id: None,
             workspace_roots: vec!["/tmp/test".to_string()],
             custom_agent_id: None,
             team_id: None,

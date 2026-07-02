@@ -2,7 +2,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use protocol::{
-    BackendKind, BackgroundAgentFeature, CodeIntelSettings, HostSettingValue, HostSettings,
+    BackendKind, BackgroundAgentFeature, CodeIntelSettings, HostLaunchProfileConfig,
+    HostSettingValue, HostSettings, LaunchProfileId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -341,6 +342,9 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
                 settings.backend_config.insert(backend, sanitized);
             }
         }
+        HostSettingValue::LaunchProfiles { profiles } => {
+            settings.launch_profiles = validate_launch_profile_configs(profiles)?;
+        }
         HostSettingValue::BackgroundAgentFeatureEnabled { feature, enabled } => match feature {
             BackgroundAgentFeature::AutoGenerateAgentNames => {
                 settings.background_agent_features.auto_generate_agent_names = enabled;
@@ -424,6 +428,21 @@ fn strip_unknown_backend_kinds(value: &mut serde_json::Value) -> Vec<String> {
             known
         });
     }
+    if let Some(profiles) = settings
+        .get_mut("launch_profiles")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        profiles.retain(|profile| {
+            let Some(backend) = profile.get("backend_kind") else {
+                return true;
+            };
+            let known = is_known_backend_kind(backend);
+            if !known {
+                skipped.push(format!("launch_profiles backend_kind {backend}"));
+            }
+            known
+        });
+    }
     skipped
 }
 
@@ -444,6 +463,7 @@ fn empty_settings() -> HostSettings {
         background_agent_features: Default::default(),
         code_intel: Default::default(),
         backend_config: std::collections::HashMap::new(),
+        launch_profiles: Vec::new(),
     }
 }
 
@@ -468,6 +488,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
     }
 
     let code_intel = validate_code_intel_settings(settings.code_intel)?;
+    let launch_profiles = validate_launch_profile_configs(settings.launch_profiles)?;
 
     // Sanitize each backend's persisted deep config against its current schema
     // so a value that is no longer valid (renamed key, changed options) is
@@ -493,6 +514,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         background_agent_features: settings.background_agent_features,
         code_intel,
         backend_config,
+        launch_profiles,
     })
 }
 
@@ -505,6 +527,48 @@ fn validate_code_intel_settings(settings: CodeIntelSettings) -> Result<CodeIntel
         }
     }
     Ok(settings)
+}
+
+fn validate_launch_profile_configs(
+    profiles: Vec<HostLaunchProfileConfig>,
+) -> Result<Vec<HostLaunchProfileConfig>, String> {
+    let mut seen = std::collections::HashSet::<LaunchProfileId>::new();
+    let mut validated = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        if profile.id.0.trim().is_empty() {
+            return Err("launch profile id must not be empty".to_owned());
+        }
+        if profile.label.trim().is_empty() {
+            return Err(format!(
+                "launch profile {} label must not be empty",
+                profile.id
+            ));
+        }
+        if CANONICAL_BACKENDS.into_iter().any(|backend| {
+            profile.id == LaunchProfileId(format!("{}:default", backend_slug(backend)))
+        }) {
+            return Err(format!(
+                "launch profile {} conflicts with a reserved default profile id",
+                profile.id
+            ));
+        }
+        if !seen.insert(profile.id.clone()) {
+            return Err(format!("duplicate launch profile id {}", profile.id));
+        }
+        validated.push(profile);
+    }
+    Ok(validated)
+}
+
+fn backend_slug(backend_kind: BackendKind) -> &'static str {
+    match backend_kind {
+        BackendKind::Tycode => "tycode",
+        BackendKind::Kiro => "kiro",
+        BackendKind::Claude => "claude",
+        BackendKind::Codex => "codex",
+        BackendKind::Antigravity => "antigravity",
+        BackendKind::Hermes => "hermes",
+    }
 }
 
 fn normalize_backend_list(backends: Vec<BackendKind>) -> Vec<BackendKind> {

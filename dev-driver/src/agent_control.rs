@@ -6,9 +6,12 @@ use std::time::Duration;
 use client::ClientConfig;
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentControlStatus, AgentErrorPayload, AgentId,
-    AgentRenamedPayload, AgentStartPayload, BackendAccessMode, BackendKind, ChatEvent, Envelope,
-    FrameKind, HostBootstrapPayload, HostSettings, HostSettingsPayload, NewAgentPayload, ProjectId,
-    SendMessagePayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath,
+    AgentRenamedPayload, AgentStartPayload, BackendAccessMode, BackendConfigSchemasPayload,
+    BackendKind, ChatEvent, Envelope, FrameKind, HostBootstrapPayload, HostSettings,
+    HostSettingsPayload, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
+    LaunchProfileId, NewAgentPayload, ProjectId, SendMessagePayload, SessionSchemaEntry,
+    SessionSchemasPayload, SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload,
+    SpawnCostHint, StreamPath,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -72,6 +75,8 @@ impl AgentState {
 #[derive(Debug, Clone, Default)]
 struct SnapshotState {
     host_settings: Option<HostSettings>,
+    launch_profile_catalog: LaunchProfileCatalog,
+    session_schemas: Vec<SessionSchemaEntry>,
     agents: HashMap<AgentId, AgentState>,
     connection_error: Option<String>,
     version: u64,
@@ -287,6 +292,18 @@ impl AgentControlHandle {
         agents
     }
 
+    pub fn list_launch_options(&self) -> ListLaunchOptionsResult {
+        let snapshot = self.snapshot();
+        ListLaunchOptionsResult {
+            catalog: snapshot.launch_profile_catalog,
+            default_backend: snapshot
+                .host_settings
+                .as_ref()
+                .and_then(|settings| settings.default_backend),
+            session_schemas: snapshot.session_schemas,
+        }
+    }
+
     pub async fn read_agent(
         &self,
         agent_id: AgentId,
@@ -391,6 +408,8 @@ pub struct SpawnRequest {
     pub workspace_roots: Vec<String>,
     pub prompt: String,
     pub backend_kind: BackendKind,
+    pub launch_profile_id: Option<LaunchProfileId>,
+    pub session_settings: Option<SessionSettingsValues>,
     pub parent_agent_id: Option<AgentId>,
     pub project_id: Option<ProjectId>,
     pub name: Option<String>,
@@ -415,6 +434,13 @@ pub struct AwaitAgentStatus {
 pub struct AwaitAgentsResult {
     pub ready: Vec<AwaitAgentStatus>,
     pub still_thinking: Vec<AwaitAgentStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListLaunchOptionsResult {
+    pub catalog: LaunchProfileCatalog,
+    pub default_backend: Option<BackendKind>,
+    pub session_schemas: Vec<SessionSchemaEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -541,9 +567,10 @@ async fn run_runtime(
                                 prompt: request.prompt,
                                 images: None,
                                 backend_kind: request.backend_kind,
+                                launch_profile_id: request.launch_profile_id.clone(),
                                 cost_hint: request.cost_hint,
                                 access_mode: request.access_mode,
-                                session_settings: None,
+                                session_settings: request.session_settings.clone(),
                             },
                         };
                         if let Err(err) = connection.spawn_agent(payload).await {
@@ -769,6 +796,8 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 .parse_payload()
                 .expect("validated HostBootstrap payload should parse");
             snapshot.host_settings = Some(payload.settings);
+            snapshot.launch_profile_catalog = payload.launch_profile_catalog;
+            snapshot.session_schemas = payload.session_schemas;
             for agent in payload.agents {
                 apply_new_agent_payload(snapshot, agent);
             }
@@ -778,6 +807,23 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 .parse_payload()
                 .expect("validated HostSettings payload should parse");
             snapshot.host_settings = Some(payload.settings);
+        }
+        FrameKind::LaunchProfileCatalogNotify => {
+            let payload: LaunchProfileCatalogPayload = envelope
+                .parse_payload()
+                .expect("validated LaunchProfileCatalogNotify payload should parse");
+            snapshot.launch_profile_catalog = payload.catalog;
+        }
+        FrameKind::SessionSchemas => {
+            let payload: SessionSchemasPayload = envelope
+                .parse_payload()
+                .expect("validated SessionSchemas payload should parse");
+            snapshot.session_schemas = payload.schemas;
+        }
+        FrameKind::BackendConfigSchemas => {
+            let _: BackendConfigSchemasPayload = envelope
+                .parse_payload()
+                .expect("validated BackendConfigSchemas payload should parse");
         }
         FrameKind::NewAgent => {
             let payload: NewAgentPayload = envelope
@@ -995,7 +1041,9 @@ impl From<CostHintInput> for SpawnCostHint {
 struct SpawnAgentToolInput {
     workspace_roots: Vec<String>,
     prompt: String,
+    launch_profile_id: Option<String>,
     backend_kind: Option<BackendKindInput>,
+    session_settings: Option<SessionSettingsValues>,
     parent_agent_id: Option<String>,
     project_id: Option<String>,
     name: Option<String>,
@@ -1007,7 +1055,9 @@ struct SpawnAgentToolInput {
 struct SpawnRequestInput {
     workspace_roots: Vec<String>,
     prompt: String,
+    launch_profile_id: Option<String>,
     backend_kind: Option<BackendKindInput>,
+    session_settings: Option<SessionSettingsValues>,
     parent_agent_id: Option<String>,
     project_id: Option<String>,
     name: Option<String>,
@@ -1020,7 +1070,9 @@ impl From<SpawnAgentToolInput> for SpawnRequestInput {
         Self {
             workspace_roots: value.workspace_roots,
             prompt: value.prompt,
+            launch_profile_id: value.launch_profile_id,
             backend_kind: value.backend_kind,
+            session_settings: value.session_settings,
             parent_agent_id: value.parent_agent_id,
             project_id: value.project_id,
             name: value.name,
@@ -1061,6 +1113,14 @@ fn parse_project_id(input: &str) -> Result<ProjectId, String> {
     Ok(ProjectId(input.to_string()))
 }
 
+fn parse_launch_profile_id(input: &str) -> Result<LaunchProfileId, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("launch_profile_id must not be empty".to_string());
+    }
+    Ok(LaunchProfileId(trimmed.to_string()))
+}
+
 fn build_spawn_request(
     snapshot: &SnapshotState,
     input: SpawnRequestInput,
@@ -1068,7 +1128,9 @@ fn build_spawn_request(
     let SpawnRequestInput {
         workspace_roots,
         prompt,
+        launch_profile_id,
         backend_kind,
+        session_settings,
         parent_agent_id,
         project_id,
         name,
@@ -1086,17 +1148,36 @@ fn build_spawn_request(
         return Err("prompt must not be empty".to_string());
     }
 
-    let backend_kind = backend_kind
-        .map(BackendKind::from)
-        .or_else(|| {
-            snapshot
-                .host_settings
-                .as_ref()
-                .and_then(|settings| settings.default_backend)
-        })
-        .ok_or_else(|| {
-            "backend_kind is required because the host has no default_backend".to_string()
-        })?;
+    let launch_profile_id = launch_profile_id
+        .as_deref()
+        .map(parse_launch_profile_id)
+        .transpose()?;
+    let launch_profile_backend = launch_profile_id
+        .as_ref()
+        .map(|id| resolve_launch_profile_backend(snapshot, id))
+        .transpose()?;
+    let backend_kind = match (backend_kind.map(BackendKind::from), launch_profile_backend) {
+        (Some(explicit), Some(profile_backend)) if explicit != profile_backend => {
+            return Err(format!(
+                "launch_profile_id {} targets {:?}, but backend_kind is {:?}",
+                launch_profile_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                profile_backend,
+                explicit
+            ));
+        }
+        (Some(explicit), _) => explicit,
+        (None, Some(profile_backend)) => profile_backend,
+        (None, None) => snapshot
+            .host_settings
+            .as_ref()
+            .and_then(|settings| settings.default_backend)
+            .ok_or_else(|| {
+                "backend_kind is required because the host has no default_backend".to_string()
+            })?,
+    };
 
     let parent_agent_id = parent_agent_id.as_deref().map(parse_agent_id).transpose()?;
     let project_id = project_id.as_deref().map(parse_project_id).transpose()?;
@@ -1106,12 +1187,34 @@ fn build_spawn_request(
         workspace_roots,
         prompt,
         backend_kind,
+        launch_profile_id,
+        session_settings,
         parent_agent_id,
         project_id,
         name,
         cost_hint: cost_hint.map(SpawnCostHint::from),
         access_mode: access_mode.map(BackendAccessMode::from).unwrap_or_default(),
     })
+}
+
+fn resolve_launch_profile_backend(
+    snapshot: &SnapshotState,
+    launch_profile_id: &LaunchProfileId,
+) -> Result<BackendKind, String> {
+    let Some(entry) = snapshot
+        .launch_profile_catalog
+        .entries
+        .iter()
+        .find(|entry| entry.id() == launch_profile_id)
+    else {
+        return Err(format!("unknown launch_profile_id {launch_profile_id}"));
+    };
+    match entry {
+        LaunchProfileEntry::Ready { profile } => Ok(profile.backend_kind),
+        LaunchProfileEntry::Unavailable { message, .. } => Err(format!(
+            "launch_profile_id {launch_profile_id} is unavailable: {message}"
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1258,13 +1361,22 @@ fn tool_definitions() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        ToolDefinition {
+            name: "tyde_list_launch_options",
+            description: "List server-owned Launch Profiles and backend launch metadata.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
 fn backend_kind_schema() -> Value {
     json!({
         "type": "string",
-        "enum": ["tycode", "kiro", "claude", "codex", "antigravity"]
+        "enum": ["tycode", "kiro", "claude", "codex", "antigravity", "hermes"]
     })
 }
 
@@ -1275,20 +1387,59 @@ fn cost_hint_schema() -> Value {
     })
 }
 
+fn access_mode_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["unrestricted", "read_only"]
+    })
+}
+
 fn spawn_agent_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
             "workspace_roots": { "type": "array", "items": { "type": "string" } },
             "prompt": { "type": "string" },
+            "launch_profile_id": { "type": "string" },
             "backend_kind": backend_kind_schema(),
+            "session_settings": session_settings_values_schema(),
             "parent_agent_id": { "type": "string" },
             "project_id": { "type": "string" },
             "name": { "type": "string" },
-            "cost_hint": cost_hint_schema()
+            "cost_hint": cost_hint_schema(),
+            "access_mode": access_mode_schema()
         },
         "required": ["workspace_roots", "prompt"],
         "additionalProperties": false
+    })
+}
+
+fn session_settings_values_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": { "string": { "type": "string" } },
+                    "required": ["string"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": { "bool": { "type": "boolean" } },
+                    "required": ["bool"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": { "integer": { "type": "integer" } },
+                    "required": ["integer"],
+                    "additionalProperties": false
+                },
+                { "type": "string", "enum": ["null"] }
+            ]
+        }
     })
 }
 
@@ -1396,6 +1547,7 @@ async fn dispatch_tool(control: &AgentControlHandle, params: CallToolParams) -> 
             }
         }
         "tyde_list_agents" => ToolCallResult::json(control.list_agents().await),
+        "tyde_list_launch_options" => ToolCallResult::json(control.list_launch_options()),
         other => ToolCallResult::text_error(format!("unknown tool '{other}'")),
     }
 }
@@ -1675,6 +1827,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spawn_tool_schema_exposes_launch_profiles_session_settings_and_hermes() {
+        let schema = spawn_agent_schema();
+        let backend_enum = schema
+            .pointer("/properties/backend_kind/enum")
+            .and_then(Value::as_array)
+            .expect("backend enum");
+        assert!(backend_enum.iter().any(|value| value == "hermes"));
+        assert!(schema.pointer("/properties/launch_profile_id").is_some());
+        assert!(schema.pointer("/properties/session_settings").is_some());
+        let access_mode_enum = schema
+            .pointer("/properties/access_mode/enum")
+            .and_then(Value::as_array)
+            .expect("access mode enum");
+        assert!(access_mode_enum.iter().any(|value| value == "read_only"));
+        assert!(access_mode_enum.iter().any(|value| value == "unrestricted"));
+    }
+
+    #[test]
+    fn spawn_tool_input_accepts_schema_advertised_access_mode() {
+        let mut args = Map::new();
+        args.insert("workspace_roots".to_string(), json!(["/tmp/test"]));
+        args.insert("prompt".to_string(), json!("hello"));
+        args.insert("backend_kind".to_string(), json!("hermes"));
+        args.insert("access_mode".to_string(), json!("read_only"));
+
+        let input = parse_tool_input::<SpawnAgentToolInput>(Some(args))
+            .expect("schema-advertised access_mode should parse");
+        assert!(matches!(input.backend_kind, Some(BackendKindInput::Hermes)));
+        assert!(matches!(
+            input.access_mode,
+            Some(BackendAccessModeInput::ReadOnly)
+        ));
+    }
+
     #[tokio::test]
     async fn await_agents_then_read_returns_completed_turn() {
         let (host, _tempdir) = test_host();
@@ -1683,6 +1870,8 @@ mod tests {
             workspace_roots: vec!["/tmp/test".to_string()],
             prompt: "hello".to_string(),
             backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            session_settings: None,
             parent_agent_id: None,
             project_id: None,
             name: Some("test-agent".to_string()),
@@ -1718,6 +1907,8 @@ mod tests {
             workspace_roots: vec!["/tmp/test".to_string()],
             prompt: "__mock_hold_until_interrupt__ dev-driver await".to_string(),
             backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            session_settings: None,
             parent_agent_id: None,
             project_id: None,
             name: Some("held-tool-agent".to_string()),
@@ -1774,6 +1965,8 @@ mod tests {
             workspace_roots: vec!["/tmp/test".to_string()],
             prompt: "first".to_string(),
             backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            session_settings: None,
             parent_agent_id: None,
             project_id: None,
             name: Some("send-message-agent".to_string()),

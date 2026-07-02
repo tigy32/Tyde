@@ -11,16 +11,17 @@ use protocol::{
     BackendConfigField, BackendConfigFieldType, BackendConfigValues, BackendKind,
     BackendSetupAction, BackendSetupInfo, BackendSetupStatus, BackgroundAgentFeature, BrokerUrl,
     CodeIntelProviderId, CustomAgent, CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL,
-    DiffContextMode, FrameKind, HostExecutablePath, HostSettingValue, McpServerConfig, McpServerId,
-    McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState,
-    MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState, ProjectId,
-    RunBackendSetupPayload, SelectOption, SessionSchemaEntry, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsValues, SetSettingPayload, Skill, SkillId, Steering,
-    SteeringId, SteeringScope, ToolPolicy,
+    DiffContextMode, FrameKind, HostExecutablePath, HostLaunchProfileConfig, HostSettingValue,
+    LaunchProfileId, McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload,
+    MobileBrokerStatus, MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload,
+    MobilePairingState, ProjectId, RunBackendSetupPayload, SelectOption, SessionSchemaEntry,
+    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
+    SetSettingPayload, Skill, SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
 };
 
 use std::collections::{HashMap, HashSet};
 
+use crate::components::session_settings::SessionSettingsControls;
 use crate::send::{
     custom_agent_delete, custom_agent_upsert, mcp_server_delete, mcp_server_upsert,
     mobile_device_revoke, mobile_pairing_cancel, mobile_pairing_start, skill_refresh,
@@ -1780,6 +1781,420 @@ fn BackendsTab() -> impl IntoView {
 
         <ComplexityTiersSection />
         <BackendConfigSection />
+        <LaunchProfilesSection />
+    }
+}
+
+// ── Launch Profiles ─────────────────────────────────────────────────────
+
+type PendingLaunchProfileDelete = (LaunchProfileId, String);
+
+#[derive(Clone)]
+struct LaunchProfileForm {
+    id: RwSignal<String>,
+    is_new: bool,
+    label: RwSignal<String>,
+    description: RwSignal<String>,
+    backend_kind: RwSignal<BackendKind>,
+    session_settings: RwSignal<SessionSettingsValues>,
+}
+
+impl LaunchProfileForm {
+    fn from_config(config: &HostLaunchProfileConfig) -> Self {
+        Self {
+            id: RwSignal::new(config.id.0.clone()),
+            is_new: false,
+            label: RwSignal::new(config.label.clone()),
+            description: RwSignal::new(config.description.clone().unwrap_or_default()),
+            backend_kind: RwSignal::new(config.backend_kind),
+            session_settings: RwSignal::new(config.session_settings.clone()),
+        }
+    }
+
+    fn blank() -> Self {
+        Self {
+            id: RwSignal::new(String::new()),
+            is_new: true,
+            label: RwSignal::new(String::new()),
+            description: RwSignal::new(String::new()),
+            backend_kind: RwSignal::new(BackendKind::Hermes),
+            session_settings: RwSignal::new(SessionSettingsValues::default()),
+        }
+    }
+
+    fn validate_and_build(&self) -> Result<HostLaunchProfileConfig, String> {
+        let id = self.id.get_untracked().trim().to_string();
+        if id.is_empty() {
+            return Err("Profile id is required.".to_string());
+        }
+        let label = self.label.get_untracked().trim().to_string();
+        if label.is_empty() {
+            return Err("Label is required.".to_string());
+        }
+        if is_reserved_launch_profile_id(&id) {
+            return Err(format!(
+                "\"{id}\" is reserved for a built-in default profile. Choose a different id."
+            ));
+        }
+        let description = self.description.get_untracked().trim().to_string();
+        Ok(HostLaunchProfileConfig {
+            id: LaunchProfileId(id),
+            label,
+            description: if description.is_empty() {
+                None
+            } else {
+                Some(description)
+            },
+            backend_kind: self.backend_kind.get_untracked(),
+            session_settings: self.session_settings.get_untracked(),
+        })
+    }
+}
+
+/// Explicit server-owned Launch Profiles: named backend + session-settings
+/// presets (e.g. `hermes:claude`) that show up as ready entries in the New Chat
+/// menu. Persisted through `HostSettingValue::LaunchProfiles`.
+#[component]
+fn LaunchProfilesSection() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let form: RwSignal<Option<LaunchProfileForm>> = RwSignal::new(None);
+    let pending_delete: RwSignal<Option<PendingLaunchProfileDelete>> = RwSignal::new(None);
+
+    let state_for_rows = state.clone();
+    let rows = Memo::new(move |_| {
+        state_for_rows
+            .selected_host_settings()
+            .map(|settings| settings.launch_profiles)
+            .unwrap_or_default()
+    });
+
+    let state_for_new_disabled = state.clone();
+
+    let pending_delete_for_cancel = pending_delete;
+    let on_cancel_delete = Callback::new(move |_| pending_delete_for_cancel.set(None));
+
+    let pending_delete_for_confirm = pending_delete;
+    let state_for_confirm_delete = state.clone();
+    let on_confirm_delete = Callback::new(move |_| {
+        let Some((id, _)) = pending_delete_for_confirm.get_untracked() else {
+            return;
+        };
+        pending_delete_for_confirm.set(None);
+        let Some(settings) = state_for_confirm_delete.selected_host_settings_untracked() else {
+            return;
+        };
+        let profiles = settings
+            .launch_profiles
+            .into_iter()
+            .filter(|p| p.id != id)
+            .collect();
+        send_host_setting(
+            &state_for_confirm_delete,
+            HostSettingValue::LaunchProfiles { profiles },
+        );
+    });
+
+    view! {
+        <div class="settings-field">
+            <label class="settings-label">"Launch Profiles"</label>
+            <p class="settings-description">
+                "Named backend + session-settings presets that appear as ready entries in the New Chat menu. Saved on the selected host."
+            </p>
+            <div class="settings-form-footer">
+                <button
+                    class="settings-btn settings-btn-primary"
+                    disabled=move || state_for_new_disabled.selected_host_id.get().is_none()
+                    on:click=move |_| form.set(Some(LaunchProfileForm::blank()))
+                >
+                    "+ New launch profile"
+                </button>
+            </div>
+
+            {move || form.get().map(|f| view! { <LaunchProfileEditor form=f editor_signal=form /> })}
+
+            <div class="settings-host-list">
+                {move || {
+                    let list = rows.get();
+                    if list.is_empty() {
+                        view! { <div class="panel-empty">"No launch profiles on this host."</div> }.into_any()
+                    } else {
+                        view! {
+                            <>
+                            {list.into_iter().map(|config| view! {
+                                <LaunchProfileRow config=config editor_signal=form delete_signal=pending_delete />
+                            }).collect_view()}
+                            </>
+                        }.into_any()
+                    }
+                }}
+            </div>
+
+            {move || {
+                pending_delete.get().map(|(_, label)| {
+                    let on_cancel = on_cancel_delete;
+                    let on_confirm = on_confirm_delete;
+                    let body = format!("Delete launch profile \"{label}\"? This cannot be undone.");
+                    view! {
+                        <SettingsConfirmDialog
+                            title="Delete launch profile".to_string()
+                            body=body
+                            confirm_label="Delete".to_string()
+                            on_cancel=on_cancel
+                            on_confirm=on_confirm
+                        />
+                    }
+                })
+            }}
+        </div>
+    }
+}
+
+#[component]
+fn LaunchProfileRow(
+    config: HostLaunchProfileConfig,
+    editor_signal: RwSignal<Option<LaunchProfileForm>>,
+    delete_signal: RwSignal<Option<PendingLaunchProfileDelete>>,
+) -> impl IntoView {
+    let config_for_edit = config.clone();
+    let on_edit =
+        move |_| editor_signal.set(Some(LaunchProfileForm::from_config(&config_for_edit)));
+
+    let id_for_delete = config.id.clone();
+    let label_for_delete = config.label.clone();
+    let on_delete =
+        move |_| delete_signal.set(Some((id_for_delete.clone(), label_for_delete.clone())));
+
+    let subtitle = format!("{} · {}", config.id.0, backend_label(config.backend_kind));
+
+    view! {
+        <div class="host-card">
+            <div class="host-card-main">
+                <div class="host-card-title-row">
+                    <span class="host-card-label">{config.label.clone()}</span>
+                    <span class=backend_badge_class(config.backend_kind)>
+                        {backend_label(config.backend_kind)}
+                    </span>
+                </div>
+                <p class="host-card-transport">{subtitle}</p>
+            </div>
+            <div class="host-card-actions">
+                <button class="settings-btn" on:click=on_edit>"Edit"</button>
+                <button class="settings-btn settings-btn-danger" on:click=on_delete>"Delete"</button>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn LaunchProfileEditor(
+    form: LaunchProfileForm,
+    editor_signal: RwSignal<Option<LaunchProfileForm>>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let title = if form.is_new {
+        "New Launch Profile"
+    } else {
+        "Edit Launch Profile"
+    };
+
+    let id_sig = form.id;
+    let is_new = form.is_new;
+    let label_sig = form.label;
+    let description_sig = form.description;
+    let backend_kind_sig = form.backend_kind;
+    let session_settings_sig = form.session_settings;
+
+    let error_sig: RwSignal<Option<String>> = RwSignal::new(None);
+
+    // Typed session-settings controls for the selected backend, sourced from the
+    // host's session schema. Falls back to a note when the schema is not
+    // available (backend not installed / no configurable settings).
+    let state_for_schema = state.clone();
+    let schema_for_backend = move || -> Option<SessionSettingsSchema> {
+        let host_id = state_for_schema.selected_host_id.get()?;
+        let kind = backend_kind_sig.get();
+        match state_for_schema
+            .session_schemas
+            .get()
+            .get(&host_id)?
+            .get(&kind)?
+        {
+            SessionSchemaEntry::Ready { schema } => Some(schema.clone()),
+            _ => None,
+        }
+    };
+
+    let settings_values: Signal<SessionSettingsValues> =
+        Signal::derive(move || session_settings_sig.get());
+    let settings_on_change =
+        Callback::new(move |values: SessionSettingsValues| session_settings_sig.set(values));
+
+    let on_backend_change = move |ev: web_sys::Event| {
+        let target = ev.target().unwrap();
+        let el: web_sys::HtmlSelectElement = target.unchecked_into();
+        let Some(kind) = parse_backend_kind(&el.value()) else {
+            log::error!(
+                "unknown backend value {} in launch profile editor",
+                el.value()
+            );
+            return;
+        };
+        backend_kind_sig.set(kind);
+        // Session settings are keyed per backend; drop stale keys on switch.
+        session_settings_sig.set(SessionSettingsValues::default());
+    };
+
+    let backend_options = all_backends()
+        .into_iter()
+        .map(|kind| view! { <option value=backend_value(kind)>{backend_label(kind)}</option> })
+        .collect::<Vec<_>>();
+
+    // A profile whose backend isn't enabled is still stored server-side, but the
+    // server filters it out of the launch catalog — so warn that it won't appear
+    // in New Chat until the backend is enabled.
+    let state_for_enabled = state.clone();
+    let backend_disabled = move || {
+        !state_for_enabled
+            .selected_host_settings()
+            .map(|settings| settings.enabled_backends.contains(&backend_kind_sig.get()))
+            .unwrap_or(false)
+    };
+
+    let state_for_save = state.clone();
+    let editor_signal_for_save = editor_signal;
+    let error_sig_for_save = error_sig;
+    let on_save = move |_| {
+        let config = match form.validate_and_build() {
+            Ok(config) => config,
+            Err(error) => {
+                error_sig_for_save.set(Some(error));
+                return;
+            }
+        };
+        let Some(settings) = state_for_save.selected_host_settings_untracked() else {
+            error_sig_for_save.set(Some("No host selected.".to_string()));
+            return;
+        };
+        let mut profiles = settings.launch_profiles;
+        if is_new && profiles.iter().any(|p| p.id == config.id) {
+            error_sig_for_save.set(Some(format!(
+                "A launch profile with id \"{}\" already exists.",
+                config.id.0
+            )));
+            return;
+        }
+        match profiles.iter_mut().find(|p| p.id == config.id) {
+            Some(existing) => *existing = config,
+            None => profiles.push(config),
+        }
+        error_sig_for_save.set(None);
+        send_host_setting(
+            &state_for_save,
+            HostSettingValue::LaunchProfiles { profiles },
+        );
+        editor_signal_for_save.set(None);
+    };
+
+    let on_cancel = move |_| editor_signal.set(None);
+
+    view! {
+        <div class="settings-field">
+            <label class="settings-label">{title}</label>
+            <div class="settings-form">
+                <label class="settings-form-label">
+                    <span>"Id"<span class="settings-form-hint">" (e.g. hermes:claude)"</span></span>
+                    <input
+                        class="settings-text-input"
+                        type="text"
+                        placeholder="hermes:claude"
+                        prop:value=move || id_sig.get()
+                        on:input=move |ev| id_sig.set(event_target_value(&ev))
+                        disabled=!is_new
+                        spellcheck="false"
+                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                        autocapitalize="none"
+                        autocomplete="off"
+                    />
+                </label>
+
+                <label class="settings-form-label">
+                    <span>"Label"</span>
+                    <input
+                        class="settings-text-input"
+                        type="text"
+                        prop:value=move || label_sig.get()
+                        on:input=move |ev| label_sig.set(event_target_value(&ev))
+                        spellcheck="false"
+                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                        autocapitalize="none"
+                        autocomplete="off"
+                    />
+                </label>
+
+                <label class="settings-form-label">
+                    <span>"Description"<span class="settings-form-hint">" (optional)"</span></span>
+                    <input
+                        class="settings-text-input"
+                        type="text"
+                        prop:value=move || description_sig.get()
+                        on:input=move |ev| description_sig.set(event_target_value(&ev))
+                        spellcheck="false"
+                        {..leptos::attr::custom::custom_attribute("autocorrect", "off")}
+                        autocapitalize="none"
+                        autocomplete="off"
+                    />
+                </label>
+
+                <label class="settings-form-label">
+                    <span>"Backend"</span>
+                    <select
+                        class="settings-select"
+                        prop:value=move || backend_value(backend_kind_sig.get()).to_string()
+                        on:change=on_backend_change
+                    >
+                        {backend_options}
+                    </select>
+                </label>
+
+                <Show when=backend_disabled>
+                    <p class="settings-form-warning" role="note">
+                        "This backend is not enabled on the selected host. The profile will be saved, but it won't appear in New Chat until you enable the backend."
+                    </p>
+                </Show>
+
+                <div class="settings-form-label">
+                    <span>"Session settings"</span>
+                    {move || match schema_for_backend() {
+                        Some(schema) if !schema.fields.is_empty() => view! {
+                            <SessionSettingsControls
+                                schema=schema
+                                values=settings_values
+                                on_change=settings_on_change
+                            />
+                        }.into_any(),
+                        Some(_) => view! {
+                            <p class="settings-description">
+                                "This backend has no configurable session settings."
+                            </p>
+                        }.into_any(),
+                        None => view! {
+                            <p class="settings-description">
+                                "Session settings for this backend are unavailable on the selected host."
+                            </p>
+                        }.into_any(),
+                    }}
+                </div>
+
+                <Show when=move || error_sig.get().is_some()>
+                    <p class="settings-error">{move || error_sig.get().unwrap_or_default()}</p>
+                </Show>
+
+                <div class="settings-form-footer">
+                    <button class="settings-btn" on:click=on_cancel>"Cancel"</button>
+                    <button class="settings-btn settings-btn-primary" on:click=on_save>"Save"</button>
+                </div>
+            </div>
+        </div>
     }
 }
 
@@ -3106,6 +3521,16 @@ fn all_backends() -> [BackendKind; 6] {
         BackendKind::Antigravity,
         BackendKind::Hermes,
     ]
+}
+
+/// Mirror the server's reserved launch-profile id rule (`store::settings`):
+/// `<backend>:default` ids belong to the built-in default profiles and are
+/// rejected by the settings store, so reject them in the editor too rather than
+/// letting the save fail silently on the wire.
+fn is_reserved_launch_profile_id(id: &str) -> bool {
+    all_backends()
+        .into_iter()
+        .any(|kind| id == format!("{}:default", backend_value(kind)))
 }
 
 fn parse_backend_kind(value: &str) -> Option<BackendKind> {
@@ -4857,6 +5282,7 @@ mod wasm_tests {
                     background_agent_features: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Vec::new(),
                 },
             );
         });
@@ -5991,6 +6417,7 @@ mod wasm_tests {
                     },
                     code_intel,
                     backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Vec::new(),
                 },
             );
         });
@@ -6193,6 +6620,7 @@ mod wasm_tests {
             background_agent_features: Default::default(),
             code_intel: Default::default(),
             backend_config,
+            launch_profiles: Vec::new(),
         }
     }
 
@@ -6320,6 +6748,406 @@ mod wasm_tests {
                 .length(),
             0,
             "no config inputs without a schema"
+        );
+    }
+
+    // ---- Launch Profiles editor ----
+
+    fn launch_profile_config(id: &str, label: &str) -> HostLaunchProfileConfig {
+        HostLaunchProfileConfig {
+            id: LaunchProfileId(id.to_owned()),
+            label: label.to_owned(),
+            description: None,
+            backend_kind: BackendKind::Hermes,
+            session_settings: SessionSettingsValues::default(),
+        }
+    }
+
+    /// Install a connected host whose Hermes session schema exposes a `model`
+    /// select, plus any explicit launch profiles, and select it. Enough for the
+    /// Launch Profiles editor to render and persist typed settings.
+    fn install_launch_profile_host(state: &AppState, profiles: Vec<HostLaunchProfileConfig>) {
+        let host_id = "host-lp".to_owned();
+        state.selected_host_id.set(Some(host_id.clone()));
+        state.host_streams.update(|m| {
+            m.insert(
+                host_id.clone(),
+                protocol::StreamPath(format!("/host/{host_id}")),
+            );
+        });
+        state.connection_statuses.update(|m| {
+            m.insert(host_id.clone(), crate::state::ConnectionStatus::Connected);
+        });
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                host_id.clone(),
+                protocol::HostSettings {
+                    enabled_backends: vec![BackendKind::Hermes],
+                    default_backend: Some(BackendKind::Hermes),
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
+                    code_intel: Default::default(),
+                    backend_config: std::collections::HashMap::new(),
+                    launch_profiles: profiles,
+                },
+            );
+        });
+        state.schemas_loaded_for_host.update(|m| {
+            m.insert(host_id.clone(), true);
+        });
+        state.session_schemas.update(|m| {
+            let host = m.entry(host_id).or_default();
+            host.insert(
+                BackendKind::Hermes,
+                SessionSchemaEntry::Ready {
+                    schema: SessionSettingsSchema {
+                        backend_kind: BackendKind::Hermes,
+                        fields: vec![protocol::SessionSettingField {
+                            key: "model".to_owned(),
+                            label: "Model".to_owned(),
+                            description: None,
+                            field_type: SessionSettingFieldType::Select {
+                                options: vec![
+                                    SelectOption {
+                                        value: "sonnet".to_owned(),
+                                        label: "Sonnet".to_owned(),
+                                    },
+                                    SelectOption {
+                                        value: "opus".to_owned(),
+                                        label: "Opus".to_owned(),
+                                    },
+                                ],
+                                default: Some("sonnet".to_owned()),
+                                nullable: false,
+                            },
+                            use_slider: false,
+                        }],
+                    },
+                },
+            );
+        });
+    }
+
+    fn set_input_value(input: &web_sys::HtmlInputElement, value: &str) {
+        input.set_value(value);
+        dispatch_event_from_js(input, "input", None);
+        // `dispatch_event_from_js` tags the element with a fixed id; clear it so
+        // dispatching on a sibling input doesn't resolve back to this one.
+        let _ = input.remove_attribute("id");
+    }
+
+    /// Return the parsed `profiles` array of the most recent LaunchProfiles
+    /// SetSetting frame, or `None` if none was emitted.
+    fn last_launch_profiles(calls: &js_sys::Array) -> Option<Vec<serde_json::Value>> {
+        recorded_set_setting_payloads(calls)
+            .into_iter()
+            .rev()
+            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("launch_profiles"))
+            .and_then(|s| {
+                s.get("profiles")
+                    .and_then(|p| p.as_array())
+                    .map(|a| a.to_vec())
+            })
+    }
+
+    /// Existing explicit launch profiles render as rows with a "New" affordance.
+    #[wasm_bindgen_test]
+    async fn launch_profiles_render_existing_rows() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_launch_profile_host(
+                &state,
+                vec![launch_profile_config("hermes:claude", "Hermes · Claude")],
+            );
+            provide_context(state);
+            view! { <LaunchProfilesSection /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Hermes · Claude"),
+            "existing profile label must render: {text:?}"
+        );
+        assert!(
+            text.contains("hermes:claude"),
+            "existing profile id must render: {text:?}"
+        );
+        assert!(
+            find_button_by_text(&container, "+ New launch profile").is_some(),
+            "New launch profile button must be present"
+        );
+    }
+
+    /// Adding a profile emits a `LaunchProfiles` SetSetting carrying the new
+    /// entry alongside any existing ones.
+    #[wasm_bindgen_test]
+    async fn launch_profiles_add_emits_set_setting() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_launch_profile_host(&state, Vec::new());
+            provide_context(state);
+            view! { <LaunchProfilesSection /> }
+        });
+        next_tick().await;
+
+        find_button_by_text(&container, "+ New launch profile")
+            .expect("New button")
+            .click();
+        next_tick().await;
+
+        let inputs = container
+            .query_selector_all(".settings-form .settings-text-input")
+            .unwrap();
+        let id_input: web_sys::HtmlInputElement = inputs.item(0).unwrap().dyn_into().unwrap();
+        let label_input: web_sys::HtmlInputElement = inputs.item(1).unwrap().dyn_into().unwrap();
+        set_input_value(&id_input, "hermes:grok");
+        set_input_value(&label_input, "Hermes · Grok");
+        next_tick().await;
+
+        find_button_by_text(&container, "Save")
+            .expect("Save button")
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let profiles =
+            last_launch_profiles(&calls).expect("a LaunchProfiles frame must be emitted");
+        assert_eq!(profiles.len(), 1, "one profile persisted: {profiles:?}");
+        assert_eq!(
+            profiles[0].get("id").and_then(|v| v.as_str()),
+            Some("hermes:grok")
+        );
+        assert_eq!(
+            profiles[0].get("label").and_then(|v| v.as_str()),
+            Some("Hermes · Grok")
+        );
+        assert_eq!(
+            profiles[0].get("backend_kind").and_then(|v| v.as_str()),
+            Some("hermes"),
+            "backend kind must be carried typed"
+        );
+    }
+
+    /// Editing a profile's typed session setting (Hermes model) persists a
+    /// `LaunchProfiles` frame whose `session_settings` carries the typed value.
+    #[wasm_bindgen_test]
+    async fn launch_profiles_edit_persists_typed_session_settings() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_launch_profile_host(
+                &state,
+                vec![launch_profile_config("hermes:claude", "Hermes · Claude")],
+            );
+            provide_context(state);
+            view! { <LaunchProfilesSection /> }
+        });
+        next_tick().await;
+
+        find_button_by_text(&container, "Edit")
+            .expect("Edit button")
+            .click();
+        next_tick().await;
+
+        let select: web_sys::HtmlSelectElement = container
+            .query_selector(".settings-form .session-setting-select")
+            .unwrap()
+            .expect("typed session-setting select must render from the Hermes schema")
+            .dyn_into()
+            .unwrap();
+        select.set_value("opus");
+        dispatch_event_from_js(&select.clone().unchecked_into(), "change", None);
+        next_tick().await;
+
+        find_button_by_text(&container, "Save")
+            .expect("Save button")
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let profiles =
+            last_launch_profiles(&calls).expect("a LaunchProfiles frame must be emitted");
+        assert_eq!(profiles.len(), 1, "still one profile: {profiles:?}");
+        let model = profiles[0]
+            .get("session_settings")
+            .and_then(|s| s.get("model"))
+            .and_then(|m| m.get("string"))
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            model,
+            Some("opus"),
+            "typed session settings must be persisted on the profile: {profiles:?}"
+        );
+    }
+
+    /// Removing a profile confirms then emits a `LaunchProfiles` frame with the
+    /// remaining profiles only.
+    #[wasm_bindgen_test]
+    async fn launch_profiles_remove_emits_set_setting() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_launch_profile_host(
+                &state,
+                vec![
+                    launch_profile_config("hermes:claude", "Hermes · Claude"),
+                    launch_profile_config("hermes:codex", "Hermes · Codex"),
+                ],
+            );
+            provide_context(state);
+            view! { <LaunchProfilesSection /> }
+        });
+        next_tick().await;
+
+        // Delete the first row's profile.
+        find_button_by_text(&container, "Delete")
+            .expect("Delete button")
+            .click();
+        next_tick().await;
+        // Confirm in the dialog (scoped to the modal, since row buttons also
+        // read "Delete").
+        let confirm: HtmlElement = container
+            .query_selector(".settings-confirm-modal .settings-btn-danger")
+            .unwrap()
+            .expect("confirm dialog Delete button")
+            .dyn_into()
+            .unwrap();
+        confirm.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let profiles =
+            last_launch_profiles(&calls).expect("a LaunchProfiles frame must be emitted");
+        let ids: Vec<&str> = profiles
+            .iter()
+            .filter_map(|p| p.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(profiles.len(), 1, "one profile must remain: {profiles:?}");
+        assert_eq!(
+            ids,
+            vec!["hermes:codex"],
+            "the other profile must be removed"
+        );
+    }
+
+    /// A reserved default id (e.g. `claude:default`) is rejected in-editor,
+    /// mirroring the server rule. No `LaunchProfiles` frame is sent and the
+    /// error stays visible instead of the save closing optimistically.
+    #[wasm_bindgen_test]
+    async fn launch_profiles_reject_reserved_default_id() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_launch_profile_host(&state, Vec::new());
+            provide_context(state);
+            view! { <LaunchProfilesSection /> }
+        });
+        next_tick().await;
+
+        find_button_by_text(&container, "+ New launch profile")
+            .expect("New button")
+            .click();
+        next_tick().await;
+
+        let inputs = container
+            .query_selector_all(".settings-form .settings-text-input")
+            .unwrap();
+        let id_input: web_sys::HtmlInputElement = inputs.item(0).unwrap().dyn_into().unwrap();
+        let label_input: web_sys::HtmlInputElement = inputs.item(1).unwrap().dyn_into().unwrap();
+        set_input_value(&id_input, "claude:default");
+        set_input_value(&label_input, "Reserved");
+        next_tick().await;
+
+        find_button_by_text(&container, "Save")
+            .expect("Save button")
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        assert!(
+            last_launch_profiles(&calls).is_none(),
+            "a reserved id must not reach the wire"
+        );
+        let error_text = container
+            .query_selector(".settings-error")
+            .unwrap()
+            .and_then(|el| el.text_content())
+            .unwrap_or_default();
+        assert!(
+            error_text.contains("reserved"),
+            "the editor must show a visible reserved-id error: {error_text:?}"
+        );
+        // Editor still open (Save button present) so the user can fix the id.
+        assert!(
+            find_button_by_text(&container, "Save").is_some(),
+            "editor must stay open on validation failure"
+        );
+    }
+
+    /// Selecting a backend that isn't enabled on the host surfaces an inline
+    /// warning that the profile won't appear in New Chat until it's enabled.
+    /// The warning is absent for an enabled backend.
+    #[wasm_bindgen_test]
+    async fn launch_profiles_warn_on_disabled_backend() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            // Host enables Hermes only.
+            install_launch_profile_host(&state, Vec::new());
+            provide_context(state);
+            view! { <LaunchProfilesSection /> }
+        });
+        next_tick().await;
+
+        find_button_by_text(&container, "+ New launch profile")
+            .expect("New button")
+            .click();
+        next_tick().await;
+
+        // Default backend is Hermes (enabled) → no warning.
+        assert!(
+            container
+                .query_selector(".settings-form-warning")
+                .unwrap()
+                .is_none(),
+            "no warning when the selected backend is enabled"
+        );
+
+        // Switch to Codex, which is not enabled on this host.
+        let select: web_sys::HtmlSelectElement = container
+            .query_selector(".settings-form .settings-select")
+            .unwrap()
+            .expect("backend select must render")
+            .dyn_into()
+            .unwrap();
+        select.set_value("codex");
+        dispatch_event_from_js(&select.clone().unchecked_into(), "change", None);
+        next_tick().await;
+
+        let warning = container
+            .query_selector(".settings-form-warning")
+            .unwrap()
+            .and_then(|el| el.text_content())
+            .unwrap_or_default();
+        assert!(
+            warning.contains("not enabled") && warning.contains("New Chat"),
+            "disabled backend must show a clear inline warning: {warning:?}"
         );
     }
 }

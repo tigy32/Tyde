@@ -353,6 +353,7 @@ mod wasm_tests {
             summary: SessionSummary {
                 id: SessionId(id.to_owned()),
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 workspace_roots: Vec::new(),
                 project_id: None,
                 alias: Some(alias.to_owned()),

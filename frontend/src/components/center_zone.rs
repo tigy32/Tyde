@@ -4,7 +4,7 @@ use leptos::prelude::*;
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::actions::begin_new_chat;
+use crate::actions::begin_new_chat_default;
 use crate::app::refresh_configured_hosts;
 use crate::bridge::{self, SetSelectedHostRequest};
 use crate::components::agent_monitor_view::AgentMonitorView;
@@ -12,13 +12,14 @@ use crate::components::chat_view::ChatView;
 use crate::components::diff_view::ReviewableDiffView;
 use crate::components::file_view::FileView;
 use crate::components::home_view::HomeView;
+use crate::components::launch_menu::{LaunchMenuBody, SubmenuAlign};
 use crate::components::review_view::ReviewCommentsSurface;
 use crate::components::settings_panel::SettingsPanel;
 use crate::components::workflow_view::WorkflowView;
 use crate::send::send_frame;
 use crate::state::{AppState, ConnectionStatus, TabContent, TabId};
 
-use protocol::{BackendKind, FrameKind, SetAgentNamePayload};
+use protocol::{FrameKind, SetAgentNamePayload};
 
 struct EscListenerHandle {
     window: web_sys::Window,
@@ -38,17 +39,6 @@ fn clear_esc_listener() {
             );
         }
     });
-}
-
-fn backend_label(kind: BackendKind) -> &'static str {
-    match kind {
-        BackendKind::Tycode => "Tycode",
-        BackendKind::Kiro => "Kiro",
-        BackendKind::Claude => "Claude",
-        BackendKind::Codex => "Codex",
-        BackendKind::Antigravity => "Antigravity",
-        BackendKind::Hermes => "Hermes",
-    }
 }
 
 fn do_rename(state: AppState, tab_id: TabId, new_label: String) {
@@ -604,17 +594,9 @@ pub fn CenterZone() -> impl IntoView {
         )
     });
 
-    let enabled_backends_state = state.clone();
-    let enabled_backends = Memo::new(move |_| {
-        enabled_backends_state
-            .chat_context_host_settings()
-            .map(|s| s.enabled_backends)
-            .unwrap_or_default()
-    });
-
     let state_for_new_chat = state.clone();
     let on_new_chat = move |_| {
-        begin_new_chat(&state_for_new_chat, None);
+        begin_new_chat_default(&state_for_new_chat);
     };
 
     let state_for_agent_monitor = state.clone();
@@ -847,7 +829,7 @@ pub fn CenterZone() -> impl IntoView {
                         </button>
                         <button
                             class="new-chat-menu-trigger"
-                            title="Choose backend for new chat"
+                            title="Choose a launch profile for new chat"
                             disabled=move || !is_connected.get()
                             on:click=on_toggle_menu
                             aria-haspopup="menu"
@@ -872,35 +854,7 @@ pub fn CenterZone() -> impl IntoView {
                                         .unwrap_or_default()
                                 }
                             >
-                                {move || {
-                                    let backends = enabled_backends.get();
-                                    if backends.is_empty() {
-                                        vec![view! {
-                                            <div class="new-chat-menu-empty">
-                                                "No backends enabled"
-                                            </div>
-                                        }.into_any()]
-                                    } else {
-                                        backends.into_iter().map(|kind| {
-                                            let label = backend_label(kind);
-                                            let menu_state = expect_context::<AppState>();
-                                            let on_click = move |_| {
-                                                menu_open.set(false);
-                                                menu_position.set(None);
-                                                begin_new_chat(&menu_state, Some(kind));
-                                            };
-                                            view! {
-                                                <button
-                                                    class="new-chat-menu-item"
-                                                    role="menuitem"
-                                                    on:click=on_click
-                                                >
-                                                    {format!("New {label} Chat")}
-                                                </button>
-                                            }.into_any()
-                                        }).collect::<Vec<_>>()
-                                    }
-                                }}
+                                <LaunchMenuBody open_sig=menu_open submenu_align=SubmenuAlign::Left />
                             </div>
                         </Show>
                     </div>

@@ -94,6 +94,7 @@ fn expected_empty_settings() -> HostSettings {
         background_agent_features: Default::default(),
         code_intel: Default::default(),
         backend_config: std::collections::HashMap::new(),
+        launch_profiles: Vec::new(),
     }
 }
 
@@ -195,6 +196,7 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             background_agent_features: Default::default(),
             code_intel: Default::default(),
             backend_config: std::collections::HashMap::new(),
+            launch_profiles: Vec::new(),
         }
     );
 }
@@ -274,7 +276,7 @@ fn generated_alias_never_overrides_user_alias() {
         resumable: true,
     };
     store
-        .upsert_backend_session(&session, None, None, None)
+        .upsert_backend_session(&session, None, None, None, None)
         .expect("upsert backend session");
 
     assert!(

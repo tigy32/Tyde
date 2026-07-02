@@ -112,6 +112,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             env.kind,
             FrameKind::HostSettings
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
@@ -154,6 +155,7 @@ async fn expect_raw_event_on_stream(
             env.kind,
             FrameKind::HostSettings
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
@@ -383,6 +385,7 @@ async fn wait_for_session_list(
             env.kind,
             FrameKind::HostSettings
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
@@ -469,6 +472,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                         env.kind,
                         FrameKind::HostSettings
                             | FrameKind::SessionSchemas
+                            | FrameKind::LaunchProfileCatalogNotify
                             | FrameKind::BackendSetup
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionSettings
@@ -536,6 +540,7 @@ async fn list_sessions_and_resume_agent() {
                 prompt: "hello".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -632,6 +637,7 @@ async fn opening_agent_bootstrap_loads_tail_and_gates_older_history() {
                 prompt: "history 0".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -746,6 +752,7 @@ async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
                 prompt: "prior 0".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -860,6 +867,7 @@ async fn resume_long_replay_history_stays_capped_without_live_broadcast() {
                 prompt: "history 0".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -966,6 +974,7 @@ async fn async_resume_replay_history_is_ingested_without_live_broadcast() {
                 prompt: "original history".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1061,6 +1070,7 @@ async fn resume_backend_close_before_barrier_flushes_eager_attach_with_fatal_err
                 prompt: MOCK_CLOSE_RESUME_BEFORE_BARRIER_SENTINEL.to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1161,6 +1171,7 @@ async fn tycode_resume_replay_history_is_ingested_without_live_broadcast() {
                 prompt: "tycode original history".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Tycode,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1264,6 +1275,7 @@ async fn agent_bootstrap_keeps_active_stream_while_recent_history_loads() {
                 prompt: "parent ready".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1299,6 +1311,7 @@ async fn agent_bootstrap_keeps_active_stream_while_recent_history_loads() {
                 prompt: format!("{MOCK_HOLD_UNTIL_INTERRUPT_SENTINEL} child active"),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1426,6 +1439,7 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
                 prompt: "parent hello".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1455,6 +1469,7 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
                 prompt: "child hello".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1580,6 +1595,7 @@ async fn session_project_id_persists_and_resume_can_override_it() {
                 prompt: "session project".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1747,6 +1763,7 @@ async fn delete_session_removes_it_from_list() {
                 prompt: "hello".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,

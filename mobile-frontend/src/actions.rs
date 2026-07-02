@@ -78,6 +78,7 @@ pub async fn spawn_new_chat(
                 Some(images)
             },
             backend_kind,
+            launch_profile_id: None,
             cost_hint: None,
             access_mode: Default::default(),
             session_settings: Some(session_settings),

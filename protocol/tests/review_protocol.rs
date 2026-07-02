@@ -668,6 +668,7 @@ fn bootstrap_payloads_round_trip() {
             background_agent_features: Default::default(),
             code_intel: Default::default(),
             backend_config: std::collections::HashMap::new(),
+            launch_profiles: Vec::new(),
         },
         mobile_access: MobileAccessStatePayload {
             broker_status: MobileBrokerStatus::Disabled,
@@ -677,9 +678,11 @@ fn bootstrap_payloads_round_trip() {
         backend_setup: BackendSetupPayload { backends: vec![] },
         session_schemas: vec![],
         backend_config_schemas: vec![],
+        launch_profile_catalog: Default::default(),
         sessions: vec![SessionSummary {
             id: session_id(),
             backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
             workspace_roots: vec!["/repo".to_owned()],
             project_id: Some(project_id()),
             alias: Some("Work".to_owned()),
@@ -722,6 +725,7 @@ fn bootstrap_payloads_round_trip() {
             name: "Agent".to_owned(),
             origin: AgentOrigin::User,
             backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
             workspace_roots: vec!["/repo".to_owned()],
             custom_agent_id: None,
             team_id: None,

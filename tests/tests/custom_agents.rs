@@ -75,6 +75,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
             env.kind,
             FrameKind::HostSettings
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
@@ -228,6 +229,7 @@ async fn expect_session_list(
             env.kind,
             FrameKind::HostSettings
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
@@ -287,6 +289,7 @@ async fn wait_for_session_list(
             env.kind,
             FrameKind::HostSettings
                 | FrameKind::SessionSchemas
+                | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
@@ -799,6 +802,7 @@ async fn replay_order_replays_customization_before_agents() {
                 prompt: "order".to_string(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -917,6 +921,7 @@ async fn spawn_with_custom_agent_resolves_expected_configuration() {
                 prompt: "hello".to_string(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -986,6 +991,7 @@ async fn default_agent_resolves_all_current_skills_and_mcp_servers() {
                 prompt: "hello".to_string(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1072,6 +1078,7 @@ async fn tool_policy_rejection_for_non_claude_backends() {
                     prompt: format!("spawn {id}"),
                     images: None,
                     backend_kind,
+                    launch_profile_id: None,
                     cost_hint: None,
                     access_mode: Default::default(),
                     session_settings: None,
@@ -1130,6 +1137,7 @@ async fn resume_re_resolves_deleted_custom_agent_with_warning() {
                 prompt: "first".to_string(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,
@@ -1289,6 +1297,7 @@ async fn steering_ordering_combines_host_and_project_by_title() {
                 prompt: "steer".to_string(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,

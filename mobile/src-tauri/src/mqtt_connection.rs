@@ -1584,6 +1584,7 @@ mod tests {
             sessions: vec![SessionSummary {
                 id: SessionId(format!("session-{seq}")),
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 workspace_roots: vec!["/workspace".to_owned()],
                 project_id: None,
                 alias: None,

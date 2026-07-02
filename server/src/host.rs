@@ -24,11 +24,12 @@ use protocol::{
     CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, GitBranchName, HostAbsPath,
     HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
-    HostFilterId, HostSettingsPayload, ImageData, LOCAL_HOST_ID, McpServerConfig,
-    McpServerDeletePayload, McpServerId, McpServerNotifyPayload, McpServerUpsertPayload,
-    McpTransportConfig, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
-    MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    HostFilterId, HostLaunchProfileConfig, HostSettingsPayload, ImageData, LOCAL_HOST_ID,
+    LaunchProfile, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
+    LaunchProfileId, McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
+    McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
     ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
@@ -144,6 +145,7 @@ struct HostSubscriber {
     bootstrapped_agent_streams: HashSet<StreamPath>,
     last_session_schemas: Option<Vec<SessionSchemaEntry>>,
     last_backend_config_schemas: Option<Vec<protocol::BackendConfigSchema>>,
+    last_launch_profile_catalog: Option<LaunchProfileCatalog>,
 }
 
 pub(crate) struct DeferredAgentAttachment {
@@ -549,6 +551,7 @@ impl HostHandle {
                 bootstrapped_agent_streams: HashSet::new(),
                 last_session_schemas: None,
                 last_backend_config_schemas: None,
+                last_launch_profile_catalog: None,
             },
         );
         assert!(
@@ -638,6 +641,7 @@ impl HostHandle {
         let schemas = session_schemas_for_enabled_backends(&state, &settings.enabled_backends);
         let backend_config_schemas =
             backend_config_schemas_for_enabled_backends(&settings.enabled_backends);
+        let launch_profile_catalog = launch_profile_catalog_for_settings(&state, &settings);
 
         let mobile_access = {
             let Some(subscriber) = state.host_streams.get(&host_path) else {
@@ -775,6 +779,7 @@ impl HostHandle {
                 name: start.name.clone(),
                 origin: start.origin,
                 backend_kind: start.backend_kind,
+                launch_profile_id: start.launch_profile_id.clone(),
                 workspace_roots: start.workspace_roots.clone(),
                 custom_agent_id: start.custom_agent_id.clone(),
                 team_id: start.team_id.clone(),
@@ -814,6 +819,7 @@ impl HostHandle {
             backend_setup,
             session_schemas: schemas,
             backend_config_schemas,
+            launch_profile_catalog,
             sessions,
             projects,
             mcp_servers,
@@ -852,6 +858,7 @@ impl HostHandle {
         }
         subscriber.last_session_schemas = Some(bootstrap.session_schemas.clone());
         subscriber.last_backend_config_schemas = Some(bootstrap.backend_config_schemas.clone());
+        subscriber.last_launch_profile_catalog = Some(bootstrap.launch_profile_catalog.clone());
         state
             .mobile_access
             .activate_bootstrap_subscriber(host_path.clone());
@@ -965,7 +972,7 @@ impl HostHandle {
         lock
     }
 
-    pub(crate) async fn spawn_agent(&self, payload: SpawnAgentPayload) -> AgentId {
+    pub(crate) async fn spawn_agent(&self, payload: SpawnAgentPayload) -> AppResult<AgentId> {
         self.spawn_agent_with_origin(payload, AgentOrigin::User)
             .await
     }
@@ -1539,6 +1546,7 @@ impl HostHandle {
                 prompt: replacement_prompt,
                 images: None,
                 backend_kind: start.backend_kind,
+                launch_profile_id: old_record.launch_profile_id.clone(),
                 cost_hint: None,
                 access_mode,
                 session_settings: old_record.session_settings.clone(),
@@ -1553,6 +1561,25 @@ impl HostHandle {
                 None,
             )
             .await;
+        let new_agent_id = match new_agent_id {
+            Ok(agent_id) => agent_id,
+            Err(error) => {
+                let _ = agent_handle.release_compaction().await;
+                send_agent_compact_notify(
+                    &stream,
+                    AgentCompactNotifyPayload {
+                        status: AgentCompactStatus::Failed,
+                        old_agent_id: agent_id,
+                        old_session_id: Some(old_session_id),
+                        new_agent_id: None,
+                        new_session_id: None,
+                        summary_preview: Some(summary_preview),
+                        message: Some(format!("replacement spawn failed: {error}")),
+                    },
+                );
+                return;
+            }
+        };
         let new_session_id = match self.wait_for_agent_session_id_result(&new_agent_id).await {
             Ok(session_id) => session_id,
             Err(error) => {
@@ -1721,7 +1748,7 @@ impl HostHandle {
         &self,
         payload: SpawnAgentPayload,
         origin: AgentOrigin,
-    ) -> AgentId {
+    ) -> AppResult<AgentId> {
         self.spawn_agent_with_origin_and_config(payload, origin, None, None)
             .await
     }
@@ -1732,7 +1759,7 @@ impl HostHandle {
         origin: AgentOrigin,
         resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
         workflow: Option<AgentWorkflowMetadata>,
-    ) -> AgentId {
+    ) -> AppResult<AgentId> {
         self.spawn_agent_with_origin_config_and_team(
             payload,
             origin,
@@ -1750,7 +1777,7 @@ impl HostHandle {
         resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
         team_context: Option<TeamSpawnContext>,
         workflow: Option<AgentWorkflowMetadata>,
-    ) -> AgentId {
+    ) -> AppResult<AgentId> {
         tracing::info!(
             parent_agent_id = ?payload.parent_agent_id,
             project_id = ?payload.project_id,
@@ -1823,10 +1850,18 @@ impl HostHandle {
                 prompt,
                 images,
                 backend_kind,
+                launch_profile_id,
                 cost_hint,
                 access_mode,
                 session_settings,
             } => {
+                let (session_settings, session_settings_source) = self
+                    .resolve_launch_profile_session_settings(
+                        backend_kind,
+                        launch_profile_id.as_ref(),
+                        session_settings,
+                    )
+                    .await?;
                 let (project_id, missing_project_failure) = match payload.project_id.clone() {
                     Some(project_id) => {
                         if removing_projects.contains(&project_id) {
@@ -1921,7 +1956,7 @@ impl HostHandle {
                         backend_kind,
                         session_settings_schema.as_ref(),
                         settings,
-                        "supplied",
+                        session_settings_source,
                     )
                 });
                 let startup_failure = startup_failure.or(settings_failure);
@@ -1970,6 +2005,7 @@ impl HostHandle {
                     parent_session_id,
                     project_id,
                     backend_kind,
+                    launch_profile_id,
                     workspace_roots,
                     initial_input: Some(protocol::SendMessagePayload {
                         message: prompt,
@@ -2002,7 +2038,7 @@ impl HostHandle {
                         name,
                         persistence: InitialAgentAliasPersistence::User,
                     });
-                    return self
+                    return Ok(self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
                             name: resolved_name,
                             origin,
@@ -2019,6 +2055,7 @@ impl HostHandle {
                                 .default_backend
                                 .or_else(|| host_settings.enabled_backends.first().copied())
                                 .unwrap_or(protocol::BackendKind::Claude),
+                            launch_profile_id: None,
                             workspace_roots: Vec::new(),
                             initial_input: prompt.map(|prompt| protocol::SendMessagePayload {
                                 message: prompt,
@@ -2042,7 +2079,7 @@ impl HostHandle {
                             initial_alias,
                             use_mock_backend,
                         })
-                        .await;
+                        .await);
                 };
                 if !session_record_is_resumable(&record) {
                     let resolved_name = payload
@@ -2055,7 +2092,7 @@ impl HostHandle {
                         name,
                         persistence: InitialAgentAliasPersistence::User,
                     });
-                    return self
+                    return Ok(self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
                             name: resolved_name,
                             origin,
@@ -2069,6 +2106,7 @@ impl HostHandle {
                             parent_session_id,
                             project_id: record.project_id.clone(),
                             backend_kind: record.backend_kind,
+                            launch_profile_id: record.launch_profile_id.clone(),
                             workspace_roots: record.workspace_roots.clone(),
                             initial_input: prompt.map(|prompt| protocol::SendMessagePayload {
                                 message: prompt,
@@ -2092,7 +2130,7 @@ impl HostHandle {
                             initial_alias,
                             use_mock_backend,
                         })
-                        .await;
+                        .await);
                 }
                 if let Some(requested_custom_agent_id) = payload.custom_agent_id.as_ref() {
                     assert_eq!(
@@ -2284,6 +2322,7 @@ impl HostHandle {
                     parent_session_id,
                     project_id,
                     backend_kind: record.backend_kind,
+                    launch_profile_id: record.launch_profile_id.clone(),
                     workspace_roots: record.workspace_roots,
                     initial_input: prompt.map(|prompt| protocol::SendMessagePayload {
                         message: prompt,
@@ -2336,7 +2375,7 @@ impl HostHandle {
                         access_mode: access_mode.unwrap_or(protocol::BackendAccessMode::ReadOnly),
                         ..Default::default()
                     };
-                    return self
+                    return Ok(self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
                             name: resolved_name,
                             origin: AgentOrigin::SideQuestion,
@@ -2348,6 +2387,7 @@ impl HostHandle {
                             parent_session_id: Some(from_session_id.clone()),
                             project_id: payload.project_id,
                             backend_kind: protocol::BackendKind::Claude,
+                            launch_profile_id: None,
                             workspace_roots: Vec::new(),
                             initial_input: Some(protocol::SendMessagePayload {
                                 message: prompt,
@@ -2371,7 +2411,7 @@ impl HostHandle {
                             initial_alias,
                             use_mock_backend,
                         })
-                        .await;
+                        .await);
                 };
                 if let Some(requested_custom_agent_id) = payload.custom_agent_id.as_ref() {
                     assert_eq!(
@@ -2595,6 +2635,7 @@ impl HostHandle {
                     parent_session_id: Some(from_session_id.clone()),
                     project_id,
                     backend_kind,
+                    launch_profile_id: None,
                     workspace_roots,
                     initial_input: Some(protocol::SendMessagePayload {
                         message: prompt,
@@ -2729,7 +2770,39 @@ impl HostHandle {
             self.schedule_generated_agent_name(agent_id.clone(), request);
         }
 
-        agent_id
+        Ok(agent_id)
+    }
+
+    async fn resolve_launch_profile_session_settings(
+        &self,
+        backend_kind: BackendKind,
+        launch_profile_id: Option<&LaunchProfileId>,
+        explicit_session_settings: Option<protocol::SessionSettingsValues>,
+    ) -> AppResult<(Option<protocol::SessionSettingsValues>, &'static str)> {
+        let Some(launch_profile_id) = launch_profile_id else {
+            return Ok((explicit_session_settings, "supplied"));
+        };
+        let profile = self
+            .resolve_launch_profile(launch_profile_id)
+            .await
+            .map_err(|error| AppError::invalid("spawn_agent", error))?;
+        if profile.backend_kind != backend_kind {
+            return Err(AppError::conflict(
+                "spawn_agent",
+                format!(
+                    "launch_profile_id {launch_profile_id} targets {:?}, but backend_kind is {:?}",
+                    profile.backend_kind, backend_kind
+                ),
+            ));
+        }
+        let mut merged = profile.session_settings;
+        let source = if let Some(explicit) = explicit_session_settings.as_ref() {
+            apply_session_settings_update(&mut merged, explicit);
+            "launch profile merged with supplied"
+        } else {
+            "launch profile"
+        };
+        Ok(((!merged.0.is_empty()).then_some(merged), source))
     }
 
     /// Applies the host-level "task complexity tiers" setting to a spawn request.
@@ -4026,6 +4099,7 @@ impl HostHandle {
                         prompt,
                         images,
                         backend_kind,
+                        launch_profile_id: None,
                         cost_hint: plan.member.cost_hint,
                         access_mode: Default::default(),
                         session_settings: None,
@@ -4105,6 +4179,7 @@ impl HostHandle {
                         prompt,
                         images,
                         backend_kind,
+                        launch_profile_id: None,
                         cost_hint: plan.member.cost_hint,
                         access_mode: Default::default(),
                         session_settings: None,
@@ -4188,7 +4263,8 @@ impl HostHandle {
                 }),
                 None,
             )
-            .await;
+            .await
+            .map_err(|error| error.to_string())?;
         match self.wait_for_agent_session_id_result(&agent_id).await {
             Ok(session_id) => {
                 let refs = {
@@ -4651,6 +4727,7 @@ impl HostHandle {
         fan_out_host_settings(&mut state, settings.clone()).await;
         apply_agent_activity_summary_setting(&mut state, &settings).await;
         state.mobile_access.settings_changed(settings);
+        fan_out_launch_profile_catalog(&mut state).await;
         if refresh_session_schemas {
             drop(state);
             self.refresh_session_schemas().await;
@@ -5001,6 +5078,7 @@ impl HostHandle {
         state.hermes_session_schema = hermes_session_schema;
         fan_out_session_schemas(&mut state).await;
         fan_out_backend_config_schemas(&mut state).await;
+        fan_out_launch_profile_catalog(&mut state).await;
     }
 
     pub(crate) async fn run_backend_setup(
@@ -5543,6 +5621,38 @@ impl HostHandle {
         self.state.lock().await.settings_store.lock().await.get()
     }
 
+    pub(crate) async fn read_launch_profile_catalog(&self) -> Result<LaunchProfileCatalog, String> {
+        let state = self.state.lock().await;
+        let settings = state.settings_store.lock().await.get()?;
+        Ok(launch_profile_catalog_for_settings(&state, &settings))
+    }
+
+    pub(crate) async fn read_launch_options(
+        &self,
+    ) -> Result<
+        (
+            LaunchProfileCatalog,
+            Option<BackendKind>,
+            Vec<SessionSchemaEntry>,
+        ),
+        String,
+    > {
+        let state = self.state.lock().await;
+        let settings = state.settings_store.lock().await.get()?;
+        let catalog = launch_profile_catalog_for_settings(&state, &settings);
+        let session_schemas =
+            session_schemas_for_enabled_backends(&state, &settings.enabled_backends);
+        Ok((catalog, settings.default_backend, session_schemas))
+    }
+
+    pub(crate) async fn resolve_launch_profile(
+        &self,
+        launch_profile_id: &LaunchProfileId,
+    ) -> Result<LaunchProfile, String> {
+        let catalog = self.read_launch_profile_catalog().await?;
+        resolve_launch_profile_from_catalog(&catalog, launch_profile_id)
+    }
+
     async fn activity_summary_settings_receiver(
         &self,
     ) -> watch::Receiver<ActivitySummarySettingsSignal> {
@@ -5778,15 +5888,16 @@ impl HostHandle {
                     None,
                     Some(workflow.clone()),
                 )
-                .await;
+                .await
+                .map_err(|error| error.to_string())?;
             self.workflow_note_agent(&workflow.workflow_run_id, agent_id.clone(), false)
                 .await?;
             return Ok(agent_id);
         }
 
-        Ok(self
-            .spawn_agent_with_origin(payload, AgentOrigin::AgentControl)
-            .await)
+        self.spawn_agent_with_origin(payload, AgentOrigin::AgentControl)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn workflow_metadata_for_agent(
@@ -6189,6 +6300,7 @@ impl HostHandle {
             parent_session_id: None,
             project_id,
             backend_kind: definition.summary.coordinator.backend,
+            launch_profile_id: None,
             workspace_roots,
             initial_input: Some(SendMessagePayload {
                 message: prompt,
@@ -6739,6 +6851,7 @@ impl HostHandle {
                 Some(parent_session_id),
                 start.project_id.clone(),
                 start.custom_agent_id.clone(),
+                start.launch_profile_id.clone(),
             )
             .unwrap_or_else(|err| {
                 panic!(
@@ -8023,6 +8136,7 @@ impl HostHandle {
             parent_session_id: None,
             project_id: Some(project_id.clone()),
             backend_kind,
+            launch_profile_id: None,
             workspace_roots: project_roots,
             initial_input: Some(payload),
             cost_hint,
@@ -8223,6 +8337,7 @@ impl HostHandle {
                 prompt,
                 images: None,
                 backend_kind,
+                launch_profile_id: None,
                 cost_hint: request.cost_hint,
                 access_mode: protocol::BackendAccessMode::ReadOnly,
                 session_settings: None,
@@ -8243,7 +8358,12 @@ impl HostHandle {
                 Some(reviewer_spawn_config),
                 None,
             )
-            .await;
+            .await
+            .map_err(|error| error.to_string());
+        let agent_id = match agent_id {
+            Ok(agent_id) => agent_id,
+            Err(error) => return (reply, Err(error)),
+        };
         if let Some(agent_handle) = self.agent_handle(&agent_id).await {
             tracing::info!(
                 review_id = %request.review_id,
@@ -10864,6 +10984,7 @@ async fn emit_new_agent_for_stream(
         name: start.name.clone(),
         origin: start.origin,
         backend_kind: start.backend_kind,
+        launch_profile_id: start.launch_profile_id.clone(),
         workspace_roots: start.workspace_roots.clone(),
         custom_agent_id: start.custom_agent_id.clone(),
         team_id: start.team_id.clone(),
@@ -11602,6 +11723,36 @@ async fn fan_out_backend_config_schemas(state: &mut HostState) {
     }
 }
 
+async fn fan_out_launch_profile_catalog(state: &mut HostState) {
+    let settings = state
+        .settings_store
+        .lock()
+        .await
+        .get()
+        .unwrap_or_else(|err| {
+            panic!("failed to load host settings for launch profile catalog: {err}")
+        });
+    let catalog = launch_profile_catalog_for_settings(state, &settings);
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_launch_profile_catalog_for_subscriber(&catalog, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
 async fn emit_backend_config_schemas_for_subscriber(
     schemas: &[protocol::BackendConfigSchema],
     subscriber: &mut HostSubscriber,
@@ -11617,6 +11768,24 @@ async fn emit_backend_config_schemas_for_subscriber(
         .stream
         .send_value(FrameKind::BackendConfigSchemas, payload)?;
     subscriber.last_backend_config_schemas = Some(schemas.to_vec());
+    Ok(())
+}
+
+async fn emit_launch_profile_catalog_for_subscriber(
+    catalog: &LaunchProfileCatalog,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    if subscriber.last_launch_profile_catalog.as_ref() == Some(catalog) {
+        return Ok(());
+    }
+    let payload = serde_json::to_value(LaunchProfileCatalogPayload {
+        catalog: catalog.clone(),
+    })
+    .expect("failed to serialize LaunchProfileCatalog payload for host stream fanout");
+    subscriber
+        .stream
+        .send_value(FrameKind::LaunchProfileCatalogNotify, payload)?;
+    subscriber.last_launch_profile_catalog = Some(catalog.clone());
     Ok(())
 }
 
@@ -11986,6 +12155,142 @@ fn session_schemas_for_enabled_backends(
         .collect()
 }
 
+fn launch_profile_catalog_for_settings(
+    state: &HostState,
+    settings: &protocol::HostSettings,
+) -> LaunchProfileCatalog {
+    let mut entries = Vec::new();
+    for backend_kind in settings.enabled_backends.iter().copied() {
+        entries.push(LaunchProfileEntry::Ready {
+            profile: LaunchProfile {
+                id: default_launch_profile_id(backend_kind),
+                label: backend_launch_profile_label(backend_kind).to_owned(),
+                description: Some(format!(
+                    "Launch {} with its backend defaults.",
+                    backend_launch_profile_label(backend_kind)
+                )),
+                backend_kind,
+                session_settings: protocol::SessionSettingsValues::default(),
+            },
+        });
+    }
+
+    for config in &settings.launch_profiles {
+        if settings.enabled_backends.contains(&config.backend_kind) {
+            entries.push(launch_profile_entry_for_config(state, config));
+        }
+    }
+
+    LaunchProfileCatalog {
+        entries,
+        default_profile_id: settings.default_backend.map(default_launch_profile_id),
+    }
+}
+
+fn default_launch_profile_id(backend_kind: protocol::BackendKind) -> LaunchProfileId {
+    LaunchProfileId(format!("{}:default", backend_slug(backend_kind)))
+}
+
+fn backend_slug(backend_kind: protocol::BackendKind) -> &'static str {
+    match backend_kind {
+        protocol::BackendKind::Tycode => "tycode",
+        protocol::BackendKind::Kiro => "kiro",
+        protocol::BackendKind::Claude => "claude",
+        protocol::BackendKind::Codex => "codex",
+        protocol::BackendKind::Antigravity => "antigravity",
+        protocol::BackendKind::Hermes => "hermes",
+    }
+}
+
+fn backend_launch_profile_label(backend_kind: protocol::BackendKind) -> &'static str {
+    match backend_kind {
+        protocol::BackendKind::Tycode => "Tycode",
+        protocol::BackendKind::Kiro => "Kiro",
+        protocol::BackendKind::Claude => "Claude",
+        protocol::BackendKind::Codex => "Codex",
+        protocol::BackendKind::Antigravity => "Antigravity",
+        protocol::BackendKind::Hermes => "Hermes",
+    }
+}
+
+fn launch_profile_entry_for_config(
+    state: &HostState,
+    config: &HostLaunchProfileConfig,
+) -> LaunchProfileEntry {
+    if config.session_settings.0.is_empty() {
+        return LaunchProfileEntry::Ready {
+            profile: LaunchProfile {
+                id: config.id.clone(),
+                label: config.label.clone(),
+                description: config.description.clone(),
+                backend_kind: config.backend_kind,
+                session_settings: protocol::SessionSettingsValues::default(),
+            },
+        };
+    }
+
+    match session_schema_entry_for_backend(state, config.backend_kind) {
+        SessionSchemaEntry::Ready { schema } => {
+            match validate_session_settings_values(&schema, &config.session_settings) {
+                Ok(()) => LaunchProfileEntry::Ready {
+                    profile: LaunchProfile {
+                        id: config.id.clone(),
+                        label: config.label.clone(),
+                        description: config.description.clone(),
+                        backend_kind: config.backend_kind,
+                        session_settings: config.session_settings.clone(),
+                    },
+                },
+                Err(error) => LaunchProfileEntry::Unavailable {
+                    id: config.id.clone(),
+                    backend_kind: config.backend_kind,
+                    label: config.label.clone(),
+                    message: format!(
+                        "configured launch profile session settings are invalid: {error}"
+                    ),
+                },
+            }
+        }
+        SessionSchemaEntry::Pending { .. } => LaunchProfileEntry::Unavailable {
+            id: config.id.clone(),
+            backend_kind: config.backend_kind,
+            label: config.label.clone(),
+            message: format!(
+                "{:?} session settings schema is still loading; launch profile is not available yet",
+                config.backend_kind
+            ),
+        },
+        SessionSchemaEntry::Unavailable { message, .. } => LaunchProfileEntry::Unavailable {
+            id: config.id.clone(),
+            backend_kind: config.backend_kind,
+            label: config.label.clone(),
+            message: format!(
+                "{:?} session settings schema is unavailable: {message}",
+                config.backend_kind
+            ),
+        },
+    }
+}
+
+fn resolve_launch_profile_from_catalog(
+    catalog: &LaunchProfileCatalog,
+    launch_profile_id: &LaunchProfileId,
+) -> Result<LaunchProfile, String> {
+    let Some(entry) = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.id() == launch_profile_id)
+    else {
+        return Err(format!("unknown launch_profile_id {launch_profile_id}"));
+    };
+    match entry {
+        LaunchProfileEntry::Ready { profile } => Ok(profile.clone()),
+        LaunchProfileEntry::Unavailable { message, .. } => Err(format!(
+            "launch_profile_id {launch_profile_id} is unavailable: {message}"
+        )),
+    }
+}
+
 fn kiro_probe_workspace_root() -> Result<String, String> {
     Ok(crate::paths::home_dir()?.to_string_lossy().into_owned())
 }
@@ -12265,6 +12570,7 @@ mod tests {
             background_agent_features: Default::default(),
             code_intel: Default::default(),
             backend_config: HashMap::new(),
+            launch_profiles: Vec::new(),
         };
         let debug_mcp = DebugMcpHandle { url: String::new() };
         let agent_control = AgentControlMcpHandle { url: String::new() };
@@ -12351,6 +12657,7 @@ mod tests {
         SessionSummary {
             id,
             backend_kind,
+            launch_profile_id: None,
             workspace_roots: Vec::new(),
             project_id: None,
             alias: None,
@@ -13098,12 +13405,14 @@ mod tests {
                     prompt: prompt.to_owned(),
                     images: None,
                     backend_kind: BackendKind::Claude,
+                    launch_profile_id: None,
                     cost_hint: None,
                     access_mode: Default::default(),
                     session_settings: None,
                 },
             })
-            .await;
+            .await
+            .expect("spawn idle user agent");
         let session_id = host
             .wait_for_agent_session_id_result(&agent_id)
             .await
@@ -13598,6 +13907,7 @@ mod tests {
                         prompt: "slow start".to_owned(),
                         images: None,
                         backend_kind: BackendKind::Claude,
+                        launch_profile_id: None,
                         cost_hint: None,
                         access_mode: Default::default(),
                         session_settings: None,
@@ -13608,7 +13918,8 @@ mod tests {
                 None,
                 None,
             )
-            .await;
+            .await
+            .expect("spawn busy agent");
         let old_session_id = fixture
             .host
             .wait_for_agent_session_id_result(&agent_id)
@@ -14197,6 +14508,7 @@ mod tests {
                     None,
                     Some(report.project_ids[0].clone()),
                     report.custom_agent_id.clone(),
+                    None,
                 )
                 .expect("persist fake session");
         }

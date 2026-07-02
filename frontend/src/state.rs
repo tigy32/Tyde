@@ -12,16 +12,17 @@ use protocol::{
     CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelLocation, CodeIntelOccurrence,
     CodeIntelOverviewPayload, CodeIntelReferencesFileResult, CodeIntelStatusPayload, CustomAgent,
     CustomAgentId, DiffContextMode, GitBranchName, HostAbsPath, HostBrowseEntry,
-    HostBrowseErrorPayload, HostPlatform, HostSettings, McpServerConfig, McpServerId,
-    MessageMetadataUpdateData, MobileAccessStatePayload, MobilePairingOfferPayload, Project,
-    ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile, ProjectGitDiffPayload, ProjectId,
-    ProjectPath, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
-    ProjectSearchFileResult, QueuedMessageEntry, Review, ReviewCommentId, ReviewId,
-    ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry, SessionSettingsValues,
-    SessionSummary, Skill, SkillId, SmartViewId, Steering, SteeringId, StreamPath, TaskList, Team,
-    TeamDraft, TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId,
-    TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog,
-    TerminalId, ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
+    HostBrowseErrorPayload, HostPlatform, HostSettings, LaunchProfileCatalog, LaunchProfileId,
+    McpServerConfig, McpServerId, MessageMetadataUpdateData, MobileAccessStatePayload,
+    MobilePairingOfferPayload, Project, ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile,
+    ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing,
+    ProjectRootPath, ProjectSearchFileResult, QueuedMessageEntry, Review, ReviewCommentId,
+    ReviewId, ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry,
+    SessionSettingsValues, SessionSummary, Skill, SkillId, SmartViewId, Steering, SteeringId,
+    StreamPath, TaskList, Team, TeamDraft, TeamDraftId, TeamId, TeamMember,
+    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
+    ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
     WorkflowDiagnostic, WorkflowId, WorkflowInputSpec, WorkflowRunId, WorkflowRunSnapshot,
     WorkflowSummary,
 };
@@ -1379,6 +1380,15 @@ pub struct AppState {
     pub agent_turn_active: RwSignal<HashMap<AgentId, bool>>,
     pub draft_backend_override: RwSignal<Option<BackendKind>>,
     pub draft_custom_agent_id: RwSignal<Option<CustomAgentId>>,
+    /// Server-owned launch profile catalog keyed by host id. Seeded by
+    /// `HostBootstrap` and replaced wholesale by `LaunchProfileCatalogNotify`.
+    /// The new-chat menus render these entries directly instead of deriving
+    /// launch options from raw backend lists.
+    pub launch_profile_catalog: RwSignal<HashMap<String, LaunchProfileCatalog>>,
+    /// Launch profile selected for the pending new chat. Set from a ready
+    /// catalog profile (never parsed from the id) and sent with
+    /// `SpawnAgentParams::New`.
+    pub draft_launch_profile_id: RwSignal<Option<LaunchProfileId>>,
     pub session_schemas: RwSignal<HashMap<String, HashMap<BackendKind, SessionSchemaEntry>>>,
     pub schemas_loaded_for_host: RwSignal<HashMap<String, bool>>,
     /// Host-level deep-config schemas, keyed by host id then backend kind.
@@ -1392,6 +1402,13 @@ pub struct AppState {
     pub pending_terminal_focus: RwSignal<Option<String>>,
     pub agent_session_settings: RwSignal<HashMap<AgentId, SessionSettingsValues>>,
     pub draft_session_settings: RwSignal<SessionSettingsValues>,
+    /// Whether the user has actually edited `draft_session_settings` in the
+    /// session-settings bar. Reset when a new-chat draft starts. When a launch
+    /// profile is selected and this is `false`, `spawn_new_chat` omits explicit
+    /// `session_settings` so the server-owned profile resolution is authoritative
+    /// (a stale copy of the profile's settings must not override a changed
+    /// server profile).
+    pub draft_session_settings_dirty: RwSignal<bool>,
     pub font_size: RwSignal<u32>,
     pub theme: RwSignal<String>,
     pub font_family: RwSignal<String>,
@@ -1699,12 +1716,15 @@ impl AppState {
             agent_turn_active: RwSignal::new(HashMap::new()),
             draft_backend_override: RwSignal::new(None),
             draft_custom_agent_id: RwSignal::new(None),
+            launch_profile_catalog: RwSignal::new(HashMap::new()),
+            draft_launch_profile_id: RwSignal::new(None),
             session_schemas: RwSignal::new(HashMap::new()),
             schemas_loaded_for_host: RwSignal::new(HashMap::new()),
             backend_config_schemas: RwSignal::new(HashMap::new()),
             pending_terminal_focus: RwSignal::new(None),
             agent_session_settings: RwSignal::new(HashMap::new()),
             draft_session_settings: RwSignal::new(SessionSettingsValues::default()),
+            draft_session_settings_dirty: RwSignal::new(false),
             font_size: RwSignal::new(13),
             theme: RwSignal::new("dark".to_owned()),
             font_family: RwSignal::new("system".to_owned()),
@@ -2855,6 +2875,9 @@ impl AppState {
         });
         self.schemas_loaded_for_host.update(|loaded| {
             loaded.remove(host_id);
+        });
+        self.launch_profile_catalog.update(|map| {
+            map.remove(host_id);
         });
         self.custom_agents.update(|map| {
             map.remove(host_id);
@@ -4211,6 +4234,7 @@ mod tests {
                         background_agent_features: Default::default(),
                         code_intel: Default::default(),
                         backend_config: std::collections::HashMap::new(),
+                        launch_profiles: Vec::new(),
                     },
                 );
                 settings.insert(
@@ -4227,6 +4251,7 @@ mod tests {
                         background_agent_features: Default::default(),
                         code_intel: Default::default(),
                         backend_config: std::collections::HashMap::new(),
+                        launch_profiles: Vec::new(),
                     },
                 );
             });

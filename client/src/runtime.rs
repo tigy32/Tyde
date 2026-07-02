@@ -5,15 +5,16 @@ use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
     AgentErrorPayload, AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
-    BackendSetupPayload, CancelWorkflowPayload, ChatEvent, CodeIntelDiagnosticsPayload,
-    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
-    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
-    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
-    CustomAgentNotifyPayload, Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
-    HostBootstrapPayload, HostSettingsPayload, InterruptPayload, ListSessionsPayload,
-    McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload,
-    NewTerminalPayload, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    BackendConfigSchemasPayload, BackendSetupPayload, CancelWorkflowPayload, ChatEvent,
+    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
+    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
+    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FetchSessionHistoryPayload,
+    FrameError, FrameKind, HostBootstrapPayload, HostSettingsPayload, InterruptPayload,
+    LaunchProfileCatalogPayload, ListSessionsPayload, McpServerNotifyPayload,
+    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
+    ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
@@ -131,6 +132,8 @@ pub enum HostEvent {
     AgentActivitySummary(AgentActivitySummaryPayload),
     AgentsViewPreferencesNotify(AgentsViewPreferencesNotifyPayload),
     BackendSetup(BackendSetupPayload),
+    BackendConfigSchemas(BackendConfigSchemasPayload),
+    LaunchProfileCatalogNotify(LaunchProfileCatalogPayload),
     SessionSchemas(SessionSchemasPayload),
     SessionList(SessionListPayload),
     CommandError(CommandErrorPayload),
@@ -874,6 +877,14 @@ async fn handle_host_envelope(
             let _ = host_tx.send(HostEvent::BackendSetup(payload)).await;
             true
         }
+        FrameKind::BackendConfigSchemas => {
+            let payload: BackendConfigSchemasPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::BackendConfigSchemas(payload)).await;
+            true
+        }
         FrameKind::MobileAccessState => {
             let payload: MobileAccessStatePayload = match envelope.parse_payload() {
                 Ok(payload) => payload,
@@ -1028,6 +1039,16 @@ async fn handle_host_envelope(
                 Err(_) => return false,
             };
             let _ = host_tx.send(HostEvent::SessionSchemas(payload)).await;
+            true
+        }
+        FrameKind::LaunchProfileCatalogNotify => {
+            let payload: LaunchProfileCatalogPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx
+                .send(HostEvent::LaunchProfileCatalogNotify(payload))
+                .await;
             true
         }
         FrameKind::CommandError => {

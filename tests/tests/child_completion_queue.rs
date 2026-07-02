@@ -35,6 +35,7 @@ async fn spawn_agent(
                 prompt: prompt.to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
                 cost_hint: None,
                 access_mode: Default::default(),
                 session_settings: None,

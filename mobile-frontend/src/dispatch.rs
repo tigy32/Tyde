@@ -8,10 +8,11 @@ use protocol::types::{AgentCompactNotifyPayload, AgentCompactStatus};
 use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin,
-    AgentRenamedPayload, AgentStartPayload, BackendSetupPayload, BrowseBootstrapListing,
-    BrowseBootstrapPayload, ChatEvent, ClientErrorCode, CodeIntelOverviewPayload,
-    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
-    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
+    AgentRenamedPayload, AgentStartPayload, BackendConfigSchemasPayload, BackendSetupPayload,
+    BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent, ClientErrorCode,
+    CodeIntelOverviewPayload, CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind,
+    HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    HostBrowseOpenedPayload, HostSettingsPayload, LaunchProfileCatalogPayload,
     McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
@@ -146,6 +147,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
             background_agent_features: Default::default(),
             code_intel: Default::default(),
             backend_config: std::collections::HashMap::new(),
+            launch_profiles: Vec::new(),
         },
         mobile_access: BootstrapMobileAccess {
             broker_status: BootstrapBrokerStatus::Disabled,
@@ -157,6 +159,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
         },
         session_schemas: Vec::new(),
         backend_config_schemas: Vec::new(),
+        launch_profile_catalog: Default::default(),
         sessions: Vec::new(),
         projects: Vec::new(),
         mcp_servers: Vec::new(),
@@ -354,6 +357,17 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 state.backend_setup_by_host.update(|map| {
                     map.insert(host.clone(), payload.backends);
                 });
+            }
+        }
+        FrameKind::BackendConfigSchemas => {
+            if let Err(error) = envelope.parse_payload::<BackendConfigSchemasPayload>() {
+                log::error!(
+                    "failed to parse BackendConfigSchemas host={} stream={} seq={}: {}",
+                    host,
+                    envelope.stream,
+                    envelope.seq,
+                    error
+                );
             }
         }
         FrameKind::SessionSchemas => {
@@ -917,10 +931,10 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 apply_agent_compact_notify(state, host, payload);
             }
         }
-        // Desktop-only surfaces (the await progress card and the Files-explorer
-        // code-intel footer). Mobile has no UI for these, so parse to validate
-        // the wire shape and intentionally drop them — quietly, without the
-        // "unhandled frame kind" warning below.
+        // Desktop-only surfaces (the await progress card, the Files-explorer
+        // code-intel footer, and launch-profile menus). Mobile has no UI for
+        // these, so parse to validate the wire shape and intentionally drop
+        // them — quietly, without the "unhandled frame kind" warning below.
         FrameKind::AgentActivityStats => {
             if let Err(error) = envelope.parse_payload::<AgentActivityStatsPayload>() {
                 log::error!(
@@ -936,6 +950,17 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
             if let Err(error) = envelope.parse_payload::<CodeIntelOverviewPayload>() {
                 log::error!(
                     "failed to parse CodeIntelOverview host={} stream={} seq={}: {}",
+                    host,
+                    envelope.stream,
+                    envelope.seq,
+                    error
+                );
+            }
+        }
+        FrameKind::LaunchProfileCatalogNotify => {
+            if let Err(error) = envelope.parse_payload::<LaunchProfileCatalogPayload>() {
+                log::error!(
+                    "failed to parse LaunchProfileCatalogNotify host={} stream={} seq={}: {}",
                     host,
                     envelope.stream,
                     envelope.seq,
@@ -2625,6 +2650,7 @@ mod wasm_tests {
                     name: "Old".to_owned(),
                     origin: protocol::AgentOrigin::User,
                     backend_kind: protocol::BackendKind::Codex,
+                    launch_profile_id: None,
                     workspace_roots: Vec::new(),
                     custom_agent_id: None,
                     team_id: None,
@@ -2682,6 +2708,7 @@ mod wasm_tests {
                     name: "Replacement".to_owned(),
                     origin: protocol::AgentOrigin::User,
                     backend_kind: protocol::BackendKind::Codex,
+                    launch_profile_id: None,
                     workspace_roots: Vec::new(),
                     custom_agent_id: None,
                     team_id: None,
@@ -2876,6 +2903,7 @@ mod wasm_tests {
         let session = protocol::SessionSummary {
             id: protocol::SessionId("sess-1".to_owned()),
             backend_kind: protocol::BackendKind::Codex,
+            launch_profile_id: None,
             workspace_roots: Vec::new(),
             project_id: None,
             alias: None,
@@ -2904,6 +2932,7 @@ mod wasm_tests {
             name: "Agent One".to_owned(),
             origin: protocol::AgentOrigin::User,
             backend_kind: protocol::BackendKind::Codex,
+            launch_profile_id: None,
             workspace_roots: Vec::new(),
             custom_agent_id: None,
             team_id: None,
@@ -2929,6 +2958,7 @@ mod wasm_tests {
                 background_agent_features: Default::default(),
                 code_intel: Default::default(),
                 backend_config: std::collections::HashMap::new(),
+                launch_profiles: Vec::new(),
             },
             mobile_access: protocol::MobileAccessStatePayload {
                 broker_status: protocol::MobileBrokerStatus::Disabled,
@@ -2940,6 +2970,7 @@ mod wasm_tests {
             },
             session_schemas: Vec::new(),
             backend_config_schemas: Vec::new(),
+            launch_profile_catalog: Default::default(),
             sessions: vec![session.clone()],
             projects: vec![project.clone()],
             mcp_servers: Vec::new(),
@@ -3027,6 +3058,7 @@ mod wasm_tests {
                     name: "Agent One".to_owned(),
                     origin: protocol::AgentOrigin::User,
                     backend_kind: protocol::BackendKind::Codex,
+                    launch_profile_id: None,
                     workspace_roots: Vec::new(),
                     custom_agent_id: None,
                     team_id: None,
@@ -3047,6 +3079,7 @@ mod wasm_tests {
             name: "Agent One".to_owned(),
             origin: protocol::AgentOrigin::User,
             backend_kind: protocol::BackendKind::Codex,
+            launch_profile_id: None,
             workspace_roots: Vec::new(),
             custom_agent_id: None,
             team_id: None,
@@ -3132,6 +3165,7 @@ mod wasm_tests {
                     name: "Agent One".to_owned(),
                     origin: protocol::AgentOrigin::User,
                     backend_kind: protocol::BackendKind::Codex,
+                    launch_profile_id: None,
                     workspace_roots: Vec::new(),
                     custom_agent_id: None,
                     team_id: None,

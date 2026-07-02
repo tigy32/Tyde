@@ -1,21 +1,9 @@
 use leptos::prelude::*;
 
-use crate::actions::{begin_new_chat, begin_new_chat_with};
+use crate::actions::begin_new_chat_default;
 use crate::components::host_browser::open_project_browser;
+use crate::components::launch_menu::{LaunchMenuBody, SubmenuAlign};
 use crate::state::{AppState, ConnectionStatus};
-
-use protocol::{BackendKind, CustomAgent};
-
-fn backend_label_for(kind: BackendKind) -> &'static str {
-    match kind {
-        BackendKind::Tycode => "Tycode",
-        BackendKind::Kiro => "Kiro",
-        BackendKind::Claude => "Claude",
-        BackendKind::Codex => "Codex",
-        BackendKind::Antigravity => "Antigravity",
-        BackendKind::Hermes => "Hermes",
-    }
-}
 
 #[component]
 pub fn HomeView() -> impl IntoView {
@@ -155,122 +143,6 @@ pub fn HomeView() -> impl IntoView {
 }
 
 #[component]
-fn FlyoutBody(
-    open_sig: RwSignal<bool>,
-    enabled_backends: Memo<Vec<BackendKind>>,
-    custom_agents_for_host: Memo<Vec<CustomAgent>>,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let open_backend = RwSignal::new(None::<BackendKind>);
-
-    move || {
-        let backends = enabled_backends.get();
-        if backends.is_empty() {
-            return view! {
-                <div class="panel-empty">"No enabled backends. Enable one in Settings → Backends."</div>
-            }
-            .into_any();
-        }
-
-        let agents = custom_agents_for_host.get();
-        let rows = backends
-            .into_iter()
-            .map(|backend| {
-                let on_row_click = {
-                    let s = state.clone();
-                    move |ev: web_sys::MouseEvent| {
-                        ev.stop_propagation();
-                        open_sig.set(false);
-                        begin_new_chat(&s, Some(backend));
-                    }
-                };
-
-                let agents_for_sub = agents.clone();
-                let submenu = move || {
-                    if open_backend.get() != Some(backend) {
-                        return None;
-                    }
-                    let state_sub = expect_context::<AppState>();
-                    let on_default = {
-                        let s = state_sub.clone();
-                        move |ev: web_sys::MouseEvent| {
-                            ev.stop_propagation();
-                            open_sig.set(false);
-                            begin_new_chat(&s, Some(backend));
-                        }
-                    };
-                    let agent_items = agents_for_sub
-                        .clone()
-                        .into_iter()
-                        .map(|agent| {
-                            let s = expect_context::<AppState>();
-                            let id = agent.id.clone();
-                            let name = agent.name.clone();
-                            let desc = agent.description.clone();
-                            let on_click = move |ev: web_sys::MouseEvent| {
-                                ev.stop_propagation();
-                                open_sig.set(false);
-                                begin_new_chat_with(&s, Some(backend), Some(id.clone()));
-                            };
-                            view! {
-                                <button
-                                    class="new-chat-flyout-item"
-                                    style="display:block;width:100%;text-align:left;padding:0.4rem 0.8rem;background:transparent;border:none;color:inherit;cursor:pointer;border-radius:4px;white-space:nowrap;"
-                                    title=desc
-                                    on:click=on_click
-                                >
-                                    {name}
-                                </button>
-                            }
-                        })
-                        .collect_view();
-                    Some(
-                        view! {
-                            <div
-                                class="new-chat-submenu"
-                                style="position:absolute;left:100%;top:-0.5rem;background:var(--bg-surface,#1e1e1e);border:1px solid var(--border-subtle,#333);border-radius:6px;padding:0.5rem;z-index:101;box-shadow:0 4px 16px rgba(0,0,0,0.4);white-space:nowrap;"
-                            >
-                                <button
-                                    class="new-chat-flyout-item"
-                                    style="display:block;width:100%;text-align:left;padding:0.4rem 0.8rem;background:transparent;border:none;color:inherit;cursor:pointer;border-radius:4px;white-space:nowrap;"
-                                    on:click=on_default
-                                >
-                                    "Default agent"
-                                </button>
-                                {agent_items}
-                            </div>
-                        }
-                        .into_any(),
-                    )
-                };
-
-                view! {
-                    <div
-                        class="new-chat-backend-row-wrap"
-                        style="position:relative;"
-                        on:mouseenter=move |_| open_backend.set(Some(backend))
-                        on:mouseleave=move |_| open_backend.set(None)
-                    >
-                        <button
-                            class="new-chat-flyout-item"
-                            style="display:flex;align-items:center;gap:0.5rem;width:100%;text-align:left;padding:0.4rem 0.6rem;background:transparent;border:none;color:inherit;cursor:pointer;border-radius:4px;white-space:nowrap;"
-                            on:click=on_row_click
-                        >
-                            <span>{backend_label_for(backend)}</span>
-                            <span style="flex:1;"></span>
-                            <span style="opacity:0.5;font-size:0.7rem;">"▶"</span>
-                        </button>
-                        {submenu}
-                    </div>
-                }
-            })
-            .collect_view();
-
-        view! { <>{rows}</> }.into_any()
-    }
-}
-
-#[component]
 fn NewChatButton(connected_sig: Memo<bool>) -> impl IntoView {
     let state = expect_context::<AppState>();
     let open = RwSignal::new(false);
@@ -280,38 +152,13 @@ fn NewChatButton(connected_sig: Memo<bool>) -> impl IntoView {
         if !connected_sig.get() {
             return;
         }
-        begin_new_chat(&state_for_default, None);
+        begin_new_chat_default(&state_for_default);
     };
 
     let on_toggle = move |ev: web_sys::MouseEvent| {
         ev.stop_propagation();
         open.update(|v| *v = !*v);
     };
-
-    let state_for_menu = state.clone();
-    let enabled_backends = Memo::new(move |_| {
-        state_for_menu
-            .chat_context_host_settings()
-            .map(|s| s.enabled_backends)
-            .unwrap_or_default()
-    });
-
-    let state_for_agents = state.clone();
-    let custom_agents_for_host = Memo::new(move |_| {
-        let Some(host_id) = state_for_agents.chat_context_host_id() else {
-            return Vec::<CustomAgent>::new();
-        };
-        let mut agents: Vec<CustomAgent> = state_for_agents
-            .custom_agents
-            .get()
-            .get(&host_id)
-            .cloned()
-            .map(|m| m.into_values().collect())
-            .unwrap_or_default();
-        agents.retain(|a| a.id.0 != crate::state::DEFAULT_CUSTOM_AGENT_ID);
-        agents.sort_by(|a, b| a.name.cmp(&b.name));
-        agents
-    });
 
     view! {
         <>
@@ -341,20 +188,17 @@ fn NewChatButton(connected_sig: Memo<bool>) -> impl IntoView {
                     style="padding:0 0.6rem;border-left:1px solid rgba(255,255,255,0.15);border-radius:0 6px 6px 0;"
                     on:click=on_toggle
                     disabled=move || !connected_sig.get()
-                    title="Pick backend and custom agent"
+                    title="Pick a launch profile and custom agent"
                 >
                     "▾"
                 </button>
                 <Show when=move || open.get()>
                     <div
                         class="new-chat-flyout"
+                        role="menu"
                         style="position:absolute;top:calc(100% + 4px);right:0;background:var(--bg-surface, #1e1e1e);border:1px solid var(--border-subtle, #333);border-radius:6px;padding:0.5rem 25px;z-index:100;box-shadow:0 4px 16px rgba(0,0,0,0.4);"
                     >
-                        <FlyoutBody
-                            open_sig=open
-                            enabled_backends=enabled_backends
-                            custom_agents_for_host=custom_agents_for_host
-                        />
+                        <LaunchMenuBody open_sig=open submenu_align=SubmenuAlign::Right />
                     </div>
                 </Show>
             </div>
@@ -368,7 +212,8 @@ mod wasm_tests {
     use crate::state::{AgentInfo, ProjectInfo};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, AgentOrigin, Project, ProjectId, ProjectRootPath, ProjectSource, StreamPath,
+        AgentId, AgentOrigin, BackendKind, Project, ProjectId, ProjectRootPath, ProjectSource,
+        StreamPath,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -424,6 +269,7 @@ mod wasm_tests {
                     background_agent_features: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Vec::new(),
                 },
             );
         });
