@@ -336,11 +336,10 @@ pub(crate) fn backend_config_schema_for_backend(
 ) -> Option<BackendConfigSchema> {
     match backend_kind {
         BackendKind::Hermes => hermes::HermesBackend::backend_config_schema(),
-        BackendKind::Tycode
-        | BackendKind::Kiro
-        | BackendKind::Claude
-        | BackendKind::Codex
-        | BackendKind::Antigravity => None,
+        BackendKind::Tycode => tycode::TycodeBackend::backend_config_schema(),
+        BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex | BackendKind::Antigravity => {
+            None
+        }
     }
 }
 
@@ -666,7 +665,7 @@ mod tests {
         assert!(sanitized.0.contains_key("default_model"));
 
         // A backend with no config schema sanitizes everything away.
-        let sanitized = sanitize_backend_config_values(BackendKind::Tycode, &good);
+        let sanitized = sanitize_backend_config_values(BackendKind::Claude, &good);
         assert!(sanitized.0.is_empty());
     }
 
