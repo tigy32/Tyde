@@ -678,6 +678,7 @@ fn bootstrap_payloads_round_trip() {
         backend_setup: BackendSetupPayload { backends: vec![] },
         session_schemas: vec![],
         backend_config_schemas: vec![],
+        backend_config_snapshots: vec![],
         launch_profile_catalog: Default::default(),
         sessions: vec![SessionSummary {
             id: session_id(),

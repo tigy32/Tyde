@@ -5,23 +5,24 @@ use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
     AgentErrorPayload, AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
-    BackendConfigSchemasPayload, BackendSetupPayload, CancelWorkflowPayload, ChatEvent,
-    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
-    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
-    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FetchSessionHistoryPayload,
-    FrameError, FrameKind, HostBootstrapPayload, HostSettingsPayload, InterruptPayload,
-    LaunchProfileCatalogPayload, ListSessionsPayload, McpServerNotifyPayload,
-    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
-    ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
-    ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
-    ProjectStageHunkPayload, QueuedMessagesPayload, SendMessagePayload, SessionHistoryPayload,
-    SessionListPayload, SessionSchemasPayload, SessionSettingsPayload, SetAgentNamePayload,
-    SetSessionSettingsPayload, SkillNotifyPayload, SpawnAgentPayload, SteeringNotifyPayload,
-    StreamPath, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
+    BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendSetupPayload,
+    CancelWorkflowPayload, ChatEvent, CodeIntelDiagnosticsPayload, CodeIntelErrorPayload,
+    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
+    CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    CustomAgentNotifyPayload, Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
+    HostBootstrapPayload, HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload,
+    ListSessionsPayload, McpServerNotifyPayload, MobileAccessStatePayload,
+    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, ProjectAccessedPayload,
+    ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectNotifyPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
+    SendMessagePayload, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
+    SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload, SkillNotifyPayload,
+    SpawnAgentPayload, SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload,
+    TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
     TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
@@ -133,6 +134,7 @@ pub enum HostEvent {
     AgentsViewPreferencesNotify(AgentsViewPreferencesNotifyPayload),
     BackendSetup(BackendSetupPayload),
     BackendConfigSchemas(BackendConfigSchemasPayload),
+    BackendConfigSnapshots(BackendConfigSnapshotsPayload),
     LaunchProfileCatalogNotify(LaunchProfileCatalogPayload),
     SessionSchemas(SessionSchemasPayload),
     SessionList(SessionListPayload),
@@ -883,6 +885,16 @@ async fn handle_host_envelope(
                 Err(_) => return false,
             };
             let _ = host_tx.send(HostEvent::BackendConfigSchemas(payload)).await;
+            true
+        }
+        FrameKind::BackendConfigSnapshots => {
+            let payload: BackendConfigSnapshotsPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx
+                .send(HostEvent::BackendConfigSnapshots(payload))
+                .await;
             true
         }
         FrameKind::MobileAccessState => {

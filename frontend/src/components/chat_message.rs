@@ -244,10 +244,17 @@ pub fn ChatMessageView(
                     MessageSender::Assistant { agent } => agent.clone(),
                     _ => String::new(),
                 };
-                let badge = this_turn_token_usage(&e.message)
+                // The footer shows the per-request figure by default; the
+                // tooltip lays out all three scopes (request/turn/cumulative)
+                // so the inline number is never ambiguous.
+                let usage = e.message.token_usage.clone();
+                let badge = request_token_usage(&e.message)
                     .as_ref()
                     .map(token_badge_data);
-                let badge_tooltip = badge.as_ref().map(|(_, _, t)| t.clone()).unwrap_or_default();
+                let badge_tooltip = usage
+                    .as_ref()
+                    .map(message_token_tooltip)
+                    .unwrap_or_default();
                 let footer_time = format_relative_time(e.message.timestamp);
                 let footer_content_empty = e.message.content.is_empty();
                 let on_copy_handler = on_copy.clone();
@@ -296,19 +303,54 @@ pub fn ChatMessageView(
     }
 }
 
-/// Resolve the THIS-TURN token usage for a chat row. `token_usage` is the
-/// authoritative this-turn figure; `turn_token_usage` refines it: `Known`
-/// carries the same this-turn figure explicitly (never the cumulative
-/// `agent_total`), and `Unavailable` means the backend reported nothing, so
-/// the row renders no badge rather than a fake-zero one.
-pub(crate) fn this_turn_token_usage(
-    message: &protocol::ChatMessage,
-) -> Option<protocol::TokenUsage> {
-    match &message.turn_token_usage {
-        Some(protocol::TurnTokenUsage::Unavailable { .. }) => None,
-        Some(protocol::TurnTokenUsage::Known { this_turn, .. }) => Some((**this_turn).clone()),
-        None => message.token_usage.clone(),
+/// The per-request token usage a chat row shows by default: `token_usage.request`
+/// when the backend reported it, else `None` (no fake-zero badge). The turn and
+/// cumulative scopes are surfaced in the badge tooltip via
+/// [`message_token_tooltip`], never folded into this figure.
+pub(crate) fn request_token_usage(message: &protocol::ChatMessage) -> Option<protocol::TokenUsage> {
+    message
+        .token_usage
+        .as_ref()
+        .and_then(|usage| usage.request.known_usage().cloned())
+}
+
+fn token_usage_unavailable_reason_text(
+    reason: protocol::TokenUsageUnavailableReason,
+) -> &'static str {
+    match reason {
+        protocol::TokenUsageUnavailableReason::BackendDidNotReport => "backend did not report",
+        protocol::TokenUsageUnavailableReason::ProviderScopeAmbiguous => "provider scope ambiguous",
     }
+}
+
+/// One scope's line for the token tooltip: the `↑input ↓output` figure when
+/// known, else an explicit "unavailable" note with the server-provided reason —
+/// never a fabricated zero.
+fn token_scope_summary(scope: &protocol::TokenUsageScope) -> String {
+    match scope {
+        protocol::TokenUsageScope::Known { usage } => {
+            let (input_text, output_text, _) = token_badge_data(usage);
+            format!("{input_text} {output_text}")
+        }
+        protocol::TokenUsageScope::Unavailable { reason } => {
+            format!(
+                "unavailable ({})",
+                token_usage_unavailable_reason_text(*reason)
+            )
+        }
+    }
+}
+
+/// Multi-scope tooltip laying out request / turn / cumulative usage so the row's
+/// inline (request) number is unambiguous and the turn + cumulative scopes are
+/// exposed on hover.
+pub(crate) fn message_token_tooltip(usage: &protocol::MessageTokenUsage) -> String {
+    format!(
+        "Request: {}\nTurn: {}\nCumulative: {}",
+        token_scope_summary(&usage.request),
+        token_scope_summary(&usage.turn),
+        token_scope_summary(&usage.cumulative),
+    )
 }
 
 /// Format a `TokenUsage` into `(input_text, output_text, tooltip)` for the
@@ -392,8 +434,8 @@ mod wasm_tests {
     use crate::state::{AppState, ChatMessageEntry, ChatRowHandle};
     use leptos::mount::mount_to;
     use protocol::{
-        AgentId, ChatMessage, ChatMessageId, MessageMetadataUpdateData, TokenUsage,
-        TokenUsageUnavailableReason, TurnTokenUsage,
+        AgentId, ChatMessage, ChatMessageId, MessageMetadataUpdateData, MessageTokenUsage,
+        TokenUsage, TokenUsageUnavailableReason,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -437,10 +479,7 @@ mod wasm_tests {
         }
     }
 
-    fn assistant_msg(
-        token_usage: Option<TokenUsage>,
-        turn_token_usage: Option<TurnTokenUsage>,
-    ) -> ChatMessageEntry {
+    fn assistant_msg(token_usage: Option<MessageTokenUsage>) -> ChatMessageEntry {
         ChatMessageEntry {
             message: ChatMessage {
                 message_id: None,
@@ -453,7 +492,6 @@ mod wasm_tests {
                 tool_calls: Vec::new(),
                 model_info: None,
                 token_usage,
-                turn_token_usage,
                 context_breakdown: None,
                 images: None,
             },
@@ -491,20 +529,22 @@ mod wasm_tests {
             .map(|el| el.text_content().unwrap_or_default())
     }
 
-    /// The chat row's token badge shows the THIS-TURN figure, never the
-    /// cumulative `agent_total` carried alongside it in `TurnTokenUsage::Known`.
+    fn badge_title(container: &HtmlElement) -> Option<String> {
+        container
+            .query_selector(".token-badge")
+            .unwrap()
+            .and_then(|el| el.get_attribute("title"))
+    }
+
+    /// The chat row's inline badge shows the REQUEST scope by default, never the
+    /// turn delta or the cumulative total carried in the same `MessageTokenUsage`.
     #[wasm_bindgen_test]
-    async fn chat_row_shows_this_turn_not_cumulative_total() {
-        // This turn is small; the agent's cumulative total is huge and distinct.
-        let this_turn = usage(1200, 300);
-        let agent_total = usage(999_000, 888_000);
-        let entry = assistant_msg(
-            Some(this_turn.clone()),
-            Some(TurnTokenUsage::Known {
-                this_turn: Box::new(this_turn),
-                agent_total: Box::new(agent_total),
-            }),
-        );
+    async fn chat_row_shows_request_scope_by_default() {
+        // Request is small and distinct from the larger turn / cumulative scopes.
+        let entry = assistant_msg(Some(
+            MessageTokenUsage::request_and_turn_known(usage(1200, 300), usage(4000, 5000))
+                .with_cumulative(usage(999_000, 888_000)),
+        ));
         let container = mount_message(entry);
         next_tick().await;
 
@@ -512,30 +552,57 @@ mod wasm_tests {
         let output = output_stat(&container).expect("output token stat present");
         assert!(
             input.contains("1.2K"),
-            "row must show the this-turn input figure: {input}"
+            "row must show the request input figure: {input}"
         );
         assert!(
             output.contains("300"),
-            "row must show the this-turn output figure: {output}"
+            "row must show the request output figure: {output}"
         );
-        // The large cumulative total must not leak into the per-turn badge.
+        // Neither the turn delta nor the cumulative total may leak into the
+        // inline badge — those live in the tooltip.
         assert!(
-            !input.contains("999") && !output.contains("888"),
-            "row must not render the cumulative agent_total: in={input} out={output}"
+            !input.contains("4.0K") && !input.contains("999"),
+            "turn/cumulative input must not leak into the inline badge: {input}"
+        );
+        assert!(
+            !output.contains("5.0K") && !output.contains("888"),
+            "turn/cumulative output must not leak into the inline badge: {output}"
         );
     }
 
-    /// `TurnTokenUsage::Unavailable` means the backend reported nothing this
-    /// turn; the row must render no token badge rather than a fake-zero one,
-    /// even though `token_usage` carries zeros for backward compatibility.
+    /// The badge tooltip exposes all three scopes (request / turn / cumulative)
+    /// with their figures, so the inline request number is never ambiguous.
+    #[wasm_bindgen_test]
+    async fn chat_row_tooltip_exposes_all_three_scopes() {
+        let entry = assistant_msg(Some(
+            MessageTokenUsage::request_and_turn_known(usage(1200, 300), usage(4000, 5000))
+                .with_cumulative(usage(999_000, 888_000)),
+        ));
+        let container = mount_message(entry);
+        next_tick().await;
+
+        let title = badge_title(&container).expect("token badge carries a tooltip");
+        assert!(
+            title.contains("Request:") && title.contains("1.2K"),
+            "tooltip must label the request scope: {title}"
+        );
+        assert!(
+            title.contains("Turn:") && title.contains("4.0K"),
+            "tooltip must expose the turn scope: {title}"
+        );
+        assert!(
+            title.contains("Cumulative:") && title.contains("999.0K"),
+            "tooltip must expose the cumulative scope: {title}"
+        );
+    }
+
+    /// A fully-unavailable `MessageTokenUsage` means the backend reported
+    /// nothing; the row must render no token badge rather than a fake-zero one.
     #[wasm_bindgen_test]
     async fn chat_row_unavailable_renders_no_fake_zero_badge() {
-        let entry = assistant_msg(
-            Some(usage(0, 0)),
-            Some(TurnTokenUsage::Unavailable {
-                reason: TokenUsageUnavailableReason::BackendDidNotReport,
-            }),
-        );
+        let entry = assistant_msg(Some(MessageTokenUsage::unavailable(
+            TokenUsageUnavailableReason::BackendDidNotReport,
+        )));
         let container = mount_message(entry);
         next_tick().await;
 
@@ -554,11 +621,11 @@ mod wasm_tests {
         );
     }
 
-    /// A live `MessageMetadataUpdated` patch that flips a row's
-    /// `turn_token_usage` from `Unavailable` to `Known` must reactively update
-    /// the mounted row to show the real this-turn figure — no badge before,
-    /// the real numbers after. This exercises both the reactive projection and
-    /// the live patch reducer (`apply_chat_message_metadata`).
+    /// A live `MessageMetadataUpdated` patch that flips a row's `token_usage`
+    /// from unavailable to a known request scope must reactively update the
+    /// mounted row to show the real request figure — no badge before, the real
+    /// numbers after. This exercises both the reactive projection and the live
+    /// patch reducer (`apply_chat_message_metadata`).
     #[wasm_bindgen_test]
     async fn chat_row_live_patch_unavailable_to_known_updates_badge() {
         let container = make_container();
@@ -586,10 +653,9 @@ mod wasm_tests {
                     reasoning: None,
                     tool_calls: Vec::new(),
                     model_info: None,
-                    token_usage: Some(usage(0, 0)),
-                    turn_token_usage: Some(TurnTokenUsage::Unavailable {
-                        reason: TokenUsageUnavailableReason::BackendDidNotReport,
-                    }),
+                    token_usage: Some(MessageTokenUsage::unavailable(
+                        TokenUsageUnavailableReason::BackendDidNotReport,
+                    )),
                     context_breakdown: None,
                     images: None,
                 },
@@ -605,28 +671,28 @@ mod wasm_tests {
         .forget();
         next_tick().await;
 
-        // Before the patch the turn is Unavailable: no badge at all.
+        // Before the patch the request scope is Unavailable: no badge at all.
         assert!(
             input_stat(&container).is_none(),
-            "Unavailable turn renders no input stat before the patch"
+            "unavailable usage renders no input stat before the patch"
         );
         assert!(
             output_stat(&container).is_none(),
-            "Unavailable turn renders no output stat before the patch"
+            "unavailable usage renders no output stat before the patch"
         );
 
-        // Live patch: the backend reports the turn's real usage.
+        // Live patch: the backend reports the request's real usage, plus a
+        // distinct cumulative total that must stay out of the inline badge.
         let state = shared.borrow().clone().expect("state captured at mount");
         state.apply_chat_message_metadata(
             &agent_id,
             MessageMetadataUpdateData {
                 message_id: message_id.clone(),
                 model_info: None,
-                token_usage: Some(usage(0, 0)),
-                turn_token_usage: Some(TurnTokenUsage::Known {
-                    this_turn: Box::new(usage(4200, 1300)),
-                    agent_total: Box::new(usage(50_000, 20_000)),
-                }),
+                token_usage: Some(
+                    MessageTokenUsage::request_known(usage(4200, 1300))
+                        .with_cumulative(usage(50_000, 20_000)),
+                ),
                 context_breakdown: None,
             },
         );
@@ -636,16 +702,16 @@ mod wasm_tests {
         let output = output_stat(&container).expect("output stat appears after the live patch");
         assert!(
             input.contains("4.2K"),
-            "row updates to the real this-turn input figure: {input}"
+            "row updates to the real request input figure: {input}"
         );
         assert!(
             output.contains("1.3K"),
-            "row updates to the real this-turn output figure: {output}"
+            "row updates to the real request output figure: {output}"
         );
-        // The cumulative agent_total must never leak into the per-turn badge.
+        // The cumulative total must never leak into the inline request badge.
         assert!(
             !input.contains("50") && !output.contains("20"),
-            "cumulative agent_total must not leak: in={input} out={output}"
+            "cumulative total must not leak into the inline badge: in={input} out={output}"
         );
     }
 }

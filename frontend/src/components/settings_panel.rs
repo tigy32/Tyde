@@ -8,9 +8,9 @@ use crate::send::send_frame;
 use crate::state::{AppState, DiffViewMode, ToolOutputMode};
 
 use protocol::{
-    BackendConfigField, BackendConfigFieldType, BackendConfigValues, BackendKind,
-    BackendSetupAction, BackendSetupInfo, BackendSetupStatus, BackgroundAgentFeature, BrokerUrl,
-    CodeIntelProviderId, CustomAgent, CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL,
+    BackendConfigField, BackendConfigFieldType, BackendConfigSnapshotStatus, BackendConfigValues,
+    BackendKind, BackendSetupAction, BackendSetupInfo, BackendSetupStatus, BackgroundAgentFeature,
+    BrokerUrl, CodeIntelProviderId, CustomAgent, CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL,
     DiffContextMode, FrameKind, HostExecutablePath, HostLaunchProfileConfig, HostSettingValue,
     LaunchProfileId, McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload,
     MobileBrokerStatus, MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload,
@@ -2409,6 +2409,8 @@ fn backend_config_rows(state: &AppState) -> Option<AnyView> {
     let host_id = state.selected_host_id.get()?;
     let schemas = state.backend_config_schemas.get();
     let host_schemas = schemas.get(&host_id)?;
+    let snapshots = state.backend_config_snapshots.get();
+    let host_snapshots = snapshots.get(&host_id);
 
     let cards = settings
         .enabled_backends
@@ -2424,15 +2426,42 @@ fn backend_config_rows(state: &AppState) -> Option<AnyView> {
                 .get(&kind)
                 .cloned()
                 .unwrap_or_default();
+            let snapshot = host_snapshots.and_then(|m| m.get(&kind));
+            // Backend-native current values, only when the server could actually
+            // read them. Never invented client-side.
+            let native = snapshot
+                .filter(|s| s.status == BackendConfigSnapshotStatus::Ready)
+                .map(|s| s.values.clone())
+                .unwrap_or_default();
+            // The server owns field order, so render the first field as the
+            // card's emphasized primary control (Tycode → Active Provider,
+            // Hermes → Default Model) and the rest as a secondary grid. Emphasis
+            // follows schema order, not any hard-coded key name.
             let fields = schema
                 .fields
                 .iter()
-                .map(|field| backend_config_field(state, kind, field, &values))
+                .enumerate()
+                .map(|(idx, field)| {
+                    backend_config_field(state, kind, field, &values, &native, idx == 0)
+                })
                 .collect::<Vec<_>>();
+            // Surface the server's own reason when it can't read native settings
+            // instead of silently showing schema defaults as if they were live.
+            let snapshot_note = snapshot
+                .filter(|s| s.status == BackendConfigSnapshotStatus::Unavailable)
+                .map(|s| {
+                    let message = s.message.clone().unwrap_or_else(|| {
+                        "Backend-native settings are currently unavailable on this host.".to_owned()
+                    });
+                    view! { <p class="settings-backend-config-snapshot-note">{message}</p> }
+                });
             Some(view! {
                 <div class="settings-backend-config-card">
-                    <div class="settings-tier-backend-name">{backend_label(kind)}</div>
-                    {fields}
+                    <div class="settings-backend-config-card-header">
+                        <span class=backend_badge_class(kind)>{backend_label(kind)}</span>
+                    </div>
+                    {snapshot_note}
+                    <div class="settings-backend-config-fields">{fields}</div>
                 </div>
             })
         })
@@ -2444,9 +2473,9 @@ fn backend_config_rows(state: &AppState) -> Option<AnyView> {
     Some(
         view! {
             <div class="settings-field">
-                <label class="settings-label">"Backend Configuration"</label>
+                <label class="settings-label">"Backend Settings"</label>
                 <p class="settings-description">
-                    "Host-level setup for backends that support it. These apply to every new session on the selected host; per-session settings still override where they overlap."
+                    "Current backend-native settings for each enabled backend on the selected host, grouped per backend. Editing a field saves an explicit Tyde override that applies to every new session; clearing it restores the backend's own value."
                 </p>
                 <div class="settings-backend-config-list">{cards}</div>
             </div>
@@ -2460,6 +2489,8 @@ fn backend_config_field(
     kind: BackendKind,
     field: &BackendConfigField,
     values: &BackendConfigValues,
+    native: &BackendConfigValues,
+    primary: bool,
 ) -> AnyView {
     let key = field.key.clone();
     let description = field.description.clone();
@@ -2470,7 +2501,9 @@ fn backend_config_field(
             multiline,
             ..
         } => {
-            let current = string_value(values, &key);
+            // Seed with the Tyde override when set, else the backend-native
+            // current value from the snapshot. Editing writes an override.
+            let current = string_value(values, &key).or_else(|| string_value(native, &key));
             let placeholder = placeholder.clone().unwrap_or_default();
             let state = state.clone();
             let key_for_change = key.clone();
@@ -2536,7 +2569,7 @@ fn backend_config_field(
             nullable,
             default,
         } => {
-            let current = match values.0.get(&key) {
+            let current = match values.0.get(&key).or_else(|| native.0.get(&key)) {
                 Some(SessionSettingValue::String(value)) => value.clone(),
                 _ => default.clone().unwrap_or_default(),
             };
@@ -2568,7 +2601,7 @@ fn backend_config_field(
             .into_any()
         }
         BackendConfigFieldType::Toggle { default } => {
-            let current = match values.0.get(&key) {
+            let current = match values.0.get(&key).or_else(|| native.0.get(&key)) {
                 Some(SessionSettingValue::Bool(value)) => *value,
                 _ => *default,
             };
@@ -2597,7 +2630,7 @@ fn backend_config_field(
             step,
             default,
         } => {
-            let current = match values.0.get(&key) {
+            let current = match values.0.get(&key).or_else(|| native.0.get(&key)) {
                 Some(SessionSettingValue::Integer(value)) => *value,
                 _ => *default,
             };
@@ -2632,15 +2665,75 @@ fn backend_config_field(
         }
     };
 
+    let field_class = if primary {
+        "settings-backend-config-field settings-backend-config-field-primary"
+    } else {
+        "settings-backend-config-field"
+    };
+    let caption = backend_config_field_caption(values.0.contains_key(&key), native.0.get(&key));
     view! {
-        <div class="settings-backend-config-field">
+        <div class=field_class>
             <span class="settings-tier-select-label">{field.label.clone()}</span>
             {control}
+            {caption}
             {description
                 .map(|text| view! { <p class="settings-description">{text}</p> })}
         </div>
     }
     .into_any()
+}
+
+/// Human-readable rendering of a native snapshot value, or `None` when there is
+/// nothing meaningful to show (empty string or an explicit backend `Null`).
+fn native_value_display(value: &SessionSettingValue) -> Option<String> {
+    match value {
+        SessionSettingValue::String(s) if !s.is_empty() => Some(s.clone()),
+        SessionSettingValue::String(_) => None,
+        SessionSettingValue::Bool(b) => Some(if *b { "On" } else { "Off" }.to_owned()),
+        SessionSettingValue::Integer(i) => Some(i.to_string()),
+        SessionSettingValue::Null => None,
+    }
+}
+
+/// The provenance caption under a backend-config control: whether the shown
+/// value is an explicit Tyde override (and what backend value it diverges from)
+/// or the backend's own current value. Purely derived from server-provided
+/// override + snapshot data — no inference.
+fn backend_config_field_caption(
+    override_present: bool,
+    native: Option<&SessionSettingValue>,
+) -> Option<AnyView> {
+    let native_str = native.and_then(native_value_display);
+    match (override_present, native_str) {
+        (true, Some(backend)) => Some(
+            view! {
+                <div class="settings-backend-config-status">
+                    <span class="settings-config-override-badge">"Tyde override"</span>
+                    <span class="settings-config-native-value">
+                        {format!("backend: {backend}")}
+                    </span>
+                </div>
+            }
+            .into_any(),
+        ),
+        (true, None) => Some(
+            view! {
+                <div class="settings-backend-config-status">
+                    <span class="settings-config-override-badge">"Tyde override"</span>
+                </div>
+            }
+            .into_any(),
+        ),
+        (false, Some(_)) => Some(
+            view! {
+                <div class="settings-backend-config-status">
+                    <span class="settings-config-native-value">"From backend"</span>
+                </div>
+            }
+            .into_any(),
+        ),
+        (false, None) => None,
+    }
 }
 
 fn string_value(values: &BackendConfigValues, key: &str) -> Option<String> {
@@ -2660,24 +2753,21 @@ fn commit_text_value(state: &AppState, kind: BackendKind, key: &str, value: Stri
     update_backend_config(state, kind, key, update);
 }
 
+/// Persist a single backend-config field change. Only the edited key is sent;
+/// the server merges it into the stored config and preserves every sibling key
+/// (see `HostSettingValue::BackendConfig`). Clearing a field sends an explicit
+/// `SessionSettingValue::Null` for that key — never omission — so the server can
+/// tell "clear this one field" apart from "leave it untouched".
 fn update_backend_config(
     state: &AppState,
     kind: BackendKind,
     key: &str,
     value: Option<SessionSettingValue>,
 ) {
-    let Some(mut settings) = state.selected_host_settings_untracked() else {
-        return;
-    };
-    let mut values = settings.backend_config.remove(&kind).unwrap_or_default();
-    match value {
-        Some(value) => {
-            values.0.insert(key.to_owned(), value);
-        }
-        None => {
-            values.0.remove(key);
-        }
-    }
+    let mut values = BackendConfigValues::default();
+    values
+        .0
+        .insert(key.to_owned(), value.unwrap_or(SessionSettingValue::Null));
     send_host_setting(
         state,
         HostSettingValue::BackendConfig {
@@ -3391,6 +3481,10 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
                     let show_signin = info.status == BackendSetupStatus::Installed
                         && info.sign_in_command.is_some();
                     let unsupported = info.status == BackendSetupStatus::Unsupported;
+                    let unavailable = info.status == BackendSetupStatus::Unavailable;
+                    // The server explains *why* a backend probe failed; show it
+                    // verbatim rather than a generic "not installed".
+                    let diagnostic_message = info.diagnostic.as_ref().map(|d| d.message.clone());
                     view! {
                         <div class="settings-backend-setup">
                             <div class="settings-backend-actions">
@@ -3426,6 +3520,18 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
                                 })}
                                 <a class="settings-doc-link" href=docs_url target="_blank" rel="noreferrer">"Docs"</a>
                             </div>
+                            {diagnostic_message.map(|message| view! {
+                                <p class="settings-backend-note settings-backend-note-warning">
+                                    {message}
+                                </p>
+                            })}
+                            {unavailable.then(|| {
+                                view! {
+                                    <p class="settings-backend-note">
+                                        "This backend is currently unavailable on the selected host. Resolve the issue above, then it can be used for new chats."
+                                    </p>
+                                }
+                            })}
                             {unsupported.then(|| {
                                 view! {
                                     <p class="settings-backend-note">
@@ -3478,6 +3584,7 @@ fn backend_setup_status_label(info: Option<&BackendSetupInfo>) -> &'static str {
     match info.map(|info| info.status) {
         Some(BackendSetupStatus::Installed) => "Installed",
         Some(BackendSetupStatus::NotInstalled) => "Not installed",
+        Some(BackendSetupStatus::Unavailable) => "Unavailable",
         Some(BackendSetupStatus::Unsupported) => "Unsupported",
         None => "Checking…",
     }
@@ -3487,6 +3594,7 @@ fn backend_setup_status_class(info: Option<&BackendSetupInfo>) -> &'static str {
     match info.map(|info| info.status) {
         Some(BackendSetupStatus::Installed) => "settings-status-chip installed",
         Some(BackendSetupStatus::NotInstalled) => "settings-status-chip missing",
+        Some(BackendSetupStatus::Unavailable) => "settings-status-chip unavailable",
         Some(BackendSetupStatus::Unsupported) => "settings-status-chip unsupported",
         None => "settings-status-chip loading",
     }
@@ -6692,7 +6800,7 @@ mod wasm_tests {
 
         let text = container.text_content().unwrap_or_default();
         assert!(
-            text.contains("Backend Configuration"),
+            text.contains("Backend Settings"),
             "section heading must render: {text:?}"
         );
         for label in ["Default Model", "Default Provider", "API Base URL"] {
@@ -6738,7 +6846,7 @@ mod wasm_tests {
 
         let text = container.text_content().unwrap_or_default();
         assert!(
-            !text.contains("Backend Configuration"),
+            !text.contains("Backend Settings"),
             "no schema means no section: {text:?}"
         );
         assert_eq!(
@@ -6748,6 +6856,267 @@ mod wasm_tests {
                 .length(),
             0,
             "no config inputs without a schema"
+        );
+    }
+
+    /// Install a connected host with the Hermes deep-config schema plus stored
+    /// values, and select it — enough for `BackendConfigSection` to render and
+    /// persist edits over the wire.
+    fn install_backend_config_host(state: &AppState, values: BackendConfigValues) {
+        let host_id = "host-cfg".to_owned();
+        state.selected_host_id.set(Some(host_id.clone()));
+        state.host_streams.update(|m| {
+            m.insert(
+                host_id.clone(),
+                protocol::StreamPath(format!("/host/{host_id}")),
+            );
+        });
+        state.connection_statuses.update(|m| {
+            m.insert(host_id.clone(), crate::state::ConnectionStatus::Connected);
+        });
+        let mut backend_config = std::collections::HashMap::new();
+        backend_config.insert(BackendKind::Hermes, values);
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                host_id.clone(),
+                host_settings_with_hermes_config(backend_config),
+            );
+        });
+        state.backend_config_schemas.update(|m| {
+            m.entry(host_id)
+                .or_default()
+                .insert(BackendKind::Hermes, hermes_config_schema());
+        });
+    }
+
+    /// Set an input's value and fire a `change` event, then drop the dispatch id
+    /// so a later dispatch on a sibling input doesn't resolve back to this one.
+    fn set_and_change(input: &HtmlInputElement, value: &str) {
+        input.set_value(value);
+        dispatch_event_from_js(input, "change", None);
+        let _ = input.remove_attribute("id");
+    }
+
+    /// Most recent `backend_config` SetSetting `setting` payload, if any.
+    fn last_backend_config(calls: &js_sys::Array) -> Option<serde_json::Value> {
+        recorded_set_setting_payloads(calls)
+            .into_iter()
+            .rev()
+            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("backend_config"))
+    }
+
+    /// Editing one backend-config field sends a partial update carrying only
+    /// that key (server merges, siblings preserved), and clearing a field sends
+    /// an explicit `Null` for it rather than dropping the key.
+    #[wasm_bindgen_test]
+    async fn backend_config_edit_sends_partial_update_and_null_clear() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let mut stored = BackendConfigValues::default();
+        stored.0.insert(
+            "default_model".to_owned(),
+            SessionSettingValue::String("anthropic/claude-sonnet-5".to_owned()),
+        );
+        let stored_for_mount = stored.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_backend_config_host(&state, stored_for_mount.clone());
+            provide_context(state);
+            view! { <BackendConfigSection /> }
+        });
+        next_tick().await;
+
+        let inputs = container
+            .query_selector_all("input.settings-backend-config-input")
+            .unwrap();
+        // Schema field order: default_model (0), default_provider (1), api_base_url (2).
+        let provider: HtmlInputElement = inputs.item(1).unwrap().dyn_into().unwrap();
+        set_and_change(&provider, "openrouter");
+        next_tick().await;
+
+        let setting = last_backend_config(&calls).expect("backend_config frame after an edit");
+        assert_eq!(
+            setting.get("backend").and_then(|b| b.as_str()),
+            Some("hermes"),
+            "edit targets the Hermes backend: {setting:?}"
+        );
+        let values = setting
+            .get("values")
+            .and_then(|v| v.as_object())
+            .expect("values object");
+        assert_eq!(
+            values.len(),
+            1,
+            "only the edited key is sent so the server merge preserves siblings: {values:?}"
+        );
+        assert_eq!(
+            values
+                .get("default_provider")
+                .and_then(|v| v.get("string"))
+                .and_then(|s| s.as_str()),
+            Some("openrouter"),
+            "the edited value is carried typed: {values:?}"
+        );
+        assert!(
+            !values.contains_key("default_model"),
+            "an unchanged sibling key must not be resent: {values:?}"
+        );
+
+        // Clearing the stored default_model sends an explicit Null, not omission.
+        let model: HtmlInputElement = inputs.item(0).unwrap().dyn_into().unwrap();
+        set_and_change(&model, "");
+        next_tick().await;
+
+        let setting = last_backend_config(&calls).expect("backend_config frame after a clear");
+        let values = setting
+            .get("values")
+            .and_then(|v| v.as_object())
+            .expect("values object");
+        assert_eq!(
+            values.len(),
+            1,
+            "clear sends just the cleared key: {values:?}"
+        );
+        assert_eq!(
+            values.get("default_model").and_then(|v| v.as_str()),
+            Some("null"),
+            "clearing a field sends an explicit Null so the server clears just it: {values:?}"
+        );
+    }
+
+    /// Install a backend-native config snapshot for the Hermes card on the
+    /// `host-cfg` host used by `install_backend_config_host`.
+    fn set_backend_snapshot(
+        state: &AppState,
+        status: BackendConfigSnapshotStatus,
+        values: BackendConfigValues,
+        message: Option<&str>,
+    ) {
+        state.backend_config_snapshots.update(|m| {
+            m.entry("host-cfg".to_owned()).or_default().insert(
+                BackendKind::Hermes,
+                protocol::BackendConfigSnapshot {
+                    backend_kind: BackendKind::Hermes,
+                    status,
+                    values,
+                    message: message.map(|s| s.to_owned()),
+                },
+            );
+        });
+    }
+
+    /// With no Tyde override, the control shows the backend's own current value
+    /// from the snapshot and labels it as coming from the backend — the UI never
+    /// invents this value locally.
+    #[wasm_bindgen_test]
+    async fn backend_config_native_snapshot_seeds_controls() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_backend_config_host(&state, BackendConfigValues::default());
+            let mut native = BackendConfigValues::default();
+            native.0.insert(
+                "default_model".to_owned(),
+                SessionSettingValue::String("anthropic/claude-opus".to_owned()),
+            );
+            set_backend_snapshot(&state, BackendConfigSnapshotStatus::Ready, native, None);
+            provide_context(state);
+            view! { <BackendConfigSection /> }
+        });
+        next_tick().await;
+
+        let inputs = container
+            .query_selector_all("input.settings-backend-config-input")
+            .unwrap();
+        let first: HtmlInputElement = inputs.item(0).unwrap().dyn_into().unwrap();
+        assert_eq!(
+            first.value(),
+            "anthropic/claude-opus",
+            "the native snapshot value seeds the control when there is no Tyde override"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("From backend"),
+            "an unoverridden field is labelled as coming from the backend: {text:?}"
+        );
+    }
+
+    /// An explicit Tyde override wins over the native value in the control, and
+    /// the caption still shows the backend value it diverges from.
+    #[wasm_bindgen_test]
+    async fn backend_config_override_wins_over_native_and_shows_both() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let mut overrides = BackendConfigValues::default();
+            overrides.0.insert(
+                "default_model".to_owned(),
+                SessionSettingValue::String("my-override".to_owned()),
+            );
+            install_backend_config_host(&state, overrides);
+            let mut native = BackendConfigValues::default();
+            native.0.insert(
+                "default_model".to_owned(),
+                SessionSettingValue::String("native-model".to_owned()),
+            );
+            set_backend_snapshot(&state, BackendConfigSnapshotStatus::Ready, native, None);
+            provide_context(state);
+            view! { <BackendConfigSection /> }
+        });
+        next_tick().await;
+
+        let inputs = container
+            .query_selector_all("input.settings-backend-config-input")
+            .unwrap();
+        let first: HtmlInputElement = inputs.item(0).unwrap().dyn_into().unwrap();
+        assert_eq!(
+            first.value(),
+            "my-override",
+            "the Tyde override wins over the native value in the control"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Tyde override"),
+            "an overridden field is badged as an override: {text:?}"
+        );
+        assert!(
+            text.contains("native-model"),
+            "the override caption shows the backend value it diverges from: {text:?}"
+        );
+    }
+
+    /// When the server reports the snapshot is unavailable, its reason is shown
+    /// verbatim (never swallowed) and the schema fields still render so overrides
+    /// stay editable.
+    #[wasm_bindgen_test]
+    async fn backend_config_unavailable_snapshot_surfaces_message() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_backend_config_host(&state, BackendConfigValues::default());
+            set_backend_snapshot(
+                &state,
+                BackendConfigSnapshotStatus::Unavailable,
+                BackendConfigValues::default(),
+                Some("Hermes gateway not reachable"),
+            );
+            provide_context(state);
+            view! { <BackendConfigSection /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Hermes gateway not reachable"),
+            "the server's unavailable reason must be surfaced, not swallowed: {text:?}"
+        );
+        assert_eq!(
+            container
+                .query_selector_all("input.settings-backend-config-input")
+                .unwrap()
+                .length(),
+            3,
+            "schema fields still render so overrides remain editable while native values are unavailable"
         );
     }
 

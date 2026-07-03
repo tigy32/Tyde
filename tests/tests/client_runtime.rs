@@ -74,6 +74,7 @@ async fn runtime_accepts_live_backend_config_schemas() {
             | HostEvent::SessionSchemas(_)
             | HostEvent::LaunchProfileCatalogNotify(_)
             | HostEvent::BackendSetup(_)
+            | HostEvent::BackendConfigSnapshots(_)
             | HostEvent::AgentsViewPreferencesNotify(_)
             | HostEvent::TeamPresetCatalogNotify(_) => {}
             _ => panic!("unexpected host event while waiting for BackendConfigSchemas"),
@@ -132,6 +133,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::HostBootstrap(_)
                 | HostEvent::BackendSetup(_)
                 | HostEvent::BackendConfigSchemas(_)
+                | HostEvent::BackendConfigSnapshots(_)
                 | HostEvent::AgentClosed(_)
                 | HostEvent::ProjectNotify(_)
                 | HostEvent::NewTerminal(_)

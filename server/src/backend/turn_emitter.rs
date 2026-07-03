@@ -70,7 +70,9 @@ pub struct StreamEndPayload<'a> {
     pub content: String,
     pub agent: Option<AgentName<'a>>,
     pub model: Option<String>,
-    pub usage: Option<Value>,
+    pub request_usage: Option<Value>,
+    pub turn_usage: Option<Value>,
+    pub cumulative_usage: Option<Value>,
     pub reasoning: Option<String>,
     pub tool_calls: Vec<Value>,
     pub context_breakdown: Option<Value>,
@@ -91,7 +93,9 @@ pub struct AssistantMessagePayload<'a> {
     pub reasoning: Option<Value>,
     pub tool_calls: Vec<Value>,
     pub model_info: Option<Value>,
-    pub token_usage: Option<Value>,
+    pub request_usage: Option<Value>,
+    pub turn_usage: Option<Value>,
+    pub cumulative_usage: Option<Value>,
     pub context_breakdown: Option<Value>,
     pub images: Vec<Value>,
 }
@@ -99,7 +103,9 @@ pub struct AssistantMessagePayload<'a> {
 pub struct MessageMetadataUpdatePayload {
     pub message_id: String,
     pub model_info: Option<Value>,
-    pub token_usage: Option<Value>,
+    pub request_usage: Option<Value>,
+    pub turn_usage: Option<Value>,
+    pub cumulative_usage: Option<Value>,
     pub context_breakdown: Option<Value>,
 }
 
@@ -494,17 +500,24 @@ impl TurnEmitterState {
             return;
         }
         if payload.model_info.is_none()
-            && payload.token_usage.is_none()
+            && payload.request_usage.is_none()
+            && payload.turn_usage.is_none()
+            && payload.cumulative_usage.is_none()
             && payload.context_breakdown.is_none()
         {
             return;
         }
+        let token_usage = build_message_token_usage_value(
+            payload.request_usage,
+            payload.turn_usage,
+            payload.cumulative_usage,
+        );
         self.send(json!({
             "kind": "MessageMetadataUpdated",
             "data": {
                 "message_id": message_id,
                 "model_info": payload.model_info.unwrap_or(Value::Null),
-                "token_usage": payload.token_usage.unwrap_or(Value::Null),
+                "token_usage": token_usage,
                 "context_breakdown": payload.context_breakdown.unwrap_or(Value::Null),
             },
         }));
@@ -698,7 +711,11 @@ fn build_stream_end_value(
         .filter(|m| !m.trim().is_empty())
         .map(|m| json!({ "model": m }))
         .unwrap_or(Value::Null);
-    let usage_value = payload.usage.clone().unwrap_or(Value::Null);
+    let usage_value = build_message_token_usage_value(
+        payload.request_usage.clone(),
+        payload.turn_usage.clone(),
+        payload.cumulative_usage.clone(),
+    );
     let reasoning_value = payload
         .reasoning
         .as_deref()
@@ -749,11 +766,40 @@ fn build_assistant_message_value(payload: &AssistantMessagePayload<'_>) -> Value
             "reasoning": payload.reasoning.clone().unwrap_or(Value::Null),
             "tool_calls": payload.tool_calls,
             "model_info": payload.model_info.clone().unwrap_or(Value::Null),
-            "token_usage": payload.token_usage.clone().unwrap_or(Value::Null),
+            "token_usage": build_message_token_usage_value(
+                payload.request_usage.clone(),
+                payload.turn_usage.clone(),
+                payload.cumulative_usage.clone(),
+            ),
             "context_breakdown": payload.context_breakdown.clone().unwrap_or(Value::Null),
             "images": payload.images,
         },
     })
+}
+
+fn build_message_token_usage_value(
+    request_usage: Option<Value>,
+    turn_usage: Option<Value>,
+    cumulative_usage: Option<Value>,
+) -> Value {
+    if request_usage.is_none() && turn_usage.is_none() && cumulative_usage.is_none() {
+        return Value::Null;
+    }
+    json!({
+        "request": token_usage_scope_value(request_usage),
+        "turn": token_usage_scope_value(turn_usage),
+        "cumulative": token_usage_scope_value(cumulative_usage),
+    })
+}
+
+fn token_usage_scope_value(usage: Option<Value>) -> Value {
+    match usage {
+        Some(usage) => json!({ "kind": "known", "usage": usage }),
+        None => json!({
+            "kind": "unavailable",
+            "reason": "backend_did_not_report",
+        }),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -863,6 +909,7 @@ mod tests {
                 backend_setup: BackendSetupPayload { backends: vec![] },
                 session_schemas: vec![],
                 backend_config_schemas: vec![],
+                backend_config_snapshots: vec![],
                 launch_profile_catalog: Default::default(),
                 sessions: vec![],
                 projects: vec![],
@@ -1049,7 +1096,9 @@ mod tests {
             content: "hello".to_string(),
             agent: Some(AgentName("codex")),
             model: Some("gpt-5-codex".to_string()),
-            usage: None,
+            request_usage: None,
+            turn_usage: None,
+            cumulative_usage: None,
             reasoning: None,
             tool_calls: Vec::new(),
             context_breakdown: None,
@@ -1072,7 +1121,7 @@ mod tests {
         emitter.message_metadata_updated(MessageMetadataUpdatePayload {
             message_id: "message-1".to_string(),
             model_info: Some(json!({ "model": "gpt-5-codex" })),
-            token_usage: Some(json!({
+            request_usage: Some(json!({
                 "input_tokens": 1,
                 "output_tokens": 2,
                 "total_tokens": 3,
@@ -1080,6 +1129,15 @@ mod tests {
                 "cache_creation_input_tokens": 0,
                 "reasoning_tokens": 0
             })),
+            turn_usage: Some(json!({
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "total_tokens": 3,
+                "cached_prompt_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "reasoning_tokens": 0
+            })),
+            cumulative_usage: None,
             context_breakdown: None,
         });
         drop(emitter);
@@ -1090,6 +1148,18 @@ mod tests {
                 .pointer("/data/message_id")
                 .and_then(Value::as_str),
             Some("message-1")
+        );
+        assert_eq!(
+            events[0]
+                .pointer("/data/token_usage/request/usage/total_tokens")
+                .and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            events[0]
+                .pointer("/data/token_usage/turn/usage/total_tokens")
+                .and_then(Value::as_u64),
+            Some(3)
         );
     }
 

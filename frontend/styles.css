@@ -7659,14 +7659,70 @@ kbd {
     gap: var(--space-3);
 }
 
+.settings-backend-config-card-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.settings-backend-config-fields {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+}
+
 .settings-backend-config-field {
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
 }
 
+/* The first (server-ordered) field is the card's headline control — a backend's
+   active provider / default model — so lift it above the rest of the grid. */
+.settings-backend-config-field-primary {
+    padding: var(--space-3);
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+}
+
+.settings-backend-config-field-primary .settings-tier-select-label {
+    color: var(--text-primary);
+    font-weight: 600;
+    font-size: 0.9em;
+}
+
 .settings-backend-config-field .settings-description {
     margin: 0;
+}
+
+.settings-backend-config-status {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    flex-wrap: wrap;
+    font-size: 0.8rem;
+}
+
+.settings-config-override-badge {
+    color: #f0b56b;
+    background: rgba(232, 160, 50, 0.14);
+    border: 1px solid rgba(232, 160, 50, 0.3);
+    border-radius: 4px;
+    padding: 0 var(--space-2);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.settings-config-native-value {
+    color: var(--text-tertiary);
+}
+
+.settings-backend-config-snapshot-note {
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--text-tertiary);
 }
 
 .settings-backend-config-input {
@@ -7790,6 +7846,12 @@ kbd {
     background: var(--surface-3);
 }
 
+.settings-status-chip.unavailable {
+    color: var(--text-tertiary);
+    background: var(--surface-3);
+    border-color: var(--border-primary);
+}
+
 .settings-status-chip.loading {
     color: var(--text-secondary);
     background: var(--surface-3);
@@ -7836,6 +7898,10 @@ kbd {
     font-size: 0.846rem;
     color: var(--text-tertiary);
     line-height: 1.4;
+}
+
+.settings-backend-note-warning {
+    color: #f0b56b;
 }
 
 /* --- Full-width select --- */
@@ -8675,6 +8741,21 @@ kbd {
 .context-menu-item:hover {
     background: var(--surface-hover);
     color: var(--text-bright);
+}
+
+/* Context-menu item that pairs a label with a keyboard-shortcut hint on the
+   right (e.g. file-viewer Go to Definition / Show References). */
+.context-menu-item--with-shortcut {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+}
+
+.context-menu-shortcut {
+    color: var(--text-tertiary);
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
 }
 
 .tab-rename-input {

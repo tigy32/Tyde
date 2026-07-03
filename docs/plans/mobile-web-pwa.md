@@ -234,6 +234,15 @@ stays in the native backend (it translates packets into already-validated neutra
 `LinkEvent`s), keeping the driver free of rumqttc types. Native `cargo build` +
 the full `mqtt-transport` test suite stay green.
 
+**MQTT transport v3 — receiver-credit data pipelining. DONE.**
+Data frames now pipeline within authenticated cumulative receiver credit:
+`DATA_CREDIT_WINDOW = 16`, `MAX_DATA_QOS1_INFLIGHT = 16`, and the broker-facing
+MQTT window remains 32 for headroom. Standalone credit frames use transport
+version `0x02`, tag `0x05`, independent AEAD nonce directions, and a separate
+control counter. Broker PUBACK frees broker in-flight capacity and completes the
+local write ack, but never advances Tyde receiver credit; beyond-window data
+counter gaps remain fatal.
+
 **Phase 2 — WASM transport backend.** Implement `link_wasm.rs` over
 `web-sys::WebSocket` + the Phase-0 codec; give `EnvelopeStream` a WASM I/O
 surface; run the pure crypto/handshake in a headless-wasm test against a wss

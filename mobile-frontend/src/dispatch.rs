@@ -159,6 +159,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
         },
         session_schemas: Vec::new(),
         backend_config_schemas: Vec::new(),
+        backend_config_snapshots: Vec::new(),
         launch_profile_catalog: Default::default(),
         sessions: Vec::new(),
         projects: Vec::new(),
@@ -560,7 +561,6 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                         tool_calls: Vec::new(),
                         model_info: None,
                         token_usage: None,
-                        turn_token_usage: None,
                         context_breakdown: None,
                         images: None,
                     },
@@ -1353,7 +1353,6 @@ fn surface_load_agent_error(state: &AppState, host: &LocalHostId, payload: &Comm
             tool_calls: Vec::new(),
             model_info: None,
             token_usage: None,
-            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         },
@@ -1724,9 +1723,6 @@ impl MobileHistoryReplay {
                 }
                 if data.token_usage.is_some() {
                     row.message.token_usage = data.token_usage;
-                }
-                if data.turn_token_usage.is_some() {
-                    row.message.turn_token_usage = data.turn_token_usage;
                 }
                 if data.context_breakdown.is_some() {
                     row.message.context_breakdown = data.context_breakdown;
@@ -2101,7 +2097,6 @@ fn apply_agent_bootstrap(
                         tool_calls: Vec::new(),
                         model_info: None,
                         token_usage: None,
-                        turn_token_usage: None,
                         context_breakdown: None,
                         images: None,
                     },
@@ -2310,7 +2305,6 @@ mod tests {
                     tool_calls: Vec::new(),
                     model_info: None,
                     token_usage: None,
-                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 };
@@ -2970,6 +2964,7 @@ mod wasm_tests {
             },
             session_schemas: Vec::new(),
             backend_config_schemas: Vec::new(),
+            backend_config_snapshots: Vec::new(),
             launch_profile_catalog: Default::default(),
             sessions: vec![session.clone()],
             projects: vec![project.clone()],
@@ -3099,7 +3094,6 @@ mod wasm_tests {
             tool_calls: Vec::new(),
             model_info: None,
             token_usage: None,
-            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         });
@@ -3380,7 +3374,6 @@ mod wasm_tests {
             tool_calls: Vec::new(),
             model_info: None,
             token_usage: None,
-            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         };
@@ -3395,15 +3388,16 @@ mod wasm_tests {
             model_info: Some(protocol::ModelInfo {
                 model: "gpt-test".to_owned(),
             }),
-            token_usage: Some(protocol::TokenUsage {
-                input_tokens: 7,
-                output_tokens: 3,
-                total_tokens: 10,
-                cached_prompt_tokens: None,
-                cache_creation_input_tokens: None,
-                reasoning_tokens: None,
-            }),
-            turn_token_usage: None,
+            token_usage: Some(protocol::MessageTokenUsage::request_known(
+                protocol::TokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    total_tokens: 10,
+                    cached_prompt_tokens: None,
+                    cache_creation_input_tokens: None,
+                    reasoning_tokens: None,
+                },
+            )),
             context_breakdown: None,
         };
         apply_chat_event(
@@ -3431,8 +3425,9 @@ mod wasm_tests {
                 .message
                 .token_usage
                 .as_ref()
-                .is_some_and(|t| t.total_tokens == 10),
-            "token_usage patched"
+                .and_then(|t| t.request.known_usage())
+                .is_some_and(|u| u.total_tokens == 10),
+            "token_usage request scope patched"
         );
         assert!(
             rows[0].message.context_breakdown.is_none(),
@@ -3457,7 +3452,6 @@ mod wasm_tests {
                 message_id: message_id.clone(),
                 model_info: None,
                 token_usage: None,
-                turn_token_usage: None,
                 context_breakdown: Some(breakdown),
             }),
         );
@@ -3478,7 +3472,8 @@ mod wasm_tests {
                 .message
                 .token_usage
                 .as_ref()
-                .is_some_and(|t| t.total_tokens == 10),
+                .and_then(|t| t.request.known_usage())
+                .is_some_and(|u| u.total_tokens == 10),
             "prior token_usage preserved across partial update"
         );
         assert!(
@@ -3498,7 +3493,6 @@ mod wasm_tests {
                 message_id: protocol::ChatMessageId("missing".to_owned()),
                 model_info: None,
                 token_usage: None,
-                turn_token_usage: None,
                 context_breakdown: None,
             }),
         );
@@ -3538,7 +3532,6 @@ mod wasm_tests {
             tool_calls: Vec::new(),
             model_info: None,
             token_usage: None,
-            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         };
@@ -3563,15 +3556,16 @@ mod wasm_tests {
                 model_info: Some(protocol::ModelInfo {
                     model: "gpt-test".to_owned(),
                 }),
-                token_usage: Some(protocol::TokenUsage {
-                    input_tokens: 7,
-                    output_tokens: 3,
-                    total_tokens: 10,
-                    cached_prompt_tokens: None,
-                    cache_creation_input_tokens: None,
-                    reasoning_tokens: None,
-                }),
-                turn_token_usage: None,
+                token_usage: Some(protocol::MessageTokenUsage::request_known(
+                    protocol::TokenUsage {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                        total_tokens: 10,
+                        cached_prompt_tokens: None,
+                        cache_creation_input_tokens: None,
+                        reasoning_tokens: None,
+                    },
+                )),
                 context_breakdown: None,
             }),
         );
@@ -3599,8 +3593,9 @@ mod wasm_tests {
                 .message
                 .token_usage
                 .as_ref()
-                .is_some_and(|t| t.total_tokens == 10),
-            "token_usage patched in place"
+                .and_then(|t| t.request.known_usage())
+                .is_some_and(|u| u.total_tokens == 10),
+            "token_usage request scope patched in place"
         );
     }
 }

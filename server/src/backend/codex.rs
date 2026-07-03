@@ -814,7 +814,9 @@ impl CodexInner {
             content: segment.content,
             agent: Some(AgentName(CODEX_AGENT_NAME)),
             model: Some(segment.model.clone()),
-            usage: None,
+            request_usage: None,
+            turn_usage: None,
+            cumulative_usage: None,
             reasoning: segment.reasoning,
             tool_calls: Vec::new(),
             context_breakdown: None,
@@ -1170,7 +1172,9 @@ impl CodexInner {
                                 reasoning: reasoning.map(|summary| json!({ "text": summary })),
                                 tool_calls: Vec::new(),
                                 model_info: Some(json!({ "model": model })),
-                                token_usage: None,
+                                request_usage: None,
+                                turn_usage: None,
+                                cumulative_usage: None,
                                 context_breakdown: None,
                                 images: Vec::new(),
                             },
@@ -1632,7 +1636,9 @@ impl CodexInner {
                     content: text,
                     agent: Some(AgentName(CODEX_AGENT_NAME)),
                     model: Some(model.to_string()),
-                    usage: None,
+                    request_usage: None,
+                    turn_usage: None,
+                    cumulative_usage: None,
                     reasoning,
                     tool_calls: Vec::new(),
                     context_breakdown: None,
@@ -2323,7 +2329,9 @@ impl CodexInner {
                     content,
                     agent: Some(AgentName(CODEX_AGENT_NAME)),
                     model: Some(model),
-                    usage: None,
+                    request_usage: None,
+                    turn_usage: None,
+                    cumulative_usage: None,
                     reasoning,
                     tool_calls: Vec::new(),
                     context_breakdown: None,
@@ -2799,7 +2807,9 @@ impl CodexInner {
                 content: segment.content,
                 agent: Some(AgentName(CODEX_AGENT_NAME)),
                 model: Some(segment.model),
-                usage: None,
+                request_usage: None,
+                turn_usage: None,
+                cumulative_usage: None,
                 reasoning: segment.reasoning,
                 tool_calls: Vec::new(),
                 context_breakdown: None,
@@ -3706,7 +3716,9 @@ fn emit_codex_message_metadata_update(
     emitter.message_metadata_updated(MessageMetadataUpdatePayload {
         message_id: pending.message_id,
         model_info: Some(json!({ "model": pending.model })),
-        token_usage,
+        request_usage: token_usage.clone(),
+        turn_usage: token_usage,
+        cumulative_usage: None,
         context_breakdown: Some(context_breakdown),
     });
 }
@@ -5110,7 +5122,6 @@ fn backend_error_message(content: String) -> ChatEvent {
         tool_calls: Vec::new(),
         model_info: None,
         token_usage: None,
-        turn_token_usage: None,
         context_breakdown: None,
         images: None,
     })
@@ -5126,7 +5137,6 @@ fn backend_warning_message(content: String) -> ChatEvent {
         tool_calls: Vec::new(),
         model_info: None,
         token_usage: None,
-        turn_token_usage: None,
         context_breakdown: None,
         images: None,
     })
@@ -5380,7 +5390,9 @@ fn maybe_finish_codex_loop_segment(
         content,
         agent: Some(AgentName(CODEX_AGENT_NAME)),
         model: Some(model_name.to_string()),
-        usage: None,
+        request_usage: None,
+        turn_usage: None,
+        cumulative_usage: None,
         reasoning,
         tool_calls: Vec::new(),
         context_breakdown: None,
@@ -5907,398 +5919,341 @@ impl Backend for CodexBackend {
 
             loop {
                 tokio::select! {
-                    notif = notif_rx.recv() => {
-                        let Some(inbound) = notif else { break };
-                        let (method, params) = match inbound {
-                            CodexInbound::Notification { method, params } => (method, params),
-                            CodexInbound::ServerRequest { id, method, params } => {
-                                respond_codex_spawn_server_request(
-                                    &stdin_for_input,
-                                    id,
-                                    &method,
-                                    &params,
-                                )
-                                .await;
-                                continue;
+                        notif = notif_rx.recv() => {
+                            let Some(inbound) = notif else { break };
+                            let (method, params) = match inbound {
+                                CodexInbound::Notification { method, params } => (method, params),
+                                CodexInbound::ServerRequest { id, method, params } => {
+                                    respond_codex_spawn_server_request(
+                                        &stdin_for_input,
+                                        id,
+                                        &method,
+                                        &params,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                CodexInbound::Stderr(line) => {
+                                    tracing::warn!("Codex stderr: {line}");
+                                    continue;
+                                }
+                                CodexInbound::Closed { exit_code } => {
+                                    tracing::warn!(?exit_code, "Codex app-server closed");
+                                    break;
+                                }
+                            };
+                            if is_reasoning_notification_method(method.as_str()) {
+                                reasoning_notification_count = reasoning_notification_count.saturating_add(1);
                             }
-                            CodexInbound::Stderr(line) => {
-                                tracing::warn!("Codex stderr: {line}");
-                                continue;
-                            }
-                            CodexInbound::Closed { exit_code } => {
-                                tracing::warn!(?exit_code, "Codex app-server closed");
-                                break;
-                            }
-                        };
-                        if is_reasoning_notification_method(method.as_str()) {
-                            reasoning_notification_count = reasoning_notification_count.saturating_add(1);
-                        }
 
-                        match method.as_str() {
-                            "turn/started" => {
-                                let turn_id = params
-                                    .get("turn")
-                                    .and_then(|v| v.get("id"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("turn")
-                                    .to_string();
-                                active_turn_id = Some(turn_id.clone());
-                                current_message_id = Some(turn_id.clone());
-                                accumulated_text.clear();
-                                accumulated_reasoning.clear();
-                                pending_tool_call_ids.clear();
-                                close_stream_when_tools_idle = false;
-                                pending_message_metadata = None;
-                                let pending_user_input = pending_user_input_bytes;
-                                pending_user_input_bytes = 0;
-                                conversation_bytes_total = conversation_bytes_total
-                                    .saturating_add(pending_user_input);
-                                turn_context_by_turn.insert(
-                                    turn_id.clone(),
-                                    TurnContextEstimate {
-                                        conversation_history_bytes: conversation_bytes_total,
-                                        ..TurnContextEstimate::default()
-                                    },
-                                );
-                                saw_agent_message_delta = false;
-                                saw_agent_message_completed = false;
-                                stream_closed_by_turn_completion = false;
-                                reasoning_notification_count = 0;
-                                started_item_types.clear();
-                                completed_item_types.clear();
-                                if !typing_status_active {
-                                    emitter.typing_status_changed(true);
-                                    typing_status_active = true;
-                                }
-                                emitter.stream_start(
-                                    &turn_id,
-                                    AgentName(CODEX_AGENT_NAME),
-                                    Some(&model_name),
-                                );
-                            }
-                            "item/agentMessage/delta" => {
-                                let delta = params
-                                    .get("delta")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                if delta.is_empty() {
-                                    continue;
-                                }
-                                saw_agent_message_delta = true;
-                                emit_codex_loop_agent_message_delta(
-                                    &emitter,
-                                    CodexLoopAgentMessageDeltaState {
-                                        current_message_id: &mut current_message_id,
-                                        accumulated_text: &mut accumulated_text,
-                                        stream_closed_by_turn_completion:
-                                            &mut stream_closed_by_turn_completion,
-                                        typing_status_active: &mut typing_status_active,
-                                    },
-                                    &params,
-                                    &delta,
-                                    &model_name,
-                                );
-                            }
-                            reasoning_method if is_reasoning_notification_method(reasoning_method) => {
-                                let Some(delta) = extract_codex_reasoning_delta_text(&params) else {
-                                    continue;
-                                };
-                                let delta = merge_reasoning_delta(&accumulated_reasoning, &delta);
-                                if delta.is_empty() {
-                                    continue;
-                                }
-                                let message_id = codex_loop_reasoning_message_id(
-                                    &params,
-                                    current_message_id.as_deref(),
-                                    active_turn_id.as_deref(),
-                                );
-                                if current_message_id.is_none() {
-                                    stream_closed_by_turn_completion = false;
+                            match method.as_str() {
+                                "turn/started" => {
+                                    let turn_id = params
+                                        .get("turn")
+                                        .and_then(|v| v.get("id"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("turn")
+                                        .to_string();
+                                    active_turn_id = Some(turn_id.clone());
+                                    current_message_id = Some(turn_id.clone());
                                     accumulated_text.clear();
                                     accumulated_reasoning.clear();
+                                    pending_tool_call_ids.clear();
                                     close_stream_when_tools_idle = false;
+                                    pending_message_metadata = None;
+                                    let pending_user_input = pending_user_input_bytes;
+                                    pending_user_input_bytes = 0;
+                                    conversation_bytes_total = conversation_bytes_total
+                                        .saturating_add(pending_user_input);
+                                    turn_context_by_turn.insert(
+                                        turn_id.clone(),
+                                        TurnContextEstimate {
+                                            conversation_history_bytes: conversation_bytes_total,
+                                            ..TurnContextEstimate::default()
+                                        },
+                                    );
+                                    saw_agent_message_delta = false;
+                                    saw_agent_message_completed = false;
+                                    stream_closed_by_turn_completion = false;
+                                    reasoning_notification_count = 0;
+                                    started_item_types.clear();
+                                    completed_item_types.clear();
                                     if !typing_status_active {
                                         emitter.typing_status_changed(true);
                                         typing_status_active = true;
                                     }
                                     emitter.stream_start(
-                                        &message_id,
+                                        &turn_id,
                                         AgentName(CODEX_AGENT_NAME),
                                         Some(&model_name),
                                     );
                                 }
-                                current_message_id = Some(message_id.clone());
-                                accumulated_reasoning.push_str(&delta);
-                                add_codex_loop_turn_reasoning_bytes(
-                                    &mut turn_context_by_turn,
-                                    active_turn_id.as_deref(),
-                                    delta.len() as u64,
-                                );
-                                emitter.stream_reasoning_delta(&message_id, &delta);
-                            }
-                            "thread/tokenUsage/updated" => {
-                                if let Some((turn_id, token_usage)) =
-                                    extract_turn_token_usage(&params, Some(&model_name))
-                                {
-                                    token_usage_by_turn.insert(turn_id, token_usage);
-                                }
-                            }
-                            "item/completed" => {
-                                let item_type = params
-                                    .get("item")
-                                    .and_then(|v| v.get("type"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("");
-                                let item = params.get("item").cloned().unwrap_or(Value::Null);
-                                let item_id = item
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("item")
-                                    .to_string();
-                                if !item_type.is_empty() && completed_item_types.len() < 8 {
-                                    completed_item_types.push(item_type.to_string());
-                                }
-                                match item_type {
-                                    "agentMessage" => {
-                                        let text = item
-                                            .get("text")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let disposition =
-                                            codex_agent_message_completion_disposition(
-                                                current_message_id.is_some(),
-                                                saw_agent_message_completed,
-                                                stream_closed_by_turn_completion,
-                                                &text,
-                                            );
-                                        match disposition {
-                                            CodexAgentMessageCompletionDisposition::SkipDuplicateEmpty => {
-                                                tracing::warn!(
-                                                    turn_id = ?active_turn_id,
-                                                    item_id = %item_id,
-                                                    "Codex emitted an empty agentMessage completion after the turn was already closed; skipping duplicate StreamEnd"
-                                                );
-                                                saw_agent_message_completed = true;
-                                                stream_closed_by_turn_completion = false;
-                                                continue;
-                                            }
-                                            CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted => {
-                                                tracing::warn!(
-                                                    turn_id = ?active_turn_id,
-                                                    item_id = %item_id,
-                                                    text_len = text.len(),
-                                                    "Codex emitted a duplicate agentMessage completion; skipping duplicate StreamEnd"
-                                                );
-                                                continue;
-                                            }
-                                            CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart => {
-                                                let start_message_id = item_id.clone();
-                                                current_message_id = Some(start_message_id.clone());
-                                                emitter.stream_start(
-                                                    &start_message_id,
-                                                    AgentName(CODEX_AGENT_NAME),
-                                                    Some(&model_name),
-                                                );
-                                            }
-                                            CodexAgentMessageCompletionDisposition::EmitOnOpenStream => {}
-                                        }
-                                        saw_agent_message_completed = true;
-                                        let final_text = if text.is_empty() {
-                                            std::mem::take(&mut accumulated_text)
-                                        } else {
-                                            accumulated_text.clear();
-                                            text
-                                        };
-                                        let reasoning = contains_non_whitespace(
-                                            &accumulated_reasoning,
-                                        )
-                                        .then(|| std::mem::take(&mut accumulated_reasoning));
-                                        conversation_bytes_total = conversation_bytes_total
-                                            .saturating_add(final_text.len() as u64);
-                                        let message_id_for_metadata = current_message_id
-                                            .clone()
-                                            .unwrap_or_else(|| item_id.clone());
-                                        if let Some(turn_id) = active_turn_id.clone() {
-                                            let turn_context = turn_context_by_turn
-                                                .get(&turn_id)
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            if let Some(metadata) = metadata_target_for_visible_message(
-                                                turn_id,
-                                                message_id_for_metadata,
-                                                &final_text,
-                                                reasoning.as_deref(),
-                                                model_name.clone(),
-                                                turn_context,
-                                            ) {
-                                                pending_message_metadata =
-                                                    Some(CodexLoopPendingMessageMetadata {
-                                                        turn_id: metadata.turn_id,
-                                                        message_id: metadata.message_id,
-                                                        turn_context: metadata.turn_context,
-                                                    });
-                                            }
-                                        }
-                                        emitter.stream_end(StreamEndPayload {
-                                            content: final_text,
-                                            agent: Some(AgentName(CODEX_AGENT_NAME)),
-                                            model: Some(model_name.clone()),
-                                            usage: None,
-                                            reasoning,
-                                            tool_calls: Vec::new(),
-                                            context_breakdown: None,
-                                        });
-                                        current_message_id = None;
-                                        stream_closed_by_turn_completion = false;
+                                "item/agentMessage/delta" => {
+                                    let delta = params
+                                        .get("delta")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    if delta.is_empty() {
+                                        continue;
                                     }
-                                    "reasoning" => {
-                                        if let Some(reasoning_text) = extract_codex_item_reasoning(&item)
-                                            && contains_non_whitespace(&reasoning_text)
-                                        {
-                                            let delta = merge_reasoning_delta(
-                                                &accumulated_reasoning,
-                                                &reasoning_text,
-                                            );
-                                            if !delta.is_empty() {
-                                                let message_id = item_id.clone();
-                                                if current_message_id.is_none() {
+                                    saw_agent_message_delta = true;
+                                    emit_codex_loop_agent_message_delta(
+                                        &emitter,
+                                        CodexLoopAgentMessageDeltaState {
+                                            current_message_id: &mut current_message_id,
+                                            accumulated_text: &mut accumulated_text,
+                                            stream_closed_by_turn_completion:
+                                                &mut stream_closed_by_turn_completion,
+                                            typing_status_active: &mut typing_status_active,
+                                        },
+                                        &params,
+                                        &delta,
+                                        &model_name,
+                                    );
+                                }
+                                reasoning_method if is_reasoning_notification_method(reasoning_method) => {
+                                    let Some(delta) = extract_codex_reasoning_delta_text(&params) else {
+                                        continue;
+                                    };
+                                    let delta = merge_reasoning_delta(&accumulated_reasoning, &delta);
+                                    if delta.is_empty() {
+                                        continue;
+                                    }
+                                    let message_id = codex_loop_reasoning_message_id(
+                                        &params,
+                                        current_message_id.as_deref(),
+                                        active_turn_id.as_deref(),
+                                    );
+                                    if current_message_id.is_none() {
+                                        stream_closed_by_turn_completion = false;
+                                        accumulated_text.clear();
+                                        accumulated_reasoning.clear();
+                                        close_stream_when_tools_idle = false;
+                                        if !typing_status_active {
+                                            emitter.typing_status_changed(true);
+                                            typing_status_active = true;
+                                        }
+                                        emitter.stream_start(
+                                            &message_id,
+                                            AgentName(CODEX_AGENT_NAME),
+                                            Some(&model_name),
+                                        );
+                                    }
+                                    current_message_id = Some(message_id.clone());
+                                    accumulated_reasoning.push_str(&delta);
+                                    add_codex_loop_turn_reasoning_bytes(
+                                        &mut turn_context_by_turn,
+                                        active_turn_id.as_deref(),
+                                        delta.len() as u64,
+                                    );
+                                    emitter.stream_reasoning_delta(&message_id, &delta);
+                                }
+                                "thread/tokenUsage/updated" => {
+                                    if let Some((turn_id, token_usage)) =
+                                        extract_turn_token_usage(&params, Some(&model_name))
+                                    {
+                                        token_usage_by_turn.insert(turn_id, token_usage);
+                                    }
+                                }
+                                "item/completed" => {
+                                    let item_type = params
+                                        .get("item")
+                                        .and_then(|v| v.get("type"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    let item = params.get("item").cloned().unwrap_or(Value::Null);
+                                    let item_id = item
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("item")
+                                        .to_string();
+                                    if !item_type.is_empty() && completed_item_types.len() < 8 {
+                                        completed_item_types.push(item_type.to_string());
+                                    }
+                                    match item_type {
+                                        "agentMessage" => {
+                                            let text = item
+                                                .get("text")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_string();
+                                            let disposition =
+                                                codex_agent_message_completion_disposition(
+                                                    current_message_id.is_some(),
+                                                    saw_agent_message_completed,
+                                                    stream_closed_by_turn_completion,
+                                                    &text,
+                                                );
+                                            match disposition {
+                                                CodexAgentMessageCompletionDisposition::SkipDuplicateEmpty => {
+                                                    tracing::warn!(
+                                                        turn_id = ?active_turn_id,
+                                                        item_id = %item_id,
+                                                        "Codex emitted an empty agentMessage completion after the turn was already closed; skipping duplicate StreamEnd"
+                                                    );
+                                                    saw_agent_message_completed = true;
                                                     stream_closed_by_turn_completion = false;
-                                                    accumulated_text.clear();
-                                                    accumulated_reasoning.clear();
-                                                    if !typing_status_active {
-                                                        emitter.typing_status_changed(true);
-                                                        typing_status_active = true;
-                                                    }
+                                                    continue;
+                                                }
+                                                CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted => {
+                                                    tracing::warn!(
+                                                        turn_id = ?active_turn_id,
+                                                        item_id = %item_id,
+                                                        text_len = text.len(),
+                                                        "Codex emitted a duplicate agentMessage completion; skipping duplicate StreamEnd"
+                                                    );
+                                                    continue;
+                                                }
+                                                CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart => {
+                                                    let start_message_id = item_id.clone();
+                                                    current_message_id = Some(start_message_id.clone());
                                                     emitter.stream_start(
-                                                        &message_id,
+                                                        &start_message_id,
                                                         AgentName(CODEX_AGENT_NAME),
                                                         Some(&model_name),
                                                     );
                                                 }
-                                                current_message_id = Some(message_id.clone());
-                                                accumulated_reasoning.push_str(&delta);
-                                                add_codex_loop_turn_reasoning_bytes(
-                                                    &mut turn_context_by_turn,
-                                                    active_turn_id.as_deref(),
-                                                    delta.len() as u64,
-                                                );
-                                                emitter.stream_reasoning_delta(&message_id, &delta);
+                                                CodexAgentMessageCompletionDisposition::EmitOnOpenStream => {}
                                             }
-                                            close_stream_when_tools_idle = true;
-                                            maybe_finish_codex_loop_segment(
-                                                &emitter,
-                                                CodexLoopSegmentState {
-                                                    current_message_id: &mut current_message_id,
-                                                    accumulated_text: &mut accumulated_text,
-                                                    accumulated_reasoning: &mut accumulated_reasoning,
-                                                    close_stream_when_tools_idle:
-                                                        &mut close_stream_when_tools_idle,
-                                                    pending_message_metadata:
-                                                        &mut pending_message_metadata,
-                                                },
-                                                CodexLoopSegmentContext {
-                                                    pending_tool_call_ids: &pending_tool_call_ids,
-                                                    active_turn_id: active_turn_id.as_deref(),
-                                                    turn_context_by_turn: &turn_context_by_turn,
-                                                    model_name: &model_name,
-                                                },
-                                            );
-                                        }
-                                    }
-                                    "commandExecution" => {
-                                        add_codex_loop_turn_tool_bytes(
-                                            &mut turn_context_by_turn,
-                                            active_turn_id.as_deref(),
-                                            estimate_command_execution_tool_bytes(&item),
-                                        );
-                                        let exit_code =
-                                            item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1)
-                                                as i32;
-                                        let output = item
-                                            .get("aggregatedOutput")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let success = exit_code == 0;
-                                        let error_message = if success {
-                                            None
-                                        } else {
-                                            Some(format!("Command failed with exit code {exit_code}"))
-                                        };
-                                        emitter.tool_completed(ToolCompletedPayload {
-                                            tool_call_id: &item_id,
-                                            tool_name: "run_command",
-                                            tool_result: json!({
-                                                "kind": "RunCommand",
-                                                "exit_code": exit_code,
-                                                "stdout": output,
-                                                "stderr": "",
-                                            }),
-                                            success,
-                                            error: error_message.as_deref(),
-                                        });
-                                        pending_tool_call_ids.remove(&item_id);
-                                        maybe_finish_codex_loop_segment(
-                                            &emitter,
-                                            CodexLoopSegmentState {
-                                                current_message_id: &mut current_message_id,
-                                                accumulated_text: &mut accumulated_text,
-                                                accumulated_reasoning: &mut accumulated_reasoning,
-                                                close_stream_when_tools_idle:
-                                                    &mut close_stream_when_tools_idle,
-                                                pending_message_metadata: &mut pending_message_metadata,
-                                            },
-                                            CodexLoopSegmentContext {
-                                                pending_tool_call_ids: &pending_tool_call_ids,
-                                                active_turn_id: active_turn_id.as_deref(),
-                                                turn_context_by_turn: &turn_context_by_turn,
-                                                model_name: &model_name,
-                                            },
-                                        );
-                                    }
-                                    "fileChange" => {
-                                        add_codex_loop_turn_tool_bytes(
-                                            &mut turn_context_by_turn,
-                                            active_turn_id.as_deref(),
-                                            estimate_file_change_tool_bytes(&item),
-                                        );
-                                        let file_changes = parse_codex_file_changes(&item);
-                                        let success =
-                                            item.get("status").and_then(Value::as_str) == Some("completed");
-                                        let known_call_ids =
-                                            file_change_call_ids.remove(&item_id).unwrap_or_default();
-                                        let completions = codex_file_change_completion_plan(
-                                            &item_id,
-                                            &known_call_ids,
-                                            &file_changes,
-                                        );
-                                        if !completions.is_empty() {
-                                            for completion in completions {
-                                                if let Some(change) = completion.request.as_ref() {
-                                                    emit_modify_file_request_to(
-                                                        &emitter,
-                                                        &completion.call_id,
-                                                        &change.path,
-                                                        &change.before,
-                                                        &change.after,
-                                                    );
+                                            saw_agent_message_completed = true;
+                                            let final_text = if text.is_empty() {
+                                                std::mem::take(&mut accumulated_text)
+                                            } else {
+                                                accumulated_text.clear();
+                                                text
+                                            };
+                                            let reasoning = contains_non_whitespace(
+                                                &accumulated_reasoning,
+                                            )
+                                            .then(|| std::mem::take(&mut accumulated_reasoning));
+                                            conversation_bytes_total = conversation_bytes_total
+                                                .saturating_add(final_text.len() as u64);
+                                            let message_id_for_metadata = current_message_id
+                                                .clone()
+                                                .unwrap_or_else(|| item_id.clone());
+                                            if let Some(turn_id) = active_turn_id.clone() {
+                                                let turn_context = turn_context_by_turn
+                                                    .get(&turn_id)
+                                                    .cloned()
+                                                    .unwrap_or_default();
+                                                if let Some(metadata) = metadata_target_for_visible_message(
+                                                    turn_id,
+                                                    message_id_for_metadata,
+                                                    &final_text,
+                                                    reasoning.as_deref(),
+                                                    model_name.clone(),
+                                                    turn_context,
+                                                ) {
+                                                    pending_message_metadata =
+                                                        Some(CodexLoopPendingMessageMetadata {
+                                                            turn_id: metadata.turn_id,
+                                                            message_id: metadata.message_id,
+                                                            turn_context: metadata.turn_context,
+                                                        });
                                                 }
-                                                emitter.tool_completed(ToolCompletedPayload {
-                                                    tool_call_id: &completion.call_id,
-                                                    tool_name: "modify_file",
-                                                    tool_result: json!({
-                                                        "kind": "ModifyFile",
-                                                        "lines_added": completion.lines_added,
-                                                        "lines_removed": completion.lines_removed,
-                                                    }),
-                                                    success,
-                                                    error: (!success)
-                                                        .then_some("File changes were not applied"),
-                                                });
-                                                pending_tool_call_ids.remove(&completion.call_id);
                                             }
+                                            emitter.stream_end(StreamEndPayload {
+                                                content: final_text,
+                                                agent: Some(AgentName(CODEX_AGENT_NAME)),
+                                                model: Some(model_name.clone()),
+                                                request_usage: None,
+                turn_usage: None,
+                cumulative_usage: None,
+                                                reasoning,
+                                                tool_calls: Vec::new(),
+                                                context_breakdown: None,
+                                            });
+                                            current_message_id = None;
+                                            stream_closed_by_turn_completion = false;
+                                        }
+                                        "reasoning" => {
+                                            if let Some(reasoning_text) = extract_codex_item_reasoning(&item)
+                                                && contains_non_whitespace(&reasoning_text)
+                                            {
+                                                let delta = merge_reasoning_delta(
+                                                    &accumulated_reasoning,
+                                                    &reasoning_text,
+                                                );
+                                                if !delta.is_empty() {
+                                                    let message_id = item_id.clone();
+                                                    if current_message_id.is_none() {
+                                                        stream_closed_by_turn_completion = false;
+                                                        accumulated_text.clear();
+                                                        accumulated_reasoning.clear();
+                                                        if !typing_status_active {
+                                                            emitter.typing_status_changed(true);
+                                                            typing_status_active = true;
+                                                        }
+                                                        emitter.stream_start(
+                                                            &message_id,
+                                                            AgentName(CODEX_AGENT_NAME),
+                                                            Some(&model_name),
+                                                        );
+                                                    }
+                                                    current_message_id = Some(message_id.clone());
+                                                    accumulated_reasoning.push_str(&delta);
+                                                    add_codex_loop_turn_reasoning_bytes(
+                                                        &mut turn_context_by_turn,
+                                                        active_turn_id.as_deref(),
+                                                        delta.len() as u64,
+                                                    );
+                                                    emitter.stream_reasoning_delta(&message_id, &delta);
+                                                }
+                                                close_stream_when_tools_idle = true;
+                                                maybe_finish_codex_loop_segment(
+                                                    &emitter,
+                                                    CodexLoopSegmentState {
+                                                        current_message_id: &mut current_message_id,
+                                                        accumulated_text: &mut accumulated_text,
+                                                        accumulated_reasoning: &mut accumulated_reasoning,
+                                                        close_stream_when_tools_idle:
+                                                            &mut close_stream_when_tools_idle,
+                                                        pending_message_metadata:
+                                                            &mut pending_message_metadata,
+                                                    },
+                                                    CodexLoopSegmentContext {
+                                                        pending_tool_call_ids: &pending_tool_call_ids,
+                                                        active_turn_id: active_turn_id.as_deref(),
+                                                        turn_context_by_turn: &turn_context_by_turn,
+                                                        model_name: &model_name,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        "commandExecution" => {
+                                            add_codex_loop_turn_tool_bytes(
+                                                &mut turn_context_by_turn,
+                                                active_turn_id.as_deref(),
+                                                estimate_command_execution_tool_bytes(&item),
+                                            );
+                                            let exit_code =
+                                                item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1)
+                                                    as i32;
+                                            let output = item
+                                                .get("aggregatedOutput")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_string();
+                                            let success = exit_code == 0;
+                                            let error_message = if success {
+                                                None
+                                            } else {
+                                                Some(format!("Command failed with exit code {exit_code}"))
+                                            };
+                                            emitter.tool_completed(ToolCompletedPayload {
+                                                tool_call_id: &item_id,
+                                                tool_name: "run_command",
+                                                tool_result: json!({
+                                                    "kind": "RunCommand",
+                                                    "exit_code": exit_code,
+                                                    "stdout": output,
+                                                    "stderr": "",
+                                                }),
+                                                success,
+                                                error: error_message.as_deref(),
+                                            });
+                                            pending_tool_call_ids.remove(&item_id);
                                             maybe_finish_codex_loop_segment(
                                                 &emitter,
                                                 CodexLoopSegmentState {
@@ -6307,8 +6262,7 @@ impl Backend for CodexBackend {
                                                     accumulated_reasoning: &mut accumulated_reasoning,
                                                     close_stream_when_tools_idle:
                                                         &mut close_stream_when_tools_idle,
-                                                    pending_message_metadata:
-                                                        &mut pending_message_metadata,
+                                                    pending_message_metadata: &mut pending_message_metadata,
                                                 },
                                                 CodexLoopSegmentContext {
                                                     pending_tool_call_ids: &pending_tool_call_ids,
@@ -6318,375 +6272,439 @@ impl Backend for CodexBackend {
                                                 },
                                             );
                                         }
-                                    }
-                                    "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
-                                    | "dynamicToolCall" => {
-                                        let tool_name = item
-                                            .get("tool")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or(item_type)
-                                            .to_string();
-                                        let success =
-                                            item.get("status").and_then(Value::as_str) == Some("completed")
-                                                || item.get("success").and_then(Value::as_bool)
-                                                    == Some(true);
-                                        let error_message =
-                                            (!success).then(|| format!("{tool_name} failed"));
-                                        if success {
-                                            emit_agent_control_spawn_progress_to(
-                                                &emitter,
+                                        "fileChange" => {
+                                            add_codex_loop_turn_tool_bytes(
+                                                &mut turn_context_by_turn,
+                                                active_turn_id.as_deref(),
+                                                estimate_file_change_tool_bytes(&item),
+                                            );
+                                            let file_changes = parse_codex_file_changes(&item);
+                                            let success =
+                                                item.get("status").and_then(Value::as_str) == Some("completed");
+                                            let known_call_ids =
+                                                file_change_call_ids.remove(&item_id).unwrap_or_default();
+                                            let completions = codex_file_change_completion_plan(
                                                 &item_id,
-                                                &tool_name,
-                                                &item,
+                                                &known_call_ids,
+                                                &file_changes,
                                             );
-                                        }
-                                        emitter.tool_completed(ToolCompletedPayload {
-                                            tool_call_id: &item_id,
-                                            tool_name: &tool_name,
-                                            tool_result: json!({
-                                                "kind": "Other",
-                                                "result": item,
-                                            }),
-                                            success,
-                                            error: error_message.as_deref(),
-                                        });
-                                        pending_tool_call_ids.remove(&item_id);
-                                        maybe_finish_codex_loop_segment(
-                                            &emitter,
-                                            CodexLoopSegmentState {
-                                                current_message_id: &mut current_message_id,
-                                                accumulated_text: &mut accumulated_text,
-                                                accumulated_reasoning: &mut accumulated_reasoning,
-                                                close_stream_when_tools_idle:
-                                                    &mut close_stream_when_tools_idle,
-                                                pending_message_metadata: &mut pending_message_metadata,
-                                            },
-                                            CodexLoopSegmentContext {
-                                                pending_tool_call_ids: &pending_tool_call_ids,
-                                                active_turn_id: active_turn_id.as_deref(),
-                                                turn_context_by_turn: &turn_context_by_turn,
-                                                model_name: &model_name,
-                                            },
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            "item/started" => {
-                                let item = params.get("item").cloned().unwrap_or(Value::Null);
-                                let item_type = item
-                                    .get("type")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default();
-                                let item_id = item
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("tool-call")
-                                    .to_string();
-                                if !item_type.is_empty() && started_item_types.len() < 8 {
-                                    started_item_types.push(item_type.to_string());
-                                }
-                                match item_type {
-                                    "commandExecution" => {
-                                        let command = item
-                                            .get("command")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let cwd = item
-                                            .get("cwd")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("")
-                                            .to_string();
-                                        pending_tool_call_ids.insert(item_id.clone());
-                                        emitter.tool_request(
-                                            &item_id,
-                                            "run_command",
-                                            json!({
-                                                "kind": "RunCommand",
-                                                "command": command,
-                                                "working_directory": cwd,
-                                            }),
-                                        );
-                                    }
-                                    "fileChange" => {
-                                        let file_changes = parse_codex_file_changes(&item);
-                                        if file_changes.is_empty() {
-                                            continue;
-                                        }
-                                        let total = file_changes.len();
-                                        let call_ids = file_changes
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(idx, _)| {
-                                                codex_file_change_call_id(&item_id, idx, total)
-                                            })
-                                            .collect::<Vec<_>>();
-                                        file_change_call_ids
-                                            .insert(item_id.clone(), call_ids.clone());
-                                        pending_tool_call_ids.extend(call_ids.iter().cloned());
-                                        for (change, call_id) in
-                                            file_changes.into_iter().zip(call_ids.into_iter())
-                                        {
-                                            emit_modify_file_request_to(
-                                                &emitter,
-                                                &call_id,
-                                                &change.path,
-                                                &change.before,
-                                                &change.after,
-                                            );
-                                        }
-                                    }
-                                    "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
-                                    | "dynamicToolCall" => {
-                                        add_codex_loop_turn_tool_bytes(
-                                            &mut turn_context_by_turn,
-                                            active_turn_id.as_deref(),
-                                            estimate_generic_tool_bytes(&item),
-                                        );
-                                        let tool_name = item
-                                            .get("tool")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or(item_type)
-                                            .to_string();
-                                        pending_tool_call_ids.insert(item_id.clone());
-                                        emitter.tool_request(
-                                            &item_id,
-                                            &tool_name,
-                                            json!({
-                                                "kind": "Other",
-                                                "args": item,
-                                            }),
-                                        );
-                                        emit_agent_control_await_progress_to(
-                                            &emitter, &item_id, &tool_name, &item,
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            "turn/completed" => {
-                                let turn_status = params
-                                    .get("turn")
-                                    .and_then(|v| v.get("status"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("completed");
-                                let turn_id_for_log = active_turn_id.clone();
-                                if let Some((turn_id, token_usage)) =
-                                    extract_turn_token_usage(&params, Some(&model_name))
-                                {
-                                    token_usage_by_turn.insert(turn_id, token_usage);
-                                }
-                                let turn_error_message = (turn_status == "failed").then(|| {
-                                    params
-                                        .get("turn")
-                                        .and_then(|v| v.get("error"))
-                                        .and_then(|v| v.get("message"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("Codex turn failed")
-                                        .to_string()
-                                });
-                                active_turn_id = None;
-                                if current_message_id.is_some() && turn_status != "interrupted" {
-                                    let final_text = std::mem::take(&mut accumulated_text);
-                                    let reasoning = contains_non_whitespace(&accumulated_reasoning)
-                                        .then(|| std::mem::take(&mut accumulated_reasoning));
-                                    let had_assistant_content = !final_text.trim().is_empty()
-                                        || saw_agent_message_delta
-                                        || saw_agent_message_completed;
-                                    let should_emit_empty_stream_end =
-                                        !had_assistant_content && turn_status != "failed";
-                                    if !had_assistant_content && !should_emit_empty_stream_end {
-                                        tracing::warn!(
-                                            turn_id = ?turn_id_for_log,
-                                            turn_status,
-                                            model = %model_name,
-                                            model_override = ?model_override,
-                                            reasoning_effort = ?effort_override,
-                                            reasoning_notification_count,
-                                            started_item_types = ?started_item_types,
-                                            completed_item_types = ?completed_item_types,
-                                            turn_error_message = ?turn_error_message,
-                                            "Codex turn completed without any assistant message content"
-                                        );
-                                    }
-                                    if had_assistant_content || should_emit_empty_stream_end {
-                                        if let Some(turn_id) = turn_id_for_log.as_ref() {
-                                            let turn_context = turn_context_by_turn
-                                                .get(turn_id)
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            if let Some(metadata) = metadata_target_for_visible_message(
-                                                turn_id.clone(),
-                                                current_message_id.clone().unwrap_or_default(),
-                                                &final_text,
-                                                reasoning.as_deref(),
-                                                model_name.clone(),
-                                                turn_context,
-                                            ) {
-                                                pending_message_metadata =
-                                                    Some(CodexLoopPendingMessageMetadata {
-                                                        turn_id: metadata.turn_id,
-                                                        message_id: metadata.message_id,
-                                                        turn_context: metadata.turn_context,
+                                            if !completions.is_empty() {
+                                                for completion in completions {
+                                                    if let Some(change) = completion.request.as_ref() {
+                                                        emit_modify_file_request_to(
+                                                            &emitter,
+                                                            &completion.call_id,
+                                                            &change.path,
+                                                            &change.before,
+                                                            &change.after,
+                                                        );
+                                                    }
+                                                    emitter.tool_completed(ToolCompletedPayload {
+                                                        tool_call_id: &completion.call_id,
+                                                        tool_name: "modify_file",
+                                                        tool_result: json!({
+                                                            "kind": "ModifyFile",
+                                                            "lines_added": completion.lines_added,
+                                                            "lines_removed": completion.lines_removed,
+                                                        }),
+                                                        success,
+                                                        error: (!success)
+                                                            .then_some("File changes were not applied"),
                                                     });
+                                                    pending_tool_call_ids.remove(&completion.call_id);
+                                                }
+                                                maybe_finish_codex_loop_segment(
+                                                    &emitter,
+                                                    CodexLoopSegmentState {
+                                                        current_message_id: &mut current_message_id,
+                                                        accumulated_text: &mut accumulated_text,
+                                                        accumulated_reasoning: &mut accumulated_reasoning,
+                                                        close_stream_when_tools_idle:
+                                                            &mut close_stream_when_tools_idle,
+                                                        pending_message_metadata:
+                                                            &mut pending_message_metadata,
+                                                    },
+                                                    CodexLoopSegmentContext {
+                                                        pending_tool_call_ids: &pending_tool_call_ids,
+                                                        active_turn_id: active_turn_id.as_deref(),
+                                                        turn_context_by_turn: &turn_context_by_turn,
+                                                        model_name: &model_name,
+                                                    },
+                                                );
                                             }
                                         }
-                                        emitter.stream_end(StreamEndPayload {
-                                            content: final_text,
-                                            agent: Some(AgentName(CODEX_AGENT_NAME)),
-                                            model: Some(model_name.clone()),
-                                            usage: None,
-                                            reasoning,
-                                            tool_calls: Vec::new(),
-                                            context_breakdown: None,
-                                        });
-                                        stream_closed_by_turn_completion = true;
-                                    }
-                                    current_message_id = None;
-                                }
-                                if turn_status != "interrupted"
-                                    && let Some(turn_id) = turn_id_for_log.as_ref()
-                                    && pending_message_metadata
-                                        .as_ref()
-                                        .is_some_and(|pending| pending.turn_id == *turn_id)
-                                    && let Some(pending) = pending_message_metadata.take()
-                                {
-                                    let usage = token_usage_by_turn.remove(turn_id);
-                                    let context_breakdown = estimate_context_breakdown(
-                                        usage.as_ref(),
-                                        &pending.turn_context,
-                                        Some(&model_name),
-                                    );
-                                    emitter.message_metadata_updated(MessageMetadataUpdatePayload {
-                                        message_id: pending.message_id,
-                                        model_info: Some(json!({ "model": model_name.clone() })),
-                                        token_usage: usage,
-                                        context_breakdown: Some(context_breakdown),
-                                    });
-                                }
-                                if turn_status == "interrupted" {
-                                    pending_message_metadata = None;
-                                    emitter.operation_cancelled("Operation cancelled");
-                                    typing_status_active = false;
-                                }
-                                if let Some(message) = turn_error_message {
-                                    emitter.error_message(&message);
-                                }
-                                if typing_status_active {
-                                    emitter.typing_status_changed(false);
-                                    typing_status_active = false;
-                                }
-                                pending_tool_call_ids.clear();
-                                close_stream_when_tools_idle = false;
-                                if let Some(turn_id) = turn_id_for_log.as_ref() {
-                                    token_usage_by_turn.remove(turn_id);
-                                    turn_context_by_turn.remove(turn_id);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    input = input_rx.recv() => {
-                        let Some(input) = input else { break };
-                        match input {
-                            AgentInput::SendMessage(payload) => {
-                                let backend_message = payload.message;
-                                pending_user_input_bytes = backend_message.len() as u64;
-                                let visible_message = backend_message.clone();
-                                let visible_images = payload.images.clone();
-                                let images = protocol_images_to_attachments(payload.images);
-                                emitter.user_message(
-                                    &visible_message,
-                                    backend_user_image_values(visible_images),
-                                );
-                                let mut input_items = vec![json!({
-                                    "type": "text",
-                                    "text": backend_message,
-                                })];
-                                if let Some(imgs) = images {
-                                    for image in imgs {
-                                        let path = match persist_temp_image(&image).await {
-                                            Ok(path) => path,
-                                            Err(err) => {
-                                                tracing::error!(
-                                                    "Failed to persist Codex image attachment: {err}"
+                                        "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
+                                        | "dynamicToolCall" => {
+                                            let tool_name = item
+                                                .get("tool")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or(item_type)
+                                                .to_string();
+                                            let success =
+                                                item.get("status").and_then(Value::as_str) == Some("completed")
+                                                    || item.get("success").and_then(Value::as_bool)
+                                                        == Some(true);
+                                            let error_message =
+                                                (!success).then(|| format!("{tool_name} failed"));
+                                            if success {
+                                                emit_agent_control_spawn_progress_to(
+                                                    &emitter,
+                                                    &item_id,
+                                                    &tool_name,
+                                                    &item,
                                                 );
+                                            }
+                                            emitter.tool_completed(ToolCompletedPayload {
+                                                tool_call_id: &item_id,
+                                                tool_name: &tool_name,
+                                                tool_result: json!({
+                                                    "kind": "Other",
+                                                    "result": item,
+                                                }),
+                                                success,
+                                                error: error_message.as_deref(),
+                                            });
+                                            pending_tool_call_ids.remove(&item_id);
+                                            maybe_finish_codex_loop_segment(
+                                                &emitter,
+                                                CodexLoopSegmentState {
+                                                    current_message_id: &mut current_message_id,
+                                                    accumulated_text: &mut accumulated_text,
+                                                    accumulated_reasoning: &mut accumulated_reasoning,
+                                                    close_stream_when_tools_idle:
+                                                        &mut close_stream_when_tools_idle,
+                                                    pending_message_metadata: &mut pending_message_metadata,
+                                                },
+                                                CodexLoopSegmentContext {
+                                                    pending_tool_call_ids: &pending_tool_call_ids,
+                                                    active_turn_id: active_turn_id.as_deref(),
+                                                    turn_context_by_turn: &turn_context_by_turn,
+                                                    model_name: &model_name,
+                                                },
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                "item/started" => {
+                                    let item = params.get("item").cloned().unwrap_or(Value::Null);
+                                    let item_type = item
+                                        .get("type")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default();
+                                    let item_id = item
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("tool-call")
+                                        .to_string();
+                                    if !item_type.is_empty() && started_item_types.len() < 8 {
+                                        started_item_types.push(item_type.to_string());
+                                    }
+                                    match item_type {
+                                        "commandExecution" => {
+                                            let command = item
+                                                .get("command")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_string();
+                                            let cwd = item
+                                                .get("cwd")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_string();
+                                            pending_tool_call_ids.insert(item_id.clone());
+                                            emitter.tool_request(
+                                                &item_id,
+                                                "run_command",
+                                                json!({
+                                                    "kind": "RunCommand",
+                                                    "command": command,
+                                                    "working_directory": cwd,
+                                                }),
+                                            );
+                                        }
+                                        "fileChange" => {
+                                            let file_changes = parse_codex_file_changes(&item);
+                                            if file_changes.is_empty() {
                                                 continue;
                                             }
-                                        };
-                                        input_items.push(json!({
-                                            "type": "localImage",
-                                            "path": path,
-                                        }));
+                                            let total = file_changes.len();
+                                            let call_ids = file_changes
+                                                .iter()
+                                                .enumerate()
+                                                .map(|(idx, _)| {
+                                                    codex_file_change_call_id(&item_id, idx, total)
+                                                })
+                                                .collect::<Vec<_>>();
+                                            file_change_call_ids
+                                                .insert(item_id.clone(), call_ids.clone());
+                                            pending_tool_call_ids.extend(call_ids.iter().cloned());
+                                            for (change, call_id) in
+                                                file_changes.into_iter().zip(call_ids.into_iter())
+                                            {
+                                                emit_modify_file_request_to(
+                                                    &emitter,
+                                                    &call_id,
+                                                    &change.path,
+                                                    &change.before,
+                                                    &change.after,
+                                                );
+                                            }
+                                        }
+                                        "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
+                                        | "dynamicToolCall" => {
+                                            add_codex_loop_turn_tool_bytes(
+                                                &mut turn_context_by_turn,
+                                                active_turn_id.as_deref(),
+                                                estimate_generic_tool_bytes(&item),
+                                            );
+                                            let tool_name = item
+                                                .get("tool")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or(item_type)
+                                                .to_string();
+                                            pending_tool_call_ids.insert(item_id.clone());
+                                            emitter.tool_request(
+                                                &item_id,
+                                                &tool_name,
+                                                json!({
+                                                    "kind": "Other",
+                                                    "args": item,
+                                                }),
+                                            );
+                                            emit_agent_control_await_progress_to(
+                                                &emitter, &item_id, &tool_name, &item,
+                                            );
+                                        }
+                                        _ => {}
                                     }
                                 }
-                                let mut turn_params = json!({
-                                    "threadId": thread_id_for_input,
-                                    "input": input_items,
-                                });
-                                if let Some(model) = model_for_input.clone() {
-                                    turn_params["model"] = Value::String(model);
+                                "turn/completed" => {
+                                    let turn_status = params
+                                        .get("turn")
+                                        .and_then(|v| v.get("status"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("completed");
+                                    let turn_id_for_log = active_turn_id.clone();
+                                    if let Some((turn_id, token_usage)) =
+                                        extract_turn_token_usage(&params, Some(&model_name))
+                                    {
+                                        token_usage_by_turn.insert(turn_id, token_usage);
+                                    }
+                                    let turn_error_message = (turn_status == "failed").then(|| {
+                                        params
+                                            .get("turn")
+                                            .and_then(|v| v.get("error"))
+                                            .and_then(|v| v.get("message"))
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("Codex turn failed")
+                                            .to_string()
+                                    });
+                                    active_turn_id = None;
+                                    if current_message_id.is_some() && turn_status != "interrupted" {
+                                        let final_text = std::mem::take(&mut accumulated_text);
+                                        let reasoning = contains_non_whitespace(&accumulated_reasoning)
+                                            .then(|| std::mem::take(&mut accumulated_reasoning));
+                                        let had_assistant_content = !final_text.trim().is_empty()
+                                            || saw_agent_message_delta
+                                            || saw_agent_message_completed;
+                                        let should_emit_empty_stream_end =
+                                            !had_assistant_content && turn_status != "failed";
+                                        if !had_assistant_content && !should_emit_empty_stream_end {
+                                            tracing::warn!(
+                                                turn_id = ?turn_id_for_log,
+                                                turn_status,
+                                                model = %model_name,
+                                                model_override = ?model_override,
+                                                reasoning_effort = ?effort_override,
+                                                reasoning_notification_count,
+                                                started_item_types = ?started_item_types,
+                                                completed_item_types = ?completed_item_types,
+                                                turn_error_message = ?turn_error_message,
+                                                "Codex turn completed without any assistant message content"
+                                            );
+                                        }
+                                        if had_assistant_content || should_emit_empty_stream_end {
+                                            if let Some(turn_id) = turn_id_for_log.as_ref() {
+                                                let turn_context = turn_context_by_turn
+                                                    .get(turn_id)
+                                                    .cloned()
+                                                    .unwrap_or_default();
+                                                if let Some(metadata) = metadata_target_for_visible_message(
+                                                    turn_id.clone(),
+                                                    current_message_id.clone().unwrap_or_default(),
+                                                    &final_text,
+                                                    reasoning.as_deref(),
+                                                    model_name.clone(),
+                                                    turn_context,
+                                                ) {
+                                                    pending_message_metadata =
+                                                        Some(CodexLoopPendingMessageMetadata {
+                                                            turn_id: metadata.turn_id,
+                                                            message_id: metadata.message_id,
+                                                            turn_context: metadata.turn_context,
+                                                        });
+                                                }
+                                            }
+                                            emitter.stream_end(StreamEndPayload {
+                                                content: final_text,
+                                                agent: Some(AgentName(CODEX_AGENT_NAME)),
+                                                model: Some(model_name.clone()),
+                                                request_usage: None,
+                turn_usage: None,
+                cumulative_usage: None,
+                                                reasoning,
+                                                tool_calls: Vec::new(),
+                                                context_breakdown: None,
+                                            });
+                                            stream_closed_by_turn_completion = true;
+                                        }
+                                        current_message_id = None;
+                                    }
+                                    if turn_status != "interrupted"
+                                        && let Some(turn_id) = turn_id_for_log.as_ref()
+                                        && pending_message_metadata
+                                            .as_ref()
+                                            .is_some_and(|pending| pending.turn_id == *turn_id)
+                                        && let Some(pending) = pending_message_metadata.take()
+                                    {
+                                        let usage = token_usage_by_turn.remove(turn_id);
+                                        let context_breakdown = estimate_context_breakdown(
+                                            usage.as_ref(),
+                                            &pending.turn_context,
+                                            Some(&model_name),
+                                        );
+                                        emitter.message_metadata_updated(MessageMetadataUpdatePayload {
+                                            message_id: pending.message_id,
+                                            model_info: Some(json!({ "model": model_name.clone() })),
+                                            request_usage: usage.clone(),
+                                            turn_usage: usage,
+                                            cumulative_usage: None,
+                                            context_breakdown: Some(context_breakdown),
+                                        });
+                                    }
+                                    if turn_status == "interrupted" {
+                                        pending_message_metadata = None;
+                                        emitter.operation_cancelled("Operation cancelled");
+                                        typing_status_active = false;
+                                    }
+                                    if let Some(message) = turn_error_message {
+                                        emitter.error_message(&message);
+                                    }
+                                    if typing_status_active {
+                                        emitter.typing_status_changed(false);
+                                        typing_status_active = false;
+                                    }
+                                    pending_tool_call_ids.clear();
+                                    close_stream_when_tools_idle = false;
+                                    if let Some(turn_id) = turn_id_for_log.as_ref() {
+                                        token_usage_by_turn.remove(turn_id);
+                                        turn_context_by_turn.remove(turn_id);
+                                    }
                                 }
-                                if let Some(effort) = effort_for_input.clone() {
-                                    turn_params["effort"] = Value::String(effort);
-                                }
-                                turn_params["summary"] =
-                                    Value::String(CODEX_REASONING_SUMMARY_LEVEL.to_string());
-                                turn_params["approvalPolicy"] =
-                                    Value::String(CODEX_FORCED_APPROVAL_POLICY.to_string());
-                                turn_params["sandboxPolicy"] =
-                                    codex_sandbox_policy(
-                                        access_mode_for_input,
-                                        turn_network_access,
-                                    );
-                                let _ = rpc_request(
-                                    &stdin_for_input,
-                                    &pending_for_input,
-                                    &next_id_for_input,
-                                    "turn/start",
-                                    turn_params,
-                                )
-                                .await;
-                            }
-                            AgentInput::UpdateSessionSettings(payload) => {
-                                let _ = rpc_request(
-                                    &stdin_for_input,
-                                    &pending_for_input,
-                                    &next_id_for_input,
-                                    "thread/update",
-                                    json!({
-                                        "threadId": thread_id_for_input,
-                                        "settings": session_settings_to_json(&payload.values),
-                                    }),
-                                )
-                                .await;
-                            }
-                            AgentInput::EditQueuedMessage(_)
-                            | AgentInput::CancelQueuedMessage(_)
-                            | AgentInput::SendQueuedMessageNow(_) => {
-                                panic!(
-                                    "queued-message inputs must be handled by the agent actor before reaching the backend"
-                                );
+                                _ => {}
                             }
                         }
+                        input = input_rx.recv() => {
+                            let Some(input) = input else { break };
+                            match input {
+                                AgentInput::SendMessage(payload) => {
+                                    let backend_message = payload.message;
+                                    pending_user_input_bytes = backend_message.len() as u64;
+                                    let visible_message = backend_message.clone();
+                                    let visible_images = payload.images.clone();
+                                    let images = protocol_images_to_attachments(payload.images);
+                                    emitter.user_message(
+                                        &visible_message,
+                                        backend_user_image_values(visible_images),
+                                    );
+                                    let mut input_items = vec![json!({
+                                        "type": "text",
+                                        "text": backend_message,
+                                    })];
+                                    if let Some(imgs) = images {
+                                        for image in imgs {
+                                            let path = match persist_temp_image(&image).await {
+                                                Ok(path) => path,
+                                                Err(err) => {
+                                                    tracing::error!(
+                                                        "Failed to persist Codex image attachment: {err}"
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+                                            input_items.push(json!({
+                                                "type": "localImage",
+                                                "path": path,
+                                            }));
+                                        }
+                                    }
+                                    let mut turn_params = json!({
+                                        "threadId": thread_id_for_input,
+                                        "input": input_items,
+                                    });
+                                    if let Some(model) = model_for_input.clone() {
+                                        turn_params["model"] = Value::String(model);
+                                    }
+                                    if let Some(effort) = effort_for_input.clone() {
+                                        turn_params["effort"] = Value::String(effort);
+                                    }
+                                    turn_params["summary"] =
+                                        Value::String(CODEX_REASONING_SUMMARY_LEVEL.to_string());
+                                    turn_params["approvalPolicy"] =
+                                        Value::String(CODEX_FORCED_APPROVAL_POLICY.to_string());
+                                    turn_params["sandboxPolicy"] =
+                                        codex_sandbox_policy(
+                                            access_mode_for_input,
+                                            turn_network_access,
+                                        );
+                                    let _ = rpc_request(
+                                        &stdin_for_input,
+                                        &pending_for_input,
+                                        &next_id_for_input,
+                                        "turn/start",
+                                        turn_params,
+                                    )
+                                    .await;
+                                }
+                                AgentInput::UpdateSessionSettings(payload) => {
+                                    let _ = rpc_request(
+                                        &stdin_for_input,
+                                        &pending_for_input,
+                                        &next_id_for_input,
+                                        "thread/update",
+                                        json!({
+                                            "threadId": thread_id_for_input,
+                                            "settings": session_settings_to_json(&payload.values),
+                                        }),
+                                    )
+                                    .await;
+                                }
+                                AgentInput::EditQueuedMessage(_)
+                                | AgentInput::CancelQueuedMessage(_)
+                                | AgentInput::SendQueuedMessageNow(_) => {
+                                    panic!(
+                                        "queued-message inputs must be handled by the agent actor before reaching the backend"
+                                    );
+                                }
+                            }
+                        }
+                        interrupt = interrupt_rx.recv() => {
+                            let Some(()) = interrupt else { break };
+                            let Some(turn_id) = active_turn_id.clone() else { continue };
+                            let _ = rpc_request(
+                                &stdin_for_input,
+                                &pending_for_input,
+                                &next_id_for_input,
+                                "turn/interrupt",
+                                json!({
+                                    "threadId": thread_id_for_input,
+                                    "turnId": turn_id,
+                                }),
+                            )
+                            .await;
+                        }
                     }
-                    interrupt = interrupt_rx.recv() => {
-                        let Some(()) = interrupt else { break };
-                        let Some(turn_id) = active_turn_id.clone() else { continue };
-                        let _ = rpc_request(
-                            &stdin_for_input,
-                            &pending_for_input,
-                            &next_id_for_input,
-                            "turn/interrupt",
-                            json!({
-                                "threadId": thread_id_for_input,
-                                "turnId": turn_id,
-                            }),
-                        )
-                        .await;
-                    }
-                }
             }
         });
 
@@ -8410,6 +8428,7 @@ for line in sys.stdin:
                 backend_setup: BackendSetupPayload { backends: vec![] },
                 session_schemas: vec![],
                 backend_config_schemas: vec![],
+                backend_config_snapshots: vec![],
                 launch_profile_catalog: Default::default(),
                 sessions: vec![],
                 projects: vec![],
@@ -8542,7 +8561,9 @@ for line in sys.stdin:
             content: final_text,
             agent: Some(AgentName(CODEX_AGENT_NAME)),
             model: Some(model_name.clone()),
-            usage: None,
+            request_usage: None,
+            turn_usage: None,
+            cumulative_usage: None,
             reasoning,
             tool_calls: Vec::new(),
             context_breakdown: None,
@@ -8555,7 +8576,9 @@ for line in sys.stdin:
         emitter.message_metadata_updated(MessageMetadataUpdatePayload {
             message_id: pending.message_id,
             model_info: Some(json!({ "model": model_name })),
-            token_usage: None,
+            request_usage: None,
+            turn_usage: None,
+            cumulative_usage: None,
             context_breakdown: None,
         });
 
@@ -9767,7 +9790,7 @@ Do not describe the tool, and do not skip the tool call."#;
             );
             assert_eq!(
                 events[0]
-                    .pointer("/data/token_usage/total_tokens")
+                    .pointer("/data/token_usage/turn/usage/total_tokens")
                     .and_then(Value::as_u64),
                 Some(17)
             );
@@ -9964,7 +9987,7 @@ Do not describe the tool, and do not skip the tool call."#;
             );
             assert_eq!(
                 completion_events[0]
-                    .pointer("/data/token_usage/total_tokens")
+                    .pointer("/data/token_usage/turn/usage/total_tokens")
                     .and_then(Value::as_u64),
                 Some(13)
             );
@@ -10173,7 +10196,7 @@ Do not describe the tool, and do not skip the tool call."#;
             );
             assert_eq!(
                 events[0]
-                    .pointer("/data/token_usage/total_tokens")
+                    .pointer("/data/token_usage/turn/usage/total_tokens")
                     .and_then(Value::as_u64),
                 Some(27)
             );

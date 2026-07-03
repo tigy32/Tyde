@@ -10,8 +10,8 @@ use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
     AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
-    AgentsViewPreferencesNotifyPayload, BackendConfigSchemasPayload, BackendSetupPayload,
-    BrowseBootstrapPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
+    AgentsViewPreferencesNotifyPayload, BackendConfigSchemasPayload, BackendConfigSnapshotsPayload,
+    BackendSetupPayload, BrowseBootstrapPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
     CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
     CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
     CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
@@ -944,6 +944,10 @@ impl Connection {
                 }
                 FrameKind::BackendConfigSchemas => {
                     let _: BackendConfigSchemasPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::BackendConfigSnapshots => {
+                    let _: BackendConfigSnapshotsPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::SessionSchemas => {

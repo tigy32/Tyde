@@ -12,14 +12,21 @@
 
 use crate::error::MqttTransportError;
 
-/// Maximum QoS 1 publishes the Tyde driver will keep in flight on one MQTT
-/// connection. Keep this well below broker caps such as AWS IoT's 100
-/// in-flight publishes per connection, and below the 16 chunks produced by a
-/// 1 MiB write so a full-size burst always has to make observable ACK progress.
-pub(crate) const MAX_QOS1_INFLIGHT: usize = 15;
+/// Receiver-credit window for Tyde data counters. A peer may publish data
+/// counters below `peer_credit_next_expected + DATA_CREDIT_WINDOW`; broker
+/// PUBACKs never advance this credit.
+pub(crate) const DATA_CREDIT_WINDOW: usize = 16;
 
-/// MQTT peer-facing windows need headroom above Tyde's data window so broker
-/// control flow cannot couple a full data burst to handshake/control publishes.
+/// Maximum Tyde data publishes the driver will keep in broker flight before
+/// their PUBACK. Broker PUBACK frees this broker slot and completes the local
+/// write ack, but it is not Tyde receiver credit and must not let data outrun
+/// [`DATA_CREDIT_WINDOW`].
+pub(crate) const MAX_DATA_QOS1_INFLIGHT: usize = 16;
+
+/// MQTT peer-facing headroom for broker control flow. This is only MQTT
+/// packet-window capacity for handshake/control traffic and broker quota
+/// tolerance; receive-side reordering is tolerated within this bounded
+/// headroom, and gaps beyond it remain fatal.
 pub(crate) const MQTT_QOS1_WINDOW: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

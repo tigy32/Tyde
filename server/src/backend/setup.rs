@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use command_group::AsyncCommandGroup;
 use protocol::{
-    BackendKind, BackendSetupAction, BackendSetupCommand, BackendSetupInfo, BackendSetupPayload,
-    BackendSetupStatus, HostPlatform,
+    BackendKind, BackendSetupAction, BackendSetupCommand, BackendSetupDiagnostic,
+    BackendSetupDiagnosticCode, BackendSetupInfo, BackendSetupPayload, BackendSetupStatus,
+    HostPlatform,
 };
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -82,7 +83,8 @@ pub(crate) fn stub_backend_setup() -> BackendSetupPayload {
             installed_version: None,
             docs_url: docs_url(kind),
             install_command,
-            sign_in_command: sign_in_command(kind),
+            diagnostic: None,
+            sign_in_command: sign_in_command(kind, None),
         }
     })
     .collect();
@@ -144,7 +146,6 @@ fn tycode_probe_candidates_from_resolved_path(resolved_binary_path: Option<&str>
 async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetupInfo {
     let docs_url = docs_url(kind);
     let install_command = install_command(kind, platform);
-    let sign_in_command = sign_in_command(kind);
 
     let probe = match kind {
         BackendKind::Tycode => probe_tycode_candidates(&tycode_probe_candidates()).await,
@@ -152,20 +153,19 @@ async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetu
         BackendKind::Claude => probe_candidates(&command_candidates(CLAUDE_CLI_CANDIDATES)).await,
         BackendKind::Codex => probe_candidates(&command_candidates(CODEX_CLI_CANDIDATES)).await,
         BackendKind::Antigravity => probe_candidates(&antigravity_command_candidates()).await,
-        BackendKind::Hermes => probe_hermes_python().await,
+        BackendKind::Hermes => probe_hermes_gateway().await,
     };
 
-    if kind == BackendKind::Codex && probe.installed {
+    if kind == BackendKind::Codex && probe.status == BackendSetupStatus::Installed {
         discover_models().await;
     }
 
     let status = if install_command.is_none() {
         BackendSetupStatus::Unsupported
-    } else if probe.installed {
-        BackendSetupStatus::Installed
     } else {
-        BackendSetupStatus::NotInstalled
+        probe.status
     };
+    let sign_in_command = sign_in_command(kind, probe.hermes_executable.as_deref());
 
     BackendSetupInfo {
         backend_kind: kind,
@@ -173,13 +173,59 @@ async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetu
         installed_version: probe.version,
         docs_url,
         install_command,
+        diagnostic: probe.diagnostic,
         sign_in_command,
     }
 }
 
 struct ProbeResult {
-    installed: bool,
+    status: BackendSetupStatus,
     version: Option<String>,
+    diagnostic: Option<BackendSetupDiagnostic>,
+    hermes_executable: Option<String>,
+}
+
+impl ProbeResult {
+    fn installed(version: Option<String>) -> Self {
+        Self {
+            status: BackendSetupStatus::Installed,
+            version,
+            diagnostic: None,
+            hermes_executable: None,
+        }
+    }
+
+    fn not_installed() -> Self {
+        Self {
+            status: BackendSetupStatus::NotInstalled,
+            version: None,
+            diagnostic: None,
+            hermes_executable: None,
+        }
+    }
+
+    fn not_installed_with_diagnostic(diagnostic: BackendSetupDiagnostic) -> Self {
+        Self {
+            status: BackendSetupStatus::NotInstalled,
+            version: None,
+            diagnostic: Some(diagnostic),
+            hermes_executable: None,
+        }
+    }
+
+    fn unavailable(diagnostic: BackendSetupDiagnostic) -> Self {
+        Self {
+            status: BackendSetupStatus::Unavailable,
+            version: None,
+            diagnostic: Some(diagnostic),
+            hermes_executable: None,
+        }
+    }
+
+    fn with_hermes_executable(mut self, executable: String) -> Self {
+        self.hermes_executable = Some(executable);
+        self
+    }
 }
 
 async fn probe_tycode_candidates(candidates: &[String]) -> ProbeResult {
@@ -187,15 +233,9 @@ async fn probe_tycode_candidates(candidates: &[String]) -> ProbeResult {
         let Some(version) = probe_tycode_command(candidate).await else {
             continue;
         };
-        return ProbeResult {
-            installed: true,
-            version,
-        };
+        return ProbeResult::installed(version);
     }
-    ProbeResult {
-        installed: false,
-        version: None,
-    }
+    ProbeResult::not_installed()
 }
 
 async fn probe_candidates(candidates: &[String]) -> ProbeResult {
@@ -203,15 +243,9 @@ async fn probe_candidates(candidates: &[String]) -> ProbeResult {
         let Some(version) = probe_command(candidate).await else {
             continue;
         };
-        return ProbeResult {
-            installed: true,
-            version,
-        };
+        return ProbeResult::installed(version);
     }
-    ProbeResult {
-        installed: false,
-        version: None,
-    }
+    ProbeResult::not_installed()
 }
 
 async fn probe_tycode_command(command: &str) -> Option<Option<String>> {
@@ -275,12 +309,10 @@ async fn run_version_command(command: &str) -> Option<Option<(String, String)>> 
 
 fn hermes_python_candidates() -> Vec<String> {
     let mut candidates = Vec::new();
-    for key in ["HERMES_PYTHON", "PYTHON"] {
-        if let Ok(value) = std::env::var(key) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() && !candidates.contains(&trimmed.to_string()) {
-                candidates.push(trimmed.to_string());
-            }
+    if let Ok(value) = std::env::var("PYTHON") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !candidates.contains(&trimmed.to_string()) {
+            candidates.push(trimmed.to_string());
         }
     }
 
@@ -314,54 +346,86 @@ fn hermes_python_candidates() -> Vec<String> {
 }
 
 async fn probe_hermes_python() -> ProbeResult {
-    for candidate in hermes_python_candidates() {
-        let Some(version) = probe_hermes_python_command(&candidate).await else {
-            continue;
-        };
-        return ProbeResult {
-            installed: true,
-            version,
+    if let Some(candidate) = crate::backend::hermes::explicit_hermes_python() {
+        return match probe_hermes_python_command(&candidate).await {
+            Ok(version) => ProbeResult::installed(version),
+            Err(err) => ProbeResult::unavailable(hermes_failure_diagnostic(
+                err.explicit_override("HERMES_PYTHON"),
+            )),
         };
     }
-    ProbeResult {
-        installed: false,
-        version: None,
+
+    let mut first_failure = None;
+    for candidate in hermes_python_candidates() {
+        match probe_hermes_python_command(&candidate).await {
+            Ok(version) => return ProbeResult::installed(version),
+            Err(err) => {
+                first_failure.get_or_insert(err);
+            }
+        }
+    }
+    match first_failure {
+        Some(err) => ProbeResult::not_installed_with_diagnostic(hermes_failure_diagnostic(err)),
+        None => ProbeResult::not_installed(),
     }
 }
 
-async fn probe_hermes_python_command(command: &str) -> Option<Option<String>> {
-    let script = format!(
-        "import importlib.util; import sys; spec=importlib.util.find_spec({module:?}); sys.exit(0 if spec else 1)",
-        module = HERMES_PYTHON_MODULE
-    );
-    let mut command_proc = Command::new(command);
-    command_proc
-        .arg("-c")
-        .arg(script)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(path) = process_env::resolved_child_process_path() {
-        command_proc.env("PATH", path);
+async fn probe_hermes_gateway() -> ProbeResult {
+    if crate::backend::hermes::explicit_hermes_python().is_some() {
+        return probe_hermes_python().await;
     }
-    let mut child = command_proc.group_spawn().ok()?;
-    let mut stdout_pipe = child.inner().stdout.take()?;
-    let mut stderr_pipe = child.inner().stderr.take()?;
-    let status = match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(_)) => return None,
-        Err(_) => {
-            let _ = child.kill().await;
-            return None;
+
+    if let Some(candidate) = crate::backend::hermes::explicit_hermes_executable() {
+        return match crate::backend::hermes::probe_hermes_cli_gateway(&candidate).await {
+            Ok(probe) => {
+                ProbeResult::installed(probe.version).with_hermes_executable(probe.executable)
+            }
+            Err(err) => ProbeResult::unavailable(hermes_failure_diagnostic(
+                err.explicit_override("HERMES_EXECUTABLE"),
+            )),
+        };
+    }
+
+    let mut first_failure = None;
+    for candidate in crate::backend::hermes::hermes_executable_candidates() {
+        match crate::backend::hermes::probe_hermes_cli_gateway(&candidate).await {
+            Ok(probe) => {
+                return ProbeResult::installed(probe.version)
+                    .with_hermes_executable(probe.executable);
+            }
+            Err(err) => {
+                tracing::debug!("Hermes executable candidate {candidate} probe failed: {err}");
+                if err.code != BackendSetupDiagnosticCode::CommandNotFound || candidate != "hermes"
+                {
+                    first_failure.get_or_insert(err);
+                }
+            }
         }
-    };
-    let mut stdout_bytes = Vec::new();
-    let _ = stdout_pipe.read_to_end(&mut stdout_bytes).await;
-    let mut stderr_bytes = Vec::new();
-    let _ = stderr_pipe.read_to_end(&mut stderr_bytes).await;
-    if !status.success() {
-        return None;
     }
-    Some(Some(format!("{command} -m {HERMES_PYTHON_MODULE}")))
+
+    let mut python_probe = probe_hermes_python().await;
+    if python_probe.status == BackendSetupStatus::NotInstalled && python_probe.diagnostic.is_none()
+    {
+        python_probe.diagnostic = first_failure.map(hermes_failure_diagnostic);
+    }
+    python_probe
+}
+
+async fn probe_hermes_python_command(
+    command: &str,
+) -> Result<Option<String>, crate::backend::hermes::HermesProbeFailure> {
+    crate::backend::hermes::probe_hermes_python_gateway_import(command)
+        .await
+        .map(|()| Some(format!("{command} -m {HERMES_PYTHON_MODULE}")))
+}
+
+fn hermes_failure_diagnostic(
+    failure: crate::backend::hermes::HermesProbeFailure,
+) -> BackendSetupDiagnostic {
+    BackendSetupDiagnostic {
+        code: failure.code,
+        message: failure.message,
+    }
 }
 
 fn antigravity_command_candidates() -> Vec<String> {
@@ -522,7 +586,7 @@ fn install_command(kind: BackendKind, platform: HostPlatform) -> Option<BackendS
         }),
         BackendKind::Hermes => Some(BackendSetupCommand {
             title: "Install Hermes".to_string(),
-            description: "Install Hermes Agent, then set HERMES_PYTHON if tui_gateway.entry is not importable from python3.".to_string(),
+            description: "Install Hermes Agent so the hermes executable is on PATH. Set HERMES_EXECUTABLE only if Tyde cannot resolve it.".to_string(),
             command: "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash".to_string(),
             display_command: None,
             runnable: true,
@@ -530,7 +594,10 @@ fn install_command(kind: BackendKind, platform: HostPlatform) -> Option<BackendS
     }
 }
 
-fn sign_in_command(kind: BackendKind) -> Option<BackendSetupCommand> {
+fn sign_in_command(
+    kind: BackendKind,
+    hermes_executable: Option<&str>,
+) -> Option<BackendSetupCommand> {
     match kind {
         BackendKind::Tycode => None,
         BackendKind::Kiro => Some(BackendSetupCommand {
@@ -562,14 +629,21 @@ fn sign_in_command(kind: BackendKind) -> Option<BackendSetupCommand> {
             display_command: None,
             runnable: true,
         }),
-        BackendKind::Hermes => Some(BackendSetupCommand {
-            title: "Sign In".to_string(),
-            description: "Run the Hermes setup wizard for provider authentication.".to_string(),
-            command: "hermes setup".to_string(),
-            display_command: None,
-            runnable: true,
-        }),
+        BackendKind::Hermes => {
+            let executable = hermes_executable?;
+            Some(BackendSetupCommand {
+                title: "Sign In".to_string(),
+                description: "Run the Hermes setup wizard for provider authentication.".to_string(),
+                command: format!("{} setup", shell_quote(executable)),
+                display_command: Some(format!("{executable} setup")),
+                runnable: true,
+            })
+        }
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn tycode_install_command(platform: HostPlatform) -> Option<BackendSetupCommand> {
@@ -712,6 +786,76 @@ fn _tycode_release_asset_url(asset_name: &str) -> String {
 mod tests {
     use super::*;
 
+    struct EnvGuard {
+        key: &'static str,
+        old_value: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old_value = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old_value }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let old_value = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.old_value.take() {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        std::fs::write(path, body).expect("write executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(path)
+                .expect("stat executable")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).expect("chmod executable");
+        }
+    }
+
+    fn write_fake_hermes_cli_install(dir: &Path) -> String {
+        let project = dir.join("hermes-agent");
+        let python = project.join("venv").join("bin").join("python");
+        std::fs::create_dir_all(python.parent().expect("fake Hermes venv parent"))
+            .expect("create fake Hermes venv");
+        write_executable(
+            &python,
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then exit 0; fi\nexit 1\n",
+        );
+        let hermes = dir.join("hermes");
+        write_executable(
+            &hermes,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'Hermes Agent v9.9.9\\nProject: {}\\n'\n  exit 0\nfi\nexit 1\n",
+                project.to_string_lossy()
+            ),
+        );
+        hermes.to_string_lossy().to_string()
+    }
+
     #[test]
     fn tycode_version_parser_ignores_task_update_frames() {
         let parsed =
@@ -730,7 +874,18 @@ mod tests {
 
     #[test]
     fn tycode_never_exposes_a_sign_in_command() {
-        assert!(sign_in_command(BackendKind::Tycode).is_none());
+        assert!(sign_in_command(BackendKind::Tycode, None).is_none());
+    }
+
+    #[test]
+    fn hermes_sign_in_uses_resolved_executable_path() {
+        let command = sign_in_command(BackendKind::Hermes, Some("/tmp/hermes path/hermes"))
+            .expect("Hermes sign-in command");
+        assert_eq!(command.command, "'/tmp/hermes path/hermes' setup");
+        assert_eq!(
+            command.display_command.as_deref(),
+            Some("/tmp/hermes path/hermes setup")
+        );
     }
 
     #[test]
@@ -761,8 +916,118 @@ mod tests {
         assert!(
             probe_hermes_python_command(&command.to_string_lossy())
                 .await
-                .is_none(),
+                .is_err(),
             "failed Hermes import probes must not be treated as installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_explicit_executable_failure_is_unavailable_without_fallback() {
+        let _lock = crate::backend::hermes::TEST_HERMES_OVERRIDE_LOCK
+            .lock()
+            .await;
+        let _python = EnvGuard::unset("HERMES_PYTHON");
+        let _executable = EnvGuard::set("HERMES_EXECUTABLE", "/definitely/not/hermes");
+
+        let result = probe_hermes_gateway().await;
+
+        assert_eq!(result.status, BackendSetupStatus::Unavailable);
+        let diagnostic = result.diagnostic.expect("diagnostic");
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandNotFound);
+        assert!(
+            diagnostic.message.contains("HERMES_EXECUTABLE"),
+            "diagnostic should name explicit override: {}",
+            diagnostic.message
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_missing_project_root_is_typed_diagnostic() {
+        let _lock = crate::backend::hermes::TEST_HERMES_OVERRIDE_LOCK
+            .lock()
+            .await;
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hermes = dir.path().join("hermes");
+        write_executable(
+            &hermes,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'Hermes Agent v9.9.9\\n'; exit 0; fi\nexit 1\n",
+        );
+        let _python = EnvGuard::unset("HERMES_PYTHON");
+        let _executable = EnvGuard::set("HERMES_EXECUTABLE", &hermes.to_string_lossy());
+
+        let result = probe_hermes_gateway().await;
+
+        assert_eq!(result.status, BackendSetupStatus::Unavailable);
+        let diagnostic = result.diagnostic.expect("diagnostic");
+        assert_eq!(
+            diagnostic.code,
+            BackendSetupDiagnosticCode::MissingProjectRoot
+        );
+        assert!(
+            diagnostic.message.contains("Project:"),
+            "diagnostic should describe missing Project line: {}",
+            diagnostic.message
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_missing_gateway_python_is_typed_diagnostic() {
+        let _lock = crate::backend::hermes::TEST_HERMES_OVERRIDE_LOCK
+            .lock()
+            .await;
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project = dir.path().join("hermes-agent");
+        std::fs::create_dir_all(&project).expect("create project without venv");
+        let hermes = dir.path().join("hermes");
+        write_executable(
+            &hermes,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'Hermes Agent v9.9.9\\nProject: {}\\n'; exit 0; fi\nexit 1\n",
+                project.to_string_lossy()
+            ),
+        );
+        let _python = EnvGuard::unset("HERMES_PYTHON");
+        let _executable = EnvGuard::set("HERMES_EXECUTABLE", &hermes.to_string_lossy());
+
+        let result = probe_hermes_gateway().await;
+
+        assert_eq!(result.status, BackendSetupStatus::Unavailable);
+        let diagnostic = result.diagnostic.expect("diagnostic");
+        assert_eq!(
+            diagnostic.code,
+            BackendSetupDiagnosticCode::MissingGatewayPython
+        );
+        assert!(
+            diagnostic.message.contains("venv"),
+            "diagnostic should mention missing Hermes venv Python: {}",
+            diagnostic.message
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_python_override_failure_is_authoritative() {
+        let _lock = crate::backend::hermes::TEST_HERMES_OVERRIDE_LOCK
+            .lock()
+            .await;
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let fake_python = dir.path().join("python");
+        write_executable(&fake_python, "#!/bin/sh\nexit 1\n");
+        let valid_hermes = write_fake_hermes_cli_install(dir.path());
+        let _python = EnvGuard::set("HERMES_PYTHON", &fake_python.to_string_lossy());
+        let _executable = EnvGuard::set("HERMES_EXECUTABLE", &valid_hermes);
+
+        let result = probe_hermes_gateway().await;
+
+        assert_eq!(result.status, BackendSetupStatus::Unavailable);
+        let diagnostic = result.diagnostic.expect("diagnostic");
+        assert_eq!(
+            diagnostic.code,
+            BackendSetupDiagnosticCode::GatewayImportFailed
+        );
+        assert!(
+            diagnostic.message.contains("HERMES_PYTHON"),
+            "diagnostic should name explicit Python override: {}",
+            diagnostic.message
         );
     }
 
@@ -785,7 +1050,7 @@ mod tests {
         assert!(
             probe_hermes_python_command(&command.to_string_lossy())
                 .await
-                .is_none(),
+                .is_err(),
             "timed-out Hermes import probes must not be treated as installed"
         );
     }

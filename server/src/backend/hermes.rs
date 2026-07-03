@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -6,15 +7,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
     AgentInput, BackendConfigField, BackendConfigFieldType, BackendConfigSchema,
-    BackendConfigValues, BackendKind, ChatEvent, ChatMessage, MessageSender, ModelInfo,
-    OperationCancelledData, SelectOption, SendMessageToolResponse, SessionId, SessionSettingField,
-    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
-    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData,
+    BackendConfigValues, BackendKind, BackendSetupDiagnosticCode, ChatEvent, ChatMessage,
+    MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData, SelectOption,
+    SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
+    StreamStartData, StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData,
     ToolExecutionResult, ToolProgressData, ToolProgressUpdate, ToolRequest, ToolRequestType,
     ToolUseData,
 };
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -29,6 +31,8 @@ use crate::process_env;
 
 const HERMES_AGENT_NAME: &str = "hermes";
 const HERMES_PYTHON_MODULE: &str = "tui_gateway.entry";
+const HERMES_EXECUTABLE_ENV: &str = "HERMES_EXECUTABLE";
+const HERMES_CLI_BINARY: &str = "hermes";
 const HERMES_STARTUP_TIMEOUT_ENV: &str = "HERMES_TUI_STARTUP_TIMEOUT_MS";
 const HERMES_RPC_TIMEOUT_ENV: &str = "HERMES_TUI_RPC_TIMEOUT_MS";
 const HERMES_REMOTE_PYTHON_ENV: &str = "TYDE_REMOTE_HERMES_PYTHON";
@@ -39,6 +43,11 @@ const HERMES_MODEL_PROVIDER_FLAG: &str = " --provider ";
 
 #[cfg(test)]
 static TEST_HERMES_PYTHON: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_HERMES_EXECUTABLE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(crate) static TEST_HERMES_OVERRIDE_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
 pub struct HermesBackend {
@@ -91,6 +100,43 @@ struct HermesSpawnTarget {
     cwd: Option<String>,
     remote_host: Option<String>,
     display_program: String,
+}
+
+pub(crate) struct HermesCliGatewayProbe {
+    pub(crate) executable: String,
+    pub(crate) gateway_python: String,
+    pub(crate) version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HermesProbeFailure {
+    pub(crate) code: BackendSetupDiagnosticCode,
+    pub(crate) message: String,
+}
+
+impl HermesProbeFailure {
+    fn new(code: BackendSetupDiagnosticCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn explicit_override(mut self, variable: &str) -> Self {
+        self.message = format!("{variable} override is invalid: {}", self.message);
+        self
+    }
+}
+
+impl std::fmt::Display for HermesProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+struct HermesVersionOutput {
+    stdout: String,
+    stderr: String,
 }
 
 struct HermesSessionIds {
@@ -405,6 +451,36 @@ pub(crate) async fn probe_session_settings_schema(
     let options = gateway.request("model.options", json!({})).await;
     gateway.shutdown().await;
     session_settings_schema_from_model_options(&options?)
+}
+
+pub(crate) async fn probe_backend_config_snapshot(
+    workspace_roots: &[String],
+) -> Result<BackendConfigValues, String> {
+    let (gateway, _events) = HermesGatewayHandle::spawn(workspace_roots).await?;
+    let options = gateway.request("model.options", json!({})).await;
+    gateway.shutdown().await;
+    hermes_backend_config_snapshot_from_model_options(&options?)
+}
+
+fn hermes_backend_config_snapshot_from_model_options(
+    value: &Value,
+) -> Result<BackendConfigValues, String> {
+    let mut values = BackendConfigValues::default();
+    if let Some(model) = optional_present_non_empty_string(value, &["model"], "model.options")? {
+        values.0.insert(
+            "default_model".to_string(),
+            SessionSettingValue::String(model),
+        );
+    }
+    if let Some(provider) =
+        optional_present_non_empty_string(value, &["provider"], "model.options")?
+    {
+        values.0.insert(
+            "default_provider".to_string(),
+            SessionSettingValue::String(provider),
+        );
+    }
+    Ok(values)
 }
 
 impl HermesSessionActor {
@@ -805,7 +881,7 @@ impl HermesGatewayHandle {
     async fn spawn(
         workspace_roots: &[String],
     ) -> Result<(Self, mpsc::UnboundedReceiver<HermesGatewayEvent>), String> {
-        let target = resolve_gateway_spawn_target(workspace_roots)?;
+        let target = resolve_gateway_spawn_target(workspace_roots).await?;
         let startup_timeout =
             duration_from_env_ms(HERMES_STARTUP_TIMEOUT_ENV, HERMES_STARTUP_TIMEOUT);
         let request_timeout = duration_from_env_ms(HERMES_RPC_TIMEOUT_ENV, HERMES_REQUEST_TIMEOUT);
@@ -1566,8 +1642,9 @@ impl HermesEventMapper {
                 reasoning,
                 tool_calls: self.tool_uses_for_message(),
                 model_info: self.model.clone().map(|model| ModelInfo { model }),
-                token_usage: usage,
-                turn_token_usage: None,
+                token_usage: usage
+                    .clone()
+                    .map(|usage| MessageTokenUsage::request_and_turn_known(usage.clone(), usage)),
                 context_breakdown: None,
                 images: None,
             },
@@ -1970,7 +2047,6 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
             tool_calls: Vec::new(),
             model_info: None,
             token_usage: None,
-            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         }));
@@ -1978,10 +2054,12 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
     Ok(events)
 }
 
-fn resolve_gateway_spawn_target(workspace_roots: &[String]) -> Result<HermesSpawnTarget, String> {
+async fn resolve_gateway_spawn_target(
+    workspace_roots: &[String],
+) -> Result<HermesSpawnTarget, String> {
     let remote_roots = crate::remote::parse_remote_workspace_roots(workspace_roots)?;
-    let args = vec!["-m".to_string(), HERMES_PYTHON_MODULE.to_string()];
     if let Some((host, roots)) = remote_roots {
+        let args = vec!["-m".to_string(), HERMES_PYTHON_MODULE.to_string()];
         let program = std::env::var(HERMES_REMOTE_PYTHON_ENV)
             .ok()
             .map(|value| value.trim().to_string())
@@ -1997,17 +2075,302 @@ fn resolve_gateway_spawn_target(workspace_roots: &[String]) -> Result<HermesSpaw
         });
     }
 
-    let program = resolve_hermes_python()?;
+    if test_hermes_python_override_is_set() {
+        return hermes_python_spawn_target(resolve_hermes_python_test_override()?, workspace_roots);
+    }
+
+    if let Some(program) = explicit_hermes_python() {
+        probe_hermes_python_gateway_import(&program)
+            .await
+            .map_err(|err| err.explicit_override("HERMES_PYTHON").message)?;
+        return hermes_python_spawn_target(program, workspace_roots);
+    }
+
+    if let Some(target) = resolve_hermes_cli_gateway_spawn_target(workspace_roots).await? {
+        return Ok(target);
+    }
+
+    let program = resolve_hermes_python_dev_fallback().await?;
+    hermes_python_spawn_target(program, workspace_roots)
+}
+
+fn hermes_python_spawn_target(
+    program: String,
+    workspace_roots: &[String],
+) -> Result<HermesSpawnTarget, String> {
     Ok(HermesSpawnTarget {
         display_program: format!("{program} -m {HERMES_PYTHON_MODULE}"),
         program,
-        args,
+        args: vec!["-m".to_string(), HERMES_PYTHON_MODULE.to_string()],
         cwd: Some(session_cwd(workspace_roots)?),
         remote_host: None,
     })
 }
 
-fn resolve_hermes_python() -> Result<String, String> {
+async fn resolve_hermes_cli_gateway_spawn_target(
+    workspace_roots: &[String],
+) -> Result<Option<HermesSpawnTarget>, String> {
+    let candidates = hermes_executable_candidates();
+    let explicit = explicit_hermes_executable().is_some();
+    for (index, candidate) in candidates.iter().enumerate() {
+        match probe_hermes_cli_gateway(candidate).await {
+            Ok(probe) => {
+                let display_program = format!(
+                    "{} via {} -m {}",
+                    probe.executable, probe.gateway_python, HERMES_PYTHON_MODULE
+                );
+                return Ok(Some(HermesSpawnTarget {
+                    program: probe.gateway_python,
+                    args: vec!["-m".to_string(), HERMES_PYTHON_MODULE.to_string()],
+                    cwd: Some(session_cwd(workspace_roots)?),
+                    remote_host: None,
+                    display_program,
+                }));
+            }
+            Err(err) if explicit && index == 0 => {
+                return Err(err.explicit_override("HERMES_EXECUTABLE").message);
+            }
+            Err(err) => {
+                tracing::debug!("Hermes executable candidate {candidate} probe failed: {err}");
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn test_hermes_python_override_is_set() -> bool {
+    #[cfg(test)]
+    {
+        TEST_HERMES_PYTHON
+            .lock()
+            .expect("test Hermes Python mutex poisoned")
+            .is_some()
+    }
+
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+pub(crate) fn hermes_executable_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    if let Some(explicit) = explicit_hermes_executable() {
+        candidates.push(explicit);
+    }
+
+    if let Some(path) = process_env::find_executable_in_path(HERMES_CLI_BINARY) {
+        push_unique_candidate(&mut candidates, path.to_string_lossy().to_string());
+    }
+
+    push_unique_candidate(&mut candidates, HERMES_CLI_BINARY.to_string());
+    candidates
+}
+
+pub(crate) fn explicit_hermes_executable() -> Option<String> {
+    #[cfg(test)]
+    if let Some(value) = TEST_HERMES_EXECUTABLE
+        .lock()
+        .expect("test Hermes executable mutex poisoned")
+        .clone()
+    {
+        return Some(value);
+    }
+
+    std::env::var(HERMES_EXECUTABLE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn explicit_hermes_python() -> Option<String> {
+    std::env::var("HERMES_PYTHON")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn push_unique_candidate(candidates: &mut Vec<String>, candidate: String) {
+    if !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
+}
+
+pub(crate) async fn probe_hermes_cli_gateway(
+    command: &str,
+) -> Result<HermesCliGatewayProbe, HermesProbeFailure> {
+    let output = run_hermes_version_command(command).await?;
+    let Some(project_root) = parse_hermes_project_root(&output.stdout, &output.stderr) else {
+        return Err(HermesProbeFailure::new(
+            BackendSetupDiagnosticCode::MissingProjectRoot,
+            format!("Hermes executable {command} --version did not report a Project: root"),
+        ));
+    };
+    let Some(gateway_python) = hermes_project_python(&project_root) else {
+        return Err(HermesProbeFailure::new(
+            BackendSetupDiagnosticCode::MissingGatewayPython,
+            format!(
+                "Hermes project {} does not contain venv/bin/python or .venv/bin/python",
+                project_root.display()
+            ),
+        ));
+    };
+    probe_hermes_python_gateway_import(&gateway_python).await?;
+    Ok(HermesCliGatewayProbe {
+        executable: command.to_string(),
+        gateway_python,
+        version: parse_hermes_version_output(&output.stdout, &output.stderr),
+    })
+}
+
+async fn run_hermes_version_command(
+    command: &str,
+) -> Result<HermesVersionOutput, HermesProbeFailure> {
+    let mut command_proc = Command::new(command);
+    command_proc
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(path) = process_env::resolved_child_process_path() {
+        command_proc.env("PATH", path);
+    }
+    let mut child = match command_proc.group_spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let code = if err.kind() == io::ErrorKind::NotFound {
+                BackendSetupDiagnosticCode::CommandNotFound
+            } else {
+                BackendSetupDiagnosticCode::CommandFailed
+            };
+            return Err(HermesProbeFailure::new(
+                code,
+                format!("Failed to run Hermes executable {command} --version: {err}"),
+            ));
+        }
+    };
+    let mut stdout_pipe = child.inner().stdout.take().ok_or_else(|| {
+        HermesProbeFailure::new(
+            BackendSetupDiagnosticCode::CommandFailed,
+            format!("Failed to capture Hermes {command} --version stdout"),
+        )
+    })?;
+    let mut stderr_pipe = child.inner().stderr.take().ok_or_else(|| {
+        HermesProbeFailure::new(
+            BackendSetupDiagnosticCode::CommandFailed,
+            format!("Failed to capture Hermes {command} --version stderr"),
+        )
+    })?;
+    let status = match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(err)) => {
+            return Err(HermesProbeFailure::new(
+                BackendSetupDiagnosticCode::CommandFailed,
+                format!("Failed to wait for Hermes {command} --version: {err}"),
+            ));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(HermesProbeFailure::new(
+                BackendSetupDiagnosticCode::CommandTimedOut,
+                format!("Timed out probing Hermes executable {command} --version"),
+            ));
+        }
+    };
+
+    let mut stdout_bytes = Vec::new();
+    stdout_pipe
+        .read_to_end(&mut stdout_bytes)
+        .await
+        .map_err(|err| {
+            HermesProbeFailure::new(
+                BackendSetupDiagnosticCode::CommandFailed,
+                format!("Failed to read Hermes {command} --version stdout: {err}"),
+            )
+        })?;
+    let mut stderr_bytes = Vec::new();
+    stderr_pipe
+        .read_to_end(&mut stderr_bytes)
+        .await
+        .map_err(|err| {
+            HermesProbeFailure::new(
+                BackendSetupDiagnosticCode::CommandFailed,
+                format!("Failed to read Hermes {command} --version stderr: {err}"),
+            )
+        })?;
+    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+
+    if !status.success() {
+        return Err(HermesProbeFailure::new(
+            BackendSetupDiagnosticCode::CommandFailed,
+            format!(
+                "Hermes executable {command} --version exited with status {status}: {}",
+                output_preview(&stdout, &stderr)
+            ),
+        ));
+    }
+
+    Ok(HermesVersionOutput { stdout, stderr })
+}
+
+fn parse_hermes_version_output(stdout: &str, stderr: &str) -> Option<String> {
+    stdout
+        .lines()
+        .chain(stderr.lines())
+        .map(str::trim)
+        .find(|line| line.starts_with("Hermes Agent") || line.starts_with("hermes "))
+        .map(str::to_string)
+}
+
+fn output_preview(stdout: &str, stderr: &str) -> String {
+    let combined = stdout
+        .lines()
+        .chain(stderr.lines())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if combined.is_empty() {
+        "no output".to_string()
+    } else {
+        combined.chars().take(500).collect()
+    }
+}
+
+fn parse_hermes_project_root(stdout: &str, stderr: &str) -> Option<PathBuf> {
+    stdout
+        .lines()
+        .chain(stderr.lines())
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("Project:").map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn hermes_project_python(project_root: &Path) -> Option<String> {
+    #[cfg(windows)]
+    let candidates = [
+        project_root.join("venv").join("Scripts").join("python.exe"),
+        project_root
+            .join(".venv")
+            .join("Scripts")
+            .join("python.exe"),
+    ];
+
+    #[cfg(not(windows))]
+    let candidates = [
+        project_root.join("venv").join("bin").join("python"),
+        project_root.join(".venv").join("bin").join("python"),
+    ];
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+fn resolve_hermes_python_test_override() -> Result<String, String> {
     #[cfg(test)]
     if let Some(value) = TEST_HERMES_PYTHON
         .lock()
@@ -2017,30 +2380,128 @@ fn resolve_hermes_python() -> Result<String, String> {
         return Ok(value);
     }
 
-    for key in ["HERMES_PYTHON", "PYTHON"] {
-        if let Ok(value) = std::env::var(key) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Ok(trimmed.to_string());
-            }
+    Err("test Hermes Python override is not set".to_string())
+}
+
+fn hermes_python_dev_fallback_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Ok(value) = std::env::var("PYTHON") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            candidates.push(trimmed.to_string());
         }
     }
     if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
         let path = Path::new(&venv).join("bin").join("python");
         if path.is_file() {
-            return Ok(path.to_string_lossy().to_string());
+            push_unique_candidate(&mut candidates, path.to_string_lossy().to_string());
         }
     }
     for dir in [".venv", "venv"] {
         let path = PathBuf::from(dir).join("bin").join("python");
         if path.is_file() {
-            return Ok(path.to_string_lossy().to_string());
+            push_unique_candidate(&mut candidates, path.to_string_lossy().to_string());
         }
     }
-    process_env::find_executable_in_path("python3")
-        .or_else(|| process_env::find_executable_in_path("python"))
-        .map(|path| path.to_string_lossy().to_string())
-        .ok_or_else(|| "Hermes Python not found; set HERMES_PYTHON to the interpreter that can import tui_gateway.entry".to_string())
+    for binary in ["python3", "python"] {
+        if let Some(path) = process_env::find_executable_in_path(binary) {
+            push_unique_candidate(&mut candidates, path.to_string_lossy().to_string());
+        }
+        push_unique_candidate(&mut candidates, binary.to_string());
+    }
+    candidates
+}
+
+async fn resolve_hermes_python_dev_fallback() -> Result<String, String> {
+    let mut last_error = None;
+    for candidate in hermes_python_dev_fallback_candidates() {
+        match probe_hermes_python_gateway_import(&candidate).await {
+            Ok(()) => return Ok(candidate),
+            Err(err) => last_error = Some(err.message),
+        }
+    }
+    Err(match last_error {
+        Some(err) => format!(
+            "Hermes Python dev fallback could not import {HERMES_PYTHON_MODULE}: {err}; set HERMES_PYTHON to the interpreter that can import {HERMES_PYTHON_MODULE}"
+        ),
+        None => format!(
+            "Hermes Python not found; set HERMES_PYTHON to the interpreter that can import {HERMES_PYTHON_MODULE}"
+        ),
+    })
+}
+
+pub(crate) async fn probe_hermes_python_gateway_import(
+    command: &str,
+) -> Result<(), HermesProbeFailure> {
+    let script = format!(
+        "import importlib.util; import sys; spec=importlib.util.find_spec({module:?}); sys.exit(0 if spec else 1)",
+        module = HERMES_PYTHON_MODULE
+    );
+    let mut command_proc = Command::new(command);
+    command_proc
+        .arg("-c")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(path) = process_env::resolved_child_process_path() {
+        command_proc.env("PATH", path);
+    }
+    let mut child = command_proc.group_spawn().map_err(|err| {
+        let code = if err.kind() == io::ErrorKind::NotFound {
+            BackendSetupDiagnosticCode::CommandNotFound
+        } else {
+            BackendSetupDiagnosticCode::CommandFailed
+        };
+        HermesProbeFailure::new(
+            code,
+            format!("Failed to run Hermes gateway import probe with {command}: {err}"),
+        )
+    })?;
+    let mut stdout_pipe = child.inner().stdout.take().ok_or_else(|| {
+        HermesProbeFailure::new(
+            BackendSetupDiagnosticCode::CommandFailed,
+            format!("Failed to capture Hermes gateway import probe stdout from {command}"),
+        )
+    })?;
+    let mut stderr_pipe = child.inner().stderr.take().ok_or_else(|| {
+        HermesProbeFailure::new(
+            BackendSetupDiagnosticCode::CommandFailed,
+            format!("Failed to capture Hermes gateway import probe stderr from {command}"),
+        )
+    })?;
+    let status = match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(err)) => {
+            return Err(HermesProbeFailure::new(
+                BackendSetupDiagnosticCode::CommandFailed,
+                format!("Failed to wait for Hermes gateway import probe with {command}: {err}"),
+            ));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(HermesProbeFailure::new(
+                BackendSetupDiagnosticCode::CommandTimedOut,
+                format!("Timed out probing {command} for {HERMES_PYTHON_MODULE}"),
+            ));
+        }
+    };
+    let mut stdout_bytes = Vec::new();
+    let _ = stdout_pipe.read_to_end(&mut stdout_bytes).await;
+    let mut stderr_bytes = Vec::new();
+    let _ = stderr_pipe.read_to_end(&mut stderr_bytes).await;
+    if status.success() {
+        Ok(())
+    } else {
+        let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+        let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        Err(HermesProbeFailure::new(
+            BackendSetupDiagnosticCode::GatewayImportFailed,
+            format!(
+                "Python {command} cannot import {HERMES_PYTHON_MODULE}: {}",
+                output_preview(&stdout, &stderr)
+            ),
+        ))
+    }
 }
 
 fn session_cwd(workspace_roots: &[String]) -> Result<String, String> {
@@ -2234,7 +2695,6 @@ fn user_message(content: &str) -> ChatMessage {
         tool_calls: Vec::new(),
         model_info: None,
         token_usage: None,
-        turn_token_usage: None,
         context_breakdown: None,
         images: None,
     }
@@ -2250,7 +2710,6 @@ fn system_message(content: impl Into<String>) -> ChatMessage {
         tool_calls: Vec::new(),
         model_info: None,
         token_usage: None,
-        turn_token_usage: None,
         context_breakdown: None,
         images: None,
     }
@@ -2266,7 +2725,6 @@ fn warning_message(content: impl Into<String>) -> ChatMessage {
         tool_calls: Vec::new(),
         model_info: None,
         token_usage: None,
-        turn_token_usage: None,
         context_breakdown: None,
         images: None,
     }
@@ -2282,7 +2740,6 @@ fn error_message(content: impl Into<String>) -> ChatMessage {
         tool_calls: Vec::new(),
         model_info: None,
         token_usage: None,
-        turn_token_usage: None,
         context_breakdown: None,
         images: None,
     }
@@ -2320,10 +2777,40 @@ mod tests {
     use tempfile::TempDir;
     use tokio::time::timeout;
 
-    static TEST_HERMES_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     struct TestHermesPythonGuard {
         old: Option<String>,
+    }
+
+    struct TestHermesExecutableGuard {
+        old: Option<String>,
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old_value: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn unset(key: &'static str) -> Self {
+            let old_value = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.old_value.take() {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
     }
 
     impl TestHermesPythonGuard {
@@ -2341,6 +2828,24 @@ mod tests {
             *TEST_HERMES_PYTHON
                 .lock()
                 .expect("test Hermes Python mutex poisoned") = self.old.take();
+        }
+    }
+
+    impl TestHermesExecutableGuard {
+        fn set(value: &str) -> Self {
+            let mut guard = TEST_HERMES_EXECUTABLE
+                .lock()
+                .expect("test Hermes executable mutex poisoned");
+            let old = guard.replace(value.to_string());
+            Self { old }
+        }
+    }
+
+    impl Drop for TestHermesExecutableGuard {
+        fn drop(&mut self) {
+            *TEST_HERMES_EXECUTABLE
+                .lock()
+                .expect("test Hermes executable mutex poisoned") = self.old.take();
         }
     }
 
@@ -2374,9 +2879,69 @@ mod tests {
         launcher.to_string_lossy().to_string()
     }
 
+    fn write_fake_hermes_cli_install(dir: &TempDir) -> (String, String) {
+        let project = dir.path().join("hermes-agent");
+        let python = project.join("venv").join("bin").join("python");
+        fs::create_dir_all(python.parent().expect("fake Hermes venv parent"))
+            .expect("create fake Hermes venv");
+        fs::write(
+            &python,
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then exit 0; fi\nexit 1\n",
+        )
+        .expect("write fake Hermes venv python");
+        let hermes = dir.path().join("hermes");
+        fs::write(
+            &hermes,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'Hermes Agent v9.9.9\\nProject: {}\\n'\n  exit 0\nfi\nexit 1\n",
+                project.to_string_lossy()
+            ),
+        )
+        .expect("write fake Hermes executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&python, &hermes] {
+                let mut perms = fs::metadata(path)
+                    .expect("fake Hermes metadata")
+                    .permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(path, perms).expect("chmod fake Hermes executable");
+            }
+        }
+        (
+            hermes.to_string_lossy().to_string(),
+            python.to_string_lossy().to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn hermes_spawn_target_prefers_verified_cli_install() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let (hermes, python) = write_fake_hermes_cli_install(&dir);
+        let _hermes_guard = TestHermesExecutableGuard::set(&hermes);
+        let _python_env = EnvGuard::unset("HERMES_PYTHON");
+
+        let target = resolve_gateway_spawn_target(&[dir.path().to_string_lossy().to_string()])
+            .await
+            .expect("resolve Hermes spawn target");
+
+        assert_eq!(target.program, python);
+        assert_eq!(
+            target.args,
+            vec!["-m".to_string(), HERMES_PYTHON_MODULE.to_string()]
+        );
+        assert!(
+            target.display_program.contains(&hermes),
+            "display should mention resolved Hermes executable: {}",
+            target.display_program
+        );
+    }
+
     #[tokio::test]
     async fn hermes_backend_maps_basic_turn() {
-        let _test_lock = TEST_HERMES_LOCK.lock().await;
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
         let dir = TempDir::new().expect("tempdir");
         let fake = write_fake_gateway(
             &dir,
@@ -2451,7 +3016,16 @@ for line in sys.stdin:
                 ChatEvent::StreamEnd(end) => {
                     assert_eq!(end.message.content, "hello");
                     assert!(end.message.reasoning.is_none());
-                    assert_eq!(end.message.token_usage.expect("usage").total_tokens, 3);
+                    assert_eq!(
+                        end.message
+                            .token_usage
+                            .expect("usage")
+                            .turn
+                            .known_usage()
+                            .expect("turn usage")
+                            .total_tokens,
+                        3
+                    );
                     saw_end = true;
                 }
                 _ => {}
@@ -2501,7 +3075,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn hermes_probe_session_settings_schema_uses_model_options() {
-        let _test_lock = TEST_HERMES_LOCK.lock().await;
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
         let dir = TempDir::new().expect("tempdir");
         let fake = write_fake_gateway(
             &dir,
@@ -2540,8 +3114,49 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn hermes_backend_config_snapshot_uses_model_options() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let fake = write_fake_gateway(
+            &dir,
+            r#"
+import json, sys
+print(json.dumps({"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready","payload":{"skin":"default"}}}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    rid = req["id"]
+    method = req["method"]
+    if method == "model.options":
+        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{
+            "provider":"openrouter",
+            "model":"anthropic/claude-haiku-4.5",
+            "providers":[]
+        }}), flush=True)
+    else:
+        print(json.dumps({"jsonrpc":"2.0","id":rid,"result":{}}), flush=True)
+"#,
+        );
+        let _guard = TestHermesPythonGuard::set(&fake);
+
+        let values = probe_backend_config_snapshot(&[dir.path().to_string_lossy().to_string()])
+            .await
+            .expect("backend config snapshot");
+
+        assert_eq!(
+            values.0.get("default_model"),
+            Some(&SessionSettingValue::String(
+                "anthropic/claude-haiku-4.5".to_string()
+            ))
+        );
+        assert_eq!(
+            values.0.get("default_provider"),
+            Some(&SessionSettingValue::String("openrouter".to_string()))
+        );
+    }
+
+    #[tokio::test]
     async fn hermes_empty_root_gateway_runs_from_tyde_no_root_cwd() {
-        let _test_lock = TEST_HERMES_LOCK.lock().await;
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
         let dir = TempDir::new().expect("tempdir");
         let cwd_log = dir.path().join("cwd.txt");
         let fake = write_fake_gateway(
@@ -3264,7 +3879,7 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn hermes_bad_prompt_status_clears_typing() {
-        let _test_lock = TEST_HERMES_LOCK.lock().await;
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
         let dir = TempDir::new().expect("tempdir");
         let fake = write_fake_gateway(
             &dir,

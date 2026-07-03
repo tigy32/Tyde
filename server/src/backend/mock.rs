@@ -4,9 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
     AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
-    MessageMetadataUpdateData, MessageSender, ModelInfo, OperationCancelledData, SessionId,
-    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData,
-    ToolExecutionResult, ToolPolicy, ToolRequest, ToolRequestType,
+    MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData,
+    SessionId, StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequest, ToolRequestType,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -690,7 +690,6 @@ async fn emit_held_turn(
                         model: MOCK_MODEL.to_owned(),
                     }),
                     token_usage: None,
-                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 },
@@ -742,7 +741,6 @@ fn emit_mock_resume_history(
                 model: MOCK_MODEL.to_owned(),
             }),
             token_usage: None,
-            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         }));
@@ -800,7 +798,6 @@ async fn emit_turn(
                 tool_calls: Vec::new(),
                 model_info: None,
                 token_usage: None,
-                turn_token_usage: None,
                 context_breakdown: None,
                 images: None,
             }))
@@ -824,7 +821,6 @@ async fn emit_turn(
                         model: MOCK_MODEL.to_owned(),
                     }),
                     token_usage: None,
-                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 },
@@ -875,8 +871,12 @@ async fn emit_turn(
         model_info: Some(ModelInfo {
             model: MOCK_MODEL.to_owned(),
         }),
-        token_usage: (!delayed_usage && !omit_usage).then(mock_turn_token_usage),
-        turn_token_usage: None,
+        token_usage: (!delayed_usage && !omit_usage).then(|| {
+            MessageTokenUsage::request_and_turn_known(
+                mock_turn_token_usage(),
+                mock_turn_token_usage(),
+            )
+        }),
         context_breakdown: None,
         images: None,
     };
@@ -895,8 +895,10 @@ async fn emit_turn(
                 MessageMetadataUpdateData {
                     message_id: ChatMessageId(message_id),
                     model_info: None,
-                    token_usage: Some(mock_turn_token_usage()),
-                    turn_token_usage: None,
+                    token_usage: Some(MessageTokenUsage::request_and_turn_known(
+                        mock_turn_token_usage(),
+                        mock_turn_token_usage(),
+                    )),
                     context_breakdown: None,
                 },
             ))
@@ -1040,7 +1042,6 @@ async fn emit_mock_agent_control_await(
                     model: MOCK_MODEL.to_owned(),
                 }),
                 token_usage: None,
-                turn_token_usage: None,
                 context_breakdown: None,
                 images: None,
             },
@@ -1195,7 +1196,6 @@ async fn emit_exit_plan_mode_request(
                         model: MOCK_MODEL.to_owned(),
                     }),
                     token_usage: None,
-                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 },
@@ -1218,7 +1218,6 @@ async fn emit_exit_plan_mode_request(
                 model: MOCK_MODEL.to_owned(),
             }),
             token_usage: None,
-            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         }))
@@ -1349,7 +1348,6 @@ fn emit_mock_error(events_tx: &mpsc::UnboundedSender<ChatEvent>, message: &str) 
         tool_calls: Vec::new(),
         model_info: None,
         token_usage: None,
-        turn_token_usage: None,
         context_breakdown: None,
         images: None,
     }));
@@ -1475,15 +1473,24 @@ fn emit_native_child_turn(event_tx: &mpsc::UnboundedSender<ChatEvent>, prompt: &
             model_info: Some(ModelInfo {
                 model: MOCK_MODEL.to_owned(),
             }),
-            token_usage: Some(TokenUsage {
-                input_tokens: 250,
-                output_tokens: 80,
-                total_tokens: 330,
-                cached_prompt_tokens: Some(0),
-                cache_creation_input_tokens: Some(0),
-                reasoning_tokens: Some(0),
-            }),
-            turn_token_usage: None,
+            token_usage: Some(MessageTokenUsage::request_and_turn_known(
+                TokenUsage {
+                    input_tokens: 250,
+                    output_tokens: 80,
+                    total_tokens: 330,
+                    cached_prompt_tokens: Some(0),
+                    cache_creation_input_tokens: Some(0),
+                    reasoning_tokens: Some(0),
+                },
+                TokenUsage {
+                    input_tokens: 250,
+                    output_tokens: 80,
+                    total_tokens: 330,
+                    cached_prompt_tokens: Some(0),
+                    cache_creation_input_tokens: Some(0),
+                    reasoning_tokens: Some(0),
+                },
+            )),
             context_breakdown: None,
             images: None,
         },

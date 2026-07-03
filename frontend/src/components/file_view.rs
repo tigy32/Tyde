@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -90,6 +91,180 @@ const FALLBACK_CHUNK_LINES: usize = 200;
 /// realistically tokenize that much without freezing the UI even with
 /// chunking. Mirrors `syntax_highlight::MAX_LINES_TO_HIGHLIGHT`.
 const HIGHLIGHT_LINE_CAP: usize = 5000;
+
+/// State for the file-viewer right-click context menu: where it opened, the
+/// byte offset resolved under the click (if any), and — when the code-intel
+/// actions can't run — a human reason shown as a disabled hint. Held in a
+/// signal on `FileViewLoaded`; `None` means the menu is closed.
+#[derive(Clone, Debug, PartialEq)]
+struct FileMenuState {
+    x: f64,
+    y: f64,
+    offset: Option<u32>,
+    disabled_reason: Option<String>,
+}
+
+struct FileMenuEscListener {
+    window: web_sys::Window,
+    callback: Closure<dyn Fn(web_sys::Event)>,
+}
+
+thread_local! {
+    static FILE_MENU_ESC_LISTENER: RefCell<Option<FileMenuEscListener>> =
+        const { RefCell::new(None) };
+}
+
+fn clear_file_menu_esc_listener() {
+    FILE_MENU_ESC_LISTENER.with(|slot| {
+        if let Some(handle) = slot.borrow_mut().take() {
+            let _ = handle.window.remove_event_listener_with_callback(
+                "keydown",
+                handle.callback.as_ref().unchecked_ref(),
+            );
+        }
+    });
+}
+
+/// Reason the go-to-definition / find-references actions are unavailable for a
+/// right-click, or `None` when they can run. Mirrors the F12/Shift+F12
+/// preconditions: an active project, a symbol under the pointer, and code-intel
+/// that isn't unsupported/unavailable/failed for the rendered file version.
+fn file_context_menu_disabled_reason(
+    state: &AppState,
+    key: &Option<CodeIntelKey>,
+    version: ProjectFileVersion,
+    offset: Option<u32>,
+) -> Option<String> {
+    let Some(key) = key else {
+        return Some("No active project".to_owned());
+    };
+    if offset.is_none() {
+        return Some("Right-click on a symbol".to_owned());
+    }
+    state.code_intel.with_untracked(|map| {
+        let file = map.get(key)?;
+        // Only judge against status the server resolved for the rendered text
+        // (version-equals-rendered); a mismatched version says nothing here.
+        if file.rendered_version != Some(version) {
+            return None;
+        }
+        let data = file.applied()?;
+        if let Some(error) = data.error.as_ref() {
+            return Some(format!("Code intelligence failed: {}", error.message));
+        }
+        match data.status.as_ref()?.state {
+            CodeIntelState::Unsupported => {
+                Some("Code intelligence unsupported for this file".to_owned())
+            }
+            CodeIntelState::Unavailable => Some("Code intelligence unavailable".to_owned()),
+            CodeIntelState::Failed => Some("Code intelligence failed".to_owned()),
+            CodeIntelState::Starting | CodeIntelState::Indexing | CodeIntelState::Ready => None,
+        }
+    })
+}
+
+/// Right-click context menu over file content: Go to Definition (F12) and Show
+/// References (Shift+F12). Positioned at the click, dismissed on Escape,
+/// outside-click/backdrop, or action selection. When `disabled_reason` is set
+/// the actions render disabled with the reason as a hint — never a silent
+/// no-op. Reuses the typed `navigate_to_definition` / `start_find_references`
+/// actions, matching the F12 keybindings exactly.
+#[component]
+fn FileContextMenu(
+    path: ProjectPath,
+    version: ProjectFileVersion,
+    menu: RwSignal<Option<FileMenuState>>,
+    x: f64,
+    y: f64,
+    offset: Option<u32>,
+    disabled_reason: Option<String>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let disabled = disabled_reason.is_some();
+
+    // Window keydown listener for Escape dismissal, stored in a thread_local so
+    // on_cleanup can remove it with a plain fn pointer (Leptos requires the
+    // cleanup callback to be Send + Sync).
+    clear_file_menu_esc_listener();
+    let esc_cb = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
+        if let Ok(kev) = ev.dyn_into::<web_sys::KeyboardEvent>()
+            && kev.key() == "Escape"
+        {
+            menu.set(None);
+        }
+    });
+    let window = web_sys::window().unwrap();
+    let _ = window.add_event_listener_with_callback("keydown", esc_cb.as_ref().unchecked_ref());
+    FILE_MENU_ESC_LISTENER.with(|slot| {
+        slot.borrow_mut().replace(FileMenuEscListener {
+            window,
+            callback: esc_cb,
+        });
+    });
+    on_cleanup(clear_file_menu_esc_listener);
+
+    let def_state = state.clone();
+    let def_path = path.clone();
+    let on_go_to_definition = move |_: web_sys::MouseEvent| {
+        menu.set(None);
+        if let Some(offset) = offset {
+            crate::actions::navigate_to_definition(&def_state, def_path.clone(), version, offset);
+        }
+    };
+
+    let ref_state = state.clone();
+    let ref_path = path.clone();
+    let on_show_references = move |_: web_sys::MouseEvent| {
+        menu.set(None);
+        if let Some(offset) = offset {
+            crate::actions::start_find_references(
+                &ref_state,
+                ref_path.clone(),
+                version,
+                offset,
+                None,
+            );
+        }
+    };
+
+    view! {
+        // Backdrop — catches click-outside / right-click-outside to dismiss.
+        <div
+            style="position: fixed; inset: 0; z-index: 1000;"
+            on:click=move |_| menu.set(None)
+            on:contextmenu=move |ev: web_sys::MouseEvent| {
+                ev.prevent_default();
+                menu.set(None);
+            }
+        />
+        <div
+            class="context-menu"
+            style=format!("left: {x}px; top: {y}px;")
+            on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+            on:contextmenu=|ev: web_sys::MouseEvent| ev.prevent_default()
+        >
+            <button
+                class="context-menu-item context-menu-item--with-shortcut"
+                disabled=disabled
+                on:click=on_go_to_definition
+            >
+                <span class="context-menu-label">"Go to Definition"</span>
+                <span class="context-menu-shortcut">"F12"</span>
+            </button>
+            <button
+                class="context-menu-item context-menu-item--with-shortcut"
+                disabled=disabled
+                on:click=on_show_references
+            >
+                <span class="context-menu-label">"Show References"</span>
+                <span class="context-menu-shortcut">"Shift+F12"</span>
+            </button>
+            {disabled_reason.map(|reason| view! {
+                <div class="context-menu-hint">{reason}</div>
+            })}
+        </div>
+    }
+}
 
 fn cancel_highlight_task(active_task_id: &Arc<Mutex<Option<u64>>>) {
     let Some(task_id) = active_task_id
@@ -618,6 +793,34 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
         }
     };
 
+    // ── Right-click context menu (Go to Definition / Show References) ───────
+    // Opening the menu resolves the byte offset under the pointer with the same
+    // helper the F12 path uses and records this file as the code-intel focus,
+    // so keyboard and menu agree on the target. `None` means the menu is closed.
+    let context_menu: RwSignal<Option<FileMenuState>> = RwSignal::new(None);
+    let lines_for_ctx = lines.clone();
+    let state_for_ctx = state.clone();
+    let ctx_path = f.path.clone();
+    let ctx_version = f.version;
+    let ctx_key = code_intel_key.clone();
+    let on_content_contextmenu = move |ev: web_sys::MouseEvent| {
+        ev.prevent_default();
+        state_for_ctx
+            .code_intel_focus
+            .set(Some((ctx_path.clone(), ctx_version)));
+        let x = ev.client_x() as f64;
+        let y = ev.client_y() as f64;
+        let offset = byte_offset_at_point(&lines_for_ctx, x, y);
+        let disabled_reason =
+            file_context_menu_disabled_reason(&state_for_ctx, &ctx_key, ctx_version, offset);
+        context_menu.set(Some(FileMenuState {
+            x,
+            y,
+            offset,
+            disabled_reason,
+        }));
+    };
+
     // Debounced hover: a settled pointer over an identifier fires a single
     // `code_intel_hover`.
     let lines_for_hover = lines.clone();
@@ -786,6 +989,7 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
     let lines_for_render = lines.clone();
     let highlighted_for_render = highlighted.clone();
     let find_for_render = find_state.clone();
+    let menu_path = f.path.clone();
 
     view! {
                             <div class="file-view-header">
@@ -833,6 +1037,7 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
                                 node_ref=pre_ref
                                 on:scroll=on_scroll
                                 on:click=on_content_click
+                                on:contextmenu=on_content_contextmenu
                                 on:mousemove=on_content_mousemove
                                 on:mouseleave=on_content_mouseleave
                             >
@@ -908,6 +1113,19 @@ fn FileViewLoaded(tab_id: TabId, path: ProjectPath, version: ProjectFileVersion)
                                     })
                                 }}
                             </pre>
+                            {move || {
+                                context_menu.get().map(|m| view! {
+                                    <FileContextMenu
+                                        path=menu_path.clone()
+                                        version=code_intel_version
+                                        menu=context_menu
+                                        x=m.x
+                                        y=m.y
+                                        offset=m.offset
+                                        disabled_reason=m.disabled_reason.clone()
+                                    />
+                                })
+                            }}
     }
 }
 
@@ -3768,6 +3986,281 @@ mod wasm_tests {
                 .unwrap()
                 .is_none(),
             "dismiss should remove the popover"
+        );
+    }
+
+    /// Synthesize a right-click over the left edge of the first rendered line's
+    /// code (over an identifier, so a byte offset resolves under the caret).
+    fn contextmenu_first_line(container: &HtmlElement) {
+        let code = container
+            .query_selector(".file-line-code")
+            .unwrap()
+            .expect("code element present");
+        let rect = code.get_bounding_client_rect();
+        let init = web_sys::MouseEventInit::new();
+        init.set_bubbles(true);
+        init.set_client_x((rect.left() + 1.0) as i32);
+        init.set_client_y((rect.top() + rect.height() / 2.0) as i32);
+        let event =
+            web_sys::MouseEvent::new_with_mouse_event_init_dict("contextmenu", &init).unwrap();
+        code.dispatch_event(&event).unwrap();
+    }
+
+    /// Right-clicking file content opens a context menu offering Go to
+    /// Definition (F12) and Show References (Shift+F12), and selecting Go to
+    /// Definition runs the same typed navigate action as the F12 keybinding.
+    #[wasm_bindgen_test]
+    async fn right_click_opens_context_menu_with_actions() {
+        use crate::state::ActiveProjectRef;
+        use protocol::ProjectId;
+
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "main.rs".to_owned(),
+        };
+        let content = "fn main() {}";
+
+        let container = make_container();
+        let mount_path = path.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let file_path = mount_path.clone();
+            state.open_files.update(|files| {
+                files.insert(
+                    file_path.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some(content.to_owned()),
+                        is_binary: false,
+                    },
+                );
+            });
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "h".to_owned(),
+                project_id: ProjectId("p".to_owned()),
+            }));
+            provide_context(state);
+            view! { <FileView tab_id=TabId(20_060) path=mount_path.clone() /> }
+        });
+
+        next_tick().await;
+        contextmenu_first_line(&container);
+        next_tick().await;
+
+        let menu = container
+            .query_selector(".context-menu")
+            .unwrap()
+            .expect("context menu should open on right-click");
+        let menu_text = menu.text_content().unwrap_or_default();
+        assert!(
+            menu_text.contains("Go to Definition") && menu_text.contains("F12"),
+            "menu must offer Go to Definition with its F12 shortcut; got {menu_text:?}"
+        );
+        assert!(
+            menu_text.contains("Show References") && menu_text.contains("Shift+F12"),
+            "menu must offer Show References with its Shift+F12 shortcut; got {menu_text:?}"
+        );
+
+        // With an active project the actions are enabled (no disabled hint).
+        let items = container.query_selector_all(".context-menu-item").unwrap();
+        assert_eq!(items.length(), 2, "expected exactly two action items");
+        for i in 0..items.length() {
+            let el: Element = items.item(i).unwrap().dyn_into().unwrap();
+            assert!(
+                !el.has_attribute("disabled"),
+                "action {i} should be enabled when a project is active"
+            );
+        }
+
+        // Selecting Go to Definition runs the navigate action (which, with no
+        // pushed model, falls back to a `code_intel_navigate` frame) and closes
+        // the menu.
+        let button: HtmlElement = items.item(0).unwrap().dyn_into().unwrap();
+        button.click();
+        for _ in 0..10 {
+            next_tick().await;
+        }
+        assert!(
+            navigate_frame_was_sent(),
+            "selecting Go to Definition should dispatch a navigate action"
+        );
+        assert!(
+            container.query_selector(".context-menu").unwrap().is_none(),
+            "selecting an action should close the menu"
+        );
+    }
+
+    /// Selecting **Show References** runs the typed find-references action: it
+    /// puts a `code_intel_find_references` frame — carrying the right-clicked
+    /// file path and a byte offset — on the wire, reveals the References tab in
+    /// the left dock, and closes the menu.
+    #[wasm_bindgen_test]
+    async fn right_click_show_references_dispatches_find_references() {
+        use crate::state::{ActiveProjectRef, LeftTab};
+        use protocol::ProjectId;
+
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "main.rs".to_owned(),
+        };
+        let content = "fn main() {}";
+
+        let container = make_container();
+        let mount_path = path.clone();
+        let captured: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
+        let cap = captured.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let file_path = mount_path.clone();
+            state.open_files.update(|files| {
+                files.insert(
+                    file_path.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some(content.to_owned()),
+                        is_binary: false,
+                    },
+                );
+            });
+            state.active_project.set(Some(ActiveProjectRef {
+                host_id: "h".to_owned(),
+                project_id: ProjectId("p".to_owned()),
+            }));
+            *cap.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <FileView tab_id=TabId(20_062) path=mount_path.clone() /> }
+        });
+
+        next_tick().await;
+        contextmenu_first_line(&container);
+        next_tick().await;
+
+        // The second action is Show References (the first is Go to Definition).
+        let items = container.query_selector_all(".context-menu-item").unwrap();
+        assert_eq!(items.length(), 2, "expected exactly two action items");
+        let show_refs: HtmlElement = items.item(1).unwrap().dyn_into().unwrap();
+        assert!(
+            show_refs
+                .text_content()
+                .unwrap_or_default()
+                .contains("Show References"),
+            "the second item should be Show References"
+        );
+        show_refs.click();
+        for _ in 0..10 {
+            next_tick().await;
+        }
+
+        // A typed `code_intel_find_references` frame was sent for this file with a
+        // numeric byte offset.
+        let probe = js_sys::eval(
+            r#"
+            (function() {
+                for (const [cmd, args] of (window.__test_send_calls || [])) {
+                    if (cmd !== "send_host_line") continue;
+                    const env = JSON.parse(JSON.parse(args).line);
+                    if (env.kind === "code_intel_find_references") {
+                        return env.kind + "|" + env.payload.path.relative_path
+                            + "|" + (typeof env.payload.offset);
+                    }
+                }
+                return "";
+            })()
+            "#,
+        )
+        .expect("probe send calls")
+        .as_string()
+        .unwrap_or_default();
+        assert_eq!(
+            probe, "code_intel_find_references|main.rs|number",
+            "selecting Show References should dispatch a code_intel_find_references frame \
+             for the right-clicked file with a byte offset"
+        );
+
+        // The action also reveals the References tab in the left dock.
+        let state = captured.borrow().clone().unwrap();
+        assert_eq!(
+            state.left_tab.get_untracked(),
+            LeftTab::References,
+            "Show References should switch the left dock to the References tab"
+        );
+
+        // Selecting an action closes the menu.
+        assert!(
+            container.query_selector(".context-menu").unwrap().is_none(),
+            "selecting Show References should close the menu"
+        );
+    }
+
+    /// With no active project the code-intel actions can't run: the menu still
+    /// opens (never a silent no-op) but its items are disabled and it shows a
+    /// clear reason.
+    #[wasm_bindgen_test]
+    async fn right_click_without_project_shows_disabled_reason() {
+        ensure_styles_loaded();
+        install_send_stub();
+
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "main.rs".to_owned(),
+        };
+        let content = "fn main() {}";
+
+        let container = make_container();
+        let mount_path = path.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let file_path = mount_path.clone();
+            state.open_files.update(|files| {
+                files.insert(
+                    file_path.clone(),
+                    OpenFile {
+                        path: file_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some(content.to_owned()),
+                        is_binary: false,
+                    },
+                );
+            });
+            // Deliberately no active project.
+            provide_context(state);
+            view! { <FileView tab_id=TabId(20_061) path=mount_path.clone() /> }
+        });
+
+        next_tick().await;
+        contextmenu_first_line(&container);
+        next_tick().await;
+
+        let menu = container
+            .query_selector(".context-menu")
+            .unwrap()
+            .expect("context menu should still open when actions are unavailable");
+
+        let items = container.query_selector_all(".context-menu-item").unwrap();
+        assert_eq!(items.length(), 2, "expected exactly two action items");
+        for i in 0..items.length() {
+            let el: Element = items.item(i).unwrap().dyn_into().unwrap();
+            assert!(
+                el.has_attribute("disabled"),
+                "action {i} must be disabled with no active project"
+            );
+        }
+
+        let hint = menu
+            .query_selector(".context-menu-hint")
+            .unwrap()
+            .expect("a disabled menu must explain why");
+        assert!(
+            hint.text_content().unwrap_or_default().contains("project"),
+            "disabled reason should mention the missing active project"
         );
     }
 }

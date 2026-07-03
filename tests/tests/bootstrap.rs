@@ -5,8 +5,8 @@ use protocol::{
     BackendAccessMode, BackendKind, CommandErrorCode, CommandErrorPayload, FrameKind,
     HostBootstrapPayload, HostBrowseInitial, HostBrowseStartPayload, HostLaunchProfileConfig,
     HostSettingValue, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
-    LaunchProfileId, NewAgentPayload, ProjectBootstrapPayload, ProjectRootPath, ReviewSummaryScope,
-    SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingValue,
+    LaunchProfileId, LaunchProfileKind, NewAgentPayload, ProjectBootstrapPayload, ProjectRootPath,
+    ReviewSummaryScope, SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingValue,
     SessionSettingsValues, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload,
     TerminalCreatePayload, TerminalLaunchTarget,
 };
@@ -228,7 +228,8 @@ async fn explicit_hermes_launch_profile_is_unavailable_until_schema_refresh() {
     assert_eq!(env.kind, FrameKind::HostBootstrap);
     let bootstrap: HostBootstrapPayload = env.parse_payload().expect("host bootstrap payload");
     match launch_profile_entry(&bootstrap.launch_profile_catalog, "hermes:claude") {
-        LaunchProfileEntry::Unavailable { message, .. } => {
+        LaunchProfileEntry::Unavailable { kind, message, .. } => {
+            assert_eq!(*kind, LaunchProfileKind::Custom);
             assert!(
                 message.contains("still loading"),
                 "unexpected initial Hermes profile message: {message}"
@@ -287,6 +288,14 @@ async fn host_bootstrap_includes_launch_profile_catalog() {
             "codex:default".to_owned(),
             "claude:haiku".to_owned()
         ]
+    );
+    assert_eq!(
+        launch_profile_entry(&bootstrap.launch_profile_catalog, "claude:default").kind(),
+        LaunchProfileKind::BackendDefault
+    );
+    assert_eq!(
+        launch_profile_entry(&bootstrap.launch_profile_catalog, "claude:haiku").kind(),
+        LaunchProfileKind::Custom
     );
 }
 

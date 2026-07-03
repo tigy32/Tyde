@@ -1457,6 +1457,7 @@ mod wasm_tests {
         );
         LaunchProfile {
             id: LaunchProfileId("hermes:claude".to_owned()),
+            kind: protocol::LaunchProfileKind::Custom,
             label: "Hermes · Claude".to_owned(),
             description: None,
             backend_kind: BackendKind::Hermes,

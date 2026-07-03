@@ -426,11 +426,13 @@ pub(crate) fn tycode_backend_config_persistence_values(
     previous: &BackendConfigValues,
 ) -> BackendConfigValues {
     let mut values = incoming.clone();
-    for key in TYCODE_MANAGED_SETTINGS {
-        if !incoming.0.contains_key(*key) && previous.0.contains_key(*key) {
-            values
-                .0
-                .insert((*key).to_string(), SessionSettingValue::Null);
+    if incoming.0.is_empty() {
+        for key in TYCODE_MANAGED_SETTINGS {
+            if previous.0.contains_key(*key) {
+                values
+                    .0
+                    .insert((*key).to_string(), SessionSettingValue::Null);
+            }
         }
     }
     values
@@ -791,6 +793,178 @@ pub(crate) async fn persist_backend_config(values: BackendConfigValues) -> Resul
         await_tycode_startup(ready_rx, &shutdown_tx, "settings save", &startup_status).await;
     let _ = shutdown_tx.send(());
     result
+}
+
+pub(crate) async fn backend_config_snapshot() -> Result<BackendConfigValues, String> {
+    let (ready_tx, ready_rx) =
+        tokio::sync::oneshot::channel::<Result<BackendConfigValues, String>>();
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
+    let startup_status = new_tycode_startup_status();
+    let startup_status_task = Arc::clone(&startup_status);
+
+    tokio::spawn(async move {
+        let roots_json = serde_json::json!([]).to_string();
+        let subprocess_bin = match subprocess_bin() {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!("{err}");
+                let _ = ready_tx.send(Err(err));
+                return;
+            }
+        };
+        let mut command = Command::new(&subprocess_bin);
+        command.arg("--workspace-roots").arg(&roots_json);
+        if let Some(path) = process_env::resolved_child_process_path() {
+            command.env("PATH", path);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match command.group_spawn() {
+            Ok(c) => c,
+            Err(err) => {
+                let _ = ready_tx.send(Err(format!(
+                    "Failed to spawn tycode-subprocess for settings snapshot: {err}"
+                )));
+                return;
+            }
+        };
+
+        let mut stdin = match child.inner().stdin.take() {
+            Some(s) => s,
+            None => {
+                let _ = ready_tx.send(Err(
+                    "Failed to capture tycode-subprocess stdin for settings snapshot".to_string(),
+                ));
+                return;
+            }
+        };
+        let stdout = match child.inner().stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = ready_tx.send(Err(
+                    "Failed to capture tycode-subprocess stdout for settings snapshot".to_string(),
+                ));
+                return;
+            }
+        };
+        let stderr = match child.inner().stderr.take() {
+            Some(s) => s,
+            None => {
+                let _ = ready_tx.send(Err(
+                    "Failed to capture tycode-subprocess stderr for settings snapshot".to_string(),
+                ));
+                return;
+            }
+        };
+        let last_stderr_line = spawn_tycode_stderr_logger(stderr);
+        let mut lines = BufReader::new(stdout).lines();
+        let mut requested_settings = false;
+        let mut ready_tx = Some(ready_tx);
+        set_tycode_startup_status(&startup_status_task, "waiting for SessionStarted");
+
+        loop {
+            let line = tokio::select! {
+                line = lines.next_line() => line,
+                shutdown = shutdown_rx.recv() => {
+                    if shutdown.is_some() {
+                        let _ = child.kill().await;
+                    }
+                    break;
+                }
+            };
+            let Ok(Some(line)) = line else {
+                break;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to parse tycode-subprocess settings-snapshot event: {err} — line: {trimmed}"
+                    );
+                    continue;
+                }
+            };
+            if let Some(error) = tycode_error_message(&value) {
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(Err(format!(
+                        "Tycode settings snapshot failed before Settings: {error}"
+                    )));
+                }
+                let _ = child.kill().await;
+                return;
+            }
+            if !requested_settings && tycode_session_started(&value).is_some() {
+                set_tycode_startup_status(
+                    &startup_status_task,
+                    "requesting Settings with GetSettings",
+                );
+                requested_settings = true;
+                if !write_command(&mut stdin, &Value::String("GetSettings".to_string())).await {
+                    if let Some(ready_tx) = ready_tx.take() {
+                        let _ = ready_tx
+                            .send(Err("Failed to request Tycode settings snapshot".to_string()));
+                    }
+                    let _ = child.kill().await;
+                    return;
+                }
+                continue;
+            }
+            if let Some(settings) = tycode_settings_data(&value) {
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(Ok(tycode_backend_config_snapshot_values(settings)));
+                }
+                let _ = child.kill().await;
+                return;
+            }
+        }
+
+        if let Some(ready_tx) = ready_tx.take() {
+            let _ = ready_tx.send(Err(tycode_startup_exit_error(&last_stderr_line)));
+        }
+    });
+
+    let timeout = tycode_startup_timeout();
+    let result = match tokio::time::timeout(timeout, ready_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("Tycode settings snapshot task ended early".to_string()),
+        Err(_) => {
+            let _ = shutdown_tx.send(());
+            let phase = *startup_status
+                .lock()
+                .expect("tycode startup status mutex poisoned");
+            Err(format!(
+                "Timed out after {} waiting for Tycode settings snapshot: {phase}",
+                format_tycode_timeout(timeout)
+            ))
+        }
+    };
+    let _ = shutdown_tx.send(());
+    result
+}
+
+fn tycode_backend_config_snapshot_values(settings: &Value) -> BackendConfigValues {
+    let mut values = BackendConfigValues::default();
+    for key in TYCODE_MANAGED_SETTINGS {
+        let Some(value) = settings.get(*key) else {
+            continue;
+        };
+        let setting = match value {
+            Value::String(value) if !value.trim().is_empty() => {
+                SessionSettingValue::String(value.clone())
+            }
+            Value::Null => SessionSettingValue::Null,
+            _ => continue,
+        };
+        values.0.insert((*key).to_string(), setting);
+    }
+    values
 }
 
 fn format_tycode_timeout(timeout: Duration) -> String {
@@ -1172,7 +1346,6 @@ impl Backend for TycodeBackend {
                         tool_calls: Vec::new(),
                         model_info: None,
                         token_usage: None,
-                        turn_token_usage: None,
                         context_breakdown: None,
                         images: None,
                     },
@@ -1443,7 +1616,6 @@ impl Backend for TycodeBackend {
                         tool_calls: Vec::new(),
                         model_info: None,
                         token_usage: None,
-                        turn_token_usage: None,
                         context_breakdown: None,
                         images: None,
                     },
@@ -2303,6 +2475,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn tycode_backend_config_snapshot_reads_current_settings_without_save() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "other",
+            "providers": {
+                "default": { "type": "mock" },
+                "other": { "type": "openrouter", "api_key": "secret" }
+            },
+            "model_quality": "high",
+            "reasoning_effort": "Max",
+            "autonomy_level": "fully_autonomous",
+            "review_level": "Task",
+            "spawn_context_mode": "Fresh"
+        });
+        let fake = write_fake_tycode_subprocess(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        let values = backend_config_snapshot()
+            .await
+            .expect("read Tycode backend config snapshot");
+
+        assert_eq!(
+            values.0.get("active_provider"),
+            Some(&SessionSettingValue::String("other".to_string()))
+        );
+        assert_eq!(
+            values.0.get("model_quality"),
+            Some(&SessionSettingValue::String("high".to_string()))
+        );
+        assert_eq!(
+            values.0.get("reasoning_effort"),
+            Some(&SessionSettingValue::String("Max".to_string()))
+        );
+        assert_eq!(
+            read_fake_commands(&log),
+            vec![Value::String("GetSettings".to_string())]
+        );
+    }
+
+    #[test]
+    fn tycode_backend_config_persistent_save_omitted_previous_key_is_preserved() {
+        let mut incoming = BackendConfigValues::default();
+        incoming.0.insert(
+            "model_quality".to_string(),
+            SessionSettingValue::String("low".to_string()),
+        );
+        let mut previous = BackendConfigValues::default();
+        previous.0.insert(
+            "active_provider".to_string(),
+            SessionSettingValue::String("default".to_string()),
+        );
+
+        let values = tycode_backend_config_persistence_values(&incoming, &previous);
+
+        assert_eq!(values.0.len(), 1);
+        assert_eq!(
+            values.0.get("model_quality"),
+            Some(&SessionSettingValue::String("low".to_string()))
+        );
+        assert!(
+            !values.0.contains_key("active_provider"),
+            "omitted Tycode keys are preserved by generic settings merge, not reset during persistence"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn tycode_backend_config_persistent_save_null_resets_only_that_key() {
         let dir = TempDir::new().expect("tempdir");
         let settings = serde_json::json!({
@@ -2354,7 +2593,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn tycode_backend_config_persistent_save_removed_previous_key_resets_only_that_key() {
+    async fn tycode_backend_config_persistent_save_empty_update_resets_previous_keys() {
         let dir = TempDir::new().expect("tempdir");
         let settings = serde_json::json!({
             "active_provider": "other",

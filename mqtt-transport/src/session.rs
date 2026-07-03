@@ -8,28 +8,28 @@ use sha2::Sha256;
 use crate::config::ParticipantRole;
 use crate::error::{CounterViolation, CryptoError};
 use crate::framing::{AEAD_KEY_LEN, AEAD_NONCE_LEN, SESSION_SALT_LEN};
-use crate::link::MAX_QOS1_INFLIGHT;
+use crate::link::{DATA_CREDIT_WINDOW, MQTT_QOS1_WINDOW};
 use crate::types::{PreSharedKey, RoomId};
 
 pub const HKDF_INFO: &[u8] = b"tyde-mqtt-v1";
 
 /// How far ahead of the next owed frame a data frame may legitimately arrive.
 ///
-/// The transport keeps up to [`MAX_QOS1_INFLIGHT`] QoS-1 publishes in flight, so
-/// the MQTT substrate can reorder them by at most that many counters. A frame
-/// more than one full window ahead cannot be a legitimately in-flight publish;
-/// it means the sender exceeded the window or the stream lost a frame QoS-1
-/// promised to deliver — a real invariant violation the receiver must surface.
-const RECEIVE_REORDER_WINDOW: u64 = MAX_QOS1_INFLIGHT as u64;
+/// Data sends are serialized for the beta hotfix, but broker/subscriber QoS-1
+/// delivery can still reorder within the MQTT receive headroom. Future frames
+/// are buffered only after AEAD succeeds; a gap beyond this bounded headroom is
+/// still a fatal transport invariant violation.
+pub(crate) const RECEIVE_REORDER_WINDOW: u64 = MQTT_QOS1_WINDOW as u64;
+const CREDIT_PLAINTEXT_LEN: usize = 8;
+const _: () = assert!(DATA_CREDIT_WINDOW as u64 <= RECEIVE_REORDER_WINDOW);
 
-/// Reassembles the ordered byte stream from data frames the MQTT substrate may
-/// deliver out of order, holding early frames until the gap before them fills.
+/// Reassembles the ordered byte stream from data frames.
 ///
 /// This is transport-layer reassembly (like TCP), not "fixing up" the Tyde
 /// protocol sequence: the NDJSON `seq` above this layer is still validated
-/// strictly. Pipelined QoS-1 publishes let the broker deliver frames out of
-/// order, and the byte-stream contract requires the receiver to put them back
-/// in counter order before handing them up.
+/// strictly. Broker PUBACK is not Tyde receiver credit, so the sender is
+/// serialized separately; the receiver still tolerates bounded MQTT reordering
+/// and fails loudly for beyond-window gaps.
 #[derive(Debug, Default)]
 struct ReceiveReassembler {
     /// Counter of the next frame still owed to the byte stream.
@@ -48,7 +48,7 @@ impl ReceiveReassembler {
         counter < self.next_expected || self.pending.contains_key(&counter)
     }
 
-    /// Reject a counter too far ahead to be a legitimately in-flight frame.
+    /// Reject a counter too far ahead to be legitimately buffered.
     fn ensure_within_window(&self, counter: u64) -> Result<(), CryptoError> {
         let window_end = self.next_expected.saturating_add(RECEIVE_REORDER_WINDOW);
         if counter >= window_end {
@@ -78,6 +78,10 @@ impl ReceiveReassembler {
         }
         Ok(ready)
     }
+
+    fn next_expected(&self) -> u64 {
+        self.next_expected
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +95,12 @@ pub struct SessionCipher {
     aad: Vec<u8>,
     send_direction: u8,
     recv_direction: u8,
+    send_credit_direction: u8,
+    recv_credit_direction: u8,
     send_counter: u64,
+    send_credit_counter: u64,
+    highest_received_credit_counter: Option<u64>,
+    peer_credit_next_expected: u64,
     recv: ReceiveReassembler,
 }
 
@@ -118,7 +127,12 @@ impl SessionCipher {
             aad: room_aad(room),
             send_direction: role.outbound_direction(),
             recv_direction: role.inbound_direction(),
+            send_credit_direction: role.outbound_credit_direction(),
+            recv_credit_direction: role.inbound_credit_direction(),
             send_counter: 0,
+            send_credit_counter: 0,
+            highest_received_credit_counter: None,
+            peer_credit_next_expected: 0,
             recv: ReceiveReassembler::new(),
         })
     }
@@ -135,6 +149,28 @@ impl SessionCipher {
             self.send_direction,
             counter,
             plaintext,
+        )?;
+        Ok(EncryptedChunk {
+            counter,
+            ciphertext_with_tag,
+        })
+    }
+
+    pub fn encrypt_credit(
+        &mut self,
+        next_expected_data_counter: u64,
+    ) -> Result<EncryptedChunk, CryptoError> {
+        let counter = self.send_credit_counter;
+        self.send_credit_counter = self
+            .send_credit_counter
+            .checked_add(1)
+            .ok_or(CryptoError::CounterRollover)?;
+        let ciphertext_with_tag = encrypt_chunk(
+            &self.cipher,
+            &self.aad,
+            self.send_credit_direction,
+            counter,
+            &next_expected_data_counter.to_be_bytes(),
         )?;
         Ok(EncryptedChunk {
             counter,
@@ -163,6 +199,57 @@ impl SessionCipher {
             ciphertext_with_tag,
         )?;
         self.recv.insert_and_drain(counter, plaintext)
+    }
+
+    pub fn decrypt_credit(
+        &mut self,
+        control_counter: u64,
+        ciphertext_with_tag: &[u8],
+    ) -> Result<Option<u64>, CryptoError> {
+        let plaintext = decrypt_chunk(
+            &self.cipher,
+            &self.aad,
+            self.recv_credit_direction,
+            control_counter,
+            ciphertext_with_tag,
+        )?;
+        let bytes: [u8; CREDIT_PLAINTEXT_LEN] = plaintext
+            .as_slice()
+            .try_into()
+            .map_err(|_| CryptoError::AeadFailure)?;
+        if self
+            .highest_received_credit_counter
+            .is_some_and(|highest| control_counter <= highest)
+        {
+            return Ok(None);
+        }
+        self.highest_received_credit_counter = Some(control_counter);
+        let credit_next_expected = u64::from_be_bytes(bytes);
+        if credit_next_expected > self.send_counter {
+            return Err(CryptoError::CounterViolation(
+                CounterViolation::CreditBeyondSent {
+                    sent_next: self.send_counter,
+                    credit_next: credit_next_expected,
+                },
+            ));
+        }
+        if credit_next_expected <= self.peer_credit_next_expected {
+            return Ok(None);
+        }
+        self.peer_credit_next_expected = credit_next_expected;
+        Ok(Some(credit_next_expected))
+    }
+
+    pub fn next_send_data_counter(&self) -> u64 {
+        self.send_counter
+    }
+
+    pub fn peer_credit_next_expected(&self) -> u64 {
+        self.peer_credit_next_expected
+    }
+
+    pub fn local_next_expected_data_counter(&self) -> u64 {
+        self.recv.next_expected()
     }
 
     #[cfg(test)]
@@ -257,7 +344,7 @@ mod tests {
     use super::*;
     use crate::config::ParticipantRole;
     use crate::error::CounterViolation;
-    use crate::framing::DIRECTION_CLIENT_TO_HOST;
+    use crate::framing::{DIRECTION_CLIENT_TO_HOST, DIRECTION_CREDIT_CLIENT_TO_HOST};
 
     fn psk() -> PreSharedKey {
         PreSharedKey([3_u8; 32])
@@ -335,7 +422,23 @@ mod tests {
     }
 
     #[test]
-    fn buffers_out_of_order_frames_until_the_gap_fills() -> Result<(), CryptoError> {
+    fn counter_one_before_zero_buffers_and_drains() -> Result<(), CryptoError> {
+        let (mut sender, mut receiver) = sender_receiver()?;
+        let first = sender.encrypt_next(b"0")?;
+        let second = sender.encrypt_next(b"1")?;
+
+        assert!(
+            receiver
+                .decrypt_received(second.counter, &second.ciphertext_with_tag)?
+                .is_empty()
+        );
+        let delivered = receiver.decrypt_received(first.counter, &first.ciphertext_with_tag)?;
+        assert_eq!(delivered, vec![b"0".to_vec(), b"1".to_vec()]);
+        Ok(())
+    }
+
+    #[test]
+    fn buffers_within_window_reorder_and_drains_in_order() -> Result<(), CryptoError> {
         let (mut sender, mut receiver) = sender_receiver()?;
         let frames: Vec<_> = (0..4)
             .map(|index| sender.encrypt_next(&[b'0' + index as u8]))
@@ -367,23 +470,181 @@ mod tests {
     }
 
     #[test]
-    fn counter_beyond_the_inflight_window_is_fatal() -> Result<(), CryptoError> {
+    fn receive_window_accepts_last_counter_before_boundary() -> Result<(), CryptoError> {
         let (mut sender, mut receiver) = sender_receiver()?;
-        // Advance the sender past a full reorder window without filling the gap.
-        let mut far = sender.encrypt_next(b"x")?;
-        for _ in 0..20 {
-            far = sender.encrypt_next(b"x")?;
+        let frames: Vec<_> = (0..MQTT_QOS1_WINDOW)
+            .map(|index| sender.encrypt_next(&[index as u8]))
+            .collect::<Result<_, _>>()?;
+        let edge = &frames[MQTT_QOS1_WINDOW - 1];
+
+        assert!(
+            receiver
+                .decrypt_received(edge.counter, &edge.ciphertext_with_tag)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn counter_at_receive_window_boundary_is_fatal() -> Result<(), CryptoError> {
+        let (mut sender, mut receiver) = sender_receiver()?;
+        for _ in 0..MQTT_QOS1_WINDOW {
+            let _ = sender.encrypt_next(b"x")?;
         }
+        let beyond = sender.encrypt_next(b"x")?;
+
         let err = receiver
-            .decrypt_received(far.counter, &far.ciphertext_with_tag)
+            .decrypt_received(beyond.counter, &beyond.ciphertext_with_tag)
             .err();
         assert!(matches!(
             err,
             Some(CryptoError::CounterViolation(CounterViolation::Gap {
                 last_seen: None,
                 actual,
-            })) if actual == far.counter
+            })) if actual == beyond.counter
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn counter_22_after_6_buffers_and_drains() -> Result<(), CryptoError> {
+        let (mut sender, mut receiver) = sender_receiver()?;
+        let frames: Vec<_> = (0..=22)
+            .map(|index| sender.encrypt_next(&[index as u8]))
+            .collect::<Result<_, _>>()?;
+
+        for (index, frame) in frames.iter().enumerate().take(7) {
+            assert_eq!(
+                receiver.decrypt_received(frame.counter, &frame.ciphertext_with_tag)?,
+                vec![vec![index as u8]]
+            );
+        }
+
+        assert!(
+            receiver
+                .decrypt_received(frames[22].counter, &frames[22].ciphertext_with_tag)?
+                .is_empty()
+        );
+
+        let mut delivered = Vec::new();
+        for frame in frames.iter().take(22).skip(7) {
+            delivered.extend(receiver.decrypt_received(frame.counter, &frame.ciphertext_with_tag)?);
+        }
+        let expected: Vec<Vec<u8>> = (7..=22).map(|index| vec![index as u8]).collect();
+        assert_eq!(delivered, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn credit_round_trip_updates_peer_credit() -> Result<(), CryptoError> {
+        let (mut sender, mut receiver) = sender_receiver()?;
+        for _ in 0..5 {
+            let _ = receiver.encrypt_next(b"sent")?;
+        }
+
+        let credit = sender.encrypt_credit(5)?;
+        assert_eq!(
+            receiver.decrypt_credit(credit.counter, &credit.ciphertext_with_tag)?,
+            Some(5)
+        );
+        assert_eq!(receiver.peer_credit_next_expected(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_stale_and_lower_credit_are_noops() -> Result<(), CryptoError> {
+        let (mut sender, mut receiver) = sender_receiver()?;
+        for _ in 0..3 {
+            let _ = receiver.encrypt_next(b"sent")?;
+        }
+
+        let first = sender.encrypt_credit(2)?;
+        assert_eq!(
+            receiver.decrypt_credit(first.counter, &first.ciphertext_with_tag)?,
+            Some(2)
+        );
+        assert_eq!(
+            receiver.decrypt_credit(first.counter, &first.ciphertext_with_tag)?,
+            None
+        );
+
+        let lower = sender.encrypt_credit(1)?;
+        assert_eq!(
+            receiver.decrypt_credit(lower.counter, &lower.ciphertext_with_tag)?,
+            None
+        );
+        assert_eq!(receiver.peer_credit_next_expected(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn credit_control_counter_gaps_are_tolerated() -> Result<(), CryptoError> {
+        let (mut sender, mut receiver) = sender_receiver()?;
+        for _ in 0..4 {
+            let _ = receiver.encrypt_next(b"sent")?;
+        }
+
+        let first = sender.encrypt_credit(1)?;
+        let _skipped = sender.encrypt_credit(2)?;
+        let third = sender.encrypt_credit(3)?;
+
+        assert_eq!(
+            receiver.decrypt_credit(first.counter, &first.ciphertext_with_tag)?,
+            Some(1)
+        );
+        assert_eq!(
+            receiver.decrypt_credit(third.counter, &third.ciphertext_with_tag)?,
+            Some(3)
+        );
+        assert_eq!(receiver.peer_credit_next_expected(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn future_credit_beyond_sent_is_fatal() -> Result<(), CryptoError> {
+        let (mut sender, mut receiver) = sender_receiver()?;
+        let credit = sender.encrypt_credit(1)?;
+        let err = receiver
+            .decrypt_credit(credit.counter, &credit.ciphertext_with_tag)
+            .err();
+        assert!(matches!(
+            err,
+            Some(CryptoError::CounterViolation(
+                CounterViolation::CreditBeyondSent {
+                    sent_next: 0,
+                    credit_next: 1,
+                }
+            ))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_credit_direction_fails_aead() -> Result<(), CryptoError> {
+        let (sender, mut receiver) = sender_receiver()?;
+        let ciphertext_with_tag = encrypt_chunk(
+            &sender.cipher,
+            &sender.aad,
+            DIRECTION_CREDIT_CLIENT_TO_HOST,
+            0,
+            &0_u64.to_be_bytes(),
+        )?;
+
+        let err = receiver.decrypt_credit(0, &ciphertext_with_tag).err();
+        assert_eq!(err, Some(CryptoError::AeadFailure));
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_credit_fails_aead() -> Result<(), CryptoError> {
+        let (mut sender, mut receiver) = sender_receiver()?;
+        let mut credit = sender.encrypt_credit(0)?;
+        credit.ciphertext_with_tag[0] ^= 0xff;
+
+        let err = receiver
+            .decrypt_credit(credit.counter, &credit.ciphertext_with_tag)
+            .err();
+        assert_eq!(err, Some(CryptoError::AeadFailure));
         Ok(())
     }
 

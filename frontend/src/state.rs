@@ -1396,6 +1396,12 @@ pub struct AppState {
     /// `host_settings_by_host` (`HostSettings.backend_config`).
     pub backend_config_schemas:
         RwSignal<HashMap<String, HashMap<BackendKind, protocol::BackendConfigSchema>>>,
+    /// Server-owned snapshots of each backend's *current native* configuration,
+    /// keyed by host id then backend kind. These are the backend's own source of
+    /// truth (read by the server), distinct from the Tyde-managed overrides in
+    /// `HostSettings.backend_config`. Backends without deep config are absent.
+    pub backend_config_snapshots:
+        RwSignal<HashMap<String, HashMap<BackendKind, protocol::BackendConfigSnapshot>>>,
     /// Host id for which the next `NewTerminal` should steal focus. Set when the
     /// user clicks Install/Sign-in; consumed in the dispatcher so the new
     /// terminal becomes active even if another terminal was already selected.
@@ -1721,6 +1727,7 @@ impl AppState {
             session_schemas: RwSignal::new(HashMap::new()),
             schemas_loaded_for_host: RwSignal::new(HashMap::new()),
             backend_config_schemas: RwSignal::new(HashMap::new()),
+            backend_config_snapshots: RwSignal::new(HashMap::new()),
             pending_terminal_focus: RwSignal::new(None),
             agent_session_settings: RwSignal::new(HashMap::new()),
             draft_session_settings: RwSignal::new(SessionSettingsValues::default()),
@@ -2398,9 +2405,6 @@ impl AppState {
             if let Some(token_usage) = update.token_usage {
                 entry.message.token_usage = Some(token_usage);
             }
-            if let Some(turn_token_usage) = update.turn_token_usage {
-                entry.message.turn_token_usage = Some(turn_token_usage);
-            }
             if let Some(context_breakdown) = update.context_breakdown {
                 entry.message.context_breakdown = Some(context_breakdown);
             }
@@ -2872,6 +2876,9 @@ impl AppState {
         });
         self.backend_config_schemas.update(|schemas| {
             schemas.remove(host_id);
+        });
+        self.backend_config_snapshots.update(|snapshots| {
+            snapshots.remove(host_id);
         });
         self.schemas_loaded_for_host.update(|loaded| {
             loaded.remove(host_id);
@@ -4353,7 +4360,6 @@ mod tests {
                     tool_calls: Vec::new(),
                     model_info: None,
                     token_usage: None,
-                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 },
@@ -5008,7 +5014,6 @@ mod tests {
                     tool_calls: Vec::new(),
                     model_info: None,
                     token_usage: None,
-                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 },
@@ -5022,15 +5027,16 @@ mod tests {
                 model_info: Some(protocol::ModelInfo {
                     model: "gpt-test".to_owned(),
                 }),
-                token_usage: Some(protocol::TokenUsage {
-                    input_tokens: 7,
-                    output_tokens: 3,
-                    total_tokens: 10,
-                    cached_prompt_tokens: None,
-                    cache_creation_input_tokens: None,
-                    reasoning_tokens: None,
-                }),
-                turn_token_usage: None,
+                token_usage: Some(protocol::MessageTokenUsage::request_known(
+                    protocol::TokenUsage {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                        total_tokens: 10,
+                        cached_prompt_tokens: None,
+                        cache_creation_input_tokens: None,
+                        reasoning_tokens: None,
+                    },
+                )),
                 context_breakdown: None,
             };
             state.apply_chat_message_metadata(&agent_id, update);
@@ -5056,8 +5062,9 @@ mod tests {
                     .message
                     .token_usage
                     .as_ref()
-                    .is_some_and(|t| t.total_tokens == 10),
-                "token_usage patched"
+                    .and_then(|t| t.request.known_usage())
+                    .is_some_and(|u| u.total_tokens == 10),
+                "token_usage request scope patched"
             );
             assert!(
                 entry.message.context_breakdown.is_none(),
@@ -5081,7 +5088,6 @@ mod tests {
                     message_id: message_id.clone(),
                     model_info: None,
                     token_usage: None,
-                    turn_token_usage: None,
                     context_breakdown: Some(breakdown),
                 },
             );
@@ -5099,7 +5105,8 @@ mod tests {
                     .message
                     .token_usage
                     .as_ref()
-                    .is_some_and(|t| t.total_tokens == 10),
+                    .and_then(|t| t.request.known_usage())
+                    .is_some_and(|u| u.total_tokens == 10),
                 "prior token_usage preserved across partial update"
             );
             assert!(
@@ -5118,7 +5125,6 @@ mod tests {
                     message_id: protocol::ChatMessageId("missing".to_owned()),
                     model_info: None,
                     token_usage: None,
-                    turn_token_usage: None,
                     context_breakdown: None,
                 },
             );

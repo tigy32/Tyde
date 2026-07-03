@@ -364,9 +364,9 @@ pub fn SessionSettingsBar() -> impl IntoView {
         })
     };
 
-    // Cumulative token usage for the active session: the running `agent_total`
-    // carried on the most recent assistant message that reported usage. Keyed
-    // per-message and summed server-side, so the latest one is the session total.
+    // Cumulative token usage for the active session: the `token_usage.cumulative`
+    // scope carried on the most recent assistant message that reported it. Summed
+    // server-side, so the latest known value is the session total.
     let cumulative_usage = {
         let state = state.clone();
         Signal::derive(move || -> Option<protocol::TokenUsage> {
@@ -374,14 +374,13 @@ pub fn SessionSettingsBar() -> impl IntoView {
             state.chat_rows.with(|rows| {
                 rows.get(&agent_ref.agent_id).and_then(|handles| {
                     handles.iter().rev().find_map(|handle| {
-                        handle
-                            .entry
-                            .with(|entry| match &entry.message.turn_token_usage {
-                                Some(protocol::TurnTokenUsage::Known { agent_total, .. }) => {
-                                    Some((**agent_total).clone())
-                                }
-                                _ => None,
-                            })
+                        handle.entry.with(|entry| {
+                            entry
+                                .message
+                                .token_usage
+                                .as_ref()
+                                .and_then(|usage| usage.cumulative.known_usage().cloned())
+                        })
                     })
                 })
             })

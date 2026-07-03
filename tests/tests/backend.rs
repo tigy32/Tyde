@@ -14,9 +14,8 @@ use protocol::{
     MessageMetadataUpdateData, MessageSender, NewAgentPayload, ProtocolValidator, SessionId,
     SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingFieldType,
     SessionSettingValue, SessionSettingsValues, SessionSummary, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, TokenUsage,
+    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, TokenUsage, TokenUsageScope,
     TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolRequest, ToolRequestType,
-    TurnTokenUsage,
 };
 use server::backend::Backend;
 use uuid::Uuid;
@@ -2322,9 +2321,6 @@ fn fold_metadata_update_into_message(message: &mut ChatMessage, update: MessageM
     if let Some(token_usage) = update.token_usage {
         message.token_usage = Some(token_usage);
     }
-    if let Some(turn_token_usage) = update.turn_token_usage {
-        message.turn_token_usage = Some(turn_token_usage);
-    }
     if let Some(context_breakdown) = update.context_breakdown {
         message.context_breakdown = Some(context_breakdown);
     }
@@ -2350,30 +2346,38 @@ fn known_turn_from_folded(
     turn_index: usize,
     folded: &FoldedTokenTurn,
 ) -> KnownTokenTurn {
-    let TurnTokenUsage::Known {
-        this_turn,
-        agent_total,
-    } = folded.message.turn_token_usage.as_ref().unwrap_or_else(|| {
+    let usage = folded.message.token_usage.as_ref().unwrap_or_else(|| {
         panic!(
-            "{} turn {turn_index} missing turn_token_usage on folded message: {:?}",
+            "{} turn {turn_index} missing token_usage on folded message: {:?}",
             backend_label(backend_kind),
             folded.message
         )
-    })
-    else {
+    });
+    let Some(this_turn) = usage.turn.known_usage() else {
         panic!(
             "{} turn {turn_index} reported unavailable token usage on folded message: {:?}",
             backend_label(backend_kind),
             folded.message
         );
     };
+    let Some(agent_total) = usage.cumulative.known_usage() else {
+        panic!(
+            "{} turn {turn_index} missing cumulative token usage on folded message: {:?}",
+            backend_label(backend_kind),
+            folded.message
+        );
+    };
 
-    let this_turn = (**this_turn).clone();
-    let agent_total = (**agent_total).clone();
+    let this_turn = this_turn.clone();
+    let agent_total = agent_total.clone();
     assert_eq!(
-        folded.message.token_usage.as_ref(),
+        folded
+            .message
+            .token_usage
+            .as_ref()
+            .and_then(|usage| usage.request.known_usage()),
         Some(&this_turn),
-        "{} turn {turn_index}: ChatMessage.token_usage must match TurnTokenUsage::Known.this_turn",
+        "{} turn {turn_index}: request usage must match this turn usage for one-request backend turn",
         backend_label(backend_kind)
     );
     assert!(
@@ -2425,17 +2429,26 @@ fn assert_unavailable_folded_turn(
     folded: &FoldedTokenTurn,
 ) {
     assert!(
-        folded.message.token_usage.is_none(),
+        matches!(
+            folded
+                .message
+                .token_usage
+                .as_ref()
+                .map(|usage| &usage.request),
+            Some(TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport
+            })
+        ),
         "{} turn {turn_index}: non-reporting backend should not fabricate ChatMessage.token_usage: {:?}",
         backend_label(backend_kind),
         folded.message.token_usage
     );
-    match folded.message.turn_token_usage.as_ref() {
-        Some(TurnTokenUsage::Unavailable {
+    match folded.message.token_usage.as_ref().map(|usage| &usage.turn) {
+        Some(TokenUsageScope::Unavailable {
             reason: TokenUsageUnavailableReason::BackendDidNotReport,
         }) => {}
         other => panic!(
-            "{} turn {turn_index}: expected TurnTokenUsage::Unavailable(BackendDidNotReport), got {other:?}",
+            "{} turn {turn_index}: expected turn usage Unavailable(BackendDidNotReport), got {other:?}",
             backend_label(backend_kind)
         ),
     }
@@ -2720,10 +2733,10 @@ async fn assert_backend_turn_usage_contract_if_reported(backend_kind: BackendKin
     .await;
 
     match (
-        first.message.turn_token_usage.as_ref(),
-        second.message.turn_token_usage.as_ref(),
+        first.message.token_usage.as_ref().map(|usage| &usage.turn),
+        second.message.token_usage.as_ref().map(|usage| &usage.turn),
     ) {
-        (Some(TurnTokenUsage::Known { .. }), Some(TurnTokenUsage::Known { .. })) => {
+        (Some(TokenUsageScope::Known { .. }), Some(TokenUsageScope::Known { .. })) => {
             let first = known_turn_from_folded(backend_kind, 1, &first);
             let second = known_turn_from_folded(backend_kind, 2, &second);
             assert_eq!(
@@ -2750,10 +2763,10 @@ async fn assert_backend_turn_usage_contract_if_reported(backend_kind: BackendKin
             );
         }
         (
-            Some(TurnTokenUsage::Unavailable {
+            Some(TokenUsageScope::Unavailable {
                 reason: TokenUsageUnavailableReason::BackendDidNotReport,
             }),
-            Some(TurnTokenUsage::Unavailable {
+            Some(TokenUsageScope::Unavailable {
                 reason: TokenUsageUnavailableReason::BackendDidNotReport,
             }),
         ) => {
@@ -3122,7 +3135,15 @@ async fn assert_codex_emits_token_usage(fixture: &mut RealBackendFixture) {
                         panic!("expected Codex StreamEnd to include message_id")
                     });
                 assert!(
-                    data.message.token_usage.is_none(),
+                    matches!(
+                        data.message
+                            .token_usage
+                            .as_ref()
+                            .map(|usage| &usage.request),
+                        Some(TokenUsageScope::Unavailable {
+                            reason: TokenUsageUnavailableReason::BackendDidNotReport
+                        })
+                    ),
                     "Codex StreamEnd should leave late token usage for MessageMetadataUpdated; message_id={message_id}"
                 );
                 assert!(
@@ -3189,6 +3210,10 @@ async fn assert_codex_emits_token_usage(fixture: &mut RealBackendFixture) {
             "expected Codex MessageMetadataUpdated for {message_id} to include token usage; final_text={final_text:?}"
         )
     });
+    let usage = usage
+        .turn
+        .known_usage()
+        .unwrap_or_else(|| panic!("expected Codex metadata to include known turn usage"));
     assert!(
         usage.total_tokens > 0,
         "expected positive Codex total token usage; got {usage:?}"

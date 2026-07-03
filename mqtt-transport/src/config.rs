@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::framing::{DIRECTION_CLIENT_TO_HOST, DIRECTION_HOST_TO_CLIENT};
+use crate::framing::{
+    DIRECTION_CLIENT_TO_HOST, DIRECTION_CREDIT_CLIENT_TO_HOST, DIRECTION_CREDIT_HOST_TO_CLIENT,
+    DIRECTION_HOST_TO_CLIENT,
+};
 use crate::topic::{client_to_host_topic, host_to_client_topic};
 use crate::types::{BrokerEndpoint, PreSharedKey, RoomId};
 
@@ -38,6 +41,20 @@ impl ParticipantRole {
         match self {
             Self::Host => DIRECTION_CLIENT_TO_HOST,
             Self::Client => DIRECTION_HOST_TO_CLIENT,
+        }
+    }
+
+    pub(crate) const fn outbound_credit_direction(self) -> u8 {
+        match self {
+            Self::Host => DIRECTION_CREDIT_HOST_TO_CLIENT,
+            Self::Client => DIRECTION_CREDIT_CLIENT_TO_HOST,
+        }
+    }
+
+    pub(crate) const fn inbound_credit_direction(self) -> u8 {
+        match self {
+            Self::Host => DIRECTION_CREDIT_CLIENT_TO_HOST,
+            Self::Client => DIRECTION_CREDIT_HOST_TO_CLIENT,
         }
     }
 

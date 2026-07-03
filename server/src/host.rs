@@ -17,17 +17,18 @@ use protocol::{
     AgentId, AgentInput, AgentOrderKey, AgentOrigin, AgentPinsUpdate, AgentStartPayload,
     AgentSystemTagAssignment, AgentSystemTagDescriptor, AgentSystemTagId, AgentTagsSnapshot,
     AgentTagsUpdate, AgentWorkflowMetadata, AgentsViewPreferencesNotifyPayload,
-    AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate, BackendKind, BackendSetupPayload,
-    BrowseBootstrapListing, BrowseBootstrapPayload, CancelWorkflowPayload,
-    CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
-    CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
+    AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate, BackendConfigSnapshot,
+    BackendConfigSnapshotsPayload, BackendKind, BackendSetupPayload, BrowseBootstrapListing,
+    BrowseBootstrapPayload, CancelWorkflowPayload, CodeIntelCancelReferencesPayload,
+    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
+    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, GitBranchName, HostAbsPath,
     HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
     HostFilterId, HostLaunchProfileConfig, HostSettingsPayload, ImageData, LOCAL_HOST_ID,
     LaunchProfile, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
-    LaunchProfileId, McpServerConfig, McpServerDeletePayload, McpServerId, McpServerNotifyPayload,
-    McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
+    LaunchProfileId, LaunchProfileKind, McpServerConfig, McpServerDeletePayload, McpServerId,
+    McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
     MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
     ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
@@ -145,6 +146,7 @@ struct HostSubscriber {
     bootstrapped_agent_streams: HashSet<StreamPath>,
     last_session_schemas: Option<Vec<SessionSchemaEntry>>,
     last_backend_config_schemas: Option<Vec<protocol::BackendConfigSchema>>,
+    last_backend_config_snapshots: Option<Vec<BackendConfigSnapshot>>,
     last_launch_profile_catalog: Option<LaunchProfileCatalog>,
 }
 
@@ -220,6 +222,7 @@ const ACTIVITY_SUMMARY_INITIAL_DELAY: Duration = Duration::from_secs(10);
 const ACTIVITY_SUMMARY_DEBOUNCE: Duration = Duration::from_secs(5);
 const ACTIVITY_SUMMARY_MAX_FREQUENCY: Duration = Duration::from_secs(60);
 const ACTIVITY_SUMMARY_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+const ACTIVITY_SUMMARY_GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActivitySummarySettingsSignal {
@@ -249,12 +252,27 @@ struct ActivitySummarySchedulerEntry {
     latest_observed_through_seq: Option<u64>,
 }
 
+#[derive(Debug)]
+struct ActivitySummaryTaskStarted {
+    agent_id: AgentId,
+    epoch: u64,
+    requested_at_ms: u64,
+    previous_summary: Option<AgentActivitySummary>,
+}
+
+#[derive(Debug)]
 struct ActivitySummaryTaskResult {
     agent_id: AgentId,
     epoch: u64,
     transient_agent_id: AgentId,
     source_through_seq: Option<u64>,
     result: Result<AgentActivitySummary, String>,
+}
+
+#[derive(Debug)]
+enum ActivitySummaryTaskEvent {
+    Started(ActivitySummaryTaskStarted),
+    Finished(ActivitySummaryTaskResult),
 }
 
 #[derive(Clone, Debug)]
@@ -333,6 +351,7 @@ pub(crate) struct HostState {
     pub mobile_access: MobileAccessHandle,
     kiro_session_schema: KiroSessionSchemaState,
     hermes_session_schema: HermesSessionSchemaState,
+    backend_config_snapshots: Vec<BackendConfigSnapshot>,
     kiro_probe_program: Option<String>,
     skip_real_backend_probe: bool,
     host_streams: HashMap<StreamPath, HostSubscriber>,
@@ -551,6 +570,7 @@ impl HostHandle {
                 bootstrapped_agent_streams: HashSet::new(),
                 last_session_schemas: None,
                 last_backend_config_schemas: None,
+                last_backend_config_snapshots: None,
                 last_launch_profile_catalog: None,
             },
         );
@@ -641,6 +661,7 @@ impl HostHandle {
         let schemas = session_schemas_for_enabled_backends(&state, &settings.enabled_backends);
         let backend_config_schemas =
             backend_config_schemas_for_enabled_backends(&settings.enabled_backends);
+        let backend_config_snapshots = state.backend_config_snapshots.clone();
         let launch_profile_catalog = launch_profile_catalog_for_settings(&state, &settings);
 
         let mobile_access = {
@@ -819,6 +840,7 @@ impl HostHandle {
             backend_setup,
             session_schemas: schemas,
             backend_config_schemas,
+            backend_config_snapshots,
             launch_profile_catalog,
             sessions,
             projects,
@@ -858,6 +880,7 @@ impl HostHandle {
         }
         subscriber.last_session_schemas = Some(bootstrap.session_schemas.clone());
         subscriber.last_backend_config_schemas = Some(bootstrap.backend_config_schemas.clone());
+        subscriber.last_backend_config_snapshots = Some(bootstrap.backend_config_snapshots.clone());
         subscriber.last_launch_profile_catalog = Some(bootstrap.launch_profile_catalog.clone());
         state
             .mobile_access
@@ -880,6 +903,7 @@ impl HostHandle {
         if refresh_dynamic_session_schemas {
             self.schedule_session_schema_refresh();
         }
+        self.schedule_backend_config_snapshot_refresh();
         deferred_attachments
     }
 
@@ -4691,7 +4715,6 @@ impl HostHandle {
         if let protocol::HostSettingValue::BackendConfig { backend, values } = &payload.setting
             && *backend == BackendKind::Tycode
         {
-            let incoming = crate::backend::sanitize_backend_config_values(*backend, values);
             let settings_store = {
                 let state = self.state.lock().await;
                 Arc::clone(&state.settings_store)
@@ -4705,10 +4728,13 @@ impl HostHandle {
                 .get(backend)
                 .map(|values| crate::backend::sanitize_backend_config_values(*backend, values))
                 .unwrap_or_default();
-            let values = crate::backend::tycode::tycode_backend_config_persistence_values(
-                &incoming, &previous,
-            );
-            crate::backend::tycode::persist_backend_config(values)
+            let incoming = crate::backend::validate_backend_config_values(*backend, values)
+                .map_err(|error| AppError::invalid(OPERATION, error))?;
+            let persistence_values =
+                crate::backend::tycode::tycode_backend_config_persistence_values(
+                    &incoming, &previous,
+                );
+            crate::backend::tycode::persist_backend_config(persistence_values)
                 .await
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         }
@@ -4717,6 +4743,14 @@ impl HostHandle {
         let refresh_session_schemas = matches!(
             &payload.setting,
             protocol::HostSettingValue::EnabledBackends { .. }
+        );
+        let refresh_backend_config_snapshots = matches!(
+            &payload.setting,
+            protocol::HostSettingValue::EnabledBackends { .. }
+                | protocol::HostSettingValue::BackendConfig {
+                    backend: BackendKind::Tycode,
+                    ..
+                }
         );
         let settings = state
             .settings_store
@@ -4728,9 +4762,14 @@ impl HostHandle {
         apply_agent_activity_summary_setting(&mut state, &settings).await;
         state.mobile_access.settings_changed(settings);
         fan_out_launch_profile_catalog(&mut state).await;
-        if refresh_session_schemas {
+        if refresh_session_schemas || refresh_backend_config_snapshots {
             drop(state);
-            self.refresh_session_schemas().await;
+            if refresh_session_schemas {
+                self.refresh_session_schemas().await;
+            }
+            if refresh_backend_config_snapshots {
+                self.refresh_backend_config_snapshots().await;
+            }
         }
         Ok(())
     }
@@ -4980,6 +5019,39 @@ impl HostHandle {
         tokio::spawn(async move {
             host.refresh_session_schemas().await;
         });
+    }
+
+    fn schedule_backend_config_snapshot_refresh(&self) {
+        let host = self.clone();
+        tokio::spawn(async move {
+            host.refresh_backend_config_snapshots().await;
+        });
+    }
+
+    pub(crate) async fn refresh_backend_config_snapshots(&self) {
+        let (settings_store, skip_real_backend_probe) = {
+            let state = self.state.lock().await;
+            (
+                Arc::clone(&state.settings_store),
+                state.skip_real_backend_probe,
+            )
+        };
+        let enabled_backends = settings_store
+            .lock()
+            .await
+            .get()
+            .unwrap_or_else(|err| {
+                panic!("failed to load host settings for backend config snapshots: {err}")
+            })
+            .enabled_backends;
+        let snapshots = if skip_real_backend_probe {
+            Vec::new()
+        } else {
+            backend_config_snapshots_for_enabled_backends(&enabled_backends).await
+        };
+        let mut state = self.state.lock().await;
+        state.backend_config_snapshots = snapshots;
+        fan_out_backend_config_snapshots(&mut state).await;
     }
 
     pub(crate) async fn refresh_session_schemas(&self) {
@@ -9359,6 +9431,7 @@ fn spawn_host_inner(
             mobile_access: mobile_access.clone(),
             kiro_session_schema: KiroSessionSchemaState::Pending,
             hermes_session_schema: HermesSessionSchemaState::Pending,
+            backend_config_snapshots: Vec::new(),
             kiro_probe_program: runtime_config.kiro_probe_program.clone(),
             skip_real_backend_probe: runtime_config.skip_real_backend_probe,
             host_streams: HashMap::new(),
@@ -9567,7 +9640,8 @@ fn spawn_agent_activity_summary_task(host: HostHandle) {
     let worker = async move {
         let mut status_rx = host.subscribe_agent_status_changes().await;
         let mut settings_rx = host.activity_summary_settings_receiver().await;
-        let (result_tx, mut result_rx) = mpsc::unbounded_channel::<ActivitySummaryTaskResult>();
+        let (task_event_tx, mut task_event_rx) =
+            mpsc::unbounded_channel::<ActivitySummaryTaskEvent>();
         let semaphore = Arc::new(Semaphore::new(1));
         let mut entries = HashMap::<AgentId, ActivitySummarySchedulerEntry>::new();
 
@@ -9594,7 +9668,7 @@ fn spawn_agent_activity_summary_task(host: HostHandle) {
                         &mut entries,
                         current_settings,
                         Arc::clone(&semaphore),
-                        result_tx.clone(),
+                        task_event_tx.clone(),
                     )
                     .await;
                 }
@@ -9622,9 +9696,16 @@ fn spawn_agent_activity_summary_task(host: HostHandle) {
                         }
                     }
                 }
-                Some(result) = result_rx.recv() => {
+                Some(event) = task_event_rx.recv() => {
                     let settings = *settings_rx.borrow();
-                    finish_activity_summary_call(&host, &mut entries, result, settings).await;
+                    match event {
+                        ActivitySummaryTaskEvent::Started(started) => {
+                            begin_activity_summary_call(&host, &mut entries, started, settings).await;
+                        }
+                        ActivitySummaryTaskEvent::Finished(result) => {
+                            finish_activity_summary_call(&host, &mut entries, result, settings).await;
+                        }
+                    }
                 }
             }
         }
@@ -9752,7 +9833,7 @@ async fn start_due_activity_summary_calls(
     entries: &mut HashMap<AgentId, ActivitySummarySchedulerEntry>,
     settings: ActivitySummarySettingsSignal,
     semaphore: Arc<Semaphore>,
-    result_tx: mpsc::UnboundedSender<ActivitySummaryTaskResult>,
+    task_event_tx: mpsc::UnboundedSender<ActivitySummaryTaskEvent>,
 ) {
     let now = Instant::now();
     let due_agent_ids = entries
@@ -9803,16 +9884,6 @@ async fn start_due_activity_summary_calls(
         let previous_text = previous_summary
             .as_ref()
             .map(|summary| summary.text.clone());
-        let requested_at_ms = crate::agent::now_ms();
-        host.set_agent_activity_summary_state(
-            agent_id.clone(),
-            AgentActivitySummaryState::Pending {
-                requested_at_ms,
-                previous: previous_summary,
-            },
-        )
-        .await;
-
         let transient_agent_id = AgentId(Uuid::new_v4().to_string());
         debug_assert!(
             !host.is_agent_registered(&transient_agent_id).await,
@@ -9834,20 +9905,22 @@ async fn start_due_activity_summary_calls(
             source_through_seq: history.through_seq,
             use_mock_backend: host.use_mock_backend().await,
         };
-        let result_tx = result_tx.clone();
+        let task_event_tx = task_event_tx.clone();
         let host_for_assert = host.clone();
         let semaphore = Arc::clone(&semaphore);
         tokio::spawn(async move {
             let permit = match semaphore.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => {
-                    let _ = result_tx.send(ActivitySummaryTaskResult {
-                        agent_id,
-                        epoch: settings.epoch,
-                        transient_agent_id,
-                        source_through_seq: request.source_through_seq,
-                        result: Err("activity summary concurrency limiter closed".to_owned()),
-                    });
+                    let _ = task_event_tx.send(ActivitySummaryTaskEvent::Finished(
+                        ActivitySummaryTaskResult {
+                            agent_id,
+                            epoch: settings.epoch,
+                            transient_agent_id,
+                            source_through_seq: request.source_through_seq,
+                            result: Err("activity summary concurrency limiter closed".to_owned()),
+                        },
+                    ));
                     return;
                 }
             };
@@ -9858,7 +9931,19 @@ async fn start_due_activity_summary_calls(
                 "activity summary transient agent id was registered before direct backend spawn"
             );
             let source_through_seq = request.source_through_seq;
-            let result = generate_agent_activity_summary(request).await;
+            let _ = task_event_tx.send(ActivitySummaryTaskEvent::Started(
+                ActivitySummaryTaskStarted {
+                    agent_id: agent_id.clone(),
+                    epoch: settings.epoch,
+                    requested_at_ms: crate::agent::now_ms(),
+                    previous_summary,
+                },
+            ));
+            let result = await_activity_summary_generation(
+                generate_agent_activity_summary(request),
+                ACTIVITY_SUMMARY_GENERATION_TIMEOUT,
+            )
+            .await;
             debug_assert!(
                 !host_for_assert
                     .is_agent_registered(&transient_agent_id)
@@ -9866,15 +9951,70 @@ async fn start_due_activity_summary_calls(
                 "activity summary transient agent id was registered after direct backend spawn"
             );
             drop(permit);
-            let _ = result_tx.send(ActivitySummaryTaskResult {
-                agent_id,
-                epoch: settings.epoch,
-                transient_agent_id,
-                source_through_seq,
-                result,
-            });
+            let _ = task_event_tx.send(ActivitySummaryTaskEvent::Finished(
+                ActivitySummaryTaskResult {
+                    agent_id,
+                    epoch: settings.epoch,
+                    transient_agent_id,
+                    source_through_seq,
+                    result,
+                },
+            ));
         });
     }
+}
+
+async fn begin_activity_summary_call(
+    host: &HostHandle,
+    entries: &mut HashMap<AgentId, ActivitySummarySchedulerEntry>,
+    started: ActivitySummaryTaskStarted,
+    settings: ActivitySummarySettingsSignal,
+) {
+    if !settings.enabled || settings.epoch != started.epoch {
+        return;
+    }
+    if !entries.contains_key(&started.agent_id) {
+        return;
+    }
+    if !host.is_agent_registered(&started.agent_id).await {
+        entries.remove(&started.agent_id);
+        return;
+    }
+
+    host.set_agent_activity_summary_state(
+        started.agent_id,
+        AgentActivitySummaryState::Pending {
+            requested_at_ms: started.requested_at_ms,
+            previous: started.previous_summary,
+        },
+    )
+    .await;
+}
+
+async fn await_activity_summary_generation<F>(
+    generation: F,
+    timeout: Duration,
+) -> Result<AgentActivitySummary, String>
+where
+    F: Future<Output = Result<AgentActivitySummary, String>>,
+{
+    match tokio::time::timeout(timeout, generation).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "activity summary generation timed out after {}",
+            activity_summary_timeout_label(timeout)
+        )),
+    }
+}
+
+fn activity_summary_timeout_label(timeout: Duration) -> String {
+    if timeout.subsec_nanos() == 0 && timeout.as_secs() == 1 {
+        return "1 second".to_owned();
+    }
+    if timeout.subsec_nanos() == 0 {
+        return format!("{} seconds", timeout.as_secs());
+    }
+    format!("{} ms", timeout.as_millis())
 }
 
 async fn finish_activity_summary_call(
@@ -11692,6 +11832,29 @@ fn backend_config_schemas_for_enabled_backends(
         .collect()
 }
 
+async fn backend_config_snapshots_for_enabled_backends(
+    enabled_backends: &[protocol::BackendKind],
+) -> Vec<BackendConfigSnapshot> {
+    let workspace_roots = match hermes_probe_workspace_root() {
+        Ok(root) => vec![root],
+        Err(err) => {
+            tracing::error!(
+                "failed to resolve backend config snapshot probe workspace root: {err}"
+            );
+            Vec::new()
+        }
+    };
+    let mut snapshots = Vec::new();
+    for kind in enabled_backends {
+        if let Some(snapshot) =
+            crate::backend::backend_config_snapshot_for_backend(*kind, &workspace_roots).await
+        {
+            snapshots.push(snapshot);
+        }
+    }
+    snapshots
+}
+
 async fn fan_out_backend_config_schemas(state: &mut HostState) {
     let enabled_backends = state
         .settings_store
@@ -11711,6 +11874,28 @@ async fn fan_out_backend_config_schemas(state: &mut HostState) {
             continue;
         };
         if emit_backend_config_schemas_for_subscriber(&schemas, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
+async fn fan_out_backend_config_snapshots(state: &mut HostState) {
+    let snapshots = state.backend_config_snapshots.clone();
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_backend_config_snapshots_for_subscriber(&snapshots, subscriber)
             .await
             .is_err()
         {
@@ -11768,6 +11953,24 @@ async fn emit_backend_config_schemas_for_subscriber(
         .stream
         .send_value(FrameKind::BackendConfigSchemas, payload)?;
     subscriber.last_backend_config_schemas = Some(schemas.to_vec());
+    Ok(())
+}
+
+async fn emit_backend_config_snapshots_for_subscriber(
+    snapshots: &[BackendConfigSnapshot],
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    if subscriber.last_backend_config_snapshots.as_deref() == Some(snapshots) {
+        return Ok(());
+    }
+    let payload = serde_json::to_value(BackendConfigSnapshotsPayload {
+        snapshots: snapshots.to_vec(),
+    })
+    .expect("failed to serialize BackendConfigSnapshots payload for host stream fanout");
+    subscriber
+        .stream
+        .send_value(FrameKind::BackendConfigSnapshots, payload)?;
+    subscriber.last_backend_config_snapshots = Some(snapshots.to_vec());
     Ok(())
 }
 
@@ -12164,6 +12367,7 @@ fn launch_profile_catalog_for_settings(
         entries.push(LaunchProfileEntry::Ready {
             profile: LaunchProfile {
                 id: default_launch_profile_id(backend_kind),
+                kind: LaunchProfileKind::BackendDefault,
                 label: backend_launch_profile_label(backend_kind).to_owned(),
                 description: Some(format!(
                     "Launch {} with its backend defaults.",
@@ -12221,6 +12425,7 @@ fn launch_profile_entry_for_config(
         return LaunchProfileEntry::Ready {
             profile: LaunchProfile {
                 id: config.id.clone(),
+                kind: LaunchProfileKind::Custom,
                 label: config.label.clone(),
                 description: config.description.clone(),
                 backend_kind: config.backend_kind,
@@ -12235,6 +12440,7 @@ fn launch_profile_entry_for_config(
                 Ok(()) => LaunchProfileEntry::Ready {
                     profile: LaunchProfile {
                         id: config.id.clone(),
+                        kind: LaunchProfileKind::Custom,
                         label: config.label.clone(),
                         description: config.description.clone(),
                         backend_kind: config.backend_kind,
@@ -12243,6 +12449,7 @@ fn launch_profile_entry_for_config(
                 },
                 Err(error) => LaunchProfileEntry::Unavailable {
                     id: config.id.clone(),
+                    kind: LaunchProfileKind::Custom,
                     backend_kind: config.backend_kind,
                     label: config.label.clone(),
                     message: format!(
@@ -12253,6 +12460,7 @@ fn launch_profile_entry_for_config(
         }
         SessionSchemaEntry::Pending { .. } => LaunchProfileEntry::Unavailable {
             id: config.id.clone(),
+            kind: LaunchProfileKind::Custom,
             backend_kind: config.backend_kind,
             label: config.label.clone(),
             message: format!(
@@ -12262,6 +12470,7 @@ fn launch_profile_entry_for_config(
         },
         SessionSchemaEntry::Unavailable { message, .. } => LaunchProfileEntry::Unavailable {
             id: config.id.clone(),
+            kind: LaunchProfileKind::Custom,
             backend_kind: config.backend_kind,
             label: config.label.clone(),
             message: format!(
@@ -12690,6 +12899,148 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn activity_summary_state(
+        host: &HostHandle,
+        agent_id: &AgentId,
+    ) -> AgentActivitySummaryState {
+        let state = host.state.lock().await;
+        current_agent_activity_summary_state(&state, agent_id)
+    }
+
+    #[tokio::test]
+    async fn activity_summary_timeout_error_clears_in_flight_and_emits_error() {
+        let fixture = compact_fixture().await;
+        let (agent_id, _) = spawn_idle_user_agent(&fixture.host, "timeout summary target").await;
+        let mut entries = HashMap::new();
+        entries.insert(
+            agent_id.clone(),
+            ActivitySummarySchedulerEntry {
+                in_flight: true,
+                ..Default::default()
+            },
+        );
+
+        finish_activity_summary_call(
+            &fixture.host,
+            &mut entries,
+            ActivitySummaryTaskResult {
+                agent_id: agent_id.clone(),
+                epoch: 7,
+                transient_agent_id: AgentId(Uuid::new_v4().to_string()),
+                source_through_seq: Some(12),
+                result: Err("activity summary generation timed out after 30 seconds".to_owned()),
+            },
+            ActivitySummarySettingsSignal {
+                enabled: true,
+                epoch: 7,
+            },
+        )
+        .await;
+
+        let entry = entries.get(&agent_id).expect("scheduler entry");
+        assert!(
+            !entry.in_flight,
+            "timeout result must clear the in-flight marker"
+        );
+        let state = activity_summary_state(&fixture.host, &agent_id).await;
+        let AgentActivitySummaryState::Error { message, .. } = state else {
+            panic!("expected activity summary error after timeout, got {state:?}");
+        };
+        assert_eq!(
+            message,
+            "activity summary generation timed out after 30 seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_summary_generation_timeout_returns_error() {
+        let error = await_activity_summary_generation(
+            std::future::pending::<Result<AgentActivitySummary, String>>(),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("pending summary generation should time out");
+
+        assert_eq!(error, "activity summary generation timed out after 10 ms");
+    }
+
+    #[tokio::test]
+    async fn queued_activity_summary_waits_for_permit_before_pending_state() {
+        let fixture = compact_fixture().await;
+        let (slow_agent_id, _) =
+            spawn_idle_user_agent(&fixture.host, "__mock_slow_activity_summary__ keep working")
+                .await;
+        let (queued_agent_id, _) =
+            spawn_idle_user_agent(&fixture.host, "normal queued summary").await;
+        let settings = ActivitySummarySettingsSignal {
+            enabled: true,
+            epoch: 11,
+        };
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (task_event_tx, mut task_event_rx) = mpsc::unbounded_channel();
+        let mut entries = HashMap::new();
+        entries.insert(
+            slow_agent_id.clone(),
+            ActivitySummarySchedulerEntry {
+                pending_due: Some(Instant::now() - Duration::from_millis(1)),
+                ..Default::default()
+            },
+        );
+
+        start_due_activity_summary_calls(
+            &fixture.host,
+            &mut entries,
+            settings,
+            Arc::clone(&semaphore),
+            task_event_tx.clone(),
+        )
+        .await;
+        let started = tokio::time::timeout(Duration::from_secs(1), task_event_rx.recv())
+            .await
+            .expect("slow summary should acquire the permit")
+            .expect("slow summary start event");
+        let ActivitySummaryTaskEvent::Started(started) = started else {
+            panic!("expected slow summary start event");
+        };
+        assert_eq!(started.agent_id, slow_agent_id);
+        begin_activity_summary_call(&fixture.host, &mut entries, started, settings).await;
+        assert!(matches!(
+            activity_summary_state(&fixture.host, &slow_agent_id).await,
+            AgentActivitySummaryState::Pending { .. }
+        ));
+
+        entries.insert(
+            queued_agent_id.clone(),
+            ActivitySummarySchedulerEntry {
+                pending_due: Some(Instant::now() - Duration::from_millis(1)),
+                ..Default::default()
+            },
+        );
+        start_due_activity_summary_calls(
+            &fixture.host,
+            &mut entries,
+            settings,
+            Arc::clone(&semaphore),
+            task_event_tx,
+        )
+        .await;
+
+        match tokio::time::timeout(Duration::from_millis(200), task_event_rx.recv()).await {
+            Err(_) => {}
+            Ok(Some(event)) => {
+                panic!("queued summary emitted an event before the permit was free: {event:?}");
+            }
+            Ok(None) => panic!("activity summary task event channel closed"),
+        }
+        assert!(
+            !matches!(
+                activity_summary_state(&fixture.host, &queued_agent_id).await,
+                AgentActivitySummaryState::Pending { .. }
+            ),
+            "queued summaries must not render as Pending before generation starts"
+        );
     }
 
     #[tokio::test]

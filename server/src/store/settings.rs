@@ -333,13 +333,12 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
             settings.backend_tier_configs.insert(backend, config);
         }
         HostSettingValue::BackendConfig { backend, values } => {
-            // Drop keys/values the backend's config schema doesn't accept so a
-            // stale client can't persist junk. An empty result clears the entry.
-            let sanitized = crate::backend::sanitize_backend_config_values(backend, &values);
-            if sanitized.0.is_empty() {
+            let previous = settings.backend_config.get(&backend);
+            let merged = crate::backend::merge_backend_config_update(backend, previous, &values)?;
+            if merged.0.is_empty() {
                 settings.backend_config.remove(&backend);
             } else {
-                settings.backend_config.insert(backend, sanitized);
+                settings.backend_config.insert(backend, merged);
             }
         }
         HostSettingValue::LaunchProfiles { profiles } => {

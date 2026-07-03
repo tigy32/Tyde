@@ -7,25 +7,26 @@ use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin,
     AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
-    BackendConfigSchemasPayload, BackendSetupPayload, BrowseBootstrapListing,
-    BrowseBootstrapPayload, ByteRange, ChatEvent, CodeIntelDiagnosticsPayload,
-    CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelHoverResultPayload, CodeIntelLocation, CodeIntelNavigateResultPayload,
-    CodeIntelOverviewPayload, CodeIntelReferenceLine, CodeIntelReferencesCompletePayload,
-    CodeIntelReferencesFileResult, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
-    CodeIntelStatusScope, CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind,
-    HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HostBrowseOpenedPayload, HostSettingsPayload, LaunchProfileCatalogPayload,
-    McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload,
-    MobilePairingState, NewAgentPayload, NewTerminalPayload, ProjectBootstrapPayload,
-    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload,
-    ProjectGitCommitResultPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectNotifyPayload, ProjectPath, ProjectSearchCompletePayload, ProjectSearchResultsPayload,
-    ProtocolValidator, QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload,
-    ReviewCommentSource, ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState,
-    SessionHistoryPayload, SessionId, SessionListPayload, SessionSchemasPayload,
-    SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
-    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
+    BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendSetupPayload,
+    BrowseBootstrapListing, BrowseBootstrapPayload, ByteRange, ChatEvent,
+    CodeIntelDiagnosticsPayload, CodeIntelErrorContext, CodeIntelErrorPayload,
+    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelLocation,
+    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferenceLine,
+    CodeIntelReferencesCompletePayload, CodeIntelReferencesFileResult,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CodeIntelStatusScope,
+    CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
+    HostBrowseEntriesPayload, HostBrowseErrorPayload, HostBrowseOpenedPayload, HostSettingsPayload,
+    LaunchProfileCatalogPayload, McpServerNotifyPayload, MobileAccessStatePayload,
+    MobilePairingOfferPayload, MobilePairingState, NewAgentPayload, NewTerminalPayload,
+    ProjectBootstrapPayload, ProjectEventPayload, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitCommitResultPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectPath,
+    ProjectSearchCompletePayload, ProjectSearchResultsPayload, ProtocolValidator,
+    QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
+    ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionHistoryPayload,
+    SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
+    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload,
+    TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
     TerminalBootstrapPayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     TerminalStartPayload, WelcomePayload, WorkflowNotifyPayload, WorkflowRunNotifyPayload,
@@ -196,6 +197,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
         },
         session_schemas: Vec::new(),
         backend_config_schemas: Vec::new(),
+        backend_config_snapshots: Vec::new(),
         launch_profile_catalog: Default::default(),
         sessions: Vec::new(),
         projects: Vec::new(),
@@ -774,6 +776,27 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 ),
             }
         }
+        FrameKind::BackendConfigSnapshots => {
+            match envelope.parse_payload::<BackendConfigSnapshotsPayload>() {
+                Ok(payload) => {
+                    state.backend_config_snapshots.update(|snapshots_by_host| {
+                        let host_snapshots =
+                            snapshots_by_host.entry(host_id.to_string()).or_default();
+                        host_snapshots.clear();
+                        for snapshot in payload.snapshots {
+                            host_snapshots.insert(snapshot.backend_kind, snapshot);
+                        }
+                    });
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse backend_config_snapshots payload: {error}"),
+                ),
+            }
+        }
         FrameKind::SessionSettings => {
             let Some(agent_id) = resolve_agent_id(state, host_id, &envelope.stream) else {
                 log::warn!("session_settings on unknown stream {}", envelope.stream);
@@ -1138,7 +1161,6 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         tool_calls: Vec::new(),
                         model_info: None,
                         token_usage: None,
-                        turn_token_usage: None,
                         context_breakdown: None,
                         images: None,
                     },
@@ -4048,9 +4070,6 @@ impl HistoryReplay {
                     if data.token_usage.is_some() {
                         entry.message.token_usage = data.token_usage.clone();
                     }
-                    if data.turn_token_usage.is_some() {
-                        entry.message.turn_token_usage = data.turn_token_usage.clone();
-                    }
                     if data.context_breakdown.is_some() {
                         entry.message.context_breakdown = data.context_breakdown.clone();
                     }
@@ -4591,6 +4610,13 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
             host_schemas.insert(schema.backend_kind, schema);
         }
     });
+    state.backend_config_snapshots.update(|snapshots_by_host| {
+        let host_snapshots = snapshots_by_host.entry(host_id.to_string()).or_default();
+        host_snapshots.clear();
+        for snapshot in payload.backend_config_snapshots {
+            host_snapshots.insert(snapshot.backend_kind, snapshot);
+        }
+    });
     state.sessions.update(|sessions| {
         sessions.retain(|session| session.host_id != host_id);
         sessions.extend(payload.sessions.into_iter().map(|summary| SessionInfo {
@@ -4832,7 +4858,6 @@ fn apply_agent_bootstrap(
                         tool_calls: Vec::new(),
                         model_info: None,
                         token_usage: None,
-                        turn_token_usage: None,
                         context_breakdown: None,
                         images: None,
                     },
@@ -5081,6 +5106,7 @@ mod tests {
                 },
                 session_schemas: Vec::new(),
                 backend_config_schemas: Vec::new(),
+                backend_config_snapshots: Vec::new(),
                 launch_profile_catalog: Default::default(),
                 sessions: Vec::new(),
                 projects: Vec::new(),
@@ -5289,7 +5315,6 @@ mod tests {
                 tool_calls: Vec::new(),
                 model_info: None,
                 token_usage: None,
-                turn_token_usage: None,
                 context_breakdown: None,
                 images: None,
             };
@@ -5316,15 +5341,16 @@ mod tests {
                     model_info: Some(protocol::ModelInfo {
                         model: "gpt-test".to_owned(),
                     }),
-                    token_usage: Some(protocol::TokenUsage {
-                        input_tokens: 7,
-                        output_tokens: 3,
-                        total_tokens: 10,
-                        cached_prompt_tokens: None,
-                        cache_creation_input_tokens: None,
-                        reasoning_tokens: None,
-                    }),
-                    turn_token_usage: None,
+                    token_usage: Some(protocol::MessageTokenUsage::request_known(
+                        protocol::TokenUsage {
+                            input_tokens: 7,
+                            output_tokens: 3,
+                            total_tokens: 10,
+                            cached_prompt_tokens: None,
+                            cache_creation_input_tokens: None,
+                            reasoning_tokens: None,
+                        },
+                    )),
                     context_breakdown: None,
                 }),
             );
@@ -5357,8 +5383,9 @@ mod tests {
                     .message
                     .token_usage
                     .as_ref()
-                    .is_some_and(|t| t.total_tokens == 10),
-                "token_usage patched"
+                    .and_then(|t| t.request.known_usage())
+                    .is_some_and(|u| u.total_tokens == 10),
+                "token_usage request scope patched"
             );
         });
     }
@@ -5403,7 +5430,6 @@ mod tests {
                     tool_calls: Vec::new(),
                     model_info: None,
                     token_usage: None,
-                    turn_token_usage: None,
                     context_breakdown: None,
                     images: None,
                 };
@@ -5508,7 +5534,6 @@ mod tests {
                 tool_calls: Vec::new(),
                 model_info: None,
                 token_usage: None,
-                turn_token_usage: None,
                 context_breakdown: None,
                 images: None,
             };

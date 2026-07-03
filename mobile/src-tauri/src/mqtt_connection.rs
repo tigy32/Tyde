@@ -1166,7 +1166,10 @@ fn mobile_error_code_for_transport(error: &MqttTransportError) -> MobileAccessEr
         }
         MqttTransportError::Framing(_)
         | MqttTransportError::RetainedMessage { .. }
-        | MqttTransportError::PublishAckMismatch { .. } => MobileAccessErrorCode::TransportFailed,
+        | MqttTransportError::PublishAckMismatch { .. }
+        | MqttTransportError::ReceiverCreditTimeout { .. } => {
+            MobileAccessErrorCode::TransportFailed
+        }
         MqttTransportError::Crypto(_) => MobileAccessErrorCode::CryptoFailed,
         MqttTransportError::ActorClosed => MobileAccessErrorCode::TransportFailed,
     }

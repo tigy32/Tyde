@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use fixture::Fixture;
 use protocol::{
-    BackendKind, BackendSetupStatus, CodeIntelProviderId, FrameKind, HostExecutablePath,
-    HostSettingValue, HostSettings, SessionId,
+    BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload, BackendConfigValues, BackendKind,
+    BackendSetupStatus, CodeIntelProviderId, FrameKind, HostExecutablePath, HostSettingValue,
+    HostSettings, HostSettingsPayload, SessionId, SessionSettingValue, SetSettingPayload,
 };
 use server::backend::BackendSession;
 use server::store::session::SessionStore;
@@ -59,6 +60,24 @@ async fn expect_no_backend_setup_replay(client: &mut client::Connection) {
     }
 }
 
+async fn expect_host_settings(
+    client: &mut client::Connection,
+    context: &str,
+) -> HostSettingsPayload {
+    loop {
+        let env = client
+            .next_event()
+            .await
+            .unwrap_or_else(|err| panic!("next_event failed before {context}: {err:?}"))
+            .unwrap_or_else(|| panic!("connection closed before {context}"));
+        if env.kind == FrameKind::HostSettings {
+            return env
+                .parse_payload()
+                .unwrap_or_else(|err| panic!("failed to parse HostSettings for {context}: {err}"));
+        }
+    }
+}
+
 fn write_fake_tycode_binary(home: &Path) -> PathBuf {
     let path = home
         .join(".tyde")
@@ -67,8 +86,38 @@ fn write_fake_tycode_binary(home: &Path) -> PathBuf {
         .join("tycode-subprocess");
     std::fs::create_dir_all(path.parent().expect("fake Tycode parent"))
         .expect("create fake Tycode install dir");
-    std::fs::write(&path, "#!/bin/sh\nprintf 'tycode-subprocess 0.7.7\\n'\n")
-        .expect("write fake Tycode binary");
+    let settings = serde_json::json!({
+        "active_provider": "native-provider",
+        "providers": {
+            "native-provider": { "type": "mock" }
+        },
+        "model_quality": "high",
+        "reasoning_effort": "Max",
+        "autonomy_level": "fully_autonomous",
+        "review_level": "Task",
+        "spawn_context_mode": "Fresh"
+    });
+    let settings_literal = serde_json::to_string(&settings.to_string()).expect("settings literal");
+    let body = r#"#!/usr/bin/env python3
+import json
+import sys
+
+if "--version" in sys.argv:
+    print("tycode-subprocess 0.7.7")
+    sys.exit(0)
+
+settings = json.loads(__SETTINGS__)
+print(json.dumps({"kind":"SessionStarted","data":{"session_id":"fake-session"}}), flush=True)
+for raw_line in sys.stdin:
+    line = raw_line.strip()
+    if not line:
+        continue
+    command = json.loads(line)
+    if command == "GetSettings":
+        print(json.dumps({"kind":"Settings","data":settings}), flush=True)
+"#
+    .replace("__SETTINGS__", &settings_literal);
+    std::fs::write(&path, body).expect("write fake Tycode binary");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -79,6 +128,41 @@ fn write_fake_tycode_binary(home: &Path) -> PathBuf {
         std::fs::set_permissions(&path, perms).expect("chmod fake Tycode binary");
     }
     path
+}
+
+fn write_fake_hermes_install(home: &Path) -> PathBuf {
+    let project = home.join(".hermes").join("hermes-agent");
+    let python = project.join("venv").join("bin").join("python");
+    std::fs::create_dir_all(python.parent().expect("fake Hermes venv parent"))
+        .expect("create fake Hermes venv");
+    std::fs::write(
+        &python,
+        "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then exit 0; fi\nexit 1\n",
+    )
+    .expect("write fake Hermes python");
+    let hermes = home.join(".local").join("bin").join("hermes");
+    std::fs::create_dir_all(hermes.parent().expect("fake Hermes bin parent"))
+        .expect("create fake Hermes bin");
+    std::fs::write(
+        &hermes,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'Hermes Agent v9.9.9\\nProject: {}\\n'\n  exit 0\nfi\nexit 1\n",
+            project.to_string_lossy()
+        ),
+    )
+    .expect("write fake Hermes executable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&python, &hermes] {
+            let mut perms = std::fs::metadata(path)
+                .expect("stat fake Hermes executable")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("chmod fake Hermes executable");
+        }
+    }
+    hermes
 }
 
 fn expected_empty_settings() -> HostSettings {
@@ -261,6 +345,205 @@ fn code_intel_language_server_paths_default_set_and_clear() {
 }
 
 #[test]
+fn backend_config_updates_merge_and_clear_explicitly_in_store() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("settings.json");
+    let store = HostSettingsStore::load(path).expect("load empty settings store");
+
+    let mut first = BackendConfigValues::default();
+    first.0.insert(
+        "default_model".to_owned(),
+        SessionSettingValue::String("anthropic/claude-sonnet-5".to_owned()),
+    );
+    store
+        .apply(HostSettingValue::BackendConfig {
+            backend: BackendKind::Hermes,
+            values: first,
+        })
+        .expect("set Hermes default model");
+
+    let mut second = BackendConfigValues::default();
+    second.0.insert(
+        "default_provider".to_owned(),
+        SessionSettingValue::String("anthropic".to_owned()),
+    );
+    let settings = store
+        .apply(HostSettingValue::BackendConfig {
+            backend: BackendKind::Hermes,
+            values: second,
+        })
+        .expect("merge Hermes default provider");
+    let values = settings
+        .backend_config
+        .get(&BackendKind::Hermes)
+        .expect("Hermes backend config");
+    assert_eq!(
+        values.0.get("default_model"),
+        Some(&SessionSettingValue::String(
+            "anthropic/claude-sonnet-5".to_owned()
+        ))
+    );
+    assert_eq!(
+        values.0.get("default_provider"),
+        Some(&SessionSettingValue::String("anthropic".to_owned()))
+    );
+
+    let mut clear_one = BackendConfigValues::default();
+    clear_one
+        .0
+        .insert("default_model".to_owned(), SessionSettingValue::Null);
+    let settings = store
+        .apply(HostSettingValue::BackendConfig {
+            backend: BackendKind::Hermes,
+            values: clear_one,
+        })
+        .expect("clear Hermes default model");
+    let values = settings
+        .backend_config
+        .get(&BackendKind::Hermes)
+        .expect("Hermes backend config after clear");
+    assert!(!values.0.contains_key("default_model"));
+    assert_eq!(
+        values.0.get("default_provider"),
+        Some(&SessionSettingValue::String("anthropic".to_owned()))
+    );
+
+    let settings = store
+        .apply(HostSettingValue::BackendConfig {
+            backend: BackendKind::Hermes,
+            values: BackendConfigValues::default(),
+        })
+        .expect("clear entire Hermes config");
+    assert!(!settings.backend_config.contains_key(&BackendKind::Hermes));
+
+    let mut tycode_provider = BackendConfigValues::default();
+    tycode_provider.0.insert(
+        "active_provider".to_owned(),
+        SessionSettingValue::String("default".to_owned()),
+    );
+    store
+        .apply(HostSettingValue::BackendConfig {
+            backend: BackendKind::Tycode,
+            values: tycode_provider,
+        })
+        .expect("set Tycode active provider");
+
+    let mut tycode_quality = BackendConfigValues::default();
+    tycode_quality.0.insert(
+        "model_quality".to_owned(),
+        SessionSettingValue::String("high".to_owned()),
+    );
+    let settings = store
+        .apply(HostSettingValue::BackendConfig {
+            backend: BackendKind::Tycode,
+            values: tycode_quality,
+        })
+        .expect("merge Tycode model quality");
+    let values = settings
+        .backend_config
+        .get(&BackendKind::Tycode)
+        .expect("Tycode backend config");
+    assert_eq!(
+        values.0.get("active_provider"),
+        Some(&SessionSettingValue::String("default".to_owned()))
+    );
+    assert_eq!(
+        values.0.get("model_quality"),
+        Some(&SessionSettingValue::String("high".to_owned()))
+    );
+}
+
+#[tokio::test]
+async fn backend_config_updates_merge_through_client_events() {
+    let mut fixture = Fixture::new().await;
+
+    let mut model = BackendConfigValues::default();
+    model.0.insert(
+        "default_model".to_owned(),
+        SessionSettingValue::String("anthropic/claude-sonnet-5".to_owned()),
+    );
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::BackendConfig {
+                backend: BackendKind::Hermes,
+                values: model,
+            },
+        })
+        .await
+        .expect("set Hermes default model");
+    let settings = expect_host_settings(&mut fixture.client, "Hermes model setting").await;
+    assert_eq!(
+        settings
+            .settings
+            .backend_config
+            .get(&BackendKind::Hermes)
+            .and_then(|values| values.0.get("default_model")),
+        Some(&SessionSettingValue::String(
+            "anthropic/claude-sonnet-5".to_owned()
+        ))
+    );
+
+    let mut provider = BackendConfigValues::default();
+    provider.0.insert(
+        "default_provider".to_owned(),
+        SessionSettingValue::String("anthropic".to_owned()),
+    );
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::BackendConfig {
+                backend: BackendKind::Hermes,
+                values: provider,
+            },
+        })
+        .await
+        .expect("merge Hermes default provider");
+    let settings = expect_host_settings(&mut fixture.client, "Hermes provider setting").await;
+    let values = settings
+        .settings
+        .backend_config
+        .get(&BackendKind::Hermes)
+        .expect("Hermes backend config after merge");
+    assert_eq!(
+        values.0.get("default_model"),
+        Some(&SessionSettingValue::String(
+            "anthropic/claude-sonnet-5".to_owned()
+        ))
+    );
+    assert_eq!(
+        values.0.get("default_provider"),
+        Some(&SessionSettingValue::String("anthropic".to_owned()))
+    );
+
+    let mut clear = BackendConfigValues::default();
+    clear
+        .0
+        .insert("default_model".to_owned(), SessionSettingValue::Null);
+    fixture
+        .client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::BackendConfig {
+                backend: BackendKind::Hermes,
+                values: clear,
+            },
+        })
+        .await
+        .expect("clear Hermes default model");
+    let settings = expect_host_settings(&mut fixture.client, "Hermes clear setting").await;
+    let values = settings
+        .settings
+        .backend_config
+        .get(&BackendKind::Hermes)
+        .expect("Hermes backend config after explicit clear");
+    assert!(!values.0.contains_key("default_model"));
+    assert_eq!(
+        values.0.get("default_provider"),
+        Some(&SessionSettingValue::String("anthropic".to_owned()))
+    );
+}
+
+#[test]
 fn generated_alias_never_overrides_user_alias() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let path = dir.path().join("sessions.json");
@@ -310,7 +593,13 @@ async fn backend_setup_payload_uses_sign_in_command_and_versioned_tycode_probe()
     let _env_guard = env_lock().lock().await;
     let temp_home = tempfile::tempdir().expect("create temp HOME");
     write_fake_tycode_binary(temp_home.path());
+    let fake_hermes = write_fake_hermes_install(temp_home.path());
     let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());
+    let _hermes = EnvVarGuard::set(
+        "HERMES_EXECUTABLE",
+        fake_hermes.to_string_lossy().to_string(),
+    );
+    let _hermes_python = EnvVarGuard::set("HERMES_PYTHON", "".to_string());
 
     let mut fixture = Fixture::new_with_real_backend_probe().await;
     let payload = fixture.bootstrap.backend_setup.clone();
@@ -368,5 +657,76 @@ async fn backend_setup_payload_uses_sign_in_command_and_versioned_tycode_probe()
     assert!(
         claude_value.get("follow_up_commands").is_none(),
         "BackendSetupInfo should not serialize follow_up_commands"
+    );
+
+    let hermes = payload
+        .backends
+        .iter()
+        .find(|info| info.backend_kind == BackendKind::Hermes)
+        .expect("Hermes backend setup entry");
+    assert_eq!(hermes.status, BackendSetupStatus::Installed);
+    assert_eq!(
+        hermes.installed_version.as_deref(),
+        Some("Hermes Agent v9.9.9")
+    );
+    assert!(
+        hermes.diagnostic.is_none(),
+        "installed fake Hermes should not report diagnostics"
+    );
+    let hermes_sign_in = hermes
+        .sign_in_command
+        .as_ref()
+        .expect("Hermes sign-in should use resolved executable");
+    let expected_hermes_setup = format!("{} setup", fake_hermes.to_string_lossy());
+    assert_eq!(
+        hermes_sign_in.display_command.as_deref(),
+        Some(expected_hermes_setup.as_str())
+    );
+    assert!(
+        hermes_sign_in
+            .command
+            .contains(&fake_hermes.to_string_lossy().to_string()),
+        "Hermes sign-in command should include resolved executable: {}",
+        hermes_sign_in.command
+    );
+}
+
+#[tokio::test]
+async fn backend_config_snapshots_report_native_tycode_settings() {
+    let _env_guard = env_lock().lock().await;
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    write_fake_tycode_binary(temp_home.path());
+    let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());
+    let _hermes_python =
+        EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
+
+    let mut fixture = Fixture::new_with_real_backend_probe().await;
+    let payload = loop {
+        let env = fixture
+            .client
+            .next_event()
+            .await
+            .expect("next_event while waiting for BackendConfigSnapshots")
+            .expect("connection closed before BackendConfigSnapshots");
+        if env.kind == FrameKind::BackendConfigSnapshots {
+            break env
+                .parse_payload::<BackendConfigSnapshotsPayload>()
+                .expect("BackendConfigSnapshots payload");
+        }
+    };
+
+    let tycode = payload
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.backend_kind == BackendKind::Tycode)
+        .expect("Tycode native backend config snapshot");
+    assert_eq!(tycode.status, BackendConfigSnapshotStatus::Ready);
+    assert_eq!(
+        tycode.values.0.get("active_provider"),
+        Some(&SessionSettingValue::String("native-provider".to_string()))
+    );
+    assert_eq!(
+        tycode.values.0.get("model_quality"),
+        Some(&SessionSettingValue::String("high".to_string()))
     );
 }

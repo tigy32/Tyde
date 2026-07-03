@@ -46,6 +46,7 @@ pub async fn connect(config: MqttConnectConfig) -> Result<EnvelopeStream, MqttTr
         pending_peer_salt: None,
         established_peer_salt: None,
         pending_data_frames: VecDeque::new(),
+        pending_credit_frames: VecDeque::new(),
         outbound_rx,
         inbound_tx,
         ready_tx: Some(ready_tx),

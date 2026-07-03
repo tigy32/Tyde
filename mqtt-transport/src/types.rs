@@ -53,7 +53,7 @@ pub enum TransportTypeError {
     },
 }
 
-pub const MQTT_TRANSPORT_PROTOCOL_VERSION: u32 = 2;
+pub const MQTT_TRANSPORT_PROTOCOL_VERSION: u32 = 3;
 pub const MOBILE_QR_VERSION: u32 = 2;
 pub const MQTT_VERSION: u8 = 5;
 pub const MQTT_QOS_AT_LEAST_ONCE: u8 = 1;

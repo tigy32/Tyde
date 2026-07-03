@@ -15,9 +15,10 @@ use std::collections::HashMap;
 
 use protocol::{
     AgentErrorCode, AgentInput, BackendAccessMode, BackendConfigFieldType, BackendConfigSchema,
-    BackendConfigValues, BackendKind, BackendTierConfig, ChatEvent, CustomAgentId, ImageData,
-    SendMessagePayload, SessionId, SessionSettingFieldType, SessionSettingValue,
-    SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
+    BackendConfigSnapshot, BackendConfigSnapshotStatus, BackendConfigValues, BackendKind,
+    BackendTierConfig, ChatEvent, CustomAgentId, ImageData, SendMessagePayload, SessionId,
+    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
+    SpawnCostHint,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -343,6 +344,34 @@ pub(crate) fn backend_config_schema_for_backend(
     }
 }
 
+pub(crate) async fn backend_config_snapshot_for_backend(
+    backend_kind: BackendKind,
+    workspace_roots: &[String],
+) -> Option<BackendConfigSnapshot> {
+    let result = match backend_kind {
+        BackendKind::Hermes => hermes::probe_backend_config_snapshot(workspace_roots).await,
+        BackendKind::Tycode => tycode::backend_config_snapshot().await,
+        BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex | BackendKind::Antigravity => {
+            return None;
+        }
+    };
+
+    Some(match result {
+        Ok(values) => BackendConfigSnapshot {
+            backend_kind,
+            status: BackendConfigSnapshotStatus::Ready,
+            values,
+            message: None,
+        },
+        Err(error) => BackendConfigSnapshot {
+            backend_kind,
+            status: BackendConfigSnapshotStatus::Unavailable,
+            values: BackendConfigValues::default(),
+            message: Some(error),
+        },
+    })
+}
+
 /// Drop keys/values that the backend's config schema does not accept. A backend
 /// with no config schema sanitizes to empty (it stores no deep config).
 pub(crate) fn sanitize_backend_config_values(
@@ -362,6 +391,55 @@ pub(crate) fn sanitize_backend_config_values(
         }
     }
     sanitized
+}
+
+pub(crate) fn validate_backend_config_values(
+    backend_kind: BackendKind,
+    values: &BackendConfigValues,
+) -> Result<BackendConfigValues, String> {
+    if values.0.is_empty() {
+        return Ok(BackendConfigValues::default());
+    }
+    let Some(schema) = backend_config_schema_for_backend(backend_kind) else {
+        return Err(format!(
+            "{backend_kind:?} does not support backend configuration"
+        ));
+    };
+    let mut sanitized = BackendConfigValues::default();
+    for (key, value) in &values.0 {
+        let Some(field) = schema.fields.iter().find(|field| field.key == *key) else {
+            return Err(format!(
+                "{backend_kind:?} backend config key '{key}' is not defined by its schema"
+            ));
+        };
+        validate_backend_config_value(key, value, &field.field_type)
+            .map_err(|err| format!("{backend_kind:?} backend config invalid: {err}"))?;
+        sanitized.0.insert(key.clone(), value.clone());
+    }
+    Ok(sanitized)
+}
+
+pub(crate) fn merge_backend_config_update(
+    backend_kind: BackendKind,
+    previous: Option<&BackendConfigValues>,
+    incoming: &BackendConfigValues,
+) -> Result<BackendConfigValues, String> {
+    if incoming.0.is_empty() {
+        return Ok(BackendConfigValues::default());
+    }
+
+    let update = validate_backend_config_values(backend_kind, incoming)?;
+    let mut merged = previous
+        .map(|values| sanitize_backend_config_values(backend_kind, values))
+        .unwrap_or_default();
+    for (key, value) in update.0 {
+        if matches!(value, SessionSettingValue::Null) {
+            merged.0.remove(&key);
+        } else {
+            merged.0.insert(key, value);
+        }
+    }
+    Ok(merged)
 }
 
 fn validate_backend_config_value(
@@ -632,8 +710,9 @@ mod tests {
     use protocol::{BackendAccessMode, BackendConfigValues, BackendKind, SessionSettingValue};
 
     use super::{
-        READ_ONLY_ACCESS_MODE_INSTRUCTIONS, render_combined_spawn_instructions,
-        sanitize_backend_config_values,
+        READ_ONLY_ACCESS_MODE_INSTRUCTIONS, merge_backend_config_update,
+        render_combined_spawn_instructions, sanitize_backend_config_values,
+        validate_backend_config_values,
     };
     use crate::agent::customization::ResolvedSpawnConfig;
 
@@ -667,6 +746,46 @@ mod tests {
         // A backend with no config schema sanitizes everything away.
         let sanitized = sanitize_backend_config_values(BackendKind::Claude, &good);
         assert!(sanitized.0.is_empty());
+    }
+
+    #[test]
+    fn backend_config_update_validation_surfaces_bad_keys_and_merges() {
+        let mut previous = BackendConfigValues::default();
+        previous.0.insert(
+            "default_model".to_string(),
+            SessionSettingValue::String("anthropic/claude-sonnet-5".to_string()),
+        );
+
+        let mut update = BackendConfigValues::default();
+        update.0.insert(
+            "default_provider".to_string(),
+            SessionSettingValue::String("anthropic".to_string()),
+        );
+        let merged = merge_backend_config_update(BackendKind::Hermes, Some(&previous), &update)
+            .expect("valid update merges");
+        assert_eq!(merged.0.len(), 2);
+        assert!(merged.0.contains_key("default_model"));
+        assert!(merged.0.contains_key("default_provider"));
+
+        let mut clear = BackendConfigValues::default();
+        clear
+            .0
+            .insert("default_model".to_string(), SessionSettingValue::Null);
+        let merged = merge_backend_config_update(BackendKind::Hermes, Some(&merged), &clear)
+            .expect("null update clears");
+        assert!(!merged.0.contains_key("default_model"));
+        assert!(merged.0.contains_key("default_provider"));
+
+        let mut unknown = BackendConfigValues::default();
+        unknown
+            .0
+            .insert("bogus_key".to_string(), SessionSettingValue::Bool(true));
+        let err = validate_backend_config_values(BackendKind::Hermes, &unknown)
+            .expect_err("unknown backend config key should be rejected");
+        assert!(
+            err.contains("bogus_key"),
+            "error should include rejected key: {err}"
+        );
     }
 
     #[test]

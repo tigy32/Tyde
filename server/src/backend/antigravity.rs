@@ -770,7 +770,6 @@ impl AntigravityInner {
             tool_calls: Vec::new(),
             model_info: None,
             token_usage: None,
-            turn_token_usage: None,
             context_breakdown: None,
             images,
         }));
@@ -795,7 +794,6 @@ impl AntigravityInner {
                     model: model.to_string(),
                 }),
                 token_usage: None,
-                turn_token_usage: None,
                 context_breakdown: None,
                 images: None,
             },
@@ -820,7 +818,6 @@ impl AntigravityInner {
             tool_calls: Vec::new(),
             model_info: None,
             token_usage: None,
-            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         }));

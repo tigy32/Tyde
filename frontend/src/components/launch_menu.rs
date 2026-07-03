@@ -1,9 +1,10 @@
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::actions::begin_new_chat_with_profile;
 use crate::state::{AppState, DEFAULT_CUSTOM_AGENT_ID};
 
-use protocol::{BackendKind, CustomAgent, LaunchProfileEntry, LaunchProfileId};
+use protocol::{BackendKind, CustomAgent, LaunchProfileEntry, LaunchProfileId, LaunchProfileKind};
 
 fn backend_label_for(kind: BackendKind) -> &'static str {
     match kind {
@@ -16,24 +17,103 @@ fn backend_label_for(kind: BackendKind) -> &'static str {
     }
 }
 
+/// The subtle backend tag shown on the right of a launch-profile row, or `None`
+/// when it would be redundant. Backend-default rows never show it — their label
+/// already *is* the backend name — so we don't render e.g. "Claude   CLAUDE".
+/// Custom rows show it only when their label differs from the backend identity,
+/// so a custom profile that happens to be named after its backend also stays
+/// clean. Driven entirely by the server-provided `kind`, never inferred from
+/// the label string.
+fn backend_tag_for(
+    kind: LaunchProfileKind,
+    backend: BackendKind,
+    label: &str,
+) -> Option<&'static str> {
+    match kind {
+        LaunchProfileKind::BackendDefault => None,
+        LaunchProfileKind::Custom => {
+            let name = backend_label_for(backend);
+            if label.trim().eq_ignore_ascii_case(name) {
+                None
+            } else {
+                Some(name)
+            }
+        }
+    }
+}
+
 const ITEM_STYLE: &str = "display:flex;align-items:center;gap:0.5rem;width:100%;text-align:left;padding:0.4rem 0.6rem;background:transparent;border:none;color:inherit;cursor:pointer;border-radius:4px;white-space:nowrap;";
 const SUBITEM_STYLE: &str = "display:block;width:100%;text-align:left;padding:0.4rem 0.8rem;background:transparent;border:none;color:inherit;cursor:pointer;border-radius:4px;white-space:nowrap;";
 const BADGE_STYLE: &str =
     "font-size:0.65rem;opacity:0.6;text-transform:uppercase;letter-spacing:0.03em;";
-const SUBMENU_STYLE_RIGHT: &str = "position:absolute;left:100%;top:-0.5rem;background:var(--bg-surface,#1e1e1e);border:1px solid var(--border-subtle,#333);border-radius:6px;padding:0.5rem;z-index:101;box-shadow:0 4px 16px rgba(0,0,0,0.4);white-space:nowrap;";
-const SUBMENU_STYLE_LEFT: &str = "position:absolute;right:100%;top:-0.5rem;background:var(--bg-surface,#1e1e1e);border:1px solid var(--border-subtle,#333);border-radius:6px;padding:0.5rem;z-index:101;box-shadow:0 4px 16px rgba(0,0,0,0.4);white-space:nowrap;";
+const CHEVRON_STYLE: &str = "opacity:0.5;font-size:0.7rem;";
+// Top-aligned with the hovered row (`top:0`) so the flyout reads as attached to
+// the row rather than floating above it. The 2px horizontal overlap tucks the
+// flyout under the parent's border so there is no visible gap on either side.
+const SUBMENU_STYLE_RIGHT: &str = "position:absolute;left:100%;top:0;margin-left:-2px;background:var(--bg-surface,#1e1e1e);border:1px solid var(--border-subtle,#333);border-radius:6px;padding:0.5rem;z-index:101;box-shadow:0 4px 16px rgba(0,0,0,0.4);white-space:nowrap;";
+const SUBMENU_STYLE_LEFT: &str = "position:absolute;right:100%;top:0;margin-right:-2px;background:var(--bg-surface,#1e1e1e);border:1px solid var(--border-subtle,#333);border-radius:6px;padding:0.5rem;z-index:101;box-shadow:0 4px 16px rgba(0,0,0,0.4);white-space:nowrap;";
 
-/// Which side a row's custom-agent submenu expands toward. The caller picks
-/// this based on where its popover is anchored so the submenu never spills off
-/// the viewport edge — positioning is a pure presentation concern owned by the
-/// caller, not derived from any server state.
+/// Which side a row's custom-agent submenu expands toward. Positioning is a
+/// pure presentation concern owned by the caller, not derived from any server
+/// state.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SubmenuAlign {
-    /// Open to the right of the row (`left:100%`). Home dropdown default.
+    /// Always open to the right of the row (`left:100%`).
     Right,
-    /// Open to the left of the row (`right:100%`). Used by the chat-top New
-    /// Chat dropdown, which is fixed and right-anchored.
+    /// Always open to the left of the row (`right:100%`).
     Left,
+    /// Prefer the natural right-side flyout, but flip to the left when the row
+    /// sits too close to the viewport's right edge for the flyout to fit. Used
+    /// by the chat-top New Chat dropdown, which is right-anchored: with room it
+    /// reads as a normal attached flyout, and near the edge it stays on-screen
+    /// and cleanly attached to the row's left instead of floating off-screen.
+    Auto,
+}
+
+/// Width we assume a custom-agent flyout needs before it would clip the right
+/// edge. Only used to decide the flip side in [`SubmenuAlign::Auto`]; the flyout
+/// itself is content-sized. A generous estimate biases toward flipping left one
+/// row early rather than letting the flyout spill off-screen.
+const SUBMENU_ESTIMATED_WIDTH: f64 = 240.0;
+
+fn submenu_style_for(align: SubmenuAlign) -> &'static str {
+    match align {
+        SubmenuAlign::Left => SUBMENU_STYLE_LEFT,
+        // `Auto` is resolved to Left/Right before this is read; default the
+        // unresolved case to the natural right-side flyout.
+        SubmenuAlign::Right | SubmenuAlign::Auto => SUBMENU_STYLE_RIGHT,
+    }
+}
+
+fn chevron_for(align: SubmenuAlign) -> &'static str {
+    match align {
+        SubmenuAlign::Left => "◀",
+        SubmenuAlign::Right | SubmenuAlign::Auto => "▶",
+    }
+}
+
+/// Resolve an [`SubmenuAlign::Auto`] row to a concrete side by measuring where
+/// the hovered row sits in the viewport. Opens right when the flyout fits, else
+/// flips left so it never spills off the right edge.
+fn resolve_auto_align(ev: &web_sys::MouseEvent) -> SubmenuAlign {
+    let Some(target) = ev.current_target() else {
+        return SubmenuAlign::Left;
+    };
+    let Ok(row) = target.dyn_into::<web_sys::Element>() else {
+        return SubmenuAlign::Left;
+    };
+    let Some(viewport_width) = web_sys::window()
+        .and_then(|w| w.inner_width().ok())
+        .and_then(|v| v.as_f64())
+    else {
+        return SubmenuAlign::Left;
+    };
+    let room_to_right = viewport_width - row.get_bounding_client_rect().right();
+    if room_to_right >= SUBMENU_ESTIMATED_WIDTH {
+        SubmenuAlign::Right
+    } else {
+        SubmenuAlign::Left
+    }
 }
 
 /// Shared new-chat launch menu body used by both the Home tab dropdown and the
@@ -48,10 +128,15 @@ pub enum SubmenuAlign {
 pub fn LaunchMenuBody(open_sig: RwSignal<bool>, submenu_align: SubmenuAlign) -> impl IntoView {
     let state = expect_context::<AppState>();
     let open_profile = RwSignal::new(None::<LaunchProfileId>);
-    let submenu_style = match submenu_align {
-        SubmenuAlign::Right => SUBMENU_STYLE_RIGHT,
-        SubmenuAlign::Left => SUBMENU_STYLE_LEFT,
-    };
+    // The concrete side the flyout currently opens toward. Fixed for
+    // `Right`/`Left`; for `Auto` it is re-measured each time a row is hovered so
+    // it flips only when the row is too close to the right edge. Chevron and
+    // flyout style both read this, so the arrow can never disagree with the side
+    // the flyout actually opens.
+    let resolved_align = RwSignal::new(match submenu_align {
+        SubmenuAlign::Left => SubmenuAlign::Left,
+        SubmenuAlign::Right | SubmenuAlign::Auto => SubmenuAlign::Right,
+    });
 
     let entries_state = state.clone();
     let entries = Memo::new(move |_| {
@@ -164,7 +249,7 @@ pub fn LaunchMenuBody(open_sig: RwSignal<bool>, submenu_align: SubmenuAlign) -> 
                                 <div
                                     class="new-chat-submenu"
                                     role="menu"
-                                    style=submenu_style
+                                    style=move || submenu_style_for(resolved_align.get())
                                 >
                                     <button
                                         class="new-chat-flyout-item"
@@ -184,11 +269,18 @@ pub fn LaunchMenuBody(open_sig: RwSignal<bool>, submenu_align: SubmenuAlign) -> 
                     let hover_id = profile_id.clone();
                     let expanded_id = profile_id.clone();
                     let label = profile.label.clone();
+                    let tag = backend_tag_for(profile.kind, backend, &label)
+                        .map(|t| view! { <span style=BADGE_STYLE>{t}</span> });
                     view! {
                         <div
                             class="new-chat-backend-row-wrap"
                             style="position:relative;"
-                            on:mouseenter=move |_| open_profile.set(Some(hover_id.clone()))
+                            on:mouseenter=move |ev: web_sys::MouseEvent| {
+                                open_profile.set(Some(hover_id.clone()));
+                                if submenu_align == SubmenuAlign::Auto {
+                                    resolved_align.set(resolve_auto_align(&ev));
+                                }
+                            }
                             on:mouseleave=move |_| open_profile.set(None)
                         >
                             <button
@@ -207,8 +299,13 @@ pub fn LaunchMenuBody(open_sig: RwSignal<bool>, submenu_align: SubmenuAlign) -> 
                             >
                                 <span>{label}</span>
                                 <span style="flex:1;"></span>
-                                <span style=BADGE_STYLE>{backend_label_for(backend)}</span>
-                                <span style="opacity:0.5;font-size:0.7rem;">"▶"</span>
+                                {tag}
+                                // Trailing arrow that points toward the side the
+                                // flyout actually opens; reactive so `Auto` flips
+                                // it in lock-step with the flyout.
+                                <span style=CHEVRON_STYLE>
+                                    {move || chevron_for(resolved_align.get())}
+                                </span>
                             </button>
                             {submenu}
                         </div>
@@ -217,23 +314,28 @@ pub fn LaunchMenuBody(open_sig: RwSignal<bool>, submenu_align: SubmenuAlign) -> 
                 }
                 LaunchProfileEntry::Unavailable {
                     id: _,
+                    kind,
                     backend_kind,
                     label,
                     message,
                 } => {
                     let title = message.clone();
+                    // Same padding/flex as the ready row so ready and
+                    // unavailable entries align down the menu.
+                    let tag = backend_tag_for(kind, backend_kind, &label)
+                        .map(|t| view! { <span style=BADGE_STYLE>{t}</span> });
                     view! {
                         <div
                             class="new-chat-backend-row-wrap new-chat-menu-item-disabled"
                             role="menuitem"
                             aria-disabled="true"
-                            style="position:relative;opacity:0.55;cursor:not-allowed;padding:0.35rem 0.6rem;"
+                            style="position:relative;opacity:0.55;cursor:not-allowed;padding:0.4rem 0.6rem;"
                             title=title
                         >
                             <div style="display:flex;align-items:center;gap:0.5rem;">
                                 <span>{label}</span>
                                 <span style="flex:1;"></span>
-                                <span style=BADGE_STYLE>{backend_label_for(backend_kind)}</span>
+                                {tag}
                             </div>
                             <div style="font-size:0.7rem;opacity:0.8;white-space:normal;">
                                 {message}
@@ -293,9 +395,19 @@ mod wasm_tests {
     }
 
     fn ready(id: &str, label: &str, backend: BackendKind) -> LaunchProfileEntry {
+        ready_kind(id, label, backend, LaunchProfileKind::BackendDefault)
+    }
+
+    fn ready_kind(
+        id: &str,
+        label: &str,
+        backend: BackendKind,
+        kind: LaunchProfileKind,
+    ) -> LaunchProfileEntry {
         LaunchProfileEntry::Ready {
             profile: LaunchProfile {
                 id: LaunchProfileId(id.to_owned()),
+                kind,
                 label: label.to_owned(),
                 description: None,
                 backend_kind: backend,
@@ -345,6 +457,7 @@ mod wasm_tests {
                 ready("claude:default", "Claude", BackendKind::Claude),
                 LaunchProfileEntry::Unavailable {
                     id: LaunchProfileId("hermes:codex".to_owned()),
+                    kind: LaunchProfileKind::Custom,
                     backend_kind: BackendKind::Codex,
                     label: "Hermes · Codex".to_owned(),
                     message: "Codex CLI not installed".to_owned(),
@@ -393,6 +506,7 @@ mod wasm_tests {
         let entry = LaunchProfileEntry::Ready {
             profile: LaunchProfile {
                 id: LaunchProfileId("claude:default".to_owned()),
+                kind: LaunchProfileKind::BackendDefault,
                 label: "Claude".to_owned(),
                 description: None,
                 backend_kind: BackendKind::Claude,
@@ -636,6 +750,7 @@ mod wasm_tests {
             "local",
             vec![LaunchProfileEntry::Unavailable {
                 id: LaunchProfileId("hermes:codex".to_owned()),
+                kind: LaunchProfileKind::Custom,
                 backend_kind: BackendKind::Codex,
                 label: "Hermes · Codex".to_owned(),
                 message: "Codex CLI not installed".to_owned(),
@@ -708,6 +823,213 @@ mod wasm_tests {
             state.draft_backend_override.get_untracked(),
             None,
             "no server default → no backend override; server resolves its default"
+        );
+    }
+
+    fn row_button_text(container: &HtmlElement) -> String {
+        container
+            .query_selector(".new-chat-menu-item")
+            .unwrap()
+            .expect("ready profile row button")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .text_content()
+            .unwrap_or_default()
+    }
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    /// A backend-default profile's label already *is* the backend name, so the
+    /// row must not also render a backend badge — the name appears exactly once,
+    /// never doubled up as "Claude … Claude". Suppression is driven by the typed
+    /// `LaunchProfileKind::BackendDefault`, not by comparing label strings.
+    #[wasm_bindgen_test]
+    async fn backend_default_row_shows_backend_name_once() {
+        let container = make_container();
+        let state = AppState::new();
+        set_catalog(
+            &state,
+            "local",
+            vec![ready_kind(
+                "claude:default",
+                "Claude",
+                BackendKind::Claude,
+                LaunchProfileKind::BackendDefault,
+            )],
+        );
+        let open = RwSignal::new(true);
+        mount_menu(&container, &state, open, SubmenuAlign::Right);
+        next_tick().await;
+
+        let text = row_button_text(&container);
+        assert_eq!(
+            count_occurrences(&text, "Claude"),
+            1,
+            "backend-default row must show the backend name exactly once: {text:?}"
+        );
+    }
+
+    /// A custom profile whose label differs from its backend keeps a subtle
+    /// backend tag, so the user can still see which backend it runs on even
+    /// though the label doesn't say so.
+    #[wasm_bindgen_test]
+    async fn custom_profile_shows_label_and_backend_tag() {
+        let container = make_container();
+        let state = AppState::new();
+        set_catalog(
+            &state,
+            "local",
+            vec![ready_kind(
+                "team:reviewer",
+                "My Reviewer",
+                BackendKind::Claude,
+                LaunchProfileKind::Custom,
+            )],
+        );
+        let open = RwSignal::new(true);
+        mount_menu(&container, &state, open, SubmenuAlign::Right);
+        next_tick().await;
+
+        let text = row_button_text(&container);
+        assert!(
+            text.contains("My Reviewer"),
+            "custom profile label must render: {text:?}"
+        );
+        assert!(
+            text.contains("Claude"),
+            "custom profile keeps a subtle backend tag when its label differs \
+             from the backend: {text:?}"
+        );
+    }
+
+    /// The row chevron points toward the side the flyout actually opens: `▶`
+    /// when the caller opens the submenu to the right, `◀` when it opens left.
+    /// The glyph and the submenu side can never disagree.
+    #[wasm_bindgen_test]
+    async fn chevron_direction_matches_submenu_alignment() {
+        async fn chevron_text(align: SubmenuAlign) -> String {
+            let container = make_container();
+            let state = AppState::new();
+            set_catalog(
+                &state,
+                "local",
+                vec![ready("claude:default", "Claude", BackendKind::Claude)],
+            );
+            let open = RwSignal::new(true);
+            mount_menu(&container, &state, open, align);
+            next_tick().await;
+            row_button_text(&container)
+        }
+
+        let right = chevron_text(SubmenuAlign::Right).await;
+        assert!(
+            right.contains('▶') && !right.contains('◀'),
+            "right-opening row must show a right chevron only: {right:?}"
+        );
+
+        let left = chevron_text(SubmenuAlign::Left).await;
+        assert!(
+            left.contains('◀') && !left.contains('▶'),
+            "left-opening row must show a left chevron only: {left:?}"
+        );
+    }
+
+    fn make_container_styled(style: &str) -> HtmlElement {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let container = document.create_element("div").unwrap();
+        container.set_attribute("style", style).unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    /// Mount an `Auto`-aligned menu (one ready profile + a custom agent so the
+    /// flyout has content) inside a container placed by `container_style`, hover
+    /// the row, and report `(row_left, submenu_left, row_button_text)`.
+    async fn auto_hover_geometry(container_style: &str) -> (f64, f64, String) {
+        let container = make_container_styled(container_style);
+        let state = AppState::new();
+        set_catalog(
+            &state,
+            "local",
+            vec![ready("claude:default", "Claude", BackendKind::Claude)],
+        );
+        state.custom_agents.update(|map| {
+            map.entry("local".to_owned()).or_default().insert(
+                CustomAgentId("reviewer".to_owned()),
+                CustomAgent {
+                    id: CustomAgentId("reviewer".to_owned()),
+                    name: "Reviewer".to_owned(),
+                    description: String::new(),
+                    instructions: None,
+                    skill_ids: Vec::new(),
+                    mcp_server_ids: Vec::new(),
+                    tool_policy: ToolPolicy::Unrestricted,
+                },
+            );
+        });
+        let open = RwSignal::new(true);
+        mount_menu(&container, &state, open, SubmenuAlign::Auto);
+        next_tick().await;
+
+        let row = container
+            .query_selector(".new-chat-backend-row-wrap")
+            .unwrap()
+            .expect("ready profile row wrapper")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let enter = web_sys::MouseEvent::new("mouseenter").unwrap();
+        row.dispatch_event(&enter).unwrap();
+        next_tick().await;
+
+        let submenu = container
+            .query_selector(".new-chat-submenu")
+            .unwrap()
+            .expect("submenu must be visible after hover")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        (
+            row.get_bounding_client_rect().left(),
+            submenu.get_bounding_client_rect().left(),
+            row_button_text(&container),
+        )
+    }
+
+    /// `Auto` opens the natural right-side flyout when the row has room to its
+    /// right, with the chevron pointing right — the normal, attached flyout.
+    #[wasm_bindgen_test]
+    async fn auto_flyout_prefers_right_when_room() {
+        // Narrow menu pinned to the left edge → lots of room on the right.
+        let (row_left, submenu_left, text) =
+            auto_hover_geometry("position:absolute;top:0;left:0;width:160px;").await;
+        assert!(
+            submenu_left >= row_left,
+            "with room, Auto must open the flyout to the right \
+             (submenu_left={submenu_left}, row_left={row_left})"
+        );
+        assert!(
+            text.contains('▶') && !text.contains('◀'),
+            "right-opening Auto row must show a right chevron: {text:?}"
+        );
+    }
+
+    /// `Auto` flips to a clean left-attached flyout when the row hugs the right
+    /// edge, so the custom-agent list stays on-screen instead of clipping — and
+    /// the chevron flips with it.
+    #[wasm_bindgen_test]
+    async fn auto_flyout_flips_left_near_right_edge() {
+        // Narrow menu pinned to the right edge → no room on the right.
+        let (row_left, submenu_left, text) =
+            auto_hover_geometry("position:absolute;top:0;right:0;width:160px;").await;
+        assert!(
+            submenu_left < row_left,
+            "near the right edge, Auto must flip the flyout to the left \
+             (submenu_left={submenu_left}, row_left={row_left})"
+        );
+        assert!(
+            text.contains('◀') && !text.contains('▶'),
+            "left-flipped Auto row must show a left chevron: {text:?}"
         );
     }
 }

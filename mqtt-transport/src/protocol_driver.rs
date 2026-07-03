@@ -33,10 +33,12 @@ use crate::chunking::MAX_PLAINTEXT_CHUNK_LEN;
 use crate::config::{MqttConnectConfig, ParticipantRole};
 use crate::error::{FramingError, MqttTransportError};
 use crate::framing::{
-    SESSION_SALT_LEN, TransportFrame, decode_frame, encode_data_frame, encode_handshake_frame,
+    SESSION_SALT_LEN, TransportFrame, decode_frame, encode_credit_frame, encode_data_frame,
+    encode_handshake_frame,
 };
 use crate::link::{
-    IncomingPublish, LinkEvent, MAX_QOS1_INFLIGHT, MqttLink, PublishAck, PublishToken,
+    DATA_CREDIT_WINDOW, IncomingPublish, LinkEvent, MAX_DATA_QOS1_INFLIGHT, MQTT_QOS1_WINDOW,
+    MqttLink, PublishAck, PublishToken,
 };
 use crate::rendezvous::{
     ConnectionId, OpenAccept, OpenRequest, decode_open_accept, decode_open_request,
@@ -51,6 +53,12 @@ const PUBLISH_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const PUBLISH_RETRY_MAX: Duration = Duration::from_secs(30);
 const OUTBOUND_BOXCAR_DELAY: Duration = Duration::from_millis(100);
 const RENDEZVOUS_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const CREDIT_EMIT_THRESHOLD: u64 = (DATA_CREDIT_WINDOW / 2) as u64;
+const CREDIT_DEBOUNCE: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
+const CREDIT_BLOCK_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const CREDIT_BLOCK_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Drives the Tyde transport protocol over an [`MqttLink`]. Field-for-field the
 /// former `MqttActor`, with the rumqttc `client`/`eventloop` pair replaced by a
@@ -64,6 +72,7 @@ pub(crate) struct ProtocolDriver<L: MqttLink> {
     pub(crate) pending_peer_salt: Option<[u8; SESSION_SALT_LEN]>,
     pub(crate) established_peer_salt: Option<[u8; SESSION_SALT_LEN]>,
     pub(crate) pending_data_frames: VecDeque<PendingDataFrame>,
+    pub(crate) pending_credit_frames: VecDeque<PendingCreditFrame>,
     pub(crate) outbound_rx: OutboundReceiver<OutboundChunk>,
     pub(crate) inbound_tx: mpsc::Sender<InboundEvent>,
     pub(crate) ready_tx: Option<oneshot::Sender<Result<(), MqttTransportError>>>,
@@ -76,14 +85,22 @@ impl<L: MqttLink> ProtocolDriver<L> {
     pub(crate) async fn run(mut self) {
         match self.establish_session().await {
             Ok(mut cipher) => {
-                if let Err(error) = self.flush_pending_data_frames(&mut cipher).await {
+                let mut credit = ReceiverCreditState::new();
+                if let Err(error) = self
+                    .flush_pending_data_frames(&mut cipher, &mut credit)
+                    .await
+                {
+                    let _sent = self.send_ready(Err(error));
+                    return;
+                }
+                if let Err(error) = self.flush_pending_credit_frames(&mut cipher).await {
                     let _sent = self.send_ready(Err(error));
                     return;
                 }
                 if !self.send_ready(Ok(())) {
                     return;
                 }
-                self.run_stream(cipher).await;
+                self.run_stream(cipher, credit).await;
             }
             Err(error) => {
                 let _sent = self.send_ready(Err(error));
@@ -165,6 +182,12 @@ impl<L: MqttLink> ProtocolDriver<L> {
                         } => {
                             self.defer_data_frame(counter, ciphertext_with_tag);
                         }
+                        TransportFrame::Credit {
+                            control_counter,
+                            ciphertext_with_tag,
+                        } => {
+                            self.defer_credit_frame(control_counter, ciphertext_with_tag);
+                        }
                     }
                 }
                 LinkEvent::PubAck(ack) => ack.result?,
@@ -229,6 +252,13 @@ impl<L: MqttLink> ProtocolDriver<L> {
                         self.defer_data_frame(counter, ciphertext_with_tag);
                         Ok(None)
                     }
+                    TransportFrame::Credit {
+                        control_counter,
+                        ciphertext_with_tag,
+                    } => {
+                        self.defer_credit_frame(control_counter, ciphertext_with_tag);
+                        Ok(None)
+                    }
                 }
             }
             LinkEvent::PubAck(ack) => {
@@ -245,20 +275,32 @@ impl<L: MqttLink> ProtocolDriver<L> {
         }
     }
 
-    async fn run_stream(mut self, mut cipher: SessionCipher) {
+    async fn run_stream(mut self, mut cipher: SessionCipher, mut credit: ReceiverCreditState) {
         let mut deferred_outbound: Option<OutboundChunk> = None;
         let mut in_flight = InflightPublishes::new();
         let mut outbound_closed = false;
+        let mut credit_blocked_since: Option<Instant> = None;
         loop {
-            if in_flight.has_capacity()
+            if let Err(error) = self
+                .publish_due_credit(&mut cipher, &mut in_flight, &mut credit)
+                .await
+            {
+                ack_deferred_outbound(&mut deferred_outbound, &error);
+                self.fail_stream(&mut in_flight, error).await;
+                return;
+            }
+
+            if can_publish_data(&cipher, &in_flight)
                 && let Some(outbound) = deferred_outbound.take()
             {
+                credit_blocked_since = None;
                 match self
                     .boxcar_outbound(
                         outbound,
                         &mut cipher,
                         &mut deferred_outbound,
                         &mut in_flight,
+                        &mut credit,
                     )
                     .await
                 {
@@ -268,12 +310,14 @@ impl<L: MqttLink> ProtocolDriver<L> {
                             .await
                         {
                             failure.batch.ack_error(&failure.error);
+                            ack_deferred_outbound(&mut deferred_outbound, &failure.error);
                             self.fail_stream(&mut in_flight, failure.error).await;
                             return;
                         }
                     }
                     Err(failure) => {
                         failure.batch.ack_error(&failure.error);
+                        ack_deferred_outbound(&mut deferred_outbound, &failure.error);
                         self.fail_stream(&mut in_flight, failure.error).await;
                         return;
                     }
@@ -287,8 +331,42 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 return;
             }
 
-            let can_accept_outbound = !outbound_closed && in_flight.has_capacity();
+            let receiver_credit_blocked =
+                deferred_outbound.is_some() && !has_receiver_credit(&cipher);
+            match (receiver_credit_blocked, credit_blocked_since) {
+                (true, None) => credit_blocked_since = Some(Instant::now()),
+                (false, Some(_)) => credit_blocked_since = None,
+                _ => {}
+            }
+            let credit_block_delay = credit_blocked_since.map(|since| {
+                CREDIT_BLOCK_TIMEOUT
+                    .checked_sub(Instant::now().duration_since(since))
+                    .unwrap_or(Duration::ZERO)
+            });
+            let credit_block_timer = sleep(credit_block_delay.unwrap_or(CREDIT_BLOCK_TIMEOUT));
+            tokio::pin!(credit_block_timer);
+
+            let credit_debounce_delay = credit.next_publish_delay();
+            let credit_debounce_timer = sleep(credit_debounce_delay.unwrap_or(CREDIT_DEBOUNCE));
+            tokio::pin!(credit_debounce_timer);
+
+            let can_accept_outbound = !outbound_closed
+                && deferred_outbound.is_none()
+                && in_flight.has_data_slot()
+                && in_flight.has_broker_capacity();
             tokio::select! {
+                _ = &mut credit_block_timer, if credit_block_delay.is_some() => {
+                    let error = MqttTransportError::ReceiverCreditTimeout {
+                        data_counter: cipher.next_send_data_counter(),
+                        timeout_ms: CREDIT_BLOCK_TIMEOUT.as_millis() as u64,
+                    };
+                    ack_deferred_outbound(&mut deferred_outbound, &error);
+                    self.fail_stream(&mut in_flight, error).await;
+                    return;
+                }
+                _ = &mut credit_debounce_timer, if credit_debounce_delay.is_some() => {
+                    continue;
+                }
                 event = self.link.poll() => {
                     match event {
                         Ok(event) => {
@@ -296,13 +374,17 @@ impl<L: MqttLink> ProtocolDriver<L> {
                                 event,
                                 &mut cipher,
                                 &mut in_flight,
+                                &mut credit,
                             ).await {
+                                ack_deferred_outbound(&mut deferred_outbound, &error);
                                 self.fail_stream(&mut in_flight, error).await;
                                 return;
                             }
                         }
                         Err(error) => {
-                            self.fail_stream(&mut in_flight, poll_error_to_disconnect(error)).await;
+                            let error = poll_error_to_disconnect(error);
+                            ack_deferred_outbound(&mut deferred_outbound, &error);
+                            self.fail_stream(&mut in_flight, error).await;
                             return;
                         }
                     }
@@ -310,15 +392,21 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 outbound = self.outbound_rx.next(), if can_accept_outbound => {
                     match outbound {
                         Some(outbound) => {
+                            if !can_publish_data(&cipher, &in_flight) {
+                                deferred_outbound = Some(outbound);
+                                continue;
+                            }
                             let batch = match self.boxcar_outbound(
                                 outbound,
                                 &mut cipher,
                                 &mut deferred_outbound,
                                 &mut in_flight,
+                                &mut credit,
                             ).await {
                                 Ok(batch) => batch,
                                 Err(failure) => {
                                     failure.batch.ack_error(&failure.error);
+                                    ack_deferred_outbound(&mut deferred_outbound, &failure.error);
                                     self.fail_stream(&mut in_flight, failure.error).await;
                                     return;
                                 }
@@ -329,6 +417,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
                                 &mut in_flight,
                             ).await {
                                 failure.batch.ack_error(&failure.error);
+                                ack_deferred_outbound(&mut deferred_outbound, &failure.error);
                                 self.fail_stream(&mut in_flight, failure.error).await;
                                 return;
                             }
@@ -348,6 +437,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
         cipher: &mut SessionCipher,
         deferred_outbound: &mut Option<OutboundChunk>,
         in_flight: &mut InflightPublishes,
+        credit: &mut ReceiverCreditState,
     ) -> Result<BoxcarBatch, BoxcarFailure> {
         let mut batch = BoxcarBatch::new(first);
         let delay = sleep(OUTBOUND_BOXCAR_DELAY);
@@ -381,7 +471,10 @@ impl<L: MqttLink> ProtocolDriver<L> {
                             });
                         }
                     };
-                    if let Err(error) = self.handle_stream_event(event, cipher, in_flight).await {
+                    if let Err(error) = self
+                        .handle_stream_event(event, cipher, in_flight, credit)
+                        .await
+                    {
                         return Err(BoxcarFailure {
                             batch,
                             error,
@@ -414,7 +507,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 return Err(PublishBatchFailure { batch, error });
             }
         };
-        in_flight.insert(InflightPublish {
+        in_flight.insert(InflightPublish::Data {
             token: published.token,
             counter: published.counter,
             plaintext_len: published.plaintext_len,
@@ -433,6 +526,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
         &mut self,
         event: LinkEvent,
         cipher: &mut SessionCipher,
+        credit: &mut ReceiverCreditState,
     ) -> Result<(), MqttTransportError> {
         match event {
             LinkEvent::Publish(publish) => {
@@ -443,9 +537,13 @@ impl<L: MqttLink> ProtocolDriver<L> {
                         counter,
                         ciphertext_with_tag,
                     } => {
-                        self.handle_data_frame(counter, ciphertext_with_tag, cipher)
+                        self.handle_data_frame(counter, ciphertext_with_tag, cipher, credit)
                             .await
                     }
+                    TransportFrame::Credit {
+                        control_counter,
+                        ciphertext_with_tag,
+                    } => self.handle_credit_frame(control_counter, ciphertext_with_tag, cipher),
                 }
             }
             LinkEvent::PubAck(ack) => ack.result,
@@ -461,11 +559,43 @@ impl<L: MqttLink> ProtocolDriver<L> {
         event: LinkEvent,
         cipher: &mut SessionCipher,
         in_flight: &mut InflightPublishes,
+        credit: &mut ReceiverCreditState,
     ) -> Result<(), MqttTransportError> {
         match event {
             LinkEvent::PubAck(ack) => self.handle_publish_ack(ack, in_flight),
-            other => self.handle_ready_event(other, cipher).await,
+            other => self.handle_ready_event(other, cipher, credit).await,
+        }?;
+        self.publish_due_credit(cipher, in_flight, credit).await?;
+        Ok(())
+    }
+
+    async fn publish_due_credit(
+        &mut self,
+        cipher: &mut SessionCipher,
+        in_flight: &mut InflightPublishes,
+        credit: &mut ReceiverCreditState,
+    ) -> Result<(), MqttTransportError> {
+        let Some(next_expected) = credit.due_credit() else {
+            return Ok(());
+        };
+        if !in_flight.has_broker_capacity() {
+            return Ok(());
         }
+        let encrypted = cipher.encrypt_credit(next_expected)?;
+        let frame = encode_credit_frame(encrypted.counter, &encrypted.ciphertext_with_tag);
+        let token = self.publish_frame(frame).await?;
+        credit.mark_published(next_expected);
+        in_flight.insert(InflightPublish::Credit {
+            token,
+            next_expected,
+        });
+        tracing::debug!(
+            role = ?self.config.role,
+            control_counter = encrypted.counter,
+            next_expected,
+            "MQTT receiver credit publish enqueued"
+        );
+        Ok(())
     }
 
     fn handle_publish_ack(
@@ -489,14 +619,31 @@ impl<L: MqttLink> ProtocolDriver<L> {
                             packet_id: None,
                             token: Some(ack.token.value()),
                         })?;
-                self.publish_pacer.record_success();
-                tracing::info!(
-                    role = ?self.config.role,
-                    counter = publish.counter,
-                    plaintext_len = publish.plaintext_len,
-                    "MQTT data publish accepted"
-                );
-                publish.batch.ack_success();
+                match publish {
+                    InflightPublish::Data {
+                        counter,
+                        plaintext_len,
+                        batch,
+                        ..
+                    } => {
+                        self.publish_pacer.record_success();
+                        tracing::info!(
+                            role = ?self.config.role,
+                            counter,
+                            plaintext_len,
+                            "MQTT data publish accepted"
+                        );
+                        batch.ack_success();
+                    }
+                    InflightPublish::Credit { next_expected, .. } => {
+                        self.publish_pacer.record_success();
+                        tracing::debug!(
+                            role = ?self.config.role,
+                            next_expected,
+                            "MQTT receiver credit publish accepted"
+                        );
+                    }
+                }
                 Ok(())
             }
             Err(error) => {
@@ -566,7 +713,9 @@ impl<L: MqttLink> ProtocolDriver<L> {
             role = ?self.config.role,
             counter,
             plaintext_len,
-            in_flight_limit = MAX_QOS1_INFLIGHT,
+            in_flight_limit = MAX_DATA_QOS1_INFLIGHT,
+            peer_credit_next_expected = cipher.peer_credit_next_expected(),
+            credit_window = DATA_CREDIT_WINDOW,
             "MQTT data publish enqueued"
         );
         Ok(PublishedFrame {
@@ -644,6 +793,12 @@ impl<L: MqttLink> ProtocolDriver<L> {
                     } => {
                         self.defer_data_frame(counter, ciphertext_with_tag);
                     }
+                    TransportFrame::Credit {
+                        control_counter,
+                        ciphertext_with_tag,
+                    } => {
+                        self.defer_credit_frame(control_counter, ciphertext_with_tag);
+                    }
                 },
                 LinkEvent::SubAck { debug, .. } => {
                     return Err(MqttTransportError::SubscribeRejected {
@@ -668,13 +823,37 @@ impl<L: MqttLink> ProtocolDriver<L> {
         });
     }
 
+    fn defer_credit_frame(&mut self, control_counter: u64, ciphertext_with_tag: Vec<u8>) {
+        tracing::info!(
+            role = ?self.config.role,
+            control_counter,
+            ciphertext_len = ciphertext_with_tag.len(),
+            "MQTT receiver credit arrived before session was ready; deferring"
+        );
+        self.pending_credit_frames.push_back(PendingCreditFrame {
+            control_counter,
+            ciphertext_with_tag,
+        });
+    }
+
     async fn flush_pending_data_frames(
         &mut self,
         cipher: &mut SessionCipher,
+        credit: &mut ReceiverCreditState,
     ) -> Result<(), MqttTransportError> {
         while let Some(frame) = self.pending_data_frames.pop_front() {
-            self.handle_data_frame(frame.counter, frame.ciphertext_with_tag, cipher)
+            self.handle_data_frame(frame.counter, frame.ciphertext_with_tag, cipher, credit)
                 .await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_pending_credit_frames(
+        &mut self,
+        cipher: &mut SessionCipher,
+    ) -> Result<(), MqttTransportError> {
+        while let Some(frame) = self.pending_credit_frames.pop_front() {
+            self.handle_credit_frame(frame.control_counter, frame.ciphertext_with_tag, cipher)?;
         }
         Ok(())
     }
@@ -684,6 +863,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
         counter: u64,
         ciphertext_with_tag: Vec<u8>,
         cipher: &mut SessionCipher,
+        credit: &mut ReceiverCreditState,
     ) -> Result<(), MqttTransportError> {
         let delivered = cipher.decrypt_received(counter, &ciphertext_with_tag)?;
         if delivered.is_empty() {
@@ -706,6 +886,24 @@ impl<L: MqttLink> ProtocolDriver<L> {
                 .await
                 .map_err(|_| MqttTransportError::ActorClosed)?;
         }
+        credit.note_delivered(cipher.local_next_expected_data_counter());
+        Ok(())
+    }
+
+    fn handle_credit_frame(
+        &mut self,
+        control_counter: u64,
+        ciphertext_with_tag: Vec<u8>,
+        cipher: &mut SessionCipher,
+    ) -> Result<(), MqttTransportError> {
+        if let Some(next_expected) = cipher.decrypt_credit(control_counter, &ciphertext_with_tag)? {
+            tracing::debug!(
+                role = ?self.config.role,
+                control_counter,
+                next_expected,
+                "MQTT receiver credit accepted"
+            );
+        }
         Ok(())
     }
 }
@@ -715,17 +913,42 @@ pub(crate) struct PendingDataFrame {
     ciphertext_with_tag: Vec<u8>,
 }
 
+pub(crate) struct PendingCreditFrame {
+    control_counter: u64,
+    ciphertext_with_tag: Vec<u8>,
+}
+
 struct PublishedFrame {
     token: PublishToken,
     counter: u64,
     plaintext_len: usize,
 }
 
-struct InflightPublish {
-    token: PublishToken,
-    counter: u64,
-    plaintext_len: usize,
-    batch: BoxcarBatch,
+enum InflightPublish {
+    Data {
+        token: PublishToken,
+        counter: u64,
+        plaintext_len: usize,
+        batch: BoxcarBatch,
+    },
+    Credit {
+        token: PublishToken,
+        next_expected: u64,
+    },
+}
+
+impl InflightPublish {
+    fn token(&self) -> PublishToken {
+        match self {
+            Self::Data { token, .. } | Self::Credit { token, .. } => *token,
+        }
+    }
+
+    fn ack_error(self, error: &MqttTransportError) {
+        if let Self::Data { batch, .. } = self {
+            batch.ack_error(error);
+        }
+    }
 }
 
 struct InflightPublishes {
@@ -745,8 +968,19 @@ impl InflightPublishes {
         self.by_token.is_empty()
     }
 
-    fn has_capacity(&self) -> bool {
-        self.by_token.len() < MAX_QOS1_INFLIGHT
+    fn data_len(&self) -> usize {
+        self.by_token
+            .values()
+            .filter(|publish| matches!(publish, InflightPublish::Data { .. }))
+            .count()
+    }
+
+    fn has_data_slot(&self) -> bool {
+        self.data_len() < MAX_DATA_QOS1_INFLIGHT
+    }
+
+    fn has_broker_capacity(&self) -> bool {
+        self.by_token.len() < MQTT_QOS1_WINDOW
     }
 
     fn contains(&self, token: PublishToken) -> bool {
@@ -754,8 +988,9 @@ impl InflightPublishes {
     }
 
     fn insert(&mut self, publish: InflightPublish) {
-        self.order.push_back(publish.token);
-        let replaced = self.by_token.insert(publish.token, publish);
+        let token = publish.token();
+        self.order.push_back(token);
+        let replaced = self.by_token.insert(token, publish);
         debug_assert!(replaced.is_none());
     }
 
@@ -768,13 +1003,85 @@ impl InflightPublishes {
     fn ack_error_all(&mut self, error: &MqttTransportError) {
         while let Some(token) = self.order.pop_front() {
             if let Some(publish) = self.by_token.remove(&token) {
-                publish.batch.ack_error(error);
+                publish.ack_error(error);
             }
         }
         for (_, publish) in self.by_token.drain() {
-            publish.batch.ack_error(error);
+            publish.ack_error(error);
         }
     }
+}
+
+struct ReceiverCreditState {
+    last_published_next_expected: u64,
+    pending_next_expected: Option<u64>,
+    publish_after: Option<Instant>,
+}
+
+impl ReceiverCreditState {
+    fn new() -> Self {
+        Self {
+            last_published_next_expected: 0,
+            pending_next_expected: None,
+            publish_after: None,
+        }
+    }
+
+    fn note_delivered(&mut self, next_expected: u64) {
+        let current_pending = self.pending_next_expected.unwrap_or(0);
+        if next_expected <= self.last_published_next_expected && next_expected <= current_pending {
+            return;
+        }
+
+        let current = self
+            .pending_next_expected
+            .unwrap_or(self.last_published_next_expected);
+        if next_expected <= current {
+            return;
+        }
+
+        self.pending_next_expected = Some(next_expected);
+        let progress = next_expected.saturating_sub(self.last_published_next_expected);
+        if progress >= CREDIT_EMIT_THRESHOLD {
+            self.publish_after = Some(Instant::now());
+        } else if self.publish_after.is_none() {
+            self.publish_after = Some(Instant::now() + CREDIT_DEBOUNCE);
+        }
+    }
+
+    fn due_credit(&self) -> Option<u64> {
+        let next_expected = self.pending_next_expected?;
+        if self.publish_after.is_some_and(|due| due <= Instant::now()) {
+            Some(next_expected)
+        } else {
+            None
+        }
+    }
+
+    fn next_publish_delay(&self) -> Option<Duration> {
+        let due = self.publish_after?;
+        self.pending_next_expected?;
+        due.checked_duration_since(Instant::now())
+    }
+
+    fn mark_published(&mut self, next_expected: u64) {
+        self.last_published_next_expected = self.last_published_next_expected.max(next_expected);
+        if self.pending_next_expected == Some(next_expected) {
+            self.pending_next_expected = None;
+            self.publish_after = None;
+        }
+    }
+}
+
+fn has_receiver_credit(cipher: &SessionCipher) -> bool {
+    cipher.next_send_data_counter()
+        < cipher
+            .peer_credit_next_expected()
+            .saturating_add(DATA_CREDIT_WINDOW as u64)
+}
+
+fn can_publish_data(cipher: &SessionCipher, in_flight: &InflightPublishes) -> bool {
+    in_flight.has_data_slot() && in_flight.has_broker_capacity() && has_receiver_credit(cipher)
 }
 
 struct BoxcarFailure {
@@ -962,6 +1269,15 @@ fn append_or_defer(
         debug_assert!(deferred_outbound.is_none());
         *deferred_outbound = Some(next);
         false
+    }
+}
+
+fn ack_deferred_outbound(
+    deferred_outbound: &mut Option<OutboundChunk>,
+    error: &MqttTransportError,
+) {
+    if let Some(outbound) = deferred_outbound.take() {
+        let _send_result = outbound.ack.send(Err(error.to_string()));
     }
 }
 
@@ -1247,12 +1563,14 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::framing::{encode_credit_frame, encode_data_frame};
     use crate::stream::EnvelopeStream;
     use crate::types::{BrokerAuth, BrokerEndpoint};
     use protocol::BrokerUrl;
 
     struct PublishRecord {
         token: PublishToken,
+        payload: Vec<u8>,
     }
 
     struct ScriptedLink {
@@ -1269,12 +1587,12 @@ mod tests {
         async fn publish(
             &mut self,
             _topic: &str,
-            _payload: Vec<u8>,
+            payload: Vec<u8>,
         ) -> Result<PublishToken, MqttTransportError> {
             let token = PublishToken::new(self.next_token);
             self.next_token += 1;
             self.publish_tx
-                .send(PublishRecord { token })
+                .send(PublishRecord { token, payload })
                 .map_err(|_| MqttTransportError::ActorClosed)?;
             Ok(token)
         }
@@ -1297,14 +1615,65 @@ mod tests {
         driver: JoinHandle<()>,
     }
 
+    fn test_room() -> RoomId {
+        RoomId([0x44; 16])
+    }
+
+    fn test_psk() -> PreSharedKey {
+        PreSharedKey([0x55; 32])
+    }
+
+    fn peer_cipher() -> Result<SessionCipher, MqttTransportError> {
+        SessionCipher::new(
+            &test_room(),
+            &test_psk(),
+            ParticipantRole::Client,
+            &[0x11; SESSION_SALT_LEN],
+            &[0x22; SESSION_SALT_LEN],
+        )
+        .map_err(MqttTransportError::Crypto)
+    }
+
+    fn incoming_publish(payload: Vec<u8>) -> LinkEvent {
+        LinkEvent::Publish(IncomingPublish {
+            topic: ParticipantRole::Host
+                .inbound_topic(&test_room())
+                .into_bytes(),
+            payload,
+            retain: false,
+        })
+    }
+
+    fn incoming_data(
+        peer: &mut SessionCipher,
+        plaintext: &[u8],
+    ) -> Result<LinkEvent, MqttTransportError> {
+        let encrypted = peer.encrypt_next(plaintext)?;
+        Ok(incoming_publish(encode_data_frame(
+            encrypted.counter,
+            &encrypted.ciphertext_with_tag,
+        )))
+    }
+
+    fn incoming_credit(
+        peer: &mut SessionCipher,
+        next_expected: u64,
+    ) -> Result<LinkEvent, MqttTransportError> {
+        let encrypted = peer.encrypt_credit(next_expected)?;
+        Ok(incoming_publish(encode_credit_frame(
+            encrypted.counter,
+            &encrypted.ciphertext_with_tag,
+        )))
+    }
+
     fn spawn_stream_driver() -> Result<DriverHarness, MqttTransportError> {
         let (outbound_tx, outbound_rx) = channel::<OutboundChunk>(64);
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEvent>(64);
         let (poll_tx, poll_rx) =
             tokio_mpsc::unbounded_channel::<Result<LinkEvent, MqttTransportError>>();
         let (publish_tx, publish_rx) = tokio_mpsc::unbounded_channel::<PublishRecord>();
-        let room = RoomId([0x44; 16]);
-        let psk = PreSharedKey([0x55; 32]);
+        let room = test_room();
+        let psk = test_psk();
         let config = MqttConnectConfig {
             endpoint: BrokerEndpoint {
                 url: BrokerUrl::new("wss://broker.example.test/mqtt").map_err(|error| {
@@ -1338,13 +1707,14 @@ mod tests {
             pending_peer_salt: None,
             established_peer_salt: Some([0x22; SESSION_SALT_LEN]),
             pending_data_frames: VecDeque::new(),
+            pending_credit_frames: VecDeque::new(),
             outbound_rx,
             inbound_tx,
             ready_tx: None,
             publish_pacer: PublishPacer::new(),
             subscribe_barrier: None,
         };
-        let driver = tokio::spawn(driver.run_stream(cipher));
+        let driver = tokio::spawn(driver.run_stream(cipher, ReceiverCreditState::new()));
         Ok(DriverHarness {
             outbound_tx,
             inbound_rx,
@@ -1381,6 +1751,34 @@ mod tests {
             .await
             .expect("timed out waiting for publish")
             .expect("publish channel closed")
+    }
+
+    async fn next_data_publish(
+        publish_rx: &mut tokio_mpsc::UnboundedReceiver<PublishRecord>,
+    ) -> PublishRecord {
+        let publish = next_publish(publish_rx).await;
+        assert!(
+            matches!(
+                decode_frame(&publish.payload),
+                Ok(TransportFrame::Data { .. })
+            ),
+            "expected data publish"
+        );
+        publish
+    }
+
+    async fn next_credit_publish(
+        publish_rx: &mut tokio_mpsc::UnboundedReceiver<PublishRecord>,
+    ) -> PublishRecord {
+        let publish = next_publish(publish_rx).await;
+        assert!(
+            matches!(
+                decode_frame(&publish.payload),
+                Ok(TransportFrame::Credit { .. })
+            ),
+            "expected credit publish"
+        );
+        publish
     }
 
     fn send_link_event(
@@ -1432,36 +1830,54 @@ mod tests {
         );
     }
 
+    async fn assert_no_publish_yet(
+        publish_rx: &mut tokio_mpsc::UnboundedReceiver<PublishRecord>,
+        message: &str,
+    ) {
+        assert!(
+            timeout(Duration::from_millis(25), publish_rx.recv())
+                .await
+                .is_err(),
+            "{message}"
+        );
+    }
+
     #[tokio::test]
-    async fn qos1_data_publishes_fill_window_before_first_puback() -> Result<(), Box<dyn Error>> {
+    async fn data_pipelines_up_to_receiver_credit_window() -> Result<(), Box<dyn Error>> {
         let mut harness = spawn_stream_driver()?;
         let mut ack_receivers = Vec::new();
-        for index in 0..=MAX_QOS1_INFLIGHT {
+        for index in 0..=DATA_CREDIT_WINDOW {
             ack_receivers.push(send_full_chunk(&mut harness.outbound_tx, index as u8).await?);
         }
 
-        let mut published = Vec::new();
-        for _ in 0..MAX_QOS1_INFLIGHT {
-            published.push(next_publish(&mut harness.publish_rx).await.token);
+        let mut tokens = Vec::new();
+        for _ in 0..DATA_CREDIT_WINDOW {
+            tokens.push(next_data_publish(&mut harness.publish_rx).await.token);
         }
-        assert!(
-            timeout(Duration::from_millis(25), harness.publish_rx.recv())
-                .await
-                .is_err(),
-            "driver exceeded the configured in-flight window before any PUBACK"
-        );
+        assert_no_publish_yet(
+            &mut harness.publish_rx,
+            "driver sent past the initial receiver credit window",
+        )
+        .await;
 
-        ack_success(&harness.poll_tx, published[0]);
-        let after_ack = next_publish(&mut harness.publish_rx).await.token;
-        published.push(after_ack);
-
-        for token in published.into_iter().skip(1) {
+        for token in tokens.iter().copied() {
             ack_success(&harness.poll_tx, token);
         }
+        assert_no_publish_yet(
+            &mut harness.publish_rx,
+            "broker PUBACK advanced receiver credit",
+        )
+        .await;
+
+        let mut peer = peer_cipher()?;
+        send_link_event(&harness.poll_tx, incoming_credit(&mut peer, 8)?);
+        let next = next_data_publish(&mut harness.publish_rx).await.token;
+        ack_success(&harness.poll_tx, next);
+
         for ack_rx in ack_receivers {
             timeout(Duration::from_secs(1), ack_rx)
                 .await
-                .expect("timed out waiting for ack")
+                .expect("ack timed out")
                 .expect("ack sender dropped")
                 .expect("ack failed");
         }
@@ -1474,33 +1890,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn out_of_order_pubacks_complete_matching_batches() -> Result<(), Box<dyn Error>> {
+    async fn receiver_emits_standalone_cumulative_credit() -> Result<(), Box<dyn Error>> {
         let mut harness = spawn_stream_driver()?;
-        let mut first_ack = Box::pin(send_full_chunk(&mut harness.outbound_tx, 1).await?);
-        let mut second_ack = Box::pin(send_full_chunk(&mut harness.outbound_tx, 2).await?);
-        let first = next_publish(&mut harness.publish_rx).await.token;
-        let second = next_publish(&mut harness.publish_rx).await.token;
+        let mut peer = peer_cipher()?;
 
-        ack_success(&harness.poll_tx, second);
-        timeout(Duration::from_secs(1), &mut second_ack)
-            .await
-            .expect("second ack timed out")
-            .expect("second ack sender dropped")
-            .expect("second ack failed");
-        assert!(
-            timeout(Duration::from_millis(25), &mut first_ack)
-                .await
-                .is_err(),
-            "first batch completed from the second batch's PUBACK"
-        );
+        send_link_event(&harness.poll_tx, incoming_data(&mut peer, b"hello")?);
+        match timeout(Duration::from_secs(1), harness.inbound_rx.recv()).await? {
+            Some(InboundEvent::Data(bytes)) => assert_eq!(bytes, b"hello"),
+            other => panic!("expected inbound data, got {other:?}"),
+        }
+        let credit = next_credit_publish(&mut harness.publish_rx).await;
+        match decode_frame(&credit.payload)? {
+            TransportFrame::Credit {
+                control_counter, ..
+            } => assert_eq!(control_counter, 0),
+            other => panic!("expected credit frame, got {other:?}"),
+        }
 
-        ack_success(&harness.poll_tx, first);
-        timeout(Duration::from_secs(1), &mut first_ack)
-            .await
-            .expect("first ack timed out")
-            .expect("first ack sender dropped")
-            .expect("first ack failed");
-
+        ack_success(&harness.poll_tx, credit.token);
         drop(harness.outbound_tx);
         timeout(Duration::from_secs(1), harness.driver)
             .await
@@ -1509,26 +1916,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn puback_rejection_fails_all_inflight_and_closes() -> Result<(), Box<dyn Error>> {
+    async fn credit_puback_does_not_complete_data_write_ack() -> Result<(), Box<dyn Error>> {
         let mut harness = spawn_stream_driver()?;
-        let ack_a = send_full_chunk(&mut harness.outbound_tx, 1).await?;
-        let ack_b = send_full_chunk(&mut harness.outbound_tx, 2).await?;
-        let ack_c = send_full_chunk(&mut harness.outbound_tx, 3).await?;
-        let _first = next_publish(&mut harness.publish_rx).await.token;
-        let second = next_publish(&mut harness.publish_rx).await.token;
-        let _third = next_publish(&mut harness.publish_rx).await.token;
+        let mut data_ack = Box::pin(send_full_chunk(&mut harness.outbound_tx, 1).await?);
+        let data = next_data_publish(&mut harness.publish_rx).await;
+
+        let mut peer = peer_cipher()?;
+        send_link_event(&harness.poll_tx, incoming_data(&mut peer, b"inbound")?);
+        let credit = next_credit_publish(&mut harness.publish_rx).await;
+        ack_success(&harness.poll_tx, credit.token);
+        assert!(
+            timeout(Duration::from_millis(25), &mut data_ack)
+                .await
+                .is_err(),
+            "credit PUBACK completed a data write ack"
+        );
+
+        ack_success(&harness.poll_tx, data.token);
+        timeout(Duration::from_secs(1), &mut data_ack)
+            .await
+            .expect("data ack timed out")
+            .expect("data ack sender dropped")
+            .expect("data ack failed");
+        drop(harness.outbound_tx);
+        timeout(Duration::from_secs(1), harness.driver)
+            .await
+            .expect("driver did not stop")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_way_bulk_transfer_crosses_credit_windows() -> Result<(), Box<dyn Error>> {
+        let mut harness = spawn_stream_driver()?;
+        let mut stream = EnvelopeStream::new(harness.outbound_tx, harness.inbound_rx);
+        stream
+            .write_all(&vec![0x5a; MAX_PLAINTEXT_CHUNK_LEN * 40])
+            .await?;
+        let mut flush_task = tokio::spawn(async move { stream.flush().await });
+
+        let mut first_window = Vec::new();
+        for _ in 0..DATA_CREDIT_WINDOW {
+            first_window.push(next_data_publish(&mut harness.publish_rx).await.token);
+        }
+        for token in first_window {
+            ack_success(&harness.poll_tx, token);
+        }
+        assert!(
+            timeout(Duration::from_millis(25), &mut flush_task)
+                .await
+                .is_err(),
+            "flush completed before receiver credit"
+        );
+
+        let mut peer = peer_cipher()?;
+        send_link_event(&harness.poll_tx, incoming_credit(&mut peer, 16)?);
+        let mut second_window = Vec::new();
+        for _ in 0..DATA_CREDIT_WINDOW {
+            second_window.push(next_data_publish(&mut harness.publish_rx).await.token);
+        }
+        for token in second_window {
+            ack_success(&harness.poll_tx, token);
+        }
+        assert!(
+            timeout(Duration::from_millis(25), &mut flush_task)
+                .await
+                .is_err(),
+            "flush completed before second receiver credit"
+        );
+
+        send_link_event(&harness.poll_tx, incoming_credit(&mut peer, 32)?);
+        let mut final_window = Vec::new();
+        for _ in 0..8 {
+            final_window.push(next_data_publish(&mut harness.publish_rx).await.token);
+        }
+        for token in final_window {
+            ack_success(&harness.poll_tx, token);
+        }
+        timeout(Duration::from_secs(1), &mut flush_task)
+            .await
+            .expect("flush timed out")
+            .expect("flush task failed")?;
+        timeout(Duration::from_secs(1), harness.driver)
+            .await
+            .expect("driver did not stop")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn credit_blocked_sender_fails_explicitly_without_credit() -> Result<(), Box<dyn Error>> {
+        let mut harness = spawn_stream_driver()?;
+        let mut stream = EnvelopeStream::new(harness.outbound_tx, harness.inbound_rx);
+        stream
+            .write_all(&vec![
+                0x5b;
+                MAX_PLAINTEXT_CHUNK_LEN * (DATA_CREDIT_WINDOW + 1)
+            ])
+            .await?;
+        let mut flush_task = tokio::spawn(async move { stream.flush().await });
+
+        let mut tokens = Vec::new();
+        for _ in 0..DATA_CREDIT_WINDOW {
+            tokens.push(next_data_publish(&mut harness.publish_rx).await.token);
+        }
+        for token in tokens {
+            ack_success(&harness.poll_tx, token);
+        }
+
+        let error = timeout(Duration::from_secs(1), &mut flush_task)
+            .await
+            .expect("flush timed out")
+            .expect("flush task failed")
+            .expect_err("flush unexpectedly succeeded");
+        let message = error.to_string();
+        assert!(
+            message.contains("receiver credit"),
+            "unexpected credit-blocked error: {message}"
+        );
+        timeout(Duration::from_secs(1), harness.driver)
+            .await
+            .expect("driver did not stop")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn credit_publish_rejection_fails_stream() -> Result<(), Box<dyn Error>> {
+        let mut harness = spawn_stream_driver()?;
+        let mut peer = peer_cipher()?;
+        send_link_event(&harness.poll_tx, incoming_data(&mut peer, b"inbound")?);
+        let credit = next_credit_publish(&mut harness.publish_rx).await;
 
         send_link_event(
             &harness.poll_tx,
             LinkEvent::PubAck(PublishAck {
-                token: second,
+                token: credit.token,
                 result: Err(quota_rejection()),
             }),
         );
-
-        expect_ack_error(ack_a, "QuotaExceeded").await;
-        expect_ack_error(ack_b, "QuotaExceeded").await;
-        expect_ack_error(ack_c, "QuotaExceeded").await;
+        match timeout(Duration::from_secs(1), harness.inbound_rx.recv()).await? {
+            Some(InboundEvent::Data(bytes)) => assert_eq!(bytes, b"inbound"),
+            other => panic!("expected inbound data before error, got {other:?}"),
+        }
         match timeout(Duration::from_secs(1), harness.inbound_rx.recv()).await? {
             Some(InboundEvent::Error(error)) => {
                 assert!(
@@ -1545,12 +2072,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnect_fails_all_inflight_and_closes() -> Result<(), Box<dyn Error>> {
+    async fn puback_rejection_fails_all_inflight_data_and_closes() -> Result<(), Box<dyn Error>> {
         let mut harness = spawn_stream_driver()?;
         let ack_a = send_full_chunk(&mut harness.outbound_tx, 1).await?;
         let ack_b = send_full_chunk(&mut harness.outbound_tx, 2).await?;
-        let _first = next_publish(&mut harness.publish_rx).await.token;
-        let _second = next_publish(&mut harness.publish_rx).await.token;
+        let first = next_data_publish(&mut harness.publish_rx).await.token;
+        let _second = next_data_publish(&mut harness.publish_rx).await.token;
+
+        send_link_event(
+            &harness.poll_tx,
+            LinkEvent::PubAck(PublishAck {
+                token: first,
+                result: Err(quota_rejection()),
+            }),
+        );
+
+        expect_ack_error(ack_a, "QuotaExceeded").await;
+        expect_ack_error(ack_b, "QuotaExceeded").await;
+        match timeout(Duration::from_secs(1), harness.inbound_rx.recv()).await? {
+            Some(InboundEvent::Error(error)) => {
+                assert!(
+                    error.to_string().contains("QuotaExceeded"),
+                    "unexpected inbound error: {error}"
+                );
+            }
+            other => panic!("expected inbound error, got {other:?}"),
+        }
+        timeout(Duration::from_secs(1), harness.driver)
+            .await
+            .expect("driver did not stop")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_fails_all_inflight_data_and_closes() -> Result<(), Box<dyn Error>> {
+        let mut harness = spawn_stream_driver()?;
+        let ack_a = send_full_chunk(&mut harness.outbound_tx, 1).await?;
+        let ack_b = send_full_chunk(&mut harness.outbound_tx, 2).await?;
+        let _first = next_data_publish(&mut harness.publish_rx).await.token;
+        let _second = next_data_publish(&mut harness.publish_rx).await.token;
 
         send_link_event(
             &harness.poll_tx,
@@ -1586,8 +2146,8 @@ mod tests {
             .await?;
         let mut flush_task = tokio::spawn(async move { stream.flush().await });
 
-        let _first = next_publish(&mut harness.publish_rx).await.token;
-        let _second = next_publish(&mut harness.publish_rx).await.token;
+        let _first = next_data_publish(&mut harness.publish_rx).await.token;
+        let _second = next_data_publish(&mut harness.publish_rx).await.token;
         assert!(
             timeout(Duration::from_millis(25), &mut flush_task)
                 .await
@@ -1613,44 +2173,6 @@ mod tests {
             "unexpected flush error: {message}"
         );
 
-        timeout(Duration::from_secs(1), harness.driver)
-            .await
-            .expect("driver did not stop")?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn flush_waits_for_all_pipelined_pubacks() -> Result<(), Box<dyn Error>> {
-        let mut harness = spawn_stream_driver()?;
-        let mut stream = EnvelopeStream::new(harness.outbound_tx, harness.inbound_rx);
-        let payload = vec![0x5a; MAX_PLAINTEXT_CHUNK_LEN * 3];
-        stream.write_all(&payload).await?;
-        let mut flush_task = tokio::spawn(async move { stream.flush().await });
-
-        let first = next_publish(&mut harness.publish_rx).await.token;
-        let second = next_publish(&mut harness.publish_rx).await.token;
-        let third = next_publish(&mut harness.publish_rx).await.token;
-        assert!(
-            timeout(Duration::from_millis(25), &mut flush_task)
-                .await
-                .is_err(),
-            "flush completed before any PUBACK"
-        );
-
-        ack_success(&harness.poll_tx, first);
-        ack_success(&harness.poll_tx, second);
-        assert!(
-            timeout(Duration::from_millis(25), &mut flush_task)
-                .await
-                .is_err(),
-            "flush completed before every in-flight PUBACK"
-        );
-
-        ack_success(&harness.poll_tx, third);
-        timeout(Duration::from_secs(1), &mut flush_task)
-            .await
-            .expect("flush timed out")
-            .expect("flush task failed")?;
         timeout(Duration::from_secs(1), harness.driver)
             .await
             .expect("driver did not stop")?;

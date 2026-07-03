@@ -672,6 +672,19 @@ struct ClaudePhaseEmission {
     reasoning_bytes: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ClaudeTurnUsage {
+    turn: Value,
+    cumulative: Value,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClaudeMessageUsage {
+    request: Option<Value>,
+    turn: Option<Value>,
+    cumulative: Option<Value>,
+}
+
 enum ClaudeHistoryReplayItem {
     Message(Value),
     ToolRequest(ClaudeToolCall),
@@ -2217,7 +2230,7 @@ impl ClaudeInner {
         &self,
         content: String,
         model: Option<String>,
-        usage: Option<Value>,
+        usage: ClaudeMessageUsage,
         reasoning: Option<String>,
         tool_calls: Vec<Value>,
         context_breakdown: Option<Value>,
@@ -2226,7 +2239,9 @@ impl ClaudeInner {
             content,
             agent: Some(AgentName(CLAUDE_AGENT_NAME)),
             model,
-            usage,
+            request_usage: usage.request,
+            turn_usage: usage.turn,
+            cumulative_usage: usage.cumulative,
             reasoning,
             tool_calls,
             context_breakdown,
@@ -2236,13 +2251,17 @@ impl ClaudeInner {
     fn emit_placeholder_stream_end(
         &self,
         model: Option<String>,
-        usage: Option<Value>,
+        turn_usage: Option<ClaudeTurnUsage>,
         context_breakdown: Option<Value>,
     ) {
         self.emit_stream_end(
             String::new(),
             model,
-            usage,
+            ClaudeMessageUsage {
+                request: None,
+                turn: turn_usage.as_ref().map(|usage| usage.turn.clone()),
+                cumulative: turn_usage.map(|usage| usage.cumulative),
+            },
             None,
             Vec::new(),
             context_breakdown,
@@ -2303,7 +2322,9 @@ impl ClaudeInner {
             reasoning,
             tool_calls,
             model_info,
-            token_usage,
+            request_usage: token_usage,
+            turn_usage: None,
+            cumulative_usage: None,
             context_breakdown,
             images,
         });
@@ -2313,14 +2334,17 @@ impl ClaudeInner {
         self.emitter.backend_error(message);
     }
 
-    async fn normalize_usage_for_turn(&self, usage: Option<Value>) -> Option<Value> {
+    async fn normalize_usage_for_turn(&self, usage: Option<Value>) -> Option<ClaudeTurnUsage> {
         let cumulative_usage = usage?;
 
         let mut state = self.state.lock().await;
         let per_turn =
             derive_turn_token_usage(&cumulative_usage, state.last_cumulative_usage.as_ref());
-        state.last_cumulative_usage = Some(cumulative_usage);
-        per_turn
+        state.last_cumulative_usage = Some(cumulative_usage.clone());
+        per_turn.map(|turn| ClaudeTurnUsage {
+            turn,
+            cumulative: cumulative_usage,
+        })
     }
 
     async fn emit_terminal_phase_or_placeholder(
@@ -2329,7 +2353,7 @@ impl ClaudeInner {
         conversation_history_bytes: u64,
         known_context_window: Option<u64>,
         model_hint: Option<String>,
-        turn_usage: Option<Value>,
+        turn_usage: Option<ClaudeTurnUsage>,
     ) -> bool {
         // The Context Usage breakdown must reflect the context-window fill — the
         // last API call's prompt footprint — which lives on `summary.usage`
@@ -2368,7 +2392,11 @@ impl ClaudeInner {
             self.emit_stream_end(
                 text,
                 selected_model,
-                turn_usage,
+                ClaudeMessageUsage {
+                    request: phase.usage,
+                    turn: turn_usage.as_ref().map(|usage| usage.turn.clone()),
+                    cumulative: turn_usage.as_ref().map(|usage| usage.cumulative.clone()),
+                },
                 phase.reasoning,
                 tool_calls,
                 Some(context_breakdown),
@@ -2402,7 +2430,7 @@ impl ClaudeInner {
                 }
                 self.emit_placeholder_stream_end(
                     selected_model,
-                    turn_usage,
+                    turn_usage.clone(),
                     Some(context_breakdown),
                 );
             }
@@ -3203,7 +3231,7 @@ fn ensure_ask_user_question_tool_request_emitted(
         inner.emit_stream_end(
             String::new(),
             None,
-            None,
+            ClaudeMessageUsage::default(),
             None,
             vec![json!({
                 "id": tool_call.id,
@@ -3285,7 +3313,7 @@ fn ensure_exit_plan_mode_tool_request_emitted(
         inner.emit_stream_end(
             String::new(),
             None,
-            None,
+            ClaudeMessageUsage::default(),
             None,
             vec![json!({
                 "id": tool_call.id,
@@ -4807,10 +4835,7 @@ fn maybe_emit_next_stream_start(
 }
 
 fn phase_usage_for_emission(summary: &mut ClaudeStdoutSummary) -> Option<Value> {
-    // Stream-event usage is session-cumulative. The terminal turn emitter
-    // attaches the normalized per-turn delta from the result event instead.
-    summary.usage.take();
-    None
+    summary.usage.take()
 }
 
 fn take_phase_emission(summary: &mut ClaudeStdoutSummary) -> Option<ClaudePhaseEmission> {
@@ -4882,8 +4907,11 @@ fn close_current_phase(
         inner.emit_stream_end(
             phase.text,
             phase.model,
-            // Intermediate phases omit raw cumulative usage; terminal carries the per-turn delta.
-            phase.usage,
+            ClaudeMessageUsage {
+                request: phase.usage,
+                turn: None,
+                cumulative: None,
+            },
             phase.reasoning,
             tool_calls,
             None,
@@ -7972,7 +8000,6 @@ fn backend_error_message(content: String) -> ChatEvent {
         tool_calls: Vec::new(),
         model_info: None,
         token_usage: None,
-        turn_token_usage: None,
         context_breakdown: None,
         images: None,
     })
@@ -9262,11 +9289,25 @@ for raw_line in sys.stdin:
             .collect()
     }
 
-    fn stream_end_total_tokens(event: &Value) -> Option<u64> {
+    fn stream_end_usage_scope_total_tokens(event: &Value, scope: &str) -> Option<u64> {
         stream_end_message(event)
             .get("token_usage")
+            .and_then(|usage| usage.get(scope))
+            .and_then(|scope| scope.get("usage"))
             .and_then(|usage| usage.get("total_tokens"))
             .and_then(Value::as_u64)
+    }
+
+    fn stream_end_request_total_tokens(event: &Value) -> Option<u64> {
+        stream_end_usage_scope_total_tokens(event, "request")
+    }
+
+    fn stream_end_turn_total_tokens(event: &Value) -> Option<u64> {
+        stream_end_usage_scope_total_tokens(event, "turn")
+    }
+
+    fn stream_end_cumulative_total_tokens(event: &Value) -> Option<u64> {
+        stream_end_usage_scope_total_tokens(event, "cumulative")
     }
 
     fn emit_test_phase_end(inner: &ClaudeInner, summary: &mut ClaudeStdoutSummary) {
@@ -9285,7 +9326,11 @@ for raw_line in sys.stdin:
         inner.emit_stream_end(
             phase.text,
             phase.model,
-            phase.usage,
+            ClaudeMessageUsage {
+                request: phase.usage,
+                turn: None,
+                cumulative: None,
+            },
             phase.reasoning,
             tool_calls,
             None,
@@ -12176,7 +12221,8 @@ for raw_line in sys.stdin:
                 .and_then(Value::as_str),
             Some("First answer")
         );
-        assert_eq!(stream_end_total_tokens(&first_end), None);
+        assert_eq!(stream_end_request_total_tokens(&first_end), Some(120));
+        assert_eq!(stream_end_turn_total_tokens(&first_end), None);
 
         let second_start = rx.recv().await.expect("second stream start");
         assert_eq!(event_kind(&second_start), Some("StreamStart"));
@@ -12197,7 +12243,8 @@ for raw_line in sys.stdin:
                 .and_then(Value::as_str),
             Some("Second answer")
         );
-        assert_eq!(stream_end_total_tokens(&second_end), None);
+        assert_eq!(stream_end_request_total_tokens(&second_end), Some(300));
+        assert_eq!(stream_end_turn_total_tokens(&second_end), None);
     }
 
     #[tokio::test]
@@ -12230,11 +12277,18 @@ for raw_line in sys.stdin:
 
         // Per-turn delta summed across the whole agentic turn — must NOT drive
         // the breakdown.
-        let turn_usage = json!({
+        let turn_usage = ClaudeTurnUsage {
+            turn: json!({
+                "input_tokens": 14_000_000,
+                "output_tokens": 500_000,
+                "total_tokens": 14_500_000,
+            }),
+            cumulative: json!({
             "input_tokens": 14_000_000,
             "output_tokens": 500_000,
             "total_tokens": 14_500_000,
-        });
+            }),
+        };
         inner
             .emit_terminal_phase_or_placeholder(
                 &mut summary,
@@ -12256,8 +12310,10 @@ for raw_line in sys.stdin:
             .and_then(Value::as_u64);
         assert_eq!(breakdown_input, Some(250));
 
-        // The token badge still carries the per-turn delta.
-        assert_eq!(stream_end_total_tokens(&end), Some(14_500_000));
+        // The turn scope still carries the per-turn delta.
+        assert_eq!(stream_end_request_total_tokens(&end), Some(300));
+        assert_eq!(stream_end_turn_total_tokens(&end), Some(14_500_000));
+        assert_eq!(stream_end_cumulative_total_tokens(&end), Some(14_500_000));
     }
 
     #[tokio::test]
@@ -12377,7 +12433,8 @@ for raw_line in sys.stdin:
             stream_end_tool_call_ids(&stream_end),
             vec!["toolu_edit".to_string()]
         );
-        assert_eq!(stream_end_total_tokens(&stream_end), None);
+        assert_eq!(stream_end_request_total_tokens(&stream_end), Some(80));
+        assert_eq!(stream_end_turn_total_tokens(&stream_end), None);
 
         let tool_request = rx.recv().await.expect("tool request after stream end");
         assert_eq!(event_kind(&tool_request), Some("ToolRequest"));
@@ -14541,7 +14598,7 @@ for raw_line in sys.stdin:
     }
 
     #[test]
-    fn phase_usage_drops_raw_cumulative_usage() {
+    fn phase_usage_emits_per_api_call_request_usage() {
         let mut summary = ClaudeStdoutSummary::default();
 
         // No usage set → None.
@@ -14556,7 +14613,11 @@ for raw_line in sys.stdin:
             "reasoning_tokens": 0
         }));
 
-        assert!(phase_usage_for_emission(&mut summary).is_none());
+        let usage = phase_usage_for_emission(&mut summary).expect("request usage");
+        assert_eq!(
+            usage.get("total_tokens").and_then(Value::as_u64),
+            Some(150_500)
+        );
         assert!(summary.usage.is_none());
     }
 

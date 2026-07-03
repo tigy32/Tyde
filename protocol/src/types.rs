@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 30;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -425,9 +425,17 @@ pub struct LaunchProfileCatalog {
     pub default_profile_id: Option<LaunchProfileId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchProfileKind {
+    BackendDefault,
+    Custom,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchProfile {
     pub id: LaunchProfileId,
+    pub kind: LaunchProfileKind,
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -444,6 +452,7 @@ pub enum LaunchProfileEntry {
     },
     Unavailable {
         id: LaunchProfileId,
+        kind: LaunchProfileKind,
         backend_kind: BackendKind,
         label: String,
         message: String,
@@ -462,6 +471,13 @@ impl LaunchProfileEntry {
         match self {
             Self::Ready { profile } => profile.backend_kind,
             Self::Unavailable { backend_kind, .. } => *backend_kind,
+        }
+    }
+
+    pub fn kind(&self) -> LaunchProfileKind {
+        match self {
+            Self::Ready { profile } => profile.kind,
+            Self::Unavailable { kind, .. } => *kind,
         }
     }
 }
@@ -710,6 +726,7 @@ pub enum FrameKind {
     SessionSchemas,
     SessionSettings,
     BackendConfigSchemas,
+    BackendConfigSnapshots,
     LaunchProfileCatalogNotify,
     MobileAccessState,
     MobilePairingOffer,
@@ -876,6 +893,7 @@ impl fmt::Display for FrameKind {
             Self::SessionSchemas => f.write_str("session_schemas"),
             Self::SessionSettings => f.write_str("session_settings"),
             Self::BackendConfigSchemas => f.write_str("backend_config_schemas"),
+            Self::BackendConfigSnapshots => f.write_str("backend_config_snapshots"),
             Self::LaunchProfileCatalogNotify => f.write_str("launch_profile_catalog_notify"),
             Self::MobileAccessState => f.write_str("mobile_access_state"),
             Self::MobilePairingOffer => f.write_str("mobile_pairing_offer"),
@@ -1205,6 +1223,8 @@ pub struct HostBootstrapPayload {
     pub session_schemas: Vec<SessionSchemaEntry>,
     #[serde(default)]
     pub backend_config_schemas: Vec<BackendConfigSchema>,
+    #[serde(default)]
+    pub backend_config_snapshots: Vec<BackendConfigSnapshot>,
     #[serde(default)]
     pub launch_profile_catalog: LaunchProfileCatalog,
     pub sessions: Vec<SessionSummary>,
@@ -1892,8 +1912,11 @@ pub enum HostSettingValue {
         provider: CodeIntelProviderId,
         path: Option<HostExecutablePath>,
     },
-    /// Replace the full deep-configuration value set for one backend. An empty
-    /// `values` map clears the backend's configuration.
+    /// Merge a deep-configuration update for one backend. Keys present with
+    /// non-null values are validated against the backend's schema and saved.
+    /// Keys present as `Null` are explicitly cleared. Missing keys are
+    /// preserved, so editing one field cannot overwrite sibling config. An
+    /// empty `values` map explicitly clears the backend's whole configuration.
     BackendConfig {
         backend: BackendKind,
         values: BackendConfigValues,
@@ -1978,6 +2001,34 @@ pub struct BackendConfigValues(pub HashMap<String, SessionSettingValue>);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendConfigSchemasPayload {
     pub schemas: Vec<BackendConfigSchema>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendConfigSnapshotStatus {
+    Ready,
+    Unavailable,
+}
+
+/// Server-owned snapshot of a backend's current native configuration. These
+/// values are read from the backend-native source of truth and are not a
+/// replacement for `HostSettings.backend_config`, which stores only explicit
+/// Tyde-managed overrides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendConfigSnapshot {
+    pub backend_kind: BackendKind,
+    pub status: BackendConfigSnapshotStatus,
+    #[serde(default)]
+    pub values: BackendConfigValues,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Server → Client on host stream. Carries current backend-native settings
+/// snapshots for enabled backends that expose deep configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendConfigSnapshotsPayload {
+    pub snapshots: Vec<BackendConfigSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2107,7 +2158,26 @@ pub struct MobileDeviceSummary {
 pub enum BackendSetupStatus {
     Installed,
     NotInstalled,
+    Unavailable,
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendSetupDiagnosticCode {
+    CommandNotFound,
+    CommandFailed,
+    CommandTimedOut,
+    MissingProjectRoot,
+    MissingGatewayPython,
+    GatewayImportFailed,
+    ExplicitOverrideInvalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendSetupDiagnostic {
+    pub code: BackendSetupDiagnosticCode,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2134,6 +2204,8 @@ pub struct BackendSetupInfo {
     pub installed_version: Option<String>,
     pub docs_url: String,
     pub install_command: Option<BackendSetupCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<BackendSetupDiagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sign_in_command: Option<BackendSetupCommand>,
 }
@@ -4845,9 +4917,8 @@ pub struct ChatMessage {
     pub reasoning: Option<ReasoningData>,
     pub tool_calls: Vec<ToolUseData>,
     pub model_info: Option<ModelInfo>,
-    pub token_usage: Option<TokenUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_token_usage: Option<TurnTokenUsage>,
+    pub token_usage: Option<MessageTokenUsage>,
     pub context_breakdown: Option<ContextBreakdown>,
     pub images: Option<Vec<ImageData>>,
 }
@@ -4856,9 +4927,8 @@ pub struct ChatMessage {
 pub struct MessageMetadataUpdateData {
     pub message_id: ChatMessageId,
     pub model_info: Option<ModelInfo>,
-    pub token_usage: Option<TokenUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_token_usage: Option<TurnTokenUsage>,
+    pub token_usage: Option<MessageTokenUsage>,
     pub context_breakdown: Option<ContextBreakdown>,
 }
 
@@ -4893,21 +4963,78 @@ pub struct TokenUsage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageTokenUsage {
+    pub request: TokenUsageScope,
+    pub turn: TokenUsageScope,
+    pub cumulative: TokenUsageScope,
+}
+
+impl MessageTokenUsage {
+    pub fn unavailable(reason: TokenUsageUnavailableReason) -> Self {
+        Self {
+            request: TokenUsageScope::Unavailable { reason },
+            turn: TokenUsageScope::Unavailable { reason },
+            cumulative: TokenUsageScope::Unavailable { reason },
+        }
+    }
+
+    pub fn request_known(usage: TokenUsage) -> Self {
+        Self {
+            request: TokenUsageScope::Known {
+                usage: Box::new(usage),
+            },
+            turn: TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport,
+            },
+            cumulative: TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport,
+            },
+        }
+    }
+
+    pub fn request_and_turn_known(request: TokenUsage, turn: TokenUsage) -> Self {
+        Self {
+            request: TokenUsageScope::Known {
+                usage: Box::new(request),
+            },
+            turn: TokenUsageScope::Known {
+                usage: Box::new(turn),
+            },
+            cumulative: TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport,
+            },
+        }
+    }
+
+    pub fn with_cumulative(mut self, cumulative: TokenUsage) -> Self {
+        self.cumulative = TokenUsageScope::Known {
+            usage: Box::new(cumulative),
+        };
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TurnTokenUsage {
-    Known {
-        this_turn: Box<TokenUsage>,
-        agent_total: Box<TokenUsage>,
-    },
-    Unavailable {
-        reason: TokenUsageUnavailableReason,
-    },
+pub enum TokenUsageScope {
+    Known { usage: Box<TokenUsage> },
+    Unavailable { reason: TokenUsageUnavailableReason },
+}
+
+impl TokenUsageScope {
+    pub fn known_usage(&self) -> Option<&TokenUsage> {
+        match self {
+            Self::Known { usage } => Some(usage),
+            Self::Unavailable { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenUsageUnavailableReason {
     BackendDidNotReport,
+    ProviderScopeAmbiguous,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5253,6 +5380,85 @@ impl SeqValidator {
 }
 
 #[cfg(test)]
+mod token_usage_serde_tests {
+    use super::*;
+
+    #[test]
+    fn chat_message_token_usage_round_trips_all_scopes() {
+        let request = TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+            cached_prompt_tokens: Some(4),
+            cache_creation_input_tokens: Some(5),
+            reasoning_tokens: Some(6),
+        };
+        let turn = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            total_tokens: 30,
+            cached_prompt_tokens: Some(40),
+            cache_creation_input_tokens: Some(50),
+            reasoning_tokens: Some(60),
+        };
+        let cumulative = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 200,
+            total_tokens: 300,
+            cached_prompt_tokens: Some(400),
+            cache_creation_input_tokens: Some(500),
+            reasoning_tokens: Some(600),
+        };
+
+        let usage = MessageTokenUsage::request_and_turn_known(request.clone(), turn.clone())
+            .with_cumulative(cumulative.clone());
+        let json = serde_json::to_value(&usage).expect("serialize");
+        assert_eq!(json["request"]["kind"], serde_json::json!("known"));
+        assert_eq!(
+            json["request"]["usage"]["total_tokens"],
+            serde_json::json!(3)
+        );
+        assert_eq!(json["turn"]["usage"]["total_tokens"], serde_json::json!(30));
+        assert_eq!(
+            json["cumulative"]["usage"]["total_tokens"],
+            serde_json::json!(300)
+        );
+
+        let round_trip: MessageTokenUsage =
+            serde_json::from_value(json).expect("deserialize message token usage");
+        assert_eq!(round_trip, usage);
+        assert_eq!(round_trip.request.known_usage(), Some(&request));
+        assert_eq!(round_trip.turn.known_usage(), Some(&turn));
+        assert_eq!(round_trip.cumulative.known_usage(), Some(&cumulative));
+    }
+
+    #[test]
+    fn token_usage_unavailable_reason_round_trips_provider_scope_ambiguous() {
+        let usage = MessageTokenUsage {
+            request: TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous,
+            },
+            turn: TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport,
+            },
+            cumulative: TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport,
+            },
+        };
+
+        let json = serde_json::to_value(&usage).expect("serialize");
+        assert_eq!(
+            json["request"]["reason"],
+            serde_json::json!("provider_scope_ambiguous")
+        );
+        assert_eq!(
+            serde_json::from_value::<MessageTokenUsage>(json).expect("deserialize"),
+            usage
+        );
+    }
+}
+
+#[cfg(test)]
 mod search_serde_tests {
     use super::*;
 
@@ -5265,8 +5471,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_twenty_seven() {
-        assert_eq!(PROTOCOL_VERSION, 27);
+    fn protocol_version_is_thirty() {
+        assert_eq!(PROTOCOL_VERSION, 30);
     }
 
     #[test]

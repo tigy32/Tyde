@@ -9,10 +9,11 @@ use protocol::{
     AgentBootstrapPayload, AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, AgentOrigin,
     AgentRenamedPayload, AgentStartPayload, BackendAccessMode, BackendKind, ChatEvent, ChatMessage,
     ChatMessageId, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin, MessageSender,
-    QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload, ReviewErrorContext,
-    SendMessagePayload, SessionId, SessionSettingsPayload, SessionSettingsValues, SpawnCostHint,
-    StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, TurnTokenUsage,
+    MessageTokenUsage, QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload,
+    ReviewErrorContext, SendMessagePayload, SessionId, SessionSettingsPayload,
+    SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
+    TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
+    ToolExecutionResult,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -311,9 +312,6 @@ impl AgentReplayState {
         if update.token_usage.is_some() {
             completed.end.message.token_usage = update.token_usage.clone();
         }
-        if update.turn_token_usage.is_some() {
-            completed.end.message.turn_token_usage = update.turn_token_usage.clone();
-        }
         if update.context_breakdown.is_some() {
             completed.end.message.context_breakdown = update.context_breakdown.clone();
         }
@@ -483,8 +481,11 @@ impl AgentActivityStatsTracker {
 
     fn stamp_message_turn_token_usage(&mut self, message: &mut ChatMessage, source_seq: u64) {
         let source = token_usage_source_for_message(message, source_seq);
-        message.turn_token_usage =
-            Some(self.turn_token_usage_for_source(source, message.token_usage.clone(), source_seq));
+        message.token_usage = Some(self.scoped_token_usage_for_source(
+            source,
+            message.token_usage.clone(),
+            source_seq,
+        ));
     }
 
     fn stamp_metadata_turn_token_usage(
@@ -492,35 +493,40 @@ impl AgentActivityStatsTracker {
         update: &mut MessageMetadataUpdateData,
         source_seq: u64,
     ) {
-        if update.token_usage.is_none() {
+        let Some(token_usage) = update.token_usage.clone() else {
             return;
-        }
-        update.turn_token_usage = Some(self.turn_token_usage_for_source(
+        };
+        update.token_usage = Some(self.scoped_token_usage_for_source(
             TokenUsageSource::Message(update.message_id.clone()),
-            update.token_usage.clone(),
+            Some(token_usage),
             source_seq,
         ));
     }
 
-    fn turn_token_usage_for_source(
+    fn scoped_token_usage_for_source(
         &mut self,
         source: TokenUsageSource,
-        token_usage: Option<TokenUsage>,
+        token_usage: Option<MessageTokenUsage>,
         source_seq: u64,
-    ) -> TurnTokenUsage {
-        let Some(token_usage) = token_usage else {
-            return TurnTokenUsage::Unavailable {
-                reason: TokenUsageUnavailableReason::BackendDidNotReport,
-            };
+    ) -> MessageTokenUsage {
+        let mut token_usage = token_usage.unwrap_or_else(|| {
+            MessageTokenUsage::unavailable(TokenUsageUnavailableReason::BackendDidNotReport)
+        });
+        let Some(turn_usage) = token_usage.turn.known_usage().cloned() else {
+            return token_usage;
         };
-        self.token_usage_by_source
-            .insert(source, token_usage.clone());
-        self.refresh_token_usage();
-        self.stats.source_through_seq = Some(source_seq);
-        TurnTokenUsage::Known {
-            this_turn: Box::new(token_usage),
-            agent_total: Box::new(self.stats.token_usage.clone()),
+
+        if let Some(cumulative) = token_usage.cumulative.known_usage().cloned() {
+            self.stats.token_usage = cumulative;
+        } else {
+            self.token_usage_by_source.insert(source, turn_usage);
+            self.refresh_token_usage();
+            token_usage.cumulative = TokenUsageScope::Known {
+                usage: Box::new(self.stats.token_usage.clone()),
+            };
         }
+        self.stats.source_through_seq = Some(source_seq);
+        token_usage
     }
 
     fn refresh_token_usage(&mut self) {
@@ -558,6 +564,10 @@ fn total_token_usage<'a>(entries: impl Iterator<Item = &'a TokenUsage>) -> Token
         add_optional_tokens(&mut total.reasoning_tokens, usage.reasoning_tokens);
     }
     total
+}
+
+fn known_turn_usage(token_usage: &Option<MessageTokenUsage>) -> Option<&TokenUsage> {
+    token_usage.as_ref()?.turn.known_usage()
 }
 
 fn add_optional_tokens(total: &mut Option<u64>, value: Option<u64>) {
@@ -952,6 +962,21 @@ pub(crate) async fn generate_agent_activity_summary(
         }
     };
 
+    collect_agent_activity_summary_events(
+        &request,
+        &mut events,
+        logged_prompt_len,
+        target_workspace_root_count,
+    )
+    .await
+}
+
+async fn collect_agent_activity_summary_events(
+    request: &GenerateAgentActivitySummaryRequest,
+    events: &mut EventStream,
+    logged_prompt_len: usize,
+    target_workspace_root_count: usize,
+) -> Result<AgentActivitySummary, String> {
     let mut streamed_text = String::new();
     let mut stream_delta_count = 0usize;
     let mut chat_event_count = 0usize;
@@ -982,12 +1007,18 @@ pub(crate) async fn generate_agent_activity_summary(
                 });
             }
             ChatEvent::ToolRequest(requested_tool) => {
+                let message = format!(
+                    "activity summary generator attempted unsupported tool call '{}' ({})",
+                    requested_tool.tool_name, requested_tool.tool_call_id
+                );
                 tracing::warn!(
                     summary_agent_id = %request.summary_agent_id,
                     backend_kind = ?request.backend_kind,
                     tool_name = %requested_tool.tool_name,
-                    "activity summary generator attempted a tool call; ignoring and continuing to read text"
+                    tool_call_id = %requested_tool.tool_call_id,
+                    "activity summary generator attempted a tool call"
                 );
+                return Err(message);
             }
             _ => {}
         }
@@ -4810,9 +4841,6 @@ fn fold_message_metadata_update_into_history_events(
         if update.token_usage.is_some() {
             message.token_usage = update.token_usage.clone();
         }
-        if update.turn_token_usage.is_some() {
-            message.turn_token_usage = update.turn_token_usage.clone();
-        }
         if update.context_breakdown.is_some() {
             message.context_breakdown = update.context_breakdown.clone();
         }
@@ -4862,11 +4890,8 @@ async fn apply_runtime_session_updates(
             ChatEvent::StreamEnd(data) => store.update(session_id, |record| {
                 record.updated_at_ms = now_ms();
                 record.message_count += 1;
-                if let Some(delta) = data
-                    .message
-                    .token_usage
-                    .as_ref()
-                    .map(|usage| usage.total_tokens)
+                if let Some(delta) =
+                    known_turn_usage(&data.message.token_usage).map(|usage| usage.total_tokens)
                 {
                     record.token_count =
                         Some(record.token_count.unwrap_or(0).saturating_add(delta));
@@ -4874,7 +4899,9 @@ async fn apply_runtime_session_updates(
             }),
             ChatEvent::MessageMetadataUpdated(data) => store.update(session_id, |record| {
                 record.updated_at_ms = now_ms();
-                if let Some(delta) = data.token_usage.as_ref().map(|usage| usage.total_tokens) {
+                if let Some(delta) =
+                    known_turn_usage(&data.token_usage).map(|usage| usage.total_tokens)
+                {
                     record.token_count =
                         Some(record.token_count.unwrap_or(0).saturating_add(delta));
                 }
@@ -5090,21 +5117,23 @@ mod tests {
     use protocol::{
         AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
         AgentId, AgentInput, AgentStartPayload, ChatEvent, ChatMessage, ChatMessageId, FrameKind,
-        MessageMetadataUpdateData, MessageSender, ModelInfo, SessionId, StreamEndData, StreamPath,
-        StreamStartData, StreamTextDeltaData, TaskList, TokenUsage, ToolExecutionCompletedData,
-        ToolExecutionResult, ToolRequest, ToolRequestType,
+        MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, SessionId,
+        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList, TokenUsage,
+        ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
 
     use super::{
-        AgentActivityStatsTracker, AgentCommand, AgentHandle, AgentReplayState, InterruptOutcome,
-        activity_history_snapshot, append_chat_event, append_event, attach_subscriber,
-        generate_mock_name, name_generation_fallback, output_events_since,
+        AgentActivityStatsTracker, AgentCommand, AgentHandle, AgentReplayState,
+        GenerateAgentActivitySummaryRequest, InterruptOutcome, activity_history_snapshot,
+        append_chat_event, append_event, attach_subscriber, collect_agent_activity_summary_events,
+        generate_mock_name, known_turn_usage, name_generation_fallback, output_events_since,
         sanitize_generated_agent_name, session_history_window, spawn_relay_agent_actor,
         upsert_activity_stats_snapshot,
     };
     use crate::agent::registry::AgentStatusHandle;
+    use crate::backend::EventStream;
     use crate::store::session::SessionStore;
     use crate::stream::Stream;
 
@@ -5218,7 +5247,6 @@ mod tests {
             tool_calls: Vec::new(),
             model_info: None,
             token_usage: None,
-            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         }
@@ -5230,15 +5258,10 @@ mod tests {
             model_info: Some(ModelInfo {
                 model: "mock-model".to_owned(),
             }),
-            token_usage: Some(TokenUsage {
-                input_tokens: total_tokens / 2,
-                output_tokens: total_tokens - (total_tokens / 2),
-                total_tokens,
-                cached_prompt_tokens: Some(0),
-                cache_creation_input_tokens: Some(0),
-                reasoning_tokens: Some(0),
-            }),
-            turn_token_usage: None,
+            token_usage: Some(MessageTokenUsage::request_and_turn_known(
+                token_usage(total_tokens),
+                token_usage(total_tokens),
+            )),
             context_breakdown: None,
         })
     }
@@ -5279,6 +5302,13 @@ mod tests {
         }
     }
 
+    fn scoped_token_usage(total_tokens: u64) -> MessageTokenUsage {
+        MessageTokenUsage::request_and_turn_known(
+            token_usage(total_tokens),
+            token_usage(total_tokens),
+        )
+    }
+
     fn stream_start(message_id: &str) -> ChatEvent {
         ChatEvent::StreamStart(StreamStartData {
             message_id: Some(message_id.to_owned()),
@@ -5290,7 +5320,10 @@ mod tests {
     fn stream_end_with_usage(message_id: &str, content: &str, total_tokens: u64) -> ChatEvent {
         let mut message = assistant_message(content);
         message.message_id = Some(ChatMessageId(message_id.to_owned()));
-        message.token_usage = Some(token_usage(total_tokens));
+        message.token_usage = Some(MessageTokenUsage::request_and_turn_known(
+            token_usage(total_tokens),
+            token_usage(total_tokens),
+        ));
         ChatEvent::StreamEnd(StreamEndData { message })
     }
 
@@ -5320,6 +5353,38 @@ mod tests {
             workflow: None,
             created_at_ms: 1,
         }
+    }
+
+    fn activity_summary_request() -> GenerateAgentActivitySummaryRequest {
+        GenerateAgentActivitySummaryRequest {
+            summary_agent_id: AgentId("summary-agent".to_owned()),
+            backend_kind: protocol::BackendKind::Claude,
+            workspace_roots: vec!["/tmp/test".to_owned()],
+            rendered_history: "assistant used a tool".to_owned(),
+            previous_summary: None,
+            source_from_seq: Some(1),
+            source_through_seq: Some(2),
+            use_mock_backend: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_summary_tool_request_is_explicit_failure() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(tool_request("summary-tool"))
+            .expect("send tool request");
+        drop(tx);
+        let mut events = EventStream::new(rx);
+
+        let error =
+            collect_agent_activity_summary_events(&activity_summary_request(), &mut events, 0, 0)
+                .await
+                .expect_err("tool request should fail summary generation");
+
+        assert!(
+            error.contains("unsupported tool call 'run_command' (summary-tool)"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -5452,7 +5517,7 @@ mod tests {
         let mut stats = AgentActivityStatsTracker::default();
         let mut message = assistant_message("done");
         message.message_id = Some(ChatMessageId("message-1".to_owned()));
-        message.token_usage = Some(token_usage(10));
+        message.token_usage = Some(scoped_token_usage(10));
 
         assert!(observe_stats(
             &mut stats,
@@ -5472,12 +5537,68 @@ mod tests {
     }
 
     #[test]
+    fn activity_stats_stamps_cumulative_scope_without_changing_request_scope() {
+        let mut stats = AgentActivityStatsTracker::default();
+        let mut message = assistant_message("done");
+        message.message_id = Some(ChatMessageId("message-1".to_owned()));
+        message.token_usage = Some(MessageTokenUsage::request_and_turn_known(
+            token_usage(7),
+            token_usage(11),
+        ));
+        let mut event = ChatEvent::MessageAdded(message);
+
+        assert!(stats.observe_chat_event(&mut event, 0, ""));
+        let ChatEvent::MessageAdded(message) = event else {
+            panic!("expected MessageAdded")
+        };
+        let usage = message.token_usage.expect("message token usage");
+        assert_eq!(
+            usage.request.known_usage().map(|usage| usage.total_tokens),
+            Some(7)
+        );
+        assert_eq!(
+            usage.turn.known_usage().map(|usage| usage.total_tokens),
+            Some(11)
+        );
+        assert_eq!(
+            usage
+                .cumulative
+                .known_usage()
+                .map(|usage| usage.total_tokens),
+            Some(11)
+        );
+        assert_eq!(stats.snapshot().token_usage.total_tokens, 11);
+    }
+
+    #[test]
+    fn activity_stats_preserves_request_only_usage_without_inventing_turn() {
+        let mut stats = AgentActivityStatsTracker::default();
+        let mut message = assistant_message("intermediate");
+        message.message_id = Some(ChatMessageId("message-1".to_owned()));
+        message.token_usage = Some(MessageTokenUsage::request_known(token_usage(7)));
+        let mut event = ChatEvent::MessageAdded(message);
+
+        assert!(stats.observe_chat_event(&mut event, 0, ""));
+        let ChatEvent::MessageAdded(message) = event else {
+            panic!("expected MessageAdded")
+        };
+        let usage = message.token_usage.expect("message token usage");
+        assert_eq!(
+            usage.request.known_usage().map(|usage| usage.total_tokens),
+            Some(7)
+        );
+        assert!(usage.turn.known_usage().is_none());
+        assert!(usage.cumulative.known_usage().is_none());
+        assert_eq!(stats.snapshot().token_usage, TokenUsage::default());
+    }
+
+    #[test]
     fn activity_stats_uses_event_seq_for_unidentified_token_usage() {
         let mut stats = AgentActivityStatsTracker::default();
         let mut first = assistant_message("first");
-        first.token_usage = Some(token_usage(6));
+        first.token_usage = Some(scoped_token_usage(6));
         let mut second = assistant_message("second");
-        second.token_usage = Some(token_usage(8));
+        second.token_usage = Some(scoped_token_usage(8));
 
         assert!(observe_stats(
             &mut stats,
@@ -6088,6 +6209,7 @@ mod tests {
                 .message
                 .token_usage
                 .as_ref()
+                .and_then(|usage| usage.turn.known_usage())
                 .map(|usage| usage.total_tokens),
             Some(42)
         );
@@ -6304,7 +6426,7 @@ mod tests {
                     Some(ChatMessageId("message-1".to_owned()))
                 );
                 assert_eq!(
-                    message.token_usage.as_ref().map(|usage| usage.total_tokens),
+                    known_turn_usage(&message.token_usage).map(|usage| usage.total_tokens),
                     Some(42)
                 );
             }
@@ -6327,7 +6449,7 @@ mod tests {
                     Some(ChatMessageId("message-1".to_owned()))
                 );
                 assert_eq!(
-                    message.token_usage.as_ref().map(|usage| usage.total_tokens),
+                    known_turn_usage(&message.token_usage).map(|usage| usage.total_tokens),
                     Some(42)
                 );
             }
@@ -6489,7 +6611,7 @@ mod tests {
             ChatEvent::MessageMetadataUpdated(update) => {
                 assert_eq!(update.message_id, ChatMessageId("message-1".to_owned()));
                 assert_eq!(
-                    update.token_usage.as_ref().map(|usage| usage.total_tokens),
+                    known_turn_usage(&update.token_usage).map(|usage| usage.total_tokens),
                     Some(42)
                 );
             }

@@ -126,6 +126,7 @@ async fn connect_inner(
         pending_peer_salt: None,
         established_peer_salt: None,
         pending_data_frames: VecDeque::new(),
+        pending_credit_frames: VecDeque::new(),
         outbound_rx,
         inbound_tx,
         ready_tx: Some(ready_tx),
@@ -208,7 +209,7 @@ mod tests {
     use crate::config::ParticipantRole;
     use crate::error::{CryptoError, FramingError};
     use crate::framing::{SESSION_SALT_LEN, encode_data_frame, encode_handshake_frame};
-    use crate::link::{MAX_QOS1_INFLIGHT, MQTT_QOS1_WINDOW};
+    use crate::link::{MAX_DATA_QOS1_INFLIGHT, MQTT_QOS1_WINDOW};
     use crate::link_native::{default_root_cert_store, mqtt_options, validate_puback};
     use crate::protocol_driver::validate_post_session_handshake;
     use crate::session::SessionCipher;
@@ -704,7 +705,7 @@ mod tests {
             .get_outgoing_inflight_upper_limit()
             .ok_or_else(|| std::io::Error::other("missing outgoing in-flight limit"))?;
         assert_eq!(outgoing_limit, MQTT_QOS1_WINDOW as u16);
-        assert!(usize::from(outgoing_limit) > MAX_QOS1_INFLIGHT);
+        assert!(usize::from(outgoing_limit) > MAX_DATA_QOS1_INFLIGHT);
 
         let receive_maximum = options
             .receive_maximum()

@@ -15,16 +15,44 @@ Tyde error instead of guessing.
 
 ## Process selection
 
-Local sessions resolve `<hermes-python>` using the order documented by the
-Hermes TUI:
+Local sessions use explicit overrides authoritatively before auto-discovery:
 
-1. `HERMES_PYTHON`
-2. `PYTHON`
-3. `$VIRTUAL_ENV/bin/python`
-4. `./.venv/bin/python`
-5. `./venv/bin/python`
-6. `python3`
-7. `python`
+1. `HERMES_PYTHON`, when set, must point at a Python interpreter that can import
+   `tui_gateway.entry`. If it cannot, Hermes setup is reported as unavailable
+   with a typed diagnostic and runtime launch fails with the same cause; Tyde
+   does not fall back to another executable.
+2. `HERMES_EXECUTABLE`, when set, must point at a Hermes CLI whose `--version`
+   output reports a `Project:` root with a virtualenv that can import
+   `tui_gateway.entry`. If this probe fails, Tyde reports the explicit failure
+   instead of falling back to PATH or Python.
+3. Without explicit overrides, Tyde probes `hermes` on the host PATH (including
+   the login-shell and common user-bin PATH that contains `~/.local/bin`).
+4. The Python-module path remains a dev fallback only when no verifiable Hermes
+   executable is available.
+
+For executable probes, Tyde runs `hermes --version`, reads Hermes's reported
+project root, verifies that the project's virtualenv can import
+`tui_gateway.entry`, then launches that virtualenv Python as:
+
+```text
+<hermes-project>/venv/bin/python -m tui_gateway.entry
+```
+
+The dev fallback probes:
+
+1. `PYTHON`
+2. `$VIRTUAL_ENV/bin/python`
+3. `./.venv/bin/python`
+4. `./venv/bin/python`
+5. `python3`
+6. `python`
+
+Setup diagnostics distinguish subprocess failures, probe timeouts, nonzero
+`--version`, missing `Project:`, missing Hermes virtualenv Python, and gateway
+import failures. The setup sign-in command uses the resolved Hermes executable
+path when Hermes was verified through `HERMES_EXECUTABLE` or PATH; if Hermes is
+only available through `HERMES_PYTHON`, Tyde does not invent a `hermes setup`
+command.
 
 Remote `ssh://host/path` workspaces spawn the same module remotely. The remote
 interpreter defaults to `python3` and can be overridden with
@@ -109,6 +137,10 @@ settings panel's **Backend Configuration** section, driven by a
 richer field-type set — `Text`, `Secret`, plus `Select`/`Toggle`/`Integer`).
 Values persist host-side in `HostSettings.backend_config` and apply to every new
 session on that host; per-session settings still override where they overlap.
+`HostSettings.backend_config` stores only explicit Tyde-managed overrides.
+Backend-native current settings are server-owned snapshots emitted separately as
+`BackendConfigSnapshots` on the host stream, so the UI can render the backend's
+current provider/model state without treating a form read as a destructive save.
 
 Hermes exposes three `Text` fields:
 
@@ -123,6 +155,10 @@ Hermes exposes three `Text` fields:
 API keys are intentionally **not** a Hermes config field: credentials remain
 Hermes-owned by the design above. The framework supports a `Secret` field type
 for backends that opt in, but Hermes does not persist keys through Tyde.
+Hermes snapshots currently map `model.options.model` to `default_model` and
+`model.options.provider` to `default_provider`; `api_base_url` remains an
+explicit Tyde override because the native gateway does not expose a verified
+read contract for that value here.
 
 ## Cancellation ordering
 

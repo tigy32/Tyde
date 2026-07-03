@@ -9,10 +9,10 @@ use crate::types::{
 use crate::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentClosedPayload, AgentOrigin,
     AgentStartPayload, AgentsViewPreferencesNotifyPayload, BackendConfigSchemasPayload,
-    BackendKind, BackendSetupPayload, CancelWorkflowPayload, ChatEvent, ChatMessage, ChatMessageId,
-    ClientErrorPayload, CodeIntelDiagnosticsPayload, CodeIntelErrorPayload,
-    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
-    CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    BackendConfigSnapshotsPayload, BackendKind, BackendSetupPayload, CancelWorkflowPayload,
+    ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload, CodeIntelDiagnosticsPayload,
+    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
+    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
     CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
     DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload,
@@ -289,6 +289,13 @@ impl ProtocolValidator {
                 envelope,
                 "BackendConfigSchemas",
             ),
+            FrameKind::BackendConfigSnapshots => {
+                parse_host_payload::<BackendConfigSnapshotsPayload>(
+                    self,
+                    envelope,
+                    "BackendConfigSnapshots",
+                )
+            }
             FrameKind::SessionSchemas => {
                 parse_host_payload::<SessionSchemasPayload>(self, envelope, "SessionSchemas")
             }
@@ -1763,8 +1770,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        ChatMessage, ChatMessageId, MessageMetadataUpdateData, MessageSender, ModelInfo,
-        StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage,
+        ChatMessage, ChatMessageId, MessageMetadataUpdateData, MessageSender, MessageTokenUsage,
+        ModelInfo, StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage,
     };
 
     fn host_stream() -> StreamPath {
@@ -1828,6 +1835,7 @@ mod tests {
                 backend_setup: BackendSetupPayload { backends: vec![] },
                 session_schemas: vec![],
                 backend_config_schemas: vec![],
+                backend_config_snapshots: vec![],
                 launch_profile_catalog: Default::default(),
                 sessions: vec![],
                 projects: vec![],
@@ -1929,7 +1937,6 @@ mod tests {
             tool_calls: vec![],
             model_info: None,
             token_usage: None,
-            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         }
@@ -1960,7 +1967,6 @@ mod tests {
             tool_calls: vec![],
             model_info: None,
             token_usage: None,
-            turn_token_usage: None,
             context_breakdown: None,
             images: None,
         }
@@ -1983,15 +1989,24 @@ mod tests {
             model_info: Some(ModelInfo {
                 model: "gpt-5-codex".to_owned(),
             }),
-            token_usage: Some(TokenUsage {
-                input_tokens: 1,
-                output_tokens: 2,
-                total_tokens: 3,
-                cached_prompt_tokens: Some(0),
-                cache_creation_input_tokens: Some(0),
-                reasoning_tokens: Some(0),
-            }),
-            turn_token_usage: None,
+            token_usage: Some(MessageTokenUsage::request_and_turn_known(
+                TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    total_tokens: 3,
+                    cached_prompt_tokens: Some(0),
+                    cache_creation_input_tokens: Some(0),
+                    reasoning_tokens: Some(0),
+                },
+                TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    total_tokens: 3,
+                    cached_prompt_tokens: Some(0),
+                    cache_creation_input_tokens: Some(0),
+                    reasoning_tokens: Some(0),
+                },
+            )),
             context_breakdown: None,
         })
     }
@@ -2064,6 +2079,22 @@ mod tests {
 
         validator.validate_envelope(&bootstrap).unwrap();
         validator.validate_envelope(&schemas).unwrap();
+    }
+
+    #[test]
+    fn live_backend_config_snapshots_are_valid_host_frames() {
+        let mut validator = ProtocolValidator::new();
+        let bootstrap = host_bootstrap_with_agents(vec![]);
+        let snapshots = Envelope::from_payload(
+            host_stream(),
+            FrameKind::BackendConfigSnapshots,
+            1,
+            &BackendConfigSnapshotsPayload { snapshots: vec![] },
+        )
+        .expect("serialize BackendConfigSnapshots");
+
+        validator.validate_envelope(&bootstrap).unwrap();
+        validator.validate_envelope(&snapshots).unwrap();
     }
 
     #[test]

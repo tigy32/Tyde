@@ -854,7 +854,7 @@ pub fn CenterZone() -> impl IntoView {
                                         .unwrap_or_default()
                                 }
                             >
-                                <LaunchMenuBody open_sig=menu_open submenu_align=SubmenuAlign::Left />
+                                <LaunchMenuBody open_sig=menu_open submenu_align=SubmenuAlign::Auto />
                             </div>
                         </Show>
                     </div>

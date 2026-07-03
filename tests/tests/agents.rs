@@ -5,17 +5,18 @@ use protocol::types::AgentClosedPayload;
 use protocol::{
     AgentActivitySummaryPayload, AgentActivitySummaryState, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentControlStatus, AgentErrorCode, AgentErrorPayload, AgentOrigin,
-    AgentRenamedPayload, AgentStartPayload, BackendConfigSchemasPayload, BackendKind,
-    BackgroundAgentFeature, ChatEvent, ClientErrorCode, ClientErrorPayload, CommandErrorCode,
-    CommandErrorPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload,
-    HostLaunchProfileConfig, HostSettingValue, HostSettingsPayload, LaunchProfileCatalogPayload,
-    LaunchProfileId, ListSessionsPayload, MessageMetadataUpdateData, MessageSender,
-    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectId, ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SendMessagePayload,
-    SendMessageToolResponse, SessionHistoryPayload, SessionListPayload, SessionSettingValue,
-    SessionSettingsValues, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamEndData,
-    StreamPath, TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult,
-    ToolRequest, ToolRequestType, TurnTokenUsage, write_envelope,
+    AgentRenamedPayload, AgentStartPayload, BackendConfigSchemasPayload,
+    BackendConfigSnapshotsPayload, BackendKind, BackgroundAgentFeature, ChatEvent, ClientErrorCode,
+    ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope,
+    FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload, HostLaunchProfileConfig,
+    HostSettingValue, HostSettingsPayload, LaunchProfileCatalogPayload, LaunchProfileId,
+    LaunchProfileKind, ListSessionsPayload, MessageMetadataUpdateData, MessageSender,
+    MessageTokenUsage, NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectId, ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath,
+    SendMessagePayload, SendMessageToolResponse, SessionHistoryPayload, SessionListPayload,
+    SessionSettingValue, SessionSettingsValues, SetSettingPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamEndData, StreamPath, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -64,6 +65,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::BackendConfigSchemas
+                | FrameKind::BackendConfigSnapshots
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList
                 | FrameKind::WorkflowNotify
@@ -226,6 +228,7 @@ async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: 
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::BackendConfigSchemas
+                | FrameKind::BackendConfigSnapshots
                 | FrameKind::QueuedMessages
                 | FrameKind::WorkflowNotify
         ) {
@@ -311,6 +314,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::LaunchProfileCatalogNotify
                             | FrameKind::BackendSetup
                             | FrameKind::BackendConfigSchemas
+                            | FrameKind::BackendConfigSnapshots
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionList
                             | FrameKind::HostSettings
@@ -658,6 +662,10 @@ async fn wait_for_ready_launch_profile_after_backend_config_schema(
                     env.parse_payload().expect("BackendConfigSchemas payload");
                 saw_backend_config_schemas = true;
             }
+            FrameKind::BackendConfigSnapshots => {
+                let _: BackendConfigSnapshotsPayload =
+                    env.parse_payload().expect("BackendConfigSnapshots payload");
+            }
             FrameKind::LaunchProfileCatalogNotify => {
                 let payload: LaunchProfileCatalogPayload = env
                     .parse_payload()
@@ -837,25 +845,32 @@ const MOCK_TURN_TOKEN_TOTAL: u64 = 1590;
 const MOCK_NATIVE_CHILD_TOKEN_TOTAL: u64 = 330;
 
 fn assert_known_turn_usage(
-    usage: &Option<TurnTokenUsage>,
+    usage: &Option<MessageTokenUsage>,
     expected_this_turn_total: u64,
     expected_agent_total: u64,
 ) {
-    match usage {
-        Some(TurnTokenUsage::Known {
-            this_turn,
-            agent_total,
-        }) => {
-            assert_eq!(this_turn.total_tokens, expected_this_turn_total);
-            assert_eq!(agent_total.total_tokens, expected_agent_total);
-        }
-        other => panic!("expected known turn token usage, got {other:?}"),
-    }
+    let usage = usage.as_ref().expect("expected token usage");
+    assert_eq!(
+        usage
+            .turn
+            .known_usage()
+            .expect("expected known turn usage")
+            .total_tokens,
+        expected_this_turn_total
+    );
+    assert_eq!(
+        usage
+            .cumulative
+            .known_usage()
+            .expect("expected known cumulative usage")
+            .total_tokens,
+        expected_agent_total
+    );
 }
 
-fn assert_unavailable_turn_usage(usage: &Option<TurnTokenUsage>) {
-    match usage {
-        Some(TurnTokenUsage::Unavailable {
+fn assert_unavailable_turn_usage(usage: &Option<MessageTokenUsage>) {
+    match usage.as_ref().map(|usage| &usage.turn) {
+        Some(TokenUsageScope::Unavailable {
             reason: TokenUsageUnavailableReason::BackendDidNotReport,
         }) => {}
         other => panic!("expected unavailable turn token usage, got {other:?}"),
@@ -987,6 +1002,7 @@ async fn expect_raw_agent_bootstrap_on_stream(
                     | FrameKind::LaunchProfileCatalogNotify
                     | FrameKind::BackendSetup
                     | FrameKind::BackendConfigSchemas
+                    | FrameKind::BackendConfigSnapshots
                     | FrameKind::QueuedMessages
                     | FrameKind::SessionList
                     | FrameKind::WorkflowNotify
@@ -1473,6 +1489,7 @@ async fn expect_no_agent_error_message(
                             | FrameKind::LaunchProfileCatalogNotify
                             | FrameKind::BackendSetup
                             | FrameKind::BackendConfigSchemas
+                            | FrameKind::BackendConfigSnapshots
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionList
                             | FrameKind::WorkflowNotify
@@ -1674,11 +1691,14 @@ async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
             .token_usage
             .as_ref()
             .expect("first turn usage")
+            .request
+            .known_usage()
+            .expect("first request usage")
             .total_tokens,
         MOCK_TURN_TOKEN_TOTAL
     );
     assert_known_turn_usage(
-        &first.message.turn_token_usage,
+        &first.message.token_usage,
         MOCK_TURN_TOKEN_TOTAL,
         MOCK_TURN_TOKEN_TOTAL,
     );
@@ -1695,7 +1715,7 @@ async fn turn_token_usage_is_known_cumulative_and_bootstrapped() {
     )
     .await;
     assert_known_turn_usage(
-        &second.message.turn_token_usage,
+        &second.message.token_usage,
         MOCK_TURN_TOKEN_TOTAL,
         MOCK_TURN_TOKEN_TOTAL * 2,
     );
@@ -1738,8 +1758,7 @@ async fn late_metadata_usage_updates_cumulative_without_double_counting() {
         "mock backend response to: first late",
     )
     .await;
-    assert!(stream_end.message.token_usage.is_none());
-    assert_unavailable_turn_usage(&stream_end.message.turn_token_usage);
+    assert_unavailable_turn_usage(&stream_end.message.token_usage);
 
     let update =
         expect_metadata_update_on_stream(&mut fixture.client, &new_agent.instance_stream).await;
@@ -1748,11 +1767,14 @@ async fn late_metadata_usage_updates_cumulative_without_double_counting() {
             .token_usage
             .as_ref()
             .expect("late metadata token usage")
+            .request
+            .known_usage()
+            .expect("late metadata request usage")
             .total_tokens,
         MOCK_TURN_TOKEN_TOTAL
     );
     assert_known_turn_usage(
-        &update.turn_token_usage,
+        &update.token_usage,
         MOCK_TURN_TOKEN_TOTAL,
         MOCK_TURN_TOKEN_TOTAL,
     );
@@ -1770,7 +1792,7 @@ async fn late_metadata_usage_updates_cumulative_without_double_counting() {
     )
     .await;
     assert_known_turn_usage(
-        &second.message.turn_token_usage,
+        &second.message.token_usage,
         MOCK_TURN_TOKEN_TOTAL,
         MOCK_TURN_TOKEN_TOTAL * 2,
     );
@@ -1817,7 +1839,7 @@ async fn subagent_turn_token_usage_is_strictly_self() {
     )
     .await;
     assert_known_turn_usage(
-        &parent_end.message.turn_token_usage,
+        &parent_end.message.token_usage,
         MOCK_TURN_TOKEN_TOTAL,
         MOCK_TURN_TOKEN_TOTAL,
     );
@@ -1838,7 +1860,7 @@ async fn subagent_turn_token_usage_is_strictly_self() {
     )
     .await;
     assert_known_turn_usage(
-        &child_end.message.turn_token_usage,
+        &child_end.message.token_usage,
         MOCK_NATIVE_CHILD_TOKEN_TOTAL,
         MOCK_NATIVE_CHILD_TOKEN_TOTAL,
     );
@@ -1860,8 +1882,7 @@ async fn missing_backend_usage_is_unavailable_not_zero() {
         "mock backend response to: missing usage",
     )
     .await;
-    assert!(stream_end.message.token_usage.is_none());
-    assert_unavailable_turn_usage(&stream_end.message.turn_token_usage);
+    assert_unavailable_turn_usage(&stream_end.message.token_usage);
 }
 
 #[tokio::test]
@@ -2411,6 +2432,7 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
                 entry,
                 protocol::LaunchProfileEntry::Ready { profile }
                     if profile.id.0 == "claude:default"
+                        && profile.kind == LaunchProfileKind::BackendDefault
             )
         }),
         "dev-driver launch options should include claude:default"
@@ -2528,6 +2550,7 @@ async fn agent_control_dev_driver_spawns_explicit_hermes_launch_profile_after_sc
                 entry,
                 protocol::LaunchProfileEntry::Ready { profile }
                     if profile.id.0 == "hermes:claude"
+                        && profile.kind == LaunchProfileKind::Custom
                         && profile.backend_kind == BackendKind::Hermes
                         && profile.session_settings == hermes_claude_session_settings()
             )
@@ -2638,6 +2661,7 @@ async fn agent_control_http_spawns_explicit_hermes_launch_profile_after_schema_r
                 entry,
                 protocol::LaunchProfileEntry::Ready { profile }
                     if profile.id.0 == "hermes:claude"
+                        && profile.kind == LaunchProfileKind::Custom
                         && profile.backend_kind == BackendKind::Hermes
                         && profile.session_settings == hermes_claude_session_settings()
             )
@@ -4976,6 +5000,7 @@ async fn multiple_agents() {
                 | FrameKind::LaunchProfileCatalogNotify
                 | FrameKind::BackendSetup
                 | FrameKind::BackendConfigSchemas
+                | FrameKind::BackendConfigSnapshots
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList
                 | FrameKind::AgentActivityStats

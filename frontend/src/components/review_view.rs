@@ -1050,12 +1050,25 @@ fn parse_submit_target(value: &str) -> Option<protocol::ReviewSubmitTarget> {
     }
 }
 
+/// Whether `agent` is a valid review submit target: a top-level agent a human
+/// owns, never a sub-agent. Sub-agents — backend-native subagents, agent-control
+/// children, and workflow / team / side-question spawns — carry a
+/// `parent_agent_id` and/or a non-`User` [`AgentOrigin`]. Decided purely from
+/// server-emitted typed provenance, never from the agent's display name (so a
+/// legitimately user-created agent named "Agent" is kept, and a sub-agent with
+/// any name is dropped).
+fn is_top_level_user_agent(agent: &AgentInfo) -> bool {
+    agent.parent_agent_id.is_none() && agent.origin == protocol::AgentOrigin::User
+}
+
 /// Live same-project agents on `host_id` for `project_id` — the deliverable
 /// review submit targets. "Live" excludes agents with a fatal error
-/// (terminated). The review's own origin is intentionally never consulted:
-/// project-scoped reviews use a synthetic, non-deliverable origin. The
-/// `tracked` flag selects reactive vs untracked signal reads so the same
-/// logic serves both the reactive submit gate and the click handler.
+/// (terminated); [`is_top_level_user_agent`] excludes sub-agents so the picker
+/// and auto-target only ever consider top-level user agents. The review's own
+/// origin is intentionally never consulted: project-scoped reviews use a
+/// synthetic, non-deliverable origin. The `tracked` flag selects reactive vs
+/// untracked signal reads so the same logic serves both the reactive submit
+/// gate and the click handler.
 fn live_same_project_candidates(
     state: &AppState,
     host_id: &str,
@@ -1069,6 +1082,7 @@ fn live_same_project_candidates(
                 a.host_id == host_id
                     && a.project_id.as_ref() == Some(project_id)
                     && a.fatal_error.is_none()
+                    && is_top_level_user_agent(a)
             })
             .map(|a| {
                 let name = if a.name.is_empty() {
@@ -2498,6 +2512,16 @@ mod wasm_tests {
         }
     }
 
+    /// A same-project sub-agent: carries a typed `parent_agent_id` and a
+    /// non-`User` `origin`, exactly as the server marks orchestrated children.
+    fn make_sub_agent(name: &str, agent_id: &str, origin: AgentOrigin, parent: &str) -> AgentInfo {
+        AgentInfo {
+            parent_agent_id: Some(AgentId(parent.to_owned())),
+            origin,
+            ..make_agent(name, agent_id, Some("proj-1"))
+        }
+    }
+
     fn comment_at_line(line: u32, body: &str) -> ReviewComment {
         ReviewComment {
             id: ReviewCommentId(format!("c-{line}-{body}")),
@@ -2694,6 +2718,114 @@ mod wasm_tests {
         assert!(
             !text.contains("Other Project"),
             "an agent from a different project must not be offered; got: {text}"
+        );
+    }
+
+    /// Sub-agents (backend-native subagents, agent-control children, workflow
+    /// spawns) must never appear in the reviewer picker — they are excluded by
+    /// their typed `parent_agent_id`/`origin`, not by their name. Asserted by
+    /// option identity so a name change can't mask a regression.
+    #[wasm_bindgen_test]
+    async fn submit_target_picker_hides_sub_agents() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let review = make_review(); // project_id = "proj-1", host = "h1"
+        let state_holder = mount_sidebar(container.clone(), review);
+
+        next_tick().await;
+        next_tick().await;
+
+        let state = state_holder.borrow().clone().unwrap();
+        state.agents.update(|agents| {
+            // One legitimate top-level user agent — must be offered.
+            agents.push(make_agent("Top Level", "a-top", Some("proj-1")));
+            // Assorted sub-agents matching the screenshot — must be hidden.
+            agents.push(make_sub_agent(
+                "Agent",
+                "a-native",
+                AgentOrigin::BackendNative,
+                "a-top",
+            ));
+            agents.push(make_sub_agent(
+                "Agent2 Stats Design Plan",
+                "a-control",
+                AgentOrigin::AgentControl,
+                "a-top",
+            ));
+            agents.push(make_sub_agent(
+                "Agent2 Stats Wiring Implementer",
+                "a-workflow",
+                AgentOrigin::Workflow,
+                "a-top",
+            ));
+        });
+        next_tick().await;
+
+        let select = container
+            .query_selector("[data-test=\"review-submit-target\"]")
+            .unwrap()
+            .expect("submit target picker rendered");
+
+        assert!(
+            select
+                .query_selector("option[value=\"existing:a-top\"]")
+                .unwrap()
+                .is_some(),
+            "the top-level user agent must remain a reviewer target"
+        );
+        for hidden in ["a-native", "a-control", "a-workflow"] {
+            assert!(
+                select
+                    .query_selector(&format!("option[value=\"existing:{hidden}\"]"))
+                    .unwrap()
+                    .is_none(),
+                "sub-agent {hidden} must not appear in the reviewer picker"
+            );
+        }
+    }
+
+    /// The filter is driven by typed provenance, never the display name: a
+    /// top-level user agent literally named "Agent" is kept, while a sub-agent
+    /// with a friendly name is still dropped.
+    #[wasm_bindgen_test]
+    async fn submit_target_picker_keeps_user_agent_named_agent() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let review = make_review();
+        let state_holder = mount_sidebar(container.clone(), review);
+
+        next_tick().await;
+        next_tick().await;
+
+        let state = state_holder.borrow().clone().unwrap();
+        state.agents.update(|agents| {
+            agents.push(make_agent("Agent", "a-user-named-agent", Some("proj-1")));
+            agents.push(make_sub_agent(
+                "Helpful Reviewer",
+                "a-child",
+                AgentOrigin::AgentControl,
+                "a-user-named-agent",
+            ));
+        });
+        next_tick().await;
+
+        let select = container
+            .query_selector("[data-test=\"review-submit-target\"]")
+            .unwrap()
+            .expect("submit target picker rendered");
+        assert!(
+            select
+                .query_selector("option[value=\"existing:a-user-named-agent\"]")
+                .unwrap()
+                .is_some(),
+            "a top-level user agent named \"Agent\" must be kept — no name inference"
+        );
+        assert!(
+            select
+                .query_selector("option[value=\"existing:a-child\"]")
+                .unwrap()
+                .is_none(),
+            "a sub-agent must be dropped even with a friendly display name"
         );
     }
 

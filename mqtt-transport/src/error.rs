@@ -52,6 +52,11 @@ pub enum MqttTransportError {
     #[error("MQTT retained message rejected on topic {topic}")]
     RetainedMessage { topic: String },
 
+    #[error(
+        "timed out waiting for MQTT receiver credit for data counter {data_counter} after {timeout_ms}ms"
+    )]
+    ReceiverCreditTimeout { data_counter: u64, timeout_ms: u64 },
+
     #[error("MQTT actor stopped before completing the requested operation")]
     ActorClosed,
 }
@@ -103,7 +108,9 @@ pub enum FramingError {
     #[error("frame is empty")]
     EmptyFrame,
 
-    #[error("unsupported transport version {actual:#04x}, expected {expected:#04x}")]
+    #[error(
+        "unsupported MQTT transport frame version {actual:#04x}, expected {expected:#04x}; update both Tyde clients and re-pair"
+    )]
     VersionMismatch { expected: u8, actual: u8 },
 
     #[error("unknown frame tag {tag:#04x}")]
@@ -157,6 +164,7 @@ pub enum CounterViolation {
     FirstFrameMustBeZero { actual: u64 },
     ReplayedOlderFrame { last_seen: u64, actual: u64 },
     Gap { last_seen: Option<u64>, actual: u64 },
+    CreditBeyondSent { sent_next: u64, credit_next: u64 },
 }
 
 impl fmt::Display for CounterViolation {
@@ -178,6 +186,13 @@ impl fmt::Display for CounterViolation {
                 ),
                 None => write!(f, "counter gap before first frame: got {actual}"),
             },
+            Self::CreditBeyondSent {
+                sent_next,
+                credit_next,
+            } => write!(
+                f,
+                "receiver credit {credit_next} exceeds next local data counter {sent_next}"
+            ),
         }
     }
 }
