@@ -13,9 +13,10 @@ use protocol::{
     CustomAgentId, Envelope, FrameKind, HostSettingValue, ImageData, ListSessionsPayload,
     MessageMetadataUpdateData, MessageSender, NewAgentPayload, ProtocolValidator, SessionId,
     SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsValues, SessionSummary, SetSettingPayload,
-    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolRequest, ToolRequestType,
+    SessionSettingValue, SessionSettingsValues, SessionSummary, SetSessionSettingsPayload,
+    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, TokenUsage,
+    TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolRequest,
+    ToolRequestType,
 };
 use server::backend::Backend;
 use uuid::Uuid;
@@ -756,6 +757,103 @@ async fn empty_workspace_spawn_is_accepted_for_all_backends() {
             "{backend_kind:?} empty-root session summary must keep workspace_roots empty"
         );
     }
+}
+
+#[tokio::test]
+async fn tycode_live_default_agent_update_is_rejected() {
+    init_tracing();
+
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Tycode runtime settings".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: Vec::new(),
+                prompt: "hello tycode".to_string(),
+                images: None,
+                backend_kind: BackendKind::Tycode,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn Tycode mock agent");
+
+    let new_agent = loop {
+        let env = expect_fixture_event(&mut fixture.client, "Tycode NewAgent").await;
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        if env.kind == FrameKind::NewAgent {
+            let payload: NewAgentPayload = env.parse_payload().expect("parse Tycode NewAgent");
+            if payload.backend_kind == BackendKind::Tycode {
+                break payload;
+            }
+        }
+    };
+    expect_fixture_agent_start(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "Tycode AgentStart",
+    )
+    .await;
+
+    loop {
+        let env = expect_fixture_event(&mut fixture.client, "Tycode initial StreamEnd").await;
+        if env.kind != FrameKind::ChatEvent || env.stream != new_agent.instance_stream {
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse Tycode initial ChatEvent");
+        if matches!(event, ChatEvent::StreamEnd(_)) {
+            break;
+        }
+    }
+
+    let mut values = SessionSettingsValues::default();
+    values.0.insert(
+        "default_agent".to_string(),
+        SessionSettingValue::String("swarm".to_string()),
+    );
+    fixture
+        .client
+        .set_session_settings(
+            &new_agent.instance_stream,
+            SetSessionSettingsPayload { values },
+        )
+        .await
+        .expect("send Tycode SetSessionSettings");
+
+    let error = loop {
+        let env = expect_fixture_event(&mut fixture.client, "Tycode live settings rejection").await;
+        if env.stream != new_agent.instance_stream {
+            continue;
+        }
+        match env.kind {
+            FrameKind::AgentError => {
+                break env
+                    .parse_payload::<protocol::AgentErrorPayload>()
+                    .expect("parse Tycode live settings AgentError");
+            }
+            FrameKind::SessionSettings => {
+                panic!("rejected Tycode default_agent update must not emit SessionSettings")
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(error.code, AgentErrorCode::Internal);
+    assert!(!error.fatal);
+    assert!(
+        error
+            .message
+            .contains("cannot be changed on a running session"),
+        "unexpected Tycode live settings rejection: {error:?}"
+    );
 }
 
 #[tokio::test]

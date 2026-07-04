@@ -526,6 +526,20 @@ pub(crate) fn validate_session_settings_values(
     Ok(())
 }
 
+pub(crate) fn validate_runtime_session_settings_update(
+    backend_kind: BackendKind,
+    values: &SessionSettingsValues,
+) -> Result<(), String> {
+    match backend_kind {
+        BackendKind::Tycode => tycode::validate_runtime_session_settings_update(values),
+        BackendKind::Kiro
+        | BackendKind::Claude
+        | BackendKind::Codex
+        | BackendKind::Antigravity
+        | BackendKind::Hermes => Ok(()),
+    }
+}
+
 pub(crate) fn sanitize_session_settings_values(
     schema: &SessionSettingsSchema,
     values: &SessionSettingsValues,

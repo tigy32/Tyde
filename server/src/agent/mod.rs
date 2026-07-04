@@ -29,7 +29,7 @@ use crate::backend::tycode::TycodeBackend;
 use crate::backend::{
     Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
     StartupMcpServer, apply_session_settings_update, resolve_backend_session_settings,
-    validate_session_settings_values,
+    validate_runtime_session_settings_update, validate_session_settings_values,
 };
 use crate::host::HostSubAgentEmitter;
 use crate::review::ReviewRegistryHandle;
@@ -2713,6 +2713,26 @@ pub(crate) fn spawn_agent_actor(
                                     if let Err(err) =
                                         validate_session_settings_values(session_schema, &update.values)
                                     {
+                                        let payload = AgentErrorPayload {
+                                            agent_id: current_start.agent_id.clone(),
+                                            code: AgentErrorCode::Internal,
+                                            message: err,
+                                            fatal: false,
+                                        };
+                                        append_event(
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            FrameKind::AgentError,
+                                            &payload,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                    if let Err(err) = validate_runtime_session_settings_update(
+                                        current_start.backend_kind,
+                                        &update.values,
+                                    ) {
                                         let payload = AgentErrorPayload {
                                             agent_id: current_start.agent_id.clone(),
                                             code: AgentErrorCode::Internal,

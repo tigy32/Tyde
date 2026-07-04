@@ -21,7 +21,7 @@ use super::{
     Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
     StartupMcpServer, StartupMcpTransport, apply_session_settings_update,
     backend_fork_unsupported_message, render_combined_spawn_instructions,
-    setup::resolve_tycode_binary_path,
+    setup::{TYCODE_VERSION, resolve_tycode_binary_path},
 };
 use crate::process_env;
 
@@ -44,6 +44,9 @@ static TEST_TYCODE_SUBPROCESS_BIN: std::sync::Mutex<Option<String>> = std::sync:
 static TEST_TYCODE_SESSIONS_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static TEST_TYCODE_STARTUP_TIMEOUT: std::sync::Mutex<Option<Duration>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_TYCODE_SET_ROOT_AGENT_SUPPORTED: std::sync::Mutex<Option<bool>> =
     std::sync::Mutex::new(None);
 
 fn tycode_startup_timeout() -> Duration {
@@ -498,6 +501,19 @@ pub(crate) fn tycode_backend_config_persistence_values(
     values
 }
 
+pub(crate) fn validate_runtime_session_settings_update(
+    update: &SessionSettingsValues,
+) -> Result<(), String> {
+    if update.0.contains_key("default_agent") {
+        return Err(
+            "Tycode default_agent cannot be changed on a running session; start a new Tycode \
+             session with the desired orchestration setting"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 enum TycodeStartupFollowUp {
     InitialUserInput(String),
     ResumeSession { session_id: String },
@@ -526,9 +542,40 @@ enum TycodeStartupObservation {
     Completed,
 }
 
+#[derive(Clone, Copy)]
+enum TycodeRootAgentOverridePolicy {
+    Supported,
+    UnsupportedPinnedVersion,
+    DisabledForReadOnly,
+}
+
+fn tycode_set_root_agent_supported() -> bool {
+    #[cfg(test)]
+    if let Some(supported) = *TEST_TYCODE_SET_ROOT_AGENT_SUPPORTED
+        .lock()
+        .expect("test Tycode SetRootAgent support mutex poisoned")
+    {
+        return supported;
+    }
+
+    false
+}
+
+fn tycode_root_agent_override_policy(config: &BackendSpawnConfig) -> TycodeRootAgentOverridePolicy {
+    if config.resolved_spawn_config.access_mode == BackendAccessMode::ReadOnly {
+        return TycodeRootAgentOverridePolicy::DisabledForReadOnly;
+    }
+    if tycode_set_root_agent_supported() {
+        TycodeRootAgentOverridePolicy::Supported
+    } else {
+        TycodeRootAgentOverridePolicy::UnsupportedPinnedVersion
+    }
+}
+
 struct TycodeStartupController {
     backend_config: BackendConfigValues,
     session_settings: SessionSettingsValues,
+    root_agent_override_policy: TycodeRootAgentOverridePolicy,
     phase: TycodeStartupPhase,
     follow_up: TycodeStartupFollowUp,
     persist_settings: bool,
@@ -539,12 +586,14 @@ impl TycodeStartupController {
     fn new(
         backend_config: BackendConfigValues,
         session_settings: SessionSettingsValues,
+        root_agent_override_policy: TycodeRootAgentOverridePolicy,
         follow_up: TycodeStartupFollowUp,
         persist_settings: bool,
     ) -> Self {
         Self {
             backend_config,
             session_settings,
+            root_agent_override_policy,
             phase: TycodeStartupPhase::AwaitSessionStarted,
             follow_up,
             persist_settings,
@@ -686,7 +735,19 @@ impl TycodeStartupController {
             Some(SessionSettingValue::String(agent))
                 if matches!(agent.as_str(), "one_shot" | "tycode" | "builder" | "swarm") =>
             {
-                Ok(Some(agent.clone()))
+                match self.root_agent_override_policy {
+                    TycodeRootAgentOverridePolicy::Supported => Ok(Some(agent.clone())),
+                    TycodeRootAgentOverridePolicy::UnsupportedPinnedVersion => Err(format!(
+                        "Tycode default_agent session setting requires SetRootAgent support, but \
+                         Tyde currently pins Tycode {TYCODE_VERSION} which does not support that \
+                         protocol"
+                    )),
+                    TycodeRootAgentOverridePolicy::DisabledForReadOnly => Err(
+                        "Tycode default_agent session setting cannot be used with read-only \
+                         Tycode sessions because it would replace Tyde's read-only root agent"
+                            .to_string(),
+                    ),
+                }
             }
             Some(SessionSettingValue::String(agent)) => Err(format!(
                 "Tycode default_agent session setting has unsupported value '{agent}'"
@@ -853,6 +914,7 @@ pub(crate) async fn persist_backend_config(values: BackendConfigValues) -> Resul
         let mut startup = TycodeStartupController::new(
             values,
             SessionSettingsValues::default(),
+            TycodeRootAgentOverridePolicy::UnsupportedPinnedVersion,
             TycodeStartupFollowUp::None,
             true,
         );
@@ -1113,6 +1175,7 @@ fn send_tycode_runtime_session_settings_update(
     update: &SessionSettingsValues,
     stdin_tx: &mpsc::UnboundedSender<TycodeStdinCommand>,
 ) -> Result<(), String> {
+    validate_runtime_session_settings_update(update)?;
     let current_settings = runtime_settings.as_ref().ok_or_else(|| {
         "Tycode runtime settings unavailable while applying session settings update".to_string()
     })?;
@@ -1375,6 +1438,7 @@ impl Backend for TycodeBackend {
             let mut startup = TycodeStartupController::new(
                 config.backend_config.clone(),
                 resolve_session_settings(&config),
+                tycode_root_agent_override_policy(&config),
                 TycodeStartupFollowUp::InitialUserInput(initial_message),
                 false,
             );
@@ -1681,6 +1745,7 @@ impl Backend for TycodeBackend {
             let mut startup = TycodeStartupController::new(
                 config.backend_config.clone(),
                 resolve_session_settings(&config),
+                tycode_root_agent_override_policy(&config),
                 TycodeStartupFollowUp::ResumeSession {
                     session_id: session_id.0.clone(),
                 },
@@ -2625,6 +2690,35 @@ mod tests {
     }
 
     #[test]
+    fn tycode_runtime_session_settings_reject_default_agent_update() {
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<TycodeStdinCommand>();
+        let mut runtime_settings = Some(serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" }
+            },
+            "default_agent": "tycode",
+            "orchestration_progress_messages": true
+        }));
+        let mut update = SessionSettingsValues::default();
+        update.0.insert(
+            "default_agent".to_string(),
+            SessionSettingValue::String("swarm".to_string()),
+        );
+
+        let err =
+            send_tycode_runtime_session_settings_update(&mut runtime_settings, &update, &stdin_tx)
+                .expect_err("live default_agent update should be rejected");
+
+        assert!(err.contains("cannot be changed on a running session"));
+        assert!(stdin_rx.try_recv().is_err());
+        assert_eq!(
+            runtime_settings.expect("runtime settings")["default_agent"],
+            "tycode"
+        );
+    }
+
+    #[test]
     fn tycode_settings_overlay_rejects_absent_active_provider() {
         let settings = serde_json::json!({
             "active_provider": "default",
@@ -2885,7 +2979,7 @@ mod tests {
         });
         let fake = write_fake_tycode_subprocess(dir.path(), &settings);
         let log = dir.path().join("commands.jsonl");
-        let _guard = TestTycodeSubprocessGuard::set(fake);
+        let _guard = TestTycodeSubprocessGuard::set_with_root_agent_support(fake);
 
         let mut session_settings = SessionSettingsValues::default();
         session_settings.0.insert(
@@ -2938,7 +3032,7 @@ mod tests {
         });
         let fake = write_fake_tycode_subprocess_rejecting_root_agent(dir.path(), &settings);
         let log = dir.path().join("commands.jsonl");
-        let _guard = TestTycodeSubprocessGuard::set(fake);
+        let _guard = TestTycodeSubprocessGuard::set_with_root_agent_support(fake);
 
         let mut session_settings = SessionSettingsValues::default();
         session_settings.0.insert(
@@ -2964,6 +3058,112 @@ mod tests {
         assert_eq!(
             commands[3],
             serde_json::json!({ "SetRootAgent": { "agent": "swarm" } })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fake_tycode_spawn_rejects_root_agent_when_command_is_unsupported() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" }
+            },
+            "model_quality": "high",
+            "reasoning_effort": "Max",
+            "autonomy_level": "plan_approval_required",
+            "review_level": "None",
+            "spawn_context_mode": "Fork"
+        });
+        let fake = write_fake_tycode_subprocess_dropping_unknown_settings(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        let mut session_settings = SessionSettingsValues::default();
+        session_settings.0.insert(
+            "default_agent".to_string(),
+            SessionSettingValue::String("swarm".to_string()),
+        );
+        let config = BackendSpawnConfig {
+            session_settings: Some(session_settings),
+            ..Default::default()
+        };
+
+        let err = match TycodeBackend::spawn(Vec::new(), config, payload("must not send")).await {
+            Ok(_) => panic!("unsupported SetRootAgent should fail startup"),
+            Err(err) => err,
+        };
+        assert!(err.contains("requires SetRootAgent support"));
+        assert!(err.contains(TYCODE_VERSION));
+
+        let commands = read_fake_commands(&log);
+        assert_eq!(commands.len(), 3, "commands: {commands:#?}");
+        assert_eq!(commands[0], Value::String("GetSettings".to_string()));
+        assert_eq!(commands[2], Value::String("GetSettings".to_string()));
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.get("SetRootAgent").is_none()),
+            "unsupported Tycode must not receive SetRootAgent: {commands:#?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.get("UserInput").is_none()),
+            "prompt must not be sent after root-agent startup rejection: {commands:#?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fake_tycode_spawn_rejects_root_agent_for_read_only_session() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" }
+            },
+            "default_agent": "tycode",
+            "orchestration_progress_messages": true
+        });
+        let fake = write_fake_tycode_subprocess(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set_with_root_agent_support(fake);
+
+        let mut session_settings = SessionSettingsValues::default();
+        session_settings.0.insert(
+            "default_agent".to_string(),
+            SessionSettingValue::String("swarm".to_string()),
+        );
+        let config = BackendSpawnConfig {
+            session_settings: Some(session_settings),
+            resolved_spawn_config: crate::agent::customization::ResolvedSpawnConfig {
+                access_mode: BackendAccessMode::ReadOnly,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = match TycodeBackend::spawn(Vec::new(), config, payload("must not send")).await {
+            Ok(_) => panic!("read-only root override should fail startup"),
+            Err(err) => err,
+        };
+        assert!(err.contains("cannot be used with read-only Tycode sessions"));
+
+        let commands = read_fake_commands(&log);
+        assert_eq!(commands.len(), 3, "commands: {commands:#?}");
+        assert_eq!(commands[0], Value::String("GetSettings".to_string()));
+        assert_eq!(commands[2], Value::String("GetSettings".to_string()));
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.get("SetRootAgent").is_none()),
+            "read-only Tycode must not receive SetRootAgent: {commands:#?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.get("UserInput").is_none()),
+            "prompt must not be sent after read-only root-agent rejection: {commands:#?}"
         );
     }
 
@@ -3485,6 +3685,7 @@ mod tests {
         previous_bin: Option<String>,
         previous_sessions_dir: Option<PathBuf>,
         previous_timeout: Option<Duration>,
+        previous_set_root_agent_supported: Option<bool>,
     }
 
     static TEST_TYCODE_SUBPROCESS_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -3494,10 +3695,23 @@ mod tests {
             Self::set_with_options(path, None, None)
         }
 
+        fn set_with_root_agent_support(path: String) -> Self {
+            Self::set_with_options_inner(path, None, None, Some(true))
+        }
+
         fn set_with_options(
             path: String,
             sessions_dir: Option<PathBuf>,
             startup_timeout: Option<Duration>,
+        ) -> Self {
+            Self::set_with_options_inner(path, sessions_dir, startup_timeout, None)
+        }
+
+        fn set_with_options_inner(
+            path: String,
+            sessions_dir: Option<PathBuf>,
+            startup_timeout: Option<Duration>,
+            set_root_agent_supported: Option<bool>,
         ) -> Self {
             let _ = crate::process_env::resolved_child_process_path();
             let lock = TEST_TYCODE_SUBPROCESS_MUTEX
@@ -3519,11 +3733,20 @@ mod tests {
                 .expect("test Tycode startup timeout mutex poisoned");
             let previous_timeout = std::mem::replace(&mut *configured_timeout, startup_timeout);
             drop(configured_timeout);
+            let mut configured_set_root_agent_supported = TEST_TYCODE_SET_ROOT_AGENT_SUPPORTED
+                .lock()
+                .expect("test Tycode SetRootAgent support mutex poisoned");
+            let previous_set_root_agent_supported = std::mem::replace(
+                &mut *configured_set_root_agent_supported,
+                set_root_agent_supported,
+            );
+            drop(configured_set_root_agent_supported);
             Self {
                 _lock: lock,
                 previous_bin,
                 previous_sessions_dir,
                 previous_timeout,
+                previous_set_root_agent_supported,
             }
         }
     }
@@ -3541,6 +3764,10 @@ mod tests {
                 .lock()
                 .expect("test Tycode startup timeout mutex poisoned") =
                 self.previous_timeout.take();
+            *TEST_TYCODE_SET_ROOT_AGENT_SUPPORTED
+                .lock()
+                .expect("test Tycode SetRootAgent support mutex poisoned") =
+                self.previous_set_root_agent_supported.take();
         }
     }
 
