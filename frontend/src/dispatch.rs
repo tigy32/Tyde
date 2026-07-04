@@ -3765,6 +3765,9 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.task_lists.update(|map| {
         map.remove(&agent_id);
     });
+    state.orchestration.update(|map| {
+        map.remove(&agent_id);
+    });
     state.agent_message_queue.update(|map| {
         map.remove(&agent_id);
     });
@@ -4013,15 +4016,6 @@ fn apply_session_history(
         }
     }
 
-    if !replay.orchestration.is_empty() {
-        state.orchestration.update(|map| {
-            let current = map.remove(&agent_id).unwrap_or_default();
-            let mut combined = replay.orchestration.clone();
-            combined.extend(current);
-            map.insert(agent_id.clone(), combined);
-        });
-    }
-
     state.session_history.update(|map| {
         let mut remove = false;
         if let Some(history) = map.get_mut(&agent_id) {
@@ -4049,13 +4043,27 @@ fn apply_session_history(
     });
 }
 
+/// True for the root orchestration announcement (`AgentStarted` with a `Root`
+/// origin, or the depth-1 interactive agent). The root persists across turns —
+/// it is announced once per session — so it is retained when a new user turn
+/// prunes the per-turn orchestration log, keeping the panel's workflow header.
+fn is_root_orchestration_record(record: &OrchestrationRecord) -> bool {
+    let OrchestrationRecord::Event(event) = record else {
+        return false;
+    };
+    matches!(
+        &event.payload,
+        protocol::OrchestrationPayload::AgentStarted { origin, depth, .. }
+            if matches!(origin, protocol::OrchestrationAgentOrigin::Root) || *depth <= 1
+    )
+}
+
 #[derive(Default)]
 struct HistoryReplay {
     rows: Vec<crate::state::ChatRowHandle>,
     message_rows: HashMap<protocol::ChatMessageId, crate::state::ChatRowId>,
     tool_rows: HashMap<ToolCallId, crate::state::ChatRowId>,
     tool_progress: HashMap<ToolCallId, protocol::ToolProgressData>,
-    orchestration: Vec<OrchestrationRecord>,
 }
 
 impl HistoryReplay {
@@ -4138,24 +4146,20 @@ impl HistoryReplay {
                 self.tool_progress
                     .insert(ToolCallId(data.tool_call_id.clone()), data);
             }
-            // Replayed orchestration must fold identically to the live stream:
-            // record the event, and record a cancellation marker so a resumed
-            // session closes any fan-out/worker that was cancelled mid-turn
-            // instead of showing it stuck "running".
-            ChatEvent::Orchestration(data) => {
-                self.orchestration.push(OrchestrationRecord::Event(data));
-            }
-            ChatEvent::OperationCancelled(_) => {
-                if !self.orchestration.is_empty() {
-                    self.orchestration.push(OrchestrationRecord::Cancelled);
-                }
-            }
+            // Paged "load earlier messages" history is strictly older turns.
+            // Orchestration is scoped to the current turn (a live session would
+            // have already pruned these on each subsequent user message), so
+            // replaying it here would resurrect stale prior-turn workers. Leave
+            // orchestration untouched; the current turn's panel comes from the
+            // live stream and the authoritative agent bootstrap.
             ChatEvent::TypingStatusChanged(_)
             | ChatEvent::StreamStart(_)
             | ChatEvent::StreamDelta(_)
             | ChatEvent::StreamReasoningDelta(_)
             | ChatEvent::TaskUpdate(_)
-            | ChatEvent::RetryAttempt(_) => {}
+            | ChatEvent::OperationCancelled(_)
+            | ChatEvent::RetryAttempt(_)
+            | ChatEvent::Orchestration(_) => {}
         }
     }
 
@@ -4231,6 +4235,20 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                 message.sender,
                 message.content.len()
             );
+            // A user message opens a new turn. Tycode announces the root
+            // orchestration agent once for the session, but its fan-outs,
+            // phases, and workers are per-turn — so drop the previous turn's
+            // orchestration (retaining only the root announcement) rather than
+            // letting the panel grow unbounded and show stale prior-turn
+            // workers as if current. Bootstrap replay runs through this same
+            // reducer, so replayed history segments identically.
+            if matches!(message.sender, protocol::MessageSender::User) {
+                state.orchestration.update(|map| {
+                    if let Some(log) = map.get_mut(&agent_id) {
+                        log.retain(is_root_orchestration_record);
+                    }
+                });
+            }
             let entry = ChatMessageEntry {
                 message,
                 tool_requests: Vec::new(),
@@ -4868,6 +4886,11 @@ fn apply_agent_bootstrap(
         map.remove(&agent_id);
     });
     state.task_lists.update(|map| {
+        map.remove(&agent_id);
+    });
+    // Bootstrap is authoritative history replacement: drop prior orchestration
+    // so the replayed ChatEvents below rebuild the current turn cleanly.
+    state.orchestration.update(|map| {
         map.remove(&agent_id);
     });
     state.agent_message_queue.update(|map| {

@@ -98,6 +98,9 @@ pub enum OrchNodeDetail {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrchNode {
+    /// Stable identity for keyed rendering: the sub-agent id, fan-out id, or a
+    /// per-turn note index. Stable across re-folds so `<For>` reuses the row.
+    pub key: String,
     pub indent: usize,
     pub status: OrchStatus,
     pub detail: OrchNodeDetail,
@@ -115,8 +118,12 @@ pub struct OrchestrationPanelModel {
 }
 
 impl OrchestrationPanelModel {
+    /// Show the panel only when the current turn is actually orchestrating:
+    /// it has body nodes or a live root phase. The root label alone (retained
+    /// across turns) must not keep an empty panel on screen during a plain
+    /// chat turn.
     pub fn is_visible(&self) -> bool {
-        self.root_label.is_some() || !self.nodes.is_empty()
+        !self.nodes.is_empty() || self.root_phase.is_some()
     }
 }
 
@@ -182,6 +189,7 @@ fn set_worker(
 
 fn push_note(
     nodes: &mut Vec<OrchNode>,
+    key: String,
     owner_id: &str,
     agent_depth: &HashMap<String, usize>,
     text: String,
@@ -189,6 +197,7 @@ fn push_note(
 ) {
     let owner_depth = agent_depth.get(owner_id).copied().unwrap_or(1);
     nodes.push(OrchNode {
+        key,
         indent: (owner_depth + 1).saturating_sub(2),
         status,
         detail: OrchNodeDetail::Note { text },
@@ -208,6 +217,7 @@ pub fn build_orchestration_panel(records: &[OrchestrationRecord]) -> Orchestrati
     let mut agent_node: HashMap<String, usize> = HashMap::new();
     let mut fanout_node: HashMap<String, usize> = HashMap::new();
     let mut agent_depth: HashMap<String, usize> = HashMap::new();
+    let mut note_seq: usize = 0;
 
     for record in records {
         let ev = match record {
@@ -243,6 +253,7 @@ pub fn build_orchestration_panel(records: &[OrchestrationRecord]) -> Orchestrati
                 } else if !agent_node.contains_key(&owner_id) {
                     agent_node.insert(owner_id.clone(), nodes.len());
                     nodes.push(OrchNode {
+                        key: owner_id.clone(),
                         indent: depth.saturating_sub(2),
                         status: OrchStatus::Running,
                         detail: OrchNodeDetail::Agent {
@@ -293,8 +304,9 @@ pub fn build_orchestration_panel(records: &[OrchestrationRecord]) -> Orchestrati
                         summary: None,
                     })
                     .collect();
-                fanout_node.insert(fid, nodes.len());
+                fanout_node.insert(fid.clone(), nodes.len());
                 nodes.push(OrchNode {
+                    key: fid,
                     indent: (owner_depth + 1).saturating_sub(2),
                     status: OrchStatus::Running,
                     detail: OrchNodeDetail::FanOut {
@@ -355,11 +367,13 @@ pub fn build_orchestration_panel(records: &[OrchestrationRecord]) -> Orchestrati
                 ));
                 push_note(
                     &mut nodes,
+                    format!("note-{note_seq}"),
                     &owner_id,
                     &agent_depth,
                     text,
                     OrchStatus::Succeeded,
                 );
+                note_seq += 1;
             }
             OrchestrationPayload::PlanSelected { candidate } => {
                 let text = match candidate {
@@ -368,11 +382,13 @@ pub fn build_orchestration_panel(records: &[OrchestrationRecord]) -> Orchestrati
                 };
                 push_note(
                     &mut nodes,
+                    format!("note-{note_seq}"),
                     &owner_id,
                     &agent_depth,
                     text,
                     OrchStatus::Succeeded,
                 );
+                note_seq += 1;
             }
             OrchestrationPayload::ReviewRoundResolved { round, verdict, .. } => {
                 let (label, status) = match verdict {
@@ -386,11 +402,13 @@ pub fn build_orchestration_panel(records: &[OrchestrationRecord]) -> Orchestrati
                 };
                 push_note(
                     &mut nodes,
+                    format!("note-{note_seq}"),
                     &owner_id,
                     &agent_depth,
                     format!("Review round {round}: {label}"),
                     status,
                 );
+                note_seq += 1;
             }
         }
     }
@@ -471,30 +489,52 @@ fn node_view(node: OrchNode) -> AnyView {
     }
 }
 
+/// Renders the current turn's orchestration progress.
+///
+/// `records` is the live per-agent log (already bounded to the current turn
+/// plus the retained root announcement — see `dispatch`). The fold runs once
+/// per change through a `Memo`, and rows are keyed so `<For>` reuses DOM and
+/// only touches nodes that actually changed rather than rebuilding the list on
+/// every event.
 #[component]
-pub fn OrchestrationView(records: Vec<OrchestrationRecord>) -> impl IntoView {
-    let model = build_orchestration_panel(&records);
-    let panel_class = if model.is_visible() {
-        "orchestration-panel"
-    } else {
-        "orchestration-panel hidden"
-    };
+pub fn OrchestrationView(records: Signal<Vec<OrchestrationRecord>>) -> impl IntoView {
+    let model = Memo::new(move |_| records.with(|r| build_orchestration_panel(r)));
 
     view! {
-        <div class=panel_class>
+        <div class=move || {
+            if model.with(|m| m.is_visible()) {
+                "orchestration-panel"
+            } else {
+                "orchestration-panel hidden"
+            }
+        }>
             <div class="orchestration-header">
                 <span class="orchestration-title">"Orchestration"</span>
-                {model
-                    .root_label
-                    .clone()
-                    .map(|label| view! { <span class="orchestration-root">{label}</span> })}
-                {model
-                    .root_phase
-                    .clone()
-                    .map(|phase| view! { <span class="orchestration-phase">{phase}</span> })}
+                {move || {
+                    model
+                        .with(|m| m.root_label.clone())
+                        .map(|label| view! { <span class="orchestration-root">{label}</span> })
+                }}
+                {move || {
+                    model
+                        .with(|m| m.root_phase.clone())
+                        .map(|phase| view! { <span class="orchestration-phase">{phase}</span> })
+                }}
             </div>
             <div class="orchestration-nodes">
-                {model.nodes.into_iter().map(node_view).collect::<Vec<_>>()}
+                <For
+                    each=move || model.with(|m| m.nodes.iter().map(|n| n.key.clone()).collect::<Vec<_>>())
+                    key=|key| key.clone()
+                    let:key
+                >
+                    {
+                        // Look the node up reactively by its stable key so a
+                        // same-key update (e.g. a worker completing inside a
+                        // fan-out) re-renders this row instead of being frozen
+                        // by the keyed `<For>`.
+                        move || model.with(|m| m.nodes.iter().find(|n| n.key == key).cloned()).map(node_view)
+                    }
+                </For>
             </div>
         </div>
     }
@@ -503,6 +543,7 @@ pub fn OrchestrationView(records: Vec<OrchestrationRecord>) -> impl IntoView {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use crate::state::AppState;
     use leptos::mount::mount_to;
     use protocol::{
         OrchestrationAgentType, OrchestrationEvent, OrchestrationId, OrchestrationWorkerInfo,
@@ -576,34 +617,50 @@ mod wasm_tests {
         }
     }
 
+    // Status glyphs the user actually sees, mirroring `OrchStatus::icon`.
+    const ICON_RUNNING: &str = "\u{27f3}";
+    const ICON_SUCCEEDED: &str = "\u{2713}";
+    const ICON_ABORTED: &str = "\u{2298}";
+
     fn mount(records: Vec<OrchestrationRecord>) -> HtmlElement {
         let container = make_container();
         mount_to(container.clone(), move || {
-            let records = records.clone();
-            view! { <OrchestrationView records=records /> }
+            let signal = RwSignal::new(records.clone());
+            view! { <OrchestrationView records=signal.into() /> }
         })
         .forget();
         container
     }
 
-    fn worker_class(container: &HtmlElement, label: &str) -> Option<String> {
-        let nodes = container.query_selector_all(".orch-worker").unwrap();
-        for i in 0..nodes.length() {
-            let el = nodes
+    /// The status glyph shown next to the worker row whose label contains
+    /// `label` — what a human reads to see whether that worker is running,
+    /// done, or aborted.
+    fn worker_icon(container: &HtmlElement, label: &str) -> Option<String> {
+        let rows = container.query_selector_all(".orch-worker").unwrap();
+        for i in 0..rows.length() {
+            let row = rows
                 .item(i)
                 .unwrap()
                 .dyn_into::<web_sys::Element>()
                 .unwrap();
-            if el.text_content().unwrap_or_default().contains(label) {
-                return el.get_attribute("class");
+            if row.text_content().unwrap_or_default().contains(label) {
+                let icon = row.query_selector(".orch-icon").unwrap()?;
+                return icon.text_content();
             }
         }
         None
     }
 
+    fn worker_labels(container: &HtmlElement) -> Vec<String> {
+        let els = container.query_selector_all(".orch-worker-label").unwrap();
+        (0..els.length())
+            .filter_map(|i| els.item(i).and_then(|n| n.text_content()))
+            .collect()
+    }
+
     /// A fan-out renders the root workflow in the header and each worker with a
-    /// status that tracks its own lifecycle: a completed worker reads as
-    /// succeeded while a still-running sibling reads as running.
+    /// status glyph that tracks its own lifecycle: a completed worker shows the
+    /// success glyph while a still-running sibling shows the running glyph.
     #[wasm_bindgen_test]
     async fn fanout_reflects_per_worker_progress() {
         let container = mount(vec![
@@ -660,15 +717,16 @@ mod wasm_tests {
             root.text_content()
         );
 
-        let a = worker_class(&container, "src/a.rs").expect("worker a rendered");
-        assert!(
-            a.contains("orch-status-succeeded"),
-            "completed worker must read succeeded: {a}"
+        assert_eq!(worker_labels(&container).len(), 2, "both workers rendered");
+        assert_eq!(
+            worker_icon(&container, "src/a.rs").as_deref(),
+            Some(ICON_SUCCEEDED),
+            "completed worker must show the success glyph"
         );
-        let b = worker_class(&container, "src/b.rs").expect("worker b rendered");
-        assert!(
-            b.contains("orch-status-running"),
-            "in-flight worker must read running: {b}"
+        assert_eq!(
+            worker_icon(&container, "src/b.rs").as_deref(),
+            Some(ICON_RUNNING),
+            "in-flight worker must show the running glyph"
         );
     }
 
@@ -713,19 +771,15 @@ mod wasm_tests {
         ]);
         next_tick().await;
 
-        let b = worker_class(&container, "src/b.rs").expect("worker b rendered");
-        assert!(
-            b.contains("orch-status-aborted"),
-            "cancelled in-flight worker must read aborted, not running: {b}"
+        assert_eq!(
+            worker_icon(&container, "src/b.rs").as_deref(),
+            Some(ICON_ABORTED),
+            "cancelled in-flight worker must show the aborted glyph, not running"
         );
-        assert!(
-            !b.contains("orch-status-running"),
-            "cancelled worker must not remain running: {b}"
-        );
-        let a = worker_class(&container, "src/a.rs").expect("worker a rendered");
-        assert!(
-            a.contains("orch-status-succeeded"),
-            "already-completed worker keeps its outcome across cancel: {a}"
+        assert_eq!(
+            worker_icon(&container, "src/a.rs").as_deref(),
+            Some(ICON_SUCCEEDED),
+            "already-completed worker keeps its outcome across cancel"
         );
     }
 
@@ -756,6 +810,157 @@ mod wasm_tests {
         assert!(
             text.contains("Consensus") && text.contains("round 2"),
             "header must reflect the current workflow phase, got: {text}"
+        );
+    }
+
+    /// Driven end-to-end through the live reducer: a new user turn segments the
+    /// panel. The prior turn's workers disappear (no stale prior-turn workers
+    /// shown as if current) while the once-announced root workflow header is
+    /// retained, and the new turn's worker appears.
+    #[wasm_bindgen_test]
+    async fn new_turn_segments_and_drops_prior_workers() {
+        use crate::dispatch::apply_chat_event;
+        use protocol::{AgentId, ChatEvent, ChatMessage, MessageSender};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let container = make_container();
+        let stash: Rc<RefCell<Option<(AppState, AgentId)>>> = Rc::new(RefCell::new(None));
+        let stash_for_mount = stash.clone();
+        mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let agent_id = AgentId("agent-1".to_owned());
+            let records: Signal<Vec<OrchestrationRecord>> = Signal::derive({
+                let state = state.clone();
+                let agent_id = agent_id.clone();
+                move || {
+                    state
+                        .orchestration
+                        .with(|m| m.get(&agent_id).cloned().unwrap_or_default())
+                }
+            });
+            *stash_for_mount.borrow_mut() = Some((state.clone(), agent_id.clone()));
+            view! { <OrchestrationView records=records /> }
+        })
+        .forget();
+
+        let (state, agent_id) = stash.borrow().clone().unwrap();
+        let host = "host";
+        let user_message = || {
+            ChatEvent::MessageAdded(ChatMessage {
+                message_id: None,
+                timestamp: 0,
+                sender: MessageSender::User,
+                content: "go".to_owned(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            })
+        };
+        let orch = |payload| {
+            ChatEvent::Orchestration(OrchestrationEvent {
+                agent_id: OrchestrationId("root".to_owned()),
+                agent_type: OrchestrationAgentType("swarm".to_owned()),
+                payload,
+            })
+        };
+
+        // Turn 1: user message, root announced, one worker started.
+        apply_chat_event(&state, host, &agent_id, user_message());
+        apply_chat_event(
+            &state,
+            host,
+            &agent_id,
+            orch(OrchestrationPayload::AgentStarted {
+                parent_agent_id: None,
+                task_preview: "run".to_owned(),
+                origin: OrchestrationAgentOrigin::Root,
+                depth: 1,
+                interactive: true,
+                model: None,
+            }),
+        );
+        apply_chat_event(
+            &state,
+            host,
+            &agent_id,
+            orch(OrchestrationPayload::FanOutStarted {
+                fanout_id: OrchestrationId("f1".to_owned()),
+                total: 1,
+                concurrency: 1,
+                workers: vec![worker_info("w1", "turn1/a.rs")],
+            }),
+        );
+        apply_chat_event(
+            &state,
+            host,
+            &agent_id,
+            orch(OrchestrationPayload::WorkerStarted {
+                fanout_id: OrchestrationId("f1".to_owned()),
+                worker_id: OrchestrationId("w1".to_owned()),
+                label: "turn1/a.rs".to_owned(),
+            }),
+        );
+        next_tick().await;
+        assert!(
+            worker_labels(&container)
+                .iter()
+                .any(|l| l.contains("turn1/a.rs")),
+            "turn 1 worker should be visible during turn 1"
+        );
+
+        // Turn 2: a new user message is the segment boundary.
+        apply_chat_event(&state, host, &agent_id, user_message());
+        next_tick().await;
+        assert!(
+            worker_labels(&container)
+                .iter()
+                .all(|l| !l.contains("turn1/a.rs")),
+            "prior-turn worker must be dropped at the new turn boundary"
+        );
+
+        apply_chat_event(
+            &state,
+            host,
+            &agent_id,
+            orch(OrchestrationPayload::FanOutStarted {
+                fanout_id: OrchestrationId("f2".to_owned()),
+                total: 1,
+                concurrency: 1,
+                workers: vec![worker_info("w2", "turn2/z.rs")],
+            }),
+        );
+        apply_chat_event(
+            &state,
+            host,
+            &agent_id,
+            orch(OrchestrationPayload::WorkerStarted {
+                fanout_id: OrchestrationId("f2".to_owned()),
+                worker_id: OrchestrationId("w2".to_owned()),
+                label: "turn2/z.rs".to_owned(),
+            }),
+        );
+        next_tick().await;
+
+        let labels = worker_labels(&container);
+        assert!(
+            labels.iter().any(|l| l.contains("turn2/z.rs")),
+            "current-turn worker must be visible: {labels:?}"
+        );
+        assert!(
+            labels.iter().all(|l| !l.contains("turn1/a.rs")),
+            "stale prior-turn worker must not reappear: {labels:?}"
+        );
+        let root = container
+            .query_selector(".orchestration-root")
+            .unwrap()
+            .expect("root workflow header retained across turns");
+        assert!(
+            root.text_content().unwrap_or_default().contains("swarm"),
+            "root workflow header must persist across the turn boundary"
         );
     }
 }

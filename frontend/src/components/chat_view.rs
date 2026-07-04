@@ -232,10 +232,15 @@ pub fn ChatView(
         state.task_lists.with(|m| m.get(&agent_id).cloned())
     };
 
-    let orchestration = move || {
-        let agent_id = agent_ref.get()?.agent_id;
-        state.orchestration.with(|m| m.get(&agent_id).cloned())
-    };
+    let orchestration_records: Signal<Vec<crate::state::OrchestrationRecord>> =
+        Signal::derive(move || {
+            let Some(agent_id) = agent_ref.get().map(|agent| agent.agent_id) else {
+                return Vec::new();
+            };
+            state
+                .orchestration
+                .with(|m| m.get(&agent_id).cloned().unwrap_or_default())
+        });
 
     // Walk back from the latest message to find the most recent assistant
     // message that carries a context_breakdown. `ContextBreakdown` does not
@@ -973,11 +978,7 @@ pub fn ChatView(
                             })
                         }}
 
-                        {move || {
-                            orchestration()
-                                .filter(|records| !records.is_empty())
-                                .map(|records| view! { <OrchestrationView records=records /> })
-                        }}
+                        <OrchestrationView records=orchestration_records />
 
                         {move || {
                             streaming().map(|ss| view! { <ChatStreamingView agent_ref=agent_ref streaming=ss /> })
