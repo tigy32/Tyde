@@ -159,6 +159,13 @@ fn tycode_read_only_agent_json(config: &BackendSpawnConfig) -> Option<String> {
 }
 
 fn tycode_session_settings_schema() -> SessionSettingsSchema {
+    if !tycode_set_root_agent_supported() {
+        return SessionSettingsSchema {
+            backend_kind: BackendKind::Tycode,
+            fields: Vec::new(),
+        };
+    }
+
     SessionSettingsSchema {
         backend_kind: BackendKind::Tycode,
         fields: vec![SessionSettingField {
@@ -2423,7 +2430,18 @@ mod tests {
     const TEST_TYCODE_STARTUP_TIMEOUT_DURATION: Duration = Duration::from_secs(2);
 
     #[test]
-    fn tycode_session_settings_schema_exposes_orchestration_slider() {
+    fn tycode_session_settings_schema_omits_orchestration_until_supported() {
+        let _guard = TestTycodeRootAgentSupportGuard::set(false);
+
+        let schema = tycode_session_settings_schema();
+        assert_eq!(schema.backend_kind, BackendKind::Tycode);
+        assert!(schema.fields.is_empty());
+    }
+
+    #[test]
+    fn tycode_session_settings_schema_exposes_orchestration_slider_when_supported() {
+        let _guard = TestTycodeRootAgentSupportGuard::set(true);
+
         let schema = tycode_session_settings_schema();
         assert_eq!(schema.backend_kind, BackendKind::Tycode);
         assert_eq!(schema.fields.len(), 1);
@@ -3689,6 +3707,38 @@ mod tests {
     }
 
     static TEST_TYCODE_SUBPROCESS_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct TestTycodeRootAgentSupportGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous_set_root_agent_supported: Option<bool>,
+    }
+
+    impl TestTycodeRootAgentSupportGuard {
+        fn set(supported: bool) -> Self {
+            let lock = TEST_TYCODE_SUBPROCESS_MUTEX
+                .lock()
+                .expect("test Tycode subprocess mutex poisoned");
+            let mut configured_set_root_agent_supported = TEST_TYCODE_SET_ROOT_AGENT_SUPPORTED
+                .lock()
+                .expect("test Tycode SetRootAgent support mutex poisoned");
+            let previous_set_root_agent_supported =
+                configured_set_root_agent_supported.replace(supported);
+            drop(configured_set_root_agent_supported);
+            Self {
+                _lock: lock,
+                previous_set_root_agent_supported,
+            }
+        }
+    }
+
+    impl Drop for TestTycodeRootAgentSupportGuard {
+        fn drop(&mut self) {
+            *TEST_TYCODE_SET_ROOT_AGENT_SUPPORTED
+                .lock()
+                .expect("test Tycode SetRootAgent support mutex poisoned") =
+                self.previous_set_root_agent_supported.take();
+        }
+    }
 
     impl TestTycodeSubprocessGuard {
         fn set(path: String) -> Self {

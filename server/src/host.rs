@@ -12303,6 +12303,14 @@ fn sanitize_stored_session_settings(
             ))),
         );
     };
+    if let Err(err) = validate_session_settings_values(schema, &stored_settings) {
+        return (
+            None,
+            Some(AgentStartupFailure::internal(format!(
+                "invalid stored session settings for backend {backend_kind:?}: {err}"
+            ))),
+        );
+    }
     (
         Some(sanitize_session_settings_values(schema, &stored_settings)),
         None,
@@ -13251,6 +13259,35 @@ mod tests {
             failure
                 .message
                 .contains("session settings schema unavailable"),
+            "unexpected failure message: {}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn stored_session_settings_invalid_for_schema_are_rejected() {
+        let mut settings = protocol::SessionSettingsValues::default();
+        settings.0.insert(
+            "default_agent".to_string(),
+            protocol::SessionSettingValue::String("swarm".to_string()),
+        );
+        let schema = crate::backend::empty_session_settings_schema(BackendKind::Tycode);
+
+        let (sanitized, failure) =
+            sanitize_stored_session_settings(BackendKind::Tycode, Some(&schema), Some(settings));
+
+        assert!(sanitized.is_none());
+        let failure = failure.expect("invalid stored Tycode settings should fail");
+        assert_eq!(failure.code, protocol::AgentErrorCode::Internal);
+        assert!(
+            failure.message.contains("invalid stored session settings"),
+            "unexpected failure message: {}",
+            failure.message
+        );
+        assert!(
+            failure
+                .message
+                .contains("unknown session setting 'default_agent'"),
             "unexpected failure message: {}",
             failure.message
         );
