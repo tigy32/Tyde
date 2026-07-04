@@ -12,15 +12,15 @@ use tokio::sync::mpsc;
 
 use protocol::{
     AgentInput, BackendAccessMode, BackendConfigField, BackendConfigFieldType, BackendConfigSchema,
-    BackendConfigValues, BackendKind, ChatEvent, ChatMessage, MessageSender, SelectOption,
-    SessionId, SessionSettingValue, StreamEndData, StreamTextDeltaData,
+    BackendConfigValues, BackendKind, ChatEvent, ChatMessage, MessageSender, OrchestrationEvent,
+    SelectOption, SessionId, SessionSettingField, SessionSettingFieldType, SessionSettingValue,
+    SessionSettingsSchema, SessionSettingsValues, StreamEndData, StreamTextDeltaData,
 };
 
 use super::{
     Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
     StartupMcpServer, StartupMcpTransport, backend_fork_unsupported_message,
-    empty_session_settings_schema, render_combined_spawn_instructions,
-    setup::resolve_tycode_binary_path,
+    render_combined_spawn_instructions, resolve_settings, setup::resolve_tycode_binary_path,
 };
 use crate::process_env;
 
@@ -152,6 +152,39 @@ fn tycode_read_only_agent_json(config: &BackendSpawnConfig) -> Option<String> {
         })
         .to_string(),
     )
+}
+
+fn tycode_session_settings_schema() -> SessionSettingsSchema {
+    SessionSettingsSchema {
+        backend_kind: BackendKind::Tycode,
+        fields: vec![SessionSettingField {
+            key: "default_agent".to_string(),
+            label: "Orchestration".to_string(),
+            description: Some(
+                "Controls Tycode's default orchestration agent for this session: None runs one \
+                 agent, Auto lets Tycode delegate as needed, Pipeline runs the builder workflow, \
+                 and Swarm runs the fan-out integration workflow."
+                    .to_string(),
+            ),
+            field_type: SessionSettingFieldType::Select {
+                options: vec![
+                    select_option("one_shot", "None"),
+                    select_option("tycode", "Auto"),
+                    select_option("builder", "Pipeline"),
+                    select_option("swarm", "Swarm"),
+                ],
+                default: Some("tycode".to_string()),
+                nullable: false,
+            },
+            use_slider: true,
+        }],
+    }
+}
+
+pub(crate) fn resolve_session_settings(config: &BackendSpawnConfig) -> SessionSettingsValues {
+    resolve_settings(config, &tycode_session_settings_schema(), |_| {
+        SessionSettingsValues::default()
+    })
 }
 
 fn tycode_backend_config_schema() -> BackendConfigSchema {
@@ -291,15 +324,37 @@ enum TycodeSettingsOverlayMode {
     PersistentSettingsPanel,
 }
 
+#[cfg(test)]
 fn apply_tycode_backend_config_overlay(
     current_settings: &Value,
     config: &BackendConfigValues,
+    mode: TycodeSettingsOverlayMode,
+) -> Result<TycodeSettingsOverlay, String> {
+    apply_tycode_settings_overlay(
+        current_settings,
+        config,
+        &SessionSettingsValues::default(),
+        mode,
+    )
+}
+
+fn apply_tycode_settings_overlay(
+    current_settings: &Value,
+    config: &BackendConfigValues,
+    session_settings: &SessionSettingsValues,
     mode: TycodeSettingsOverlayMode,
 ) -> Result<TycodeSettingsOverlay, String> {
     let mut settings = current_settings.clone();
     let object = settings
         .as_object_mut()
         .ok_or_else(|| "Tycode Settings event data must be a JSON object".to_string())?;
+
+    if mode == TycodeSettingsOverlayMode::SessionRuntime {
+        object.insert(
+            "orchestration_progress_messages".to_string(),
+            Value::Bool(false),
+        );
+    }
 
     let mut active_provider_change = None;
     for (key, value) in &config.0 {
@@ -396,6 +451,18 @@ fn apply_tycode_backend_config_overlay(
         }
     }
 
+    for (key, value) in &session_settings.0 {
+        match (key.as_str(), value) {
+            ("default_agent", SessionSettingValue::String(agent)) => {
+                object.insert("default_agent".to_string(), Value::String(agent.clone()));
+            }
+            ("default_agent", _) => {
+                return Err("Tycode default_agent session setting must be a string".to_string());
+            }
+            _ => {}
+        }
+    }
+
     Ok(TycodeSettingsOverlay {
         settings,
         active_provider_change,
@@ -465,22 +532,27 @@ enum TycodeStartupObservation {
 
 struct TycodeStartupController {
     backend_config: BackendConfigValues,
+    session_settings: SessionSettingsValues,
     phase: TycodeStartupPhase,
     follow_up: TycodeStartupFollowUp,
     persist_settings: bool,
+    runtime_settings: Option<Value>,
 }
 
 impl TycodeStartupController {
     fn new(
         backend_config: BackendConfigValues,
+        session_settings: SessionSettingsValues,
         follow_up: TycodeStartupFollowUp,
         persist_settings: bool,
     ) -> Self {
         Self {
             backend_config,
+            session_settings,
             phase: TycodeStartupPhase::AwaitSessionStarted,
             follow_up,
             persist_settings,
+            runtime_settings: None,
         }
     }
 
@@ -492,11 +564,6 @@ impl TycodeStartupController {
         match &mut self.phase {
             TycodeStartupPhase::AwaitSessionStarted => {
                 if tycode_session_started(value).is_some() {
-                    if self.backend_config.0.is_empty() && !self.persist_settings {
-                        self.send_follow_up(stdin_tx)?;
-                        self.phase = TycodeStartupPhase::Complete;
-                        return Ok(TycodeStartupObservation::Completed);
-                    }
                     send_tycode_json(stdin_tx, Value::String("GetSettings".to_string()))?;
                     self.phase = TycodeStartupPhase::AwaitInitialSettings;
                 }
@@ -509,9 +576,10 @@ impl TycodeStartupController {
                     ));
                 }
                 if let Some(settings) = tycode_settings_data(value) {
-                    let overlay = apply_tycode_backend_config_overlay(
+                    let overlay = apply_tycode_settings_overlay(
                         settings,
                         &self.backend_config,
+                        &self.session_settings,
                         if self.persist_settings {
                             TycodeSettingsOverlayMode::PersistentSettingsPanel
                         } else {
@@ -548,6 +616,7 @@ impl TycodeStartupController {
                 }
                 if let Some(settings) = tycode_settings_data(value) {
                     verify_tycode_settings_overlay(expected_settings, settings)?;
+                    self.runtime_settings = Some(settings.clone());
                     if let Some(provider) = active_provider_change.take() {
                         send_tycode_json(
                             stdin_tx,
@@ -578,6 +647,10 @@ impl TycodeStartupController {
             }
             TycodeStartupPhase::Complete => Ok(TycodeStartupObservation::Allow),
         }
+    }
+
+    fn runtime_settings(&self) -> Option<&Value> {
+        self.runtime_settings.as_ref()
     }
 
     fn send_follow_up(
@@ -731,7 +804,12 @@ pub(crate) async fn persist_backend_config(values: BackendConfigValues) -> Resul
             }
         });
 
-        let mut startup = TycodeStartupController::new(values, TycodeStartupFollowUp::None, true);
+        let mut startup = TycodeStartupController::new(
+            values,
+            SessionSettingsValues::default(),
+            TycodeStartupFollowUp::None,
+            true,
+        );
         set_tycode_startup_status(&startup_status_task, startup.phase_description());
 
         let mut lines = BufReader::new(stdout).lines();
@@ -984,6 +1062,34 @@ fn send_tycode_json(
         .map_err(|_| "Tycode stdin writer closed".to_string())
 }
 
+fn send_tycode_runtime_session_settings_update(
+    runtime_settings: &mut Option<Value>,
+    update: &SessionSettingsValues,
+    stdin_tx: &mpsc::UnboundedSender<TycodeStdinCommand>,
+) -> Result<(), String> {
+    let current_settings = runtime_settings.as_ref().ok_or_else(|| {
+        "Tycode runtime settings unavailable while applying session settings update".to_string()
+    })?;
+    let overlay = apply_tycode_settings_overlay(
+        current_settings,
+        &BackendConfigValues::default(),
+        update,
+        TycodeSettingsOverlayMode::SessionRuntime,
+    )
+    .map_err(|err| format!("Failed to apply Tycode session settings update: {err}"))?;
+    send_tycode_json(
+        stdin_tx,
+        serde_json::json!({
+            "SaveSettings": {
+                "settings": overlay.settings.clone(),
+                "persist": false,
+            }
+        }),
+    )?;
+    *runtime_settings = Some(overlay.settings);
+    Ok(())
+}
+
 fn tycode_settings_data(value: &Value) -> Option<&Value> {
     (value.get("kind").and_then(Value::as_str) == Some("Settings"))
         .then(|| value.get("data"))
@@ -1040,6 +1146,8 @@ fn tycode_settings_verification_error(expected: &Value, actual: &Value) -> Strin
         "autonomy_level",
         "review_level",
         "spawn_context_mode",
+        "default_agent",
+        "orchestration_progress_messages",
     ];
     let mismatched = managed_keys
         .into_iter()
@@ -1073,6 +1181,8 @@ fn verify_tycode_settings_overlay(expected: &Value, actual: &Value) -> Result<()
         "autonomy_level",
         "review_level",
         "spawn_context_mode",
+        "default_agent",
+        "orchestration_progress_messages",
     ];
     let managed_keys_match = managed_keys
         .into_iter()
@@ -1087,7 +1197,7 @@ fn verify_tycode_settings_overlay(expected: &Value, actual: &Value) -> Result<()
 
 impl Backend for TycodeBackend {
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
-        empty_session_settings_schema(BackendKind::Tycode)
+        tycode_session_settings_schema()
     }
 
     fn backend_config_schema() -> Option<BackendConfigSchema> {
@@ -1204,8 +1314,12 @@ impl Backend for TycodeBackend {
                 }
             });
 
+            let (settings_update_tx, mut settings_update_rx) =
+                mpsc::unbounded_channel::<SessionSettingsValues>();
+
             let mut startup = TycodeStartupController::new(
                 config.backend_config.clone(),
+                resolve_session_settings(&config),
                 TycodeStartupFollowUp::InitialUserInput(initial_message),
                 false,
             );
@@ -1227,7 +1341,11 @@ impl Backend for TycodeBackend {
                                 break;
                             }
                         }
-                        AgentInput::UpdateSessionSettings(_) => {}
+                        AgentInput::UpdateSessionSettings(payload) => {
+                            if settings_update_tx.send(payload.values).is_err() {
+                                break;
+                            }
+                        }
                         AgentInput::EditQueuedMessage(_)
                         | AgentInput::CancelQueuedMessage(_)
                         | AgentInput::SendQueuedMessageNow(_) => {
@@ -1252,10 +1370,27 @@ impl Backend for TycodeBackend {
             let mut lines = BufReader::new(stdout).lines();
             let mut stream_open = false;
             let mut accumulated_text = String::new();
+            let mut runtime_settings = None;
+            let mut settings_updates_open = true;
             let mut ready_tx = Some(ready_tx);
             loop {
                 let line = tokio::select! {
                     line = lines.next_line() => line,
+                    settings_update = settings_update_rx.recv(), if settings_updates_open => {
+                        let Some(settings_update) = settings_update else {
+                            settings_updates_open = false;
+                            continue;
+                        };
+                        if let Err(err) = send_tycode_runtime_session_settings_update(
+                            &mut runtime_settings,
+                            &settings_update,
+                            &stdin_tx,
+                        ) {
+                            tracing::error!("{err}");
+                            let _ = events_tx.send(tycode_error_chat_event(err));
+                        }
+                        continue;
+                    }
                     shutdown = shutdown_rx.recv() => {
                         if shutdown.is_some() {
                             let _ = child.kill().await;
@@ -1308,11 +1443,16 @@ impl Backend for TycodeBackend {
                     TycodeStartupObservation::Allow => {}
                     TycodeStartupObservation::Suppress => continue,
                     TycodeStartupObservation::Completed => {
+                        runtime_settings = startup.runtime_settings().cloned();
                         if let Some(ready_tx) = ready_tx.take() {
                             let _ = ready_tx.send(Ok(()));
                         }
                         continue;
                     }
+                }
+
+                if let Some(settings) = tycode_settings_data(&value) {
+                    runtime_settings = Some(settings.clone());
                 }
 
                 let events = map_tycode_value_to_chat_events(&value);
@@ -1480,8 +1620,12 @@ impl Backend for TycodeBackend {
                 }
             });
 
+            let (settings_update_tx, mut settings_update_rx) =
+                mpsc::unbounded_channel::<SessionSettingsValues>();
+
             let mut startup = TycodeStartupController::new(
                 config.backend_config.clone(),
+                resolve_session_settings(&config),
                 TycodeStartupFollowUp::ResumeSession {
                     session_id: session_id.0.clone(),
                 },
@@ -1504,7 +1648,11 @@ impl Backend for TycodeBackend {
                                 break;
                             }
                         }
-                        AgentInput::UpdateSessionSettings(_) => {}
+                        AgentInput::UpdateSessionSettings(payload) => {
+                            if settings_update_tx.send(payload.values).is_err() {
+                                break;
+                            }
+                        }
                         AgentInput::EditQueuedMessage(_)
                         | AgentInput::CancelQueuedMessage(_)
                         | AgentInput::SendQueuedMessageNow(_) => {
@@ -1528,6 +1676,8 @@ impl Backend for TycodeBackend {
             let mut lines = BufReader::new(stdout).lines();
             let mut stream_open = false;
             let mut accumulated_text = String::new();
+            let mut runtime_settings = None;
+            let mut settings_updates_open = true;
             let mut replay_barrier =
                 TycodeResumeReplayBarrier::new(session_id.0.clone(), replay_event_count);
             let mut resume_replay_complete_tx = Some(resume_replay_complete_tx);
@@ -1535,6 +1685,21 @@ impl Backend for TycodeBackend {
             loop {
                 let line = tokio::select! {
                     line = lines.next_line() => line,
+                    settings_update = settings_update_rx.recv(), if settings_updates_open => {
+                        let Some(settings_update) = settings_update else {
+                            settings_updates_open = false;
+                            continue;
+                        };
+                        if let Err(err) = send_tycode_runtime_session_settings_update(
+                            &mut runtime_settings,
+                            &settings_update,
+                            &stdin_tx,
+                        ) {
+                            tracing::error!("{err}");
+                            let _ = events_tx.send(tycode_error_chat_event(err));
+                        }
+                        continue;
+                    }
                     shutdown = shutdown_rx.recv() => {
                         if shutdown.is_some() {
                             let _ = child.kill().await;
@@ -1576,11 +1741,16 @@ impl Backend for TycodeBackend {
                     TycodeStartupObservation::Allow => {}
                     TycodeStartupObservation::Suppress => continue,
                     TycodeStartupObservation::Completed => {
+                        runtime_settings = startup.runtime_settings().cloned();
                         if let Some(ready_tx) = ready_tx.take() {
                             let _ = ready_tx.send(Ok(()));
                         }
                         continue;
                     }
+                }
+
+                if let Some(settings) = tycode_settings_data(&value) {
+                    runtime_settings = Some(settings.clone());
                 }
 
                 if resume_replay_complete_tx.is_some() && replay_barrier.observe(&value) {
@@ -1993,6 +2163,10 @@ fn is_tycode_replay_filtered_delta(value: &Value) -> bool {
 }
 
 fn map_tycode_value_to_chat_events(value: &Value) -> Vec<ChatEvent> {
+    if value.get("kind").and_then(Value::as_str) == Some("Orchestration") {
+        return map_tycode_orchestration_event(value);
+    }
+
     if let Ok(event) = serde_json::from_value::<ChatEvent>(value.clone()) {
         return vec![event];
     }
@@ -2016,6 +2190,77 @@ fn map_tycode_value_to_chat_events(value: &Value) -> Vec<ChatEvent> {
             Vec::new()
         }
     }
+}
+
+fn map_tycode_orchestration_event(value: &Value) -> Vec<ChatEvent> {
+    let Some(payload_kind) = value
+        .get("data")
+        .and_then(|data| data.get("payload"))
+        .and_then(|payload| payload.get("kind"))
+        .and_then(Value::as_str)
+    else {
+        tracing::error!(raw = %value, "Malformed Tycode Orchestration event missing payload kind");
+        return vec![tycode_error_chat_event(
+            "Malformed Tycode Orchestration event: missing data.payload.kind",
+        )];
+    };
+
+    if !is_known_tycode_orchestration_payload_kind(payload_kind) {
+        tracing::warn!(
+            payload_kind,
+            raw = %value,
+            "Ignoring unknown Tycode Orchestration payload kind"
+        );
+        return Vec::new();
+    }
+
+    match value
+        .get("data")
+        .cloned()
+        .ok_or_else(|| "missing data".to_string())
+        .and_then(|data| {
+            serde_json::from_value::<OrchestrationEvent>(data)
+                .map_err(|err| format!("failed to parse {payload_kind}: {err}"))
+        }) {
+        Ok(event) => vec![ChatEvent::Orchestration(event)],
+        Err(err) => {
+            tracing::error!(payload_kind, error = %err, raw = %value, "Malformed Tycode Orchestration event");
+            vec![tycode_error_chat_event(format!(
+                "Malformed Tycode Orchestration event ({payload_kind}): {err}"
+            ))]
+        }
+    }
+}
+
+fn is_known_tycode_orchestration_payload_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "AgentStarted"
+            | "AgentCompleted"
+            | "PhaseChanged"
+            | "FanOutStarted"
+            | "WorkerStarted"
+            | "WorkerCompleted"
+            | "FanOutCompleted"
+            | "ConsensusRoundResolved"
+            | "PlanSelected"
+            | "ReviewRoundResolved"
+    )
+}
+
+fn tycode_error_chat_event(message: impl Into<String>) -> ChatEvent {
+    ChatEvent::MessageAdded(ChatMessage {
+        message_id: None,
+        timestamp: unix_now_ms(),
+        sender: MessageSender::Error,
+        content: message.into(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    })
 }
 
 fn update_tycode_stream_state(
@@ -2051,10 +2296,44 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use protocol::SendMessagePayload;
+    use protocol::{OrchestrationAgentOrigin, OrchestrationPayload, SendMessagePayload};
     use tempfile::TempDir;
 
     const TEST_TYCODE_STARTUP_TIMEOUT_DURATION: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn tycode_session_settings_schema_exposes_orchestration_slider() {
+        let schema = tycode_session_settings_schema();
+        assert_eq!(schema.backend_kind, BackendKind::Tycode);
+        assert_eq!(schema.fields.len(), 1);
+        let field = &schema.fields[0];
+        assert_eq!(field.key, "default_agent");
+        assert_eq!(field.label, "Orchestration");
+        assert!(field.use_slider);
+        match &field.field_type {
+            SessionSettingFieldType::Select {
+                options,
+                default,
+                nullable,
+            } => {
+                assert_eq!(default.as_deref(), Some("tycode"));
+                assert!(!nullable);
+                assert_eq!(
+                    options
+                        .iter()
+                        .map(|option| (option.value.as_str(), option.label.as_str()))
+                        .collect::<Vec<_>>(),
+                    vec![
+                        ("one_shot", "None"),
+                        ("tycode", "Auto"),
+                        ("builder", "Pipeline"),
+                        ("swarm", "Swarm"),
+                    ]
+                );
+            }
+            other => panic!("default_agent should be Select, got {other:?}"),
+        }
+    }
 
     #[test]
     fn tycode_backend_config_schema_exposes_runtime_json_settings() {
@@ -2196,6 +2475,7 @@ mod tests {
         assert_eq!(overlay.settings["reasoning_effort"], "Max");
         assert_eq!(overlay.settings["review_level"], "Task");
         assert_eq!(overlay.settings["spawn_context_mode"], "Fresh");
+        assert_eq!(overlay.settings["orchestration_progress_messages"], false);
         assert_eq!(overlay.settings["disable_custom_steering"], false);
         assert_eq!(overlay.settings["disable_streaming"], false);
         assert!(overlay.settings.get("unknown").is_none());
@@ -2231,8 +2511,41 @@ mod tests {
             TycodeSettingsOverlayMode::SessionRuntime,
         )
         .expect("overlay settings");
-        assert_eq!(overlay.settings, settings);
+        let mut expected = settings.clone();
+        expected.as_object_mut().expect("settings object").insert(
+            "orchestration_progress_messages".to_string(),
+            Value::Bool(false),
+        );
+        assert_eq!(overlay.settings, expected);
         assert_eq!(overlay.active_provider_change, None);
+    }
+
+    #[test]
+    fn tycode_settings_overlay_applies_session_default_agent() {
+        let settings = serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" }
+            },
+            "default_agent": "tycode",
+            "orchestration_progress_messages": true
+        });
+        let mut session_settings = SessionSettingsValues::default();
+        session_settings.0.insert(
+            "default_agent".to_string(),
+            SessionSettingValue::String("swarm".to_string()),
+        );
+
+        let overlay = apply_tycode_settings_overlay(
+            &settings,
+            &BackendConfigValues::default(),
+            &session_settings,
+            TycodeSettingsOverlayMode::SessionRuntime,
+        )
+        .expect("overlay settings");
+
+        assert_eq!(overlay.settings["default_agent"], "swarm");
+        assert_eq!(overlay.settings["orchestration_progress_messages"], false);
     }
 
     #[test]
@@ -2382,8 +2695,52 @@ mod tests {
         assert_eq!(save["settings"]["active_provider"], "other");
         assert_eq!(save["settings"]["model_quality"], "high");
         assert_eq!(save["settings"]["spawn_context_mode"], "Fresh");
+        assert_eq!(save["settings"]["default_agent"], "tycode");
+        assert_eq!(save["settings"]["orchestration_progress_messages"], false);
         assert_eq!(save["settings"]["disable_streaming"], false);
         assert_eq!(save["settings"]["providers"], settings["providers"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fake_tycode_spawn_forces_typed_orchestration_runtime_overlay_without_user_config() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" }
+            },
+            "default_agent": "tycode",
+            "orchestration_progress_messages": true
+        });
+        let fake = write_fake_tycode_subprocess(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        let (backend, mut events) = TycodeBackend::spawn(
+            Vec::new(),
+            BackendSpawnConfig::default(),
+            payload("hello Tycode"),
+        )
+        .await
+        .expect("spawn fake Tycode");
+        wait_for_fake_done(&mut events).await;
+        backend.shutdown().await;
+
+        let commands = read_fake_commands(&log);
+        assert_eq!(commands.len(), 4, "commands: {commands:#?}");
+        assert_eq!(commands[0], Value::String("GetSettings".to_string()));
+        assert_eq!(commands[2], Value::String("GetSettings".to_string()));
+        assert_eq!(
+            commands[3],
+            serde_json::json!({ "UserInput": "hello Tycode" })
+        );
+
+        let save = commands[1]
+            .get("SaveSettings")
+            .expect("SaveSettings command");
+        assert_eq!(save["persist"], false);
+        assert_eq!(save["settings"]["default_agent"], "tycode");
+        assert_eq!(save["settings"]["orchestration_progress_messages"], false);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2694,6 +3051,12 @@ mod tests {
             commands[4],
             serde_json::json!({ "UserInput": "hello Tycode" })
         );
+
+        let save = commands[1]
+            .get("SaveSettings")
+            .expect("SaveSettings command");
+        assert_eq!(save["settings"]["default_agent"], "tycode");
+        assert_eq!(save["settings"]["orchestration_progress_messages"], false);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3252,6 +3615,119 @@ for raw_line in sys.stdin:
             }
             other => panic!("expected StreamStart pass-through, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_tycode_value_to_chat_events_translates_orchestration() {
+        let value = serde_json::json!({
+            "kind": "Orchestration",
+            "data": {
+                "agent_id": "root-1",
+                "agent_type": "swarm",
+                "payload": {
+                    "kind": "AgentStarted",
+                    "parent_agent_id": null,
+                    "task_preview": "plan the work",
+                    "origin": { "kind": "Root" },
+                    "depth": 1,
+                    "interactive": true,
+                    "model": "claude-fable"
+                }
+            }
+        });
+
+        let events = map_tycode_value_to_chat_events(&value);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ChatEvent::Orchestration(event) => {
+                assert_eq!(event.agent_id.0, "root-1");
+                assert_eq!(event.agent_type.0, "swarm");
+                match &event.payload {
+                    OrchestrationPayload::AgentStarted {
+                        parent_agent_id,
+                        task_preview,
+                        origin,
+                        depth,
+                        interactive,
+                        model,
+                    } => {
+                        assert_eq!(parent_agent_id, &None);
+                        assert_eq!(task_preview, "plan the work");
+                        assert!(matches!(origin, OrchestrationAgentOrigin::Root));
+                        assert_eq!(*depth, 1);
+                        assert!(*interactive);
+                        assert_eq!(model, &Some(protocol::TycodeModel::ClaudeFable));
+                    }
+                    other => panic!("expected AgentStarted, got {other:?}"),
+                }
+            }
+            other => panic!("expected Orchestration event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tycode_value_to_chat_events_ignores_unknown_orchestration_payload_kind() {
+        let value = serde_json::json!({
+            "kind": "Orchestration",
+            "data": {
+                "agent_id": "root-1",
+                "agent_type": "swarm",
+                "payload": {
+                    "kind": "FuturePayload",
+                    "new_field": true
+                }
+            }
+        });
+
+        let events = map_tycode_value_to_chat_events(&value);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn map_tycode_value_to_chat_events_surfaces_malformed_known_orchestration_payload() {
+        let value = serde_json::json!({
+            "kind": "Orchestration",
+            "data": {
+                "agent_id": "root-1",
+                "agent_type": "swarm",
+                "payload": {
+                    "kind": "AgentCompleted",
+                    "status": "Succeeded"
+                }
+            }
+        });
+
+        let events = map_tycode_value_to_chat_events(&value);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ChatEvent::MessageAdded(message) => {
+                assert!(matches!(message.sender, MessageSender::Error));
+                assert!(
+                    message
+                        .content
+                        .contains("Malformed Tycode Orchestration event")
+                );
+                assert!(message.content.contains("AgentCompleted"));
+            }
+            other => panic!("expected visible error message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tycode_operation_cancelled_passes_through_without_terminal_worker_inference() {
+        let value = serde_json::json!({
+            "kind": "OperationCancelled",
+            "data": {
+                "message": "cancelled"
+            }
+        });
+
+        let events = map_tycode_value_to_chat_events(&value);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ChatEvent::OperationCancelled(data) if data.message == "cancelled"
+        ));
     }
 
     #[test]

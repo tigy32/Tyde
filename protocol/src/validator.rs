@@ -1470,6 +1470,7 @@ fn validate_chat_event(
             Ok(())
         }
         ChatEvent::TypingStatusChanged(_)
+        | ChatEvent::Orchestration(_)
         | ChatEvent::TaskUpdate(_)
         | ChatEvent::RetryAttempt(_) => Ok(()),
     }
@@ -1743,6 +1744,12 @@ fn summarize_chat_event(event: &ChatEvent) -> String {
                 data.attempt, data.max_retries
             )
         }
+        ChatEvent::Orchestration(data) => format!(
+            "event=orchestration agent_id={} agent_type={} payload={}",
+            data.agent_id,
+            data.agent_type,
+            data.payload.kind()
+        ),
     }
 }
 
@@ -1761,6 +1768,7 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
         ChatEvent::TaskUpdate(_) => "TaskUpdate",
         ChatEvent::OperationCancelled(_) => "OperationCancelled",
         ChatEvent::RetryAttempt(_) => "RetryAttempt",
+        ChatEvent::Orchestration(_) => "Orchestration",
     }
 }
 

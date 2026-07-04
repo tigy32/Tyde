@@ -494,7 +494,7 @@ pub(crate) fn resolve_backend_session_settings(
     config: &BackendSpawnConfig,
 ) -> SessionSettingsValues {
     match backend_kind {
-        BackendKind::Tycode => SessionSettingsValues::default(),
+        BackendKind::Tycode => tycode::resolve_session_settings(config),
         BackendKind::Kiro => kiro::resolve_session_settings(config),
         BackendKind::Claude => claude::resolve_session_settings(config),
         BackendKind::Codex => codex::resolve_session_settings(config),

@@ -5,8 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use protocol::{
     AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
     MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData,
-    SessionId, StreamEndData, StreamStartData, StreamTextDeltaData, TokenUsage,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequest, ToolRequestType,
+    OrchestrationAgentOrigin, OrchestrationAgentType, OrchestrationEvent, OrchestrationId,
+    OrchestrationPayload, SessionId, StreamEndData, StreamStartData, StreamTextDeltaData,
+    TokenUsage, ToolExecutionCompletedData, ToolExecutionResult, ToolPolicy, ToolRequest,
+    ToolRequestType,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -57,6 +59,7 @@ const MOCK_HISTORY_SENTINEL: &str = "__mock_history__";
 const MOCK_CLOSE_RESUME_BEFORE_BARRIER_SENTINEL: &str = "__mock_close_resume_before_barrier__";
 const MOCK_LATE_USAGE_SENTINEL: &str = "__mock_late_usage__";
 const MOCK_NO_USAGE_SENTINEL: &str = "__mock_no_usage__";
+const MOCK_ORCHESTRATION_SENTINEL: &str = "__mock_orchestration__";
 const MOCK_FAILED_TOOL_CALL_ID: &str = "mock-failed-tool";
 const MOCK_EXIT_PLAN_MODE_TOOL_CALL_ID: &str = "mock-exit-plan-tool";
 const MOCK_EXIT_PLAN_MODE_PLAN: &str = "# Plan\n\nApprove the mock plan.";
@@ -517,6 +520,8 @@ fn start_mock_command_loop(
                 emit_mock_error(&events_tx, "mock backend emitted error without idle");
             } else if initial_message.contains(MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL) {
                 emit_mock_tool_failure_without_idle(&events_tx);
+            } else if initial_message.contains(MOCK_ORCHESTRATION_SENTINEL) {
+                emit_mock_orchestration(&events_tx);
             } else {
                 if !emit_turn(
                     &events_tx,
@@ -609,6 +614,8 @@ fn start_mock_command_loop(
                         .contains(MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL)
                     {
                         emit_mock_tool_failure_without_idle(&events_tx);
+                    } else if payload.message.contains(MOCK_ORCHESTRATION_SENTINEL) {
+                        emit_mock_orchestration(&events_tx);
                     } else {
                         if !emit_turn(&events_tx, &session_id_for_task, &payload.message, false)
                             .await
@@ -1336,6 +1343,22 @@ async fn emit_exit_plan_mode_completion(
         sleep(delay_after_completion).await;
     }
     emit_turn(events_tx, session_id, &message, false).await
+}
+
+fn emit_mock_orchestration(events_tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let _ = events_tx.send(ChatEvent::Orchestration(OrchestrationEvent {
+        agent_id: OrchestrationId("mock-root".to_owned()),
+        agent_type: OrchestrationAgentType("swarm".to_owned()),
+        payload: OrchestrationPayload::AgentStarted {
+            parent_agent_id: None,
+            task_preview: "mock orchestration".to_owned(),
+            origin: OrchestrationAgentOrigin::Root,
+            depth: 1,
+            interactive: true,
+            model: None,
+        },
+    }));
+    let _ = events_tx.send(ChatEvent::TypingStatusChanged(false));
 }
 
 fn emit_mock_error(events_tx: &mpsc::UnboundedSender<ChatEvent>, message: &str) {

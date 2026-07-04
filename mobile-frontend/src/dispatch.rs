@@ -1629,6 +1629,16 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                     });
             });
         }
+        ChatEvent::Orchestration(data) => {
+            log::trace!(
+                "mobile dispatch chat_event host={} agent_id={} type=orchestration orchestration_agent_id={} orchestration_agent_type={} payload={}",
+                agent_ref.local_host_id,
+                agent_ref.agent_id,
+                data.agent_id,
+                data.agent_type,
+                data.payload.kind()
+            );
+        }
     }
 }
 
@@ -1779,7 +1789,8 @@ impl MobileHistoryReplay {
             | ChatEvent::ToolProgress(_)
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::OperationCancelled(_)
-            | ChatEvent::RetryAttempt(_) => {}
+            | ChatEvent::RetryAttempt(_)
+            | ChatEvent::Orchestration(_) => {}
         }
     }
 
@@ -2256,6 +2267,7 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
         ChatEvent::TaskUpdate(_) => "TaskUpdate",
         ChatEvent::OperationCancelled(_) => "OperationCancelled",
         ChatEvent::RetryAttempt(_) => "RetryAttempt",
+        ChatEvent::Orchestration(_) => "Orchestration",
     }
 }
 

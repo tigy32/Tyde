@@ -11,12 +11,13 @@ use protocol::{
     FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload, HostLaunchProfileConfig,
     HostSettingValue, HostSettingsPayload, LaunchProfileCatalogPayload, LaunchProfileId,
     LaunchProfileKind, ListSessionsPayload, MessageMetadataUpdateData, MessageSender,
-    MessageTokenUsage, NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectId, ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath,
-    SendMessagePayload, SendMessageToolResponse, SessionHistoryPayload, SessionListPayload,
-    SessionSettingValue, SessionSettingsValues, SetSettingPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamEndData, StreamPath, TokenUsageScope, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
+    MessageTokenUsage, NewAgentPayload, OrchestrationAgentOrigin, OrchestrationPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectId,
+    ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SendMessagePayload,
+    SendMessageToolResponse, SessionHistoryPayload, SessionListPayload, SessionSettingValue,
+    SessionSettingsValues, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamEndData,
+    StreamPath, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
+    ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -841,6 +842,7 @@ const MOCK_TOOL_FAILURE_WITHOUT_IDLE_SENTINEL: &str = "__mock_tool_failure_witho
 const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
 const MOCK_LATE_USAGE_SENTINEL: &str = "__mock_late_usage__";
 const MOCK_NO_USAGE_SENTINEL: &str = "__mock_no_usage__";
+const MOCK_ORCHESTRATION_SENTINEL: &str = "__mock_orchestration__";
 const MOCK_TURN_TOKEN_TOTAL: u64 = 1590;
 const MOCK_NATIVE_CHILD_TOKEN_TOTAL: u64 = 330;
 
@@ -908,6 +910,50 @@ async fn spawn_token_usage_agent(
     expect_agent_start_on_stream(client, &new_agent.instance_stream, &format!("{name} start"))
         .await;
     new_agent
+}
+
+#[tokio::test]
+async fn orchestration_chat_events_are_observable_from_mock_backend() {
+    let mut fixture = Fixture::new().await;
+    let new_agent = spawn_token_usage_agent(
+        &mut fixture.client,
+        "mock-orchestration-agent",
+        MOCK_ORCHESTRATION_SENTINEL,
+    )
+    .await;
+
+    let env = expect_chat_event_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "mock orchestration ChatEvent",
+    )
+    .await;
+    let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+    match event {
+        ChatEvent::Orchestration(event) => {
+            assert_eq!(event.agent_id.0, "mock-root");
+            assert_eq!(event.agent_type.0, "swarm");
+            match event.payload {
+                OrchestrationPayload::AgentStarted {
+                    parent_agent_id,
+                    task_preview,
+                    origin,
+                    depth,
+                    interactive,
+                    model,
+                } => {
+                    assert_eq!(parent_agent_id, None);
+                    assert_eq!(task_preview, "mock orchestration");
+                    assert!(matches!(origin, OrchestrationAgentOrigin::Root));
+                    assert_eq!(depth, 1);
+                    assert!(interactive);
+                    assert_eq!(model, None);
+                }
+                other => panic!("expected AgentStarted orchestration payload, got {other:?}"),
+            }
+        }
+        other => panic!("expected Orchestration ChatEvent, got {other:?}"),
+    }
 }
 
 async fn expect_turn_stream_end_on_stream(

@@ -4133,7 +4133,8 @@ impl HistoryReplay {
             | ChatEvent::StreamReasoningDelta(_)
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::OperationCancelled(_)
-            | ChatEvent::RetryAttempt(_) => {}
+            | ChatEvent::RetryAttempt(_)
+            | ChatEvent::Orchestration(_) => {}
         }
     }
 
@@ -4499,6 +4500,16 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                         backoff_ms: data.backoff_ms,
                     });
             });
+        }
+        ChatEvent::Orchestration(data) => {
+            log::trace!(
+                "dispatch chat_event host={} agent_id={} type=orchestration orchestration_agent_id={} orchestration_agent_type={} payload={}",
+                host_id,
+                agent_id,
+                data.agent_id,
+                data.agent_type,
+                data.payload.kind()
+            );
         }
     }
 }

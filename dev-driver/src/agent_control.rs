@@ -887,7 +887,8 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 | ChatEvent::ToolProgress(_)
                 | ChatEvent::ToolExecutionCompleted(_)
                 | ChatEvent::TaskUpdate(_)
-                | ChatEvent::RetryAttempt(_) => {}
+                | ChatEvent::RetryAttempt(_)
+                | ChatEvent::Orchestration(_) => {}
             }
         }
         FrameKind::AgentRenamed => {

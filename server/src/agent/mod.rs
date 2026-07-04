@@ -461,7 +461,8 @@ impl AgentActivityStatsTracker {
             | ChatEvent::ToolExecutionCompleted(_)
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::OperationCancelled(_)
-            | ChatEvent::RetryAttempt(_) => {}
+            | ChatEvent::RetryAttempt(_)
+            | ChatEvent::Orchestration(_) => {}
             ChatEvent::StreamStart(_) => {
                 self.active_reasoning.clear();
             }
@@ -4269,7 +4270,10 @@ fn record_chat_event_for_replay(
             }
             push_chat_event_to_replay_log(canonical_stream, event_log, event);
         }
-        ChatEvent::MessageAdded(_) | ChatEvent::TaskUpdate(_) | ChatEvent::RetryAttempt(_) => {
+        ChatEvent::MessageAdded(_)
+        | ChatEvent::TaskUpdate(_)
+        | ChatEvent::RetryAttempt(_)
+        | ChatEvent::Orchestration(_) => {
             push_chat_event_to_replay_log(canonical_stream, event_log, event);
         }
     }
@@ -4582,6 +4586,11 @@ fn render_activity_chat_event(event: &ChatEvent) -> Option<String> {
         ChatEvent::TypingStatusChanged(typing) => {
             Some(format!("Agent typing status changed: {typing}"))
         }
+        ChatEvent::Orchestration(event) => Some(format!(
+            "Orchestration {}: {}",
+            event.agent_type,
+            event.payload.kind()
+        )),
         ChatEvent::MessageMetadataUpdated(_) => None,
     }
 }

@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 31;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -4836,6 +4836,274 @@ pub struct AgentErrorPayload {
     pub fatal: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OrchestrationId(pub String);
+
+impl fmt::Display for OrchestrationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OrchestrationAgentType(pub String);
+
+impl fmt::Display for OrchestrationAgentType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TycodeModel {
+    #[serde(rename = "claude-fable")]
+    ClaudeFable,
+    #[serde(rename = "claude-opus")]
+    ClaudeOpus,
+    #[serde(rename = "claude-opus-fast")]
+    ClaudeOpusFast,
+    #[serde(rename = "claude-sonnet")]
+    ClaudeSonnet,
+    #[serde(rename = "claude-haiku")]
+    ClaudeHaiku,
+    #[serde(rename = "gpt")]
+    Gpt,
+    #[serde(rename = "gpt-pro")]
+    GptPro,
+    #[serde(rename = "gpt-mini")]
+    GptMini,
+    #[serde(rename = "gpt-codex")]
+    GptCodex,
+    #[serde(rename = "gpt-codex-max")]
+    GptCodexMax,
+    #[serde(rename = "gpt-oss-120b")]
+    GptOss120b,
+    #[serde(rename = "gpt-oss-120b-free")]
+    GptOss120bFree,
+    #[serde(rename = "gemini-flash")]
+    GeminiFlash,
+    #[serde(rename = "gemini-pro")]
+    GeminiPro,
+    #[serde(rename = "gemini-flash-lite")]
+    GeminiFlashLite,
+    #[serde(rename = "kimi-k2")]
+    KimiK2,
+    #[serde(rename = "kimi-k2-free")]
+    KimiK2Free,
+    #[serde(rename = "qwen-max")]
+    QwenMax,
+    #[serde(rename = "qwen-plus")]
+    QwenPlus,
+    #[serde(rename = "qwen-flash")]
+    QwenFlash,
+    #[serde(rename = "qwen-coder")]
+    QwenCoder,
+    #[serde(rename = "deepseek-pro")]
+    DeepSeekPro,
+    #[serde(rename = "deepseek-flash")]
+    DeepSeekFlash,
+    #[serde(rename = "deepseek-flash-free")]
+    DeepSeekFlashFree,
+    #[serde(rename = "glm")]
+    Glm,
+    #[serde(rename = "minimax-m2")]
+    MinimaxM2,
+    #[serde(rename = "grok")]
+    Grok,
+    #[serde(rename = "grok-build")]
+    GrokBuild,
+    #[serde(rename = "ring")]
+    Ring,
+    #[serde(rename = "step-flash")]
+    StepFlash,
+    #[serde(rename = "openrouter/auto")]
+    OpenRouterAuto,
+    #[serde(rename = "None")]
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationEvent {
+    pub agent_id: OrchestrationId,
+    pub agent_type: OrchestrationAgentType,
+    pub payload: OrchestrationPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum OrchestrationPayload {
+    AgentStarted {
+        parent_agent_id: Option<OrchestrationId>,
+        task_preview: String,
+        origin: OrchestrationAgentOrigin,
+        depth: usize,
+        interactive: bool,
+        model: Option<TycodeModel>,
+    },
+    AgentCompleted {
+        status: OrchestrationOutcomeStatus,
+        result: String,
+    },
+    PhaseChanged {
+        phase: OrchestrationWorkflowPhase,
+    },
+    FanOutStarted {
+        fanout_id: OrchestrationId,
+        total: usize,
+        concurrency: usize,
+        workers: Vec<OrchestrationWorkerInfo>,
+    },
+    WorkerStarted {
+        fanout_id: OrchestrationId,
+        worker_id: OrchestrationId,
+        label: String,
+    },
+    WorkerCompleted {
+        fanout_id: OrchestrationId,
+        worker_id: OrchestrationId,
+        label: String,
+        status: OrchestrationOutcomeStatus,
+        summary: String,
+    },
+    FanOutCompleted {
+        fanout_id: OrchestrationId,
+        status: OrchestrationOutcomeStatus,
+    },
+    ConsensusRoundResolved {
+        round: u32,
+        verdicts: Vec<OrchestrationPanelVerdict>,
+        eliminated: Option<OrchestrationCandidateInfo>,
+        remaining: Vec<OrchestrationCandidateInfo>,
+    },
+    PlanSelected {
+        candidate: Option<OrchestrationCandidateInfo>,
+    },
+    ReviewRoundResolved {
+        round: u32,
+        verdict: OrchestrationReviewVerdict,
+        feedback: String,
+    },
+}
+
+impl OrchestrationPayload {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::AgentStarted { .. } => "AgentStarted",
+            Self::AgentCompleted { .. } => "AgentCompleted",
+            Self::PhaseChanged { .. } => "PhaseChanged",
+            Self::FanOutStarted { .. } => "FanOutStarted",
+            Self::WorkerStarted { .. } => "WorkerStarted",
+            Self::WorkerCompleted { .. } => "WorkerCompleted",
+            Self::FanOutCompleted { .. } => "FanOutCompleted",
+            Self::ConsensusRoundResolved { .. } => "ConsensusRoundResolved",
+            Self::PlanSelected { .. } => "PlanSelected",
+            Self::ReviewRoundResolved { .. } => "ReviewRoundResolved",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum OrchestrationAgentOrigin {
+    Tool { tool_call_id: String },
+    Workflow,
+    Root,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrchestrationOutcomeStatus {
+    Succeeded,
+    Failed,
+    /// The agent was discarded by an agent switch, conversation reset, or
+    /// session change. Tycode turn cancellation is different:
+    /// `ChatEvent::OperationCancelled` aborts in-flight fan-outs without
+    /// terminal worker events, so consumers must close those locally.
+    Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrchestrationReviewVerdict {
+    Approved,
+    Rejected,
+    RoundLimitReached,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationWorkerInfo {
+    pub worker_id: OrchestrationId,
+    pub label: String,
+    pub agent_type: OrchestrationAgentType,
+    pub model: Option<TycodeModel>,
+    pub reviewed: bool,
+    pub task_preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationCandidateInfo {
+    pub label: String,
+    pub author: Option<TycodeModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationPanelVerdict {
+    pub judge: Option<TycodeModel>,
+    pub position: OrchestrationPanelPosition,
+    pub worst_vote: Option<OrchestrationCandidateInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum OrchestrationPanelPosition {
+    Endorsed {
+        candidate: OrchestrationCandidateInfo,
+    },
+    Revised,
+    NoPosition,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum OrchestrationWorkflowPhase {
+    Reviewing {
+        round: u32,
+    },
+    Fixing {
+        round: u32,
+    },
+    BuilderPlanning,
+    BuilderImplementing,
+    BuilderReviewing {
+        round: u32,
+    },
+    BuilderFixing {
+        round: u32,
+    },
+    SwarmPlanning,
+    SwarmPlanFanOut {
+        models: Vec<TycodeModel>,
+    },
+    SwarmConsensus {
+        round: u32,
+        candidates: Vec<OrchestrationCandidateInfo>,
+    },
+    SwarmImplementing {
+        fixer_model: Option<TycodeModel>,
+    },
+    SwarmFanOut {
+        model: Option<TycodeModel>,
+    },
+    SwarmIntegration {
+        round: u32,
+        models: Vec<TycodeModel>,
+    },
+    SwarmFixing {
+        round: u32,
+    },
+}
+
 /// Events a backend emits on a chat stream. Mirrors the Tycode
 /// `ChatEvent` enum in `tycode-core/src/chat/events.rs`; any semantic
 /// change must be made there first so every backend (Claude, Codex,
@@ -4896,6 +5164,7 @@ pub enum ChatEvent {
     TaskUpdate(TaskList),
     OperationCancelled(OperationCancelledData),
     RetryAttempt(RetryAttemptData),
+    Orchestration(OrchestrationEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5471,8 +5740,41 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty() {
-        assert_eq!(PROTOCOL_VERSION, 30);
+    fn protocol_version_is_thirty_one() {
+        assert_eq!(PROTOCOL_VERSION, 31);
+    }
+
+    #[test]
+    fn orchestration_event_round_trips_tycode_shape() {
+        let event = ChatEvent::Orchestration(OrchestrationEvent {
+            agent_id: OrchestrationId("boot-1-7".to_owned()),
+            agent_type: OrchestrationAgentType("swarm".to_owned()),
+            payload: OrchestrationPayload::WorkerCompleted {
+                fanout_id: OrchestrationId("boot-1-8".to_owned()),
+                worker_id: OrchestrationId("boot-1-9".to_owned()),
+                label: "src/a.rs".to_owned(),
+                status: OrchestrationOutcomeStatus::Succeeded,
+                summary: "done".to_owned(),
+            },
+        });
+
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(json["kind"], "Orchestration");
+        assert_eq!(json["data"]["agent_id"], "boot-1-7");
+        assert_eq!(json["data"]["agent_type"], "swarm");
+        assert_eq!(json["data"]["payload"]["kind"], "WorkerCompleted");
+        assert_eq!(json["data"]["payload"]["status"], "Succeeded");
+
+        let decoded: ChatEvent = serde_json::from_value(json).expect("deserialize");
+        let ChatEvent::Orchestration(decoded) = decoded else {
+            panic!("expected Orchestration event");
+        };
+        assert_eq!(decoded.agent_id.0, "boot-1-7");
+        assert_eq!(decoded.agent_type.0, "swarm");
+        assert!(matches!(
+            decoded.payload,
+            OrchestrationPayload::WorkerCompleted { .. }
+        ));
     }
 
     #[test]
