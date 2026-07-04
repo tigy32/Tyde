@@ -19,8 +19,9 @@ use protocol::{
 
 use super::{
     Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
-    StartupMcpServer, StartupMcpTransport, backend_fork_unsupported_message,
-    render_combined_spawn_instructions, resolve_settings, setup::resolve_tycode_binary_path,
+    StartupMcpServer, StartupMcpTransport, apply_session_settings_update,
+    backend_fork_unsupported_message, render_combined_spawn_instructions,
+    setup::resolve_tycode_binary_path,
 };
 use crate::process_env;
 
@@ -161,9 +162,9 @@ fn tycode_session_settings_schema() -> SessionSettingsSchema {
             key: "default_agent".to_string(),
             label: "Orchestration".to_string(),
             description: Some(
-                "Controls Tycode's default orchestration agent for this session: None runs one \
-                 agent, Auto lets Tycode delegate as needed, Pipeline runs the builder workflow, \
-                 and Swarm runs the fan-out integration workflow."
+                "Controls Tycode's session root agent: None runs one agent, Auto lets Tycode \
+                 delegate as needed, Pipeline runs the builder workflow, and Swarm runs the \
+                 fan-out integration workflow."
                     .to_string(),
             ),
             field_type: SessionSettingFieldType::Select {
@@ -182,9 +183,11 @@ fn tycode_session_settings_schema() -> SessionSettingsSchema {
 }
 
 pub(crate) fn resolve_session_settings(config: &BackendSpawnConfig) -> SessionSettingsValues {
-    resolve_settings(config, &tycode_session_settings_schema(), |_| {
-        SessionSettingsValues::default()
-    })
+    let mut resolved = SessionSettingsValues::default();
+    if let Some(session_settings) = config.session_settings.as_ref() {
+        apply_session_settings_update(&mut resolved, session_settings);
+    }
+    resolved
 }
 
 fn tycode_backend_config_schema() -> BackendConfigSchema {
@@ -341,7 +344,7 @@ fn apply_tycode_backend_config_overlay(
 fn apply_tycode_settings_overlay(
     current_settings: &Value,
     config: &BackendConfigValues,
-    session_settings: &SessionSettingsValues,
+    _session_settings: &SessionSettingsValues,
     mode: TycodeSettingsOverlayMode,
 ) -> Result<TycodeSettingsOverlay, String> {
     let mut settings = current_settings.clone();
@@ -349,7 +352,9 @@ fn apply_tycode_settings_overlay(
         .as_object_mut()
         .ok_or_else(|| "Tycode Settings event data must be a JSON object".to_string())?;
 
-    if mode == TycodeSettingsOverlayMode::SessionRuntime {
+    if mode == TycodeSettingsOverlayMode::SessionRuntime
+        && object.contains_key("orchestration_progress_messages")
+    {
         object.insert(
             "orchestration_progress_messages".to_string(),
             Value::Bool(false),
@@ -451,18 +456,6 @@ fn apply_tycode_settings_overlay(
         }
     }
 
-    for (key, value) in &session_settings.0 {
-        match (key.as_str(), value) {
-            ("default_agent", SessionSettingValue::String(agent)) => {
-                object.insert("default_agent".to_string(), Value::String(agent.clone()));
-            }
-            ("default_agent", _) => {
-                return Err("Tycode default_agent session setting must be a string".to_string());
-            }
-            _ => {}
-        }
-    }
-
     Ok(TycodeSettingsOverlay {
         settings,
         active_provider_change,
@@ -520,6 +513,9 @@ enum TycodeStartupPhase {
     },
     AwaitProviderChange {
         provider: String,
+    },
+    AwaitRootAgentChanged {
+        agent: String,
     },
     Complete,
 }
@@ -624,9 +620,7 @@ impl TycodeStartupController {
                         )?;
                         self.phase = TycodeStartupPhase::AwaitProviderChange { provider };
                     } else {
-                        self.send_follow_up(stdin_tx)?;
-                        self.phase = TycodeStartupPhase::Complete;
-                        return Ok(TycodeStartupObservation::Completed);
+                        return self.send_root_agent_or_follow_up(stdin_tx);
                     }
                     return Ok(TycodeStartupObservation::Suppress);
                 }
@@ -639,6 +633,20 @@ impl TycodeStartupController {
                     ));
                 }
                 if tycode_provider_changed_message(value, provider) {
+                    return self.send_root_agent_or_follow_up(stdin_tx);
+                }
+                Ok(tycode_startup_internal_observation(value))
+            }
+            TycodeStartupPhase::AwaitRootAgentChanged { agent } => {
+                if let Some(error) = tycode_error_message(value) {
+                    return Err(format!("Tycode SetRootAgent '{agent}' failed: {error}"));
+                }
+                if let Some(changed_agent) = tycode_root_agent_changed(value) {
+                    if changed_agent != agent {
+                        return Err(format!(
+                            "Tycode SetRootAgent '{agent}' acknowledged unexpected root agent '{changed_agent}'"
+                        ));
+                    }
                     self.send_follow_up(stdin_tx)?;
                     self.phase = TycodeStartupPhase::Complete;
                     return Ok(TycodeStartupObservation::Completed);
@@ -651,6 +659,41 @@ impl TycodeStartupController {
 
     fn runtime_settings(&self) -> Option<&Value> {
         self.runtime_settings.as_ref()
+    }
+
+    fn send_root_agent_or_follow_up(
+        &mut self,
+        stdin_tx: &mpsc::UnboundedSender<TycodeStdinCommand>,
+    ) -> Result<TycodeStartupObservation, String> {
+        if let Some(agent) = self.requested_root_agent()? {
+            send_tycode_json(
+                stdin_tx,
+                serde_json::json!({ "SetRootAgent": { "agent": agent } }),
+            )?;
+            self.phase = TycodeStartupPhase::AwaitRootAgentChanged { agent };
+            return Ok(TycodeStartupObservation::Suppress);
+        }
+        self.send_follow_up(stdin_tx)?;
+        self.phase = TycodeStartupPhase::Complete;
+        Ok(TycodeStartupObservation::Completed)
+    }
+
+    fn requested_root_agent(&self) -> Result<Option<String>, String> {
+        if !matches!(self.follow_up, TycodeStartupFollowUp::InitialUserInput(_)) {
+            return Ok(None);
+        }
+        match self.session_settings.0.get("default_agent") {
+            Some(SessionSettingValue::String(agent))
+                if matches!(agent.as_str(), "one_shot" | "tycode" | "builder" | "swarm") =>
+            {
+                Ok(Some(agent.clone()))
+            }
+            Some(SessionSettingValue::String(agent)) => Err(format!(
+                "Tycode default_agent session setting has unsupported value '{agent}'"
+            )),
+            Some(_) => Err("Tycode default_agent session setting must be a string".to_string()),
+            None => Ok(None),
+        }
     }
 
     fn send_follow_up(
@@ -683,6 +726,9 @@ impl TycodeStartupController {
             }
             TycodeStartupPhase::AwaitProviderChange { .. } => {
                 "waiting for ChangeProvider acknowledgement"
+            }
+            TycodeStartupPhase::AwaitRootAgentChanged { .. } => {
+                "waiting for RootAgentChanged acknowledgement"
             }
             TycodeStartupPhase::Complete => "complete",
         }
@@ -1129,9 +1175,20 @@ fn tycode_provider_changed_message(value: &Value, provider: &str) -> bool {
     is_system && data.get("content").and_then(Value::as_str) == Some(expected.as_str())
 }
 
+fn tycode_root_agent_changed(value: &Value) -> Option<&str> {
+    (value.get("kind").and_then(Value::as_str) == Some("RootAgentChanged"))
+        .then(|| {
+            value
+                .get("data")
+                .and_then(|data| data.get("agent"))
+                .and_then(Value::as_str)
+        })
+        .flatten()
+}
+
 fn tycode_startup_internal_observation(value: &Value) -> TycodeStartupObservation {
     match value.get("kind").and_then(Value::as_str) {
-        Some("Settings" | "TimingUpdate" | "TypingStatusChanged") => {
+        Some("Settings" | "TimingUpdate" | "TypingStatusChanged" | "RootAgentChanged") => {
             TycodeStartupObservation::Suppress
         }
         _ => TycodeStartupObservation::Allow,
@@ -1146,7 +1203,6 @@ fn tycode_settings_verification_error(expected: &Value, actual: &Value) -> Strin
         "autonomy_level",
         "review_level",
         "spawn_context_mode",
-        "default_agent",
         "orchestration_progress_messages",
     ];
     let mismatched = managed_keys
@@ -1181,7 +1237,6 @@ fn verify_tycode_settings_overlay(expected: &Value, actual: &Value) -> Result<()
         "autonomy_level",
         "review_level",
         "spawn_context_mode",
-        "default_agent",
         "orchestration_progress_messages",
     ];
     let managed_keys_match = managed_keys
@@ -2184,6 +2239,7 @@ fn map_tycode_value_to_chat_events(value: &Value) -> Vec<ChatEvent> {
         | "TimingUpdate"
         | "ModuleSchemas"
         | "SessionStarted"
+        | "RootAgentChanged"
         | "Error" => Vec::new(),
         other => {
             tracing::warn!(kind = %other, raw = %value, "Ignoring unsupported Tycode event");
@@ -2336,6 +2392,30 @@ mod tests {
     }
 
     #[test]
+    fn tycode_resolve_session_settings_keeps_only_explicit_root_agent() {
+        let default_config = BackendSpawnConfig::default();
+        assert!(resolve_session_settings(&default_config).0.is_empty());
+
+        let mut config = BackendSpawnConfig {
+            session_settings: Some(SessionSettingsValues::default()),
+            ..Default::default()
+        };
+        config
+            .session_settings
+            .as_mut()
+            .expect("session settings")
+            .0
+            .insert(
+                "default_agent".to_string(),
+                SessionSettingValue::String("tycode".to_string()),
+            );
+        assert_eq!(
+            resolve_session_settings(&config).0.get("default_agent"),
+            Some(&SessionSettingValue::String("tycode".to_string()))
+        );
+    }
+
+    #[test]
     fn tycode_backend_config_schema_exposes_runtime_json_settings() {
         let schema = tycode_backend_config_schema();
         assert_eq!(schema.backend_kind, BackendKind::Tycode);
@@ -2427,6 +2507,7 @@ mod tests {
             "reasoning_effort": null,
             "review_level": "None",
             "spawn_context_mode": "Fork",
+            "orchestration_progress_messages": true,
             "disable_custom_steering": false,
             "disable_streaming": false,
             "unmanaged_top_level": { "still": "here" }
@@ -2511,17 +2592,12 @@ mod tests {
             TycodeSettingsOverlayMode::SessionRuntime,
         )
         .expect("overlay settings");
-        let mut expected = settings.clone();
-        expected.as_object_mut().expect("settings object").insert(
-            "orchestration_progress_messages".to_string(),
-            Value::Bool(false),
-        );
-        assert_eq!(overlay.settings, expected);
+        assert_eq!(overlay.settings, settings);
         assert_eq!(overlay.active_provider_change, None);
     }
 
     #[test]
-    fn tycode_settings_overlay_applies_session_default_agent() {
+    fn tycode_settings_overlay_keeps_default_agent_out_of_save_settings() {
         let settings = serde_json::json!({
             "active_provider": "default",
             "providers": {
@@ -2544,7 +2620,7 @@ mod tests {
         )
         .expect("overlay settings");
 
-        assert_eq!(overlay.settings["default_agent"], "swarm");
+        assert_eq!(overlay.settings["default_agent"], "tycode");
         assert_eq!(overlay.settings["orchestration_progress_messages"], false);
     }
 
@@ -2695,14 +2771,18 @@ mod tests {
         assert_eq!(save["settings"]["active_provider"], "other");
         assert_eq!(save["settings"]["model_quality"], "high");
         assert_eq!(save["settings"]["spawn_context_mode"], "Fresh");
-        assert_eq!(save["settings"]["default_agent"], "tycode");
-        assert_eq!(save["settings"]["orchestration_progress_messages"], false);
+        assert!(save["settings"].get("default_agent").is_none());
+        assert!(
+            save["settings"]
+                .get("orchestration_progress_messages")
+                .is_none()
+        );
         assert_eq!(save["settings"]["disable_streaming"], false);
         assert_eq!(save["settings"]["providers"], settings["providers"]);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fake_tycode_spawn_forces_typed_orchestration_runtime_overlay_without_user_config() {
+    async fn fake_tycode_spawn_disables_supported_progress_messages_without_user_config() {
         let dir = TempDir::new().expect("tempdir");
         let settings = serde_json::json!({
             "active_provider": "default",
@@ -2741,6 +2821,150 @@ mod tests {
         assert_eq!(save["persist"], false);
         assert_eq!(save["settings"]["default_agent"], "tycode");
         assert_eq!(save["settings"]["orchestration_progress_messages"], false);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fake_tycode_spawn_tolerates_old_binary_that_drops_unknown_settings() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" }
+            },
+            "model_quality": "high",
+            "reasoning_effort": "Max",
+            "autonomy_level": "plan_approval_required",
+            "review_level": "None",
+            "spawn_context_mode": "Fork"
+        });
+        let fake = write_fake_tycode_subprocess_dropping_unknown_settings(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        let (backend, mut events) = TycodeBackend::spawn(
+            Vec::new(),
+            BackendSpawnConfig::default(),
+            payload("hello old Tycode"),
+        )
+        .await
+        .expect("spawn old fake Tycode");
+        wait_for_fake_done(&mut events).await;
+        backend.shutdown().await;
+
+        let commands = read_fake_commands(&log);
+        assert_eq!(commands.len(), 4, "commands: {commands:#?}");
+        assert_eq!(commands[0], Value::String("GetSettings".to_string()));
+        assert_eq!(commands[2], Value::String("GetSettings".to_string()));
+        assert_eq!(
+            commands[3],
+            serde_json::json!({ "UserInput": "hello old Tycode" })
+        );
+
+        let save = commands[1]
+            .get("SaveSettings")
+            .expect("SaveSettings command");
+        assert_eq!(save["persist"], false);
+        assert!(
+            save["settings"]
+                .get("orchestration_progress_messages")
+                .is_none()
+        );
+        assert!(save["settings"].get("default_agent").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fake_tycode_spawn_sets_requested_root_agent_before_user_input() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" }
+            },
+            "default_agent": "tycode",
+            "orchestration_progress_messages": true
+        });
+        let fake = write_fake_tycode_subprocess(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        let mut session_settings = SessionSettingsValues::default();
+        session_settings.0.insert(
+            "default_agent".to_string(),
+            SessionSettingValue::String("swarm".to_string()),
+        );
+        let config = BackendSpawnConfig {
+            session_settings: Some(session_settings),
+            ..Default::default()
+        };
+
+        let (backend, mut events) =
+            TycodeBackend::spawn(Vec::new(), config, payload("hello Tycode"))
+                .await
+                .expect("spawn fake Tycode");
+        wait_for_fake_done(&mut events).await;
+        backend.shutdown().await;
+
+        let commands = read_fake_commands(&log);
+        assert_eq!(commands.len(), 5, "commands: {commands:#?}");
+        assert_eq!(commands[0], Value::String("GetSettings".to_string()));
+        assert_eq!(commands[2], Value::String("GetSettings".to_string()));
+        assert_eq!(
+            commands[3],
+            serde_json::json!({ "SetRootAgent": { "agent": "swarm" } })
+        );
+        assert_eq!(
+            commands[4],
+            serde_json::json!({ "UserInput": "hello Tycode" })
+        );
+
+        let save = commands[1]
+            .get("SaveSettings")
+            .expect("SaveSettings command");
+        assert_eq!(save["persist"], false);
+        assert_eq!(save["settings"]["default_agent"], "tycode");
+        assert_eq!(save["settings"]["orchestration_progress_messages"], false);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fake_tycode_spawn_surfaces_root_agent_rejection_before_prompt() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" }
+            },
+            "default_agent": "tycode",
+            "orchestration_progress_messages": true
+        });
+        let fake = write_fake_tycode_subprocess_rejecting_root_agent(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        let mut session_settings = SessionSettingsValues::default();
+        session_settings.0.insert(
+            "default_agent".to_string(),
+            SessionSettingValue::String("swarm".to_string()),
+        );
+        let config = BackendSpawnConfig {
+            session_settings: Some(session_settings),
+            ..Default::default()
+        };
+
+        let err = match TycodeBackend::spawn(Vec::new(), config, payload("must not send")).await {
+            Ok(_) => panic!("root agent rejection should fail startup"),
+            Err(err) => err,
+        };
+        assert!(err.contains("Tycode SetRootAgent 'swarm' failed"));
+        assert!(err.contains("Unknown agent type 'swarm'"));
+
+        let commands = read_fake_commands(&log);
+        assert_eq!(commands.len(), 4, "commands: {commands:#?}");
+        assert_eq!(commands[0], Value::String("GetSettings".to_string()));
+        assert_eq!(commands[2], Value::String("GetSettings".to_string()));
+        assert_eq!(
+            commands[3],
+            serde_json::json!({ "SetRootAgent": { "agent": "swarm" } })
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3055,8 +3279,12 @@ mod tests {
         let save = commands[1]
             .get("SaveSettings")
             .expect("SaveSettings command");
-        assert_eq!(save["settings"]["default_agent"], "tycode");
-        assert_eq!(save["settings"]["orchestration_progress_messages"], false);
+        assert!(save["settings"].get("default_agent").is_none());
+        assert!(
+            save["settings"]
+                .get("orchestration_progress_messages")
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3317,16 +3545,45 @@ mod tests {
     }
 
     fn write_fake_tycode_subprocess(dir: &Path, settings: &Value) -> String {
+        write_fake_tycode_subprocess_with_options(dir, settings, false, false)
+    }
+
+    fn write_fake_tycode_subprocess_dropping_unknown_settings(
+        dir: &Path,
+        settings: &Value,
+    ) -> String {
+        write_fake_tycode_subprocess_with_options(dir, settings, true, false)
+    }
+
+    fn write_fake_tycode_subprocess_rejecting_root_agent(dir: &Path, settings: &Value) -> String {
+        write_fake_tycode_subprocess_with_options(dir, settings, false, true)
+    }
+
+    fn write_fake_tycode_subprocess_with_options(
+        dir: &Path,
+        settings: &Value,
+        drop_unknown_settings: bool,
+        reject_root_agent: bool,
+    ) -> String {
         let script = dir.join("fake_tycode_subprocess.py");
         let log = dir.join("commands.jsonl");
         let settings_literal =
             serde_json::to_string(&settings.to_string()).expect("settings literal");
         let log_literal = serde_json::to_string(&log.to_string_lossy()).expect("log literal");
+        let drop_unknown_literal = if drop_unknown_settings {
+            "True"
+        } else {
+            "False"
+        };
+        let reject_root_agent_literal = if reject_root_agent { "True" } else { "False" };
         let body = r#"#!/usr/bin/env python3
 import json
 import sys
 
 settings = json.loads(__SETTINGS__)
+known_settings_keys = set(settings.keys())
+drop_unknown_settings = __DROP_UNKNOWN_SETTINGS__
+reject_root_agent = __REJECT_ROOT_AGENT__
 log_path = __LOG__
 
 def emit(value):
@@ -3360,13 +3617,36 @@ for raw_line in sys.stdin:
     if command == "GetSettings":
         emit({"kind": "Settings", "data": settings})
     elif isinstance(command, dict) and "SaveSettings" in command:
-        settings = command["SaveSettings"]["settings"]
+        incoming_settings = command["SaveSettings"]["settings"]
+        if drop_unknown_settings:
+            settings = {
+                key: value
+                for key, value in incoming_settings.items()
+                if key in known_settings_keys
+            }
+        else:
+            settings = incoming_settings
     elif isinstance(command, dict) and "ChangeProvider" in command:
         emit(message("System", f"Switched to provider: {command['ChangeProvider']}"))
+    elif isinstance(command, dict) and "SetRootAgent" in command:
+        agent = command["SetRootAgent"]["agent"]
+        valid_agents = {"one_shot", "tycode", "builder", "swarm"}
+        if reject_root_agent or agent not in valid_agents:
+            emit({
+                "kind": "Error",
+                "data": (
+                    f"Unknown agent type '{agent}'. Available agents: "
+                    "one_shot, tycode, builder, swarm"
+                ),
+            })
+        else:
+            emit({"kind": "RootAgentChanged", "data": {"agent": agent}})
     elif isinstance(command, dict) and "UserInput" in command:
         emit(message({"Assistant": {"agent": "tycode"}}, "fake done"))
 "#
         .replace("__SETTINGS__", &settings_literal)
+        .replace("__DROP_UNKNOWN_SETTINGS__", drop_unknown_literal)
+        .replace("__REJECT_ROOT_AGENT__", reject_root_agent_literal)
         .replace("__LOG__", &log_literal);
         std::fs::write(&script, body).expect("write fake Tycode script");
         #[cfg(unix)]
