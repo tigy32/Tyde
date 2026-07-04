@@ -12,6 +12,7 @@ use wasm_bindgen::closure::Closure;
 use crate::components::chat_input::ChatInput;
 use crate::components::chat_message::ChatMessageView;
 use crate::components::chat_streaming::ChatStreamingView;
+use crate::components::orchestration_view::OrchestrationView;
 use crate::components::settings_panel::persist_tool_output_mode;
 use crate::components::task_list::TaskListView;
 use crate::send::send_frame;
@@ -229,6 +230,11 @@ pub fn ChatView(
     let task_list = move || {
         let agent_id = agent_ref.get()?.agent_id;
         state.task_lists.with(|m| m.get(&agent_id).cloned())
+    };
+
+    let orchestration = move || {
+        let agent_id = agent_ref.get()?.agent_id;
+        state.orchestration.with(|m| m.get(&agent_id).cloned())
     };
 
     // Walk back from the latest message to find the most recent assistant
@@ -965,6 +971,12 @@ pub fn ChatView(
                                     }
                                 }).collect::<Vec<_>>()
                             })
+                        }}
+
+                        {move || {
+                            orchestration()
+                                .filter(|records| !records.is_empty())
+                                .map(|records| view! { <OrchestrationView records=records /> })
                         }}
 
                         {move || {

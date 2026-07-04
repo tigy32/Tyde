@@ -20,6 +20,7 @@ pub mod host_browser;
 pub mod hover_popover;
 pub mod inline_review;
 pub mod launch_menu;
+pub mod orchestration_view;
 pub mod project_rail;
 pub mod references_panel;
 pub mod review_layer;

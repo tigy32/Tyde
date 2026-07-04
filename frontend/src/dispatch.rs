@@ -35,10 +35,11 @@ use protocol::{
 use crate::line_source::FileLines;
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry,
-    CodeIntelKey, ConnectionStatus, OpenFile, ProjectInfo, ProjectReferencesMode,
-    ProjectReferencesUiState, ReviewActionTarget, SessionHistoryState, SessionInfo, StreamingState,
-    StreamingToolRequest, TabContent, TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent,
-    WorkflowPanelError, reduce_diff_response, root_display_name, sort_project_infos,
+    CodeIntelKey, ConnectionStatus, OpenFile, OrchestrationRecord, ProjectInfo,
+    ProjectReferencesMode, ProjectReferencesUiState, ReviewActionTarget, SessionHistoryState,
+    SessionInfo, StreamingState, StreamingToolRequest, TabContent, TerminalInfo, ToolCallId,
+    ToolRequestEntry, TransientEvent, WorkflowPanelError, reduce_diff_response, root_display_name,
+    sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -4012,6 +4013,15 @@ fn apply_session_history(
         }
     }
 
+    if !replay.orchestration.is_empty() {
+        state.orchestration.update(|map| {
+            let current = map.remove(&agent_id).unwrap_or_default();
+            let mut combined = replay.orchestration.clone();
+            combined.extend(current);
+            map.insert(agent_id.clone(), combined);
+        });
+    }
+
     state.session_history.update(|map| {
         let mut remove = false;
         if let Some(history) = map.get_mut(&agent_id) {
@@ -4045,6 +4055,7 @@ struct HistoryReplay {
     message_rows: HashMap<protocol::ChatMessageId, crate::state::ChatRowId>,
     tool_rows: HashMap<ToolCallId, crate::state::ChatRowId>,
     tool_progress: HashMap<ToolCallId, protocol::ToolProgressData>,
+    orchestration: Vec<OrchestrationRecord>,
 }
 
 impl HistoryReplay {
@@ -4127,14 +4138,24 @@ impl HistoryReplay {
                 self.tool_progress
                     .insert(ToolCallId(data.tool_call_id.clone()), data);
             }
+            // Replayed orchestration must fold identically to the live stream:
+            // record the event, and record a cancellation marker so a resumed
+            // session closes any fan-out/worker that was cancelled mid-turn
+            // instead of showing it stuck "running".
+            ChatEvent::Orchestration(data) => {
+                self.orchestration.push(OrchestrationRecord::Event(data));
+            }
+            ChatEvent::OperationCancelled(_) => {
+                if !self.orchestration.is_empty() {
+                    self.orchestration.push(OrchestrationRecord::Cancelled);
+                }
+            }
             ChatEvent::TypingStatusChanged(_)
             | ChatEvent::StreamStart(_)
             | ChatEvent::StreamDelta(_)
             | ChatEvent::StreamReasoningDelta(_)
             | ChatEvent::TaskUpdate(_)
-            | ChatEvent::OperationCancelled(_)
-            | ChatEvent::RetryAttempt(_)
-            | ChatEvent::Orchestration(_) => {}
+            | ChatEvent::RetryAttempt(_) => {}
         }
     }
 
@@ -4471,6 +4492,14 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
             state.streaming_text.update(|map| {
                 map.remove(&agent_id);
             });
+            // Close any in-flight orchestration: Tycode drops fan-outs and
+            // workers without terminal events on cancel, so the panel would
+            // otherwise show them stuck "running".
+            state.orchestration.update(|map| {
+                if let Some(log) = map.get_mut(&agent_id) {
+                    log.push(OrchestrationRecord::Cancelled);
+                }
+            });
             state.transient_events.update(|events| {
                 events.entry(agent_id.clone()).or_default().push(
                     TransientEvent::OperationCancelled {
@@ -4510,6 +4539,11 @@ pub fn apply_chat_event(state: &AppState, host_id: &str, agent_id: &AgentId, eve
                 data.agent_type,
                 data.payload.kind()
             );
+            state.orchestration.update(|map| {
+                map.entry(agent_id.clone())
+                    .or_default()
+                    .push(OrchestrationRecord::Event(data));
+            });
         }
     }
 }

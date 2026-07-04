@@ -910,6 +910,22 @@ pub enum TransientEvent {
     },
 }
 
+/// One entry in an agent's Tycode orchestration log, in chronological order.
+/// The log stores the typed events the server emitted verbatim, plus a
+/// locally-injected [`OrchestrationRecord::Cancelled`] marker for turn
+/// cancellations. The orchestration panel folds this log into a presentation
+/// tree at render time (see `components::orchestration_view`) — no aggregated
+/// state is cached; the events are the source of truth.
+#[derive(Clone, Debug)]
+pub enum OrchestrationRecord {
+    Event(protocol::OrchestrationEvent),
+    /// A `ChatEvent::OperationCancelled` at this point in the stream. Tycode
+    /// drops any in-flight fan-out/worker/sub-agent without terminal events on
+    /// cancel, so the fold closes everything still running at this marker
+    /// instead of leaving it stuck "running".
+    Cancelled,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectInfo {
     pub host_id: String,
@@ -1274,6 +1290,12 @@ pub struct AppState {
     pub tool_progress: RwSignal<HashMap<(AgentId, ToolCallId), ArcRwSignal<ToolProgressData>>>,
     pub chat_input: RwSignal<String>,
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
+    /// Per-agent Tycode orchestration event log (sub-agent/workflow progress),
+    /// chronological. Appended to as `ChatEvent::Orchestration` events arrive
+    /// and as history replays; the orchestration panel folds it into a compact
+    /// progress tree. These are Tycode-internal orchestration nodes, not
+    /// first-class Tyde agents. Cleared with the agent's other per-agent state.
+    pub orchestration: RwSignal<HashMap<AgentId, Vec<OrchestrationRecord>>>,
     /// Server-owned per-agent activity stats (running tool-call count, token
     /// usage, last output line), keyed by the owning `(host_id, agent_id)` so two
     /// hosts that hand out the same agent-id string can't collide. Populated from
@@ -1678,6 +1700,7 @@ impl AppState {
             tool_progress: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
             task_lists: RwSignal::new(HashMap::new()),
+            orchestration: RwSignal::new(HashMap::new()),
             center_zone,
             tab_lru: RwSignal::new(initial_lru),
             tab_scroll_state: RwSignal::new(HashMap::new()),
@@ -2050,6 +2073,9 @@ impl AppState {
             map.remove(agent_id);
         });
         self.task_lists.update(|map| {
+            map.remove(agent_id);
+        });
+        self.orchestration.update(|map| {
             map.remove(agent_id);
         });
         self.agent_message_queue.update(|map| {
@@ -2736,6 +2762,9 @@ impl AppState {
                 map.retain(|id, _| !drop_set.contains(id));
             });
             self.task_lists.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.orchestration.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
             self.transient_events.update(|map| {
@@ -4382,6 +4411,9 @@ mod tests {
                 state.transient_events.update(|m| {
                     m.insert(id.clone(), Vec::new());
                 });
+                state.orchestration.update(|m| {
+                    m.insert(id.clone(), Vec::new());
+                });
                 state.agent_message_queue.update(|m| {
                     m.insert(id.clone(), Vec::new());
                 });
@@ -4412,6 +4444,11 @@ mod tests {
                         .transient_events
                         .with_untracked(|m| m.contains_key(id)),
                     "transient_events still has dropped agent {}",
+                    id.0
+                );
+                assert!(
+                    !state.orchestration.with_untracked(|m| m.contains_key(id)),
+                    "orchestration still has dropped agent {}",
                     id.0
                 );
                 assert!(

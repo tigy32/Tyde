@@ -4101,6 +4101,153 @@ kbd {
     font-size: 0.923rem;
 }
 
+/* --- Orchestration panel (Tycode sub-agent / workflow progress) --- */
+.orchestration-panel {
+    margin: 6px 0;
+    padding: 6px 0;
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    background: var(--surface-1);
+    font-size: 0.846rem;
+}
+
+.orchestration-panel.hidden {
+    display: none;
+}
+
+.orchestration-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 12px 6px 12px;
+    border-bottom: 1px solid var(--border-primary);
+    margin-bottom: 4px;
+}
+
+.orchestration-title {
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.769rem;
+}
+
+.orchestration-root {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.orchestration-phase {
+    margin-left: auto;
+    padding: 1px 8px;
+    border-radius: 10px;
+    background: rgba(0, 122, 204, 0.12);
+    color: var(--accent-primary);
+    font-size: 0.769rem;
+    font-weight: 500;
+}
+
+.orchestration-nodes {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.orch-row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 3px 12px 3px 8px;
+    line-height: 1.4;
+}
+
+.orch-icon {
+    flex-shrink: 0;
+    width: 14px;
+    text-align: center;
+    color: var(--text-tertiary);
+    font-size: 0.769rem;
+}
+
+.orch-status-running > .orch-icon {
+    color: var(--accent-primary);
+}
+
+.orch-status-succeeded > .orch-icon {
+    color: var(--success);
+}
+
+.orch-status-failed > .orch-icon {
+    color: var(--error);
+}
+
+.orch-status-aborted > .orch-icon {
+    color: var(--warning);
+}
+
+.orch-agent-type {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.orch-task,
+.orch-result,
+.orch-worker-summary {
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+.orch-phase-chip {
+    padding: 0 6px;
+    border-radius: 8px;
+    background: rgba(0, 122, 204, 0.12);
+    color: var(--accent-primary);
+    font-size: 0.723rem;
+}
+
+.orch-fanout {
+    display: flex;
+    flex-direction: column;
+}
+
+.orch-fanout-title {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.orch-fanout-meta {
+    color: var(--text-tertiary);
+    font-size: 0.769rem;
+}
+
+.orch-workers {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding-left: 26px;
+}
+
+.orch-worker {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 2px 12px 2px 0;
+    line-height: 1.35;
+}
+
+.orch-worker-label {
+    color: var(--text-primary);
+    flex-shrink: 0;
+}
+
+.orch-note-text {
+    color: var(--text-secondary);
+    font-style: italic;
+}
+
 .task-item-row.status-completed .task-item-icon {
     color: var(--success);
 }
