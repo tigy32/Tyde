@@ -74,6 +74,33 @@ pub fn ConnectionBanner() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
+                    // Sticky, terminal update-required state: the host speaks a
+                    // protocol this build cannot. No dismiss — clearing it would
+                    // just leave a blank skeleton behind an unusable connection.
+                    // The web/PWA loader self-heals by rebooting into the host's
+                    // published bundle; native shells surface this until the app
+                    // is updated.
+                    ConnectionStatus::UpdateRequired { host_protocol, app_protocol, release_version } => {
+                        let message = crate::state::update_required_message(
+                            host_protocol,
+                            app_protocol,
+                            release_version.as_ref(),
+                        );
+                        view! {
+                            <div
+                                class="connection-banner-inner error"
+                                role="alert"
+                                data-mobile-test="connection-banner-update-required"
+                            >
+                                <StatusDot
+                                    label="Update required".to_string()
+                                    tone=StatusTone::Error
+                                    data_mobile_test="connection-banner-dot-update-required"
+                                />
+                                <span class="status-text">{message}</span>
+                            </div>
+                        }.into_any()
+                    }
                 }
             }}
             {move || {
@@ -234,6 +261,55 @@ mod wasm_tests {
                 .unwrap_or_default()
                 .contains("host unreachable"),
             "connection error text should disappear after dismissal"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn update_required_renders_actionable_message_without_dismiss() {
+        let host = LocalHostId("host-update-required".to_owned());
+        let host_for_mount = host.clone();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.connection_statuses.update(|statuses| {
+                statuses.insert(
+                    host_for_mount.clone(),
+                    ConnectionStatus::UpdateRequired {
+                        host_protocol: 31,
+                        app_protocol: 30,
+                        release_version: Some(
+                            protocol::TydeReleaseVersion::parse("0.8.19-beta.15").unwrap(),
+                        ),
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <ConnectionBanner /> }
+        });
+        next_tick().await;
+
+        let alert = container
+            .query_selector("[data-mobile-test='connection-banner-update-required']")
+            .unwrap()
+            .expect("update-required alert must render");
+        let alert_text = alert.text_content().unwrap_or_default();
+        assert!(
+            alert_text.contains("0.8.19-beta.15"),
+            "the reject's host build must be named to the user: {alert_text}"
+        );
+        assert!(
+            alert_text.contains("protocol 31") && alert_text.contains("app protocol 30"),
+            "the actionable protocol mismatch must be shown to the user: {alert_text}"
+        );
+        // Terminal/sticky: no dismiss button — clearing it would only reveal a
+        // blank skeleton behind an unusable connection.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='connection-error-dismiss']")
+                .unwrap()
+                .is_none(),
+            "update-required is sticky and must not offer a dismiss control"
         );
     }
 

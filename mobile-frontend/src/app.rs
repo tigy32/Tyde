@@ -201,10 +201,7 @@ fn install_event_listeners(state: AppState) {
             "host-error",
             bridge::listen_host_error(move |event| {
                 log::error!("host error on {}: {}", event.host_id, event.message);
-                let host = LocalHostId(event.host_id);
-                state_error.connection_statuses.update(|map| {
-                    map.insert(host, ConnectionStatus::Error(event.message));
-                });
+                apply_host_error(&state_error, LocalHostId(event.host_id), event.message);
             })
             .await,
         );
@@ -502,6 +499,20 @@ fn apply_connection_status(
     status: PairedHostConnectionStatus,
     connection_instance_id: Option<u64>,
 ) {
+    // A sticky app-level `UpdateRequired` outranks any transport status. The
+    // host genuinely speaks a protocol this build cannot, and that stays true
+    // across transport reconnect churn (Connecting/Connected/Disconnected/
+    // Failed), so none of those may overwrite it — nor re-run the Connected
+    // branch below, which would allocate a fresh stream and re-send `Hello`
+    // only to be rejected again. Only a successful `Welcome` (a compatible
+    // reconnect, handled in `dispatch`) or forgetting the host clears it.
+    if matches!(
+        state.connection_statuses.get_untracked().get(&host),
+        Some(ConnectionStatus::UpdateRequired { .. })
+    ) {
+        return;
+    }
+
     let connection: ConnectionStatus = status.clone().into();
     state.connection_statuses.update(|m| {
         m.insert(host.clone(), connection.clone());
@@ -612,6 +623,23 @@ fn apply_connection_status(
             // re-establishes.
         }
     }
+}
+
+/// Records a transport-level host error unless a sticky app-level
+/// `UpdateRequired` is already in effect. Overwriting `UpdateRequired` with a
+/// transient `Error` would let the next transport `Connected` re-send `Hello`
+/// and reopen the incompatible-protocol reject loop the sticky state exists to
+/// stop, so the terminal handshake verdict outranks a transport error.
+fn apply_host_error(state: &AppState, host: LocalHostId, message: String) {
+    state.connection_statuses.update(|map| {
+        if matches!(
+            map.get(&host),
+            Some(ConnectionStatus::UpdateRequired { .. })
+        ) {
+            return;
+        }
+        map.insert(host, ConnectionStatus::Error(message));
+    });
 }
 
 fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String>) {
@@ -893,6 +921,211 @@ mod wasm_tests {
             .expect("reattached connected host should have a stream");
 
         assert_ne!(second_stream, first_stream);
+    }
+
+    /// An `IncompatibleProtocol` reject makes the status a sticky
+    /// `UpdateRequired` that transport reconnect churn cannot overwrite:
+    /// neither `Connecting` nor `Connected` may replace it or re-run the
+    /// Connected branch (which would allocate a host stream and re-send Hello,
+    /// only to be rejected again — the "spinning forever" bug).
+    #[wasm_bindgen_test]
+    fn update_required_status_is_sticky_over_transport_reconnect() {
+        install_tauri_invoke_stub();
+        let state = AppState::new();
+        let host = LocalHostId("host-update-required".to_owned());
+        let update_required = ConnectionStatus::UpdateRequired {
+            host_protocol: 31,
+            app_protocol: 30,
+            release_version: None,
+        };
+
+        // Simulate the outcome of dispatching a Reject { IncompatibleProtocol }.
+        state.connection_statuses.update(|m| {
+            m.insert(host.clone(), update_required.clone());
+        });
+
+        // Transport keeps reconnecting underneath the app-level rejection.
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connecting,
+            None,
+        );
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(9),
+        );
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Disconnected {
+                reason: "socket dropped".to_owned(),
+            },
+            None,
+        );
+
+        assert_eq!(
+            state.connection_statuses.get_untracked().get(&host),
+            Some(&update_required),
+            "transport reconnect statuses must not overwrite a sticky UpdateRequired",
+        );
+        assert!(
+            state.host_stream_untracked(&host).is_none(),
+            "the Connected branch must not run under UpdateRequired: no stream, no re-Hello",
+        );
+        assert!(
+            state
+                .active_connection_instance_ids
+                .get_untracked()
+                .get(&host)
+                .is_none(),
+            "no connection instance should be tracked while an update is required",
+        );
+        // `host_snapshot_pending` must be false so Home renders the actionable
+        // error instead of an indefinite loading skeleton.
+        state.active_local_host_id.set(Some(host.clone()));
+        assert!(
+            !state.host_snapshot_pending(),
+            "an update-required host must not read as a pending snapshot (no spinner)",
+        );
+    }
+
+    /// A transport-level host error must NOT overwrite a sticky
+    /// `UpdateRequired`: doing so would let the next transport `Connected`
+    /// re-send Hello and reopen the reject loop.
+    #[wasm_bindgen_test]
+    fn host_error_does_not_overwrite_update_required() {
+        let state = AppState::new();
+        let host = LocalHostId("host-error-vs-update".to_owned());
+        let update_required = ConnectionStatus::UpdateRequired {
+            host_protocol: 31,
+            app_protocol: 30,
+            release_version: None,
+        };
+        state.connection_statuses.update(|m| {
+            m.insert(host.clone(), update_required.clone());
+        });
+
+        apply_host_error(&state, host.clone(), "MQTT connection dropped".to_owned());
+
+        assert_eq!(
+            state.connection_statuses.get_untracked().get(&host),
+            Some(&update_required),
+            "a host error must not clobber the sticky UpdateRequired",
+        );
+
+        // A plain host on the same path is still recorded as an Error.
+        let other = LocalHostId("host-plain-error".to_owned());
+        apply_host_error(&state, other.clone(), "socket closed".to_owned());
+        assert!(matches!(
+            state.connection_statuses.get_untracked().get(&other),
+            Some(ConnectionStatus::Error(msg)) if msg == "socket closed"
+        ));
+    }
+
+    /// The real flow: `Connected` allocates a host stream / instance id / sends
+    /// Hello, then the host answers with `Reject(IncompatibleProtocol)`.
+    /// Dispatching the reject through the actual frame path must (a) make the
+    /// status a sticky `UpdateRequired` carrying the host build, (b) tear down
+    /// the runtime connection state (stream + instance id), and (c) survive the
+    /// transport reconnect churn without re-allocating a stream — the loop is
+    /// broken end-to-end, not just on a synthetic status insert.
+    #[wasm_bindgen_test]
+    fn connected_then_incompatible_reject_clears_runtime_and_is_sticky() {
+        install_tauri_invoke_stub();
+        let state = AppState::new();
+        let host = LocalHostId("host-connected-reject".to_owned());
+
+        // 1. Transport connects: stream + instance id allocated, Hello sent.
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(9),
+        );
+        let stream = state
+            .host_stream_untracked(&host)
+            .expect("Connected must allocate a host stream");
+        assert_eq!(
+            state
+                .active_connection_instance_ids
+                .get_untracked()
+                .get(&host)
+                .copied(),
+            Some(9),
+        );
+
+        // 2. Host answers Hello with an incompatible-protocol reject, on the
+        //    same host stream, at seq 0 — dispatched through the real line path.
+        let reject = protocol::RejectPayload {
+            code: protocol::RejectCode::IncompatibleProtocol,
+            message: "protocol 30 is no longer supported".to_owned(),
+            server_protocol_version: protocol::PROTOCOL_VERSION + 1,
+            server_tyde_version: protocol::TYDE_VERSION,
+            release_version: Some(protocol::TydeReleaseVersion::parse("0.8.19-beta.15").unwrap()),
+        };
+        let envelope =
+            protocol::Envelope::from_payload(stream, protocol::FrameKind::Reject, 0, &reject)
+                .expect("build reject envelope");
+        handle_host_line_event(
+            &state,
+            bridge::HostLineEvent {
+                host_id: host.0.clone(),
+                line: serde_json::to_string(&envelope).expect("serialize reject"),
+                connection_instance_id: None,
+                delivery_id: None,
+            },
+        );
+
+        // 3a. Sticky UpdateRequired carrying the reject's protocol + build.
+        assert_eq!(
+            state.connection_statuses.get_untracked().get(&host),
+            Some(&ConnectionStatus::UpdateRequired {
+                host_protocol: protocol::PROTOCOL_VERSION + 1,
+                app_protocol: protocol::PROTOCOL_VERSION,
+                release_version: Some(
+                    protocol::TydeReleaseVersion::parse("0.8.19-beta.15").unwrap()
+                ),
+            }),
+        );
+        // 3b. Runtime connection state torn down.
+        assert!(
+            state.host_stream_untracked(&host).is_none(),
+            "the reject must clear the stale host stream",
+        );
+        assert!(
+            state
+                .active_connection_instance_ids
+                .get_untracked()
+                .get(&host)
+                .is_none(),
+            "the reject must clear the stale connection-instance id",
+        );
+
+        // 4. Transport keeps reconnecting: no new stream, no re-Hello, status
+        //    unchanged — the spinning-forever loop stays broken.
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connecting,
+            None,
+        );
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(10),
+        );
+        assert!(
+            state.host_stream_untracked(&host).is_none(),
+            "a post-reject Connected must not re-allocate a stream or re-send Hello",
+        );
+        assert!(matches!(
+            state.connection_statuses.get_untracked().get(&host),
+            Some(ConnectionStatus::UpdateRequired { .. })
+        ));
     }
 
     // ── New instance-id lifecycle tests ────────────────────────────────

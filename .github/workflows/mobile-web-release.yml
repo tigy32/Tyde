@@ -1,6 +1,8 @@
 name: Mobile Web Release Deploy
 
 on:
+  # Tag pushes deploy mobile web through release.yml after release builds finish.
+  # Do not add a tag push trigger here; it can race the unversioned loader shell.
   release:
     types: [published]
   workflow_dispatch:

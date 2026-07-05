@@ -138,6 +138,18 @@ pub fn take_pending_pairing_uri() -> Option<String> {
     }
 }
 
+/// Web-only: ask the PWA loader to reboot into the host's exact published
+/// bundle (identified by `release_version`) after an incompatible-protocol
+/// reject, so an already-paired host self-heals without a re-scan. Native
+/// shells have no loader to reboot, so this is a no-op there and the sticky
+/// `UpdateRequired` error is the surface. Synchronous: it just dispatches the
+/// DOM `tyde:repair-version` CustomEvent the loader listens for.
+pub fn request_loader_repair_version(release_version: &str) {
+    if use_web_backend() {
+        web::request_loader_repair_version(release_version);
+    }
+}
+
 pub async fn frontend_attached(
     known_connection_instance_ids: &[KnownConnectionInstance],
 ) -> Result<(), String> {

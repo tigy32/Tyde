@@ -36,6 +36,16 @@ export const PAIR_URI_KEY = "tyde.pair.uri";
 // version-matched bundle. sessionStorage (not the URL) keeps the PSK-bearing URI
 // out of history/referrer, same as PAIR_URI_KEY.
 export const REPAIR_URI_KEY = "tyde.repair.uri";
+// Reconnect self-heal handoff: a booted bundle whose COMPILED protocol no longer
+// matches an already-paired host (the host was upgraded under it) gets an
+// app-level protocol-incompatible reject carrying the host's release version.
+// The bundle dispatches `tyde:repair-version` with that version; the loader
+// stashes it here and reloads so the fresh `init()` boots the version-matched
+// bundle. Unlike REPAIR_URI_KEY this needs no pairing URI — the paired host is
+// already in IndexedDB, so the rebooted bundle restores and reconnects to it.
+// Shares the REPAIR_ATTEMPTS_KEY loop guard so a misconfigured release cannot
+// wedge the PWA in an infinite reload.
+export const REPAIR_VERSION_KEY = "tyde.repair.version";
 // Session-scoped counter of self-heal reboots already processed, so a corrupt
 // manifest that stamps a matching protocol but serves a bundle whose COMPILED
 // protocol differs (the booted bundle re-dispatches `tyde:repair-needed`
@@ -543,6 +553,22 @@ export function takeRepairUri() {
   }
 }
 
+// Reads and CLEARS the reconnect self-heal repair version a stale bundle stashed
+// before it asked the loader to reload (see REPAIR_VERSION_KEY / onRepairVersion).
+// Returns the raw version string or null. Always clears so a stale version cannot
+// replay across a later clean load.
+export function takeRepairVersion() {
+  try {
+    const version = sessionStorage.getItem(REPAIR_VERSION_KEY);
+    if (version !== null && version !== undefined) {
+      sessionStorage.removeItem(REPAIR_VERSION_KEY);
+    }
+    return version && version.length > 0 ? version : null;
+  } catch {
+    return null;
+  }
+}
+
 // Increments and returns the session-scoped self-heal reboot counter. `init()`
 // calls this once per repair reboot it processes and breaks the loop when the
 // count exceeds MAX_REPAIR_ATTEMPTS. If sessionStorage is unavailable the repair
@@ -596,6 +622,42 @@ export function onRepairNeeded(detail, reload) {
     // No sessionStorage (private mode): can't hand off across reload, so fall
     // back to the pair screen for a manual re-scan rather than silently nothing.
     show("pair");
+    return false;
+  }
+  const doReload =
+    typeof reload === "function"
+      ? reload
+      : typeof window !== "undefined" &&
+          window.location &&
+          typeof window.location.reload === "function"
+        ? () => window.location.reload()
+        : null;
+  if (doReload) doReload();
+  return true;
+}
+
+// Handles a `tyde:repair-version` event. A booted bundle dispatches it when an
+// ALREADY-PAIRED host it reconnected to answered the Tyde handshake with a
+// protocol-incompatible reject carrying the host's release version (see
+// mobile-frontend `request_loader_repair_version`). Stash the version, forget
+// the stale remembered bundle, and reload so the fresh loader boots the
+// version-matched bundle for the still-stored paired host — no re-scan. Without
+// a usable version: just forget so the next clean load picks a fresh target.
+// Returns true when it routed to a repair-reload. The version is only VALIDATED
+// (against the manifest) on the reload side, so a bad value fails closed with an
+// explicit error rather than silently falling back. Exported for unit testing;
+// `reload` is injectable so tests don't navigate.
+export function onRepairVersion(detail, reload) {
+  forgetVersion();
+  const version = typeof detail === "string" && detail.length > 0 ? detail : null;
+  if (!version) {
+    return false;
+  }
+  try {
+    sessionStorage.setItem(REPAIR_VERSION_KEY, version);
+  } catch {
+    // No sessionStorage (private mode): can't hand off across a reload, so leave
+    // the booted bundle's sticky "update required" error as the surface.
     return false;
   }
   const doReload =
@@ -1001,6 +1063,18 @@ async function init() {
     onRepairNeeded(detail);
   });
 
+  // Reconnect self-heal: the booted bundle reconnected to an already-paired host
+  // whose upgraded build now rejects this bundle's protocol, and forwarded the
+  // host's release version (mobile-frontend `request_loader_repair_version`).
+  // Reboot into the version-matched bundle for the still-stored paired host —
+  // no re-scan. Bounded by the same REPAIR_ATTEMPTS_KEY loop guard as the URI
+  // path (handled in the repair block below).
+  window.addEventListener("tyde:repair-version", (event) => {
+    const detail =
+      event && typeof event.detail === "string" ? event.detail : null;
+    onRepairVersion(detail);
+  });
+
   // Capture + IMMEDIATELY clear any URL fragment BEFORE the first await or early
   // return below, so the PSK-bearing `tyde-pair://…` fragment can never leak
   // into a later navigation/referrer regardless of which path init() takes
@@ -1041,7 +1115,11 @@ async function init() {
   // re-dispatches repair every reload. Cap the reboots: after MAX_REPAIR_ATTEMPTS
   // clear repair state and show an explicit error instead of reloading again.
   const repairUri = takeRepairUri();
-  if (repairUri) {
+  // A version-only repair (reconnect self-heal) is mutually exclusive with a
+  // URI repair (in-app pairing self-heal); prefer the URI path when both were
+  // stashed and consume the version stash either way so it can't replay later.
+  const repairVersion = takeRepairVersion();
+  if (repairUri || repairVersion) {
     const attempts = registerRepairAttempt();
     if (attempts > MAX_REPAIR_ATTEMPTS) {
       clearRepairAttempts();
@@ -1051,7 +1129,24 @@ async function init() {
       );
       return;
     }
-    await handlePairingUri(repairUri, manifest);
+    if (repairUri) {
+      await handlePairingUri(repairUri, manifest);
+      return;
+    }
+    // Version-only self-heal: the paired host is already stored, so resolve its
+    // published bundle by release version and boot it directly. Strict and
+    // fail-closed — a blocked/unpublished/malformed version surfaces an explicit
+    // error, never a silent fallback to the latest bundle. If the manifest is
+    // drifted (stamps a matching protocol but serves a mismatched bundle) the
+    // rebooted bundle re-rejects and re-dispatches, and the loop guard above
+    // stops it after MAX_REPAIR_ATTEMPTS.
+    const resolved = resolveBootTarget(repairVersion, manifest);
+    if (!resolved.ok) {
+      setError(reasonToMessage(resolved.reason), `version ${repairVersion}`);
+      return;
+    }
+    rememberVersion(resolved.version);
+    await bootTarget(resolved);
     return;
   }
   // Clean (non-repair) entry: reset the loop guard so a later genuine drift can

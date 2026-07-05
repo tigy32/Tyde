@@ -56,6 +56,9 @@ const {
   registerRepairAttempt,
   clearRepairAttempts,
   onRepairNeeded,
+  onRepairVersion,
+  takeRepairVersion,
+  REPAIR_VERSION_KEY,
   resolvePairingFragment,
 } = await import("../loader.js");
 const { REAL_WITH_PRERELEASE, EXAMPLE_MANIFEST, makePairingUri } = await import(
@@ -181,6 +184,45 @@ test("onRepairNeeded without a URI forgets the version and does not reload", () 
   assert.equal(localStore[STORAGE_KEY], undefined, "version still forgotten");
   assert.equal(sessionStore[REPAIR_URI_KEY], undefined, "nothing stashed");
   assert.equal(reloads, 0, "no reload without a carried URI");
+});
+
+// --- reconnect self-heal: takeRepairVersion + onRepairVersion --------------
+
+test("takeRepairVersion reads and clears the stashed repair version", () => {
+  sessionStore[REPAIR_VERSION_KEY] = "0.8.19-beta.2";
+  assert.equal(takeRepairVersion(), "0.8.19-beta.2");
+  assert.equal(sessionStore[REPAIR_VERSION_KEY], undefined, "cleared after read");
+  assert.equal(takeRepairVersion(), null, "second read is empty");
+});
+
+test("onRepairVersion with a version forgets the stale bundle, stashes it, and reloads", () => {
+  delete sessionStore[REPAIR_VERSION_KEY];
+  localStore[STORAGE_KEY] = "0.8.19-beta.8"; // stale remembered version
+  let reloads = 0;
+  const routed = onRepairVersion("0.8.19-beta.2", () => {
+    reloads += 1;
+  });
+  assert.equal(routed, true);
+  assert.equal(localStore[STORAGE_KEY], undefined, "stale remembered version forgotten");
+  assert.equal(
+    sessionStore[REPAIR_VERSION_KEY],
+    "0.8.19-beta.2",
+    "version stashed for the fresh loader",
+  );
+  assert.equal(reloads, 1, "reloaded to tear down the stale WASM");
+});
+
+test("onRepairVersion without a version forgets the bundle and does not reload", () => {
+  delete sessionStore[REPAIR_VERSION_KEY];
+  localStore[STORAGE_KEY] = "0.8.19-beta.8";
+  let reloads = 0;
+  const routed = onRepairVersion(null, () => {
+    reloads += 1;
+  });
+  assert.equal(routed, false);
+  assert.equal(localStore[STORAGE_KEY], undefined, "version still forgotten");
+  assert.equal(sessionStore[REPAIR_VERSION_KEY], undefined, "nothing stashed");
+  assert.equal(reloads, 0, "no reload without a carried version");
 });
 
 // --- reload-loop breaker (Claude review #1) ---------------------------------

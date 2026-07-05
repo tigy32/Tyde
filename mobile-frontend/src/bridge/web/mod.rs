@@ -300,6 +300,33 @@ fn request_loader_repair(qr_uri: &str) {
 #[cfg(not(target_arch = "wasm32"))]
 fn request_loader_repair(_qr_uri: &str) {}
 
+/// Dispatch the PWA loader's `tyde:repair-version` event carrying the host's
+/// validated release version so the loader forgets the stale remembered bundle
+/// and reboots into the version-matched one (see `web/loader/loader.js`
+/// `onRepairVersion`). Unlike [`request_loader_repair`], this carries no
+/// pairing URI — the reconnect path already has the paired host stored in
+/// IndexedDB, so the rebooted bundle restores it and reconnects without a
+/// re-scan. Best-effort: any failure (no window, CustomEvent unavailable)
+/// leaves the sticky `UpdateRequired` error as the visible surface.
+///
+/// wasm-only for the same reason as [`request_loader_repair`]: `web_sys::window`
+/// is a wasm-bindgen import, and the native build (unit tests) gets a no-op.
+#[cfg(target_arch = "wasm32")]
+pub fn request_loader_repair_version(release_version: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let init = web_sys::CustomEventInit::new();
+    init.set_detail(&wasm_bindgen::JsValue::from_str(release_version));
+    if let Ok(event) = web_sys::CustomEvent::new_with_event_init_dict("tyde:repair-version", &init)
+    {
+        let _ = window.dispatch_event(&event);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn request_loader_repair_version(_release_version: &str) {}
+
 fn normalize_host_label(host_label: String) -> Result<String, String> {
     let trimmed = host_label.trim().to_owned();
     if trimmed.is_empty() {
@@ -481,5 +508,40 @@ mod wasm_tests {
             .expect("remove listener");
 
         assert!(!*fired.borrow(), "no repair on a matching protocol");
+    }
+
+    /// The reconnect self-heal dispatches `tyde:repair-version` carrying the
+    /// host's release version so the loader can reboot an already-paired host
+    /// into the version-matched bundle without a re-scan.
+    #[wasm_bindgen_test]
+    fn request_loader_repair_version_dispatches_event_with_version() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use wasm_bindgen::JsCast;
+        use wasm_bindgen::closure::Closure;
+
+        let window = web_sys::window().expect("window");
+        let captured: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let captured_cb = captured.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+            if let Ok(custom) = event.dyn_into::<web_sys::CustomEvent>() {
+                *captured_cb.borrow_mut() = custom.detail().as_string();
+            }
+        });
+        window
+            .add_event_listener_with_callback("tyde:repair-version", cb.as_ref().unchecked_ref())
+            .expect("add listener");
+
+        request_loader_repair_version("0.8.19-beta.15");
+
+        window
+            .remove_event_listener_with_callback("tyde:repair-version", cb.as_ref().unchecked_ref())
+            .expect("remove listener");
+
+        assert_eq!(
+            captured.borrow().as_deref(),
+            Some("0.8.19-beta.15"),
+            "repair-version must carry the release version for the loader to reboot",
+        );
     }
 }

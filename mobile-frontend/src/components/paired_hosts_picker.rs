@@ -173,6 +173,18 @@ fn ConnectionPill(state: AppState, local_host_id: LocalHostId) -> impl IntoView 
             ConnectionStatus::Connecting => ("connecting", "Connecting…".to_string()),
             ConnectionStatus::Disconnected => ("disconnected", "Offline".to_string()),
             ConnectionStatus::Error(msg) => ("error", format!("Error: {msg}")),
+            ConnectionStatus::UpdateRequired {
+                host_protocol,
+                app_protocol,
+                release_version,
+            } => (
+                "error",
+                crate::state::update_required_message(
+                    host_protocol,
+                    app_protocol,
+                    release_version.as_ref(),
+                ),
+            ),
         }
     };
     view! {
@@ -193,17 +205,25 @@ fn ConnectDisconnectButton(
 ) -> impl IntoView {
     let id_status_lookup = local_host_id_for_connect.clone();
     let state_for_status = state.clone();
+    let status = move || {
+        state_for_status
+            .connection_statuses
+            .get()
+            .get(&id_status_lookup)
+            .cloned()
+            .unwrap_or(ConnectionStatus::Disconnected)
+    };
+    let status_for_connected = status.clone();
     let is_connected = move || {
         matches!(
-            state_for_status
-                .connection_statuses
-                .get()
-                .get(&id_status_lookup)
-                .cloned()
-                .unwrap_or(ConnectionStatus::Disconnected),
+            status_for_connected(),
             ConnectionStatus::Connected | ConnectionStatus::Connecting
         )
     };
+    // A sticky incompatible-protocol reject can't be recovered by reconnecting
+    // (the app-level handshake would just be rejected again), so the picker must
+    // not offer a no-op Connect affordance for it.
+    let needs_update = move || matches!(status(), ConnectionStatus::UpdateRequired { .. });
 
     // Phase C MEDIUM: do NOT optimistically write Connecting/Error into
     // `connection_statuses` — that signal is owned by the
@@ -247,7 +267,17 @@ fn ConnectDisconnectButton(
     let _ = pending_invoke;
 
     view! {
-        {move || if is_connected() {
+        {move || if needs_update() {
+            view! {
+                <Button
+                    label="Update required"
+                    variant=ButtonVariant::Secondary
+                    full_width=true
+                    disabled=true
+                    data_mobile_test="paired-host-update-required"
+                />
+            }.into_any()
+        } else if is_connected() {
             view! {
                 <Button
                     label="Disconnect"
@@ -353,6 +383,57 @@ mod wasm_tests {
         next_tick().await;
         let text = container.text_content().unwrap_or_default();
         assert!(text.contains("Online"), "expected Online pill, got: {text}");
+    }
+
+    /// A host stuck in `UpdateRequired` must not offer a no-op Connect button;
+    /// the picker shows a disabled "Update required" affordance instead.
+    #[wasm_bindgen_test]
+    async fn update_required_host_shows_disabled_update_button_not_connect() {
+        let container = make_container();
+        let host = LocalHostId("h-update".to_owned());
+        let host_for_mount = host.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state
+                .paired_hosts
+                .set(vec![fixture_host("h-update", "Studio")]);
+            state.connection_statuses.update(|m| {
+                m.insert(
+                    host_for_mount.clone(),
+                    ConnectionStatus::UpdateRequired {
+                        host_protocol: 31,
+                        app_protocol: 30,
+                        release_version: Some(
+                            protocol::TydeReleaseVersion::parse("0.8.19-beta.15").unwrap(),
+                        ),
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <PairedHostsPicker /> }
+        });
+        next_tick().await;
+
+        let button: HtmlElement = container
+            .query_selector("[data-mobile-test='paired-host-update-required']")
+            .unwrap()
+            .expect("update-required host must render the disabled update affordance")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            button.has_attribute("disabled"),
+            "the update-required affordance must be disabled, not a live no-op",
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("Connect"),
+            "no Connect button may be offered while an update is required: {text}"
+        );
+        // The status pill still names the host build so the user knows why.
+        assert!(
+            text.contains("0.8.19-beta.15"),
+            "host build should surface: {text}"
+        );
     }
 
     #[wasm_bindgen_test]

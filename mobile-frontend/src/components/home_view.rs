@@ -91,6 +91,12 @@ pub fn HomeView() -> impl IntoView {
                 (StatusTone::Muted, "Offline", PillTone::Neutral, "Offline")
             }
             ConnectionStatus::Error(_) => (StatusTone::Error, "Error", PillTone::Error, "Error"),
+            ConnectionStatus::UpdateRequired { .. } => (
+                StatusTone::Error,
+                "Update required",
+                PillTone::Error,
+                "Update required",
+            ),
         });
 
     let s_new_chat = state.clone();
@@ -130,17 +136,14 @@ pub fn HomeView() -> impl IntoView {
     let s_has_host = state.clone();
     let has_active_host = move || s_has_host.active_local_host_id.get().is_some();
 
-    // Skeleton hint shown when the user has selected a host but the
-    // server's first `HostSettings` echo hasn't landed yet — keeps
-    // the dashboard from popping into existence.
+    // Skeleton hint shown while the host is connecting/connected but its
+    // bootstrap snapshot hasn't landed yet — keeps the dashboard from popping
+    // into existence. `host_snapshot_pending` returns false once the snapshot
+    // arrives AND on a terminal connection state (error, disconnected, or a
+    // sticky `UpdateRequired` protocol reject), so the skeleton never outlives
+    // a connection that will never deliver data.
     let s_loading = state.clone();
-    let initial_loading = move || {
-        let active = s_loading.active_local_host_id.get();
-        let Some(active) = active else { return false };
-        s_loading
-            .host_settings_by_host
-            .with(|m| !m.contains_key(&active))
-    };
+    let initial_loading = move || s_loading.host_snapshot_pending();
 
     view! {
         <SafeArea inset_top=true inset_bottom=false data_mobile_test="home-safe-area">
@@ -462,6 +465,51 @@ mod wasm_tests {
         assert!(
             text.to_lowercase().contains("pair"),
             "empty-state copy must guide the user to pair a host: {text}"
+        );
+    }
+
+    /// A sticky `UpdateRequired` protocol reject must NOT leave the dashboard
+    /// stuck on the loading skeleton (the "spinning forever" bug). Instead the
+    /// connection surfaces render an actionable "Update required" label.
+    #[wasm_bindgen_test]
+    async fn home_view_update_required_shows_actionable_state_not_skeleton() {
+        let host = LocalHostId("host-update".to_owned());
+        let container = make_container();
+        let host_for_mount = host.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            // No HostSettings ever arrives on a rejected handshake; before the
+            // fix this alone forced the skeleton forever.
+            state.connection_statuses.update(|m| {
+                m.insert(
+                    host_for_mount.clone(),
+                    ConnectionStatus::UpdateRequired {
+                        host_protocol: 31,
+                        app_protocol: 30,
+                        release_version: None,
+                    },
+                );
+            });
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            provide_context(state);
+            view! { <HomeView /> }
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='home-loading']")
+                .unwrap()
+                .is_none(),
+            "update-required host must not render the indefinite loading skeleton"
+        );
+        let pill = container
+            .query_selector("[data-mobile-test='home-connection-pill']")
+            .unwrap()
+            .expect("connection pill must render");
+        assert_eq!(
+            pill.text_content().unwrap_or_default().trim(),
+            "Update required"
         );
     }
 

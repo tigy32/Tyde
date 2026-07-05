@@ -16,7 +16,7 @@ use protocol::{
     SessionSettingsValues, SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath,
     TaskList, Team, TeamCompactNotifyPayload, TeamDraft, TeamDraftId, TeamMember,
     TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion, TeamPresetCatalog,
-    ToolExecutionCompletedData, ToolRequest,
+    ToolExecutionCompletedData, ToolRequest, TydeReleaseVersion,
 };
 
 // ── Tool output viewing mode ───────────────────────────────────────────
@@ -36,6 +36,42 @@ pub enum ConnectionStatus {
     Connecting,
     Connected,
     Error(String),
+    /// The MQTT transport connected, but the Tyde application handshake was
+    /// rejected because the host speaks a protocol version this build cannot.
+    /// This is a higher-order truth than transport connectivity: it stays true
+    /// across transport reconnects, so it is **sticky** — automatic reconnect
+    /// statuses (`Connecting`/`Connected`/`Disconnected`/`Failed`) must not
+    /// overwrite it (see `app::apply_connection_status`). Only a successful
+    /// `Welcome` (a genuinely compatible reconnect) or forgetting the host
+    /// clears it. Carries the typed protocol numbers so the UI can render an
+    /// actionable "update required" message instead of an indefinite spinner.
+    /// `release_version` is the host's exact published build from the reject
+    /// (`RejectPayload::release_version`) when the host sent one, so the message
+    /// can name the host build rather than only bare protocol integers.
+    UpdateRequired {
+        host_protocol: u32,
+        app_protocol: u32,
+        release_version: Option<TydeReleaseVersion>,
+    },
+}
+
+/// Actionable, user-facing message for an incompatible-protocol reject. Shared
+/// by every surface that renders [`ConnectionStatus::UpdateRequired`] so the
+/// wording stays consistent. Names the host build when the reject carried a
+/// `release_version`; otherwise falls back to the protocol integers alone.
+pub fn update_required_message(
+    host_protocol: u32,
+    app_protocol: u32,
+    release_version: Option<&TydeReleaseVersion>,
+) -> String {
+    match release_version {
+        Some(version) => format!(
+            "Update required — host build {version} (protocol {host_protocol}, app protocol {app_protocol})"
+        ),
+        None => {
+            format!("Update required — host protocol {host_protocol}, app protocol {app_protocol}")
+        }
+    }
 }
 
 impl From<PairedHostConnectionStatus> for ConnectionStatus {
@@ -1042,5 +1078,20 @@ mod tests {
             }),
             ConnectionStatus::Error(_)
         ));
+    }
+
+    #[test]
+    fn update_required_message_names_host_build_when_present() {
+        let version = TydeReleaseVersion::parse("0.8.19-beta.15").unwrap();
+        let with_build = update_required_message(31, 30, Some(&version));
+        assert!(with_build.contains("0.8.19-beta.15"), "{with_build}");
+        assert!(with_build.contains("protocol 31"), "{with_build}");
+        assert!(with_build.contains("app protocol 30"), "{with_build}");
+
+        let without = update_required_message(31, 30, None);
+        assert_eq!(
+            without,
+            "Update required — host protocol 31, app protocol 30"
+        );
     }
 }

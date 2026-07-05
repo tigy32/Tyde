@@ -16,8 +16,8 @@ use protocol::{
     McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
-    QueuedMessagesPayload, RejectPayload, ReviewBootstrapPayload, ReviewEventPayload, ReviewId,
-    SeqMismatch, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
+    QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload, ReviewEventPayload,
+    ReviewId, SeqMismatch, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
     SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
     TeamCompactNotifyPayload, TeamCompactStatus, TeamDraftNotifyPayload,
     TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
@@ -304,10 +304,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
         }
         FrameKind::Reject => {
             if let Ok(payload) = envelope.parse_payload::<RejectPayload>() {
-                log::error!("connection rejected on {host}: {}", payload.message);
-                state.connection_statuses.update(|map| {
-                    map.insert(host.clone(), ConnectionStatus::Error(payload.message));
-                });
+                apply_reject(state, host, payload);
                 clear_session_history_loading_for_host(state, host);
             }
         }
@@ -1842,6 +1839,63 @@ fn rebuild_chat_message_index(state: &AppState, agent_ref: &AgentRef) {
             indexes.remove(agent_ref);
         }
     });
+}
+
+// A `Reject` frame is the host's answer to our `Hello`: the app-level Tyde
+// handshake failed before any `Welcome`/`HostBootstrap` could arrive. An
+// `IncompatibleProtocol` reject is terminal for this build against this host,
+// so it becomes a sticky [`ConnectionStatus::UpdateRequired`] (which transport
+// reconnect statuses cannot overwrite — see `app::apply_connection_status`)
+// rather than a transient error the reconnect loop would immediately paper
+// over with `Connecting`/`Connected`. On the web/PWA we additionally ask the
+// loader to self-heal by rebooting into the host's exact published bundle,
+// keyed on the reject's `release_version`, so an already-paired host recovers
+// without a re-scan. Native shells have no loader to reboot, so the sticky
+// error is the surface until the app itself is updated.
+fn apply_reject(state: &AppState, host: &LocalHostId, payload: RejectPayload) {
+    log::error!(
+        "connection rejected on {host}: {} (code={:?}, host protocol {}, app protocol {})",
+        payload.message,
+        payload.code,
+        payload.server_protocol_version,
+        protocol::PROTOCOL_VERSION
+    );
+    match payload.code {
+        RejectCode::IncompatibleProtocol => {
+            state.connection_statuses.update(|map| {
+                map.insert(
+                    host.clone(),
+                    ConnectionStatus::UpdateRequired {
+                        host_protocol: payload.server_protocol_version,
+                        app_protocol: protocol::PROTOCOL_VERSION,
+                        release_version: payload.release_version.clone(),
+                    },
+                );
+            });
+            if let Some(release_version) = payload.release_version.as_ref() {
+                crate::bridge::request_loader_repair_version(release_version.as_str());
+            }
+            // The Connected transport event that preceded this reject already
+            // allocated a host stream, seq state, and a connection-instance id
+            // (Connected arrives before Hello is answered). Tear that runtime
+            // down so the sticky UpdateRequired leaves no dangling connection a
+            // later transport event could reuse, and so a self-heal reload or a
+            // post-update reconnect starts from a clean protocol session.
+            state.host_streams.update(|map| {
+                map.remove(host);
+            });
+            state.active_connection_instance_ids.update(|map| {
+                map.remove(host);
+            });
+            crate::send::reset_seq_for_host(host);
+            reset_inbound_seq_for_host(host);
+        }
+        RejectCode::InvalidHandshake => {
+            state.connection_statuses.update(|map| {
+                map.insert(host.clone(), ConnectionStatus::Error(payload.message));
+            });
+        }
+    }
 }
 
 // ── Bootstrap apply helpers ──────────────────────────────────────────────
