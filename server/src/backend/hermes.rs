@@ -6,9 +6,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
-    AgentInput, BackendConfigField, BackendConfigFieldType, BackendConfigSchema,
-    BackendConfigValues, BackendKind, BackendSetupDiagnosticCode, ChatEvent, ChatMessage,
-    MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData, SelectOption,
+    AgentInput, BackendConfigField, BackendConfigFieldType, BackendConfigPersistenceMode,
+    BackendConfigSchema, BackendConfigValues, BackendKind, BackendSetupDiagnosticCode, ChatEvent,
+    ChatMessage, MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData, SelectOption,
     SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
     SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
     StreamStartData, StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData,
@@ -184,6 +184,7 @@ fn hermes_cost_hint_defaults(_cost_hint: protocol::SpawnCostHint) -> SessionSett
 fn hermes_backend_config_schema() -> BackendConfigSchema {
     BackendConfigSchema {
         backend_kind: BackendKind::Hermes,
+        persistence_mode: BackendConfigPersistenceMode::TydeSettingsStore,
         fields: vec![
             BackendConfigField {
                 key: "default_model".to_string(),
@@ -3393,6 +3394,10 @@ for line in sys.stdin:
     fn hermes_backend_config_schema_exposes_model_provider_base_url() {
         let schema = hermes_backend_config_schema();
         assert_eq!(schema.backend_kind, BackendKind::Hermes);
+        assert_eq!(
+            schema.persistence_mode,
+            BackendConfigPersistenceMode::TydeSettingsStore
+        );
         let keys: Vec<&str> = schema.fields.iter().map(|f| f.key.as_str()).collect();
         assert_eq!(
             keys,

@@ -336,12 +336,29 @@ pub(crate) fn backend_config_schema_for_backend(
     backend_kind: BackendKind,
 ) -> Option<BackendConfigSchema> {
     match backend_kind {
-        BackendKind::Hermes => hermes::HermesBackend::backend_config_schema(),
         BackendKind::Tycode => tycode::TycodeBackend::backend_config_schema(),
-        BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex | BackendKind::Antigravity => {
-            None
-        }
+        BackendKind::Kiro => kiro::KiroBackend::backend_config_schema(),
+        BackendKind::Claude => claude::ClaudeBackend::backend_config_schema(),
+        BackendKind::Codex => codex::CodexBackend::backend_config_schema(),
+        BackendKind::Antigravity => antigravity::AntigravityBackend::backend_config_schema(),
+        BackendKind::Hermes => hermes::HermesBackend::backend_config_schema(),
     }
+}
+
+/// Host/build-level backend config schemas. This is a catalog of configurable
+/// backends, not a projection of the current enabled-backend list.
+pub(crate) fn backend_config_schema_catalog() -> Vec<BackendConfigSchema> {
+    [
+        BackendKind::Tycode,
+        BackendKind::Kiro,
+        BackendKind::Claude,
+        BackendKind::Codex,
+        BackendKind::Antigravity,
+        BackendKind::Hermes,
+    ]
+    .into_iter()
+    .filter_map(backend_config_schema_for_backend)
+    .collect()
 }
 
 pub(crate) async fn backend_config_snapshot_for_backend(
@@ -721,12 +738,15 @@ fn session_setting_value_to_json(value: &SessionSettingValue) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use protocol::{BackendAccessMode, BackendConfigValues, BackendKind, SessionSettingValue};
+    use protocol::{
+        BackendAccessMode, BackendConfigPersistenceMode, BackendConfigValues, BackendKind,
+        SessionSettingValue,
+    };
 
     use super::{
-        READ_ONLY_ACCESS_MODE_INSTRUCTIONS, merge_backend_config_update,
-        render_combined_spawn_instructions, sanitize_backend_config_values,
-        validate_backend_config_values,
+        READ_ONLY_ACCESS_MODE_INSTRUCTIONS, backend_config_schema_catalog,
+        merge_backend_config_update, render_combined_spawn_instructions,
+        sanitize_backend_config_values, validate_backend_config_values,
     };
     use crate::agent::customization::ResolvedSpawnConfig;
 
@@ -760,6 +780,36 @@ mod tests {
         // A backend with no config schema sanitizes everything away.
         let sanitized = sanitize_backend_config_values(BackendKind::Claude, &good);
         assert!(sanitized.0.is_empty());
+    }
+
+    #[test]
+    fn backend_config_schema_catalog_includes_configurable_backends_only() {
+        let schemas = backend_config_schema_catalog();
+
+        let tycode = schemas
+            .iter()
+            .find(|schema| schema.backend_kind == BackendKind::Tycode)
+            .expect("Tycode config schema");
+        let hermes = schemas
+            .iter()
+            .find(|schema| schema.backend_kind == BackendKind::Hermes)
+            .expect("Hermes config schema");
+
+        assert_eq!(
+            schemas
+                .iter()
+                .map(|schema| schema.backend_kind)
+                .collect::<Vec<_>>(),
+            vec![BackendKind::Tycode, BackendKind::Hermes]
+        );
+        assert_eq!(
+            tycode.persistence_mode,
+            BackendConfigPersistenceMode::BackendNative
+        );
+        assert_eq!(
+            hermes.persistence_mode,
+            BackendConfigPersistenceMode::TydeSettingsStore
+        );
     }
 
     #[test]

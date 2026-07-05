@@ -5,6 +5,7 @@ import {
   decodeStoredPairedHostsState,
   resolveStartupTarget,
 } from "../loader.js";
+import { resolveBootTarget } from "../manifest-policy.js";
 
 const integrity = "sha384-" + "A".repeat(64);
 const wasmIntegrity = "sha384-" + "B".repeat(64);
@@ -27,6 +28,27 @@ const MANIFEST = {
   versions: {
     "0.8.19-beta.4": entry("0.8.19-beta.4"),
     "0.8.19-beta.8": entry("0.8.19-beta.8"),
+  },
+};
+
+const SELF_HEAL_MANIFEST = {
+  schemaVersion: 1,
+  minSupported: "0.8.19-beta.16",
+  blocked: [],
+  versions: {
+    "0.8.19-beta.15": entry("0.8.19-beta.15"),
+    "0.8.19-beta.16": entry("0.8.19-beta.16"),
+    "0.8.19-beta.17": entry("0.8.19-beta.17"),
+  },
+};
+
+const BETA16_LATEST_MANIFEST = {
+  schemaVersion: 1,
+  minSupported: "0.8.19-beta.16",
+  blocked: [],
+  versions: {
+    "0.8.19-beta.15": entry("0.8.19-beta.15"),
+    "0.8.19-beta.16": entry("0.8.19-beta.16"),
   },
 };
 
@@ -65,4 +87,38 @@ test("startup target boots latest when no remembered version exists", () => {
   assert.equal(target.ok, true);
   assert.equal(target.version, "0.8.19-beta.8");
   assert.equal(target.source, "latest");
+});
+
+test("startup target skips remembered beta15 below beta16 floor with paired hosts", () => {
+  const target = resolveStartupTarget(BETA16_LATEST_MANIFEST, "0.8.19-beta.15", true);
+  assert.equal(target.ok, true);
+  assert.equal(target.version, "0.8.19-beta.16");
+  assert.equal(target.source, "latest");
+});
+
+test("startup target keeps remembered beta16 when paired hosts exist", () => {
+  const target = resolveStartupTarget(SELF_HEAL_MANIFEST, "0.8.19-beta.16", true);
+  assert.equal(target.ok, true);
+  assert.equal(target.version, "0.8.19-beta.16");
+  assert.equal(target.source, "remembered");
+});
+
+test("startup target still prefers supported remembered versions over latest", () => {
+  const target = resolveStartupTarget(SELF_HEAL_MANIFEST, "0.8.19-beta.16", null);
+  assert.equal(target.ok, true);
+  assert.equal(target.version, "0.8.19-beta.16");
+  assert.equal(target.source, "remembered");
+});
+
+test("startup target uses latest beta17 when beta16 is remembered but no hosts are paired", () => {
+  const target = resolveStartupTarget(SELF_HEAL_MANIFEST, "0.8.19-beta.16", false);
+  assert.equal(target.ok, true);
+  assert.equal(target.version, "0.8.19-beta.17");
+  assert.equal(target.source, "latest");
+});
+
+test("version-only repair target below beta16 floor is rejected", () => {
+  const target = resolveBootTarget("0.8.19-beta.15", BETA16_LATEST_MANIFEST);
+  assert.equal(target.ok, false);
+  assert.equal(target.reason, "below-min-supported");
 });

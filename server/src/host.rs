@@ -676,8 +676,7 @@ impl HostHandle {
             .copied()
             .any(backend_has_dynamic_session_schema);
         let schemas = session_schemas_for_enabled_backends(&state, &settings.enabled_backends);
-        let backend_config_schemas =
-            backend_config_schemas_for_enabled_backends(&settings.enabled_backends);
+        let backend_config_schemas = crate::backend::backend_config_schema_catalog();
         let backend_config_snapshots = state.backend_config_snapshots.clone();
         let launch_profile_catalog = launch_profile_catalog_for_settings(&state, &settings);
 
@@ -12354,15 +12353,6 @@ async fn fan_out_session_schemas(state: &mut HostState) {
     }
 }
 
-fn backend_config_schemas_for_enabled_backends(
-    enabled_backends: &[protocol::BackendKind],
-) -> Vec<protocol::BackendConfigSchema> {
-    enabled_backends
-        .iter()
-        .filter_map(|kind| crate::backend::backend_config_schema_for_backend(*kind))
-        .collect()
-}
-
 async fn backend_config_snapshots_for_enabled_backends(
     enabled_backends: &[protocol::BackendKind],
 ) -> Vec<BackendConfigSnapshot> {
@@ -12387,16 +12377,7 @@ async fn backend_config_snapshots_for_enabled_backends(
 }
 
 async fn fan_out_backend_config_schemas(state: &mut HostState) {
-    let enabled_backends = state
-        .settings_store
-        .lock()
-        .await
-        .get()
-        .unwrap_or_else(|err| {
-            panic!("failed to load host settings for backend config schemas: {err}")
-        })
-        .enabled_backends;
-    let schemas = backend_config_schemas_for_enabled_backends(&enabled_backends);
+    let schemas = crate::backend::backend_config_schema_catalog();
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
 

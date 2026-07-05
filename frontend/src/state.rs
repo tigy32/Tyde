@@ -4517,6 +4517,7 @@ mod tests {
 
             let schema = |backend_kind: BackendKind| protocol::BackendConfigSchema {
                 backend_kind,
+                persistence_mode: protocol::BackendConfigPersistenceMode::TydeSettingsStore,
                 fields: Vec::new(),
             };
 

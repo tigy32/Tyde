@@ -57,7 +57,7 @@ test("generator stamps protocolVersion from Rust protocol source", () => {
       "--dist",
       dist,
       "--version",
-      "0.8.19-beta.9",
+      "0.8.19-beta.16",
       "--manifest",
       manifest,
       "--protocol-source",
@@ -68,14 +68,14 @@ test("generator stamps protocolVersion from Rust protocol source", () => {
 
   assert.equal(result.status, 0, result.stderr);
   const generated = JSON.parse(readFileSync(manifest, "utf8"));
-  assert.equal(generated.minSupported, "0.8.19-beta.8");
+  assert.equal(generated.minSupported, "0.8.19-beta.16");
   assert.ok(generated.versions["0.8.19-beta.8"], "preserves existing entries");
-  const entry = generated.versions["0.8.19-beta.9"];
+  const entry = generated.versions["0.8.19-beta.16"];
   assert.equal(entry.protocolVersion, 42);
-  assert.equal(entry.path, "/tyde/v0.8.19-beta.9/");
-  assert.equal(entry.entry, "/tyde/v0.8.19-beta.9/mobile-frontend-test.js");
+  assert.equal(entry.path, "/tyde/v0.8.19-beta.16/");
+  assert.equal(entry.entry, "/tyde/v0.8.19-beta.16/mobile-frontend-test.js");
   assert.ok(entry.integrity.startsWith("sha384-"));
-  assert.ok(entry.artifacts["/tyde/v0.8.19-beta.9/mobile-frontend-test_bg.wasm"]);
+  assert.ok(entry.artifacts["/tyde/v0.8.19-beta.16/mobile-frontend-test_bg.wasm"]);
 });
 
 test("generator raises minSupported past entries without protocolVersion", () => {
@@ -109,7 +109,7 @@ test("generator raises minSupported past entries without protocolVersion", () =>
       "--dist",
       dist,
       "--version",
-      "0.8.19-beta.9",
+      "0.8.19-beta.16",
       "--manifest",
       manifest,
       "--protocol-source",
@@ -120,7 +120,73 @@ test("generator raises minSupported past entries without protocolVersion", () =>
 
   assert.equal(result.status, 0, result.stderr);
   const generated = JSON.parse(readFileSync(manifest, "utf8"));
-  assert.equal(generated.minSupported, "0.8.19-beta.9");
+  assert.equal(generated.minSupported, "0.8.19-beta.16");
+});
+
+test("generator preserves minSupported above the self-heal floor", () => {
+  const root = tempDir();
+  const dist = writeDist(root);
+  const manifest = join(root, "manifest.json");
+  const protocolSource = join(root, "types.rs");
+  writeFileSync(protocolSource, "pub const PROTOCOL_VERSION: u32 = 42;\n");
+  writeFileSync(
+    manifest,
+    JSON.stringify({
+      schemaVersion: 1,
+      minSupported: "0.8.19-beta.17",
+      versions: {},
+    }),
+  );
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      SCRIPT,
+      "--dist",
+      dist,
+      "--version",
+      "0.8.19-beta.16",
+      "--manifest",
+      manifest,
+      "--protocol-source",
+      protocolSource,
+    ],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const generated = JSON.parse(readFileSync(manifest, "utf8"));
+  assert.equal(generated.minSupported, "0.8.19-beta.17");
+});
+
+test("generator raises explicit minSupported below the self-heal floor", () => {
+  const root = tempDir();
+  const dist = writeDist(root);
+  const manifest = join(root, "manifest.json");
+  const protocolSource = join(root, "types.rs");
+  writeFileSync(protocolSource, "pub const PROTOCOL_VERSION: u32 = 42;\n");
+
+  const result = spawnSync(
+    process.execPath,
+    [
+      SCRIPT,
+      "--dist",
+      dist,
+      "--version",
+      "0.8.19-beta.16",
+      "--manifest",
+      manifest,
+      "--protocol-source",
+      protocolSource,
+      "--min-supported",
+      "0.8.19-beta.15",
+    ],
+    { encoding: "utf8" },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const generated = JSON.parse(readFileSync(manifest, "utf8"));
+  assert.equal(generated.minSupported, "0.8.19-beta.16");
 });
 
 test("generator fails when protocol source lacks PROTOCOL_VERSION", () => {

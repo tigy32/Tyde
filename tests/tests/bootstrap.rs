@@ -2,13 +2,14 @@ use std::time::Duration;
 
 use client::ClientConfig;
 use protocol::{
-    BackendAccessMode, BackendKind, CommandErrorCode, CommandErrorPayload, FrameKind,
-    HostBootstrapPayload, HostBrowseInitial, HostBrowseStartPayload, HostLaunchProfileConfig,
-    HostSettingValue, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
-    LaunchProfileId, LaunchProfileKind, NewAgentPayload, ProjectBootstrapPayload, ProjectRootPath,
-    ReviewSummaryScope, SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingValue,
-    SessionSettingsValues, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload,
-    TerminalCreatePayload, TerminalLaunchTarget,
+    BackendAccessMode, BackendConfigPersistenceMode, BackendKind, CommandErrorCode,
+    CommandErrorPayload, FrameKind, HostBootstrapPayload, HostBrowseInitial,
+    HostBrowseStartPayload, HostLaunchProfileConfig, HostSettingValue, LaunchProfileCatalog,
+    LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId, LaunchProfileKind,
+    NewAgentPayload, ProjectBootstrapPayload, ProjectRootPath, ReviewSummaryScope, SessionId,
+    SessionListPayload, SessionSchemasPayload, SessionSettingValue, SessionSettingsValues,
+    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, TerminalCreatePayload,
+    TerminalLaunchTarget,
 };
 use server::backend::BackendSession;
 use server::store::project::ProjectStore;
@@ -204,6 +205,45 @@ async fn connection_emits_one_host_bootstrap_without_old_initial_spam() {
         "old initial replay spam",
     )
     .await;
+}
+
+#[tokio::test]
+async fn host_bootstrap_includes_backend_config_schema_catalog() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let settings_path = dir.path().join("settings.json");
+    write_enabled_backends_settings(&settings_path, &[BackendKind::Claude]);
+    let host = server::spawn_host_with_mock_backend(
+        dir.path().join("sessions.json"),
+        dir.path().join("projects.json"),
+        settings_path,
+    )
+    .expect("spawn host");
+    let mut client = connect_raw(host).await;
+
+    let env = next_env(&mut client, "host bootstrap").await;
+    assert_eq!(env.kind, FrameKind::HostBootstrap);
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("host bootstrap payload");
+    assert_eq!(
+        bootstrap.settings.enabled_backends,
+        vec![BackendKind::Claude]
+    );
+    assert_eq!(
+        bootstrap
+            .backend_config_schemas
+            .iter()
+            .map(|schema| schema.backend_kind)
+            .collect::<Vec<_>>(),
+        vec![BackendKind::Tycode, BackendKind::Hermes]
+    );
+    assert_eq!(
+        bootstrap.backend_config_schemas[0].persistence_mode,
+        BackendConfigPersistenceMode::BackendNative
+    );
+    assert_eq!(
+        bootstrap.backend_config_schemas[1].persistence_mode,
+        BackendConfigPersistenceMode::TydeSettingsStore
+    );
+    assert!(bootstrap.backend_config_snapshots.is_empty());
 }
 
 #[tokio::test]

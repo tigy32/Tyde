@@ -76,7 +76,7 @@ class MobileWebManifestCheckTests(unittest.TestCase):
         with self.assertRaisesRegex(check.CheckError, "lacks protocolVersion"):
             check.validate_supported_entries_have_protocol_versions(manifest)
 
-    def test_protocol_floor_blocks_old_entries_without_protocol_version(self) -> None:
+    def test_min_supported_floor_blocks_old_entries_without_protocol_version(self) -> None:
         manifest = {
             "minSupported": "0.8.19-beta.1",
             "versions": {
@@ -88,13 +88,31 @@ class MobileWebManifestCheckTests(unittest.TestCase):
                         "/tyde/v0.8.19-beta.8/mobile_bg.wasm": "sha384-" + "B" * 64,
                     },
                 },
-                "0.8.19-beta.9": entry("0.8.19-beta.9"),
+                "0.8.19-beta.16": entry("0.8.19-beta.16"),
             },
         }
 
-        self.assertTrue(check.enforce_protocol_floor(manifest))
-        self.assertEqual(manifest["minSupported"], "0.8.19-beta.9")
+        self.assertTrue(check.enforce_min_supported_floor(manifest))
+        self.assertEqual(manifest["minSupported"], "0.8.19-beta.16")
         check.validate_supported_entries_have_protocol_versions(manifest)
+
+    def test_manifest_check_rejects_floor_below_self_heal_minimum(self) -> None:
+        manifest = {
+            "minSupported": "0.8.19-beta.15",
+            "versions": {"0.8.19-beta.16": entry("0.8.19-beta.16")},
+        }
+
+        with self.assertRaisesRegex(check.CheckError, "at least 0.8.19-beta.16"):
+            check.validate_min_supported_floor(manifest)
+
+    def test_enforce_min_supported_floor_preserves_higher_floor(self) -> None:
+        manifest = {
+            "minSupported": "0.8.19-beta.17",
+            "versions": {"0.8.19-beta.16": entry("0.8.19-beta.16")},
+        }
+
+        self.assertFalse(check.enforce_min_supported_floor(manifest))
+        self.assertEqual(manifest["minSupported"], "0.8.19-beta.17")
 
     def test_merge_target_entry_preserves_newer_live_entry_and_raises_floor(self) -> None:
         base = {
@@ -111,13 +129,13 @@ class MobileWebManifestCheckTests(unittest.TestCase):
                 "0.8.19-beta.10": entry("0.8.19-beta.10"),
             },
         }
-        source = {"versions": {"0.8.19-beta.9": entry("0.8.19-beta.9")}}
+        source = {"versions": {"0.8.19-beta.16": entry("0.8.19-beta.16")}}
 
-        merged = check.merge_target_entry(base, source, "0.8.19-beta.9", 23)
+        merged = check.merge_target_entry(base, source, "0.8.19-beta.16", 23)
 
-        self.assertEqual(merged["minSupported"], "0.8.19-beta.9")
+        self.assertEqual(merged["minSupported"], "0.8.19-beta.16")
         self.assertIn("0.8.19-beta.10", merged["versions"])
-        self.assertIn("0.8.19-beta.9", merged["versions"])
+        self.assertIn("0.8.19-beta.16", merged["versions"])
         check.validate_supported_entries_have_protocol_versions(merged)
 
     def test_cli_reads_protocol_source(self) -> None:
@@ -127,13 +145,20 @@ class MobileWebManifestCheckTests(unittest.TestCase):
             protocol_source.write_text("pub const PROTOCOL_VERSION: u32 = 42;\n", encoding="utf-8")
             manifest = root / "manifest.json"
             manifest.write_text(
-                json.dumps({"versions": {"0.8.19-beta.9": entry("0.8.19-beta.9", 42)}}),
+                json.dumps(
+                    {
+                        "minSupported": "0.8.19-beta.16",
+                        "versions": {
+                            "0.8.19-beta.16": entry("0.8.19-beta.16", 42)
+                        },
+                    }
+                ),
                 encoding="utf-8",
             )
 
             status = check.main(
                 [
-                    "v0.8.19-beta.9",
+                    "v0.8.19-beta.16",
                     "--manifest",
                     str(manifest),
                     "--protocol-source",
@@ -169,7 +194,7 @@ class MobileWebManifestCheckTests(unittest.TestCase):
             )
             source = root / "source.json"
             source.write_text(
-                json.dumps({"versions": {"0.8.19-beta.9": entry("0.8.19-beta.9")}}),
+                json.dumps({"versions": {"0.8.19-beta.16": entry("0.8.19-beta.16")}}),
                 encoding="utf-8",
             )
             out = root / "out.json"
@@ -178,7 +203,7 @@ class MobileWebManifestCheckTests(unittest.TestCase):
                 [
                     sys.executable,
                     str(MERGE_PATH),
-                    "v0.8.19-beta.9",
+                    "v0.8.19-beta.16",
                     "--base",
                     str(base),
                     "--entry-source",
@@ -195,7 +220,7 @@ class MobileWebManifestCheckTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             merged = json.loads(out.read_text(encoding="utf-8"))
-            self.assertEqual(merged["minSupported"], "0.8.19-beta.9")
+            self.assertEqual(merged["minSupported"], "0.8.19-beta.16")
 
 
 if __name__ == "__main__":

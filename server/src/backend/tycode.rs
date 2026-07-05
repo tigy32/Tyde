@@ -11,10 +11,11 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use protocol::{
-    AgentInput, BackendAccessMode, BackendConfigField, BackendConfigFieldType, BackendConfigSchema,
-    BackendConfigValues, BackendKind, ChatEvent, ChatMessage, MessageSender, OrchestrationEvent,
-    SelectOption, SessionId, SessionSettingField, SessionSettingFieldType, SessionSettingValue,
-    SessionSettingsSchema, SessionSettingsValues, StreamEndData, StreamTextDeltaData,
+    AgentInput, BackendAccessMode, BackendConfigField, BackendConfigFieldType,
+    BackendConfigPersistenceMode, BackendConfigSchema, BackendConfigValues, BackendKind, ChatEvent,
+    ChatMessage, MessageSender, OrchestrationEvent, SelectOption, SessionId, SessionSettingField,
+    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
+    StreamEndData, StreamTextDeltaData,
 };
 
 use super::{
@@ -203,6 +204,7 @@ pub(crate) fn resolve_session_settings(config: &BackendSpawnConfig) -> SessionSe
 fn tycode_backend_config_schema() -> BackendConfigSchema {
     BackendConfigSchema {
         backend_kind: BackendKind::Tycode,
+        persistence_mode: BackendConfigPersistenceMode::BackendNative,
         fields: vec![
             BackendConfigField {
                 key: "active_provider".to_string(),
@@ -2502,6 +2504,10 @@ mod tests {
     fn tycode_backend_config_schema_exposes_runtime_json_settings() {
         let schema = tycode_backend_config_schema();
         assert_eq!(schema.backend_kind, BackendKind::Tycode);
+        assert_eq!(
+            schema.persistence_mode,
+            BackendConfigPersistenceMode::BackendNative
+        );
         let keys = schema
             .fields
             .iter()

@@ -14,7 +14,8 @@ loader needs.
 > way.
 
 Nothing here is run automatically. `deploy.sh` assumes this behavior already
-exists; it only ever does `aws s3 sync` (additive) + `create-invalidation`.
+exists; it only ever performs additive S3 uploads/syncs under `tyde/` plus
+`create-invalidation`.
 
 ## Ground truth (from read-only recon)
 

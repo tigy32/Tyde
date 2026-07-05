@@ -28,8 +28,9 @@
 //
 // Merge is ADDITIVE: an existing manifest's other `versions`, `minSupported`,
 // `blocked`, and `schemaVersion` are preserved; only `versions[<ver>]` is
-// (re)written. Policy is changed only when explicitly passed (--min-supported /
-// --blocked).
+// (re)written. `minSupported` is also raised to the shared mobile-web policy
+// floor when needed so remembered stale PWAs cannot boot known-incompatible
+// bundles.
 //
 // No third-party deps — Node built-ins only.
 
@@ -40,6 +41,8 @@ import { fileURLToPath } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(SCRIPT_DIR, "..", "..");
+const MOBILE_WEB_POLICY = join(SCRIPT_DIR, "mobile-web-policy.json");
+const SELF_HEAL_MIN_SUPPORTED_KEY = "selfHealMinSupported";
 
 // --- arg parsing -----------------------------------------------------------
 
@@ -86,7 +89,7 @@ function usage() {
   --entry <rel>          Entry JS path relative to dist (default: auto-detected).
   --protocol-source <p>  Rust source containing PROTOCOL_VERSION
                          (default: protocol/src/types.rs).
-  --min-supported <ver>  Set manifest.minSupported (default: preserve existing).
+  --min-supported <ver>  Set manifest.minSupported, then apply the shared floor.
   --blocked <csv>        Set manifest.blocked to this comma list (default: preserve existing).
 `,
   );
@@ -247,14 +250,45 @@ function compareVersions(a, b) {
   return 0;
 }
 
-function enforceProtocolFloor(manifest) {
+function readMobileWebPolicy() {
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(MOBILE_WEB_POLICY, "utf8"));
+  } catch (err) {
+    fail(`failed to read mobile web policy ${MOBILE_WEB_POLICY}: ${err.message}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    fail(`mobile web policy root must be an object (${MOBILE_WEB_POLICY})`);
+  }
+  return parsed;
+}
+
+function selfHealMinSupported() {
+  const raw = readMobileWebPolicy()[SELF_HEAL_MIN_SUPPORTED_KEY];
+  const version = validateReleaseVersion(raw);
+  if (!version) {
+    fail(
+      `mobile web policy ${SELF_HEAL_MIN_SUPPORTED_KEY} must be a release version: ${JSON.stringify(raw)}`,
+    );
+  }
+  return version;
+}
+
+function minSupportedFloor(manifest) {
   const protocolVersions = Object.entries(manifest.versions)
     .filter(([, entry]) => entry && typeof entry === "object" && Number.isSafeInteger(entry.protocolVersion))
     .map(([entryVersion]) => validateReleaseVersion(entryVersion))
     .filter(Boolean)
     .sort(compareVersions);
-  if (protocolVersions.length === 0) return;
-  const floor = protocolVersions[0];
+  let floor = selfHealMinSupported();
+  if (protocolVersions.length > 0 && compareVersions(protocolVersions[0], floor) > 0) {
+    floor = protocolVersions[0];
+  }
+  return floor;
+}
+
+function enforceMinSupportedFloor(manifest) {
+  const floor = minSupportedFloor(manifest);
   const current = validateReleaseVersion(manifest.minSupported);
   if (!current || compareVersions(current, floor) < 0) {
     manifest.minSupported = floor;
@@ -377,7 +411,7 @@ manifest.versions[version] = {
   protocolVersion,
   artifacts,
 };
-enforceProtocolFloor(manifest);
+enforceMinSupportedFloor(manifest);
 
 const json = JSON.stringify(manifest, null, 2) + "\n";
 const writePath = opts.out || opts.manifest;

@@ -47,6 +47,38 @@ async fn handshake_rejects_incompatible_protocol() {
 }
 
 #[tokio::test]
+async fn incompatible_protocol_reject_includes_configured_release_version() {
+    server::set_host_release_version("0.8.19-beta.16");
+    let (client_stream, server_stream) = tokio::io::duplex(8192);
+    let server_config = server::ServerConfig::current();
+    let client_config = client::ClientConfig {
+        protocol_version: 999,
+        ..client::ClientConfig::current()
+    };
+
+    let server_handle =
+        tokio::spawn(async move { server::accept(&server_config, server_stream).await });
+
+    let client_result = client::connect(&client_config, client_stream).await;
+    match client_result {
+        Err(client::HandshakeError::Rejected(reject)) => {
+            assert_eq!(reject.code, protocol::RejectCode::IncompatibleProtocol);
+            assert_eq!(
+                reject.release_version,
+                Some(protocol::TydeReleaseVersion::parse("0.8.19-beta.16").unwrap())
+            );
+        }
+        _ => panic!("expected incompatible protocol error"),
+    }
+
+    let server_result = server_handle.await.expect("server task panicked");
+    assert!(matches!(
+        server_result,
+        Err(server::HandshakeError::IncompatibleProtocol { .. })
+    ));
+}
+
+#[tokio::test]
 async fn handshake_rejects_wrong_first_frame_kind() {
     let (client_stream, server_stream) = tokio::io::duplex(8192);
     let server_config = server::ServerConfig::current();

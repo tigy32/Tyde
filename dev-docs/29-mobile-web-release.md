@@ -40,17 +40,22 @@ not hand-copy it into JS or workflow YAML.
   backfill through `workflow_dispatch`.
 - Both workflows use one global `mobile-web-manifest` concurrency group for
   manifest writers.
-- Deploys use `web/deploy/deploy.sh --confirm --live-manifest-base`, which fetches
+- Real deploys use `web/deploy/deploy.sh --confirm`, which automatically fetches
   the live manifest before generation and again immediately before the final
   manifest upload. This preserves newer published entries when an older tag is
   backfilled and fails closed if the live manifest cannot be read or parsed.
 - The versioned bundle is uploaded and verified before `manifest.json` is
-  published. Loader shell sync explicitly excludes `manifest.json`; the manifest
-  upload is last so production never advertises a bundle before its files exist.
-- Generated manifests raise `minSupported` to the first entry that carries
-  `protocolVersion` when older entries lack the field. That keeps older
-  non-stamped entries in history without advertising them as bootable to a loader
-  that requires protocol metadata.
+  published. Loader shell upload explicitly excludes `manifest.json`; the
+  manifest upload is last so production never advertises a bundle before its
+  files exist.
+- Generated manifests raise `minSupported` to the shared mobile-web self-heal
+  floor in `web/deploy/mobile-web-policy.json` (`0.8.19-beta.16` as of the
+  beta16 protocol-32 repair). If the first protocol-stamped entry is newer than
+  that floor, generation raises to the newer protocol-stamped floor instead.
+  This keeps older entries in history without advertising them as bootable.
+- Loader shell assets are re-uploaded with short cache metadata on every deploy;
+  do not switch this back to metadata-preserving `sync`, because unchanged
+  `loader.js`/`sw.js` keys can otherwise retain stale long-lived cache headers.
 
 ## AWS requirements
 
@@ -95,6 +100,31 @@ python3 tools/merge_mobile_web_manifest.py v<release> \
 The last command should be run against both the generated local manifest and the
 post-deploy manifest fetched from S3.
 
+## Self-heal floor and beta15 recovery
+
+The mobile web loader normally remembers the last successfully paired bundle in
+`localStorage` (`tyde.loader.version`) and prefers it when paired hosts exist.
+That remembered-first behavior is intentional for supported versions: it lets an
+older still-supported paired host boot its matching bundle instead of always
+forcing the newest web client.
+
+The beta16 incident is the boundary case this floor protects. An installed PWA
+could remember `0.8.19-beta.15` and boot that protocol-31 bundle against a
+`0.8.19-beta.16` protocol-32 host. Beta15 predates the loader repair event, so
+it can look connected but never receive `HostBootstrap`. Publishing a manifest
+with `minSupported >= 0.8.19-beta.16` makes the fresh loader reject the remembered
+beta15 target and fall through to the latest bootable beta16+ bundle.
+
+That manifest floor is not injected into an already-running beta15 WASM bundle.
+Users already stuck inside beta15 need a loader reload boundary after the live
+manifest is fixed: force-quit/swipe away and reopen an installed iOS PWA, reload
+the page, or clear site data if the shell is wedged. Simply backgrounding and
+foregrounding an installed PWA may not be enough to re-run the loader. Once the
+beta16+ bundle is running, future host/client protocol drift can use the
+app-dispatched loader repair events
+(`tyde:repair-needed` / `tyde:repair-version`) to reload into the matching
+bundle without a manual rescan when the app has enough host version information.
+
 ## Backfilling a release
 
 To remediate a missed release without deploying from a dirty tree, run the
@@ -106,20 +136,24 @@ version = v0.8.19
 confirm = true
 ```
 
-Use the exact target tag, for example `v0.8.19` or `v0.8.19-beta.9`. The
-workflow checks out that tag as the release source, verifies that tag is
-contained in the default branch, runs current deploy tooling from the default
-branch, builds the tag's `mobile-frontend`, stamps the tag's Rust
-`PROTOCOL_VERSION`, merges the live manifest, publishes only under `tyde/`,
-invalidates CloudFront, and verifies the deployed target entry.
+Use the exact target tag, for example `v0.8.19` or `v0.8.19-beta.16`. Pre-floor
+prereleases such as beta9 are intentionally not normal backfill targets once the
+self-heal floor is beta16: the manifest may retain historical entries, but
+`minSupported` makes the loader reject them with `below-min-supported` rather
+than advertising them as bootable. The workflow checks out the tag as the
+release source, verifies that tag is contained in the default branch, runs
+current deploy tooling from the default branch, builds the tag's
+`mobile-frontend`, stamps the tag's Rust `PROTOCOL_VERSION`, merges the live
+manifest, publishes only under `tyde/`, invalidates CloudFront, and verifies the
+deployed target entry.
 
 This backfill fixes fresh loader-routed pairing for that release. It cannot
 inject newer app-dispatched repair behavior into an already-running stale PWA
 bundle; a host handshake `Reject` by itself only surfaces as a connection error
 in those historical bundles. Users already stuck inside that stale bundle may
-need to close/reopen the PWA, reload or clear site data, or open the target
-release QR through the loader so the loader can choose the matching
-`/tyde/v<release>/` bundle.
+need to force-quit/swipe away an installed iOS PWA, close/reopen the PWA, reload
+or clear site data, or open the target release QR through the loader so the
+loader can choose the matching `/tyde/v<release>/` bundle.
 Protocol-stamped bundles can use the loader repair path when the app explicitly
 dispatches `tyde:repair-needed`, such as after in-app QR/protocol validation
 detects drift.

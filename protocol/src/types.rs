@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 32;
+pub const PROTOCOL_VERSION: u32 = 33;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -1944,7 +1944,20 @@ pub struct HostSettingsPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendConfigSchema {
     pub backend_kind: BackendKind,
+    pub persistence_mode: BackendConfigPersistenceMode,
     pub fields: Vec<BackendConfigField>,
+}
+
+/// Where persisted backend configuration is written. This lets clients render
+/// backend-owned setup state without hardcoding backend names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendConfigPersistenceMode {
+    /// Values are stored in Tyde host settings and applied when spawning.
+    TydeSettingsStore,
+    /// Values are written to the backend-native configuration source and
+    /// require that backend to be installed/runnable on the host.
+    BackendNative,
 }
 
 /// One configurable field in a backend's deep configuration.
@@ -2000,8 +2013,9 @@ pub enum BackendConfigFieldType {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendConfigValues(pub HashMap<String, SessionSettingValue>);
 
-/// Server → Client on host stream. Carries deep-config schemas for every
-/// enabled backend that exposes one (backends without deep config are omitted).
+/// Server → Client on host stream. Carries the host/build's deep-config schema
+/// catalog for every backend that exposes one. Enabled-backend state does not
+/// filter this catalog; backends without deep config are omitted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendConfigSchemasPayload {
     pub schemas: Vec<BackendConfigSchema>,
@@ -2029,7 +2043,8 @@ pub struct BackendConfigSnapshot {
 }
 
 /// Server → Client on host stream. Carries current backend-native settings
-/// snapshots for enabled backends that expose deep configuration.
+/// snapshots for enabled backends that expose deep configuration. Snapshot
+/// probing remains runtime-driven and separate from the schema catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendConfigSnapshotsPayload {
     pub snapshots: Vec<BackendConfigSnapshot>,
@@ -5899,8 +5914,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_two() {
-        assert_eq!(PROTOCOL_VERSION, 32);
+    fn protocol_version_is_thirty_three() {
+        assert_eq!(PROTOCOL_VERSION, 33);
     }
 
     #[test]

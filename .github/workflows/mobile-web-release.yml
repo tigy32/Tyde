@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version tag to deploy (for example v0.8.19 or v0.8.19-beta.9)'
+        description: 'Release version tag to deploy (for example v0.8.19 or v0.8.19-beta.16)'
         required: true
       confirm:
         description: 'Actually deploy to tycode.dev/tyde (required for manual backfills)'

@@ -15,7 +15,7 @@
 #   * DRY-RUN BY DEFAULT. The real deploy requires an explicit --confirm.
 #   * Every S3 destination is built from BUCKET + PREFIX and asserted to live
 #     under s3://tycode-static/tyde/. Nothing else can be written.
-#   * --delete is NEVER passed to aws s3 sync and is REFUSED as an input arg.
+#   * --delete is NEVER passed to AWS S3 writes and is REFUSED as an input arg.
 #   * The version is validated with the host's release-version rules and (when
 #     it matches the repo) cross-checked against tools/check_release_version.py.
 #   * The marketing site, the tycode.dev bucket beyond tyde/, and tyggs.* are
@@ -28,9 +28,9 @@
 #   VERSION     Release version (e.g. 0.8.19-beta.2). Default: the canonical
 #               version printed by tools/check_release_version.py.
 #   --confirm   Perform the REAL deploy (build + upload + invalidate). Without
-#               it the script runs `aws s3 sync --dryrun` and SKIPS the
-#               CloudFront invalidation so you can preview exactly what would be
-#               written (all under tyde/, no deletes).
+#               it the script runs AWS S3 dry-run upload/sync commands and
+#               SKIPS the CloudFront invalidation so you can preview exactly
+#               what would be written (all under tyde/, no deletes).
 #   --dist DIR  Built Trunk output to publish as the versioned bundle.
 #               Default: <source-root>/mobile-frontend/dist.
 #   --source-root DIR
@@ -39,7 +39,8 @@
 #               the latest deploy tooling from the default branch.
 #   --live-manifest-base
 #               Fetch s3://tycode-static/tyde/manifest.json first and merge into
-#               that live manifest, so CI never clobbers newer published entries.
+#               that live manifest. This is automatic for --confirm; the flag is
+#               still useful for dry-run/validation previews.
 #
 set -euo pipefail
 
@@ -49,6 +50,23 @@ readonly BUCKET="tycode-static"
 readonly PREFIX="tyde"                      # additive target prefix (NEVER root)
 readonly DISTRIBUTION_ID="E3JJ1OF4I8TP6U"
 readonly INVALIDATION_PATHS="/tyde/*"
+readonly LOADER_SHELL_CACHE_CONTROL="public, max-age=60, must-revalidate"
+readonly MANIFEST_CACHE_CONTROL="no-store, max-age=0, must-revalidate"
+readonly -a LOADER_SHELL_KEYS=(
+  "index.html"
+  "sw.js"
+  "loader.js"
+  "loader.css"
+  "cbor.js"
+  "pairing.js"
+  "pairing-ui.js"
+  "styles.js"
+  "manifest-policy.js"
+  "integrity.js"
+  "vendor/jsqr.js"
+  "manifest.webmanifest"
+  "icons/icon.svg"
+)
 
 # --- locate repo + tooling -------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -97,6 +115,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+if [ "${CONFIRM}" -eq 1 ]; then
+  LIVE_MANIFEST_BASE=1
+fi
 
 # Belt-and-suspenders: refuse a --delete smuggled in via the environment.
 case " ${AWS_S3_SYNC_EXTRA_ARGS:-} " in
@@ -181,15 +203,16 @@ if [ "${CONFIRM}" -ne 1 ]; then
 fi
 
 # ===========================================================================
-# 0. Optional CI guard: start from the live manifest.
+# 0. Live-manifest guard: start from the live manifest for every real deploy.
 # ===========================================================================
-# Release CI may run from an older tag while newer versions are already published.
-# Fetching the live manifest as the generator's merge base preserves those newer
-# entries and fails closed if the authority cannot be read or parsed.
+# Release CI/manual deploys may run from a checkout whose checked-in manifest is
+# older than production. Fetching the live manifest as the generator's merge base
+# preserves newer entries/policy and fails closed if the authority cannot be read
+# or parsed.
 MANIFEST_INPUT="${MANIFEST}"
 if [ "${LIVE_MANIFEST_BASE}" -eq 1 ]; then
-  command -v aws >/dev/null 2>&1 || die "aws CLI required for --live-manifest-base"
-  command -v python3 >/dev/null 2>&1 || die "python3 required for --live-manifest-base"
+  command -v aws >/dev/null 2>&1 || die "aws CLI required for live manifest merge"
+  command -v python3 >/dev/null 2>&1 || die "python3 required for live manifest merge"
   LIVE_MANIFEST="$(mktemp)"
   echo "deploy: fetching live manifest base from ${S3_LOADER}manifest.json…" >&2
   aws s3 cp "${S3_LOADER}manifest.json" "${LIVE_MANIFEST}" \
@@ -342,10 +365,12 @@ fi
 # ===========================================================================
 # Short cache for the un-versioned shell (index.html, sw.js, loader .js modules,
 # css, webmanifest, icons) so loader fixes + blocked/minSupported revocations go
-# live within ~a minute.
-echo "deploy: syncing loader shell -> ${S3_LOADER} (${MODE})…" >&2
-aws s3 sync "${LOADER_DIR}/" "${S3_LOADER}" \
+# live within ~a minute. Use `cp --recursive`, not `sync`: `sync` skips
+# unchanged keys and leaves their old S3 metadata/cache headers in place.
+echo "deploy: publishing loader shell -> ${S3_LOADER} (${MODE})…" >&2
+aws s3 cp "${LOADER_DIR}/" "${S3_LOADER}" \
   --region "${AWS_REGION}" \
+  --recursive \
   --exclude 'manifest.json' \
   --exclude 'test/*' \
   --exclude 'node_modules/*' \
@@ -355,9 +380,23 @@ aws s3 sync "${LOADER_DIR}/" "${S3_LOADER}" \
   --exclude '.*' \
   --exclude '._*' \
   --exclude '*/._*' \
-  --cache-control 'public, max-age=60, must-revalidate' \
+  --cache-control "${LOADER_SHELL_CACHE_CONTROL}" \
   ${DRYFLAG} \
   ${AWS_S3_SYNC_EXTRA_ARGS:-}
+
+if [ "${CONFIRM}" -eq 1 ]; then
+  echo "deploy: validating loader shell cache metadata…" >&2
+  for shell_key in "${LOADER_SHELL_KEYS[@]}"; do
+    cache_control="$(aws s3api head-object \
+      --bucket "${BUCKET}" \
+      --key "${PREFIX}/${shell_key}" \
+      --region "${AWS_REGION}" \
+      --query CacheControl \
+      --output text)"
+    [ "${cache_control}" = "${LOADER_SHELL_CACHE_CONTROL}" ] \
+      || die "loader shell cache metadata drift for s3://${BUCKET}/${PREFIX}/${shell_key}: ${cache_control}"
+  done
+fi
 
 if [ "${CONFIRM}" -eq 1 ] || [ "${HAVE_DIST}" -eq 1 ]; then
   # Re-fetch the live global manifest immediately before upload and merge just
@@ -391,8 +430,18 @@ if [ "${CONFIRM}" -eq 1 ] || [ "${HAVE_DIST}" -eq 1 ]; then
   aws s3 cp "${MANIFEST}" "${S3_LOADER}manifest.json" \
     --region "${AWS_REGION}" \
     --content-type 'application/json' \
-    --cache-control 'no-store, max-age=0, must-revalidate' \
+    --cache-control "${MANIFEST_CACHE_CONTROL}" \
     ${DRYFLAG}
+  if [ "${CONFIRM}" -eq 1 ]; then
+    manifest_cache_control="$(aws s3api head-object \
+      --bucket "${BUCKET}" \
+      --key "${PREFIX}/manifest.json" \
+      --region "${AWS_REGION}" \
+      --query CacheControl \
+      --output text)"
+    [ "${manifest_cache_control}" = "${MANIFEST_CACHE_CONTROL}" ] \
+      || die "manifest cache metadata drift for s3://${BUCKET}/${PREFIX}/manifest.json: ${manifest_cache_control}"
+  fi
 else
   echo "deploy: [dry-run] SKIPPING manifest upload because no bundle manifest was generated." >&2
 fi

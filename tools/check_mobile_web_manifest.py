@@ -9,6 +9,7 @@ import pathlib
 import re
 import sys
 from functools import cmp_to_key
+from functools import lru_cache
 from typing import Any
 
 
@@ -19,6 +20,8 @@ PROTOCOL_VERSION_RE = re.compile(
     r"\bpub\s+const\s+PROTOCOL_VERSION\s*:\s*u32\s*=\s*([0-9]+)\s*;"
 )
 INTEGRITY_RE = re.compile(r"^sha384-[A-Za-z0-9+/]+={0,2}$")
+MOBILE_WEB_POLICY_PATH = pathlib.Path("web/deploy/mobile-web-policy.json")
+SELF_HEAL_MIN_SUPPORTED_KEY = "selfHealMinSupported"
 
 
 class CheckError(ValueError):
@@ -27,6 +30,25 @@ class CheckError(ValueError):
 
 def repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parent.parent
+
+
+@lru_cache(maxsize=None)
+def read_mobile_web_policy() -> dict[str, Any]:
+    path = repo_root() / MOBILE_WEB_POLICY_PATH
+    try:
+        policy = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise CheckError(f"mobile web policy is not valid JSON: {path}: {error}") from error
+    if not isinstance(policy, dict):
+        raise CheckError("mobile web policy root must be a JSON object")
+    return policy
+
+
+def self_heal_min_supported() -> str:
+    raw = read_mobile_web_policy().get(SELF_HEAL_MIN_SUPPORTED_KEY)
+    if not isinstance(raw, str):
+        raise CheckError(f"mobile web policy {SELF_HEAL_MIN_SUPPORTED_KEY} must be a string")
+    return normalize_release_version(raw)
 
 
 def normalize_release_version(raw: str) -> str:
@@ -229,21 +251,42 @@ def validate_supported_entries_have_protocol_versions(manifest: dict[str, Any]) 
             )
 
 
-def enforce_protocol_floor(manifest: dict[str, Any]) -> bool:
+def _manifest_min_supported_floor(manifest: dict[str, Any]) -> str:
     versions = _versions_object(manifest)
     protocol_versions = [
         normalize_release_version(version)
         for version, entry in versions.items()
         if _entry_has_protocol_version(entry)
     ]
-    if not protocol_versions:
-        return False
-    floor = min(protocol_versions, key=cmp_to_key(compare_release_versions))
+    floor = self_heal_min_supported()
+    if protocol_versions:
+        protocol_floor = min(protocol_versions, key=cmp_to_key(compare_release_versions))
+        if compare_release_versions(protocol_floor, floor) > 0:
+            floor = protocol_floor
+    return floor
+
+
+def validate_min_supported_floor(manifest: dict[str, Any]) -> None:
+    floor = _manifest_min_supported_floor(manifest)
+    current = _min_supported(manifest)
+    if current is None or compare_release_versions(current, floor) < 0:
+        raise CheckError(
+            f"manifest.minSupported must be at least {floor} "
+            f"(mobile web self-heal floor is {self_heal_min_supported()})"
+        )
+
+
+def enforce_min_supported_floor(manifest: dict[str, Any]) -> bool:
+    floor = _manifest_min_supported_floor(manifest)
     current = _min_supported(manifest)
     if current is None or compare_release_versions(current, floor) < 0:
         manifest["minSupported"] = floor
         return True
     return False
+
+
+def enforce_protocol_floor(manifest: dict[str, Any]) -> bool:
+    return enforce_min_supported_floor(manifest)
 
 
 def merge_target_entry(
@@ -258,8 +301,9 @@ def merge_target_entry(
     versions = _versions_object(merged)
     source_versions = _versions_object(entry_source_manifest)
     versions[version] = copy.deepcopy(source_versions[version])
-    enforce_protocol_floor(merged)
+    enforce_min_supported_floor(merged)
     validate_supported_entries_have_protocol_versions(merged)
+    validate_min_supported_floor(merged)
     validate_manifest_entry(merged, version, expected_protocol_version)
     if not is_allowed_by_policy(merged, version):
         raise CheckError(f"versions[{version!r}] is not allowed by manifest policy")
@@ -298,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest = load_manifest(args.manifest)
         validate_manifest_entry(manifest, version, protocol_version)
         validate_supported_entries_have_protocol_versions(manifest)
+        validate_min_supported_floor(manifest)
         if not is_allowed_by_policy(manifest, version):
             raise CheckError(f"versions[{version!r}] is not allowed by manifest policy")
     except (OSError, CheckError) as error:

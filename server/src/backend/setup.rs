@@ -144,9 +144,6 @@ fn tycode_probe_candidates_from_resolved_path(resolved_binary_path: Option<&str>
 }
 
 async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetupInfo {
-    let docs_url = docs_url(kind);
-    let install_command = install_command(kind, platform);
-
     let probe = match kind {
         BackendKind::Tycode => probe_tycode_candidates(&tycode_probe_candidates()).await,
         BackendKind::Kiro => probe_candidates(&command_candidates(KIRO_CLI_CANDIDATES)).await,
@@ -160,11 +157,17 @@ async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetu
         discover_models().await;
     }
 
-    let status = if install_command.is_none() {
-        BackendSetupStatus::Unsupported
-    } else {
-        probe.status
-    };
+    backend_setup_info_from_probe(kind, platform, probe)
+}
+
+fn backend_setup_info_from_probe(
+    kind: BackendKind,
+    platform: HostPlatform,
+    probe: ProbeResult,
+) -> BackendSetupInfo {
+    let docs_url = docs_url(kind);
+    let install_command = install_command(kind, platform);
+    let status = backend_setup_status_for_probe(probe.status, install_command.is_some());
     let sign_in_command = sign_in_command(kind, probe.hermes_executable.as_deref());
 
     BackendSetupInfo {
@@ -175,6 +178,17 @@ async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetu
         install_command,
         diagnostic: probe.diagnostic,
         sign_in_command,
+    }
+}
+
+fn backend_setup_status_for_probe(
+    probe_status: BackendSetupStatus,
+    has_install_command: bool,
+) -> BackendSetupStatus {
+    match probe_status {
+        BackendSetupStatus::Installed | BackendSetupStatus::Unavailable => probe_status,
+        BackendSetupStatus::NotInstalled if !has_install_command => BackendSetupStatus::Unsupported,
+        BackendSetupStatus::NotInstalled | BackendSetupStatus::Unsupported => probe_status,
     }
 }
 
@@ -851,6 +865,53 @@ mod tests {
             vec!["/tmp/tycode-subprocess".to_string()]
         );
         assert!(tycode_probe_candidates_from_resolved_path(None).is_empty());
+    }
+
+    #[test]
+    fn installed_tycode_probe_on_unsupported_install_platform_stays_installed() {
+        let info = backend_setup_info_from_probe(
+            BackendKind::Tycode,
+            HostPlatform::Windows,
+            ProbeResult::installed(Some("tycode-subprocess 0.7.7".to_string())),
+        );
+
+        assert_eq!(info.status, BackendSetupStatus::Installed);
+        assert_eq!(
+            info.installed_version.as_deref(),
+            Some("tycode-subprocess 0.7.7")
+        );
+        assert!(info.install_command.is_none());
+        assert!(info.diagnostic.is_none());
+    }
+
+    #[test]
+    fn unavailable_tycode_probe_on_unsupported_install_platform_stays_unavailable() {
+        let diagnostic = BackendSetupDiagnostic {
+            code: BackendSetupDiagnosticCode::CommandFailed,
+            message: "Tycode probe failed".to_string(),
+        };
+        let info = backend_setup_info_from_probe(
+            BackendKind::Tycode,
+            HostPlatform::Windows,
+            ProbeResult::unavailable(diagnostic.clone()),
+        );
+
+        assert_eq!(info.status, BackendSetupStatus::Unavailable);
+        assert!(info.install_command.is_none());
+        assert_eq!(info.diagnostic, Some(diagnostic));
+    }
+
+    #[test]
+    fn not_installed_tycode_without_install_support_is_unsupported() {
+        let info = backend_setup_info_from_probe(
+            BackendKind::Tycode,
+            HostPlatform::Windows,
+            ProbeResult::not_installed(),
+        );
+
+        assert_eq!(info.status, BackendSetupStatus::Unsupported);
+        assert!(info.install_command.is_none());
+        assert!(info.diagnostic.is_none());
     }
 
     #[tokio::test]

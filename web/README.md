@@ -80,9 +80,10 @@ loader into running attacker code or a known-bad client. Defenses, in order:
    `minSupported`) is rejected wholesale rather than silently degraded — a
    corrupt/partial manifest can never *widen* what is allowed. Generated version
    entries also carry `protocolVersion` from `protocol/src/types.rs`; entries
-   older than the protocol-stamped floor are below `minSupported` rather than
-   advertised as bootable. Release tooling rejects a missing/mismatched target
-   entry before publish. (`manifest-policy.js`, `web/deploy/generate-manifest.mjs`,
+   older than the shared self-heal/protocol floor are below `minSupported`
+   rather than advertised as bootable. Release tooling rejects a
+   missing/mismatched target entry before publish. (`manifest-policy.js`,
+   `web/deploy/generate-manifest.mjs`, `web/deploy/mobile-web-policy.json`,
    `tools/check_mobile_web_manifest.py`.)
 4. **Subresource Integrity over EVERY executable artifact.** A `<script
    integrity>` only covers the entry JS; the entry then fetches its `.wasm`
@@ -143,16 +144,25 @@ forged/stale stash is rejected by the app's parse and cleared on read.
   (`tyde.loader.version`). On next launch the loader boots it directly — **no
   QR** — *after* re-checking it against a freshly fetched manifest.
 - If that version is gone from the manifest (or now blocked / below
-  `minSupported`), the fast path **fails closed**: the stored version is
-  forgotten and the loader shows the pair/re-pair flow.
+  `minSupported`), the stored version is forgotten and the loader falls through
+  to the newest bootable manifest entry. If no supported entry can boot, it then
+  shows the pair/re-pair flow.
+- The beta16 self-heal floor uses this same policy path: a remembered beta15
+  bundle is below `minSupported`, so a fresh loader launch skips it and boots the
+  latest supported beta16+ bundle. An already-running beta15 bundle still needs a
+  reload/close-open boundary before the loader can apply that manifest policy;
+  installed iOS PWA users may need to force-quit/swipe away the PWA rather than
+  only backgrounding and foregrounding it.
 - A protocol mismatch during the normal host handshake is still rejected by the
   host and surfaced by the app as a connection error. Do **not** assume a
   historical bundle can repair itself from that handshake alone.
 - Current bundles can use the loader repair path only when the app explicitly
-  dispatches `window` event `tyde:repair-needed` (for example, after in-app QR
-  validation detects that the host needs a newer release). The loader listens
-  for that app-owned signal, forgets the stored version, and reloads through the
-  manifest-controlled release-version path.
+  dispatches a loader event: `tyde:repair-needed` after in-app QR validation
+  detects that the host needs a newer release, or `tyde:repair-version` after an
+  already-paired reconnect gets an incompatible-protocol reject with a host
+  release version. The loader listens for those app-owned signals, forgets the
+  stored version, and reloads through the manifest-controlled release-version
+  path.
 
 ## Phase 6 — deploy (`web/deploy/`)
 
@@ -160,7 +170,7 @@ Phase 6 tooling lives in `web/deploy/`:
 
 | File | Role |
 | --- | --- |
-| `deploy.sh` | One-command deploy: build bundle → generate manifest → sync loader + versioned bundle → invalidate. **Dry-run by default.** CI uses `--live-manifest-base` so older release tags do not clobber newer published entries. |
+| `deploy.sh` | One-command deploy: build bundle → generate manifest → upload loader shell + sync versioned bundle → invalidate. **Dry-run by default.** Real deploys automatically merge the live manifest so older release tags do not clobber newer published entries. |
 | `generate-manifest.mjs` | Node, no deps. Hashes every executable artifact of a built `dist/`, stamps `protocolVersion` from Rust `PROTOCOL_VERSION`, and merges a version record into `manifest.json` (additive). |
 | `cloudfront-setup.md` | One-time manual CloudFront setup: a `tyde/*` cache behavior + a CSP/HSTS/CORS `ResponseHeadersPolicy`. Owner runs it once. |
 
@@ -183,14 +193,14 @@ our prefix → s3://tycode-static/tyde/         (loader shell, additive)
 #    Follow web/deploy/cloudfront-setup.md (owner runs it; not automated).
 
 # 1. ALWAYS dry-run first (default). Builds nothing, mutates nothing — it runs
-#    `aws s3 sync --dryrun` so you can confirm every write is under tyde/ with
-#    no deletes, and SKIPS the CloudFront invalidation.
+#    dry-run S3 upload/sync commands so you can confirm every write is under
+#    tyde/ with no deletes, and SKIPS the CloudFront invalidation.
 web/deploy/deploy.sh
 
 # 2. Real deploy. Version defaults to tools/check_release_version.py; pass one
 #    explicitly only if it matches the repo's canonical version.
 web/deploy/deploy.sh --confirm
-web/deploy/deploy.sh 0.8.19-beta.2 --confirm
+web/deploy/deploy.sh 0.8.19-beta.16 --confirm
 ```
 
 `deploy.sh --confirm` then:
@@ -216,12 +226,14 @@ web/deploy/deploy.sh 0.8.19-beta.2 --confirm
    break `WebAssembly.instantiateStreaming`). Real deploys then `HEAD` every
    listed executable artifact and assert uploaded `.wasm` objects have
    `Content-Type: application/wasm`.
-4. Syncs `web/loader/` → `s3://tycode-static/tyde/` with **short cache**
+4. Uploads `web/loader/` → `s3://tycode-static/tyde/` with **short cache**
    (`max-age=60`) so loader logic + revocations propagate, excluding
-   `manifest.json`.
-5. Re-fetches the live manifest when `--live-manifest-base` is set, merges only
-   this release's generated entry into that latest live manifest, validates the
-   target entry and all still-supported entries, then uploads `manifest.json`
+   `manifest.json`. This uses metadata-rewriting copy behavior rather than
+   metadata-preserving sync, so unchanged shell keys still get the short cache
+   headers.
+5. Re-fetches the live manifest on real deploys, merges only this release's
+   generated entry into that latest live manifest, validates the target entry
+   and all still-supported entries, then uploads `manifest.json`
    last with **`no-store`**. Production therefore never advertises a versioned
    bundle before its files are present.
 6. `aws cloudfront create-invalidation --distribution-id E3JJ1OF4I8TP6U
@@ -245,8 +257,9 @@ Releases deploy the mobile web bundle automatically from CI:
   `AWS_TYDE_WEB_DEPLOY_ROLE_ARN` as a GitHub secret or variable. The assumed role
   should have only additive writes under `s3://tycode-static/tyde/*`, read/list of
   that prefix, and `cloudfront:CreateInvalidation` for `E3JJ1OF4I8TP6U`.
-- CI passes `--live-manifest-base`. If the live manifest is missing or malformed,
-  deploy fails closed rather than uploading a partial replacement.
+- Real deploys automatically use the live manifest as their merge base. If the
+  live manifest is missing or malformed, deploy fails closed rather than
+  uploading a partial replacement.
 
 To backfill a missed release after the automation lands, run **Mobile Web
 Release Deploy** from GitHub Actions with the exact target tag:
@@ -256,23 +269,26 @@ version = v0.8.19
 confirm = true
 ```
 
-That workflow accepts stable tags such as `v0.8.19` and prerelease tags such as
-`v0.8.19-beta.9`. It checks out the exact tag as `release-source`, verifies the
-tag is contained in the default branch, runs the latest deploy tooling from the
-default branch, builds that tag's `mobile-frontend`, stamps the tag's Rust
+That workflow accepts stable tags such as `v0.8.19` and prerelease tags at or
+above the self-heal floor, such as `v0.8.19-beta.16`. Backfilling a pre-floor
+release is intentionally blocked by `minSupported`: the manifest may retain its
+historical entry, but the loader fails closed instead of advertising it as
+bootable. The workflow checks out the exact tag as `release-source`, verifies
+the tag is contained in the default branch, runs the latest deploy tooling from
+the default branch, builds that tag's `mobile-frontend`, stamps the tag's Rust
 `PROTOCOL_VERSION`, merges the live manifest, and verifies the deployed manifest
 entry. This fixes fresh loader-routed pairing for that release. It does **not**
 retrofit new app-dispatched repair behavior into an already-running stale PWA;
-users stuck in that state may need to close/reopen the PWA, reload/clear site
-data, or open the target release QR through the loader so it can select the
-matching `/tyde/v<release>/` bundle.
+users stuck in that state may need to force-quit/swipe away an installed iOS
+PWA, close/reopen the PWA, reload/clear site data, or open the target release QR
+through the loader so it can select the matching `/tyde/v<release>/` bundle.
 
 ### Guardrails (enforced by `deploy.sh`)
 
 - **Dry-run by default.** A bare invocation never touches prod; the real deploy
   requires `--confirm`.
-- **Never `--delete`.** The sync is strictly additive; `--delete` is refused as
-  an input and never passed to `aws`.
+- **Never `--delete`.** S3 writes are strictly additive; `--delete` is refused
+  as an input and never passed to `aws`.
 - **Scoped to `tyde/` only.** Every S3 destination is built from the bucket +
   `tyde` prefix and asserted to live under `s3://tycode-static/tyde/` before any
   write. The marketing keys at the bucket root, the `tycode.dev` bucket beyond
@@ -282,8 +298,9 @@ matching `/tyde/v<release>/` bundle.
   target manifest entry is then checked with
   `tools/check_mobile_web_manifest.py`, which verifies the entry exists and its
   `protocolVersion` matches Rust `PROTOCOL_VERSION`. The same check rejects any
-  still-supported manifest entry that lacks `protocolVersion`; generated manifests
-  raise `minSupported` to the first protocol-stamped entry when needed.
+  still-supported manifest entry that lacks `protocolVersion`; generated
+  manifests raise `minSupported` to the shared self-heal floor (or a newer first
+  protocol-stamped entry) when needed.
 - **CSP only on `tyde/*`.** The security `ResponseHeadersPolicy` attaches solely
   to the `tyde/*` behavior — never the default, which would break the marketing
   pages (see `cloudfront-setup.md`).

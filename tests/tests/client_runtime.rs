@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use client::{AgentEndpoint, AgentEvent, HostEndpoint, HostEvent, ProjectEvent};
 use protocol::{
-    AgentBootstrapEvent, BackendKind, ChatEvent, HostSettingValue, ProjectRootPath,
-    ReviewSummaryScope, SendMessagePayload, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload,
+    AgentBootstrapEvent, BackendConfigPersistenceMode, BackendKind, ChatEvent, ProjectRootPath,
+    ReviewSummaryScope, SendMessagePayload, SpawnAgentParams, SpawnAgentPayload,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -23,7 +23,7 @@ fn init_tracing() {
 }
 
 #[tokio::test]
-async fn runtime_accepts_live_backend_config_schemas() {
+async fn runtime_accepts_backend_config_schema_catalog() {
     init_tracing();
 
     let session_store_dir = tempfile::tempdir().expect("create session tempdir");
@@ -37,48 +37,27 @@ async fn runtime_accepts_live_backend_config_schemas() {
     let HostEndpoint {
         mut events,
         commands: _,
-    } = connect_runtime(host.clone()).await;
+    } = connect_runtime(host).await;
     match next_host_event(&mut events, "initial host bootstrap").await {
-        HostEvent::HostBootstrap(_) => {}
-        _ => panic!("expected initial HostBootstrap"),
-    }
-
-    let mut raw = connect_raw(host).await;
-    let bootstrap = raw
-        .next_event()
-        .await
-        .expect("raw bootstrap read failed")
-        .expect("raw connection closed before bootstrap");
-    assert_eq!(bootstrap.kind, protocol::FrameKind::HostBootstrap);
-    raw.set_setting(SetSettingPayload {
-        setting: HostSettingValue::EnabledBackends {
-            enabled_backends: vec![BackendKind::Hermes],
-        },
-    })
-    .await
-    .expect("enable Hermes");
-
-    loop {
-        match next_host_event(&mut events, "live BackendConfigSchemas").await {
-            HostEvent::BackendConfigSchemas(payload) => {
-                assert!(
-                    payload
-                        .schemas
-                        .iter()
-                        .any(|schema| schema.backend_kind == BackendKind::Hermes),
-                    "BackendConfigSchemas should include Hermes: {payload:?}"
-                );
-                break;
-            }
-            HostEvent::HostSettings(_)
-            | HostEvent::SessionSchemas(_)
-            | HostEvent::LaunchProfileCatalogNotify(_)
-            | HostEvent::BackendSetup(_)
-            | HostEvent::BackendConfigSnapshots(_)
-            | HostEvent::AgentsViewPreferencesNotify(_)
-            | HostEvent::TeamPresetCatalogNotify(_) => {}
-            _ => panic!("unexpected host event while waiting for BackendConfigSchemas"),
+        HostEvent::HostBootstrap(payload) => {
+            assert_eq!(
+                payload
+                    .backend_config_schemas
+                    .iter()
+                    .map(|schema| schema.backend_kind)
+                    .collect::<Vec<_>>(),
+                vec![BackendKind::Tycode, BackendKind::Hermes]
+            );
+            assert_eq!(
+                payload.backend_config_schemas[0].persistence_mode,
+                BackendConfigPersistenceMode::BackendNative
+            );
+            assert_eq!(
+                payload.backend_config_schemas[1].persistence_mode,
+                BackendConfigPersistenceMode::TydeSettingsStore
+            );
         }
+        _ => panic!("expected initial HostBootstrap"),
     }
 }
 
@@ -385,25 +364,6 @@ async fn connect_runtime(host: server::HostHandle) -> HostEndpoint {
     client::connect_host_endpoint(&client_config, client_stream)
         .await
         .expect("runtime handshake failed")
-}
-
-async fn connect_raw(host: server::HostHandle) -> client::Connection {
-    let (client_stream, server_stream) = tokio::io::duplex(8192);
-    let server_config = server::ServerConfig::current();
-    let client_config = client::ClientConfig::current();
-
-    tokio::spawn(async move {
-        let conn = server::accept(&server_config, server_stream)
-            .await
-            .expect("server handshake failed");
-        if let Err(err) = server::run_connection(conn, host).await {
-            eprintln!("server connection loop failed: {err:?}");
-        }
-    });
-
-    client::connect(&client_config, client_stream)
-        .await
-        .expect("client handshake failed")
 }
 
 async fn next_host_event(events: &mut client::HostEvents, context: &str) -> HostEvent {

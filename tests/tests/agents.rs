@@ -5,20 +5,20 @@ use protocol::types::AgentClosedPayload;
 use protocol::{
     AgentActivitySummaryPayload, AgentActivitySummaryState, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentControlStatus, AgentErrorCode, AgentErrorPayload, AgentOrigin,
-    AgentRenamedPayload, AgentStartPayload, BackendConfigSchemasPayload,
-    BackendConfigSnapshotsPayload, BackendKind, BackgroundAgentFeature, ChatEvent, ClientErrorCode,
-    ClientErrorPayload, CommandErrorCode, CommandErrorPayload, Envelope,
-    FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload, HostLaunchProfileConfig,
-    HostSettingValue, HostSettingsPayload, LaunchProfileCatalogPayload, LaunchProfileId,
-    LaunchProfileKind, ListSessionsPayload, MessageMetadataUpdateData, MessageSender,
-    MessageTokenUsage, NewAgentPayload, OrchestrationAgentOrigin, OrchestrationPayload, Project,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectId,
-    ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SendMessagePayload,
-    SendMessageToolResponse, SessionHistoryPayload, SessionListPayload, SessionSettingValue,
-    SessionSettingsValues, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamEndData,
-    StreamPath, TaskTokenUsagePayload, TaskTokenUsageScope, TaskTokenUsageStatus,
-    TaskTokenUsageUnavailableReason, TokenUsageScope, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
+    AgentRenamedPayload, AgentStartPayload, BackendConfigSnapshotsPayload, BackendKind,
+    BackgroundAgentFeature, ChatEvent, ClientErrorCode, ClientErrorPayload, CommandErrorCode,
+    CommandErrorPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HostBootstrapPayload,
+    HostLaunchProfileConfig, HostSettingValue, HostSettingsPayload, LaunchProfileCatalogPayload,
+    LaunchProfileId, LaunchProfileKind, ListSessionsPayload, MessageMetadataUpdateData,
+    MessageSender, MessageTokenUsage, NewAgentPayload, OrchestrationAgentOrigin,
+    OrchestrationPayload, Project, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectId, ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath,
+    SendMessagePayload, SendMessageToolResponse, SessionHistoryPayload, SessionListPayload,
+    SessionSettingValue, SessionSettingsValues, SetSettingPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamEndData, StreamPath, TaskTokenUsagePayload, TaskTokenUsageScope,
+    TaskTokenUsageStatus, TaskTokenUsageUnavailableReason, TokenUsageScope,
+    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
+    ToolRequestType, write_envelope,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -639,12 +639,11 @@ fn hermes_claude_launch_profile() -> HostLaunchProfileConfig {
     }
 }
 
-async fn wait_for_ready_launch_profile_after_backend_config_schema(
+async fn wait_for_ready_launch_profile(
     client: &mut client::Connection,
     profile_id: &str,
 ) -> LaunchProfileCatalogPayload {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut saw_backend_config_schemas = false;
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -663,9 +662,8 @@ async fn wait_for_ready_launch_profile_after_backend_config_schema(
 
         match env.kind {
             FrameKind::BackendConfigSchemas => {
-                let _: BackendConfigSchemasPayload =
+                let _: protocol::BackendConfigSchemasPayload =
                     env.parse_payload().expect("BackendConfigSchemas payload");
-                saw_backend_config_schemas = true;
             }
             FrameKind::BackendConfigSnapshots => {
                 let _: BackendConfigSnapshotsPayload =
@@ -680,10 +678,6 @@ async fn wait_for_ready_launch_profile_after_backend_config_schema(
                         protocol::LaunchProfileEntry::Ready { profile }
                             if profile.id.0.as_str() == profile_id =>
                         {
-                            assert!(
-                                saw_backend_config_schemas,
-                                "expected BackendConfigSchemas before ready {profile_id}"
-                            );
                             return payload;
                         }
                         protocol::LaunchProfileEntry::Unavailable { id, .. }
@@ -719,6 +713,27 @@ async fn expect_project_notify(
 
 fn assert_awaited_agent_idle(result: &tyde_dev_driver::agent_control::AwaitAgentStatus) {
     assert_eq!(result.status, AgentControlStatus::Idle);
+}
+
+async fn await_dev_driver_agent_ready(
+    control: &AgentControlHandle,
+    agent_id: &str,
+    context: &str,
+) -> tyde_dev_driver::agent_control::AwaitAgentsResult {
+    let awaited = tokio::time::timeout(
+        Duration::from_secs(15),
+        control.await_agents(Some(vec![protocol::AgentId(agent_id.to_owned())]), None),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {context}"))
+    .unwrap_or_else(|err| panic!("agent control await failed for {context}: {err}"));
+    assert!(
+        awaited.still_thinking.is_empty(),
+        "agent control await should observe {context} ready, got {awaited:?}"
+    );
+    assert_eq!(awaited.ready.len(), 1);
+    assert_awaited_agent_idle(&awaited.ready[0]);
+    awaited
 }
 
 fn assert_await_result_ready(body: &Value, agent_id: &protocol::AgentId) {
@@ -2901,16 +2916,7 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
         vec!["/tmp/test".to_owned()]
     );
 
-    let awaited = control
-        .await_agents(
-            Some(vec![protocol::AgentId(spawned.agent_id.clone())]),
-            Some(5_000),
-        )
-        .await
-        .expect("agent control await should succeed");
-    assert!(awaited.still_thinking.is_empty());
-    assert_eq!(awaited.ready.len(), 1);
-    assert_awaited_agent_idle(&awaited.ready[0]);
+    await_dev_driver_agent_ready(&control, &spawned.agent_id, "initial agent-control turn").await;
     let cursor = assert_read_agent_contains(
         &control,
         &spawned.agent_id,
@@ -2931,16 +2937,7 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
         .await
         .expect("agent control send_message should succeed");
 
-    let awaited_follow_up = control
-        .await_agents(
-            Some(vec![protocol::AgentId(spawned.agent_id.clone())]),
-            Some(5_000),
-        )
-        .await
-        .expect("agent control follow-up await should succeed");
-    assert!(awaited_follow_up.still_thinking.is_empty());
-    assert_eq!(awaited_follow_up.ready.len(), 1);
-    assert_awaited_agent_idle(&awaited_follow_up.ready[0]);
+    await_dev_driver_agent_ready(&control, &spawned.agent_id, "agent-control follow-up turn").await;
     assert_read_agent_contains(
         &control,
         &spawned.agent_id,
@@ -2976,8 +2973,7 @@ async fn agent_control_dev_driver_spawns_explicit_hermes_launch_profile_after_sc
         .await
         .expect("enable Hermes");
 
-    wait_for_ready_launch_profile_after_backend_config_schema(&mut fixture.client, "hermes:claude")
-        .await;
+    wait_for_ready_launch_profile(&mut fixture.client, "hermes:claude").await;
 
     let control = fixture.connect_agent_control().await;
     let options = control.list_launch_options();
@@ -3011,16 +3007,12 @@ async fn agent_control_dev_driver_spawns_explicit_hermes_launch_profile_after_sc
         .await
         .expect("agent control spawn should succeed");
 
-    let awaited = control
-        .await_agents(
-            Some(vec![protocol::AgentId(spawned.agent_id.clone())]),
-            Some(5_000),
-        )
-        .await
-        .expect("agent control await should succeed");
-    assert!(awaited.still_thinking.is_empty());
-    assert_eq!(awaited.ready.len(), 1);
-    assert_awaited_agent_idle(&awaited.ready[0]);
+    await_dev_driver_agent_ready(
+        &control,
+        &spawned.agent_id,
+        "explicit Hermes launch-profile turn",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -3087,11 +3079,7 @@ async fn agent_control_http_spawns_explicit_hermes_launch_profile_after_schema_r
         .await
         .expect("enable Hermes");
 
-    let catalog = wait_for_ready_launch_profile_after_backend_config_schema(
-        &mut fixture.client,
-        "hermes:claude",
-    )
-    .await;
+    let catalog = wait_for_ready_launch_profile(&mut fixture.client, "hermes:claude").await;
     assert!(
         catalog.catalog.entries.iter().any(|entry| {
             matches!(

@@ -1,0 +1,4 @@
+{
+  "$comment": "Shared mobile web release policy. selfHealMinSupported is the remembered-version floor that prevents installed PWAs from booting beta15 (protocol 31) against beta16+ hosts (protocol 32). Raise this value only when a new minimum bootable web bundle is required.",
+  "selfHealMinSupported": "0.8.19-beta.16"
+}

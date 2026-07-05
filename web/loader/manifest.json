@@ -1,7 +1,7 @@
 {
-  "$comment": "Server-controlled allowlist of bootable Tyde web client versions. This is the AUTHORITY: the loader only boots a version present in `versions` that is not blocked / below minSupported, and it SRI-verifies every artifact listed (entry `integrity` PLUS every path in `artifacts`) before the bundle runs. Phase 6's generator (web/deploy/generate-manifest.mjs) hashes every executable artifact of a version — the entry .js, the .wasm, and any code-split chunks — and merges the real version record below at deploy time. minSupported intentionally points at the first protocol-stamped release floor; the checked-in example may not contain that generated release entry until CI deploys it, and older un-stamped entries remain historical data below the floor rather than advertised boot targets.",
+  "$comment": "Server-controlled allowlist of bootable Tyde web client versions. This is the AUTHORITY: the loader only boots a version present in `versions` that is not blocked / below minSupported, and it SRI-verifies every artifact listed (entry `integrity` PLUS every path in `artifacts`) before the bundle runs. Phase 6's generator (web/deploy/generate-manifest.mjs) hashes every executable artifact of a version — the entry .js, the .wasm, and any code-split chunks — and merges the real version record below at deploy time. minSupported intentionally points at the shared mobile-web self-heal floor; the checked-in example may not contain that generated release entry until CI deploys it, and older entries remain historical data below the floor rather than advertised boot targets.",
   "schemaVersion": 1,
-  "minSupported": "0.8.19-beta.9",
+  "minSupported": "0.8.19-beta.16",
   "blocked": [],
   "versions": {
     "0.8.19-beta.2": {

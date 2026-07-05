@@ -8,15 +8,16 @@ use crate::send::send_frame;
 use crate::state::{AppState, DiffViewMode, ToolOutputMode};
 
 use protocol::{
-    BackendConfigField, BackendConfigFieldType, BackendConfigSnapshotStatus, BackendConfigValues,
-    BackendKind, BackendSetupAction, BackendSetupInfo, BackendSetupStatus, BackgroundAgentFeature,
-    BrokerUrl, CodeIntelProviderId, CustomAgent, CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL,
-    DiffContextMode, FrameKind, HostExecutablePath, HostLaunchProfileConfig, HostSettingValue,
-    LaunchProfileId, McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload,
-    MobileBrokerStatus, MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload,
-    MobilePairingState, ProjectId, RunBackendSetupPayload, SelectOption, SessionSchemaEntry,
-    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
-    SetSettingPayload, Skill, SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
+    BackendConfigField, BackendConfigFieldType, BackendConfigPersistenceMode,
+    BackendConfigSnapshotStatus, BackendConfigValues, BackendKind, BackendSetupAction,
+    BackendSetupInfo, BackendSetupStatus, BackgroundAgentFeature, BrokerUrl, CodeIntelProviderId,
+    CustomAgent, CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL, DiffContextMode, FrameKind,
+    HostExecutablePath, HostLaunchProfileConfig, HostSettingValue, LaunchProfileId,
+    McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus,
+    MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState,
+    ProjectId, RunBackendSetupPayload, SelectOption, SessionSchemaEntry, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, SetSettingPayload, Skill,
+    SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -529,7 +530,7 @@ pub fn restore_appearance(state: &AppState) {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsTab {
     Hosts,
     Appearance,
@@ -610,6 +611,7 @@ impl SettingsTab {
             ],
             Self::Backends => &[
                 "Backends",
+                "Overview",
                 "Default Backend",
                 "The backend to use by default when creating new agents",
                 "Enabled Backends",
@@ -710,10 +712,80 @@ const ALL_TABS: [SettingsTab; 10] = [
     SettingsTab::Debug,
 ];
 
+/// Tabs listed under the "Settings" sidebar group. `SettingsTab::Backends` is
+/// deliberately absent: it renders as the stable "Overview" entry of the
+/// dedicated Backends group.
+const SETTINGS_GROUP_TABS: [SettingsTab; 9] = [
+    SettingsTab::Hosts,
+    SettingsTab::Appearance,
+    SettingsTab::General,
+    SettingsTab::CustomAgents,
+    SettingsTab::McpServers,
+    SettingsTab::Steering,
+    SettingsTab::Skills,
+    SettingsTab::Mobile,
+    SettingsTab::Debug,
+];
+
+/// One page of the settings panel: either a regular tab or a per-backend
+/// settings page derived from the server-owned backend-config schema catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    Tab(SettingsTab),
+    Backend(BackendKind),
+}
+
+/// Backends that get their own sidebar page on the selected host, in the
+/// canonical backend order. Derived purely from the server-owned schema
+/// catalog — never from `enabled_backends`, and never hardcoded per backend.
+fn schema_backends(state: &AppState) -> Vec<BackendKind> {
+    let Some(host_id) = state.selected_host_id.get() else {
+        return Vec::new();
+    };
+    let schemas = state.backend_config_schemas.get();
+    let Some(host_schemas) = schemas.get(&host_id) else {
+        return Vec::new();
+    };
+    all_backends()
+        .into_iter()
+        .filter(|kind| {
+            host_schemas
+                .get(kind)
+                .is_some_and(|schema| !schema.fields.is_empty())
+        })
+        .collect()
+}
+
+/// Search matching for a per-backend page: the backend's name plus the
+/// server-provided schema field labels and descriptions.
+fn backend_page_matches_query(state: &AppState, kind: BackendKind, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let q = query.to_lowercase();
+    if backend_label(kind).to_lowercase().contains(&q) {
+        return true;
+    }
+    let Some(host_id) = state.selected_host_id.get() else {
+        return false;
+    };
+    let schemas = state.backend_config_schemas.get();
+    let Some(schema) = schemas.get(&host_id).and_then(|m| m.get(&kind)) else {
+        return false;
+    };
+    schema.fields.iter().any(|field| {
+        field.label.to_lowercase().contains(&q)
+            || field
+                .description
+                .as_ref()
+                .is_some_and(|d| d.to_lowercase().contains(&q))
+    })
+}
+
 #[component]
 pub fn SettingsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let active_tab = RwSignal::new(SettingsTab::Appearance);
+    let active_page = RwSignal::new(SettingsPage::Tab(SettingsTab::Appearance));
     let search_query = RwSignal::new(String::new());
 
     // Honor deep-link requests (e.g. the onboarding "Set up an AI engine" CTA
@@ -723,9 +795,24 @@ pub fn SettingsPanel() -> impl IntoView {
         Effect::new(move |_| {
             if let Some(label) = state.settings_tab_request.get() {
                 if let Some(tab) = ALL_TABS.into_iter().find(|tab| tab.label() == label) {
-                    active_tab.set(tab);
+                    active_page.set(SettingsPage::Tab(tab));
                 }
                 state.settings_tab_request.set(None);
+            }
+        });
+    }
+
+    // A backend page only exists while the selected host's schema catalog
+    // carries that backend. If the host changes (or schemas haven't loaded),
+    // fall back to the stable Overview page instead of rendering a stale or
+    // blank child page.
+    {
+        let state = state.clone();
+        Effect::new(move |_| {
+            if let SettingsPage::Backend(kind) = active_page.get()
+                && !schema_backends(&state).contains(&kind)
+            {
+                active_page.set(SettingsPage::Tab(SettingsTab::Backends));
             }
         });
     }
@@ -761,28 +848,39 @@ pub fn SettingsPanel() -> impl IntoView {
                                     autocomplete="off"
                                 />
                             </div>
-                            <div class="settings-nav-group">
-                                <div class="settings-nav-group-title">"Settings"</div>
-                                <div class="settings-nav-group-items">
-                                    {ALL_TABS.map(|tab| {
-                                        let is_active = move || active_tab.get() == tab;
-                                        let matches_search = move || {
-                                            tab.matches_query(&search_query.get())
-                                        };
-                                        view! {
-                                            <Show when=matches_search>
-                                                <button
-                                                    class="settings-nav-item"
-                                                    class:active=is_active
-                                                    on:click=move |_| active_tab.set(tab)
-                                                >
-                                                    {tab.label()}
-                                                </button>
-                                            </Show>
-                                        }
-                                    }).collect_view()}
+                            <Show when=move || {
+                                SETTINGS_GROUP_TABS
+                                    .into_iter()
+                                    .any(|tab| tab.matches_query(&search_query.get()))
+                            }>
+                                <div class="settings-nav-group">
+                                    <div class="settings-nav-group-title">"Settings"</div>
+                                    <div class="settings-nav-group-items">
+                                        {SETTINGS_GROUP_TABS.map(|tab| {
+                                            let is_active = move || {
+                                                active_page.get() == SettingsPage::Tab(tab)
+                                            };
+                                            let matches_search = move || {
+                                                tab.matches_query(&search_query.get())
+                                            };
+                                            view! {
+                                                <Show when=matches_search>
+                                                    <button
+                                                        class="settings-nav-item"
+                                                        class:active=is_active
+                                                        on:click=move |_| {
+                                                            active_page.set(SettingsPage::Tab(tab))
+                                                        }
+                                                    >
+                                                        {tab.label()}
+                                                    </button>
+                                                </Show>
+                                            }
+                                        }).collect_view()}
+                                    </div>
                                 </div>
-                            </div>
+                            </Show>
+                            <BackendsNavGroup active_page search_query />
                             <div class="settings-nav-footer">
                                 <button class="settings-feedback-link" on:click=move |_| {
                                     state.settings_open.set(false);
@@ -792,23 +890,96 @@ pub fn SettingsPanel() -> impl IntoView {
                         </nav>
 
                         <div class="settings-content">
-                            {move || match active_tab.get() {
-                                SettingsTab::Hosts => view! { <HostsTab /> }.into_any(),
-                                SettingsTab::Appearance => view! { <AppearanceTab /> }.into_any(),
-                                SettingsTab::General => view! { <GeneralTab /> }.into_any(),
-                                SettingsTab::Backends => view! { <BackendsTab /> }.into_any(),
-                                SettingsTab::CustomAgents => view! { <CustomAgentsTab /> }.into_any(),
-                                SettingsTab::McpServers => view! { <McpServersTab /> }.into_any(),
-                                SettingsTab::Steering => view! { <SteeringTab /> }.into_any(),
-                                SettingsTab::Skills => view! { <SkillsTab /> }.into_any(),
-                                SettingsTab::Mobile => view! { <MobileTab /> }.into_any(),
-                                SettingsTab::Debug => view! { <DebugTab /> }.into_any(),
+                            {move || match active_page.get() {
+                                SettingsPage::Tab(tab) => match tab {
+                                    SettingsTab::Hosts => view! { <HostsTab /> }.into_any(),
+                                    SettingsTab::Appearance => view! { <AppearanceTab /> }.into_any(),
+                                    SettingsTab::General => view! { <GeneralTab /> }.into_any(),
+                                    SettingsTab::Backends => view! { <BackendsTab active_page /> }.into_any(),
+                                    SettingsTab::CustomAgents => view! { <CustomAgentsTab /> }.into_any(),
+                                    SettingsTab::McpServers => view! { <McpServersTab /> }.into_any(),
+                                    SettingsTab::Steering => view! { <SteeringTab /> }.into_any(),
+                                    SettingsTab::Skills => view! { <SkillsTab /> }.into_any(),
+                                    SettingsTab::Mobile => view! { <MobileTab /> }.into_any(),
+                                    SettingsTab::Debug => view! { <DebugTab /> }.into_any(),
+                                },
+                                SettingsPage::Backend(kind) => {
+                                    view! { <BackendSettingsPage kind /> }.into_any()
+                                }
                             }}
                         </div>
                     </div>
                 </div>
             </div>
         </Show>
+    }
+}
+
+/// The "Backends" sidebar group: a stable Overview entry plus one page per
+/// backend in the selected host's server-owned schema catalog.
+#[component]
+fn BackendsNavGroup(
+    active_page: RwSignal<SettingsPage>,
+    search_query: RwSignal<String>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let visible = move || {
+        let query = search_query.get();
+        SettingsTab::Backends.matches_query(&query)
+            || schema_backends(&state)
+                .into_iter()
+                .any(|kind| backend_page_matches_query(&state, kind, &query))
+    };
+    view! {
+        <Show when=visible>
+            <div class="settings-nav-group">
+                <div class="settings-nav-group-title">"Backends"</div>
+                <div class="settings-nav-group-items">
+                    <Show when=move || SettingsTab::Backends.matches_query(&search_query.get())>
+                        <button
+                            class="settings-nav-item"
+                            class:active=move || {
+                                active_page.get() == SettingsPage::Tab(SettingsTab::Backends)
+                            }
+                            on:click=move |_| {
+                                active_page.set(SettingsPage::Tab(SettingsTab::Backends))
+                            }
+                        >
+                            "Overview"
+                        </button>
+                    </Show>
+                    <BackendNavItems active_page search_query />
+                </div>
+            </div>
+        </Show>
+    }
+}
+
+#[component]
+fn BackendNavItems(
+    active_page: RwSignal<SettingsPage>,
+    search_query: RwSignal<String>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    view! {
+        {move || {
+            let query = search_query.get();
+            schema_backends(&state)
+                .into_iter()
+                .filter(|kind| backend_page_matches_query(&state, *kind, &query))
+                .map(|kind| {
+                    view! {
+                        <button
+                            class="settings-nav-item"
+                            class:active=move || active_page.get() == SettingsPage::Backend(kind)
+                            on:click=move |_| active_page.set(SettingsPage::Backend(kind))
+                        >
+                            {backend_label(kind)}
+                        </button>
+                    }
+                })
+                .collect_view()
+        }}
     }
 }
 
@@ -1701,7 +1872,7 @@ fn BackgroundAgentFeaturesSection() -> impl IntoView {
 }
 
 #[component]
-fn BackendsTab() -> impl IntoView {
+fn BackendsTab(active_page: RwSignal<SettingsPage>) -> impl IntoView {
     let state = expect_context::<AppState>();
 
     view! {
@@ -1710,7 +1881,7 @@ fn BackendsTab() -> impl IntoView {
         </div>
 
         <p class="settings-description settings-panel-intro">
-            "Toggle backends, install them on the selected host, and run sign-in when available. Install and sign-in commands run in the host terminal so output stays visible."
+            "Toggle backends, install them on the selected host, and run sign-in when available. Install and sign-in commands run in the host terminal so output stays visible. Backend-specific settings live on each backend's own page in the sidebar."
         </p>
 
         <div class="settings-field">
@@ -1774,13 +1945,12 @@ fn BackendsTab() -> impl IntoView {
             <div class="settings-backend-list settings-backend-list-rich">
                 {all_backends()
                     .into_iter()
-                    .map(|kind| view! { <BackendCard kind /> })
+                    .map(|kind| view! { <BackendCard kind active_page /> })
                     .collect::<Vec<_>>()}
             </div>
         </div>
 
         <ComplexityTiersSection />
-        <BackendConfigSection />
         <LaunchProfilesSection />
     }
 }
@@ -2392,96 +2562,223 @@ fn update_tier_setting(
     );
 }
 
-/// Per-backend deep configuration (e.g. Hermes default model/provider/base URL).
-/// Rows are generated from each backend's `BackendConfigSchema`, so a backend
-/// controls exactly which fields appear here with no frontend changes.
+/// One backend's settings page, reached from the Backends sidebar group. The
+/// page content is driven entirely by the server-owned schema, snapshot, and
+/// host-settings state for the selected host; fields are generated from the
+/// backend's `BackendConfigSchema`, so a backend controls exactly which fields
+/// appear here with no frontend changes.
 #[component]
-fn BackendConfigSection() -> impl IntoView {
+fn BackendSettingsPage(kind: BackendKind) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let state_for_rows = state.clone();
+    let state_for_body = state.clone();
+    let state_for_status = state.clone();
+    let setup_info = move || {
+        state_for_status
+            .selected_host_backend_setup()
+            .and_then(|infos| infos.into_iter().find(|info| info.backend_kind == kind))
+    };
+    let setup_info_for_class = setup_info.clone();
+    let state_for_intro = state.clone();
+    // The intro states where edits land, straight from the schema's
+    // server-owned persistence mode — never inferred per backend.
+    let intro = move || {
+        let mode = state_for_intro.selected_host_id.get().and_then(|host_id| {
+            state_for_intro
+                .backend_config_schemas
+                .get()
+                .get(&host_id)
+                .and_then(|m| m.get(&kind))
+                .map(|schema| schema.persistence_mode)
+        });
+        match mode {
+            Some(BackendConfigPersistenceMode::BackendNative) => {
+                "Settings are written to the backend's own configuration on the selected host. Editing a field saves an explicit Tyde override that applies to every new session; clearing it restores the backend's own value."
+            }
+            Some(BackendConfigPersistenceMode::TydeSettingsStore) => {
+                "Settings are stored in Tyde on the selected host and applied to every new session. Editing a field saves an explicit Tyde override; clearing it restores the backend's own value."
+            }
+            None => "Settings for this backend on the selected host.",
+        }
+    };
+
     view! {
-        {move || backend_config_rows(&state_for_rows)}
+        <div class="settings-panel-header">
+            <h2 class="settings-panel-title">{backend_label(kind)}</h2>
+            <span class=move || backend_setup_status_class(setup_info_for_class().as_ref())>
+                {move || backend_setup_status_label(setup_info().as_ref())}
+            </span>
+        </div>
+
+        <p class="settings-description settings-panel-intro">{intro}</p>
+
+        {move || backend_page_body(&state_for_body, kind)}
     }
 }
 
-fn backend_config_rows(state: &AppState) -> Option<AnyView> {
-    let settings = state.selected_host_settings()?;
-    let host_id = state.selected_host_id.get()?;
+fn backend_page_body(state: &AppState, kind: BackendKind) -> AnyView {
+    let Some(host_id) = state.selected_host_id.get() else {
+        return view! {
+            <p class="settings-description">"Select a host to configure this backend."</p>
+        }
+        .into_any();
+    };
+    let Some(settings) = state.selected_host_settings() else {
+        return view! {
+            <p class="settings-description">"Host settings not loaded for the selected host."</p>
+        }
+        .into_any();
+    };
     let schemas = state.backend_config_schemas.get();
-    let host_schemas = schemas.get(&host_id)?;
-    let snapshots = state.backend_config_snapshots.get();
-    let host_snapshots = snapshots.get(&host_id);
+    let Some(schema) = schemas.get(&host_id).and_then(|m| m.get(&kind)).cloned() else {
+        // Transient: the nav fallback effect returns to Overview when the
+        // selected host's catalog no longer carries this backend.
+        return view! {
+            <p class="settings-description">
+                "No configuration is available for this backend on the selected host."
+            </p>
+        }
+        .into_any();
+    };
 
-    let cards = settings
-        .enabled_backends
-        .iter()
-        .copied()
-        .filter_map(|kind| {
-            let schema = host_schemas.get(&kind)?;
-            if schema.fields.is_empty() {
-                return None;
+    // Pages are never hidden for disabled or uninstalled backends — instead
+    // the state is explicit and the controls lock until the backend can
+    // actually accept edits. The schema's server-owned persistence mode says
+    // what an edit needs: `BackendNative` config is written straight to the
+    // backend's own configuration source, so those edits also require the
+    // backend to be installed and runnable; `TydeSettingsStore` config lives
+    // in Tyde host settings and stays editable whenever the backend is
+    // enabled — users may need those settings precisely to recover a backend
+    // whose setup probe reports it unavailable.
+    let enabled = settings.enabled_backends.contains(&kind);
+    let setup_status = state
+        .selected_host_backend_setup()
+        .and_then(|infos| infos.into_iter().find(|info| info.backend_kind == kind))
+        .map(|info| info.status);
+    let needs_install = match schema.persistence_mode {
+        BackendConfigPersistenceMode::BackendNative => {
+            setup_status != Some(BackendSetupStatus::Installed)
+        }
+        BackendConfigPersistenceMode::TydeSettingsStore => false,
+    };
+    let locked = !enabled || needs_install;
+    let locked_banner = locked.then(|| {
+        let mut reasons: Vec<String> = Vec::new();
+        if !enabled {
+            reasons.push(format!(
+                "{} is disabled on the selected host, so it isn't offered for new chats.",
+                backend_label(kind),
+            ));
+        }
+        if needs_install {
+            match setup_status {
+                Some(BackendSetupStatus::Installed) => {}
+                Some(BackendSetupStatus::NotInstalled) => reasons.push(format!(
+                    "{} is not installed on this host. Install it from the Backends overview.",
+                    backend_label(kind),
+                )),
+                Some(BackendSetupStatus::Unavailable) => reasons.push(format!(
+                    "{} is currently unavailable on this host. See the Backends overview for details.",
+                    backend_label(kind),
+                )),
+                Some(BackendSetupStatus::Unsupported) => reasons.push(format!(
+                    "Automatic setup for {} is not supported on this host platform.",
+                    backend_label(kind),
+                )),
+                None => reasons.push("Checking install status for this host…".to_owned()),
             }
-            let values = settings
-                .backend_config
-                .get(&kind)
-                .cloned()
-                .unwrap_or_default();
-            let snapshot = host_snapshots.and_then(|m| m.get(&kind));
-            // Backend-native current values, only when the server could actually
-            // read them. Never invented client-side.
-            let native = snapshot
-                .filter(|s| s.status == BackendConfigSnapshotStatus::Ready)
-                .map(|s| s.values.clone())
-                .unwrap_or_default();
-            // The server owns field order, so render the first field as the
-            // card's emphasized primary control (Tycode → Active Provider,
-            // Hermes → Default Model) and the rest as a secondary grid. Emphasis
-            // follows schema order, not any hard-coded key name.
-            let fields = schema
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(idx, field)| {
-                    backend_config_field(state, kind, field, &values, &native, idx == 0)
-                })
-                .collect::<Vec<_>>();
-            // Surface the server's own reason when it can't read native settings
-            // instead of silently showing schema defaults as if they were live.
-            let snapshot_note = snapshot
-                .filter(|s| s.status == BackendConfigSnapshotStatus::Unavailable)
-                .map(|s| {
-                    let message = s.message.clone().unwrap_or_else(|| {
-                        "Backend-native settings are currently unavailable on this host.".to_owned()
-                    });
-                    view! { <p class="settings-backend-config-snapshot-note">{message}</p> }
-                });
-            Some(view! {
-                <div class="settings-backend-config-card">
-                    <div class="settings-backend-config-card-header">
-                        <span class=backend_badge_class(kind)>{backend_label(kind)}</span>
-                    </div>
-                    {snapshot_note}
-                    <div class="settings-backend-config-fields">{fields}</div>
-                </div>
-            })
-        })
-        .collect::<Vec<_>>();
-
-    if cards.is_empty() {
-        return None;
-    }
-    Some(
+        }
+        let mut requirements = Vec::new();
+        if !enabled {
+            requirements.push("enabled");
+        }
+        if needs_install {
+            requirements.push("installed");
+        }
+        reasons.push(format!(
+            "Settings are read-only until the backend is {}.",
+            requirements.join(" and "),
+        ));
+        let enable_button = (!enabled).then(|| {
+            let state_for_enable = state.clone();
+            let enabled_now = settings.enabled_backends.clone();
+            view! {
+                <button
+                    class="settings-btn settings-btn-primary"
+                    on:click=move |_| {
+                        let enabled_backends = all_backends()
+                            .into_iter()
+                            .filter(|candidate| {
+                                *candidate == kind || enabled_now.contains(candidate)
+                            })
+                            .collect::<Vec<_>>();
+                        send_host_setting(
+                            &state_for_enable,
+                            HostSettingValue::EnabledBackends { enabled_backends },
+                        );
+                    }
+                >
+                    "Enable backend"
+                </button>
+            }
+        });
         view! {
-            <div class="settings-field">
-                <label class="settings-label">"Backend Settings"</label>
-                <p class="settings-description">
-                    "Current backend-native settings for each enabled backend on the selected host, grouped per backend. Editing a field saves an explicit Tyde override that applies to every new session; clearing it restores the backend's own value."
-                </p>
-                <div class="settings-backend-config-list">{cards}</div>
+            <div class="settings-backend-page-banner">
+                <p class="settings-backend-page-banner-text">{reasons.join(" ")}</p>
+                {enable_button}
             </div>
         }
-        .into_any(),
-    )
+    });
+
+    if schema.fields.is_empty() {
+        return view! {
+            {locked_banner}
+            <p class="settings-description">"This backend has no configurable settings."</p>
+        }
+        .into_any();
+    }
+
+    let values = settings
+        .backend_config
+        .get(&kind)
+        .cloned()
+        .unwrap_or_default();
+    let snapshots = state.backend_config_snapshots.get();
+    let snapshot = snapshots.get(&host_id).and_then(|m| m.get(&kind));
+    // Backend-native current values, only when the server could actually
+    // read them. Never invented client-side.
+    let native = snapshot
+        .filter(|s| s.status == BackendConfigSnapshotStatus::Ready)
+        .map(|s| s.values.clone())
+        .unwrap_or_default();
+    // The server owns field order, so render the first field as the page's
+    // emphasized primary control (Tycode → Active Provider, Hermes → Default
+    // Model) and the rest as a secondary grid. Emphasis follows schema order,
+    // not any hard-coded key name.
+    let fields = schema
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            backend_config_field(state, kind, field, &values, &native, idx == 0, locked)
+        })
+        .collect::<Vec<_>>();
+    // Surface the server's own reason when it can't read native settings
+    // instead of silently showing schema defaults as if they were live.
+    let snapshot_note = snapshot
+        .filter(|s| s.status == BackendConfigSnapshotStatus::Unavailable)
+        .map(|s| {
+            let message = s.message.clone().unwrap_or_else(|| {
+                "Backend-native settings are currently unavailable on this host.".to_owned()
+            });
+            view! { <p class="settings-backend-config-snapshot-note">{message}</p> }
+        });
+
+    view! {
+        {locked_banner}
+        {snapshot_note}
+        <div class="settings-backend-config-fields">{fields}</div>
+    }
+    .into_any()
 }
 
 fn backend_config_field(
@@ -2491,10 +2788,13 @@ fn backend_config_field(
     values: &BackendConfigValues,
     native: &BackendConfigValues,
     primary: bool,
+    locked: bool,
 ) -> AnyView {
     let key = field.key.clone();
     let description = field.description.clone();
 
+    // `disabled` already blocks user interaction; the handler guards exist so
+    // a locked field can never reach the wire even via synthetic events.
     let control = match &field.field_type {
         BackendConfigFieldType::Text {
             placeholder,
@@ -2508,6 +2808,9 @@ fn backend_config_field(
             let state = state.clone();
             let key_for_change = key.clone();
             let on_change = move |ev: web_sys::Event| {
+                if locked {
+                    return;
+                }
                 let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
                 commit_text_value(&state, kind, &key_for_change, el.value());
             };
@@ -2517,6 +2820,7 @@ fn backend_config_field(
                         class="settings-input settings-backend-config-input"
                         prop:value=current
                         placeholder=placeholder
+                        disabled=locked
                         on:change=on_change
                     ></textarea>
                 }
@@ -2530,6 +2834,7 @@ fn backend_config_field(
                         placeholder=placeholder
                         autocomplete="off"
                         spellcheck="false"
+                        disabled=locked
                         on:change=on_change
                     />
                 }
@@ -2549,6 +2854,9 @@ fn backend_config_field(
             let state = state.clone();
             let key_for_change = key.clone();
             let on_change = move |ev: web_sys::Event| {
+                if locked {
+                    return;
+                }
                 let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
                 // Empty clears the stored secret; non-empty replaces it.
                 commit_text_value(&state, kind, &key_for_change, el.value());
@@ -2559,6 +2867,7 @@ fn backend_config_field(
                     class="settings-input settings-backend-config-input"
                     placeholder=placeholder
                     autocomplete="off"
+                    disabled=locked
                     on:change=on_change
                 />
             }
@@ -2583,6 +2892,9 @@ fn backend_config_field(
             let state = state.clone();
             let key_for_change = key.clone();
             let on_change = move |ev: web_sys::Event| {
+                if locked {
+                    return;
+                }
                 let el: web_sys::HtmlSelectElement = ev.target().unwrap().unchecked_into();
                 let value = el.value();
                 let update = if value.is_empty() {
@@ -2593,7 +2905,12 @@ fn backend_config_field(
                 update_backend_config(&state, kind, &key_for_change, update);
             };
             view! {
-                <select class="settings-select" prop:value=current on:change=on_change>
+                <select
+                    class="settings-select"
+                    prop:value=current
+                    disabled=locked
+                    on:change=on_change
+                >
                     {nullable.then(|| view! { <option value="">"Auto"</option> })}
                     {option_views}
                 </select>
@@ -2608,6 +2925,9 @@ fn backend_config_field(
             let state = state.clone();
             let key_for_change = key.clone();
             let on_change = move |ev: web_sys::Event| {
+                if locked {
+                    return;
+                }
                 let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
                 update_backend_config(
                     &state,
@@ -2618,7 +2938,12 @@ fn backend_config_field(
             };
             view! {
                 <label class="settings-toggle">
-                    <input type="checkbox" prop:checked=current on:change=on_change />
+                    <input
+                        type="checkbox"
+                        prop:checked=current
+                        disabled=locked
+                        on:change=on_change
+                    />
                     <span class="settings-toggle-slider"></span>
                 </label>
             }
@@ -2638,6 +2963,9 @@ fn backend_config_field(
             let state = state.clone();
             let key_for_change = key.clone();
             let on_change = move |ev: web_sys::Event| {
+                if locked {
+                    return;
+                }
                 let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
                 if let Ok(parsed) = el.value().parse::<i64>() {
                     let clamped = parsed.clamp(min, max);
@@ -2658,6 +2986,7 @@ fn backend_config_field(
                     max=max.to_string()
                     step=step.to_string()
                     autocomplete="off"
+                    disabled=locked
                     on:change=on_change
                 />
             }
@@ -3382,7 +3711,7 @@ fn MobileTab() -> impl IntoView {
 }
 
 #[component]
-fn BackendCard(kind: BackendKind) -> impl IntoView {
+fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl IntoView {
     let state = expect_context::<AppState>();
     let name = backend_label(kind);
     let description = backend_description(kind);
@@ -3390,6 +3719,11 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
     let state_for_checked = state.clone();
     let state_for_disable = state.clone();
     let state_for_setup = state.clone();
+    let state_for_configure = state.clone();
+
+    // A card links to its settings page only when the server's schema catalog
+    // says the backend is configurable — never hardcoded per backend.
+    let has_settings_page = move || schema_backends(&state_for_configure).contains(&kind);
 
     let checked = move || {
         state_for_checked
@@ -3550,6 +3884,17 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
                 }
                 .into_any(),
             }}
+
+            {move || has_settings_page().then(|| view! {
+                <div class="settings-backend-card-footer">
+                    <button
+                        class="settings-btn settings-backend-configure-btn"
+                        on:click=move |_| active_page.set(SettingsPage::Backend(kind))
+                    >
+                        {format!("Configure {name}")}
+                    </button>
+                </div>
+            })}
         </div>
     }
 }
@@ -6715,9 +7060,10 @@ mod wasm_tests {
 
     fn host_settings_with_hermes_config(
         backend_config: std::collections::HashMap<BackendKind, BackendConfigValues>,
+        enabled_backends: Vec<BackendKind>,
     ) -> protocol::HostSettings {
         protocol::HostSettings {
-            enabled_backends: vec![BackendKind::Hermes],
+            enabled_backends,
             default_backend: Some(BackendKind::Hermes),
             enable_mobile_connections: false,
             mobile_broker_url: None,
@@ -6740,6 +7086,7 @@ mod wasm_tests {
         };
         protocol::BackendConfigSchema {
             backend_kind: BackendKind::Hermes,
+            persistence_mode: BackendConfigPersistenceMode::TydeSettingsStore,
             fields: vec![
                 BackendConfigField {
                     key: "default_model".to_owned(),
@@ -6763,10 +7110,51 @@ mod wasm_tests {
         }
     }
 
-    /// The settings-panel deep-config section renders a backend's schema fields
-    /// and seeds each control from the stored host-level value.
+    /// A Tycode-shaped schema: a Select primary field plus a text field. Tycode
+    /// is the backend whose `BackendConfig` edits persist natively right away,
+    /// so it's the canonical fixture for the locked-page tests.
+    fn tycode_config_schema() -> protocol::BackendConfigSchema {
+        protocol::BackendConfigSchema {
+            backend_kind: BackendKind::Tycode,
+            persistence_mode: BackendConfigPersistenceMode::BackendNative,
+            fields: vec![
+                BackendConfigField {
+                    key: "active_provider".to_owned(),
+                    label: "Active Provider".to_owned(),
+                    description: None,
+                    field_type: BackendConfigFieldType::Select {
+                        options: vec![
+                            SelectOption {
+                                value: "anthropic".to_owned(),
+                                label: "Anthropic".to_owned(),
+                            },
+                            SelectOption {
+                                value: "bedrock".to_owned(),
+                                label: "Bedrock".to_owned(),
+                            },
+                        ],
+                        default: Some("anthropic".to_owned()),
+                        nullable: false,
+                    },
+                },
+                BackendConfigField {
+                    key: "profile".to_owned(),
+                    label: "AWS Profile".to_owned(),
+                    description: None,
+                    field_type: BackendConfigFieldType::Text {
+                        default: None,
+                        placeholder: None,
+                        multiline: false,
+                    },
+                },
+            ],
+        }
+    }
+
+    /// A backend settings page renders one control per schema field and seeds
+    /// each control from the stored host-level value.
     #[wasm_bindgen_test]
-    async fn backend_config_section_renders_schema_fields_and_seeds_stored_values() {
+    async fn backend_page_renders_schema_fields_and_seeds_stored_values() {
         let container = make_container();
         let state = AppState::new();
         let host_id = "host-a".to_owned();
@@ -6782,7 +7170,7 @@ mod wasm_tests {
         state.host_settings_by_host.update(|map| {
             map.insert(
                 host_id.clone(),
-                host_settings_with_hermes_config(backend_config),
+                host_settings_with_hermes_config(backend_config, vec![BackendKind::Hermes]),
             );
         });
         state.backend_config_schemas.update(|map| {
@@ -6790,18 +7178,27 @@ mod wasm_tests {
                 .or_default()
                 .insert(BackendKind::Hermes, hermes_config_schema());
         });
+        state.backend_setup_by_host.update(|map| {
+            map.insert(
+                host_id.clone(),
+                vec![backend_setup_info(
+                    BackendKind::Hermes,
+                    BackendSetupStatus::Installed,
+                )],
+            );
+        });
 
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <BackendConfigSection /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
         });
         next_tick().await;
 
         let text = container.text_content().unwrap_or_default();
         assert!(
-            text.contains("Backend Settings"),
-            "section heading must render: {text:?}"
+            text.contains("Hermes"),
+            "page heading must name the backend: {text:?}"
         );
         for label in ["Default Model", "Default Provider", "API Base URL"] {
             assert!(
@@ -6822,9 +7219,10 @@ mod wasm_tests {
         );
     }
 
-    /// A backend that exposes no config schema renders nothing (no empty card).
+    /// A backend page without a schema on the selected host renders an explicit
+    /// empty state — never config inputs, never blank UI.
     #[wasm_bindgen_test]
-    async fn backend_config_section_is_empty_without_schema() {
+    async fn backend_page_without_schema_shows_explicit_empty_state() {
         let container = make_container();
         let state = AppState::new();
         let host_id = "host-a".to_owned();
@@ -6832,7 +7230,10 @@ mod wasm_tests {
         state.host_settings_by_host.update(|map| {
             map.insert(
                 host_id.clone(),
-                host_settings_with_hermes_config(std::collections::HashMap::new()),
+                host_settings_with_hermes_config(
+                    std::collections::HashMap::new(),
+                    vec![BackendKind::Hermes],
+                ),
             );
         });
         // No schema pushed for this host.
@@ -6840,14 +7241,14 @@ mod wasm_tests {
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <BackendConfigSection /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
         });
         next_tick().await;
 
         let text = container.text_content().unwrap_or_default();
         assert!(
-            !text.contains("Backend Settings"),
-            "no schema means no section: {text:?}"
+            text.contains("No configuration is available"),
+            "missing schema must render an explicit message, not blank UI: {text:?}"
         );
         assert_eq!(
             container
@@ -6859,10 +7260,31 @@ mod wasm_tests {
         );
     }
 
+    /// A server-shaped setup probe result for one backend.
+    fn backend_setup_info(
+        kind: BackendKind,
+        status: BackendSetupStatus,
+    ) -> protocol::BackendSetupInfo {
+        protocol::BackendSetupInfo {
+            backend_kind: kind,
+            status,
+            installed_version: None,
+            docs_url: "https://example.test/docs".to_owned(),
+            install_command: None,
+            diagnostic: None,
+            sign_in_command: None,
+        }
+    }
+
     /// Install a connected host with the Hermes deep-config schema plus stored
-    /// values, and select it — enough for `BackendConfigSection` to render and
-    /// persist edits over the wire.
-    fn install_backend_config_host(state: &AppState, values: BackendConfigValues) {
+    /// values, and select it — enough for `BackendSettingsPage` to render and
+    /// persist edits over the wire. Hermes is reported Installed so the page's
+    /// availability lock stays open unless a test overrides it.
+    fn install_backend_config_host(
+        state: &AppState,
+        values: BackendConfigValues,
+        enabled_backends: Vec<BackendKind>,
+    ) {
         let host_id = "host-cfg".to_owned();
         state.selected_host_id.set(Some(host_id.clone()));
         state.host_streams.update(|m| {
@@ -6879,13 +7301,22 @@ mod wasm_tests {
         state.host_settings_by_host.update(|m| {
             m.insert(
                 host_id.clone(),
-                host_settings_with_hermes_config(backend_config),
+                host_settings_with_hermes_config(backend_config, enabled_backends),
             );
         });
         state.backend_config_schemas.update(|m| {
-            m.entry(host_id)
+            m.entry(host_id.clone())
                 .or_default()
                 .insert(BackendKind::Hermes, hermes_config_schema());
+        });
+        state.backend_setup_by_host.update(|m| {
+            m.insert(
+                host_id,
+                vec![backend_setup_info(
+                    BackendKind::Hermes,
+                    BackendSetupStatus::Installed,
+                )],
+            );
         });
     }
 
@@ -6920,9 +7351,13 @@ mod wasm_tests {
         let stored_for_mount = stored.clone();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_backend_config_host(&state, stored_for_mount.clone());
+            install_backend_config_host(
+                &state,
+                stored_for_mount.clone(),
+                vec![BackendKind::Hermes],
+            );
             provide_context(state);
-            view! { <BackendConfigSection /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
         });
         next_tick().await;
 
@@ -7013,7 +7448,11 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_backend_config_host(&state, BackendConfigValues::default());
+            install_backend_config_host(
+                &state,
+                BackendConfigValues::default(),
+                vec![BackendKind::Hermes],
+            );
             let mut native = BackendConfigValues::default();
             native.0.insert(
                 "default_model".to_owned(),
@@ -7021,7 +7460,7 @@ mod wasm_tests {
             );
             set_backend_snapshot(&state, BackendConfigSnapshotStatus::Ready, native, None);
             provide_context(state);
-            view! { <BackendConfigSection /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
         });
         next_tick().await;
 
@@ -7053,7 +7492,7 @@ mod wasm_tests {
                 "default_model".to_owned(),
                 SessionSettingValue::String("my-override".to_owned()),
             );
-            install_backend_config_host(&state, overrides);
+            install_backend_config_host(&state, overrides, vec![BackendKind::Hermes]);
             let mut native = BackendConfigValues::default();
             native.0.insert(
                 "default_model".to_owned(),
@@ -7061,7 +7500,7 @@ mod wasm_tests {
             );
             set_backend_snapshot(&state, BackendConfigSnapshotStatus::Ready, native, None);
             provide_context(state);
-            view! { <BackendConfigSection /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
         });
         next_tick().await;
 
@@ -7093,7 +7532,11 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_backend_config_host(&state, BackendConfigValues::default());
+            install_backend_config_host(
+                &state,
+                BackendConfigValues::default(),
+                vec![BackendKind::Hermes],
+            );
             set_backend_snapshot(
                 &state,
                 BackendConfigSnapshotStatus::Unavailable,
@@ -7101,7 +7544,7 @@ mod wasm_tests {
                 Some("Hermes gateway not reachable"),
             );
             provide_context(state);
-            view! { <BackendConfigSection /> }
+            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
         });
         next_tick().await;
 
@@ -7117,6 +7560,549 @@ mod wasm_tests {
                 .length(),
             3,
             "schema fields still render so overrides remain editable while native values are unavailable"
+        );
+    }
+
+    // ---- Backends sidebar group + per-backend pages ----
+
+    fn panel_title(container: &HtmlElement) -> String {
+        container
+            .query_selector(".settings-panel-title")
+            .unwrap()
+            .and_then(|el| el.text_content())
+            .unwrap_or_default()
+    }
+
+    /// The sidebar has a dedicated Backends group: a stable Overview entry plus
+    /// one schema-derived item per configurable backend. The overview page no
+    /// longer renders any backend config fields; the configurable backend's
+    /// card links to its own settings page instead.
+    #[wasm_bindgen_test]
+    async fn backends_group_lists_schema_pages_and_overview_has_no_config_fields() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_backend_config_host(
+                &state,
+                BackendConfigValues::default(),
+                vec![BackendKind::Hermes],
+            );
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        let overview = find_button_by_text(&container, "Overview")
+            .expect("the Backends group must have a stable Overview item");
+        assert!(
+            find_button_by_text(&container, "Hermes").is_some(),
+            "a backend in the host's schema catalog must get its own nav item"
+        );
+        assert!(
+            find_button_by_text(&container, "Claude").is_none(),
+            "a backend without a schema must not get a nav item"
+        );
+
+        overview.click();
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert_eq!(panel_title(&container), "Backends");
+        assert!(
+            text.contains("Default Backend"),
+            "the overview keeps the global backend controls: {text:?}"
+        );
+        assert_eq!(
+            container
+                .query_selector_all("input.settings-backend-config-input")
+                .unwrap()
+                .length(),
+            0,
+            "backend config fields must no longer render on the overview"
+        );
+
+        // The configurable backend's card links to its settings page.
+        find_button_by_text(&container, "Configure Hermes")
+            .expect("a configurable backend's card must offer a Configure action")
+            .click();
+        next_tick().await;
+
+        assert_eq!(
+            panel_title(&container),
+            "Hermes",
+            "Configure must open the backend's own settings page"
+        );
+        assert_eq!(
+            container
+                .query_selector_all("input.settings-backend-config-input")
+                .unwrap()
+                .length(),
+            3,
+            "the backend page renders one control per schema field"
+        );
+    }
+
+    /// A disabled backend still gets its page (never filtered by
+    /// `enabled_backends`), renders an explicit disabled state with its schema
+    /// fields visible but locked — some backends persist config edits to the
+    /// native backend immediately, so an edit while disabled would fail — and
+    /// offers an enable action that commits an `EnabledBackends` SetSetting
+    /// preserving already-enabled backends.
+    #[wasm_bindgen_test]
+    async fn backend_page_disabled_backend_shows_enable_action() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_backend_config_host(
+                &state,
+                BackendConfigValues::default(),
+                vec![BackendKind::Claude],
+            );
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        click_tab(&container, "Hermes");
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("disabled on the selected host"),
+            "a disabled backend's page must state the disabled condition explicitly: {text:?}"
+        );
+        let inputs = container
+            .query_selector_all("input.settings-backend-config-input")
+            .unwrap();
+        assert_eq!(
+            inputs.length(),
+            3,
+            "schema fields still render so the user can see the configuration"
+        );
+        for i in 0..inputs.length() {
+            let input: HtmlInputElement = inputs.item(i).unwrap().dyn_into().unwrap();
+            assert!(
+                input.disabled(),
+                "config controls must be locked while the backend is disabled"
+            );
+        }
+
+        // Even a synthetic change event on a locked control must not reach the
+        // wire — the edit would fail server-side for natively-persisted
+        // backends.
+        let first: HtmlInputElement = inputs.item(0).unwrap().dyn_into().unwrap();
+        set_and_change(&first, "should-not-commit");
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            last_backend_config(&calls).is_none(),
+            "a locked config field must never emit a backend_config frame"
+        );
+
+        find_button_by_text(&container, "Enable backend")
+            .expect("the disabled state must offer an enable action")
+            .click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_set_setting_payloads(&calls);
+        let enabled = settings
+            .iter()
+            .rev()
+            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("enabled_backends"))
+            .expect("Enable backend must emit an EnabledBackends SetSetting frame");
+        let list: Vec<&str> = enabled
+            .get("enabled_backends")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            list.contains(&"hermes"),
+            "the enable action must enable this backend: {list:?}"
+        );
+        assert!(
+            list.contains(&"claude"),
+            "already-enabled backends must be preserved: {list:?}"
+        );
+    }
+
+    /// Tycode persists `BackendConfig` edits to the native backend right away,
+    /// so a page for a Tycode-like backend that is disabled and not installed
+    /// must lock every config control — no edit frame can reach the wire, even
+    /// from synthetic events — while keeping the Enable action live. Once the
+    /// server reports the backend enabled and installed, the controls unlock
+    /// and edits commit normally.
+    #[wasm_bindgen_test]
+    async fn tycode_page_locks_config_until_enabled_and_installed() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        let host_id = "host-tyc".to_owned();
+        state.selected_host_id.set(Some(host_id.clone()));
+        state.host_streams.update(|m| {
+            m.insert(
+                host_id.clone(),
+                protocol::StreamPath(format!("/host/{host_id}")),
+            );
+        });
+        state.connection_statuses.update(|m| {
+            m.insert(host_id.clone(), crate::state::ConnectionStatus::Connected);
+        });
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                host_id.clone(),
+                protocol::HostSettings {
+                    enabled_backends: vec![BackendKind::Claude],
+                    default_backend: Some(BackendKind::Claude),
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: true,
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
+                    code_intel: Default::default(),
+                    backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Vec::new(),
+                },
+            );
+        });
+        state.backend_config_schemas.update(|m| {
+            m.entry(host_id.clone())
+                .or_default()
+                .insert(BackendKind::Tycode, tycode_config_schema());
+        });
+        state.backend_setup_by_host.update(|m| {
+            m.insert(
+                host_id.clone(),
+                vec![backend_setup_info(
+                    BackendKind::Tycode,
+                    BackendSetupStatus::NotInstalled,
+                )],
+            );
+        });
+        state.settings_open.set(true);
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        click_tab(&container, "Tycode");
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("disabled on the selected host"),
+            "the locked page must state the disabled condition: {text:?}"
+        );
+        assert!(
+            text.contains("not installed"),
+            "the locked page must state the not-installed condition: {text:?}"
+        );
+        assert!(
+            text.contains("read-only"),
+            "the locked page must say the settings are read-only: {text:?}"
+        );
+
+        let select: HtmlSelectElement = container
+            .query_selector(".settings-backend-config-fields select")
+            .unwrap()
+            .expect("the Tycode provider select must render from the schema")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            select.disabled(),
+            "the select control must be locked while disabled and not installed"
+        );
+        let input: HtmlInputElement = container
+            .query_selector("input.settings-backend-config-input")
+            .unwrap()
+            .expect("the Tycode text field must render from the schema")
+            .dyn_into()
+            .unwrap();
+        assert!(input.disabled(), "the text control must be locked");
+
+        // Locked controls must never reach the wire, even via synthetic events
+        // that bypass the disabled attribute.
+        select.set_value("bedrock");
+        dispatch_event_from_js(&select.clone().unchecked_into(), "change", None);
+        let _ = select.remove_attribute("id");
+        set_and_change(&input, "work");
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            last_backend_config(&calls).is_none(),
+            "a locked page must not emit any backend_config frame"
+        );
+
+        // The enable path stays live from the locked page.
+        let enable = find_button_by_text(&container, "Enable backend")
+            .expect("the locked page must keep the enable action available");
+        assert!(
+            !enable.has_attribute("disabled"),
+            "the enable action itself must not be locked"
+        );
+        enable.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            recorded_set_setting_payloads(&calls)
+                .iter()
+                .any(|s| s.get("kind").and_then(|k| k.as_str()) == Some("enabled_backends")),
+            "the enable action must emit an EnabledBackends SetSetting frame"
+        );
+
+        // Server confirms the backend enabled and installed → controls unlock.
+        state.host_settings_by_host.update(|m| {
+            if let Some(settings) = m.get_mut(&host_id) {
+                settings.enabled_backends = vec![BackendKind::Claude, BackendKind::Tycode];
+            }
+        });
+        state.backend_setup_by_host.update(|m| {
+            m.insert(
+                host_id.clone(),
+                vec![backend_setup_info(
+                    BackendKind::Tycode,
+                    BackendSetupStatus::Installed,
+                )],
+            );
+        });
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let select: HtmlSelectElement = container
+            .query_selector(".settings-backend-config-fields select")
+            .unwrap()
+            .expect("the select must re-render after the server state change")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            !select.disabled(),
+            "controls must unlock once the backend is enabled and installed"
+        );
+        select.set_value("bedrock");
+        dispatch_event_from_js(&select.clone().unchecked_into(), "change", None);
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let setting =
+            last_backend_config(&calls).expect("an unlocked edit must emit a backend_config frame");
+        assert_eq!(
+            setting.get("backend").and_then(|b| b.as_str()),
+            Some("tycode"),
+            "the edit must target Tycode: {setting:?}"
+        );
+        let values = setting
+            .get("values")
+            .and_then(|v| v.as_object())
+            .expect("values object");
+        assert_eq!(
+            values
+                .get("active_provider")
+                .and_then(|v| v.get("string"))
+                .and_then(|s| s.as_str()),
+            Some("bedrock"),
+            "the unlocked edit must carry the typed value: {values:?}"
+        );
+    }
+
+    /// A `TydeSettingsStore` backend's config lives in Tyde host settings, not
+    /// in the backend itself, so an enabled backend stays editable even while
+    /// its setup probe reports Unavailable — users need exactly these settings
+    /// to recover such a backend. Edits must still emit typed
+    /// `backend_config` frames.
+    #[wasm_bindgen_test]
+    async fn tyde_store_page_stays_editable_when_setup_unavailable() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_backend_config_host(
+                &state,
+                BackendConfigValues::default(),
+                vec![BackendKind::Hermes],
+            );
+            // The setup probe can't reach the backend, but the schema's
+            // persistence mode is TydeSettingsStore — controls stay live.
+            state.backend_setup_by_host.update(|m| {
+                m.insert(
+                    "host-cfg".to_owned(),
+                    vec![backend_setup_info(
+                        BackendKind::Hermes,
+                        BackendSetupStatus::Unavailable,
+                    )],
+                );
+            });
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("read-only"),
+            "an enabled TydeSettingsStore backend must not be locked by setup status: {text:?}"
+        );
+
+        let inputs = container
+            .query_selector_all("input.settings-backend-config-input")
+            .unwrap();
+        assert_eq!(inputs.length(), 3, "schema fields must render");
+        for i in 0..inputs.length() {
+            let input: HtmlInputElement = inputs.item(i).unwrap().dyn_into().unwrap();
+            assert!(
+                !input.disabled(),
+                "controls must stay editable while the backend is enabled"
+            );
+        }
+
+        // Schema field order: default_model (0), default_provider (1).
+        let provider: HtmlInputElement = inputs.item(1).unwrap().dyn_into().unwrap();
+        set_and_change(&provider, "openrouter");
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let setting = last_backend_config(&calls)
+            .expect("an edit on an editable TydeSettingsStore page must reach the wire");
+        assert_eq!(
+            setting.get("backend").and_then(|b| b.as_str()),
+            Some("hermes"),
+            "the edit must target the schema's backend: {setting:?}"
+        );
+        assert_eq!(
+            setting
+                .get("values")
+                .and_then(|v| v.get("default_provider"))
+                .and_then(|v| v.get("string"))
+                .and_then(|s| s.as_str()),
+            Some("openrouter"),
+            "the edit must carry the typed value: {setting:?}"
+        );
+    }
+
+    /// When the selected host changes to one whose schema catalog no longer
+    /// carries the active backend page, the panel falls back to Overview and
+    /// the stale nav item disappears — no stale child list, no blank page.
+    #[wasm_bindgen_test]
+    async fn backend_page_falls_back_to_overview_when_host_changes() {
+        let container = make_container();
+        let state = AppState::new();
+        install_backend_config_host(
+            &state,
+            BackendConfigValues::default(),
+            vec![BackendKind::Hermes],
+        );
+        state.settings_open.set(true);
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        click_tab(&container, "Hermes");
+        next_tick().await;
+        assert_eq!(panel_title(&container), "Hermes");
+
+        state.selected_host_id.set(Some("host-other".to_owned()));
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        assert_eq!(
+            panel_title(&container),
+            "Backends",
+            "losing the schema must land the user on the Backends overview"
+        );
+        assert!(
+            find_button_by_text(&container, "Hermes").is_none(),
+            "the stale backend nav item must not linger after the host change"
+        );
+    }
+
+    /// The existing "Backends" deep link (e.g. the onboarding CTA) opens the
+    /// Backends overview page.
+    #[wasm_bindgen_test]
+    async fn settings_deep_link_opens_backends_overview() {
+        let container = make_container();
+        let state = AppState::new();
+        state.settings_open.set(true);
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        state.settings_tab_request.set(Some("Backends"));
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        assert_eq!(
+            panel_title(&container),
+            "Backends",
+            "the Backends deep link must open the overview page"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Default Backend"),
+            "the overview content must render after the deep link: {text:?}"
+        );
+    }
+
+    /// Settings search matches backend pages by their server-provided schema
+    /// field labels, and filters out unrelated tabs (including Overview when
+    /// only a backend page matches).
+    #[wasm_bindgen_test]
+    async fn settings_search_matches_backend_page_fields() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_backend_config_host(
+                &state,
+                BackendConfigValues::default(),
+                vec![BackendKind::Hermes],
+            );
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        let search: web_sys::HtmlInputElement = container
+            .query_selector(".settings-search-input")
+            .unwrap()
+            .expect("settings search input must render")
+            .dyn_into()
+            .unwrap();
+        search.set_value("default provider");
+        dispatch_event_from_js(&search, "input", None);
+        next_tick().await;
+
+        assert!(
+            find_button_by_text(&container, "Hermes").is_some(),
+            "a backend page must match a search for one of its schema field labels"
+        );
+        assert!(
+            find_button_by_text(&container, "Appearance").is_none(),
+            "non-matching settings tabs must be filtered out"
+        );
+        assert!(
+            find_button_by_text(&container, "Overview").is_none(),
+            "Overview must be filtered when the query only matches a backend page"
         );
     }
 
