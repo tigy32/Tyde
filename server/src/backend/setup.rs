@@ -307,75 +307,34 @@ async fn run_version_command(command: &str) -> Option<Option<(String, String)>> 
     Some(Some((stdout, stderr)))
 }
 
-fn hermes_python_candidates() -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Ok(value) = std::env::var("PYTHON") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() && !candidates.contains(&trimmed.to_string()) {
-            candidates.push(trimmed.to_string());
-        }
-    }
-
-    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
-        let path = Path::new(&venv).join("bin").join("python");
-        if path.is_file() {
-            let value = path.to_string_lossy().to_string();
-            if !candidates.contains(&value) {
-                candidates.push(value);
-            }
-        }
-    }
-
-    for dir in [".venv", "venv"] {
-        let path = Path::new(dir).join("bin").join("python");
-        if path.is_file() {
-            let value = path.to_string_lossy().to_string();
-            if !candidates.contains(&value) {
-                candidates.push(value);
-            }
-        }
-    }
-
-    for candidate in command_candidates(&["python3", "python"]) {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-
-    candidates
-}
-
-async fn probe_hermes_python() -> ProbeResult {
-    if let Some(candidate) = crate::backend::hermes::explicit_hermes_python() {
-        return match probe_hermes_python_command(&candidate).await {
-            Ok(version) => ProbeResult::installed(version),
-            Err(err) => ProbeResult::unavailable(hermes_failure_diagnostic(
-                err.explicit_override("HERMES_PYTHON"),
-            )),
-        };
-    }
-
-    let mut first_failure = None;
-    for candidate in hermes_python_candidates() {
-        match probe_hermes_python_command(&candidate).await {
-            Ok(version) => return ProbeResult::installed(version),
-            Err(err) => {
-                first_failure.get_or_insert(err);
-            }
-        }
-    }
-    match first_failure {
-        Some(err) => ProbeResult::not_installed_with_diagnostic(hermes_failure_diagnostic(err)),
-        None => ProbeResult::not_installed(),
+async fn probe_explicit_hermes_python(candidate: &str) -> ProbeResult {
+    match probe_hermes_python_command(candidate).await {
+        Ok(version) => ProbeResult::installed(version),
+        Err(err) => ProbeResult::unavailable(hermes_failure_diagnostic(
+            err.explicit_override("HERMES_PYTHON"),
+        )),
     }
 }
 
 async fn probe_hermes_gateway() -> ProbeResult {
-    if crate::backend::hermes::explicit_hermes_python().is_some() {
-        return probe_hermes_python().await;
+    probe_hermes_gateway_with_sources(
+        crate::backend::hermes::explicit_hermes_python(),
+        crate::backend::hermes::explicit_hermes_executable(),
+        crate::backend::hermes::hermes_executable_candidates(),
+    )
+    .await
+}
+
+async fn probe_hermes_gateway_with_sources(
+    explicit_python: Option<String>,
+    explicit_executable: Option<String>,
+    executable_candidates: Vec<String>,
+) -> ProbeResult {
+    if let Some(candidate) = explicit_python {
+        return probe_explicit_hermes_python(&candidate).await;
     }
 
-    if let Some(candidate) = crate::backend::hermes::explicit_hermes_executable() {
+    if let Some(candidate) = explicit_executable {
         return match crate::backend::hermes::probe_hermes_cli_gateway(&candidate).await {
             Ok(probe) => {
                 ProbeResult::installed(probe.version).with_hermes_executable(probe.executable)
@@ -387,7 +346,7 @@ async fn probe_hermes_gateway() -> ProbeResult {
     }
 
     let mut first_failure = None;
-    for candidate in crate::backend::hermes::hermes_executable_candidates() {
+    for candidate in executable_candidates {
         match crate::backend::hermes::probe_hermes_cli_gateway(&candidate).await {
             Ok(probe) => {
                 return ProbeResult::installed(probe.version)
@@ -403,12 +362,9 @@ async fn probe_hermes_gateway() -> ProbeResult {
         }
     }
 
-    let mut python_probe = probe_hermes_python().await;
-    if python_probe.status == BackendSetupStatus::NotInstalled && python_probe.diagnostic.is_none()
-    {
-        python_probe.diagnostic = first_failure.map(hermes_failure_diagnostic);
-    }
-    python_probe
+    ProbeResult::not_installed_with_diagnostic(hermes_failure_diagnostic(
+        crate::backend::hermes::hermes_cli_required_failure(first_failure),
+    ))
 }
 
 async fn probe_hermes_python_command(
@@ -937,6 +893,47 @@ mod tests {
         assert!(
             diagnostic.message.contains("HERMES_EXECUTABLE"),
             "diagnostic should name explicit override: {}",
+            diagnostic.message
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_auto_cli_failure_ignores_ambient_python() {
+        let _lock = crate::backend::hermes::TEST_HERMES_OVERRIDE_LOCK
+            .lock()
+            .await;
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hermes = dir.path().join("hermes");
+        write_executable(
+            &hermes,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'Hermes Agent v9.9.9\\n'; exit 0; fi\nexit 1\n",
+        );
+        let python = dir.path().join("python");
+        write_executable(
+            &python,
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then exit 0; fi\nexit 1\n",
+        );
+        let _python_path = EnvGuard::set("PYTHON", &python.to_string_lossy());
+        let _hermes_python = EnvGuard::unset("HERMES_PYTHON");
+        let _hermes_executable = EnvGuard::unset("HERMES_EXECUTABLE");
+
+        let result = probe_hermes_gateway_with_sources(
+            None,
+            None,
+            vec![hermes.to_string_lossy().to_string()],
+        )
+        .await;
+
+        assert_eq!(result.status, BackendSetupStatus::NotInstalled);
+        assert_eq!(result.version, None);
+        let diagnostic = result.diagnostic.expect("diagnostic");
+        assert_eq!(
+            diagnostic.code,
+            BackendSetupDiagnosticCode::MissingProjectRoot
+        );
+        assert!(
+            diagnostic.message.contains("Could not verify Hermes CLI"),
+            "diagnostic should preserve CLI failure instead of using ambient Python: {}",
             diagnostic.message
         );
     }

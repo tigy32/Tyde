@@ -49,13 +49,14 @@ usage() {
 Usage: $(basename "$0") <command>
 
 Commands:
-  check     Type-check the full workspace (native + WASM)
-  build     Build the frontend WASM bundle (into frontend/dist/)
-  dev       Run the Tauri desktop app from the live workspace with no hot reload
-  tauri     Build and run the full Tauri desktop app
-  ios       Build/install the bundled standalone iOS app (optional device name)
-  release   Build release bundles and, on macOS, sign/notarize them
-  clean     Remove build artifacts
+  check          Type-check the full workspace (native + WASM)
+  build          Build the frontend WASM bundle (into frontend/dist/)
+  dev            Run the Tauri desktop app from the live workspace with no hot reload
+  tauri          Build and run the full Tauri desktop app
+  ios            Build/install the bundled standalone iOS app (optional device name)
+  release-check  Run the canonical release/mobile drift guard (optional vX.Y.Z)
+  release        Run release-check, then build/sign release bundles (optional vX.Y.Z)
+  clean          Remove build artifacts
 EOF
     exit 1
 }
@@ -300,11 +301,6 @@ print(identifier(device) or name(device))
 PY
     rm -f "$json_path"
     return "$status"
-}
-
-check_release_versions() {
-    ensure_python3
-    python3 "$SCRIPT_DIR/tools/check_release_version.py"
 }
 
 sign_and_notarize() {
@@ -583,11 +579,25 @@ PY
     fi
 }
 
+cmd_release_check() {
+    "$SCRIPT_DIR/tools/release_check.sh" "$@"
+}
+
 cmd_release() {
+    [[ $# -le 1 ]] || error "release accepts at most one optional expected tag"
+    if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+        usage
+    fi
+
     ensure_wasm_target
     ensure_trunk
     ensure_tauri_cli
-    check_release_versions
+
+    if [[ $# -eq 1 ]]; then
+        cmd_release_check "$1"
+    else
+        cmd_release_check
+    fi
 
     log "Building Tyde release bundle"
     (
@@ -659,7 +669,8 @@ case "$1" in
     dev)       cmd_dev ;;
     tauri)     cmd_tauri ;;
     ios)       shift; cmd_ios "$@" ;;
-    release)   cmd_release ;;
+    release-check) shift; cmd_release_check "$@" ;;
+    release)   shift; cmd_release "$@" ;;
     clean)     cmd_clean ;;
     *)         usage ;;
 esac

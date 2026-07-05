@@ -66,6 +66,19 @@ asserts every S3 destination stays under `s3://tycode-static/tyde/`.
 
 ## Local checks
 
+Use the canonical local guard before release builds:
+
+```sh
+tools/release_check.sh [v<release>]
+```
+
+It validates build/version/protocol/mobile-web coherence by generating a
+temporary manifest entry for the checked version instead of requiring
+`web/loader/manifest.json` to already contain the release. It also prints the
+native-mobile drift reminder: installed native apps are bundled and must be
+rebuilt/reinstalled after protocol changes. This guard does not replace the
+AGENTS release steps for a clean tree, `main`, tag checks, approval, or pushes.
+
 Use these focused checks for release-infra changes:
 
 ```sh

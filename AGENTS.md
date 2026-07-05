@@ -103,7 +103,11 @@ After approval:
 4. Verify the tag does not already exist locally or on `origin`:
    `git tag --list vX.Y.Z` and `git ls-remote --tags origin vX.Y.Z`. Stop if
    it exists unless the user gives explicit further instructions.
-5. Run the full pre-commit sequence above. Stop if any check fails.
+5. Run the canonical local release guard: `tools/release_check.sh vX.Y.Z`.
+   This includes the full pre-commit sequence above plus mobile-web
+   release-coherence checks and the native mobile drift reminder. It does not
+   replace the clean tree, `main`, tag, approval, or push checks in this
+   section. Stop if any check fails.
 6. Re-run the release-version check immediately before tagging:
    `python3 tools/check_release_version.py vX.Y.Z`. Stop if it fails.
 7. Create the annotated tag:

@@ -981,7 +981,9 @@ async fn collect_agent_activity_summary_events(
     let mut streamed_text = String::new();
     let mut stream_delta_count = 0usize;
     let mut chat_event_count = 0usize;
+    let mut stream_end_without_usable_text_count = 0usize;
     let mut backend_error: Option<String> = None;
+    let mut attempted_tools = Vec::new();
     while let Some(event) = events.recv().await {
         chat_event_count += 1;
         match event {
@@ -994,39 +996,58 @@ async fn collect_agent_activity_summary_events(
             }
             ChatEvent::StreamEnd(data) => {
                 let final_content = data.message.content;
-                let candidate = if final_content.trim().is_empty() {
-                    streamed_text
-                } else {
-                    final_content
-                };
-                let text = sanitize_activity_summary_text(&candidate)?;
-                return Ok(AgentActivitySummary {
-                    text,
-                    generated_at_ms: now_ms(),
-                    source_from_seq: request.source_from_seq,
-                    source_through_seq: request.source_through_seq,
-                });
+                if let Some(text) = sanitize_activity_summary_candidate_text([
+                    final_content.as_str(),
+                    streamed_text.as_str(),
+                ]) {
+                    return Ok(AgentActivitySummary {
+                        text,
+                        generated_at_ms: now_ms(),
+                        source_from_seq: request.source_from_seq,
+                        source_through_seq: request.source_through_seq,
+                    });
+                }
+                stream_end_without_usable_text_count =
+                    stream_end_without_usable_text_count.saturating_add(1);
+                let attempted_tool_labels =
+                    activity_summary_attempted_tool_labels(&attempted_tools);
+                tracing::debug!(
+                    summary_agent_id = %request.summary_agent_id,
+                    backend_kind = ?request.backend_kind,
+                    cost_hint = ?SpawnCostHint::Low,
+                    prompt_len = logged_prompt_len,
+                    target_workspace_root_count,
+                    chat_event_count,
+                    stream_delta_count,
+                    stream_end_without_usable_text_count,
+                    final_content_len = final_content.len(),
+                    streamed_text_len = streamed_text.len(),
+                    backend_error = ?backend_error.as_deref(),
+                    attempted_tool_count = attempted_tools.len(),
+                    attempted_tools = %attempted_tool_labels,
+                    "agent activity summary generator stream segment ended without usable assistant text"
+                );
             }
             ChatEvent::ToolRequest(requested_tool) => {
-                let message = format!(
-                    "activity summary generator attempted unsupported tool call '{}' ({})",
-                    requested_tool.tool_name, requested_tool.tool_call_id
-                );
+                let tool_name = requested_tool.tool_name;
+                let tool_call_id = requested_tool.tool_call_id;
                 tracing::warn!(
                     summary_agent_id = %request.summary_agent_id,
                     backend_kind = ?request.backend_kind,
-                    tool_name = %requested_tool.tool_name,
-                    tool_call_id = %requested_tool.tool_call_id,
-                    "activity summary generator attempted a tool call"
+                    tool_name = %tool_name,
+                    tool_call_id = %tool_call_id,
+                    "activity summary generator attempted a tool call; ignoring and continuing"
                 );
-                return Err(message);
+                attempted_tools.push(ActivitySummaryToolAttempt {
+                    tool_name,
+                    tool_call_id,
+                });
             }
             _ => {}
         }
     }
 
-    if !streamed_text.trim().is_empty() {
-        let text = sanitize_activity_summary_text(&streamed_text)?;
+    if let Some(text) = sanitize_activity_summary_candidate_text([streamed_text.as_str()]) {
         return Ok(AgentActivitySummary {
             text,
             generated_at_ms: now_ms(),
@@ -1035,6 +1056,7 @@ async fn collect_agent_activity_summary_events(
         });
     }
 
+    let attempted_tool_labels = activity_summary_attempted_tool_labels(&attempted_tools);
     tracing::warn!(
         summary_agent_id = %request.summary_agent_id,
         backend_kind = ?request.backend_kind,
@@ -1043,11 +1065,75 @@ async fn collect_agent_activity_summary_events(
         target_workspace_root_count,
         chat_event_count,
         stream_delta_count,
+        stream_end_without_usable_text_count,
+        backend_error = ?backend_error.as_deref(),
+        attempted_tool_count = attempted_tools.len(),
+        attempted_tools = %attempted_tool_labels,
         "agent activity summary generator ended without usable assistant text"
     );
-    Err(backend_error.unwrap_or_else(|| {
-        "agent activity summary generator ended before producing usable text".to_owned()
-    }))
+    Err(activity_summary_no_usable_text_error(
+        backend_error.as_deref(),
+        &attempted_tools,
+    ))
+}
+
+#[derive(Debug)]
+struct ActivitySummaryToolAttempt {
+    tool_name: String,
+    tool_call_id: String,
+}
+
+fn sanitize_activity_summary_candidate_text<'a>(
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    candidates.into_iter().find_map(|candidate| {
+        if candidate.trim().is_empty() {
+            return None;
+        }
+        sanitize_activity_summary_text(candidate).ok()
+    })
+}
+
+fn activity_summary_no_usable_text_error(
+    backend_error: Option<&str>,
+    attempted_tools: &[ActivitySummaryToolAttempt],
+) -> String {
+    let mut message =
+        "agent activity summary generator produced no usable assistant text".to_owned();
+    if let Some(error) = backend_error
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+    {
+        message.push_str(": backend error: ");
+        message.push_str(error);
+    }
+    if !attempted_tools.is_empty() {
+        let attempted_tool_labels = activity_summary_attempted_tool_labels(attempted_tools);
+        message.push_str("; attempted ");
+        message.push_str(&attempted_tools.len().to_string());
+        message.push_str(" tool call(s)");
+        if !attempted_tool_labels.is_empty() {
+            message.push_str(": ");
+            message.push_str(&attempted_tool_labels);
+        }
+    }
+    message
+}
+
+fn activity_summary_attempted_tool_labels(
+    attempted_tools: &[ActivitySummaryToolAttempt],
+) -> String {
+    attempted_tools
+        .iter()
+        .map(|attempt| {
+            if attempt.tool_call_id.trim().is_empty() {
+                attempt.tool_name.clone()
+            } else {
+                format!("{} ({})", attempt.tool_name, attempt.tool_call_id)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Type-erased backend handle. The actor loop only needs `send()` — this lets
@@ -5146,9 +5232,9 @@ mod tests {
     use protocol::{
         AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
         AgentId, AgentInput, AgentStartPayload, ChatEvent, ChatMessage, ChatMessageId, FrameKind,
-        MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, SessionId,
-        StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList, TokenUsage,
-        ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType,
+        MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, ReasoningData,
+        SessionId, StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
+        TokenUsage, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -5398,22 +5484,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activity_summary_tool_request_is_explicit_failure() {
+    async fn activity_summary_tool_request_does_not_fail_when_text_arrives() {
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send(tool_request("summary-tool"))
             .expect("send tool request");
+        tx.send(ChatEvent::StreamDelta(StreamTextDeltaData {
+            message_id: Some("summary-message".to_owned()),
+            text: "Agent is reviewing the requested files".to_owned(),
+        }))
+        .expect("send stream delta");
+        tx.send(ChatEvent::StreamEnd(StreamEndData {
+            message: assistant_message(""),
+        }))
+        .expect("send stream end");
         drop(tx);
         let mut events = EventStream::new(rx);
 
-        let error =
+        let summary =
             collect_agent_activity_summary_events(&activity_summary_request(), &mut events, 0, 0)
                 .await
-                .expect_err("tool request should fail summary generation");
+                .expect("streamed text should satisfy summary generation");
 
-        assert!(
-            error.contains("unsupported tool call 'run_command' (summary-tool)"),
-            "unexpected error: {error}"
-        );
+        assert_eq!(summary.text, "Agent is reviewing the requested files");
+        assert_eq!(summary.source_from_seq, Some(1));
+        assert_eq!(summary.source_through_seq, Some(2));
+    }
+
+    #[tokio::test]
+    async fn activity_summary_tool_request_empty_stream_end_waits_for_later_text() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(stream_start("empty-segment"))
+            .expect("send empty stream start");
+        tx.send(tool_request("summary-tool"))
+            .expect("send tool request");
+        tx.send(ChatEvent::StreamEnd(StreamEndData {
+            message: assistant_message(""),
+        }))
+        .expect("send empty stream end");
+        tx.send(stream_start("answer-segment"))
+            .expect("send answer stream start");
+        tx.send(ChatEvent::StreamEnd(StreamEndData {
+            message: assistant_message("Agent finished updating the activity summary"),
+        }))
+        .expect("send final stream end");
+        drop(tx);
+        let mut events = EventStream::new(rx);
+
+        let summary =
+            collect_agent_activity_summary_events(&activity_summary_request(), &mut events, 0, 0)
+                .await
+                .expect("later final text should satisfy summary generation");
+
+        assert_eq!(summary.text, "Agent finished updating the activity summary");
+    }
+
+    #[tokio::test]
+    async fn activity_summary_reasoning_only_stream_end_waits_for_later_answer() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(stream_start("reasoning-segment"))
+            .expect("send reasoning stream start");
+        tx.send(ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
+            message_id: Some("reasoning-segment".to_owned()),
+            text: "Thinking through the recent tool activity".to_owned(),
+        }))
+        .expect("send reasoning delta");
+        let mut reasoning_message = assistant_message("");
+        reasoning_message.reasoning = Some(ReasoningData {
+            text: "Thinking through the recent tool activity".to_owned(),
+            tokens: Some(7),
+            signature: None,
+            blob: None,
+        });
+        tx.send(ChatEvent::StreamEnd(StreamEndData {
+            message: reasoning_message,
+        }))
+        .expect("send reasoning-only stream end");
+        tx.send(stream_start("answer-segment"))
+            .expect("send answer stream start");
+        tx.send(ChatEvent::StreamEnd(StreamEndData {
+            message: assistant_message("Agent is summarizing completed Codex work"),
+        }))
+        .expect("send final stream end");
+        drop(tx);
+        let mut events = EventStream::new(rx);
+
+        let summary =
+            collect_agent_activity_summary_events(&activity_summary_request(), &mut events, 0, 0)
+                .await
+                .expect("later final text should satisfy summary generation");
+
+        assert_eq!(summary.text, "Agent is summarizing completed Codex work");
+    }
+
+    #[tokio::test]
+    async fn activity_summary_tool_request_without_text_is_explicit_error() {
+        for include_stream_end in [false, true] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tx.send(tool_request("summary-tool"))
+                .expect("send tool request");
+            if include_stream_end {
+                tx.send(ChatEvent::StreamEnd(StreamEndData {
+                    message: assistant_message(""),
+                }))
+                .expect("send empty stream end");
+            }
+            drop(tx);
+            let mut events = EventStream::new(rx);
+            let mode = if include_stream_end {
+                "empty stream end"
+            } else {
+                "backend close"
+            };
+
+            let error = collect_agent_activity_summary_events(
+                &activity_summary_request(),
+                &mut events,
+                0,
+                0,
+            )
+            .await
+            .expect_err("tool-only summary generation should fail");
+
+            assert!(
+                error.contains("no usable assistant text"),
+                "{mode}: unexpected error: {error}"
+            );
+            assert!(
+                error.contains("attempted 1 tool call(s)"),
+                "{mode}: unexpected error: {error}"
+            );
+            assert!(
+                error.contains("run_command (summary-tool)"),
+                "{mode}: unexpected error: {error}"
+            );
+        }
     }
 
     #[test]

@@ -25,10 +25,8 @@ Local sessions use explicit overrides authoritatively before auto-discovery:
    output reports a `Project:` root with a virtualenv that can import
    `tui_gateway.entry`. If this probe fails, Tyde reports the explicit failure
    instead of falling back to PATH or Python.
-3. Without explicit overrides, Tyde probes `hermes` on the host PATH (including
-   the login-shell and common user-bin PATH that contains `~/.local/bin`).
-4. The Python-module path remains a dev fallback only when no verifiable Hermes
-   executable is available.
+3. Without explicit overrides, Tyde probes the Hermes CLI discovered from
+   common user-bin locations such as `~/.local/bin` and the resolved host PATH.
 
 For executable probes, Tyde runs `hermes --version`, reads Hermes's reported
 project root, verifies that the project's virtualenv can import
@@ -38,14 +36,11 @@ project root, verifies that the project's virtualenv can import
 <hermes-project>/venv/bin/python -m tui_gateway.entry
 ```
 
-The dev fallback probes:
-
-1. `PYTHON`
-2. `$VIRTUAL_ENV/bin/python`
-3. `./.venv/bin/python`
-4. `./venv/bin/python`
-5. `python3`
-6. `python`
+If no explicit override or verified CLI is available, setup reports Hermes as
+not installed with instructions to install Hermes or set `HERMES_EXECUTABLE` or
+`HERMES_PYTHON`. Tyde does not infer Hermes from `PYTHON`, `VIRTUAL_ENV`,
+workspace `.venv`/`venv`, `python3`, or `python`; those interpreters are only
+used when explicitly named by `HERMES_PYTHON`.
 
 Setup diagnostics distinguish subprocess failures, probe timeouts, nonzero
 `--version`, missing `Project:`, missing Hermes virtualenv Python, and gateway
