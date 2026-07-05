@@ -8575,8 +8575,155 @@ kbd {
     flex-shrink: 0;
 }
 
+/* Header row wrapping the accordion toggle plus the aggregate task badge */
+.session-settings-header {
+    display: flex;
+    align-items: stretch;
+    position: relative;
+}
+
+.session-settings-header .session-settings-toggle {
+    flex: 1;
+    min-width: 0;
+}
+
+/* Aggregate task usage (root agent + sub-agents), far right of the header.
+   margin-left: auto right-aligns it in rows without a flex: 1 sibling
+   (schema-status text rows, badge-only rows). */
+.session-task-usage {
+    position: relative;
+    display: inline-flex;
+    align-items: stretch;
+    flex-shrink: 0;
+    margin-left: auto;
+}
+
+.session-task-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px var(--space-3);
+    background: transparent;
+    border: none;
+    border-left: 1px solid var(--border-primary);
+    cursor: pointer;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-tertiary);
+    white-space: nowrap;
+    transition: background 0.1s, color 0.1s;
+}
+
+.session-task-toggle:hover,
+.session-task-toggle:focus-visible {
+    background: var(--surface-2);
+    color: var(--text-secondary);
+}
+
+.session-task-label,
+.session-task-status {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.session-task-status-partial {
+    color: var(--warning);
+}
+
+.session-task-status-unavailable {
+    color: var(--error);
+}
+
+.session-task-popover {
+    position: absolute;
+    /* Flush against the header top — a gap here would break the hover
+       region (pointerleave fires while crossing it). */
+    bottom: 100%;
+    right: 4px;
+    z-index: 1000;
+    min-width: min(300px, calc(100vw - 24px));
+    max-width: min(440px, calc(100vw - 24px));
+    max-height: 320px;
+    overflow-y: auto;
+    padding: var(--space-2);
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
+    text-align: left;
+    cursor: default;
+}
+
+.session-task-popover-title {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    padding-bottom: 4px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--border-primary);
+    color: var(--text-secondary);
+}
+
+.session-task-popover-status {
+    color: var(--warning);
+    font-size: 0.68rem;
+}
+
+.session-task-popover-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.session-task-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-family: var(--font-mono);
+}
+
+.session-task-row-name {
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.session-task-row-meta {
+    color: var(--text-tertiary);
+    font-size: 0.68rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.session-task-row-usage {
+    margin-left: auto;
+    display: inline-flex;
+    gap: 8px;
+    flex-shrink: 0;
+    color: var(--text-secondary);
+}
+
+.session-task-row-unavailable {
+    color: var(--warning);
+    font-style: italic;
+}
+
 .session-settings-unavailable {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     padding: 6px var(--space-3);
+}
+
+.session-task-total {
+    color: var(--text-secondary);
 }
 
 .session-settings-unavailable-text {

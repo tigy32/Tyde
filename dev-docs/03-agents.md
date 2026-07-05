@@ -778,6 +778,23 @@ zero when a backend did not report usage. `AgentActivityStats.token_usage` is
 the same `agent_total` snapshot so reconnecting clients can render the current
 total without waiting for another turn.
 
+Task-level token totals are also server-owned. The host emits
+`TaskTokenUsagePayload` on the host stream and includes current rollups in
+`HostBootstrapPayload.task_token_usages`. A rollup is keyed by the active root
+agent/session and sums that root plus descendants from explicit
+`parent_agent_id` relationships. Each agent contributes its strict-self total
+once; parent totals do not absorb sub-agent totals. Missing child usage is
+reported as `partial`/`unavailable` with a typed reason instead of being
+coerced to zero. If every row in an aggregate is unavailable, the aggregate
+status is `unavailable` and split fields such as input/output tokens are omitted
+rather than emitted as real zeroes. Breakdown entries are agent rows and always
+carry an `agent_id`; a live agent that cannot answer its usage snapshot remains
+in the tree as `AgentUnavailable`. Closed descendants are retained in the live
+host's rollup from their last server snapshot. Persisting that
+closed-descendant breakdown across a host restart needs a fuller per-agent usage
+store; the existing session store only has a total token count and not enough
+identity/model detail for this payload.
+
 ---
 
 ## 7. Backends

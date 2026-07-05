@@ -34,6 +34,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::SessionList
+                | FrameKind::TaskTokenUsage
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::AgentActivityStats

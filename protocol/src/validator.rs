@@ -30,13 +30,13 @@ use crate::{
     SetAgentGroupsPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
     SetAgentsViewPreferencesPayload, SetSettingPayload, SkillNotifyPayload, SkillRefreshPayload,
     SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload, SteeringUpsertPayload,
-    StreamPath, TeamCreatePayload, TeamDeletePayload, TeamDraftApplyTemplatePayload,
-    TeamDraftCommitPayload, TeamDraftCreatePayload, TeamDraftDiscardPayload,
-    TeamDraftNotifyPayload, TeamDraftShufflePayload, TeamDraftUpdatePayload,
-    TeamMemberActivatePayload, TeamMemberBindingNotifyPayload, TeamMemberCreatePayload,
-    TeamMemberDeletePayload, TeamMemberNotifyPayload, TeamMemberShufflePayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
+    StreamPath, TaskTokenUsagePayload, TeamCreatePayload, TeamDeletePayload,
+    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
+    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
+    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
+    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
+    TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload, TeamMemberUpdatePayload,
+    TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     ToolExecutionCompletedData, ToolRequest, TriggerWorkflowPayload, WelcomePayload,
     WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
@@ -266,6 +266,9 @@ impl ProtocolValidator {
                     envelope.stream
                 ),
             )),
+            FrameKind::TaskTokenUsage => {
+                parse_host_payload::<TaskTokenUsagePayload>(self, envelope, "TaskTokenUsage")
+            }
             FrameKind::AgentsViewPreferencesNotify => {
                 parse_host_payload::<AgentsViewPreferencesNotifyPayload>(
                     self,
@@ -1862,6 +1865,7 @@ mod tests {
                 team_members: vec![],
                 team_member_bindings: vec![],
                 agents,
+                task_token_usages: Vec::new(),
                 workflow_summaries: vec![],
                 workflow_diagnostics: vec![],
                 workflow_runs: vec![],

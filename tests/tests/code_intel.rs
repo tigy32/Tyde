@@ -41,6 +41,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
+                | FrameKind::TaskTokenUsage
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::ProjectEvent
@@ -64,7 +65,10 @@ async fn expect_project_notify(
         }
         if matches!(
             env.kind,
-            FrameKind::ProjectFileList | FrameKind::ProjectGitStatus | FrameKind::CodeIntelOverview
+            FrameKind::ProjectFileList
+                | FrameKind::ProjectGitStatus
+                | FrameKind::CodeIntelOverview
+                | FrameKind::TaskTokenUsage
         ) {
             continue;
         }
@@ -80,7 +84,10 @@ async fn expect_project_bootstrap(client: &mut client::Connection, context: &str
         }
         if matches!(
             env.kind,
-            FrameKind::ProjectFileList | FrameKind::ProjectGitStatus | FrameKind::CodeIntelOverview
+            FrameKind::ProjectFileList
+                | FrameKind::ProjectGitStatus
+                | FrameKind::CodeIntelOverview
+                | FrameKind::TaskTokenUsage
         ) {
             continue;
         }
@@ -113,6 +120,7 @@ async fn drain_initial_project_state_pushes(client: &mut client::Connection, con
                             | FrameKind::ProjectFileList
                             | FrameKind::ProjectGitStatus
                             | FrameKind::CodeIntelOverview
+                            | FrameKind::TaskTokenUsage
                     ) =>
             {
                 continue;
@@ -265,6 +273,7 @@ async fn wait_for_code_intel_unavailable(
             | FrameKind::AgentError
             | FrameKind::AgentActivitySummary
             | FrameKind::AgentActivityStats
+            | FrameKind::TaskTokenUsage
             | FrameKind::ChatEvent
             | FrameKind::SessionSchemas
             | FrameKind::LaunchProfileCatalogNotify
@@ -338,6 +347,7 @@ async fn wait_for_code_intel_unavailable_with_overview(
             | FrameKind::AgentError
             | FrameKind::AgentActivitySummary
             | FrameKind::AgentActivityStats
+            | FrameKind::TaskTokenUsage
             | FrameKind::ChatEvent
             | FrameKind::SessionSchemas
             | FrameKind::LaunchProfileCatalogNotify
@@ -416,6 +426,7 @@ async fn wait_for_code_intel_warm_unavailable_overview(
             | FrameKind::AgentError
             | FrameKind::AgentActivitySummary
             | FrameKind::AgentActivityStats
+            | FrameKind::TaskTokenUsage
             | FrameKind::ChatEvent
             | FrameKind::SessionSchemas
             | FrameKind::LaunchProfileCatalogNotify
@@ -466,6 +477,7 @@ async fn wait_for_code_intel_status_matching(
             | FrameKind::SessionSettings
             | FrameKind::TeamPresetCatalogNotify
             | FrameKind::SessionList
+            | FrameKind::TaskTokenUsage
             | FrameKind::WorkflowNotify
             | FrameKind::AgentsViewPreferencesNotify
             | FrameKind::CodeIntelError => {}
@@ -508,6 +520,7 @@ async fn wait_for_code_intel_overview_matching(
             | FrameKind::SessionSettings
             | FrameKind::TeamPresetCatalogNotify
             | FrameKind::SessionList
+            | FrameKind::TaskTokenUsage
             | FrameKind::WorkflowNotify
             | FrameKind::AgentsViewPreferencesNotify
             | FrameKind::CodeIntelStatus

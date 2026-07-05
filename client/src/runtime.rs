@@ -21,8 +21,8 @@ use protocol::{
     ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, QueuedMessagesPayload,
     SendMessagePayload, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
     SessionSettingsPayload, SetAgentNamePayload, SetSessionSettingsPayload, SkillNotifyPayload,
-    SpawnAgentPayload, SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload,
-    TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
+    SpawnAgentPayload, SteeringNotifyPayload, StreamPath, TaskTokenUsagePayload,
+    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
     TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalOutputPayload, TerminalResizePayload, TerminalSendPayload,
@@ -131,6 +131,7 @@ pub enum HostEvent {
     HostBootstrap(Box<HostBootstrapPayload>),
     HostSettings(HostSettingsPayload),
     AgentActivitySummary(AgentActivitySummaryPayload),
+    TaskTokenUsage(TaskTokenUsagePayload),
     AgentsViewPreferencesNotify(AgentsViewPreferencesNotifyPayload),
     BackendSetup(BackendSetupPayload),
     BackendConfigSchemas(BackendConfigSchemasPayload),
@@ -859,6 +860,14 @@ async fn handle_host_envelope(
                 Err(_) => return false,
             };
             let _ = host_tx.send(HostEvent::AgentActivitySummary(payload)).await;
+            true
+        }
+        FrameKind::TaskTokenUsage => {
+            let payload: TaskTokenUsagePayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::TaskTokenUsage(payload)).await;
             true
         }
         FrameKind::AgentsViewPreferencesNotify => {

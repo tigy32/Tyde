@@ -377,7 +377,7 @@ async fn spawn_project_agent_with_prompt(
     let new_agent = expect_new_agent(client, "new origin agent").await;
     let mut saw_start = false;
     let mut saw_idle = !wait_until_idle;
-    let mut session_id = None;
+    let mut session_id = new_agent.session_id.clone();
     while !saw_start || !saw_idle || session_id.is_none() {
         let env = next_env(client, "origin agent startup").await;
         match env.kind {
@@ -386,8 +386,11 @@ async fn spawn_project_agent_with_prompt(
                     env.parse_payload().expect("agent bootstrap payload");
                 for event in bootstrap.events {
                     match event {
-                        AgentBootstrapEvent::AgentStart(_) => {
+                        AgentBootstrapEvent::AgentStart(payload) => {
                             saw_start = true;
+                            if let Some(start_session_id) = payload.session_id {
+                                session_id = Some(start_session_id);
+                            }
                         }
                         AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(false)) => {
                             saw_idle = true;
@@ -397,8 +400,11 @@ async fn spawn_project_agent_with_prompt(
                 }
             }
             FrameKind::AgentStart if env.stream == new_agent.instance_stream => {
-                let _: AgentStartPayload = env.parse_payload().expect("agent start payload");
+                let payload: AgentStartPayload = env.parse_payload().expect("agent start payload");
                 saw_start = true;
+                if let Some(start_session_id) = payload.session_id {
+                    session_id = Some(start_session_id);
+                }
             }
             FrameKind::ChatEvent if env.stream == new_agent.instance_stream => {
                 let event: ChatEvent = env.parse_payload().expect("chat event");

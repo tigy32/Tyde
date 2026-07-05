@@ -16,8 +16,9 @@ use protocol::{
     ProjectNotifyPayload, ProjectRenamePayload, ProjectRootPath, SendMessagePayload,
     SendMessageToolResponse, SessionHistoryPayload, SessionListPayload, SessionSettingValue,
     SessionSettingsValues, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamEndData,
-    StreamPath, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
-    ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
+    StreamPath, TaskTokenUsagePayload, TaskTokenUsageScope, TaskTokenUsageStatus,
+    TaskTokenUsageUnavailableReason, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType, write_envelope,
 };
 use rmcp::{
     ClientHandler, ServiceExt,
@@ -69,6 +70,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::BackendConfigSnapshots
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList
+                | FrameKind::TaskTokenUsage
                 | FrameKind::WorkflowNotify
         ) {
             continue;
@@ -231,6 +233,7 @@ async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: 
                 | FrameKind::BackendConfigSchemas
                 | FrameKind::BackendConfigSnapshots
                 | FrameKind::QueuedMessages
+                | FrameKind::TaskTokenUsage
                 | FrameKind::WorkflowNotify
         ) {
             continue;
@@ -246,7 +249,7 @@ async fn expect_chat_event(client: &mut client::Connection, context: &str) -> En
         let env = expect_next_event(client, context).await;
         if matches!(
             env.kind,
-            FrameKind::SessionList | FrameKind::AgentActivityStats
+            FrameKind::SessionList | FrameKind::AgentActivityStats | FrameKind::TaskTokenUsage
         ) {
             continue;
         }
@@ -321,6 +324,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::HostSettings
                             | FrameKind::WorkflowNotify
                             | FrameKind::AgentActivityStats
+                            | FrameKind::TaskTokenUsage
                     ) =>
             {
                 continue;
@@ -877,6 +881,56 @@ fn assert_unavailable_turn_usage(usage: &Option<MessageTokenUsage>) {
         }) => {}
         other => panic!("expected unavailable turn token usage, got {other:?}"),
     }
+}
+
+async fn expect_task_token_usage_matching(
+    client: &mut client::Connection,
+    root_agent_id: &protocol::AgentId,
+    context: &str,
+    mut matches_payload: impl FnMut(&TaskTokenUsagePayload) -> bool,
+) -> TaskTokenUsagePayload {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for task token usage {context}"
+        );
+        let env = match tokio::time::timeout(remaining, client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before task token usage {context}"),
+            Ok(Err(err)) => panic!("next_event failed before task token usage {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for task token usage {context}"),
+        };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        if env.kind == FrameKind::AgentBootstrap {
+            let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
+            let _ = record_agent_bootstrap_events(&env.stream, bootstrap);
+            continue;
+        }
+        if env.kind != FrameKind::TaskTokenUsage {
+            continue;
+        }
+        let payload: TaskTokenUsagePayload = env.parse_payload().expect("TaskTokenUsage");
+        if &payload.root_agent_id == root_agent_id && matches_payload(&payload) {
+            return payload;
+        }
+    }
+}
+
+fn assert_known_task_scope(scope: &TaskTokenUsageScope, expected_total: u64) {
+    match scope {
+        TaskTokenUsageScope::Known { usage } => {
+            assert_eq!(usage.total_tokens, expected_total);
+        }
+        other => panic!("expected known task token usage, got {other:?}"),
+    }
+}
+
+fn assert_known_task_status(status: &TaskTokenUsageStatus) {
+    assert_eq!(status, &TaskTokenUsageStatus::Known);
 }
 
 async fn spawn_token_usage_agent(
@@ -1538,6 +1592,7 @@ async fn expect_no_agent_error_message(
                             | FrameKind::BackendConfigSnapshots
                             | FrameKind::QueuedMessages
                             | FrameKind::SessionList
+                            | FrameKind::TaskTokenUsage
                             | FrameKind::WorkflowNotify
                     ) =>
             {
@@ -1929,6 +1984,342 @@ async fn missing_backend_usage_is_unavailable_not_zero() {
     )
     .await;
     assert_unavailable_turn_usage(&stream_end.message.token_usage);
+}
+
+#[tokio::test]
+async fn task_token_usage_rolls_up_parent_child_and_grandchild() {
+    let mut fixture = Fixture::new().await;
+    let root = spawn_token_usage_agent(&mut fixture.client, "usage-root", "root usage").await;
+    let _ = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &root.instance_stream,
+        "mock backend response to: root usage",
+    )
+    .await;
+    let child = spawn_user_child(
+        &mut fixture.client,
+        &root.agent_id,
+        "usage-child",
+        "child usage",
+        "/tmp/usage-child",
+    )
+    .await;
+    let grandchild = spawn_user_child(
+        &mut fixture.client,
+        &child.agent_id,
+        "usage-grandchild",
+        "grandchild usage",
+        "/tmp/usage-grandchild",
+    )
+    .await;
+
+    let payload = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &root.agent_id,
+        "root child grandchild aggregate",
+        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 3,
+    )
+    .await;
+    assert_known_task_status(&payload.total.status);
+    assert_known_task_status(&payload.descendant_usage.status);
+    assert_known_task_scope(&payload.self_usage, MOCK_TURN_TOKEN_TOTAL);
+    assert_eq!(
+        payload.descendant_usage.usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL * 2
+    );
+    assert_eq!(payload.descendant_count, 2);
+    assert_eq!(payload.breakdown.len(), 3);
+    assert_eq!(&payload.breakdown[0].agent_id, &root.agent_id);
+    assert_eq!(payload.breakdown[0].depth, 0);
+    assert_eq!(payload.breakdown[0].tree_index, 0);
+    assert_eq!(payload.breakdown[0].parent_agent_id, None);
+    assert_eq!(payload.breakdown[0].backend_kind, BackendKind::Claude);
+    assert_eq!(payload.breakdown[0].model.as_deref(), Some("mock"));
+    assert_known_task_scope(&payload.breakdown[0].usage, MOCK_TURN_TOKEN_TOTAL);
+    assert_eq!(&payload.breakdown[1].agent_id, &child.agent_id);
+    assert_eq!(
+        payload.breakdown[1].parent_agent_id.as_ref(),
+        Some(&root.agent_id)
+    );
+    assert_eq!(payload.breakdown[1].depth, 1);
+    assert_eq!(payload.breakdown[1].tree_index, 1);
+    assert_known_task_scope(&payload.breakdown[1].usage, MOCK_TURN_TOKEN_TOTAL);
+    assert_eq!(&payload.breakdown[2].agent_id, &grandchild.agent_id);
+    assert_eq!(
+        payload.breakdown[2].parent_agent_id.as_ref(),
+        Some(&child.agent_id)
+    );
+    assert_eq!(payload.breakdown[2].depth, 2);
+    assert_eq!(payload.breakdown[2].tree_index, 2);
+    assert_known_task_scope(&payload.breakdown[2].usage, MOCK_TURN_TOKEN_TOTAL);
+
+    let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let bootstrapped = bootstrap
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == root.agent_id)
+        .expect("HostBootstrap should include root task token usage");
+    assert_eq!(
+        bootstrapped.total.usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL * 3
+    );
+    assert_eq!(bootstrapped.descendant_count, 2);
+}
+
+#[tokio::test]
+async fn task_token_usage_marks_missing_descendant_usage_partial() {
+    let mut fixture = Fixture::new().await;
+    let root = spawn_token_usage_agent(&mut fixture.client, "partial-root", "root usage").await;
+    let _ = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &root.instance_stream,
+        "mock backend response to: root usage",
+    )
+    .await;
+    let child = spawn_user_child(
+        &mut fixture.client,
+        &root.agent_id,
+        "partial-child",
+        &format!("child missing usage {MOCK_NO_USAGE_SENTINEL}"),
+        "/tmp/partial-child",
+    )
+    .await;
+
+    let payload = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &root.agent_id,
+        "partial aggregate",
+        |payload| {
+            matches!(
+                &payload.total.status,
+                TaskTokenUsageStatus::Partial {
+                    unavailable_count: 1,
+                    reasons
+                } if reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+            )
+        },
+    )
+    .await;
+    assert_eq!(payload.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL);
+    assert_eq!(payload.descendant_count, 1);
+    match &payload.total.status {
+        TaskTokenUsageStatus::Partial {
+            unavailable_count,
+            reasons,
+        } => {
+            assert_eq!(*unavailable_count, 1);
+            assert_eq!(
+                reasons,
+                &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+            );
+        }
+        other => panic!("expected partial aggregate, got {other:?}"),
+    }
+    match &payload.descendant_usage.status {
+        TaskTokenUsageStatus::Unavailable {
+            unavailable_count,
+            reasons,
+        } => {
+            assert_eq!(*unavailable_count, 1);
+            assert_eq!(
+                reasons,
+                &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+            );
+        }
+        other => panic!("expected unavailable descendant usage, got {other:?}"),
+    }
+    let child_entry = payload
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id.eq(&child.agent_id))
+        .expect("child breakdown entry");
+    assert!(matches!(
+        child_entry.usage,
+        TaskTokenUsageScope::Unavailable {
+            reason: TaskTokenUsageUnavailableReason::BackendDidNotReport
+        }
+    ));
+}
+
+#[tokio::test]
+async fn task_token_usage_all_unavailable_omits_split_zeroes() {
+    let mut fixture = Fixture::new().await;
+    let root = spawn_token_usage_agent(
+        &mut fixture.client,
+        "unavailable-root",
+        &format!("root missing usage {MOCK_NO_USAGE_SENTINEL}"),
+    )
+    .await;
+    let _ = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &root.instance_stream,
+        "mock backend response to: root missing usage",
+    )
+    .await;
+    let child = spawn_user_child(
+        &mut fixture.client,
+        &root.agent_id,
+        "unavailable-child",
+        &format!("child missing usage {MOCK_NO_USAGE_SENTINEL}"),
+        "/tmp/unavailable-child",
+    )
+    .await;
+
+    let payload = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &root.agent_id,
+        "all-unavailable aggregate",
+        |payload| {
+            matches!(
+                &payload.total.status,
+                TaskTokenUsageStatus::Unavailable {
+                    unavailable_count: 2,
+                    reasons
+                } if reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+            )
+        },
+    )
+    .await;
+    assert_eq!(payload.total.usage.total_tokens, 0);
+    assert_eq!(payload.total.usage.input_tokens, None);
+    assert_eq!(payload.total.usage.output_tokens, None);
+    assert_eq!(payload.descendant_usage.usage.total_tokens, 0);
+    assert_eq!(payload.descendant_usage.usage.input_tokens, None);
+    assert_eq!(payload.descendant_usage.usage.output_tokens, None);
+    assert_eq!(payload.descendant_count, 1);
+    assert!(matches!(
+        payload.self_usage,
+        TaskTokenUsageScope::Unavailable {
+            reason: TaskTokenUsageUnavailableReason::BackendDidNotReport
+        }
+    ));
+    let child_entry = payload
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id.eq(&child.agent_id))
+        .expect("child breakdown entry");
+    assert!(matches!(
+        child_entry.usage,
+        TaskTokenUsageScope::Unavailable {
+            reason: TaskTokenUsageUnavailableReason::BackendDidNotReport
+        }
+    ));
+}
+
+#[tokio::test]
+async fn task_token_usage_updates_when_child_usage_changes() {
+    let mut fixture = Fixture::new().await;
+    let root = spawn_token_usage_agent(&mut fixture.client, "update-root", "root usage").await;
+    let _ = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &root.instance_stream,
+        "mock backend response to: root usage",
+    )
+    .await;
+    let child = spawn_user_child(
+        &mut fixture.client,
+        &root.agent_id,
+        "update-child",
+        "child first usage",
+        "/tmp/update-child",
+    )
+    .await;
+    let first = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &root.agent_id,
+        "initial child aggregate",
+        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 2,
+    )
+    .await;
+    assert_known_task_status(&first.total.status);
+
+    fixture
+        .client
+        .send_message(&child.instance_stream, "child second usage".to_owned())
+        .await
+        .expect("send child follow-up");
+    let _ = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "mock backend response to: child second usage",
+    )
+    .await;
+
+    let updated = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &root.agent_id,
+        "updated child aggregate",
+        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 3,
+    )
+    .await;
+    assert_known_task_status(&updated.total.status);
+    assert_eq!(
+        updated.descendant_usage.usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL * 2
+    );
+    let child_entry = updated
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id.eq(&child.agent_id))
+        .expect("child breakdown entry");
+    assert_known_task_scope(&child_entry.usage, MOCK_TURN_TOKEN_TOTAL * 2);
+}
+
+#[tokio::test]
+async fn task_token_usage_keeps_closed_child_in_live_root_rollup() {
+    let mut fixture = Fixture::new().await;
+    let root = spawn_token_usage_agent(&mut fixture.client, "closed-root", "root usage").await;
+    let _ = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &root.instance_stream,
+        "mock backend response to: root usage",
+    )
+    .await;
+    let child = spawn_user_child(
+        &mut fixture.client,
+        &root.agent_id,
+        "closed-child",
+        "child usage",
+        "/tmp/closed-child",
+    )
+    .await;
+    let before_close = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &root.agent_id,
+        "aggregate before child close",
+        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 2,
+    )
+    .await;
+    assert_known_task_status(&before_close.total.status);
+
+    fixture
+        .client
+        .close_agent(&child.instance_stream)
+        .await
+        .expect("close child");
+    let closed = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "closed child AgentClosed",
+    )
+    .await;
+    let payload: AgentClosedPayload = closed.parse_payload().expect("AgentClosed payload");
+    assert_eq!(payload.agent_id, child.agent_id);
+
+    let after_close = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &root.agent_id,
+        "aggregate immediately after child close",
+        |payload| payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 2,
+    )
+    .await;
+    assert_eq!(after_close.descendant_count, 1);
+    let child_entry = after_close
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id.eq(&child.agent_id))
+        .expect("closed child breakdown entry");
+    assert_known_task_scope(&child_entry.usage, MOCK_TURN_TOKEN_TOTAL);
 }
 
 #[tokio::test]
@@ -5050,6 +5441,7 @@ async fn multiple_agents() {
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionList
                 | FrameKind::AgentActivityStats
+                | FrameKind::TaskTokenUsage
         ) {
             continue;
         }

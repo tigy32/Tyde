@@ -4054,6 +4054,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                 team_members: vec![],
                 team_member_bindings: vec![],
                 agents: vec![new_agent],
+                task_token_usages: Vec::new(),
                 workflow_summaries: vec![],
                 workflow_diagnostics: vec![],
                 workflow_runs: vec![],

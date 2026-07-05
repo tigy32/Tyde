@@ -118,6 +118,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::SessionList
+                | FrameKind::TaskTokenUsage
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::AgentActivityStats
@@ -160,6 +161,7 @@ async fn expect_raw_event_on_stream(
                 | FrameKind::QueuedMessages
                 | FrameKind::SessionSettings
                 | FrameKind::TeamPresetCatalogNotify
+                | FrameKind::TaskTokenUsage
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
         ) {
@@ -183,6 +185,16 @@ async fn expect_chat_event_on_stream(
             continue;
         }
         assert_eq!(env.kind, FrameKind::ChatEvent);
+        return env.parse_payload().expect("failed to parse ChatEvent");
+    }
+}
+
+async fn expect_chat_event(client: &mut client::Connection, context: &str) -> ChatEvent {
+    loop {
+        let env = expect_next_event(client, context).await;
+        if env.kind != FrameKind::ChatEvent {
+            continue;
+        }
         return env.parse_payload().expect("failed to parse ChatEvent");
     }
 }
@@ -395,6 +407,7 @@ async fn wait_for_session_list(
                 | FrameKind::NewAgent
                 | FrameKind::AgentStart
                 | FrameKind::AgentError
+                | FrameKind::TaskTokenUsage
                 | FrameKind::ChatEvent
         ) {
             continue;
@@ -412,29 +425,17 @@ async fn wait_for_session_list(
 }
 
 async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
-    let env = expect_next_event(client, "TypingStatusChanged(true) or StreamStart").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    let event = expect_chat_event(client, "TypingStatusChanged(true) or StreamStart").await;
     let delta = match event {
         ChatEvent::TypingStatusChanged(true) => {
-            let env = expect_next_event(client, "StreamStart").await;
-            assert_eq!(env.kind, FrameKind::ChatEvent);
-            let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+            let event = expect_chat_event(client, "StreamStart").await;
             match event {
-                ChatEvent::StreamStart(_) => {
-                    let env = expect_next_event(client, "StreamDelta").await;
-                    assert_eq!(env.kind, FrameKind::ChatEvent);
-                    env.parse_payload().expect("failed to parse ChatEvent")
-                }
+                ChatEvent::StreamStart(_) => expect_chat_event(client, "StreamDelta").await,
                 delta @ ChatEvent::StreamDelta(_) => delta,
                 other => panic!("expected StreamStart or StreamDelta, got {other:?}"),
             }
         }
-        ChatEvent::StreamStart(_) => {
-            let env = expect_next_event(client, "StreamDelta").await;
-            assert_eq!(env.kind, FrameKind::ChatEvent);
-            env.parse_payload().expect("failed to parse ChatEvent")
-        }
+        ChatEvent::StreamStart(_) => expect_chat_event(client, "StreamDelta").await,
         delta @ ChatEvent::StreamDelta(_) => delta,
         other => panic!("expected TypingStatusChanged(true) or StreamStart, got {other:?}"),
     };
@@ -450,14 +451,10 @@ async fn expect_turn(client: &mut client::Connection, expected_text: &str) {
         other => panic!("expected StreamDelta, got {other:?}"),
     }
 
-    let env = expect_next_event(client, "StreamEnd").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    let event = expect_chat_event(client, "StreamEnd").await;
     assert!(matches!(event, ChatEvent::StreamEnd(..)));
 
-    let env = expect_next_event(client, "TypingStatusChanged(false)").await;
-    assert_eq!(env.kind, FrameKind::ChatEvent);
-    let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+    let event = expect_chat_event(client, "TypingStatusChanged(false)").await;
     assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
 }
 
@@ -478,6 +475,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                             | FrameKind::SessionSettings
                             | FrameKind::TeamPresetCatalogNotify
                             | FrameKind::SessionList
+                            | FrameKind::TaskTokenUsage
                             | FrameKind::WorkflowNotify
                             | FrameKind::AgentsViewPreferencesNotify
                     ) =>

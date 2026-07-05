@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 31;
+pub const PROTOCOL_VERSION: u32 = 32;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -677,6 +677,7 @@ pub enum FrameKind {
     NewAgent,
     AgentActivitySummary,
     AgentActivityStats,
+    TaskTokenUsage,
     AgentStart,
     AgentRenamed,
     AgentCompactNotify,
@@ -841,6 +842,7 @@ impl fmt::Display for FrameKind {
             Self::NewAgent => f.write_str("new_agent"),
             Self::AgentActivitySummary => f.write_str("agent_activity_summary"),
             Self::AgentActivityStats => f.write_str("agent_activity_stats"),
+            Self::TaskTokenUsage => f.write_str("task_token_usage"),
             Self::AgentStart => f.write_str("agent_start"),
             Self::AgentRenamed => f.write_str("agent_renamed"),
             Self::AgentCompactNotify => f.write_str("agent_compact_notify"),
@@ -1239,6 +1241,8 @@ pub struct HostBootstrapPayload {
     pub team_members: Vec<TeamMember>,
     pub team_member_bindings: Vec<TeamMemberBindingPayload>,
     pub agents: Vec<NewAgentPayload>,
+    #[serde(default)]
+    pub task_token_usages: Vec<TaskTokenUsagePayload>,
     #[serde(default)]
     pub workflow_summaries: Vec<WorkflowSummary>,
     #[serde(default)]
@@ -2691,6 +2695,161 @@ pub struct AgentActivityStats {
 pub struct AgentActivityStatsPayload {
     pub agent_id: AgentId,
     pub stats: AgentActivityStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTokenUsagePayload {
+    pub root_agent_id: AgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_session_id: Option<SessionId>,
+    pub total: TaskTokenUsageAggregate,
+    pub self_usage: TaskTokenUsageScope,
+    pub descendant_usage: TaskTokenUsageAggregate,
+    pub descendant_count: u32,
+    pub breakdown: Vec<TaskTokenUsageEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTokenUsageAggregate {
+    pub usage: TaskTokenUsageAmount,
+    pub status: TaskTokenUsageStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTokenUsageEntry {
+    pub agent_id: AgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<SessionId>,
+    pub name: String,
+    pub origin: AgentOrigin,
+    pub backend_kind: BackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub depth: u32,
+    pub tree_index: u32,
+    pub usage: TaskTokenUsageScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTokenUsageAmount {
+    pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_prompt_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+}
+
+impl TaskTokenUsageAmount {
+    pub fn zero() -> Self {
+        Self {
+            total_tokens: 0,
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cached_prompt_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+            reasoning_tokens: Some(0),
+        }
+    }
+
+    pub fn from_token_usage(usage: &TokenUsage) -> Self {
+        Self {
+            total_tokens: usage.total_tokens,
+            input_tokens: Some(usage.input_tokens),
+            output_tokens: Some(usage.output_tokens),
+            cached_prompt_tokens: usage.cached_prompt_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+        }
+    }
+
+    pub fn total_only(total_tokens: u64) -> Self {
+        Self {
+            total_tokens,
+            input_tokens: None,
+            output_tokens: None,
+            cached_prompt_tokens: None,
+            cache_creation_input_tokens: None,
+            reasoning_tokens: None,
+        }
+    }
+
+    pub fn saturating_add(&mut self, other: &Self) {
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        add_optional_usage_amount(&mut self.input_tokens, other.input_tokens);
+        add_optional_usage_amount(&mut self.output_tokens, other.output_tokens);
+        add_optional_usage_amount(&mut self.cached_prompt_tokens, other.cached_prompt_tokens);
+        add_optional_usage_amount(
+            &mut self.cache_creation_input_tokens,
+            other.cache_creation_input_tokens,
+        );
+        add_optional_usage_amount(&mut self.reasoning_tokens, other.reasoning_tokens);
+    }
+}
+
+fn add_optional_usage_amount(total: &mut Option<u64>, value: Option<u64>) {
+    *total = match (*total, value) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        _ => None,
+    };
+}
+
+impl Default for TaskTokenUsageAmount {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskTokenUsageScope {
+    Known {
+        usage: Box<TaskTokenUsageAmount>,
+    },
+    Unavailable {
+        reason: TaskTokenUsageUnavailableReason,
+    },
+}
+
+impl TaskTokenUsageScope {
+    pub fn known_usage(&self) -> Option<&TaskTokenUsageAmount> {
+        match self {
+            Self::Known { usage } => Some(usage),
+            Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskTokenUsageStatus {
+    Known,
+    Partial {
+        unavailable_count: u32,
+        reasons: Vec<TaskTokenUsageUnavailableReason>,
+    },
+    Unavailable {
+        unavailable_count: u32,
+        reasons: Vec<TaskTokenUsageUnavailableReason>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTokenUsageUnavailableReason {
+    NoAssistantTurnCompleted,
+    BackendDidNotReport,
+    ProviderScopeAmbiguous,
+    AgentUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5740,8 +5899,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_one() {
-        assert_eq!(PROTOCOL_VERSION, 31);
+    fn protocol_version_is_thirty_two() {
+        assert_eq!(PROTOCOL_VERSION, 32);
     }
 
     #[test]
@@ -5844,6 +6003,117 @@ mod search_serde_tests {
             round_trip(&bootstrap).events.as_slice(),
             [AgentBootstrapEvent::AgentActivityStats(round_tripped)] if round_tripped == &payload
         ));
+    }
+
+    #[test]
+    fn task_token_usage_payload_round_trips() {
+        assert_eq!(FrameKind::TaskTokenUsage.to_string(), "task_token_usage");
+        let usage = TaskTokenUsageAmount {
+            total_tokens: 42,
+            input_tokens: Some(30),
+            output_tokens: Some(12),
+            cached_prompt_tokens: Some(5),
+            cache_creation_input_tokens: None,
+            reasoning_tokens: Some(3),
+        };
+        let payload = TaskTokenUsagePayload {
+            root_agent_id: AgentId("root".to_owned()),
+            root_session_id: Some(SessionId("root-session".to_owned())),
+            total: TaskTokenUsageAggregate {
+                usage: usage.clone(),
+                status: TaskTokenUsageStatus::Partial {
+                    unavailable_count: 1,
+                    reasons: vec![TaskTokenUsageUnavailableReason::BackendDidNotReport],
+                },
+            },
+            self_usage: TaskTokenUsageScope::Known {
+                usage: Box::new(usage.clone()),
+            },
+            descendant_usage: TaskTokenUsageAggregate {
+                usage: TaskTokenUsageAmount::total_only(10),
+                status: TaskTokenUsageStatus::Known,
+            },
+            descendant_count: 2,
+            breakdown: vec![TaskTokenUsageEntry {
+                agent_id: AgentId("root".to_owned()),
+                session_id: Some(SessionId("root-session".to_owned())),
+                parent_agent_id: None,
+                parent_session_id: None,
+                name: "Root".to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                model: Some("mock".to_owned()),
+                depth: 0,
+                tree_index: 0,
+                usage: TaskTokenUsageScope::Unavailable {
+                    reason: TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous,
+                },
+            }],
+        };
+
+        assert_eq!(round_trip(&payload), payload);
+        let mut entry_without_agent_id =
+            serde_json::to_value(&payload.breakdown[0]).expect("serialize entry");
+        entry_without_agent_id
+            .as_object_mut()
+            .expect("entry object")
+            .remove("agent_id");
+        assert!(
+            serde_json::from_value::<TaskTokenUsageEntry>(entry_without_agent_id).is_err(),
+            "TaskTokenUsageEntry.agent_id is required for agent breakdown rows"
+        );
+        let bootstrap = HostBootstrapPayload {
+            settings: HostSettings {
+                enabled_backends: Vec::new(),
+                default_backend: None,
+                enable_mobile_connections: false,
+                mobile_broker_url: None,
+                tyde_debug_mcp_enabled: false,
+                tyde_agent_control_mcp_enabled: true,
+                complexity_tiers_enabled: false,
+                backend_tier_configs: HashMap::new(),
+                background_agent_features: BackgroundAgentFeaturesSettings::default(),
+                code_intel: CodeIntelSettings::default(),
+                backend_config: HashMap::new(),
+                launch_profiles: Vec::new(),
+            },
+            mobile_access: MobileAccessStatePayload {
+                broker_status: MobileBrokerStatus::Disabled,
+                pairing: MobilePairingState::Idle,
+                paired_devices: Vec::new(),
+            },
+            backend_setup: BackendSetupPayload {
+                backends: Vec::new(),
+            },
+            session_schemas: Vec::new(),
+            backend_config_schemas: Vec::new(),
+            backend_config_snapshots: Vec::new(),
+            launch_profile_catalog: LaunchProfileCatalog::default(),
+            sessions: Vec::new(),
+            projects: Vec::new(),
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            steering: Vec::new(),
+            custom_agents: Vec::new(),
+            team_preset_catalog: TeamPresetCatalog {
+                role_presets: Vec::new(),
+                personality_traits: Vec::new(),
+                personality_presets: Vec::new(),
+                team_templates: Vec::new(),
+            },
+            team_drafts: Vec::new(),
+            teams: Vec::new(),
+            team_members: Vec::new(),
+            team_member_bindings: Vec::new(),
+            agents: Vec::new(),
+            task_token_usages: vec![payload.clone()],
+            workflow_summaries: Vec::new(),
+            workflow_diagnostics: Vec::new(),
+            workflow_runs: Vec::new(),
+            workflow_locations: Vec::new(),
+            agents_view_preferences: None,
+        };
+        assert_eq!(round_trip(&bootstrap).task_token_usages, vec![payload]);
     }
 
     #[test]

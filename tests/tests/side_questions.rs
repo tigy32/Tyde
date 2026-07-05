@@ -98,16 +98,24 @@ fn record_agent_bootstrap_events(
     let first = events.next();
     let mut rest = events.collect::<VecDeque<_>>();
     if !rest.is_empty() {
-        pending_agent_events()
-            .lock()
-            .expect("pending agent event mutex poisoned")
-            .entry(pending_key)
-            .or_default()
-            .entry(stream.clone())
-            .or_default()
-            .append(&mut rest);
+        push_pending_agent_events(pending_key, stream, &mut rest);
     }
     first
+}
+
+fn push_pending_agent_events(
+    pending_key: usize,
+    stream: &StreamPath,
+    events: &mut VecDeque<Envelope>,
+) {
+    pending_agent_events()
+        .lock()
+        .expect("pending agent event mutex poisoned")
+        .entry(pending_key)
+        .or_default()
+        .entry(stream.clone())
+        .or_default()
+        .append(events);
 }
 
 fn pop_pending_agent_event(pending_key: usize) -> Option<Envelope> {
@@ -139,6 +147,7 @@ fn is_noise(env: &Envelope) -> bool {
             | FrameKind::LaunchProfileCatalogNotify
             | FrameKind::BackendSetup
             | FrameKind::TeamPresetCatalogNotify
+            | FrameKind::TaskTokenUsage
             | FrameKind::HostSettings
     )
 }
@@ -199,10 +208,18 @@ async fn expect_agent_start(
     stream: &StreamPath,
     context: &str,
 ) -> protocol::AgentStartPayload {
+    let pending_key = client as *mut client::Connection as usize;
+    let mut deferred = VecDeque::new();
     loop {
         let env = expect_event(client, context).await;
         if env.stream == *stream && env.kind == FrameKind::AgentStart {
+            if !deferred.is_empty() {
+                push_pending_agent_events(pending_key, stream, &mut deferred);
+            }
             return env.parse_payload().expect("parse AgentStartPayload");
+        }
+        if env.stream == *stream {
+            deferred.push_back(env);
         }
     }
 }
@@ -246,10 +263,14 @@ async fn collect_turn_delta_text(
         }
         let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
         match event {
+            ChatEvent::MessageAdded(message) => {
+                text.push_str(&message.content);
+                return text;
+            }
             ChatEvent::TypingStatusChanged(true) => saw_turn = true,
             ChatEvent::StreamDelta(delta) => text.push_str(&delta.text),
             ChatEvent::StreamEnd(end) => text.push_str(&end.message.content),
-            ChatEvent::TypingStatusChanged(false) if saw_turn => return text,
+            ChatEvent::TypingStatusChanged(false) if saw_turn || !text.is_empty() => return text,
             _ => {}
         }
     }

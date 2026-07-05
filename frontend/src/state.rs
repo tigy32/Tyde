@@ -19,7 +19,7 @@ use protocol::{
     ProjectRootPath, ProjectSearchFileResult, QueuedMessageEntry, Review, ReviewCommentId,
     ReviewId, ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry,
     SessionSettingsValues, SessionSummary, Skill, SkillId, SmartViewId, Steering, SteeringId,
-    StreamPath, TaskList, Team, TeamDraft, TeamDraftId, TeamId, TeamMember,
+    StreamPath, TaskList, TaskTokenUsagePayload, Team, TeamDraft, TeamDraftId, TeamId, TeamMember,
     TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
     TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
     ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
@@ -1303,6 +1303,13 @@ pub struct AppState {
     /// these verbatim and never derives tool/token counts from chat rows. Cleared
     /// on agent close and host disconnect.
     pub agent_activity_stats: RwSignal<HashMap<ActiveAgentRef, AgentActivityStats>>,
+    /// Server-authoritative task token rollups (root agent + descendants),
+    /// keyed by the owning `(host_id, root_agent_id)`. Populated from
+    /// `TaskTokenUsage` host-stream frames and host bootstrap; the frontend
+    /// renders totals and breakdown rows verbatim and never sums entries
+    /// itself. Cleared on agent close and host disconnect; a host bootstrap
+    /// replaces the host's full set.
+    pub task_token_usage: RwSignal<HashMap<ActiveAgentRef, TaskTokenUsagePayload>>,
     pub center_zone: RwSignal<CenterZoneState>,
     /// Tabs whose content components are currently mounted, MRU-first. The
     /// active tab is always at the front; the next slot (if any) is the most
@@ -1697,6 +1704,7 @@ impl AppState {
             session_history: RwSignal::new(HashMap::new()),
             streaming_text: RwSignal::new(HashMap::new()),
             agent_activity_stats: RwSignal::new(HashMap::new()),
+            task_token_usage: RwSignal::new(HashMap::new()),
             tool_progress: RwSignal::new(HashMap::new()),
             chat_input: RwSignal::new(String::new()),
             task_lists: RwSignal::new(HashMap::new()),
@@ -2061,6 +2069,12 @@ impl AppState {
             map.remove(agent_id);
         });
         self.agent_activity_stats.update(|map| {
+            map.remove(&ActiveAgentRef {
+                host_id: host_id.to_owned(),
+                agent_id: agent_id.clone(),
+            });
+        });
+        self.task_token_usage.update(|map| {
             map.remove(&ActiveAgentRef {
                 host_id: host_id.to_owned(),
                 agent_id: agent_id.clone(),
@@ -2756,6 +2770,9 @@ impl AppState {
                 map.retain(|id, _| !drop_set.contains(id));
             });
             self.agent_activity_stats.update(|map| {
+                map.retain(|key, _| key.host_id != host_id);
+            });
+            self.task_token_usage.update(|map| {
                 map.retain(|key, _| key.host_id != host_id);
             });
             self.session_history.update(|map| {

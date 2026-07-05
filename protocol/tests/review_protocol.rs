@@ -739,6 +739,7 @@ fn bootstrap_payloads_round_trip() {
             instance_stream: StreamPath("/agent/agent-1/instance-1".to_owned()),
             activity_summary: Default::default(),
         }],
+        task_token_usages: Vec::new(),
         workflow_summaries: vec![],
         workflow_diagnostics: vec![],
         workflow_runs: vec![],

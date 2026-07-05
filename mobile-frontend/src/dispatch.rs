@@ -19,7 +19,7 @@ use protocol::{
     QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload, ReviewEventPayload,
     ReviewId, SeqMismatch, SessionHistoryPayload, SessionListPayload, SessionSchemasPayload,
     SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload, StreamPath,
-    TeamCompactNotifyPayload, TeamCompactStatus, TeamDraftNotifyPayload,
+    TaskTokenUsagePayload, TeamCompactNotifyPayload, TeamCompactStatus, TeamDraftNotifyPayload,
     TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
 };
@@ -178,6 +178,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
         team_members: Vec::new(),
         team_member_bindings: Vec::new(),
         agents: Vec::new(),
+        task_token_usages: Vec::new(),
         workflow_summaries: Vec::new(),
         workflow_diagnostics: Vec::new(),
         workflow_runs: Vec::new(),
@@ -348,6 +349,17 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     envelope.seq,
                     error
                 ),
+            }
+        }
+        FrameKind::TaskTokenUsage => {
+            if let Err(error) = envelope.parse_payload::<TaskTokenUsagePayload>() {
+                log::error!(
+                    "failed to parse TaskTokenUsage host={} stream={} seq={}: {}",
+                    host,
+                    envelope.stream,
+                    envelope.seq,
+                    error
+                );
             }
         }
         FrameKind::BackendSetup => {
@@ -3049,6 +3061,7 @@ mod wasm_tests {
             team_members: Vec::new(),
             team_member_bindings: Vec::new(),
             agents: vec![agent_payload.clone()],
+            task_token_usages: Vec::new(),
             workflow_summaries: Vec::new(),
             workflow_diagnostics: Vec::new(),
             workflow_runs: Vec::new(),

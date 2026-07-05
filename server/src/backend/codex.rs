@@ -8447,6 +8447,7 @@ for line in sys.stdin:
                 team_members: vec![],
                 team_member_bindings: vec![],
                 agents: vec![new_agent.clone()],
+                task_token_usages: Vec::new(),
                 workflow_summaries: vec![],
                 workflow_diagnostics: vec![],
                 workflow_runs: vec![],

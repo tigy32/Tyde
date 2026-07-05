@@ -25,8 +25,8 @@ use protocol::{
     QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload, ReviewCommentSource,
     ReviewErrorContext, ReviewEventPayload, ReviewId, ReviewSuggestionState, SessionHistoryPayload,
     SessionId, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
-    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TeamDraftNotifyPayload,
-    TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
+    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TaskTokenUsagePayload,
+    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberId, TeamMemberNotifyPayload,
     TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
     TerminalBootstrapPayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
     TerminalStartPayload, WelcomePayload, WorkflowNotifyPayload, WorkflowRunNotifyPayload,
@@ -217,6 +217,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
         team_members: Vec::new(),
         team_member_bindings: Vec::new(),
         agents: Vec::new(),
+        task_token_usages: Vec::new(),
         workflow_summaries: Vec::new(),
         workflow_diagnostics: Vec::new(),
         workflow_runs: Vec::new(),
@@ -645,6 +646,16 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 ),
             }
         }
+        FrameKind::TaskTokenUsage => match envelope.parse_payload::<TaskTokenUsagePayload>() {
+            Ok(payload) => apply_task_token_usage(state, host_id, payload),
+            Err(error) => report_dispatch_error(
+                state,
+                host_id,
+                &envelope.stream,
+                envelope.kind,
+                format!("failed to parse task_token_usage payload: {error}"),
+            ),
+        },
         FrameKind::AgentActivityStats => {
             match envelope.parse_payload::<AgentActivityStatsPayload>() {
                 Ok(payload) => apply_agent_activity_stats(state, host_id, payload),
@@ -3564,6 +3575,25 @@ fn apply_agent_activity_stats(state: &AppState, host_id: &str, payload: AgentAct
     });
 }
 
+fn apply_task_token_usage(state: &AppState, host_id: &str, payload: TaskTokenUsagePayload) {
+    log::debug!(
+        "dispatch task_token_usage host={} root_agent={} total_tokens={} descendants={}",
+        host_id,
+        payload.root_agent_id,
+        payload.total.usage.total_tokens,
+        payload.descendant_count
+    );
+    state.task_token_usage.update(|map| {
+        map.insert(
+            ActiveAgentRef {
+                host_id: host_id.to_owned(),
+                agent_id: payload.root_agent_id.clone(),
+            },
+            payload,
+        );
+    });
+}
+
 fn apply_agent_rename(state: &AppState, host_id: &str, payload: AgentRenamedPayload) {
     let agent_id = payload.agent_id;
     let name = payload.name;
@@ -3751,6 +3781,12 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
         map.remove(&agent_id);
     });
     state.agent_activity_stats.update(|map| {
+        map.remove(&ActiveAgentRef {
+            host_id: host_id.to_owned(),
+            agent_id: agent_id.clone(),
+        });
+    });
+    state.task_token_usage.update(|map| {
         map.remove(&ActiveAgentRef {
             host_id: host_id.to_owned(),
             agent_id: agent_id.clone(),
@@ -4724,6 +4760,18 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
             host_map.insert(custom_agent.id.clone(), custom_agent);
         }
     });
+    state.task_token_usage.update(|map| {
+        map.retain(|key, _| key.host_id != host_id);
+        for usage in payload.task_token_usages {
+            map.insert(
+                ActiveAgentRef {
+                    host_id: host_id.to_string(),
+                    agent_id: usage.root_agent_id.clone(),
+                },
+                usage,
+            );
+        }
+    });
     state.workflow_summaries.update(|map| {
         map.insert(host_id.to_string(), payload.workflow_summaries);
     });
@@ -5193,6 +5241,7 @@ mod tests {
                 team_members: Vec::new(),
                 team_member_bindings: Vec::new(),
                 agents: Vec::new(),
+                task_token_usages: Vec::new(),
                 workflow_summaries: Vec::new(),
                 workflow_diagnostics: Vec::new(),
                 workflow_runs: Vec::new(),

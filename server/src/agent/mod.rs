@@ -12,8 +12,8 @@ use protocol::{
     MessageTokenUsage, QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload,
     ReviewErrorContext, SendMessagePayload, SessionId, SessionSettingsPayload,
     SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
-    TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
-    ToolExecutionResult,
+    TaskTokenUsageAmount, TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage,
+    TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -139,6 +139,9 @@ enum AgentCommand {
         max_bytes: usize,
         reply: oneshot::Sender<AgentActivityHistorySnapshot>,
     },
+    ReadUsageSnapshot {
+        reply: oneshot::Sender<AgentUsageSnapshot>,
+    },
     Interrupt {
         reply: oneshot::Sender<InterruptOutcome>,
     },
@@ -164,6 +167,13 @@ pub(crate) struct AgentActivityHistorySnapshot {
     pub through_seq: Option<u64>,
     pub event_count: usize,
     pub active_stream_included: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AgentUsageSnapshot {
+    pub start: AgentStartPayload,
+    pub usage: TaskTokenUsageScope,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -409,13 +419,35 @@ enum TokenUsageSource {
 struct AgentActivityStatsTracker {
     stats: AgentActivityStats,
     seen_tool_calls: HashSet<String>,
-    token_usage_by_source: HashMap<TokenUsageSource, TokenUsage>,
+    token_usage_by_source: HashMap<TokenUsageSource, TaskTokenUsageScope>,
     active_reasoning: String,
+    latest_model: Option<String>,
 }
 
 impl AgentActivityStatsTracker {
     fn snapshot(&self) -> AgentActivityStats {
         self.stats.clone()
+    }
+
+    fn usage_snapshot(&self) -> (TaskTokenUsageScope, Option<String>) {
+        let usage = if self.token_usage_by_source.is_empty() {
+            TaskTokenUsageScope::Unavailable {
+                reason: TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted,
+            }
+        } else if let Some(reason) = self
+            .token_usage_by_source
+            .values()
+            .find_map(task_token_usage_unavailable_reason)
+        {
+            TaskTokenUsageScope::Unavailable { reason }
+        } else {
+            TaskTokenUsageScope::Known {
+                usage: Box::new(TaskTokenUsageAmount::from_token_usage(
+                    &self.stats.token_usage,
+                )),
+            }
+        };
+        (usage, self.latest_model.clone())
     }
 
     fn observe_chat_event(
@@ -428,11 +460,13 @@ impl AgentActivityStatsTracker {
         match event {
             ChatEvent::MessageAdded(message) => {
                 if matches!(message.sender, MessageSender::Assistant { .. }) {
+                    self.observe_model(message.model_info.as_ref());
                     self.update_last_output(&message.content, source_seq);
                     self.stamp_message_turn_token_usage(message, source_seq);
                 }
             }
             ChatEvent::MessageMetadataUpdated(update) => {
+                self.observe_model(update.model_info.as_ref());
                 self.stamp_metadata_turn_token_usage(update, source_seq);
             }
             ChatEvent::StreamDelta(delta) => {
@@ -446,6 +480,7 @@ impl AgentActivityStatsTracker {
                 self.update_last_output(&active_reasoning, source_seq);
             }
             ChatEvent::StreamEnd(data) => {
+                self.observe_model(data.message.model_info.as_ref());
                 self.update_last_output(&data.message.content, source_seq);
                 self.stamp_message_turn_token_usage(&mut data.message, source_seq);
                 self.active_reasoning.clear();
@@ -463,11 +498,24 @@ impl AgentActivityStatsTracker {
             | ChatEvent::OperationCancelled(_)
             | ChatEvent::RetryAttempt(_)
             | ChatEvent::Orchestration(_) => {}
-            ChatEvent::StreamStart(_) => {
+            ChatEvent::StreamStart(data) => {
+                if let Some(model) = data.model.as_ref().filter(|model| !model.trim().is_empty()) {
+                    self.latest_model = Some(model.clone());
+                }
                 self.active_reasoning.clear();
             }
         }
         self.stats != previous
+    }
+
+    fn observe_model(&mut self, model_info: Option<&protocol::ModelInfo>) {
+        let Some(model) = model_info
+            .map(|info| info.model.trim())
+            .filter(|model| !model.is_empty())
+        else {
+            return;
+        };
+        self.latest_model = Some(model.to_owned());
     }
 
     fn update_last_output(&mut self, text: &str, source_seq: u64) {
@@ -514,13 +562,28 @@ impl AgentActivityStatsTracker {
             MessageTokenUsage::unavailable(TokenUsageUnavailableReason::BackendDidNotReport)
         });
         let Some(turn_usage) = token_usage.turn.known_usage().cloned() else {
+            let reason = match token_usage.turn {
+                TokenUsageScope::Known { .. } => TaskTokenUsageUnavailableReason::AgentUnavailable,
+                TokenUsageScope::Unavailable { reason } => {
+                    task_token_usage_reason_from_message_reason(reason)
+                }
+            };
+            self.token_usage_by_source
+                .insert(source, TaskTokenUsageScope::Unavailable { reason });
             return token_usage;
         };
 
+        self.token_usage_by_source.insert(
+            source,
+            TaskTokenUsageScope::Known {
+                usage: Box::new(TaskTokenUsageAmount::from_token_usage(&turn_usage)),
+            },
+        );
         if let Some(cumulative) = token_usage.cumulative.known_usage().cloned() {
             self.stats.token_usage = cumulative;
+            self.token_usage_by_source
+                .retain(|_, usage| matches!(usage, TaskTokenUsageScope::Known { .. }));
         } else {
-            self.token_usage_by_source.insert(source, turn_usage);
             self.refresh_token_usage();
             token_usage.cumulative = TokenUsageScope::Known {
                 usage: Box::new(self.stats.token_usage.clone()),
@@ -531,7 +594,35 @@ impl AgentActivityStatsTracker {
     }
 
     fn refresh_token_usage(&mut self) {
-        self.stats.token_usage = total_token_usage(self.token_usage_by_source.values());
+        self.stats.token_usage =
+            total_task_token_usage(self.token_usage_by_source.values().filter_map(|usage| {
+                match usage {
+                    TaskTokenUsageScope::Known { usage } => Some(usage.as_ref()),
+                    TaskTokenUsageScope::Unavailable { .. } => None,
+                }
+            }));
+    }
+}
+
+fn task_token_usage_unavailable_reason(
+    usage: &TaskTokenUsageScope,
+) -> Option<TaskTokenUsageUnavailableReason> {
+    match usage {
+        TaskTokenUsageScope::Known { .. } => None,
+        TaskTokenUsageScope::Unavailable { reason } => Some(*reason),
+    }
+}
+
+fn task_token_usage_reason_from_message_reason(
+    reason: TokenUsageUnavailableReason,
+) -> TaskTokenUsageUnavailableReason {
+    match reason {
+        TokenUsageUnavailableReason::BackendDidNotReport => {
+            TaskTokenUsageUnavailableReason::BackendDidNotReport
+        }
+        TokenUsageUnavailableReason::ProviderScopeAmbiguous => {
+            TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous
+        }
     }
 }
 
@@ -551,11 +642,17 @@ fn last_non_empty_logical_line(text: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn total_token_usage<'a>(entries: impl Iterator<Item = &'a TokenUsage>) -> TokenUsage {
+fn total_task_token_usage<'a>(
+    entries: impl Iterator<Item = &'a TaskTokenUsageAmount>,
+) -> TokenUsage {
     let mut total = TokenUsage::default();
     for usage in entries {
-        total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
-        total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+        total.input_tokens = total
+            .input_tokens
+            .saturating_add(usage.input_tokens.unwrap_or(0));
+        total.output_tokens = total
+            .output_tokens
+            .saturating_add(usage.output_tokens.unwrap_or(0));
         total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
         add_optional_tokens(&mut total.cached_prompt_tokens, usage.cached_prompt_tokens);
         add_optional_tokens(
@@ -714,6 +811,18 @@ impl AgentHandle {
                 max_bytes,
                 reply: reply_tx,
             })
+            .is_err()
+        {
+            return None;
+        }
+        reply_rx.await.ok()
+    }
+
+    pub async fn read_usage_snapshot(&self) -> Option<AgentUsageSnapshot> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::ReadUsageSnapshot { reply: reply_tx })
             .is_err()
         {
             return None;
@@ -3007,6 +3116,12 @@ pub(crate) fn spawn_agent_actor(
                                 max_bytes,
                             ));
                         }
+                        AgentCommand::ReadUsageSnapshot { reply } => {
+                            let _ = reply.send(agent_usage_snapshot_from_tracker(
+                                &current_start,
+                                &activity_stats,
+                            ));
+                        }
                         AgentCommand::Interrupt { reply } => {
                             if matches!(lifecycle, ActorLifecycle::Closing) {
                                 let _ = reply.send(InterruptOutcome::NotRunning);
@@ -3416,6 +3531,12 @@ pub(crate) fn spawn_relay_agent_actor(
                                 max_bytes,
                             ));
                         }
+                        AgentCommand::ReadUsageSnapshot { reply } => {
+                            let _ = reply.send(agent_usage_snapshot_from_tracker(
+                                &current_start,
+                                &activity_stats,
+                            ));
+                        }
                         AgentCommand::Close { reply } => {
                             accepting_input_task.store(false, Ordering::SeqCst);
                             if matches!(lifecycle, ActorLifecycle::Closing) {
@@ -3654,6 +3775,9 @@ async fn park_terminal_agent(
                     event_log, None, after_seq, max_events, max_bytes,
                 ));
             }
+            AgentCommand::ReadUsageSnapshot { reply } => {
+                let _ = reply.send(agent_usage_snapshot_from_log(current_start, event_log));
+            }
             AgentCommand::Attach { stream, reply } => {
                 let attached = attach_subscriber(event_log, None, subscribers, stream);
                 let _ = reply.send(attached);
@@ -3740,6 +3864,9 @@ async fn park_relay_terminal_agent(
                 let _ = reply.send(activity_history_snapshot(
                     event_log, None, after_seq, max_events, max_bytes,
                 ));
+            }
+            AgentCommand::ReadUsageSnapshot { reply } => {
+                let _ = reply.send(agent_usage_snapshot_from_log(current_start, event_log));
             }
             AgentCommand::Attach { stream, reply } => {
                 let attached = attach_subscriber(event_log, None, subscribers, stream);
@@ -4596,6 +4723,49 @@ fn activity_history_snapshot(
     }
 }
 
+fn agent_usage_snapshot_from_tracker(
+    start: &AgentStartPayload,
+    tracker: &AgentActivityStatsTracker,
+) -> AgentUsageSnapshot {
+    let (usage, model) = tracker.usage_snapshot();
+    AgentUsageSnapshot {
+        start: start.clone(),
+        usage,
+        model,
+    }
+}
+
+fn agent_usage_snapshot_from_log(
+    start: &AgentStartPayload,
+    event_log: &[Envelope],
+) -> AgentUsageSnapshot {
+    let mut stats = AgentActivityStats::default();
+    for envelope in event_log {
+        if envelope.kind != FrameKind::AgentActivityStats {
+            continue;
+        }
+        if let Ok(payload) =
+            serde_json::from_value::<AgentActivityStatsPayload>(envelope.payload.clone())
+        {
+            stats = payload.stats;
+        }
+    }
+    let usage = if stats.token_usage.total_tokens > 0 {
+        TaskTokenUsageScope::Known {
+            usage: Box::new(TaskTokenUsageAmount::from_token_usage(&stats.token_usage)),
+        }
+    } else {
+        TaskTokenUsageScope::Unavailable {
+            reason: TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted,
+        }
+    };
+    AgentUsageSnapshot {
+        start: start.clone(),
+        usage,
+        model: None,
+    }
+}
+
 fn rendered_activity_entries_len(entries: &[(u64, String)]) -> usize {
     entries
         .iter()
@@ -5242,10 +5412,10 @@ mod tests {
     use super::{
         AgentActivityStatsTracker, AgentCommand, AgentHandle, AgentReplayState,
         GenerateAgentActivitySummaryRequest, InterruptOutcome, activity_history_snapshot,
-        append_chat_event, append_event, attach_subscriber, collect_agent_activity_summary_events,
-        generate_mock_name, known_turn_usage, name_generation_fallback, output_events_since,
-        sanitize_generated_agent_name, session_history_window, spawn_relay_agent_actor,
-        upsert_activity_stats_snapshot,
+        agent_usage_snapshot_from_log, append_chat_event, append_event, attach_subscriber,
+        collect_agent_activity_summary_events, generate_mock_name, known_turn_usage,
+        name_generation_fallback, output_events_since, sanitize_generated_agent_name,
+        session_history_window, spawn_relay_agent_actor, upsert_activity_stats_snapshot,
     };
     use crate::agent::registry::AgentStatusHandle;
     use crate::backend::EventStream;
@@ -5316,6 +5486,9 @@ mod tests {
                         let _ = reply.send(activity_history_snapshot(
                             &event_log, None, after_seq, max_events, max_bytes,
                         ));
+                    }
+                    AgentCommand::ReadUsageSnapshot { reply } => {
+                        let _ = reply.send(agent_usage_snapshot_from_log(&start, &event_log));
                     }
                     AgentCommand::Attach { stream, reply } => {
                         let attached =

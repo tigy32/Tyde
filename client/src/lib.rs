@@ -32,12 +32,12 @@ use protocol::{
     SessionHistoryPayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
     SetAgentNamePayload, SetSessionSettingsPayload, SetSettingPayload, SkillNotifyPayload,
     SkillRefreshPayload, SpawnAgentPayload, SteeringDeletePayload, SteeringNotifyPayload,
-    SteeringUpsertPayload, StreamPath, TYDE_VERSION, TeamCreatePayload, TeamDeletePayload,
-    TeamDraftApplyTemplatePayload, TeamDraftCommitPayload, TeamDraftCreatePayload,
-    TeamDraftDiscardPayload, TeamDraftNotifyPayload, TeamDraftShufflePayload,
-    TeamDraftUpdatePayload, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
-    TeamMemberCreatePayload, TeamMemberDeletePayload, TeamMemberNotifyPayload,
-    TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamNotifyPayload,
+    SteeringUpsertPayload, StreamPath, TYDE_VERSION, TaskTokenUsagePayload, TeamCreatePayload,
+    TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
+    TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
+    TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamMemberActivatePayload,
+    TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
+    TeamMemberNotifyPayload, TeamMemberShufflePayload, TeamMemberUpdatePayload, TeamNotifyPayload,
     TeamPresetCatalogNotifyPayload, TeamRenamePayload, TeamSetManagerPayload,
     TerminalBootstrapPayload, TerminalClosePayload, TerminalCreatePayload, TerminalErrorPayload,
     TerminalExitPayload, TerminalId, TerminalOutputPayload, TerminalResizePayload,
@@ -928,6 +928,10 @@ impl Connection {
                 }
                 FrameKind::AgentActivitySummary => {
                     let _: AgentActivitySummaryPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::TaskTokenUsage => {
+                    let _: TaskTokenUsagePayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::MobileAccessState => {

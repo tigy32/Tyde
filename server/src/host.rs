@@ -43,7 +43,9 @@ use protocol::{
     SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
     SetAgentsViewPreferencesPayload, SetSettingPayload, Skill, SkillNotifyPayload,
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
-    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TeamCreatePayload,
+    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
+    TaskTokenUsageAggregate, TaskTokenUsageAmount, TaskTokenUsageEntry, TaskTokenUsagePayload,
+    TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason, TeamCreatePayload,
     TeamDeletePayload, TeamDraftApplyTemplatePayload, TeamDraftCommitPayload,
     TeamDraftCreatePayload, TeamDraftDiscardPayload, TeamDraftNotifyPayload,
     TeamDraftShufflePayload, TeamDraftUpdatePayload, TeamId, TeamMember,
@@ -71,10 +73,10 @@ use crate::agent::registry::{
     RelaySpawnRequest, ResolvedSpawnRequest,
 };
 use crate::agent::{
-    AgentHandle, CompactionStart, CompactionSummary, DEFAULT_COMPACTION_SUMMARY_MAX_BYTES,
-    GenerateAgentActivitySummaryRequest, GenerateAgentNameRequest, InterruptOutcome,
-    MAX_COMPACTION_SUMMARY_BYTES, derive_agent_name, generate_agent_activity_summary,
-    generate_agent_name,
+    AgentHandle, AgentUsageSnapshot, CompactionStart, CompactionSummary,
+    DEFAULT_COMPACTION_SUMMARY_MAX_BYTES, GenerateAgentActivitySummaryRequest,
+    GenerateAgentNameRequest, InterruptOutcome, MAX_COMPACTION_SUMMARY_BYTES, derive_agent_name,
+    generate_agent_activity_summary, generate_agent_name,
 };
 use crate::agent_control_mcp::AgentControlMcpHandle;
 use crate::backend::setup;
@@ -140,14 +142,25 @@ use crate::workflows::watch::{WorkflowCatalogSignal, WorkflowWatcherHandle};
 
 struct HostSubscriber {
     stream: Stream,
+    bootstrapped: bool,
     agent_replay: AgentReplayMode,
     known_agent_streams: HashSet<StreamPath>,
     attached_agent_streams: HashSet<StreamPath>,
     bootstrapped_agent_streams: HashSet<StreamPath>,
+    pending_bootstrap_new_agents: Vec<PendingNewAgentFanout>,
+    pending_bootstrap_frames: Vec<(FrameKind, serde_json::Value)>,
     last_session_schemas: Option<Vec<SessionSchemaEntry>>,
     last_backend_config_schemas: Option<Vec<protocol::BackendConfigSchema>>,
     last_backend_config_snapshots: Option<Vec<BackendConfigSnapshot>>,
     last_launch_profile_catalog: Option<LaunchProfileCatalog>,
+}
+
+struct PendingNewAgentFanout {
+    start: AgentStartPayload,
+    agent_handle: AgentHandle,
+    instance_stream: StreamPath,
+    attach_eagerly: bool,
+    activity_summary: AgentActivitySummaryState,
 }
 
 pub(crate) struct DeferredAgentAttachment {
@@ -335,6 +348,7 @@ pub(crate) struct HostState {
     pub skill_store: Arc<Mutex<SkillStore>>,
     pub agent_sessions: HashMap<AgentId, SessionId>,
     pub agent_activity_summaries: HashMap<AgentId, AgentActivitySummaryState>,
+    closed_agent_usage_snapshots: HashMap<AgentId, AgentUsageSnapshot>,
     activity_summary_epoch: u64,
     activity_summary_settings_tx: watch::Sender<ActivitySummarySettingsSignal>,
     pub sub_agent_spawn_tx: HostSubAgentSpawnTx,
@@ -564,10 +578,13 @@ impl HostHandle {
             host_path.clone(),
             HostSubscriber {
                 stream: host_stream,
+                bootstrapped: false,
                 agent_replay,
                 known_agent_streams: HashSet::new(),
                 attached_agent_streams: HashSet::new(),
                 bootstrapped_agent_streams: HashSet::new(),
+                pending_bootstrap_new_agents: Vec::new(),
+                pending_bootstrap_frames: Vec::new(),
                 last_session_schemas: None,
                 last_backend_config_schemas: None,
                 last_backend_config_snapshots: None,
@@ -833,6 +850,16 @@ impl HostHandle {
                 });
             }
         }
+        let (usage_handles, closed_usage_snapshots, live_usage_agent_ids, usage_agent_sessions) =
+            task_token_usage_sources_for_state(&state);
+        drop(state);
+        let task_token_usages = task_token_usage_rollups_from_handles(
+            usage_handles,
+            closed_usage_snapshots,
+            &live_usage_agent_ids,
+            &usage_agent_sessions,
+        )
+        .await;
 
         let bootstrap = HostBootstrapPayload {
             settings,
@@ -854,6 +881,7 @@ impl HostHandle {
             team_members: team_snapshot.members,
             team_member_bindings: team_snapshot.bindings,
             agents,
+            task_token_usages,
             workflow_summaries,
             workflow_diagnostics,
             workflow_runs,
@@ -863,25 +891,70 @@ impl HostHandle {
 
         let payload = serde_json::to_value(&bootstrap)
             .expect("failed to serialize HostBootstrap payload for host stream registration");
-        let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
-            panic!(
-                "host stream {} disappeared before HostBootstrap emission",
-                host_path
-            );
+        let bootstrap_agent_ids = bootstrap
+            .agents
+            .iter()
+            .map(|agent| agent.agent_id.clone())
+            .collect::<HashSet<_>>();
+        let mut state = self.state.lock().await;
+        let (pending_new_agents, pending_frames, bootstrap_stream) = {
+            let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
+                panic!(
+                    "host stream {} disappeared before HostBootstrap emission",
+                    host_path
+                );
+            };
+            if subscriber
+                .stream
+                .send_value(FrameKind::HostBootstrap, payload)
+                .is_err()
+            {
+                state.mobile_access.unregister_subscriber(host_path.clone());
+                state.host_streams.remove(&host_path);
+                return Vec::new();
+            }
+            subscriber.bootstrapped = true;
+            subscriber.last_session_schemas = Some(bootstrap.session_schemas.clone());
+            subscriber.last_backend_config_schemas = Some(bootstrap.backend_config_schemas.clone());
+            subscriber.last_backend_config_snapshots =
+                Some(bootstrap.backend_config_snapshots.clone());
+            subscriber.last_launch_profile_catalog = Some(bootstrap.launch_profile_catalog.clone());
+            (
+                std::mem::take(&mut subscriber.pending_bootstrap_new_agents),
+                std::mem::take(&mut subscriber.pending_bootstrap_frames),
+                subscriber.stream.clone(),
+            )
         };
-        if subscriber
-            .stream
-            .send_value(FrameKind::HostBootstrap, payload)
-            .is_err()
-        {
-            state.mobile_access.unregister_subscriber(host_path.clone());
-            state.host_streams.remove(&host_path);
-            return Vec::new();
+        for pending in pending_new_agents {
+            if bootstrap_agent_ids.contains(&pending.start.agent_id) {
+                continue;
+            }
+            match emit_new_agent_for_stream(
+                &pending.start,
+                &pending.agent_handle,
+                &bootstrap_stream,
+                pending.instance_stream,
+                pending.attach_eagerly,
+                pending.activity_summary,
+            )
+            .await
+            {
+                Ok(Some(attachment)) => deferred_attachments.push(attachment),
+                Ok(None) => {}
+                Err(_) => {
+                    state.mobile_access.unregister_subscriber(host_path.clone());
+                    state.host_streams.remove(&host_path);
+                    return Vec::new();
+                }
+            }
         }
-        subscriber.last_session_schemas = Some(bootstrap.session_schemas.clone());
-        subscriber.last_backend_config_schemas = Some(bootstrap.backend_config_schemas.clone());
-        subscriber.last_backend_config_snapshots = Some(bootstrap.backend_config_snapshots.clone());
-        subscriber.last_launch_profile_catalog = Some(bootstrap.launch_profile_catalog.clone());
+        for (kind, payload) in pending_frames {
+            if bootstrap_stream.send_value(kind, payload).is_err() {
+                state.mobile_access.unregister_subscriber(host_path.clone());
+                state.host_streams.remove(&host_path);
+                return Vec::new();
+            }
+        }
         state
             .mobile_access
             .activate_bootstrap_subscriber(host_path.clone());
@@ -2711,23 +2784,23 @@ impl HostHandle {
             let host_streams = state
                 .host_streams
                 .iter_mut()
-                .map(|(path, subscriber)| {
-                    let instance_stream = new_instance_stream(&spawned.start.agent_id);
-                    subscriber
-                        .known_agent_streams
-                        .insert(instance_stream.clone());
-                    let attach_eagerly = matches!(subscriber.agent_replay, AgentReplayMode::Eager);
-                    if attach_eagerly {
-                        subscriber
-                            .attached_agent_streams
-                            .insert(instance_stream.clone());
-                    }
-                    (
-                        path.clone(),
-                        subscriber.stream.clone(),
-                        attach_eagerly,
-                        instance_stream,
+                .filter_map(|(path, subscriber)| {
+                    prepare_new_agent_fanout_for_subscriber(
+                        subscriber,
+                        &spawned.start,
+                        &spawned.handle,
                         activity_summary.clone(),
+                    )
+                    .map(
+                        |(stream, attach_eagerly, instance_stream, activity_summary)| {
+                            (
+                                path.clone(),
+                                stream,
+                                attach_eagerly,
+                                instance_stream,
+                                activity_summary,
+                            )
+                        },
                     )
                 })
                 .collect::<Vec<_>>();
@@ -2954,23 +3027,23 @@ impl HostHandle {
             let host_streams = state
                 .host_streams
                 .iter_mut()
-                .map(|(path, subscriber)| {
-                    let instance_stream = new_instance_stream(&spawned.start.agent_id);
-                    subscriber
-                        .known_agent_streams
-                        .insert(instance_stream.clone());
-                    let attach_eagerly = matches!(subscriber.agent_replay, AgentReplayMode::Eager);
-                    if attach_eagerly {
-                        subscriber
-                            .attached_agent_streams
-                            .insert(instance_stream.clone());
-                    }
-                    (
-                        path.clone(),
-                        subscriber.stream.clone(),
-                        attach_eagerly,
-                        instance_stream,
+                .filter_map(|(path, subscriber)| {
+                    prepare_new_agent_fanout_for_subscriber(
+                        subscriber,
+                        &spawned.start,
+                        &spawned.handle,
                         activity_summary.clone(),
+                    )
+                    .map(
+                        |(stream, attach_eagerly, instance_stream, activity_summary)| {
+                            (
+                                path.clone(),
+                                stream,
+                                attach_eagerly,
+                                instance_stream,
+                                activity_summary,
+                            )
+                        },
                     )
                 })
                 .collect::<Vec<_>>();
@@ -4710,6 +4783,22 @@ impl HostHandle {
         fan_out_session_lists(&mut state).await;
     }
 
+    pub(crate) async fn fan_out_task_token_usages(&self) {
+        let (handles, closed_snapshots, live_agent_ids, agent_sessions) = {
+            let state = self.state.lock().await;
+            task_token_usage_sources_for_state(&state)
+        };
+        let payloads = task_token_usage_rollups_from_handles(
+            handles,
+            closed_snapshots,
+            &live_agent_ids,
+            &agent_sessions,
+        )
+        .await;
+        let mut state = self.state.lock().await;
+        fan_out_task_token_usages(&mut state, payloads).await;
+    }
+
     pub(crate) async fn set_setting(&self, payload: SetSettingPayload) -> AppResult<()> {
         const OPERATION: &str = "set_setting";
         if let protocol::HostSettingValue::BackendConfig { backend, values } = &payload.setting
@@ -5537,7 +5626,13 @@ impl HostHandle {
             let host_streams = state
                 .host_streams
                 .iter()
-                .map(|(path, subscriber)| (path.clone(), subscriber.stream.clone()))
+                .map(|(path, subscriber)| {
+                    (
+                        path.clone(),
+                        subscriber.stream.clone(),
+                        subscriber.bootstrapped,
+                    )
+                })
                 .collect::<Vec<_>>();
             (close_targets, host_streams)
         };
@@ -5546,8 +5641,29 @@ impl HostHandle {
             .iter()
             .map(|(agent_id, _)| agent_id.clone())
             .collect::<Vec<_>>();
-        let mut live_streams = host_streams;
+        let bootstrapping_paths = host_streams
+            .iter()
+            .filter_map(|(path, _, bootstrapped)| (!*bootstrapped).then_some(path.clone()))
+            .collect::<Vec<_>>();
+        let mut live_streams = host_streams
+            .into_iter()
+            .filter_map(|(path, stream, bootstrapped)| bootstrapped.then_some((path, stream)))
+            .collect::<Vec<_>>();
         let mut dead_paths = Vec::new();
+        let mut closed_usage_snapshots = Vec::new();
+
+        for (_, agent_handle) in &close_targets {
+            closed_usage_snapshots
+                .push(read_agent_usage_snapshot_or_unavailable(agent_handle).await);
+        }
+        {
+            let mut state = self.state.lock().await;
+            for snapshot in closed_usage_snapshots {
+                state
+                    .closed_agent_usage_snapshots
+                    .insert(snapshot.start.agent_id.clone(), snapshot);
+            }
+        }
 
         for (target_agent_id, agent_handle) in close_targets {
             let _ = agent_handle.close().await;
@@ -5555,6 +5671,25 @@ impl HostHandle {
             let payload = AgentClosedPayload {
                 agent_id: target_agent_id,
             };
+            if !bootstrapping_paths.is_empty() {
+                let payload_value = serde_json::to_value(&payload)
+                    .expect("failed to serialize AgentClosed payload for host stream fanout");
+                let mut state = self.state.lock().await;
+                for path in &bootstrapping_paths {
+                    let Some(subscriber) = state.host_streams.get_mut(path) else {
+                        continue;
+                    };
+                    if emit_or_queue_host_frame(
+                        subscriber,
+                        FrameKind::AgentClosed,
+                        payload_value.clone(),
+                    )
+                    .is_err()
+                    {
+                        dead_paths.push(path.clone());
+                    }
+                }
+            }
             let mut failed_paths = Vec::new();
             for (path, stream) in &live_streams {
                 if emit_agent_closed_for_stream(&payload, stream)
@@ -5623,6 +5758,8 @@ impl HostHandle {
         }
         fan_out_session_lists(&mut state).await;
         fan_out_current_agents_view_preferences(&mut state).await;
+        drop(state);
+        self.fan_out_task_token_usages().await;
 
         true
     }
@@ -6883,23 +7020,23 @@ impl HostHandle {
             let host_streams = state
                 .host_streams
                 .iter_mut()
-                .map(|(path, subscriber)| {
-                    let instance_stream = new_instance_stream(&spawned.start.agent_id);
-                    subscriber
-                        .known_agent_streams
-                        .insert(instance_stream.clone());
-                    let attach_eagerly = matches!(subscriber.agent_replay, AgentReplayMode::Eager);
-                    if attach_eagerly {
-                        subscriber
-                            .attached_agent_streams
-                            .insert(instance_stream.clone());
-                    }
-                    (
-                        path.clone(),
-                        subscriber.stream.clone(),
-                        attach_eagerly,
-                        instance_stream,
+                .filter_map(|(path, subscriber)| {
+                    prepare_new_agent_fanout_for_subscriber(
+                        subscriber,
+                        &spawned.start,
+                        &spawned.handle,
                         activity_summary.clone(),
+                    )
+                    .map(
+                        |(stream, attach_eagerly, instance_stream, activity_summary)| {
+                            (
+                                path.clone(),
+                                stream,
+                                attach_eagerly,
+                                instance_stream,
+                                activity_summary,
+                            )
+                        },
                     )
                 })
                 .collect::<Vec<_>>();
@@ -9415,6 +9552,7 @@ fn spawn_host_inner(
             skill_store: Arc::new(Mutex::new(skill_store)),
             agent_sessions: HashMap::new(),
             agent_activity_summaries: HashMap::new(),
+            closed_agent_usage_snapshots: HashMap::new(),
             activity_summary_epoch: 0,
             activity_summary_settings_tx,
             sub_agent_spawn_tx,
@@ -9540,9 +9678,52 @@ fn spawn_host_inner(
     spawn_host_review_project_update_task(host.clone(), review_project_update_rx);
     spawn_host_workflow_catalog_task(host.clone(), workflow_signal_rx);
     spawn_host_team_status_task(host.clone());
+    spawn_task_token_usage_task(host.clone());
     spawn_agent_activity_summary_task(host.clone());
 
     Ok(host)
+}
+
+fn spawn_task_token_usage_task(host: HostHandle) {
+    let worker = async move {
+        let mut status_rx = host.subscribe_agent_status_changes().await;
+        loop {
+            if status_rx.changed().await.is_err() {
+                break;
+            }
+            host.fan_out_task_token_usages().await;
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    if let Err(err) = std::thread::Builder::new()
+        .name("tyde-task-token-usage".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        "failed to build task-token-usage runtime"
+                    );
+                    return;
+                }
+            };
+            runtime.block_on(worker);
+        })
+    {
+        tracing::error!(
+            error = %err,
+            "failed to spawn task-token-usage worker thread"
+        );
+    }
 }
 
 fn spawn_host_team_status_task(host: HostHandle) {
@@ -11111,6 +11292,57 @@ fn annotation_target_key(target: &AgentAnnotationTarget) -> (u8, &str, &str) {
     }
 }
 
+fn emit_or_queue_host_frame(
+    subscriber: &mut HostSubscriber,
+    kind: FrameKind,
+    payload: serde_json::Value,
+) -> Result<(), StreamClosed> {
+    if subscriber.bootstrapped {
+        subscriber.stream.send_value(kind, payload)
+    } else {
+        subscriber.pending_bootstrap_frames.push((kind, payload));
+        Ok(())
+    }
+}
+
+fn prepare_new_agent_fanout_for_subscriber(
+    subscriber: &mut HostSubscriber,
+    start: &AgentStartPayload,
+    agent_handle: &AgentHandle,
+    activity_summary: AgentActivitySummaryState,
+) -> Option<(Stream, bool, StreamPath, AgentActivitySummaryState)> {
+    let instance_stream = new_instance_stream(&start.agent_id);
+    subscriber
+        .known_agent_streams
+        .insert(instance_stream.clone());
+    let attach_eagerly = matches!(subscriber.agent_replay, AgentReplayMode::Eager);
+    if attach_eagerly {
+        subscriber
+            .attached_agent_streams
+            .insert(instance_stream.clone());
+    }
+
+    if subscriber.bootstrapped {
+        Some((
+            subscriber.stream.clone(),
+            attach_eagerly,
+            instance_stream,
+            activity_summary,
+        ))
+    } else {
+        subscriber
+            .pending_bootstrap_new_agents
+            .push(PendingNewAgentFanout {
+                start: start.clone(),
+                agent_handle: agent_handle.clone(),
+                instance_stream,
+                attach_eagerly,
+                activity_summary,
+            });
+        None
+    }
+}
+
 async fn emit_new_agent_for_stream(
     start: &AgentStartPayload,
     agent_handle: &AgentHandle,
@@ -11170,11 +11402,7 @@ async fn fan_out_session_lists(state: &mut HostState) {
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if subscriber
-            .stream
-            .send_value(FrameKind::SessionList, payload.clone())
-            .is_err()
-        {
+        if emit_or_queue_host_frame(subscriber, FrameKind::SessionList, payload.clone()).is_err() {
             dead_paths.push(path);
         }
     }
@@ -11182,6 +11410,309 @@ async fn fan_out_session_lists(state: &mut HostState) {
     for path in dead_paths {
         state.host_streams.remove(&path);
     }
+}
+
+async fn fan_out_task_token_usages(state: &mut HostState, payloads: Vec<TaskTokenUsagePayload>) {
+    if payloads.is_empty() {
+        return;
+    }
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        for payload in &payloads {
+            if emit_task_token_usage_for_subscriber(payload, subscriber)
+                .await
+                .is_err()
+            {
+                dead_paths.push(path.clone());
+                break;
+            }
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
+}
+
+fn task_token_usage_sources_for_state(
+    state: &HostState,
+) -> (
+    Vec<AgentHandle>,
+    Vec<AgentUsageSnapshot>,
+    HashSet<AgentId>,
+    HashMap<AgentId, SessionId>,
+) {
+    let live_agent_ids = state
+        .registry
+        .agent_ids()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let handles = state
+        .registry
+        .agent_ids()
+        .into_iter()
+        .filter_map(|agent_id| state.registry.agent_handle(&agent_id))
+        .collect::<Vec<_>>();
+    (
+        handles,
+        state
+            .closed_agent_usage_snapshots
+            .values()
+            .filter(|snapshot| !live_agent_ids.contains(&snapshot.start.agent_id))
+            .cloned()
+            .collect(),
+        live_agent_ids,
+        state.agent_sessions.clone(),
+    )
+}
+
+async fn task_token_usage_rollups_from_handles(
+    handles: Vec<AgentHandle>,
+    closed_snapshots: Vec<AgentUsageSnapshot>,
+    live_agent_ids: &HashSet<AgentId>,
+    agent_sessions: &HashMap<AgentId, SessionId>,
+) -> Vec<TaskTokenUsagePayload> {
+    let mut snapshots = Vec::new();
+    for handle in handles {
+        snapshots.push(read_agent_usage_snapshot_or_unavailable(&handle).await);
+    }
+    snapshots.extend(closed_snapshots);
+    task_token_usage_rollups_from_snapshots(snapshots, live_agent_ids, agent_sessions)
+}
+
+async fn read_agent_usage_snapshot_or_unavailable(handle: &AgentHandle) -> AgentUsageSnapshot {
+    let start = handle.snapshot();
+    handle
+        .read_usage_snapshot()
+        .await
+        .unwrap_or_else(|| unavailable_agent_usage_snapshot(start))
+}
+
+fn unavailable_agent_usage_snapshot(start: AgentStartPayload) -> AgentUsageSnapshot {
+    AgentUsageSnapshot {
+        start,
+        usage: TaskTokenUsageScope::Unavailable {
+            reason: TaskTokenUsageUnavailableReason::AgentUnavailable,
+        },
+        model: None,
+    }
+}
+
+fn task_token_usage_rollups_from_snapshots(
+    snapshots: Vec<AgentUsageSnapshot>,
+    live_agent_ids: &HashSet<AgentId>,
+    agent_sessions: &HashMap<AgentId, SessionId>,
+) -> Vec<TaskTokenUsagePayload> {
+    let snapshots_by_id = snapshots
+        .into_iter()
+        .map(|snapshot| (snapshot.start.agent_id.clone(), snapshot))
+        .collect::<HashMap<_, _>>();
+    let mut children_by_parent: HashMap<AgentId, Vec<AgentId>> = HashMap::new();
+    for snapshot in snapshots_by_id.values() {
+        if let Some(parent_agent_id) = &snapshot.start.parent_agent_id
+            && snapshots_by_id.contains_key(parent_agent_id)
+        {
+            children_by_parent
+                .entry(parent_agent_id.clone())
+                .or_default()
+                .push(snapshot.start.agent_id.clone());
+        }
+    }
+    for children in children_by_parent.values_mut() {
+        children.sort_by(|left, right| {
+            let left_start = &snapshots_by_id
+                .get(left)
+                .expect("child id must have snapshot")
+                .start;
+            let right_start = &snapshots_by_id
+                .get(right)
+                .expect("child id must have snapshot")
+                .start;
+            (left_start.created_at_ms, left.0.as_str())
+                .cmp(&(right_start.created_at_ms, right.0.as_str()))
+        });
+    }
+
+    let mut roots = snapshots_by_id
+        .values()
+        .filter(|snapshot| {
+            live_agent_ids.contains(&snapshot.start.agent_id)
+                && snapshot
+                    .start
+                    .parent_agent_id
+                    .as_ref()
+                    .is_none_or(|parent| !snapshots_by_id.contains_key(parent))
+        })
+        .map(|snapshot| snapshot.start.agent_id.clone())
+        .collect::<Vec<_>>();
+    roots.sort_by(|left, right| {
+        let left_start = &snapshots_by_id
+            .get(left)
+            .expect("root id must have snapshot")
+            .start;
+        let right_start = &snapshots_by_id
+            .get(right)
+            .expect("root id must have snapshot")
+            .start;
+        (left_start.created_at_ms, left.0.as_str())
+            .cmp(&(right_start.created_at_ms, right.0.as_str()))
+    });
+
+    roots
+        .into_iter()
+        .filter_map(|root_id| {
+            task_token_usage_rollup_for_root(
+                &root_id,
+                &snapshots_by_id,
+                &children_by_parent,
+                agent_sessions,
+            )
+        })
+        .collect()
+}
+
+fn task_token_usage_rollup_for_root(
+    root_id: &AgentId,
+    snapshots_by_id: &HashMap<AgentId, AgentUsageSnapshot>,
+    children_by_parent: &HashMap<AgentId, Vec<AgentId>>,
+    agent_sessions: &HashMap<AgentId, SessionId>,
+) -> Option<TaskTokenUsagePayload> {
+    let root = snapshots_by_id.get(root_id)?;
+    let mut ordered = Vec::new();
+    let mut visited = HashSet::new();
+    collect_task_token_usage_entries(
+        root_id,
+        0,
+        snapshots_by_id,
+        children_by_parent,
+        agent_sessions,
+        &mut visited,
+        &mut ordered,
+    );
+
+    let descendant_count = ordered.len().saturating_sub(1).min(u32::MAX as usize) as u32;
+    let total = aggregate_task_token_usage(ordered.iter().map(|entry| &entry.usage));
+    let descendant_usage =
+        aggregate_task_token_usage(ordered.iter().skip(1).map(|entry| &entry.usage));
+    Some(TaskTokenUsagePayload {
+        root_agent_id: root.start.agent_id.clone(),
+        root_session_id: agent_session_id(&root.start, agent_sessions),
+        total,
+        self_usage: ordered.first().map(|entry| entry.usage.clone()).unwrap_or(
+            TaskTokenUsageScope::Unavailable {
+                reason: TaskTokenUsageUnavailableReason::AgentUnavailable,
+            },
+        ),
+        descendant_usage,
+        descendant_count,
+        breakdown: ordered,
+    })
+}
+
+fn collect_task_token_usage_entries(
+    agent_id: &AgentId,
+    depth: u32,
+    snapshots_by_id: &HashMap<AgentId, AgentUsageSnapshot>,
+    children_by_parent: &HashMap<AgentId, Vec<AgentId>>,
+    agent_sessions: &HashMap<AgentId, SessionId>,
+    visited: &mut HashSet<AgentId>,
+    ordered: &mut Vec<TaskTokenUsageEntry>,
+) {
+    if !visited.insert(agent_id.clone()) {
+        return;
+    }
+    let Some(snapshot) = snapshots_by_id.get(agent_id) else {
+        return;
+    };
+    let tree_index = ordered.len().min(u32::MAX as usize) as u32;
+    let parent_session_id = snapshot
+        .start
+        .parent_agent_id
+        .as_ref()
+        .and_then(|parent| snapshots_by_id.get(parent).map(|snapshot| &snapshot.start))
+        .and_then(|start| agent_session_id(start, agent_sessions));
+    ordered.push(TaskTokenUsageEntry {
+        agent_id: snapshot.start.agent_id.clone(),
+        session_id: agent_session_id(&snapshot.start, agent_sessions),
+        parent_agent_id: snapshot.start.parent_agent_id.clone(),
+        parent_session_id,
+        name: snapshot.start.name.clone(),
+        origin: snapshot.start.origin,
+        backend_kind: snapshot.start.backend_kind,
+        model: snapshot.model.clone(),
+        depth,
+        tree_index,
+        usage: snapshot.usage.clone(),
+    });
+    if let Some(children) = children_by_parent.get(agent_id) {
+        for child in children {
+            collect_task_token_usage_entries(
+                child,
+                depth.saturating_add(1),
+                snapshots_by_id,
+                children_by_parent,
+                agent_sessions,
+                visited,
+                ordered,
+            );
+        }
+    }
+}
+
+fn agent_session_id(
+    start: &AgentStartPayload,
+    agent_sessions: &HashMap<AgentId, SessionId>,
+) -> Option<SessionId> {
+    start
+        .session_id
+        .clone()
+        .or_else(|| agent_sessions.get(&start.agent_id).cloned())
+}
+
+fn aggregate_task_token_usage<'a>(
+    usages: impl Iterator<Item = &'a TaskTokenUsageScope>,
+) -> TaskTokenUsageAggregate {
+    let mut usage = TaskTokenUsageAmount::zero();
+    let mut known_count = 0_u32;
+    let mut reasons = Vec::new();
+    let mut unavailable_count = 0_u32;
+
+    for scope in usages {
+        match scope {
+            TaskTokenUsageScope::Known { usage: known } => {
+                known_count = known_count.saturating_add(1);
+                usage.saturating_add(known);
+            }
+            TaskTokenUsageScope::Unavailable { reason } => {
+                unavailable_count = unavailable_count.saturating_add(1);
+                if !reasons.contains(reason) {
+                    reasons.push(*reason);
+                }
+            }
+        }
+    }
+    reasons.sort();
+
+    let status = if unavailable_count == 0 {
+        TaskTokenUsageStatus::Known
+    } else if known_count == 0 {
+        usage = TaskTokenUsageAmount::total_only(0);
+        TaskTokenUsageStatus::Unavailable {
+            unavailable_count,
+            reasons,
+        }
+    } else {
+        TaskTokenUsageStatus::Partial {
+            unavailable_count,
+            reasons,
+        }
+    };
+    TaskTokenUsageAggregate { usage, status }
 }
 
 fn normalize_antigravity_session_resumability(sessions: &mut [SessionSummary]) {
@@ -11949,9 +12480,7 @@ async fn emit_backend_config_schemas_for_subscriber(
         schemas: schemas.to_vec(),
     })
     .expect("failed to serialize BackendConfigSchemas payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::BackendConfigSchemas, payload)?;
+    emit_or_queue_host_frame(subscriber, FrameKind::BackendConfigSchemas, payload)?;
     subscriber.last_backend_config_schemas = Some(schemas.to_vec());
     Ok(())
 }
@@ -11967,9 +12496,7 @@ async fn emit_backend_config_snapshots_for_subscriber(
         snapshots: snapshots.to_vec(),
     })
     .expect("failed to serialize BackendConfigSnapshots payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::BackendConfigSnapshots, payload)?;
+    emit_or_queue_host_frame(subscriber, FrameKind::BackendConfigSnapshots, payload)?;
     subscriber.last_backend_config_snapshots = Some(snapshots.to_vec());
     Ok(())
 }
@@ -11985,9 +12512,7 @@ async fn emit_launch_profile_catalog_for_subscriber(
         catalog: catalog.clone(),
     })
     .expect("failed to serialize LaunchProfileCatalog payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::LaunchProfileCatalogNotify, payload)?;
+    emit_or_queue_host_frame(subscriber, FrameKind::LaunchProfileCatalogNotify, payload)?;
     subscriber.last_launch_profile_catalog = Some(catalog.clone());
     Ok(())
 }
@@ -12019,7 +12544,7 @@ async fn emit_team_notify_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize TeamNotify payload for host stream fanout");
-    subscriber.stream.send_value(FrameKind::TeamNotify, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::TeamNotify, payload)
 }
 
 async fn emit_team_member_notify_for_subscriber(
@@ -12028,9 +12553,7 @@ async fn emit_team_member_notify_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize TeamMemberNotify payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::TeamMemberNotify, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::TeamMemberNotify, payload)
 }
 
 async fn emit_team_member_binding_notify_for_subscriber(
@@ -12039,9 +12562,7 @@ async fn emit_team_member_binding_notify_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize TeamMemberBindingNotify payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::TeamMemberBindingNotify, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::TeamMemberBindingNotify, payload)
 }
 
 async fn emit_team_draft_notify_for_subscriber(
@@ -12050,9 +12571,7 @@ async fn emit_team_draft_notify_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize TeamDraftNotify payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::TeamDraftNotify, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::TeamDraftNotify, payload)
 }
 
 async fn emit_team_member_shuffle_suggestion_for_subscriber(
@@ -12062,9 +12581,11 @@ async fn emit_team_member_shuffle_suggestion_for_subscriber(
     let payload = serde_json::to_value(payload).expect(
         "failed to serialize TeamMemberShuffleSuggestionNotify payload for host stream fanout",
     );
-    subscriber
-        .stream
-        .send_value(FrameKind::TeamMemberShuffleSuggestionNotify, payload)
+    emit_or_queue_host_frame(
+        subscriber,
+        FrameKind::TeamMemberShuffleSuggestionNotify,
+        payload,
+    )
 }
 
 async fn emit_project_notify_for_subscriber(
@@ -12073,9 +12594,7 @@ async fn emit_project_notify_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize ProjectNotify payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::ProjectNotify, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::ProjectNotify, payload)
 }
 
 async fn emit_custom_agent_notify_for_subscriber(
@@ -12084,9 +12603,7 @@ async fn emit_custom_agent_notify_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize CustomAgentNotify payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::CustomAgentNotify, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::CustomAgentNotify, payload)
 }
 
 async fn emit_steering_notify_for_subscriber(
@@ -12095,9 +12612,7 @@ async fn emit_steering_notify_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize SteeringNotify payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::SteeringNotify, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::SteeringNotify, payload)
 }
 
 async fn emit_skill_notify_for_subscriber(
@@ -12106,9 +12621,7 @@ async fn emit_skill_notify_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize SkillNotify payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::SkillNotify, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::SkillNotify, payload)
 }
 
 async fn emit_mcp_server_notify_for_subscriber(
@@ -12117,9 +12630,7 @@ async fn emit_mcp_server_notify_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize McpServerNotify payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::McpServerNotify, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::McpServerNotify, payload)
 }
 
 async fn emit_workflow_notify_for_subscriber(
@@ -12128,9 +12639,7 @@ async fn emit_workflow_notify_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize WorkflowNotify payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::WorkflowNotify, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::WorkflowNotify, payload)
 }
 
 async fn emit_workflow_run_notify_for_subscriber(
@@ -12139,9 +12648,7 @@ async fn emit_workflow_run_notify_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize WorkflowRunNotify payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::WorkflowRunNotify, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::WorkflowRunNotify, payload)
 }
 
 async fn emit_host_settings_for_subscriber(
@@ -12152,9 +12659,7 @@ async fn emit_host_settings_for_subscriber(
         settings: settings.clone(),
     })
     .expect("failed to serialize HostSettings payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::HostSettings, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::HostSettings, payload)
 }
 
 async fn emit_agent_activity_summary_for_subscriber(
@@ -12163,9 +12668,16 @@ async fn emit_agent_activity_summary_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize AgentActivitySummary payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::AgentActivitySummary, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::AgentActivitySummary, payload)
+}
+
+async fn emit_task_token_usage_for_subscriber(
+    payload: &TaskTokenUsagePayload,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(payload)
+        .expect("failed to serialize TaskTokenUsage payload for host stream fanout");
+    emit_or_queue_host_frame(subscriber, FrameKind::TaskTokenUsage, payload)
 }
 
 async fn emit_agents_view_preferences_for_subscriber(
@@ -12174,9 +12686,7 @@ async fn emit_agents_view_preferences_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize AgentsViewPreferencesNotify payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::AgentsViewPreferencesNotify, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::AgentsViewPreferencesNotify, payload)
 }
 
 async fn emit_backend_setup_for_subscriber(
@@ -12185,9 +12695,7 @@ async fn emit_backend_setup_for_subscriber(
 ) -> Result<(), StreamClosed> {
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize BackendSetup payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::BackendSetup, payload)
+    emit_or_queue_host_frame(subscriber, FrameKind::BackendSetup, payload)
 }
 
 async fn emit_agent_closed_for_stream(
@@ -12210,9 +12718,7 @@ async fn emit_session_schemas_for_subscriber(
         schemas: schemas.to_vec(),
     })
     .expect("failed to serialize SessionSchemas payload for host stream fanout");
-    subscriber
-        .stream
-        .send_value(FrameKind::SessionSchemas, payload)?;
+    emit_or_queue_host_frame(subscriber, FrameKind::SessionSchemas, payload)?;
     subscriber.last_session_schemas = Some(schemas.to_vec());
     Ok(())
 }
@@ -13871,6 +14377,154 @@ mod tests {
                 .any(|event| matches!(event, protocol::AgentBootstrapEvent::AgentStart(_))),
             "loaded agent bootstrap should include its AgentStart snapshot"
         );
+    }
+
+    #[tokio::test]
+    async fn task_token_usage_keeps_unresponsive_live_agent_unavailable() {
+        let fixture = compact_fixture().await;
+        let (agent_id, _) =
+            spawn_idle_user_agent(&fixture.host, "remember unavailable live agent").await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/unavailable-agent-{}", Uuid::new_v4()));
+        let host_stream = Stream::new(host_path, tx);
+
+        assert!(
+            fixture
+                .host
+                .register_host_stream(host_stream, AgentReplayMode::Lazy)
+                .await
+                .is_empty()
+        );
+        let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("registration should emit HostBootstrap")
+            .expect("output envelope");
+        assert_eq!(envelope.kind, FrameKind::HostBootstrap);
+
+        let handle = {
+            let state = fixture.host.state.lock().await;
+            state
+                .registry
+                .agent_handle(&agent_id)
+                .expect("live registry handle")
+        };
+        assert!(handle.close().await);
+
+        fixture.host.fan_out_task_token_usages().await;
+
+        let payload = loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("task token usage should be emitted")
+                .expect("output envelope");
+            if envelope.kind != FrameKind::TaskTokenUsage {
+                continue;
+            }
+            let payload: TaskTokenUsagePayload =
+                envelope.parse_payload().expect("TaskTokenUsage payload");
+            if payload.root_agent_id == agent_id {
+                break payload;
+            }
+        };
+
+        assert_eq!(payload.descendant_count, 0);
+        assert_eq!(payload.breakdown.len(), 1);
+        assert_eq!(payload.breakdown[0].agent_id, agent_id);
+        assert!(matches!(
+            payload.self_usage,
+            TaskTokenUsageScope::Unavailable {
+                reason: TaskTokenUsageUnavailableReason::AgentUnavailable
+            }
+        ));
+        assert_eq!(payload.total.usage.total_tokens, 0);
+        assert_eq!(payload.total.usage.input_tokens, None);
+        assert!(matches!(
+            payload.total.status,
+            TaskTokenUsageStatus::Unavailable {
+                unavailable_count: 1,
+                ref reasons
+            } if reasons == &vec![TaskTokenUsageUnavailableReason::AgentUnavailable]
+        ));
+    }
+
+    #[tokio::test]
+    async fn bootstrapping_new_agent_fanout_is_deferred_until_after_bootstrap() {
+        let fixture = compact_fixture().await;
+        let (agent_id, _) =
+            spawn_idle_user_agent(&fixture.host, "remember bootstrap fanout ordering").await;
+        let handle = {
+            let state = fixture.host.state.lock().await;
+            state
+                .registry
+                .agent_handle(&agent_id)
+                .expect("live registry handle")
+        };
+        let start = handle.snapshot();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/bootstrap-pending-{}", Uuid::new_v4()));
+        let stream = Stream::new(host_path, tx);
+        let mut subscriber = HostSubscriber {
+            stream: stream.clone(),
+            bootstrapped: false,
+            agent_replay: AgentReplayMode::Eager,
+            known_agent_streams: HashSet::new(),
+            attached_agent_streams: HashSet::new(),
+            bootstrapped_agent_streams: HashSet::new(),
+            pending_bootstrap_new_agents: Vec::new(),
+            pending_bootstrap_frames: Vec::new(),
+            last_session_schemas: None,
+            last_backend_config_schemas: None,
+            last_backend_config_snapshots: None,
+            last_launch_profile_catalog: None,
+        };
+
+        assert!(
+            prepare_new_agent_fanout_for_subscriber(
+                &mut subscriber,
+                &start,
+                &handle,
+                AgentActivitySummaryState::default(),
+            )
+            .is_none()
+        );
+        assert_eq!(subscriber.pending_bootstrap_new_agents.len(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "NewAgent must not be emitted before HostBootstrap"
+        );
+
+        subscriber
+            .stream
+            .send_value(FrameKind::HostBootstrap, serde_json::json!({}))
+            .expect("send bootstrap marker");
+        subscriber.bootstrapped = true;
+        for pending in std::mem::take(&mut subscriber.pending_bootstrap_new_agents) {
+            emit_new_agent_for_stream(
+                &pending.start,
+                &pending.agent_handle,
+                &subscriber.stream,
+                pending.instance_stream,
+                pending.attach_eagerly,
+                pending.activity_summary,
+            )
+            .await
+            .expect("flush pending NewAgent");
+        }
+
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("bootstrap marker should be first")
+            .expect("bootstrap marker envelope");
+        assert_eq!(first.kind, FrameKind::HostBootstrap);
+        let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("pending NewAgent should follow bootstrap")
+            .expect("pending NewAgent envelope");
+        assert_eq!(second.kind, FrameKind::NewAgent);
+        let payload: NewAgentPayload = second.parse_payload().expect("NewAgent payload");
+        assert_eq!(payload.agent_id, agent_id);
     }
 
     async fn wait_for_agent_idle(host: &HostHandle, agent_id: &AgentId) {
