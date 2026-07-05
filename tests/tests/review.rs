@@ -33,6 +33,21 @@ async fn next_env(client: &mut client::Connection, context: &str) -> Envelope {
     }
 }
 
+async fn next_env_before(
+    client: &mut client::Connection,
+    deadline: tokio::time::Instant,
+    context: &str,
+) -> Envelope {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    assert!(!remaining.is_zero(), "timed out waiting for {context}");
+    match tokio::time::timeout(remaining, client.next_event()).await {
+        Ok(Ok(Some(env))) => env,
+        Ok(Ok(None)) => panic!("connection closed before {context}"),
+        Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+        Err(_) => panic!("timed out waiting for {context}"),
+    }
+}
+
 async fn expect_project(client: &mut client::Connection, context: &str) -> Project {
     loop {
         let env = next_env(client, context).await;
@@ -346,6 +361,13 @@ async fn spawn_project_agent(
     client: &mut client::Connection,
     project: &Project,
 ) -> (NewAgentPayload, SessionId) {
+    spawn_project_agent_with_prompt(client, project, "start review origin", false).await
+}
+
+async fn spawn_idle_project_agent(
+    client: &mut client::Connection,
+    project: &Project,
+) -> (NewAgentPayload, SessionId) {
     spawn_project_agent_with_prompt(client, project, "start review origin", true).await
 }
 
@@ -378,8 +400,13 @@ async fn spawn_project_agent_with_prompt(
     let mut saw_start = false;
     let mut saw_idle = !wait_until_idle;
     let mut session_id = new_agent.session_id.clone();
+    let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !saw_start || !saw_idle || session_id.is_none() {
-        let env = next_env(client, "origin agent startup").await;
+        let context = format!(
+            "origin agent startup (saw_start={saw_start}, saw_idle={saw_idle}, session_id={})",
+            session_id.is_some()
+        );
+        let env = next_env_before(client, startup_deadline, &context).await;
         match env.kind {
             FrameKind::AgentBootstrap if env.stream == new_agent.instance_stream => {
                 let bootstrap: protocol::AgentBootstrapPayload =
@@ -931,7 +958,7 @@ async fn create_review_add_update_delete_and_submit_live() {
     seed_repo(&repo);
 
     let project = create_project(&mut client, &repo).await;
-    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+    let (agent, _session_id) = spawn_idle_project_agent(&mut client, &project).await;
     let review = create_review(&mut client, &project, &agent).await;
 
     assert_eq!(review.diffs.len(), 1);
@@ -1509,7 +1536,7 @@ async fn submitted_review_sends_rendered_markdown_to_origin() {
     seed_repo(&repo);
 
     let project = create_project(&mut client, &repo).await;
-    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+    let (agent, _session_id) = spawn_idle_project_agent(&mut client, &project).await;
     let review = create_review(&mut client, &project, &agent).await;
     let location = new_line_location(&review);
     let expected_heading = match &location.anchor {
@@ -1610,7 +1637,7 @@ async fn submit_to_closed_existing_agent_keeps_draft_comments() {
     seed_repo(&repo);
 
     let project = create_project(&mut client, &repo).await;
-    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+    let (agent, _session_id) = spawn_idle_project_agent(&mut client, &project).await;
     let review = create_review(&mut client, &project, &agent).await;
     let comment_id = add_comment(&mut client, &review, "Offline delivery comment.").await;
 
@@ -1979,7 +2006,7 @@ async fn cancel_rules_for_draft_and_failed_submit_reviews() {
     seed_repo(&repo);
 
     let project = create_project(&mut client, &repo).await;
-    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+    let (agent, _session_id) = spawn_idle_project_agent(&mut client, &project).await;
     let draft_review = create_review(&mut client, &project, &agent).await;
     client
         .review_action(&draft_review.id, ReviewActionPayload::Cancel)
