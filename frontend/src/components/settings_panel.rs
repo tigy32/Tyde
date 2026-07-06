@@ -3810,8 +3810,15 @@ fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl I
                         .as_ref()
                         .map(|command| command.runnable)
                         .unwrap_or(false);
-                    let show_install = info.status == BackendSetupStatus::NotInstalled
-                        && info.install_command.is_some();
+                    // An Unavailable backend (found but unusable) gets the same
+                    // install command as a repair action, matching the server's
+                    // "re-run the installer" diagnostics.
+                    let install_label = match info.status {
+                        BackendSetupStatus::NotInstalled => Some("Install"),
+                        BackendSetupStatus::Unavailable => Some("Repair install"),
+                        BackendSetupStatus::Installed | BackendSetupStatus::Unsupported => None,
+                    }
+                    .filter(|_| info.install_command.is_some());
                     let show_signin = info.status == BackendSetupStatus::Installed
                         && info.sign_in_command.is_some();
                     let unsupported = info.status == BackendSetupStatus::Unsupported;
@@ -3822,7 +3829,7 @@ fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl I
                     view! {
                         <div class="settings-backend-setup">
                             <div class="settings-backend-actions">
-                                {show_install.then(|| view! {
+                                {install_label.map(|label| view! {
                                     <button
                                         class="settings-btn settings-btn-primary"
                                         disabled=!install_runnable
@@ -3834,7 +3841,7 @@ fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl I
                                             );
                                         }
                                     >
-                                        "Install"
+                                        {label}
                                     </button>
                                 })}
                                 {show_signin.then(|| view! {
@@ -7989,6 +7996,123 @@ mod wasm_tests {
                 .and_then(|s| s.as_str()),
             Some("openrouter"),
             "the edit must carry the typed value: {setting:?}"
+        );
+    }
+
+    /// A backend whose CLI is found but unusable is reported `Unavailable`
+    /// with a server-owned diagnostic telling the user to repair the install.
+    /// The Backends overview card must pair that diagnostic with a runnable
+    /// repair affordance — hiding the install command would tell the user to
+    /// re-run the installer while offering no way to do it.
+    #[wasm_bindgen_test]
+    async fn backend_card_unavailable_offers_repair_install() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let diagnostic_message =
+            "Hermes CLI found but unusable: re-run the Hermes installer or set HERMES_PYTHON";
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_backend_config_host(
+                &state,
+                BackendConfigValues::default(),
+                vec![BackendKind::Hermes],
+            );
+            state.backend_setup_by_host.update(|m| {
+                m.insert(
+                    "host-cfg".to_owned(),
+                    vec![protocol::BackendSetupInfo {
+                        backend_kind: BackendKind::Hermes,
+                        status: BackendSetupStatus::Unavailable,
+                        installed_version: None,
+                        docs_url: "https://example.test/docs".to_owned(),
+                        install_command: Some(protocol::BackendSetupCommand {
+                            title: "Install Hermes".to_owned(),
+                            description: "Installs the Hermes CLI".to_owned(),
+                            command: "hermes-installer".to_owned(),
+                            display_command: None,
+                            runnable: true,
+                        }),
+                        diagnostic: Some(protocol::BackendSetupDiagnostic {
+                            code: protocol::BackendSetupDiagnosticCode::GatewayImportFailed,
+                            message: diagnostic_message.to_owned(),
+                        }),
+                        sign_in_command: None,
+                    }],
+                );
+            });
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        find_button_by_text(&container, "Overview")
+            .expect("the Backends group must have an Overview item")
+            .click();
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Unavailable"),
+            "the card must report the server's Unavailable status: {text:?}"
+        );
+        assert!(
+            !text.contains("Not installed"),
+            "a found-but-unusable install must not be misreported as not installed: {text:?}"
+        );
+        assert!(
+            text.contains(diagnostic_message),
+            "the server-owned diagnostic must stay visible verbatim: {text:?}"
+        );
+
+        assert!(
+            find_button_by_text(&container, "Install").is_none(),
+            "an Unavailable backend must offer a repair action, not a fresh Install"
+        );
+        let repair = find_button_by_text(&container, "Repair install")
+            .expect("an Unavailable backend with an install command must offer a repair action");
+        assert!(
+            !repair.has_attribute("disabled"),
+            "a runnable install command must keep the repair action live"
+        );
+
+        repair.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let setup_frames: Vec<serde_json::Value> = calls
+            .iter()
+            .filter_map(|entry| entry.dyn_into::<js_sys::Array>().ok())
+            .filter(|arr| arr.get(0).as_string().as_deref() == Some("send_host_line"))
+            .filter_map(|arr| arr.get(1).as_string())
+            .filter_map(|args_json| serde_json::from_str::<serde_json::Value>(&args_json).ok())
+            .filter_map(|args| {
+                args.get("line")
+                    .and_then(|v| v.as_str())
+                    .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            })
+            .filter(|envelope| {
+                envelope.get("kind").and_then(|v| v.as_str()) == Some("run_backend_setup")
+            })
+            .collect();
+        assert_eq!(
+            setup_frames.len(),
+            1,
+            "clicking the repair action must fire exactly one RunBackendSetup frame"
+        );
+        let payload = setup_frames[0]
+            .get("payload")
+            .expect("run_backend_setup frame must carry a payload");
+        assert_eq!(
+            payload.get("backend_kind").and_then(|v| v.as_str()),
+            Some("hermes"),
+            "the repair action must target this card's backend: {payload:?}"
+        );
+        assert_eq!(
+            payload.get("action").and_then(|v| v.as_str()),
+            Some("install"),
+            "the repair action must run the server's install command: {payload:?}"
         );
     }
 
