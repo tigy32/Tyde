@@ -1603,6 +1603,7 @@ mod tests {
                 compacted_at_ms: None,
                 compaction_summary_preview: Some("x".repeat(preview_len)),
             }],
+            page: Default::default(),
         };
         let envelope = Envelope::from_payload(
             StreamPath("host/session-list".to_owned()),

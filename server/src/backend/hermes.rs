@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{fs, io};
 
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
@@ -106,6 +106,12 @@ pub(crate) struct HermesCliGatewayProbe {
     pub(crate) executable: String,
     pub(crate) gateway_python: String,
     pub(crate) version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HermesGatewayPythonCandidate {
+    program: String,
+    source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2223,27 +2229,344 @@ pub(crate) async fn probe_hermes_cli_gateway(
     command: &str,
 ) -> Result<HermesCliGatewayProbe, HermesProbeFailure> {
     let output = run_hermes_version_command(command).await?;
+    let version = parse_hermes_version_output(&output.stdout, &output.stderr);
     let Some(project_root) = parse_hermes_project_root(&output.stdout, &output.stderr) else {
         return Err(HermesProbeFailure::new(
             BackendSetupDiagnosticCode::MissingProjectRoot,
             format!("Hermes executable {command} --version did not report a Project: root"),
         ));
     };
-    let Some(gateway_python) = hermes_project_python(&project_root) else {
-        return Err(HermesProbeFailure::new(
-            BackendSetupDiagnosticCode::MissingGatewayPython,
-            format!(
-                "Hermes project {} does not contain venv/bin/python or .venv/bin/python",
-                project_root.display()
-            ),
-        ));
-    };
-    probe_hermes_python_gateway_import(&gateway_python).await?;
+    let gateway_python =
+        resolve_hermes_cli_gateway_python(command, version.as_deref(), &project_root).await?;
     Ok(HermesCliGatewayProbe {
         executable: command.to_string(),
         gateway_python,
-        version: parse_hermes_version_output(&output.stdout, &output.stderr),
+        version,
     })
+}
+
+async fn resolve_hermes_cli_gateway_python(
+    command: &str,
+    version: Option<&str>,
+    project_root: &Path,
+) -> Result<String, HermesProbeFailure> {
+    let candidates = hermes_gateway_python_candidates(command, project_root);
+    let identity = hermes_cli_identity(command, version, project_root);
+    let mut import_failures = Vec::new();
+
+    for candidate in candidates {
+        match probe_hermes_python_gateway_import(&candidate.program).await {
+            Ok(()) => return Ok(candidate.program),
+            Err(err) => import_failures.push((candidate, err)),
+        }
+    }
+
+    if import_failures.is_empty() {
+        return Err(HermesProbeFailure::new(
+            BackendSetupDiagnosticCode::MissingGatewayPython,
+            format!(
+                "{identity}, but Tyde could not resolve a Python interpreter from the Hermes CLI wrapper, console-script shebang, or project virtualenv that can import {HERMES_PYTHON_MODULE}. Remedy: {}",
+                hermes_gateway_python_remedy()
+            ),
+        ));
+    }
+
+    let attempts = import_failures
+        .into_iter()
+        .map(|(candidate, err)| {
+            format!(
+                "{} from {} failed: {}",
+                candidate.program, candidate.source, err.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(HermesProbeFailure::new(
+        BackendSetupDiagnosticCode::GatewayImportFailed,
+        format!(
+            "{identity}, but no resolved gateway Python can import {HERMES_PYTHON_MODULE}. {attempts}. Remedy: {}",
+            hermes_gateway_python_remedy()
+        ),
+    ))
+}
+
+fn hermes_gateway_python_remedy() -> String {
+    format!(
+        "Re-run the Hermes installer to restore its Python environment, or set HERMES_PYTHON to a Python interpreter that can import {HERMES_PYTHON_MODULE}."
+    )
+}
+
+fn hermes_cli_identity(command: &str, version: Option<&str>, project_root: &Path) -> String {
+    match version {
+        Some(version) => format!(
+            "Hermes CLI {command} reported {version} with project {}",
+            project_root.display()
+        ),
+        None => format!(
+            "Hermes CLI {command} reported project {}",
+            project_root.display()
+        ),
+    }
+}
+
+fn hermes_gateway_python_candidates(
+    command: &str,
+    project_root: &Path,
+) -> Vec<HermesGatewayPythonCandidate> {
+    let mut candidates = Vec::new();
+    if let Some(path) = local_executable_path_for_inspection(command) {
+        collect_python_candidates_from_executable(&path, &mut candidates, &mut Vec::new(), 0);
+    }
+
+    for program in hermes_project_python_candidates(project_root) {
+        push_unique_python_candidate(
+            &mut candidates,
+            program,
+            format!("Hermes project {}", project_root.display()),
+        );
+    }
+
+    candidates
+}
+
+fn local_executable_path_for_inspection(command: &str) -> Option<PathBuf> {
+    let path = Path::new(command);
+    if path.components().count() > 1 {
+        return path.exists().then(|| path.to_path_buf());
+    }
+
+    process_env::find_executable_in_path(command)
+}
+
+fn collect_python_candidates_from_executable(
+    path: &Path,
+    candidates: &mut Vec<HermesGatewayPythonCandidate>,
+    visited: &mut Vec<PathBuf>,
+    depth: usize,
+) {
+    if depth > 6 {
+        return;
+    }
+
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if visited.contains(&canonical) {
+        return;
+    }
+    visited.push(canonical.clone());
+
+    let program = canonical.to_string_lossy().to_string();
+    if path_looks_like_python(&canonical) {
+        push_unique_python_candidate(
+            candidates,
+            program,
+            format!("Hermes CLI wrapper {}", canonical.display()),
+        );
+    }
+
+    let Ok(contents) = fs::read_to_string(&canonical) else {
+        return;
+    };
+
+    if let Some(shebang) = contents
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("#!"))
+        && let Some(program) = python_from_shebang(shebang)
+    {
+        push_unique_python_candidate(
+            candidates,
+            program,
+            format!("shebang of {}", canonical.display()),
+        );
+    }
+
+    for target in executable_targets_from_script(&contents, canonical.parent()) {
+        collect_python_candidates_from_executable(&target, candidates, visited, depth + 1);
+    }
+}
+
+fn push_unique_python_candidate(
+    candidates: &mut Vec<HermesGatewayPythonCandidate>,
+    program: String,
+    source: String,
+) {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.program == program)
+    {
+        return;
+    }
+    candidates.push(HermesGatewayPythonCandidate { program, source });
+}
+
+fn path_looks_like_python(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase().contains("python"))
+        .unwrap_or(false)
+}
+
+fn python_from_shebang(shebang: &str) -> Option<String> {
+    let tokens = split_shell_words(shebang.trim())?;
+    if tokens.is_empty() {
+        return None;
+    }
+
+    if path_looks_like_python(Path::new(&tokens[0])) {
+        return Some(tokens[0].clone());
+    }
+
+    if Path::new(&tokens[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("env")
+    {
+        let mut iter = tokens.into_iter().skip(1);
+        while let Some(token) = iter.next() {
+            if token == "-S" {
+                let script = iter.collect::<Vec<_>>().join(" ");
+                return split_shell_words(&script)?
+                    .into_iter()
+                    .find(|token| path_looks_like_python(Path::new(token)));
+            }
+            if token.starts_with('-') {
+                continue;
+            }
+            if path_looks_like_python(Path::new(&token)) {
+                return Some(token);
+            }
+            return None;
+        }
+    }
+
+    None
+}
+
+fn executable_targets_from_script(contents: &str, script_dir: Option<&Path>) -> Vec<PathBuf> {
+    contents
+        .lines()
+        .filter_map(exec_line_tokens)
+        .flat_map(|tokens| {
+            tokens
+                .into_iter()
+                .filter_map(move |token| executable_target_from_token(&token, script_dir))
+        })
+        .collect()
+}
+
+fn exec_line_tokens(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix("exec")?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let tokens = split_shell_words(rest.trim())?;
+    Some(
+        tokens
+            .into_iter()
+            .filter(|token| !skip_exec_token(token))
+            .collect(),
+    )
+}
+
+fn skip_exec_token(token: &str) -> bool {
+    token.is_empty()
+        || matches!(token, "$@" | "$*" | "${@}" | "${*}")
+        || token.starts_with('-')
+        || (token.contains('=') && !token.contains('/'))
+}
+
+fn executable_target_from_token(token: &str, script_dir: Option<&Path>) -> Option<PathBuf> {
+    let expanded = expand_known_shell_vars(token);
+    if expanded.is_empty() || expanded.contains('$') {
+        return None;
+    }
+
+    let path = Path::new(&expanded);
+    if path.components().count() > 1 {
+        if path.is_absolute() {
+            return path.exists().then(|| path.to_path_buf());
+        }
+        if let Some(script_dir) = script_dir {
+            let candidate = script_dir.join(path);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        return path.exists().then(|| path.to_path_buf());
+    }
+
+    process_env::find_executable_in_path(&expanded)
+}
+
+fn expand_known_shell_vars(token: &str) -> String {
+    let mut expanded = token.to_string();
+    if let Ok(home) = std::env::var("HOME") {
+        expanded = expanded.replace("${HOME}", &home);
+        expanded = expanded.replace("$HOME", &home);
+    }
+    expanded
+}
+
+fn split_shell_words(input: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut quote = None;
+    let mut in_word = false;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Some('"') => match ch {
+                '"' => quote = None,
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                _ => current.push(ch),
+            },
+            Some(_) => return None,
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    in_word = true;
+                }
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                        in_word = true;
+                    }
+                }
+                ch if ch.is_whitespace() => {
+                    if in_word {
+                        words.push(std::mem::take(&mut current));
+                        in_word = false;
+                    }
+                }
+                '#' if !in_word => break,
+                _ => {
+                    current.push(ch);
+                    in_word = true;
+                }
+            },
+        }
+    }
+
+    if quote.is_some() {
+        return None;
+    }
+    if in_word {
+        words.push(current);
+    }
+    Some(words)
 }
 
 async fn run_hermes_version_command(
@@ -2370,7 +2693,7 @@ fn parse_hermes_project_root(stdout: &str, stderr: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn hermes_project_python(project_root: &Path) -> Option<String> {
+fn hermes_project_python_candidates(project_root: &Path) -> Vec<String> {
     #[cfg(windows)]
     let candidates = [
         project_root.join("venv").join("Scripts").join("python.exe"),
@@ -2388,8 +2711,9 @@ fn hermes_project_python(project_root: &Path) -> Option<String> {
 
     candidates
         .into_iter()
-        .find(|path| path.is_file())
+        .filter(|path| path.is_file())
         .map(|path| path.to_string_lossy().to_string())
+        .collect()
 }
 
 pub(crate) fn hermes_cli_required_failure(
@@ -2402,7 +2726,10 @@ pub(crate) fn hermes_cli_required_failure(
         Some(failure) if failure.code != BackendSetupDiagnosticCode::CommandNotFound => {
             HermesProbeFailure::new(
                 failure.code,
-                format!("Could not verify Hermes CLI: {}. {action}", failure.message),
+                format!(
+                    "Found Hermes CLI, but it is not usable by Tyde: {}",
+                    failure.message
+                ),
             )
         }
         Some(failure) => HermesProbeFailure::new(
@@ -2885,27 +3212,33 @@ mod tests {
 
     fn write_fake_hermes_cli_install(dir: &TempDir) -> (String, String) {
         let project = dir.path().join("hermes-agent");
-        let python = project.join("venv").join("bin").join("python");
-        fs::create_dir_all(python.parent().expect("fake Hermes venv parent"))
-            .expect("create fake Hermes venv");
+        fs::create_dir_all(&project).expect("create fake Hermes project");
+        let python = dir.path().join("fake_python");
+        let console = dir.path().join("hermes_console");
         fs::write(
             &python,
             "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then exit 0; fi\nexit 1\n",
         )
-        .expect("write fake Hermes venv python");
+        .expect("write fake Hermes Python");
+        fs::write(
+            &console,
+            format!("#!{}\nimport sys\nsys.exit(1)\n", python.to_string_lossy()),
+        )
+        .expect("write fake Hermes console script");
         let hermes = dir.path().join("hermes");
+        let console_quoted = console.to_string_lossy().replace('\'', "'\\''");
         fs::write(
             &hermes,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'Hermes Agent v9.9.9\\nProject: {}\\n'\n  exit 0\nfi\nexit 1\n",
-                project.to_string_lossy()
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'Hermes Agent v9.9.9\\nProject: {}\\n'\n  exit 0\nfi\nexec '{console_quoted}' \"$@\"\n",
+                project.to_string_lossy(),
             ),
         )
         .expect("write fake Hermes executable");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for path in [&python, &hermes] {
+            for path in [&python, &console, &hermes] {
                 let mut perms = fs::metadata(path)
                     .expect("fake Hermes metadata")
                     .permissions();

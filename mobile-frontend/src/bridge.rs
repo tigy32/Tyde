@@ -64,6 +64,7 @@ impl UnlistenHandle {
 /// detected mode is logged once on first use so a future `__TAURI__`-injected-
 /// late misdetection (web chosen when Tauri was expected, or vice-versa) is
 /// visible in the console rather than silently changing every host call.
+#[cfg(not(all(test, target_arch = "wasm32")))]
 fn use_web_backend() -> bool {
     thread_local! {
         static IS_WEB: bool = {
@@ -76,6 +77,11 @@ fn use_web_backend() -> bool {
         };
     }
     IS_WEB.with(|is_web| *is_web)
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+fn use_web_backend() -> bool {
+    !tauri_present()
 }
 
 fn tauri_present() -> bool {

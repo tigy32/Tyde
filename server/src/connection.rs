@@ -19,7 +19,7 @@ pub async fn run_connection(connection: Connection, host: HostHandle) -> Result<
     run_connection_with_origin(connection, host, ConnectionOrigin::Desktop).await
 }
 
-pub(crate) async fn run_mobile_connection(
+pub async fn run_mobile_connection(
     connection: Connection,
     host: HostHandle,
 ) -> Result<(), FrameError> {

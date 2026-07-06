@@ -87,6 +87,12 @@ pub fn HomeView() -> impl IntoView {
                 PillTone::Warning,
                 "Connecting",
             ),
+            ConnectionStatus::Bootstrapping => (
+                StatusTone::Pending,
+                "Loading host",
+                PillTone::Warning,
+                "Loading",
+            ),
             ConnectionStatus::Disconnected => {
                 (StatusTone::Muted, "Offline", PillTone::Neutral, "Offline")
             }

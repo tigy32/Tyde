@@ -49,12 +49,21 @@ pub fn SessionsView() -> impl IntoView {
         search.set(input.value());
     };
 
+    let state_for_count = state.clone();
     view! {
         <div class="view sessions-view" data-mobile-test="sessions-view">
             <header class="view-header">
                 <h1 class="view-title">"Sessions"</h1>
                 {move || {
-                    let count = filtered.get().len();
+                    let filtered_count = filtered.get().len() as u32;
+                    let count = if search.get().trim().is_empty() {
+                        state_for_count
+                            .active_session_list_state()
+                            .map(|list| list.page.total_count)
+                            .unwrap_or(filtered_count)
+                    } else {
+                        filtered_count
+                    };
                     view! {
                         <Pill
                             label=format!("{count}")
@@ -82,6 +91,20 @@ pub fn SessionsView() -> impl IntoView {
                     let sessions = filtered.get();
                     if sessions.is_empty() {
                         if search.get().trim().is_empty() {
+                            if state
+                                .active_session_list_state()
+                                .is_some_and(|list| list.loading_more || list.page.total_count > 0)
+                            {
+                                return view! {
+                                    <div class="view-loading" data-mobile-test="sessions-loading">
+                                        <Spinner
+                                            large=true
+                                            aria_label="Loading sessions".to_string()
+                                            data_mobile_test="sessions-loading-spinner"
+                                        />
+                                    </div>
+                                }.into_any();
+                            }
                             // Sessions arrive in the host snapshot; show a
                             // spinner while it's still in flight instead of the
                             // "No sessions yet" empty state, which would read as
@@ -115,6 +138,9 @@ pub fn SessionsView() -> impl IntoView {
                             />
                         }.into_any();
                     }
+                    let loading_more = state
+                        .active_session_list_state()
+                        .is_some_and(|list| list.loading_more);
                     view! {
                         <div class="session-list" data-mobile-test="sessions-list">
                             {sessions.into_iter().map(|session| {
@@ -225,6 +251,19 @@ pub fn SessionsView() -> impl IntoView {
                                     </Card>
                                 }
                             }).collect::<Vec<_>>()}
+                            {if loading_more {
+                                view! {
+                                    <div class="view-loading-inline" data-mobile-test="sessions-loading-more">
+                                        <Spinner
+                                            aria_label="Loading more sessions".to_string()
+                                            data_mobile_test="sessions-loading-more-spinner"
+                                        />
+                                        <span>"Loading more sessions…"</span>
+                                    </div>
+                                }.into_any()
+                            } else {
+                                view! { <div></div> }.into_any()
+                            }}
                         </div>
                     }.into_any()
                 }}
@@ -306,7 +345,9 @@ async fn delete_session(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::state::{AppState, ConnectionStatus, LocalHostId, SessionInfo};
+    use crate::state::{
+        AppState, ConnectionStatus, LocalHostId, SessionInfo, SessionListLoadState,
+    };
     use leptos::mount::mount_to;
     use protocol::{BackendKind, SessionId, SessionSummary};
     use wasm_bindgen::JsCast;
@@ -485,6 +526,73 @@ mod wasm_tests {
                 .query_selector("[data-mobile-test='sessions-empty-search']")
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn sessions_count_uses_total_until_search_filters() {
+        let host = LocalHostId("host-count".to_owned());
+        let container = make_container();
+        let host_for_mount = host.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.sessions.set(vec![
+                fixture(&host_for_mount, "s-1", "Code review"),
+                fixture(&host_for_mount, "s-2", "Onboarding draft"),
+            ]);
+            state.session_lists_by_host.update(|lists| {
+                lists.insert(
+                    host_for_mount.clone(),
+                    SessionListLoadState::from_page(
+                        protocol::SessionListPageInfo {
+                            cursor: protocol::SessionListCursor {
+                                generation: protocol::SessionListGeneration(1),
+                                offset: 0,
+                            },
+                            limit: 2,
+                            total_count: 5,
+                            status: protocol::SessionListPageStatus::More {
+                                next_cursor: protocol::SessionListCursor {
+                                    generation: protocol::SessionListGeneration(1),
+                                    offset: 2,
+                                },
+                            },
+                        },
+                        2,
+                    ),
+                );
+            });
+            provide_context(state);
+            view! { <SessionsView /> }
+        });
+        next_tick().await;
+
+        let count = container
+            .query_selector("[data-mobile-test='sessions-count-pill']")
+            .unwrap()
+            .expect("count pill");
+        assert_eq!(
+            count.text_content().unwrap_or_default(),
+            "5",
+            "without search the pill should show server total sessions"
+        );
+
+        let input: web_sys::HtmlInputElement = container
+            .query_selector("[data-mobile-test='sessions-search']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.set_value("code");
+        let ev = web_sys::Event::new("input").unwrap();
+        input.dispatch_event(&ev).unwrap();
+        next_tick().await;
+
+        assert_eq!(
+            count.text_content().unwrap_or_default(),
+            "1",
+            "active search should show filtered result count"
         );
     }
 

@@ -51,6 +51,7 @@ use crate::types::{PreSharedKey, RoomId};
 const CLIENT_HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const PUBLISH_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const PUBLISH_RETRY_MAX: Duration = Duration::from_secs(30);
+const PUBLISH_RETRY_ATTEMPTS: u8 = 5;
 const OUTBOUND_BOXCAR_DELAY: Duration = Duration::from_millis(100);
 const RENDEZVOUS_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const CREDIT_EMIT_THRESHOLD: u64 = (DATA_CREDIT_WINDOW / 2) as u64;
@@ -511,6 +512,8 @@ impl<L: MqttLink> ProtocolDriver<L> {
             token: published.token,
             counter: published.counter,
             plaintext_len: published.plaintext_len,
+            frame: published.frame,
+            quota_retries: 0,
             batch,
         });
         Ok(())
@@ -562,7 +565,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
         credit: &mut ReceiverCreditState,
     ) -> Result<(), MqttTransportError> {
         match event {
-            LinkEvent::PubAck(ack) => self.handle_publish_ack(ack, in_flight),
+            LinkEvent::PubAck(ack) => self.handle_publish_ack(ack, in_flight).await,
             other => self.handle_ready_event(other, cipher, credit).await,
         }?;
         self.publish_due_credit(cipher, in_flight, credit).await?;
@@ -583,11 +586,13 @@ impl<L: MqttLink> ProtocolDriver<L> {
         }
         let encrypted = cipher.encrypt_credit(next_expected)?;
         let frame = encode_credit_frame(encrypted.counter, &encrypted.ciphertext_with_tag);
-        let token = self.publish_frame(frame).await?;
+        let token = self.publish_frame(frame.clone()).await?;
         credit.mark_published(next_expected);
         in_flight.insert(InflightPublish::Credit {
             token,
             next_expected,
+            frame,
+            quota_retries: 0,
         });
         tracing::debug!(
             role = ?self.config.role,
@@ -598,7 +603,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
         Ok(())
     }
 
-    fn handle_publish_ack(
+    async fn handle_publish_ack(
         &mut self,
         ack: PublishAck,
         in_flight: &mut InflightPublishes,
@@ -648,7 +653,40 @@ impl<L: MqttLink> ProtocolDriver<L> {
             }
             Err(error) => {
                 self.publish_pacer.record_rejection(&error);
-                Err(error)
+                if !publish_error_is_quota_exceeded(&error) {
+                    return Err(error);
+                }
+
+                let Some(mut publish) = in_flight.remove(ack.token) else {
+                    return Err(MqttTransportError::PublishAckMismatch {
+                        packet_id: None,
+                        token: Some(ack.token.value()),
+                    });
+                };
+                let quota_retries = publish.quota_retries();
+                if quota_retries >= PUBLISH_RETRY_ATTEMPTS {
+                    in_flight.insert(publish);
+                    return Err(error);
+                }
+                let frame = publish.frame().to_vec();
+                let retry_number = quota_retries.saturating_add(1);
+                tracing::warn!(
+                    role = ?self.config.role,
+                    retry_number,
+                    max_retries = PUBLISH_RETRY_ATTEMPTS,
+                    error = %error,
+                    "retrying MQTT publish rejected by broker quota"
+                );
+                let token = match self.publish_frame(frame).await {
+                    Ok(token) => token,
+                    Err(retry_error) => {
+                        publish.ack_error(&retry_error);
+                        return Err(retry_error);
+                    }
+                };
+                publish.requeue_after_quota_retry(token);
+                in_flight.insert(publish);
+                Ok(())
             }
         }
     }
@@ -708,7 +746,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
         let counter = encrypted.counter;
         let plaintext_len = plaintext.len();
         let frame = encode_data_frame(encrypted.counter, &encrypted.ciphertext_with_tag);
-        let token = self.publish_frame(frame).await?;
+        let token = self.publish_frame(frame.clone()).await?;
         tracing::debug!(
             role = ?self.config.role,
             counter,
@@ -722,6 +760,7 @@ impl<L: MqttLink> ProtocolDriver<L> {
             token,
             counter,
             plaintext_len,
+            frame,
         })
     }
 
@@ -922,6 +961,7 @@ struct PublishedFrame {
     token: PublishToken,
     counter: u64,
     plaintext_len: usize,
+    frame: Vec<u8>,
 }
 
 enum InflightPublish {
@@ -929,11 +969,15 @@ enum InflightPublish {
         token: PublishToken,
         counter: u64,
         plaintext_len: usize,
+        frame: Vec<u8>,
+        quota_retries: u8,
         batch: BoxcarBatch,
     },
     Credit {
         token: PublishToken,
         next_expected: u64,
+        frame: Vec<u8>,
+        quota_retries: u8,
     },
 }
 
@@ -941,6 +985,36 @@ impl InflightPublish {
     fn token(&self) -> PublishToken {
         match self {
             Self::Data { token, .. } | Self::Credit { token, .. } => *token,
+        }
+    }
+
+    fn frame(&self) -> &[u8] {
+        match self {
+            Self::Data { frame, .. } | Self::Credit { frame, .. } => frame,
+        }
+    }
+
+    fn quota_retries(&self) -> u8 {
+        match self {
+            Self::Data { quota_retries, .. } | Self::Credit { quota_retries, .. } => *quota_retries,
+        }
+    }
+
+    fn requeue_after_quota_retry(&mut self, new_token: PublishToken) {
+        match self {
+            Self::Data {
+                token,
+                quota_retries,
+                ..
+            }
+            | Self::Credit {
+                token,
+                quota_retries,
+                ..
+            } => {
+                *token = new_token;
+                *quota_retries = quota_retries.saturating_add(1);
+            }
         }
     }
 
@@ -1767,6 +1841,22 @@ mod tests {
         publish
     }
 
+    fn data_publish_counter(publish: &PublishRecord) -> u64 {
+        match decode_frame(&publish.payload).expect("decode data publish") {
+            TransportFrame::Data { counter, .. } => counter,
+            other => panic!("expected data publish, got {other:?}"),
+        }
+    }
+
+    fn credit_publish_counter(publish: &PublishRecord) -> u64 {
+        match decode_frame(&publish.payload).expect("decode credit publish") {
+            TransportFrame::Credit {
+                control_counter, ..
+            } => control_counter,
+            other => panic!("expected credit publish, got {other:?}"),
+        }
+    }
+
     async fn next_credit_publish(
         publish_rx: &mut tokio_mpsc::UnboundedReceiver<PublishRecord>,
     ) -> PublishRecord {
@@ -1814,6 +1904,16 @@ mod tests {
                 code: crate::error::PUBACK_QUOTA_EXCEEDED,
                 code_name: "QuotaExceeded".to_string(),
                 reason_string: Some("test quota".to_string()),
+            },
+        }
+    }
+
+    fn non_quota_rejection() -> MqttTransportError {
+        MqttTransportError::PublishRejected {
+            reason: crate::error::PublishRejection {
+                code: 0x80,
+                code_name: "UnspecifiedError".to_string(),
+                reason_string: Some("test rejection".to_string()),
             },
         }
     }
@@ -1946,6 +2046,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quota_rejected_data_publish_is_retried_with_same_counter() -> Result<(), Box<dyn Error>>
+    {
+        let mut harness = spawn_stream_driver()?;
+        let mut data_ack = Box::pin(send_full_chunk(&mut harness.outbound_tx, 1).await?);
+        let first = next_data_publish(&mut harness.publish_rx).await;
+        assert_eq!(data_publish_counter(&first), 0);
+
+        send_link_event(
+            &harness.poll_tx,
+            LinkEvent::PubAck(PublishAck {
+                token: first.token,
+                result: Err(quota_rejection()),
+            }),
+        );
+        let retry = next_data_publish(&mut harness.publish_rx).await;
+        assert_eq!(
+            data_publish_counter(&retry),
+            0,
+            "quota retry must retransmit the same encrypted data counter"
+        );
+        assert!(
+            timeout(Duration::from_millis(25), &mut data_ack)
+                .await
+                .is_err(),
+            "quota rejection completed the write before retry PUBACK"
+        );
+
+        ack_success(&harness.poll_tx, retry.token);
+        timeout(Duration::from_secs(1), &mut data_ack)
+            .await
+            .expect("data ack timed out")
+            .expect("data ack sender dropped")
+            .expect("data ack failed after retry");
+        drop(harness.outbound_tx);
+        timeout(Duration::from_secs(1), harness.driver)
+            .await
+            .expect("driver did not stop")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quota_rejected_credit_publish_is_retried_with_same_counter()
+    -> Result<(), Box<dyn Error>> {
+        let mut harness = spawn_stream_driver()?;
+        let mut peer = peer_cipher()?;
+        send_link_event(&harness.poll_tx, incoming_data(&mut peer, b"inbound")?);
+        let first = next_credit_publish(&mut harness.publish_rx).await;
+        assert_eq!(credit_publish_counter(&first), 0);
+
+        send_link_event(
+            &harness.poll_tx,
+            LinkEvent::PubAck(PublishAck {
+                token: first.token,
+                result: Err(quota_rejection()),
+            }),
+        );
+        let retry = next_credit_publish(&mut harness.publish_rx).await;
+        assert_eq!(
+            credit_publish_counter(&retry),
+            0,
+            "quota retry must retransmit the same encrypted credit counter"
+        );
+
+        ack_success(&harness.poll_tx, retry.token);
+        match timeout(Duration::from_secs(1), harness.inbound_rx.recv()).await? {
+            Some(InboundEvent::Data(bytes)) => assert_eq!(bytes, b"inbound"),
+            other => panic!("expected inbound data, got {other:?}"),
+        }
+        drop(harness.outbound_tx);
+        timeout(Duration::from_secs(1), harness.driver)
+            .await
+            .expect("driver did not stop")?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn one_way_bulk_transfer_crosses_credit_windows() -> Result<(), Box<dyn Error>> {
         let mut harness = spawn_stream_driver()?;
         let mut stream = EnvelopeStream::new(harness.outbound_tx, harness.inbound_rx);
@@ -2049,7 +2225,7 @@ mod tests {
             &harness.poll_tx,
             LinkEvent::PubAck(PublishAck {
                 token: credit.token,
-                result: Err(quota_rejection()),
+                result: Err(non_quota_rejection()),
             }),
         );
         match timeout(Duration::from_secs(1), harness.inbound_rx.recv()).await? {
@@ -2059,7 +2235,7 @@ mod tests {
         match timeout(Duration::from_secs(1), harness.inbound_rx.recv()).await? {
             Some(InboundEvent::Error(error)) => {
                 assert!(
-                    error.to_string().contains("QuotaExceeded"),
+                    error.to_string().contains("UnspecifiedError"),
                     "unexpected inbound error: {error}"
                 );
             }
@@ -2083,16 +2259,16 @@ mod tests {
             &harness.poll_tx,
             LinkEvent::PubAck(PublishAck {
                 token: first,
-                result: Err(quota_rejection()),
+                result: Err(non_quota_rejection()),
             }),
         );
 
-        expect_ack_error(ack_a, "QuotaExceeded").await;
-        expect_ack_error(ack_b, "QuotaExceeded").await;
+        expect_ack_error(ack_a, "UnspecifiedError").await;
+        expect_ack_error(ack_b, "UnspecifiedError").await;
         match timeout(Duration::from_secs(1), harness.inbound_rx.recv()).await? {
             Some(InboundEvent::Error(error)) => {
                 assert!(
-                    error.to_string().contains("QuotaExceeded"),
+                    error.to_string().contains("UnspecifiedError"),
                     "unexpected inbound error: {error}"
                 );
             }

@@ -39,6 +39,17 @@ pub fn ConnectionBanner() -> impl IntoView {
                             </div>
                         }.into_any()
                     }
+                    ConnectionStatus::Bootstrapping => {
+                        view! {
+                            <div class="connection-banner-inner connecting" data-mobile-test="connection-banner-bootstrapping">
+                                <Spinner
+                                    data_mobile_test="connection-banner-bootstrap-spinner"
+                                    aria_label="Loading host state".to_string()
+                                />
+                                <span class="status-text">"Loading host…"</span>
+                            </div>
+                        }.into_any()
+                    }
                     ConnectionStatus::Disconnected => {
                         view! {
                             <div class="connection-banner-inner disconnected">
@@ -207,6 +218,38 @@ mod wasm_tests {
                 .trim()
                 .is_empty(),
             "connected state should not render a text status bar"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn bootstrapping_status_is_visible() {
+        let host = LocalHostId("host-bootstrapping".to_owned());
+        let host_for_mount = host.clone();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.connection_statuses.update(|statuses| {
+                statuses.insert(host_for_mount.clone(), ConnectionStatus::Bootstrapping);
+            });
+            provide_context(state);
+            view! { <ConnectionBanner /> }
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='connection-banner-bootstrapping']")
+                .unwrap()
+                .is_some(),
+            "bootstrapping status should render a visible loading banner"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Loading host"),
+            "bootstrapping status should distinguish host bootstrap from transport connect"
         );
     }
 

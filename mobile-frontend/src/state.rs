@@ -12,11 +12,12 @@ use protocol::{
     HostBrowseOpenedPayload, HostSettings, McpServerConfig, McpServerId, MessageMetadataUpdateData,
     Project, ProjectDiffScope, ProjectFileContentsPayload, ProjectGitDiffFile, ProjectId,
     ProjectPath, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, QueuedMessageEntry,
-    Review, ReviewErrorPayload, ReviewId, ReviewSummary, SessionId, SessionSchemaEntry,
-    SessionSettingsValues, SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath,
-    TaskList, Team, TeamCompactNotifyPayload, TeamDraft, TeamDraftId, TeamMember,
-    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion, TeamPresetCatalog,
-    ToolExecutionCompletedData, ToolRequest, TydeReleaseVersion,
+    Review, ReviewErrorPayload, ReviewId, ReviewSummary, SessionId, SessionListCursor,
+    SessionListPageInfo, SessionListPageStatus, SessionSchemaEntry, SessionSettingsValues,
+    SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, Team,
+    TeamCompactNotifyPayload, TeamDraft, TeamDraftId, TeamMember, TeamMemberBindingPayload,
+    TeamMemberId, TeamMemberShuffleSuggestion, TeamPresetCatalog, ToolExecutionCompletedData,
+    ToolRequest, TydeReleaseVersion,
 };
 
 // ── Tool output viewing mode ───────────────────────────────────────────
@@ -34,6 +35,7 @@ pub enum ToolOutputMode {
 pub enum ConnectionStatus {
     Disconnected,
     Connecting,
+    Bootstrapping,
     Connected,
     Error(String),
     /// The MQTT transport connected, but the Tyde application handshake was
@@ -78,7 +80,7 @@ impl From<PairedHostConnectionStatus> for ConnectionStatus {
     fn from(status: PairedHostConnectionStatus) -> Self {
         match status {
             PairedHostConnectionStatus::Connecting => ConnectionStatus::Connecting,
-            PairedHostConnectionStatus::Connected => ConnectionStatus::Connected,
+            PairedHostConnectionStatus::Connected => ConnectionStatus::Bootstrapping,
             PairedHostConnectionStatus::Disconnected { .. } => ConnectionStatus::Disconnected,
             PairedHostConnectionStatus::Failed { message, .. } => ConnectionStatus::Error(message),
         }
@@ -397,6 +399,29 @@ pub struct SessionInfo {
     pub summary: SessionSummary,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionListLoadState {
+    pub page: SessionListPageInfo,
+    pub loaded_count: u32,
+    pub loading_more: bool,
+}
+
+impl SessionListLoadState {
+    pub fn from_page(page: SessionListPageInfo, loaded_count: usize) -> Self {
+        let loaded_count = u32::try_from(loaded_count).unwrap_or(u32::MAX);
+        let loading_more = matches!(page.status, SessionListPageStatus::More { .. });
+        Self {
+            page,
+            loaded_count,
+            loading_more,
+        }
+    }
+
+    pub fn next_cursor(&self) -> Option<SessionListCursor> {
+        self.page.next_cursor()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HostBrowseSession {
     pub local_host_id: LocalHostId,
@@ -433,6 +458,10 @@ pub struct AppState {
     /// replays (no re-Hello needed) vs. genuinely new connections.
     pub active_connection_instance_ids: RwSignal<HashMap<LocalHostId, u64>>,
     pub host_streams: RwSignal<HashMap<LocalHostId, StreamPath>>,
+    /// Host stream whose `HostBootstrap` has actually been applied. This is
+    /// distinct from cached host settings so a fresh stream cannot be marked
+    /// ready by stale state from an older connection.
+    pub bootstrapped_host_streams: RwSignal<HashMap<LocalHostId, StreamPath>>,
     pub host_settings_by_host: RwSignal<HashMap<LocalHostId, HostSettings>>,
     pub command_errors_by_host: RwSignal<HashMap<LocalHostId, String>>,
     pub backend_setup_by_host: RwSignal<HashMap<LocalHostId, Vec<BackendSetupInfo>>>,
@@ -515,6 +544,7 @@ pub struct AppState {
 
     // Sessions
     pub sessions: RwSignal<Vec<SessionInfo>>,
+    pub session_lists_by_host: RwSignal<HashMap<LocalHostId, SessionListLoadState>>,
 
     // Draft state for new agent
     pub draft_backend_override: RwSignal<Option<BackendKind>>,
@@ -542,6 +572,7 @@ impl AppState {
             connection_statuses: RwSignal::new(HashMap::new()),
             active_connection_instance_ids: RwSignal::new(HashMap::new()),
             host_streams: RwSignal::new(HashMap::new()),
+            bootstrapped_host_streams: RwSignal::new(HashMap::new()),
             host_settings_by_host: RwSignal::new(HashMap::new()),
             command_errors_by_host: RwSignal::new(HashMap::new()),
             backend_setup_by_host: RwSignal::new(HashMap::new()),
@@ -594,6 +625,7 @@ impl AppState {
             host_browses: RwSignal::new(HashMap::new()),
 
             sessions: RwSignal::new(Vec::new()),
+            session_lists_by_host: RwSignal::new(HashMap::new()),
 
             draft_backend_override: RwSignal::new(None),
             draft_custom_agent_id: RwSignal::new(None),
@@ -606,6 +638,22 @@ impl AppState {
 
     pub fn host_stream_untracked(&self, host: &LocalHostId) -> Option<StreamPath> {
         self.host_streams.get_untracked().get(host).cloned()
+    }
+
+    pub fn host_bootstrap_applied_for_current_stream(&self, host: &LocalHostId) -> bool {
+        let current = self.host_streams.get().get(host).cloned();
+        let bootstrapped = self.bootstrapped_host_streams.get().get(host).cloned();
+        matches!((current, bootstrapped), (Some(current), Some(bootstrapped)) if current == bootstrapped)
+    }
+
+    pub fn host_bootstrap_applied_for_current_stream_untracked(&self, host: &LocalHostId) -> bool {
+        let current = self.host_streams.get_untracked().get(host).cloned();
+        let bootstrapped = self
+            .bootstrapped_host_streams
+            .get_untracked()
+            .get(host)
+            .cloned();
+        matches!((current, bootstrapped), (Some(current), Some(bootstrapped)) if current == bootstrapped)
     }
 
     /// Append a chat row for `agent_ref` and, if the message carries a
@@ -727,22 +775,23 @@ impl AppState {
     }
 
     /// True while the active host is connecting/connected but its
-    /// `HostBootstrap` snapshot (the source of the agent + session lists)
-    /// hasn't been applied yet. `HostSettings` is written as part of the
-    /// bootstrap, so its presence is the same "snapshot landed" proxy
-    /// `home_view` uses. Returns false once the snapshot lands (even if the
-    /// lists are genuinely empty) and on a failed/disconnected host, so a
-    /// loading spinner never outlives a connection that won't deliver data.
+    /// `HostBootstrap` snapshot for the active host stream (the source of the
+    /// agent + session lists) hasn't been applied yet. Returns false once the
+    /// current stream's snapshot lands (even if the lists are genuinely empty)
+    /// and on a failed/disconnected host, so a loading spinner never outlives
+    /// a connection that won't deliver data.
     pub fn host_snapshot_pending(&self) -> bool {
         let Some(host) = self.active_local_host_id.get() else {
             return false;
         };
-        if self.host_settings_by_host.with(|m| m.contains_key(&host)) {
+        if self.host_bootstrap_applied_for_current_stream(&host) {
             return false;
         }
         matches!(
             self.active_host_connection_status(),
-            ConnectionStatus::Connecting | ConnectionStatus::Connected
+            ConnectionStatus::Connecting
+                | ConnectionStatus::Bootstrapping
+                | ConnectionStatus::Connected
         )
     }
 
@@ -760,6 +809,11 @@ impl AppState {
             .get(&host)
             .cloned()
             .unwrap_or_default()
+    }
+
+    pub fn active_session_list_state(&self) -> Option<SessionListLoadState> {
+        let host = self.active_local_host_id.get()?;
+        self.session_lists_by_host.get().get(&host).cloned()
     }
 
     pub fn active_host_custom_agents(&self) -> HashMap<CustomAgentId, CustomAgent> {
@@ -789,6 +843,9 @@ impl AppState {
             m.remove(host);
         });
         self.host_streams.update(|m| {
+            m.remove(host);
+        });
+        self.bootstrapped_host_streams.update(|m| {
             m.remove(host);
         });
         self.host_settings_by_host.update(|m| {
@@ -828,6 +885,9 @@ impl AppState {
         });
         self.sessions
             .update(|sessions| sessions.retain(|s| s.local_host_id != *host));
+        self.session_lists_by_host.update(|m| {
+            m.remove(host);
+        });
 
         self.file_tree.update(|m| {
             m.retain(|(h, _), _| h != host);
@@ -1062,7 +1122,7 @@ mod tests {
             PairedHostConnectionStatus::Connecting.into()
         );
         assert_eq!(
-            ConnectionStatus::Connected,
+            ConnectionStatus::Bootstrapping,
             PairedHostConnectionStatus::Connected.into()
         );
         assert!(matches!(

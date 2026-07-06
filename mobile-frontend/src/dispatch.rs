@@ -12,7 +12,7 @@ use protocol::{
     BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent, ClientErrorCode,
     CodeIntelOverviewPayload, CommandErrorPayload, CustomAgentNotifyPayload, Envelope, FrameKind,
     HostBootstrapPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HostBrowseOpenedPayload, HostSettingsPayload, LaunchProfileCatalogPayload,
+    HostBrowseOpenedPayload, HostSettingsPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
     McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProtocolValidator,
@@ -28,8 +28,8 @@ use crate::state::MobileShellError;
 use crate::state::{
     ActiveAgentRef, AgentInfo, AgentRef, AppState, ChatMessageEntry, ConnectionStatus,
     HostBrowseSession, LocalHostId, ProjectDiffRef, ProjectFileRef, ProjectFileState, ProjectInfo,
-    ReviewRef, SessionHistoryState, SessionInfo, StreamingState, ToolRequestEntry, TransientEvent,
-    reduce_project_diff_response, sort_project_infos,
+    ReviewRef, SessionHistoryState, SessionInfo, SessionListLoadState, StreamingState,
+    ToolRequestEntry, TransientEvent, reduce_project_diff_response, sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -162,6 +162,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
         backend_config_snapshots: Vec::new(),
         launch_profile_catalog: Default::default(),
         sessions: Vec::new(),
+        session_list: Default::default(),
         projects: Vec::new(),
         mcp_servers: Vec::new(),
         skills: Vec::new(),
@@ -210,6 +211,9 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
             host, error.stream, error.kind, error.expected, error.got
         );
         log::error!("{message}");
+        if envelope.kind == FrameKind::SessionList {
+            clear_session_list_loading(state, host);
+        }
         report_protocol_error(state, host, message);
         return;
     }
@@ -218,6 +222,9 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
     {
         let message = format!("protocol violation on host {host}: {error}");
         log::error!("{message}");
+        if envelope.kind == FrameKind::SessionList {
+            clear_session_list_loading(state, host);
+        }
         report_protocol_error(state, host, message);
         return;
     }
@@ -228,7 +235,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 map.remove(host);
             });
             state.connection_statuses.update(|map| {
-                map.insert(host.clone(), ConnectionStatus::Connected);
+                map.insert(host.clone(), ConnectionStatus::Bootstrapping);
             });
             // Sessions/projects/teams etc. arrive via HostBootstrap (seq 1
             // on the host stream).  We do not pre-clear anything here because
@@ -238,14 +245,15 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
             log::info!("connected to host {}", host);
         }
         FrameKind::HostBootstrap => match envelope.parse_payload::<HostBootstrapPayload>() {
-            Ok(payload) => apply_host_bootstrap(state, host, payload),
-            Err(error) => log::error!(
-                "failed to parse HostBootstrap host={} stream={} seq={}: {}",
-                host,
-                envelope.stream,
-                envelope.seq,
-                error
-            ),
+            Ok(payload) => apply_host_bootstrap(state, host, &envelope.stream, payload),
+            Err(error) => {
+                let message = format!(
+                    "failed to parse HostBootstrap host={} stream={} seq={}: {}",
+                    host, envelope.stream, envelope.seq, error
+                );
+                log::error!("{message}");
+                report_protocol_error(state, host, message);
+            }
         },
         FrameKind::AgentBootstrap => match envelope.parse_payload::<AgentBootstrapPayload>() {
             Ok(payload) => apply_agent_bootstrap(state, host, &envelope.stream, payload),
@@ -328,6 +336,9 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     state.command_errors_by_host.update(|map| {
                         map.insert(host.clone(), message);
                     });
+                    if matches!(payload.request_kind, FrameKind::ListSessions) {
+                        clear_session_list_loading(state, host);
+                    }
                     clear_session_history_loading_on_error(state, host, &payload);
                 }
             }
@@ -593,23 +604,19 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
         },
         FrameKind::SessionList => match envelope.parse_payload::<SessionListPayload>() {
             Ok(payload) => {
-                let count = payload.sessions.len();
-                log::info!("mobile_apply_session_list host={} count={}", host, count);
-                state.sessions.update(|sessions| {
-                    sessions.retain(|s| s.local_host_id != *host);
-                    sessions.extend(payload.sessions.into_iter().map(|summary| SessionInfo {
-                        local_host_id: host.clone(),
-                        summary,
-                    }));
-                });
+                apply_session_list_page(state, host, payload);
             }
-            Err(error) => log::error!(
-                "failed to parse SessionList host={} stream={} seq={}: {}",
-                host,
-                envelope.stream,
-                envelope.seq,
-                error
-            ),
+            Err(error) => {
+                let message = format!(
+                    "failed to parse SessionList host={} stream={} seq={}: {}",
+                    host, envelope.stream, envelope.seq, error
+                );
+                log::error!("{message}");
+                state.command_errors_by_host.update(|map| {
+                    map.insert(host.clone(), message);
+                });
+                clear_session_list_loading(state, host);
+            }
         },
         FrameKind::ProjectNotify => {
             if let Ok(payload) = envelope.parse_payload::<ProjectNotifyPayload>() {
@@ -997,6 +1004,14 @@ fn report_protocol_error(state: &AppState, host: &LocalHostId, message: String) 
         code: MobileAccessErrorCode::BrokerProtocol,
         message,
     }));
+}
+
+fn clear_session_list_loading(state: &AppState, host: &LocalHostId) {
+    state.session_lists_by_host.update(|map| {
+        if let Some(list) = map.get_mut(host) {
+            list.loading_more = false;
+        }
+    });
 }
 
 /// Emits a `ClientError { code: ProtocolValidation }` frame to the host on its
@@ -1918,16 +1933,137 @@ fn apply_reject(state: &AppState, host: &LocalHostId, payload: RejectPayload) {
 // depend on user intent (e.g. auto-opening a chat tab) stay in the
 // per-event arms.
 
-fn apply_host_bootstrap(state: &AppState, host: &LocalHostId, payload: HostBootstrapPayload) {
+fn apply_session_list_page(state: &AppState, host: &LocalHostId, payload: SessionListPayload) {
+    let page = payload.page;
+    let page_session_count = payload.sessions.len();
     log::info!(
-        "dispatch host_bootstrap host={} sessions={} projects={} agents={} teams={}",
+        "mobile_apply_session_list host={} cursor={} count={} total={}",
         host,
-        payload.sessions.len(),
+        page.cursor.offset,
+        page_session_count,
+        page.total_count
+    );
+    state.sessions.update(|sessions| {
+        if page.cursor.offset == 0 {
+            sessions.retain(|s| s.local_host_id != *host);
+        }
+        for summary in payload.sessions {
+            if let Some(existing) = sessions
+                .iter_mut()
+                .find(|s| s.local_host_id == *host && s.summary.id == summary.id)
+            {
+                existing.summary = summary;
+            } else {
+                sessions.push(SessionInfo {
+                    local_host_id: host.clone(),
+                    summary,
+                });
+            }
+        }
+    });
+    let loaded_count = state
+        .sessions
+        .with_untracked(|sessions| sessions.iter().filter(|s| s.local_host_id == *host).count());
+    state.session_lists_by_host.update(|map| {
+        map.insert(
+            host.clone(),
+            SessionListLoadState::from_page(page, loaded_count),
+        );
+    });
+    request_next_session_page_if_needed(state, host, page);
+}
+
+fn request_next_session_page_if_needed(
+    state: &AppState,
+    host: &LocalHostId,
+    page: protocol::SessionListPageInfo,
+) {
+    let Some(next_cursor) = page.next_cursor() else {
+        return;
+    };
+    let Some(stream) = state.host_stream_untracked(host) else {
+        let message = format!(
+            "cannot request session page {} for {host}: no host stream",
+            next_cursor.offset
+        );
+        log::error!("{message}");
+        state.command_errors_by_host.update(|map| {
+            map.insert(host.clone(), message);
+        });
+        state.session_lists_by_host.update(|map| {
+            if let Some(list) = map.get_mut(host) {
+                list.loading_more = false;
+            }
+        });
+        return;
+    };
+    let host = host.clone();
+    let state_for_error = state.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let payload = ListSessionsPayload {
+            cursor: Some(next_cursor),
+            limit: Some(page.limit),
+        };
+        if let Err(error) =
+            crate::send::send_frame(&host, stream, FrameKind::ListSessions, &payload).await
+        {
+            let message = format!(
+                "failed to request session page {} for {host}: {error}",
+                next_cursor.offset
+            );
+            log::error!("{message}");
+            state_for_error.command_errors_by_host.update(|map| {
+                map.insert(host.clone(), message);
+            });
+            state_for_error.session_lists_by_host.update(|map| {
+                if let Some(list) = map.get_mut(&host) {
+                    list.loading_more = false;
+                }
+            });
+        }
+    });
+}
+
+fn apply_host_bootstrap(
+    state: &AppState,
+    host: &LocalHostId,
+    stream: &StreamPath,
+    payload: HostBootstrapPayload,
+) {
+    if let Some(current) = state.host_stream_untracked(host) {
+        if &current != stream {
+            let message = format!(
+                "HostBootstrap host={} stream={} does not match active host stream {}",
+                host, stream, current
+            );
+            log::error!("{message}");
+            report_protocol_error(state, host, message);
+            return;
+        }
+    } else {
+        state.host_streams.update(|map| {
+            map.insert(host.clone(), stream.clone());
+        });
+    }
+
+    let session_page = payload.session_list;
+    let bootstrap_session_count = payload.sessions.len();
+    log::info!(
+        "dispatch host_bootstrap host={} sessions={} total_sessions={} projects={} agents={} teams={}",
+        host,
+        bootstrap_session_count,
+        session_page.total_count,
         payload.projects.len(),
         payload.agents.len(),
         payload.teams.len(),
     );
 
+    state.bootstrapped_host_streams.update(|map| {
+        map.insert(host.clone(), stream.clone());
+    });
+    state.connection_statuses.update(|map| {
+        map.insert(host.clone(), ConnectionStatus::Connected);
+    });
     state.host_settings_by_host.update(|map| {
         map.insert(host.clone(), payload.settings);
     });
@@ -1951,6 +2087,13 @@ fn apply_host_bootstrap(state: &AppState, host: &LocalHostId, payload: HostBoots
             summary,
         }));
     });
+    state.session_lists_by_host.update(|map| {
+        map.insert(
+            host.clone(),
+            SessionListLoadState::from_page(session_page, bootstrap_session_count),
+        );
+    });
+    request_next_session_page_if_needed(state, host, session_page);
     state.projects.update(|projects| {
         projects.retain(|p| p.local_host_id != *host);
         projects.extend(payload.projects.into_iter().map(|project| ProjectInfo {
@@ -2525,7 +2668,7 @@ mod wasm_tests {
                 "/host/mobile-seq-gap",
                 FrameKind::ListSessions,
                 1,
-                &ListSessionsPayload {},
+                &ListSessionsPayload::default(),
             ),
         );
 
@@ -2541,6 +2684,124 @@ mod wasm_tests {
             .expect("shell error");
         assert_eq!(error.code, MobileAccessErrorCode::BrokerProtocol);
         assert!(error.message.contains("closing dispatch"));
+    }
+
+    #[wasm_bindgen_test]
+    fn list_sessions_command_error_clears_loading_state() {
+        let state = AppState::new();
+        let host = primed_host(&state, "mobile-session-list-error");
+        state.session_lists_by_host.update(|lists| {
+            lists.insert(
+                host.clone(),
+                SessionListLoadState::from_page(
+                    protocol::SessionListPageInfo {
+                        cursor: protocol::SessionListCursor {
+                            generation: protocol::SessionListGeneration(1),
+                            offset: 0,
+                        },
+                        limit: 64,
+                        total_count: 100,
+                        status: protocol::SessionListPageStatus::More {
+                            next_cursor: protocol::SessionListCursor {
+                                generation: protocol::SessionListGeneration(1),
+                                offset: 64,
+                            },
+                        },
+                    },
+                    64,
+                ),
+            );
+        });
+
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/host/mobile-session-list-error",
+                FrameKind::CommandError,
+                0,
+                &protocol::CommandErrorPayload {
+                    stream: StreamPath("/host/mobile-session-list-error".to_owned()),
+                    request_kind: FrameKind::ListSessions,
+                    operation: "list_sessions".to_owned(),
+                    code: protocol::CommandErrorCode::InvalidInput,
+                    message: "stale session list cursor generation 1".to_owned(),
+                    fatal: false,
+                },
+            ),
+        );
+
+        assert!(
+            state
+                .session_lists_by_host
+                .with_untracked(|lists| lists.get(&host).is_some_and(|list| !list.loading_more)),
+            "ListSessions CommandError should clear the loading-more state"
+        );
+        assert!(
+            state.command_errors_by_host.with_untracked(|errors| errors
+                .get(&host)
+                .is_some_and(|message| message.contains("stale session list cursor"))),
+            "ListSessions CommandError should remain user-visible"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn malformed_session_list_clears_loading_state() {
+        let state = AppState::new();
+        let host = primed_host(&state, "mobile-session-list-parse-error");
+        state.session_lists_by_host.update(|lists| {
+            lists.insert(
+                host.clone(),
+                SessionListLoadState::from_page(
+                    protocol::SessionListPageInfo {
+                        cursor: protocol::SessionListCursor {
+                            generation: protocol::SessionListGeneration(1),
+                            offset: 0,
+                        },
+                        limit: 64,
+                        total_count: 100,
+                        status: protocol::SessionListPageStatus::More {
+                            next_cursor: protocol::SessionListCursor {
+                                generation: protocol::SessionListGeneration(1),
+                                offset: 64,
+                            },
+                        },
+                    },
+                    64,
+                ),
+            );
+        });
+
+        dispatch_envelope(
+            &state,
+            &host,
+            Envelope {
+                stream: StreamPath("/host/mobile-session-list-parse-error".to_owned()),
+                kind: FrameKind::SessionList,
+                seq: 0,
+                payload: serde_json::json!({
+                    "sessions": null,
+                    "page": {
+                        "cursor": { "generation": 1, "offset": 0 },
+                        "limit": 64,
+                        "total_count": 100,
+                        "status": { "kind": "complete" }
+                    }
+                }),
+            },
+        );
+
+        assert!(
+            state
+                .session_lists_by_host
+                .with_untracked(|lists| lists.get(&host).is_some_and(|list| !list.loading_more)),
+            "malformed SessionList should clear the loading-more state"
+        );
+        assert!(matches!(
+            state.connection_statuses.get_untracked().get(&host),
+            Some(ConnectionStatus::Error(message))
+                if message.contains("failed to parse SessionList payload")
+        ));
     }
 
     #[wasm_bindgen_test]
@@ -3045,6 +3306,15 @@ mod wasm_tests {
             backend_config_snapshots: Vec::new(),
             launch_profile_catalog: Default::default(),
             sessions: vec![session.clone()],
+            session_list: protocol::SessionListPageInfo {
+                cursor: protocol::SessionListCursor {
+                    generation: protocol::SessionListGeneration(1),
+                    offset: 0,
+                },
+                limit: 1,
+                total_count: 1,
+                status: protocol::SessionListPageStatus::Complete,
+            },
             projects: vec![project.clone()],
             mcp_servers: Vec::new(),
             skills: Vec::new(),

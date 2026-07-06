@@ -121,8 +121,8 @@ pub(crate) async fn route_client_envelope(
                 host.spawn_agent(payload).await?;
             }
             FrameKind::ListSessions => {
-                let _: ListSessionsPayload = parse_payload(&envelope, "list_sessions")?;
-                host.list_sessions(host_output_stream).await?;
+                let payload: ListSessionsPayload = parse_payload(&envelope, "list_sessions")?;
+                host.list_sessions(host_output_stream, payload).await?;
             }
             FrameKind::DeleteSession => {
                 let payload: DeleteSessionPayload = parse_payload(&envelope, "delete_session")?;

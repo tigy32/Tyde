@@ -699,6 +699,7 @@ fn bootstrap_payloads_round_trip() {
             compacted_at_ms: None,
             compaction_summary_preview: None,
         }],
+        session_list: Default::default(),
         projects: vec![Project {
             id: project_id(),
             name: "Repo".to_owned(),

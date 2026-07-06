@@ -376,9 +376,13 @@ async fn probe_hermes_gateway_with_sources(
         }
     }
 
-    ProbeResult::not_installed_with_diagnostic(hermes_failure_diagnostic(
-        crate::backend::hermes::hermes_cli_required_failure(first_failure),
-    ))
+    let failure = crate::backend::hermes::hermes_cli_required_failure(first_failure);
+    let diagnostic = hermes_failure_diagnostic(failure.clone());
+    if failure.code == BackendSetupDiagnosticCode::CommandNotFound {
+        ProbeResult::not_installed_with_diagnostic(diagnostic)
+    } else {
+        ProbeResult::unavailable(diagnostic)
+    }
 }
 
 async fn probe_hermes_python_command(
@@ -808,19 +812,24 @@ mod tests {
 
     fn write_fake_hermes_cli_install(dir: &Path) -> String {
         let project = dir.join("hermes-agent");
-        let python = project.join("venv").join("bin").join("python");
-        std::fs::create_dir_all(python.parent().expect("fake Hermes venv parent"))
-            .expect("create fake Hermes venv");
+        std::fs::create_dir_all(&project).expect("create fake Hermes project");
+        let python = dir.join("fake_python");
+        let console = dir.join("hermes_console");
         write_executable(
             &python,
             "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then exit 0; fi\nexit 1\n",
+        );
+        write_executable(
+            &console,
+            &format!("#!{}\nimport sys\nsys.exit(1)\n", python.to_string_lossy()),
         );
         let hermes = dir.join("hermes");
         write_executable(
             &hermes,
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'Hermes Agent v9.9.9\\nProject: {}\\n'\n  exit 0\nfi\nexit 1\n",
-                project.to_string_lossy()
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'Hermes Agent v9.9.9\\nProject: {}\\n'\n  exit 0\nfi\nexec {} \"$@\"\n",
+                project.to_string_lossy(),
+                shell_quote(&console.to_string_lossy())
             ),
         );
         hermes.to_string_lossy().to_string()
@@ -985,7 +994,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.status, BackendSetupStatus::NotInstalled);
+        assert_eq!(result.status, BackendSetupStatus::Unavailable);
         assert_eq!(result.version, None);
         let diagnostic = result.diagnostic.expect("diagnostic");
         assert_eq!(
@@ -993,8 +1002,80 @@ mod tests {
             BackendSetupDiagnosticCode::MissingProjectRoot
         );
         assert!(
-            diagnostic.message.contains("Could not verify Hermes CLI"),
+            diagnostic.message.contains("Found Hermes CLI"),
             "diagnostic should preserve CLI failure instead of using ambient Python: {}",
+            diagnostic.message
+        );
+    }
+
+    #[tokio::test]
+    async fn hermes_cli_wrapper_without_project_venv_is_installed() {
+        let _lock = crate::backend::hermes::TEST_HERMES_OVERRIDE_LOCK
+            .lock()
+            .await;
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let hermes = write_fake_hermes_cli_install(dir.path());
+        let _python = EnvGuard::unset("HERMES_PYTHON");
+        let _executable = EnvGuard::unset("HERMES_EXECUTABLE");
+
+        let result = probe_hermes_gateway_with_sources(None, None, vec![hermes.clone()]).await;
+
+        assert_eq!(result.status, BackendSetupStatus::Installed);
+        assert_eq!(result.version.as_deref(), Some("Hermes Agent v9.9.9"));
+        assert!(result.diagnostic.is_none());
+        assert_eq!(result.hermes_executable.as_deref(), Some(hermes.as_str()));
+    }
+
+    #[tokio::test]
+    async fn hermes_found_unusable_cli_is_unavailable_not_not_installed() {
+        let _lock = crate::backend::hermes::TEST_HERMES_OVERRIDE_LOCK
+            .lock()
+            .await;
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let project = dir.path().join("hermes-agent");
+        std::fs::create_dir_all(&project).expect("create project without venv");
+        let hermes = dir.path().join("hermes");
+        write_executable(
+            &hermes,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'Hermes Agent v9.9.9\\nProject: {}\\n'; exit 0; fi\nexit 1\n",
+                project.to_string_lossy()
+            ),
+        );
+        let _python = EnvGuard::unset("HERMES_PYTHON");
+        let _executable = EnvGuard::unset("HERMES_EXECUTABLE");
+
+        let result = probe_hermes_gateway_with_sources(
+            None,
+            None,
+            vec![hermes.to_string_lossy().to_string()],
+        )
+        .await;
+
+        assert_eq!(result.status, BackendSetupStatus::Unavailable);
+        let diagnostic = result.diagnostic.expect("diagnostic");
+        assert_eq!(
+            diagnostic.code,
+            BackendSetupDiagnosticCode::MissingGatewayPython
+        );
+        assert!(
+            diagnostic.message.contains("Hermes Agent v9.9.9")
+                && diagnostic
+                    .message
+                    .contains(&project.to_string_lossy().to_string()),
+            "diagnostic should name version and project: {}",
+            diagnostic.message
+        );
+        assert!(
+            !diagnostic.message.contains("so `hermes` is on PATH")
+                && !diagnostic.message.contains("set HERMES_EXECUTABLE"),
+            "found-unusable diagnostic should not recommend PATH/HERMES_EXECUTABLE remedies: {}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("Re-run the Hermes installer")
+                && diagnostic.message.contains("HERMES_PYTHON"),
+            "found-unusable diagnostic should include an actionable gateway-Python remedy: {}",
             diagnostic.message
         );
     }
@@ -1056,8 +1137,16 @@ mod tests {
             BackendSetupDiagnosticCode::MissingGatewayPython
         );
         assert!(
-            diagnostic.message.contains("venv"),
-            "diagnostic should mention missing Hermes venv Python: {}",
+            diagnostic
+                .message
+                .contains("could not resolve a Python interpreter"),
+            "diagnostic should mention the unresolved gateway Python: {}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("Re-run the Hermes installer")
+                && diagnostic.message.contains("HERMES_PYTHON"),
+            "diagnostic should include an actionable gateway-Python remedy: {}",
             diagnostic.message
         );
     }

@@ -1849,6 +1849,7 @@ mod tests {
                 backend_config_snapshots: vec![],
                 launch_profile_catalog: Default::default(),
                 sessions: vec![],
+                session_list: Default::default(),
                 projects: vec![],
                 mcp_servers: vec![],
                 skills: vec![],
@@ -1878,6 +1879,57 @@ mod tests {
 
     fn new_agent_envelope() -> Envelope {
         host_bootstrap_with_agents(vec![new_agent_payload(AgentOrigin::User, None, None)])
+    }
+
+    #[test]
+    fn missing_host_bootstrap_session_list_is_rejected() {
+        let mut envelope = host_bootstrap_with_agents(vec![]);
+        envelope
+            .payload
+            .as_object_mut()
+            .expect("HostBootstrap payload should be an object")
+            .remove("session_list");
+
+        let err = ProtocolValidator::new()
+            .validate_envelope(&envelope)
+            .expect_err("missing HostBootstrap.session_list must be rejected");
+
+        assert!(
+            err.message
+                .contains("failed to parse HostBootstrap payload")
+        );
+        assert!(err.message.contains("session_list"));
+    }
+
+    #[test]
+    fn missing_session_list_page_is_rejected() {
+        let mut validator = ProtocolValidator::new();
+        validator
+            .validate_envelope(&host_bootstrap_with_agents(vec![]))
+            .expect("bootstrap should be valid");
+
+        let mut envelope = Envelope::from_payload(
+            host_stream(),
+            FrameKind::SessionList,
+            1,
+            &SessionListPayload {
+                sessions: vec![],
+                page: Default::default(),
+            },
+        )
+        .expect("serialize SessionList");
+        envelope
+            .payload
+            .as_object_mut()
+            .expect("SessionList payload should be an object")
+            .remove("page");
+
+        let err = validator
+            .validate_envelope(&envelope)
+            .expect_err("missing SessionList.page must be rejected");
+
+        assert!(err.message.contains("failed to parse SessionList payload"));
+        assert!(err.message.contains("page"));
     }
 
     fn agent_start_payload() -> crate::AgentStartPayload {

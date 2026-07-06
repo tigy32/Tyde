@@ -23,11 +23,12 @@ use protocol::{
     CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
     CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, FrameKind, GitBranchName, HostAbsPath,
-    HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
-    HostFilterId, HostLaunchProfileConfig, HostSettingsPayload, ImageData, LOCAL_HOST_ID,
-    LaunchProfile, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
-    LaunchProfileId, LaunchProfileKind, McpServerConfig, McpServerDeletePayload, McpServerId,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DEFAULT_SESSION_LIST_PAGE_LIMIT, FrameKind,
+    GitBranchName, HostAbsPath, HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload,
+    HostBrowseStartPayload, HostFilterId, HostLaunchProfileConfig, HostSettingsPayload, ImageData,
+    LOCAL_HOST_ID, LaunchProfile, LaunchProfileCatalog, LaunchProfileCatalogPayload,
+    LaunchProfileEntry, LaunchProfileId, LaunchProfileKind, ListSessionsPayload,
+    MAX_SESSION_LIST_PAGE_LIMIT, McpServerConfig, McpServerDeletePayload, McpServerId,
     McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
     MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
     ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
@@ -38,7 +39,8 @@ use protocol::{
     ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
     ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
     ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
-    SessionHistoryPayload, SessionId, SessionListPayload, SessionSchemaEntry,
+    SessionHistoryPayload, SessionId, SessionListCursor, SessionListGeneration,
+    SessionListPageInfo, SessionListPageStatus, SessionListPayload, SessionSchemaEntry,
     SessionSchemasPayload, SessionSettingsSchema, SessionSummary, SetAgentGroupsPayload,
     SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
     SetAgentsViewPreferencesPayload, SetSettingPayload, Skill, SkillNotifyPayload,
@@ -144,6 +146,8 @@ struct HostSubscriber {
     stream: Stream,
     bootstrapped: bool,
     agent_replay: AgentReplayMode,
+    session_list_replay: SessionListReplayMode,
+    session_list_snapshot: Option<SessionListSnapshot>,
     known_agent_streams: HashSet<StreamPath>,
     attached_agent_streams: HashSet<StreamPath>,
     bootstrapped_agent_streams: HashSet<StreamPath>,
@@ -174,6 +178,29 @@ pub(crate) struct DeferredAgentAttachment {
 pub(crate) enum AgentReplayMode {
     Eager,
     Lazy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionListReplayMode {
+    Full,
+    Paged { limit: u32 },
+}
+
+impl SessionListReplayMode {
+    fn for_agent_replay(agent_replay: AgentReplayMode) -> Self {
+        match agent_replay {
+            AgentReplayMode::Eager => Self::Full,
+            AgentReplayMode::Lazy => Self::Paged {
+                limit: DEFAULT_SESSION_LIST_PAGE_LIMIT,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SessionListSnapshot {
+    generation: SessionListGeneration,
+    sessions: Vec<SessionSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -580,6 +607,8 @@ impl HostHandle {
                 stream: host_stream,
                 bootstrapped: false,
                 agent_replay,
+                session_list_replay: SessionListReplayMode::for_agent_replay(agent_replay),
+                session_list_snapshot: None,
                 known_agent_streams: HashSet::new(),
                 attached_agent_streams: HashSet::new(),
                 bootstrapped_agent_streams: HashSet::new(),
@@ -711,13 +740,22 @@ impl HostHandle {
             .map(|project| project.id.clone())
             .collect::<Vec<_>>();
 
-        let mut sessions = state
+        let mut all_sessions = state
             .session_store
             .lock()
             .await
             .summaries()
             .unwrap_or_else(|err| panic!("failed to list sessions for host registration: {err}"));
-        normalize_antigravity_session_resumability(&mut sessions);
+        normalize_antigravity_session_resumability(&mut all_sessions);
+        let (sessions, session_list) = {
+            let subscriber = state.host_streams.get_mut(&host_path).unwrap_or_else(|| {
+                panic!("host stream {host_path} disappeared before session bootstrap paging")
+            });
+            replace_session_list_snapshot(subscriber, all_sessions, None, "host_bootstrap")
+                .unwrap_or_else(|err| {
+                    panic!("failed to page sessions for host registration: {err}")
+                })
+        };
 
         let mcp_servers = state
             .mcp_server_store
@@ -869,6 +907,7 @@ impl HostHandle {
             backend_config_snapshots,
             launch_profile_catalog,
             sessions,
+            session_list,
             projects,
             mcp_servers,
             skills,
@@ -4724,21 +4763,55 @@ impl HostHandle {
         fan_out_team_registry_events(&mut state, events).await;
     }
 
-    pub(crate) async fn list_sessions(&self, host_output_stream: &Stream) -> AppResult<()> {
+    pub(crate) async fn list_sessions(
+        &self,
+        host_output_stream: &Stream,
+        payload: ListSessionsPayload,
+    ) -> AppResult<()> {
         const OPERATION: &str = "list_sessions";
-        let sessions = {
+        let (sessions, page) = if let Some(cursor) = payload.cursor {
             let state = self.state.lock().await;
-            let mut sessions = state
-                .session_store
+            let subscriber = state
+                .host_streams
+                .get(host_output_stream.path())
+                .ok_or_else(|| {
+                    AppError::invalid(
+                        OPERATION,
+                        format!("unknown host stream {}", host_output_stream.path()),
+                    )
+                })?;
+            page_existing_session_list_snapshot(subscriber, cursor, payload.limit, OPERATION)?
+        } else {
+            let session_store = {
+                let state = self.state.lock().await;
+                if !state.host_streams.contains_key(host_output_stream.path()) {
+                    return Err(AppError::invalid(
+                        OPERATION,
+                        format!("unknown host stream {}", host_output_stream.path()),
+                    ));
+                }
+                Arc::clone(&state.session_store)
+            };
+            let mut sessions = session_store
                 .lock()
                 .await
                 .summaries()
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
             normalize_antigravity_session_resumability(&mut sessions);
-            sessions
+            let mut state = self.state.lock().await;
+            let subscriber = state
+                .host_streams
+                .get_mut(host_output_stream.path())
+                .ok_or_else(|| {
+                    AppError::invalid(
+                        OPERATION,
+                        format!("unknown host stream {}", host_output_stream.path()),
+                    )
+                })?;
+            replace_session_list_snapshot(subscriber, sessions, payload.limit, OPERATION)?
         };
 
-        let payload = SessionListPayload { sessions };
+        let payload = SessionListPayload { sessions, page };
         let payload = serde_json::to_value(&payload).map_err(|error| {
             AppError::internal_message(
                 OPERATION,
@@ -11383,6 +11456,185 @@ async fn emit_new_agent_for_stream(
     Ok(attachment)
 }
 
+#[derive(Clone, Copy)]
+struct SessionPageRequest {
+    cursor: SessionListCursor,
+    limit: Option<u32>,
+}
+
+impl SessionPageRequest {
+    fn initial(
+        generation: SessionListGeneration,
+        mode: SessionListReplayMode,
+        total_count: usize,
+        limit: Option<u32>,
+        operation: &'static str,
+    ) -> AppResult<Self> {
+        Ok(Self {
+            cursor: SessionListCursor {
+                generation,
+                offset: 0,
+            },
+            limit: session_page_limit(limit, mode, total_count, operation)?,
+        })
+    }
+
+    fn continuing(
+        cursor: SessionListCursor,
+        limit: Option<u32>,
+        mode: SessionListReplayMode,
+        total_count: usize,
+        operation: &'static str,
+    ) -> AppResult<Self> {
+        Ok(Self {
+            cursor,
+            limit: session_page_limit(limit, mode, total_count, operation)?,
+        })
+    }
+}
+
+fn session_page_limit(
+    limit: Option<u32>,
+    mode: SessionListReplayMode,
+    total_count: usize,
+    operation: &'static str,
+) -> AppResult<Option<u32>> {
+    match limit {
+        Some(0) => Err(AppError::invalid(
+            operation,
+            "session list limit must be greater than zero",
+        )),
+        Some(limit) if limit > MAX_SESSION_LIST_PAGE_LIMIT => Err(AppError::invalid(
+            operation,
+            format!("session list limit {limit} exceeds maximum {MAX_SESSION_LIST_PAGE_LIMIT}"),
+        )),
+        Some(limit) => Ok(Some(limit)),
+        None => match mode {
+            SessionListReplayMode::Full => Ok(u32::try_from(total_count).ok()),
+            SessionListReplayMode::Paged { limit } => Ok(Some(limit)),
+        },
+    }
+}
+
+fn replace_session_list_snapshot(
+    subscriber: &mut HostSubscriber,
+    sessions: Vec<SessionSummary>,
+    limit: Option<u32>,
+    operation: &'static str,
+) -> AppResult<(Vec<SessionSummary>, SessionListPageInfo)> {
+    let generation = subscriber
+        .session_list_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.generation.0.checked_add(1))
+        .map(SessionListGeneration)
+        .unwrap_or(SessionListGeneration(1));
+    let request = SessionPageRequest::initial(
+        generation,
+        subscriber.session_list_replay,
+        sessions.len(),
+        limit,
+        operation,
+    )?;
+    subscriber.session_list_snapshot = Some(SessionListSnapshot {
+        generation,
+        sessions,
+    });
+    let snapshot = subscriber
+        .session_list_snapshot
+        .as_ref()
+        .expect("session list snapshot was just stored");
+    page_session_summaries(&snapshot.sessions, request).map_err(|message| {
+        AppError::invalid(
+            operation,
+            format!("failed to page session list snapshot: {message}"),
+        )
+    })
+}
+
+fn page_existing_session_list_snapshot(
+    subscriber: &HostSubscriber,
+    cursor: SessionListCursor,
+    limit: Option<u32>,
+    operation: &'static str,
+) -> AppResult<(Vec<SessionSummary>, SessionListPageInfo)> {
+    let snapshot = subscriber.session_list_snapshot.as_ref().ok_or_else(|| {
+        AppError::invalid(
+            operation,
+            "session list cursor cannot be used before a session list snapshot exists",
+        )
+    })?;
+    if cursor.generation != snapshot.generation {
+        return Err(AppError::invalid(
+            operation,
+            format!(
+                "stale session list cursor generation {}; current generation is {}",
+                cursor.generation.0, snapshot.generation.0
+            ),
+        ));
+    }
+    let request = SessionPageRequest::continuing(
+        cursor,
+        limit,
+        subscriber.session_list_replay,
+        snapshot.sessions.len(),
+        operation,
+    )?;
+    page_session_summaries(&snapshot.sessions, request).map_err(|message| {
+        AppError::invalid(
+            operation,
+            format!("failed to page session list snapshot: {message}"),
+        )
+    })
+}
+
+fn page_session_summaries(
+    sessions: &[SessionSummary],
+    request: SessionPageRequest,
+) -> Result<(Vec<SessionSummary>, SessionListPageInfo), String> {
+    let total_count = u32::try_from(sessions.len())
+        .map_err(|_| "session count exceeds protocol page counter range".to_owned())?;
+    let start = usize::try_from(request.cursor.offset)
+        .map_err(|_| "session cursor exceeds host pointer range".to_owned())?;
+    if start > sessions.len() {
+        return Err(format!(
+            "session cursor {} is beyond total session count {}",
+            request.cursor.offset, total_count
+        ));
+    }
+
+    let remaining = sessions.len().saturating_sub(start);
+    let requested_limit = match request.limit {
+        Some(limit) => limit,
+        None => u32::try_from(remaining)
+            .map_err(|_| "remaining session count exceeds protocol page range".to_owned())?,
+    };
+    let limit = usize::try_from(requested_limit)
+        .map_err(|_| "session page limit exceeds host pointer range".to_owned())?;
+    let end = start.saturating_add(limit).min(sessions.len());
+    let page_sessions = sessions[start..end].to_vec();
+    let status = if end < sessions.len() {
+        let offset = u32::try_from(end)
+            .map_err(|_| "next session cursor exceeds protocol range".to_owned())?;
+        let next_cursor = SessionListCursor {
+            generation: request.cursor.generation,
+            offset,
+        };
+        SessionListPageStatus::More { next_cursor }
+    } else {
+        SessionListPageStatus::Complete
+    };
+
+    Ok((
+        page_sessions,
+        SessionListPageInfo {
+            cursor: request.cursor,
+            limit: requested_limit,
+            total_count,
+            status,
+        },
+    ))
+}
+
 async fn fan_out_session_lists(state: &mut HostState) {
     let mut sessions = state
         .session_store
@@ -11391,8 +11643,6 @@ async fn fan_out_session_lists(state: &mut HostState) {
         .summaries()
         .unwrap_or_else(|err| panic!("failed to list sessions for fanout: {err}"));
     normalize_antigravity_session_resumability(&mut sessions);
-    let payload = serde_json::to_value(SessionListPayload { sessions })
-        .expect("failed to serialize SessionList payload for host stream fanout");
 
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
@@ -11401,6 +11651,18 @@ async fn fan_out_session_lists(state: &mut HostState) {
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
+        let (page_sessions, page) = replace_session_list_snapshot(
+            subscriber,
+            sessions.clone(),
+            None,
+            "session_list_fanout",
+        )
+        .unwrap_or_else(|err| panic!("failed to page sessions for fanout: {err}"));
+        let payload = serde_json::to_value(SessionListPayload {
+            sessions: page_sessions,
+            page,
+        })
+        .expect("failed to serialize SessionList payload for host stream fanout");
         if emit_or_queue_host_frame(subscriber, FrameKind::SessionList, payload.clone()).is_err() {
             dead_paths.push(path);
         }
@@ -14448,6 +14710,8 @@ mod tests {
             stream: stream.clone(),
             bootstrapped: false,
             agent_replay: AgentReplayMode::Eager,
+            session_list_replay: SessionListReplayMode::Full,
+            session_list_snapshot: None,
             known_agent_streams: HashSet::new(),
             attached_agent_streams: HashSet::new(),
             bootstrapped_agent_streams: HashSet::new(),
@@ -14596,6 +14860,13 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let host_path = StreamPath(format!("/host/compact-route-{}", Uuid::new_v4()));
         let host_stream = Stream::new(host_path.clone(), tx);
+        assert!(
+            fixture
+                .host
+                .register_host_stream(host_stream.clone(), AgentReplayMode::Lazy)
+                .await
+                .is_empty()
+        );
         let agent_path = StreamPath(format!("/agent/{}/{}", old_agent_id, Uuid::new_v4()));
         let compact = protocol::Envelope::from_payload(
             agent_path,

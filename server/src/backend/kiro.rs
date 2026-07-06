@@ -4038,6 +4038,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                 backend_config_snapshots: vec![],
                 launch_profile_catalog: Default::default(),
                 sessions: vec![],
+                session_list: Default::default(),
                 projects: vec![],
                 mcp_servers: vec![],
                 skills: vec![],

@@ -513,10 +513,6 @@ fn apply_connection_status(
         return;
     }
 
-    let connection: ConnectionStatus = status.clone().into();
-    state.connection_statuses.update(|m| {
-        m.insert(host.clone(), connection.clone());
-    });
     match status {
         PairedHostConnectionStatus::Connected => {
             // Determine whether this Connected event refers to the same
@@ -542,12 +538,21 @@ fn apply_connection_status(
                     // the heuristic used before instance tracking existed.
                     matches!(
                         state.connection_statuses.get_untracked().get(&host),
-                        Some(ConnectionStatus::Connected)
+                        Some(ConnectionStatus::Connected | ConnectionStatus::Bootstrapping)
                     ) && state.host_stream_untracked(&host).is_some()
                 }
             };
 
             if same_connection {
+                state.connection_statuses.update(|m| {
+                    let status = if state.host_bootstrap_applied_for_current_stream_untracked(&host)
+                    {
+                        ConnectionStatus::Connected
+                    } else {
+                        ConnectionStatus::Bootstrapping
+                    };
+                    m.insert(host.clone(), status);
+                });
                 // Same live connection: just ensure a host is selected.
                 if state.active_local_host_id.get_untracked().is_none() {
                     state.active_local_host_id.set(Some(host.clone()));
@@ -556,6 +561,12 @@ fn apply_connection_status(
                 return;
             }
 
+            state.connection_statuses.update(|m| {
+                m.insert(host.clone(), ConnectionStatus::Bootstrapping);
+            });
+            state.bootstrapped_host_streams.update(|m| {
+                m.remove(&host);
+            });
             // New or changed connection: allocate a fresh host stream and
             // send Hello.  Intentionally do NOT pre-clear host data here —
             // apply_host_bootstrap will replace all bootstrap-owned slices
@@ -603,6 +614,9 @@ fn apply_connection_status(
             drain_pending_host_lines(state.clone());
         }
         PairedHostConnectionStatus::Disconnected { reason } => {
+            state.connection_statuses.update(|m| {
+                m.insert(host.clone(), ConnectionStatus::Disconnected);
+            });
             // Terminal: clear tracked instance so the next Connected event
             // unconditionally starts a fresh protocol session.
             state.active_connection_instance_ids.update(|m| {
@@ -611,12 +625,18 @@ fn apply_connection_status(
             apply_disconnect(state, &host, Some(reason));
         }
         PairedHostConnectionStatus::Failed { message, .. } => {
+            state.connection_statuses.update(|m| {
+                m.insert(host.clone(), ConnectionStatus::Error(message.clone()));
+            });
             state.active_connection_instance_ids.update(|m| {
                 m.remove(&host);
             });
             apply_disconnect(state, &host, Some(message));
         }
         PairedHostConnectionStatus::Connecting => {
+            state.connection_statuses.update(|m| {
+                m.insert(host.clone(), ConnectionStatus::Connecting);
+            });
             // Transient reconnect: status signal already updated above.
             // Keep all reactive state visible so the UI shows stale-but-
             // present data rather than a blank screen while the connection
@@ -652,7 +672,9 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
             .or_insert(ConnectionStatus::Disconnected);
         if matches!(
             entry,
-            ConnectionStatus::Connected | ConnectionStatus::Connecting
+            ConnectionStatus::Connected
+                | ConnectionStatus::Connecting
+                | ConnectionStatus::Bootstrapping
         ) {
             *entry = ConnectionStatus::Disconnected;
         }
@@ -662,6 +684,9 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
     // Clear protocol-level snapshots; the paired host record itself is
     // preserved (forget_paired_host is the only thing that removes it).
     state.host_streams.update(|m| {
+        m.remove(host);
+    });
+    state.bootstrapped_host_streams.update(|m| {
         m.remove(host);
     });
     state.host_settings_by_host.update(|m| {
@@ -700,6 +725,9 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
     state
         .sessions
         .update(|sessions| sessions.retain(|s| s.local_host_id != *host));
+    state.session_lists_by_host.update(|m| {
+        m.remove(host);
+    });
     state.file_tree.update(|m| {
         m.retain(|(h, _), _| h != host);
     });
@@ -807,6 +835,23 @@ mod wasm_tests {
         "#,
         )
         .expect("install tauri stub");
+    }
+
+    fn empty_host_settings() -> protocol::HostSettings {
+        protocol::HostSettings {
+            enabled_backends: Vec::new(),
+            default_backend: None,
+            enable_mobile_connections: false,
+            mobile_broker_url: None,
+            tyde_debug_mcp_enabled: false,
+            tyde_agent_control_mcp_enabled: true,
+            complexity_tiers_enabled: false,
+            backend_tier_configs: Default::default(),
+            background_agent_features: Default::default(),
+            code_intel: Default::default(),
+            backend_config: Default::default(),
+            launch_profiles: Vec::new(),
+        }
     }
 
     fn fixture_host(id: &str, label: &str) -> PairedHostSummary {
@@ -1176,7 +1221,7 @@ mod wasm_tests {
         );
         assert_eq!(
             state.connection_statuses.get_untracked().get(&host),
-            Some(&ConnectionStatus::Connected),
+            Some(&ConnectionStatus::Bootstrapping),
         );
     }
 
@@ -1300,6 +1345,67 @@ mod wasm_tests {
         assert!(
             projects.iter().any(|p| p.local_host_id == host),
             "existing data must survive the new-instance transition; bootstrap clears it"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn same_instance_replay_before_new_bootstrap_stays_bootstrapping() {
+        install_tauri_invoke_stub();
+        let state = AppState::new();
+        let host = LocalHostId("host-replay-before-bootstrap".to_owned());
+        let old_stream = protocol::StreamPath("/host/old-bootstrap".to_owned());
+
+        state.host_streams.update(|m| {
+            m.insert(host.clone(), old_stream.clone());
+        });
+        state.bootstrapped_host_streams.update(|m| {
+            m.insert(host.clone(), old_stream);
+        });
+        state.host_settings_by_host.update(|m| {
+            m.insert(host.clone(), empty_host_settings());
+        });
+        state.active_connection_instance_ids.update(|m| {
+            m.insert(host.clone(), 1);
+        });
+        state.connection_statuses.update(|m| {
+            m.insert(host.clone(), ConnectionStatus::Connected);
+        });
+
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(2),
+        );
+        let new_stream = state
+            .host_stream_untracked(&host)
+            .expect("new instance must allocate a stream");
+        assert_eq!(
+            state.connection_statuses.get_untracked().get(&host),
+            Some(&ConnectionStatus::Bootstrapping),
+            "new instance must wait for its own HostBootstrap"
+        );
+        assert!(
+            !state.host_bootstrap_applied_for_current_stream_untracked(&host),
+            "old HostBootstrap state must not match the new stream"
+        );
+
+        apply_connection_status(
+            &state,
+            host.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(2),
+        );
+
+        assert_eq!(
+            state.host_stream_untracked(&host),
+            Some(new_stream),
+            "duplicate same-instance Connected must preserve the active stream"
+        );
+        assert_eq!(
+            state.connection_statuses.get_untracked().get(&host),
+            Some(&ConnectionStatus::Bootstrapping),
+            "duplicate same-instance Connected must not use stale HostSettings as proof of bootstrap"
         );
     }
 
@@ -1519,7 +1625,7 @@ mod wasm_tests {
 
         assert_eq!(
             state.connection_statuses.get_untracked().get(&host),
-            Some(&ConnectionStatus::Connected),
+            Some(&ConnectionStatus::Bootstrapping),
             "stale line must not poison the active connection"
         );
         assert!(

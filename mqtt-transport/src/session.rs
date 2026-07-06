@@ -536,6 +536,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_counters_7_to_11_withhold_12_to_22_until_gap_arrives() -> Result<(), CryptoError> {
+        let (mut sender, mut receiver) = sender_receiver()?;
+        let frames: Vec<_> = (0..=22)
+            .map(|index| sender.encrypt_next(&[index as u8]))
+            .collect::<Result<_, _>>()?;
+
+        for (index, frame) in frames.iter().enumerate().take(7) {
+            assert_eq!(
+                receiver.decrypt_received(frame.counter, &frame.ciphertext_with_tag)?,
+                vec![vec![index as u8]]
+            );
+        }
+
+        for frame in frames.iter().take(23).skip(12) {
+            assert!(
+                receiver
+                    .decrypt_received(frame.counter, &frame.ciphertext_with_tag)?
+                    .is_empty(),
+                "future counters must wait for missing counter 7"
+            );
+        }
+
+        let mut delivered = Vec::new();
+        for frame in frames.iter().take(12).skip(7) {
+            delivered.extend(receiver.decrypt_received(frame.counter, &frame.ciphertext_with_tag)?);
+        }
+        let expected: Vec<Vec<u8>> = (7..=22).map(|index| vec![index as u8]).collect();
+        assert_eq!(delivered, expected);
+        Ok(())
+    }
+
+    #[test]
     fn credit_round_trip_updates_peer_credit() -> Result<(), CryptoError> {
         let (mut sender, mut receiver) = sender_receiver()?;
         for _ in 0..5 {

@@ -7,9 +7,9 @@ use protocol::{
     HostBrowseStartPayload, HostLaunchProfileConfig, HostSettingValue, LaunchProfileCatalog,
     LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId, LaunchProfileKind,
     NewAgentPayload, ProjectBootstrapPayload, ProjectRootPath, ReviewSummaryScope, SessionId,
-    SessionListPayload, SessionSchemasPayload, SessionSettingValue, SessionSettingsValues,
-    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, TerminalCreatePayload,
-    TerminalLaunchTarget,
+    SessionListPageStatus, SessionListPayload, SessionSchemasPayload, SessionSettingValue,
+    SessionSettingsValues, SetSettingPayload, SpawnAgentParams, SpawnAgentPayload,
+    TerminalCreatePayload, TerminalLaunchTarget,
 };
 use server::backend::BackendSession;
 use server::store::project::ProjectStore;
@@ -30,6 +30,23 @@ async fn connect_raw(host: server::HostHandle) -> client::Connection {
     client::connect(&ClientConfig::current(), client_stream)
         .await
         .expect("client handshake")
+}
+
+async fn connect_mobile_raw(host: server::HostHandle) -> client::Connection {
+    let (client_stream, server_stream) = tokio::io::duplex(8192);
+    let server_config = server::ServerConfig::current();
+    tokio::spawn(async move {
+        let conn = server::accept(&server_config, server_stream)
+            .await
+            .expect("server handshake");
+        if let Err(err) = server::run_mobile_connection(conn, host).await {
+            eprintln!("server mobile connection failed: {err:?}");
+        }
+    });
+
+    client::connect(&ClientConfig::current(), client_stream)
+        .await
+        .expect("mobile client handshake")
 }
 
 async fn next_env(client: &mut client::Connection, context: &str) -> protocol::Envelope {
@@ -99,6 +116,30 @@ fn spawn_host(dir: &tempfile::TempDir) -> server::HostHandle {
         dir.path().join("settings.json"),
     )
     .expect("spawn host")
+}
+
+fn seed_session_store(path: &std::path::Path, count: u32) {
+    let store = SessionStore::load(path.to_owned()).expect("load session store");
+    for index in 0..count {
+        store
+            .upsert_backend_session(
+                &BackendSession {
+                    id: SessionId(format!("session-{index:04}")),
+                    backend_kind: BackendKind::Claude,
+                    workspace_roots: vec![format!("/workspace/{index}")],
+                    title: Some(format!("Session {index:04}")),
+                    token_count: Some(index as u64),
+                    created_at_ms: Some(index as u64),
+                    updated_at_ms: Some((count - index) as u64),
+                    resumable: true,
+                },
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("seed backend session");
+    }
 }
 
 fn write_enabled_backends_settings(path: &std::path::Path, backends: &[BackendKind]) {
@@ -205,6 +246,157 @@ async fn connection_emits_one_host_bootstrap_without_old_initial_spam() {
         "old initial replay spam",
     )
     .await;
+}
+
+#[tokio::test]
+async fn mobile_bootstrap_pages_large_session_store() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session_path = dir.path().join("sessions.json");
+    seed_session_store(&session_path, 300);
+    let host = server::spawn_host_with_mock_backend(
+        session_path,
+        dir.path().join("projects.json"),
+        dir.path().join("settings.json"),
+    )
+    .expect("spawn host");
+    let mut client = connect_mobile_raw(host).await;
+
+    let env = next_env(&mut client, "mobile host bootstrap").await;
+    assert_eq!(env.kind, FrameKind::HostBootstrap);
+    let serialized_len = serde_json::to_vec(&env)
+        .expect("serialize mobile HostBootstrap envelope")
+        .len();
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("host bootstrap payload");
+    assert_eq!(bootstrap.session_list.total_count, 300);
+    assert_eq!(
+        bootstrap.sessions.len(),
+        protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT as usize
+    );
+    assert!(
+        serialized_len < 128 * 1024,
+        "mobile HostBootstrap should stay bounded, got {serialized_len} bytes"
+    );
+    let next_cursor = match bootstrap.session_list.status {
+        SessionListPageStatus::More { next_cursor } => next_cursor,
+        SessionListPageStatus::Complete => panic!("large mobile bootstrap should be paged"),
+    };
+    assert_eq!(
+        next_cursor.offset,
+        protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT
+    );
+
+    client
+        .list_sessions(protocol::ListSessionsPayload {
+            cursor: Some(next_cursor),
+            limit: Some(protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT),
+        })
+        .await
+        .expect("request second session page");
+    let env = next_kind(
+        &mut client,
+        FrameKind::SessionList,
+        "second mobile session page",
+    )
+    .await;
+    let page: SessionListPayload = env.parse_payload().expect("parse SessionList");
+    assert_eq!(
+        page.page.cursor.offset,
+        protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT
+    );
+    assert_eq!(page.page.total_count, 300);
+    assert_eq!(
+        page.sessions.len(),
+        protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT as usize
+    );
+    assert!(matches!(
+        page.page.status,
+        SessionListPageStatus::More { .. }
+    ));
+}
+
+#[tokio::test]
+async fn mobile_session_pages_use_stable_snapshot_when_sessions_reorder() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session_path = dir.path().join("sessions.json");
+    seed_session_store(&session_path, 130);
+    let host = server::spawn_host_with_mock_backend(
+        session_path.clone(),
+        dir.path().join("projects.json"),
+        dir.path().join("settings.json"),
+    )
+    .expect("spawn host");
+    let mut client = connect_mobile_raw(host).await;
+
+    let env = next_env(&mut client, "mobile host bootstrap").await;
+    assert_eq!(env.kind, FrameKind::HostBootstrap);
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("host bootstrap payload");
+    assert_eq!(
+        bootstrap
+            .sessions
+            .first()
+            .map(|session| session.id.0.as_str()),
+        Some("session-0000")
+    );
+    assert_eq!(
+        bootstrap
+            .sessions
+            .last()
+            .map(|session| session.id.0.as_str()),
+        Some("session-0063")
+    );
+    let mut all_ids = bootstrap
+        .sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+    let first_generation = bootstrap.session_list.cursor.generation;
+    let mut next_cursor = match bootstrap.session_list.status {
+        SessionListPageStatus::More { next_cursor } => next_cursor,
+        SessionListPageStatus::Complete => panic!("large mobile bootstrap should be paged"),
+    };
+
+    let store = SessionStore::load(session_path).expect("reload session store");
+    store
+        .update(&SessionId("session-0100".to_owned()), |record| {
+            record.updated_at_ms = 1_000_000;
+        })
+        .expect("reorder a later session between page requests");
+
+    loop {
+        client
+            .list_sessions(protocol::ListSessionsPayload {
+                cursor: Some(next_cursor),
+                limit: Some(protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT),
+            })
+            .await
+            .expect("request next session page");
+        let env = next_kind(&mut client, FrameKind::SessionList, "next session page").await;
+        let page: SessionListPayload = env.parse_payload().expect("parse SessionList");
+        assert_eq!(
+            page.page.cursor.generation, first_generation,
+            "continuation pages must come from the original snapshot"
+        );
+        if page.page.cursor.offset == protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT {
+            assert_eq!(
+                page.sessions.first().map(|session| session.id.0.as_str()),
+                Some("session-0064"),
+                "fresh offset paging would duplicate session-0063 and silently skip a later session"
+            );
+        }
+        all_ids.extend(page.sessions.into_iter().map(|session| session.id));
+        match page.page.status {
+            SessionListPageStatus::More { next_cursor: next } => next_cursor = next,
+            SessionListPageStatus::Complete => break,
+        }
+    }
+
+    let unique_ids = all_ids.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(all_ids.len(), 130);
+    assert_eq!(unique_ids.len(), 130);
+    assert!(
+        unique_ids.contains(&SessionId("session-0129".to_owned())),
+        "stable snapshot paging must not silently truncate the old tail"
+    );
 }
 
 #[tokio::test]

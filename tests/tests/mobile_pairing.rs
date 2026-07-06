@@ -11,9 +11,12 @@ use protocol::{
     HostBootstrapPayload, HostSettingValue, ListSessionsPayload, LoadAgentPayload,
     MobileAccessErrorCode, MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState,
     MobilePairingOfferPayload, MobilePairingStartPayload, MobilePairingState, NewAgentPayload,
-    ProjectCreatePayload, ProjectRootPath, SendMessagePayload, SetSettingPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath, TerminalCreatePayload, TerminalLaunchTarget, write_envelope,
+    ProjectCreatePayload, ProjectRootPath, SendMessagePayload, SessionId, SessionListPageStatus,
+    SetSettingPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath, TerminalCreatePayload,
+    TerminalLaunchTarget, write_envelope,
 };
+use server::backend::BackendSession;
+use server::store::session::SessionStore;
 use tokio::time::timeout;
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -25,9 +28,15 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
+        Self::with_seeded_sessions(0).await
+    }
+
+    async fn with_seeded_sessions(session_count: u32) -> Self {
         let store_dir = tempfile::tempdir().expect("create mobile pairing test store dir");
+        let session_path = store_dir.path().join("sessions.json");
+        seed_session_store(&session_path, session_count);
         let host = server::spawn_host_with_mock_backend(
-            store_dir.path().join("sessions.json"),
+            session_path,
             store_dir.path().join("projects.json"),
             store_dir.path().join("settings.json"),
         )
@@ -40,6 +49,30 @@ impl Harness {
 
     async fn connect_desktop(&self) -> client::Connection {
         connect_desktop(self.host.clone()).await
+    }
+}
+
+fn seed_session_store(path: &std::path::Path, count: u32) {
+    let store = SessionStore::load(path.to_owned()).expect("load session store");
+    for index in 0..count {
+        store
+            .upsert_backend_session(
+                &BackendSession {
+                    id: SessionId(format!("session-{index:04}")),
+                    backend_kind: BackendKind::Claude,
+                    workspace_roots: vec![format!("/workspace/{index}")],
+                    title: Some(format!("Session {index:04}")),
+                    token_count: Some(index as u64),
+                    created_at_ms: Some(index as u64),
+                    updated_at_ms: Some((count - index) as u64),
+                    resumable: true,
+                },
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("seed backend session");
     }
 }
 
@@ -498,7 +531,7 @@ async fn mqtt_pairing_accepts_mobile_tyde_hello_over_encrypted_stream() {
     send_host_payload(
         &mut mobile,
         FrameKind::ListSessions,
-        &ListSessionsPayload {},
+        &ListSessionsPayload::default(),
     )
     .await;
     let _ = wait_for_kind(&mut mobile, FrameKind::SessionList, "mobile SessionList").await;
@@ -519,6 +552,86 @@ async fn mqtt_pairing_accepts_mobile_tyde_hello_over_encrypted_stream() {
         error.message.contains("not allowed from Tyde Mobile"),
         "unexpected terminal rejection: {error:?}"
     );
+}
+
+#[tokio::test]
+async fn mqtt_mobile_bootstrap_pages_large_session_store() {
+    let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
+    let harness = Harness::with_seeded_sessions(300).await;
+    let mut desktop = harness.connect_desktop().await;
+    expect_initial_replay(&mut desktop).await;
+
+    set_mobile_broker_url(&mut desktop, Some(broker.broker_url.clone())).await;
+    set_mobile_enabled(&mut desktop, true).await;
+    let _ = wait_for_mobile_state(
+        &mut desktop,
+        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
+        "MobileBrokerStatus::Online",
+    )
+    .await;
+    send_mobile_pairing_start(&mut desktop).await;
+
+    let offer_env = wait_for_kind(
+        &mut desktop,
+        FrameKind::MobilePairingOffer,
+        "MobilePairingOffer",
+    )
+    .await;
+    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
+    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
+    let mut mobile = connect_mobile_client(&qr).await;
+
+    let env = expect_next_kind(
+        &mut mobile,
+        FrameKind::HostBootstrap,
+        "large mobile HostBootstrap",
+    )
+    .await;
+    let serialized_len = serde_json::to_vec(&env)
+        .expect("serialize mobile HostBootstrap envelope")
+        .len();
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("parse HostBootstrap");
+    assert_eq!(bootstrap.session_list.total_count, 300);
+    assert_eq!(
+        bootstrap.sessions.len(),
+        protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT as usize
+    );
+    assert!(
+        serialized_len < 128 * 1024,
+        "mobile HostBootstrap over MQTT should stay bounded, got {serialized_len} bytes"
+    );
+
+    let mut loaded = bootstrap.sessions.len();
+    let mut next_cursor = match bootstrap.session_list.status {
+        SessionListPageStatus::More { next_cursor } => next_cursor,
+        SessionListPageStatus::Complete => panic!("large mobile bootstrap should be paged"),
+    };
+    loop {
+        send_host_payload(
+            &mut mobile,
+            FrameKind::ListSessions,
+            &ListSessionsPayload {
+                cursor: Some(next_cursor),
+                limit: Some(protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT),
+            },
+        )
+        .await;
+        let env = wait_for_kind(
+            &mut mobile,
+            FrameKind::SessionList,
+            "large mobile SessionList page",
+        )
+        .await;
+        let page: protocol::SessionListPayload = env.parse_payload().expect("parse SessionList");
+        assert_eq!(page.page.total_count, 300);
+        loaded += page.sessions.len();
+        match page.page.status {
+            SessionListPageStatus::More { next_cursor: next } => next_cursor = next,
+            SessionListPageStatus::Complete => break,
+        }
+    }
+
+    assert_eq!(loaded, 300);
 }
 
 #[tokio::test]
@@ -640,7 +753,7 @@ async fn mqtt_mobile_receives_agent_replay_sessions_and_chat_events() {
     send_host_payload(
         &mut mobile,
         FrameKind::ListSessions,
-        &ListSessionsPayload {},
+        &ListSessionsPayload::default(),
     )
     .await;
     let session_env =
@@ -752,7 +865,7 @@ async fn mqtt_mobile_reconnect_replays_bootstrap_state_again() {
     send_host_payload(
         &mut second,
         FrameKind::ListSessions,
-        &ListSessionsPayload {},
+        &ListSessionsPayload::default(),
     )
     .await;
     let session_env = wait_for_kind(

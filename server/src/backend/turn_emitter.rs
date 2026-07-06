@@ -912,6 +912,7 @@ mod tests {
                 backend_config_snapshots: vec![],
                 launch_profile_catalog: Default::default(),
                 sessions: vec![],
+                session_list: Default::default(),
                 projects: vec![],
                 mcp_servers: vec![],
                 skills: vec![],

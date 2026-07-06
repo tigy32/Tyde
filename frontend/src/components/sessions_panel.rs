@@ -176,7 +176,7 @@ pub fn SessionsPanel() -> impl IntoView {
                     &host_id,
                     host_stream,
                     FrameKind::ListSessions,
-                    &ListSessionsPayload {},
+                    &ListSessionsPayload::default(),
                 )
                 .await
             {

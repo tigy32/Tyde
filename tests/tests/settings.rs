@@ -8,8 +8,9 @@ use std::time::Duration;
 use fixture::Fixture;
 use protocol::{
     BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload, BackendConfigValues, BackendKind,
-    BackendSetupStatus, CodeIntelProviderId, FrameKind, HostExecutablePath, HostSettingValue,
-    HostSettings, HostSettingsPayload, SessionId, SessionSettingValue, SetSettingPayload,
+    BackendSetupDiagnosticCode, BackendSetupStatus, CodeIntelProviderId, FrameKind,
+    HostExecutablePath, HostSettingValue, HostSettings, HostSettingsPayload, SessionId,
+    SessionSettingValue, SetSettingPayload,
 };
 use server::backend::BackendSession;
 use server::store::session::SessionStore;
@@ -132,14 +133,48 @@ for raw_line in sys.stdin:
 
 fn write_fake_hermes_install(home: &Path) -> PathBuf {
     let project = home.join(".hermes").join("hermes-agent");
-    let python = project.join("venv").join("bin").join("python");
-    std::fs::create_dir_all(python.parent().expect("fake Hermes venv parent"))
-        .expect("create fake Hermes venv");
+    std::fs::create_dir_all(&project).expect("create fake Hermes project");
+    let python = home.join(".hermes").join("fake_python");
+    let console = home.join(".hermes").join("hermes_console");
     std::fs::write(
         &python,
         "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then exit 0; fi\nexit 1\n",
     )
     .expect("write fake Hermes python");
+    std::fs::write(
+        &console,
+        format!("#!{}\nimport sys\nsys.exit(1)\n", python.to_string_lossy()),
+    )
+    .expect("write fake Hermes console script");
+    let hermes = home.join(".local").join("bin").join("hermes");
+    std::fs::create_dir_all(hermes.parent().expect("fake Hermes bin parent"))
+        .expect("create fake Hermes bin");
+    std::fs::write(
+        &hermes,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'Hermes Agent v9.9.9\\nProject: {}\\n'\n  exit 0\nfi\nexec '{}' \"$@\"\n",
+            project.to_string_lossy(),
+            console.to_string_lossy().replace('\'', "'\\''")
+        ),
+    )
+    .expect("write fake Hermes executable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&python, &console, &hermes] {
+            let mut perms = std::fs::metadata(path)
+                .expect("stat fake Hermes executable")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("chmod fake Hermes executable");
+        }
+    }
+    hermes
+}
+
+fn write_unusable_hermes_cli(home: &Path) -> PathBuf {
+    let project = home.join(".hermes").join("hermes-agent");
+    std::fs::create_dir_all(&project).expect("create unusable Hermes project");
     let hermes = home.join(".local").join("bin").join("hermes");
     std::fs::create_dir_all(hermes.parent().expect("fake Hermes bin parent"))
         .expect("create fake Hermes bin");
@@ -150,17 +185,15 @@ fn write_fake_hermes_install(home: &Path) -> PathBuf {
             project.to_string_lossy()
         ),
     )
-    .expect("write fake Hermes executable");
+    .expect("write unusable Hermes executable");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for path in [&python, &hermes] {
-            let mut perms = std::fs::metadata(path)
-                .expect("stat fake Hermes executable")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(path, perms).expect("chmod fake Hermes executable");
-        }
+        let mut perms = std::fs::metadata(&hermes)
+            .expect("stat fake Hermes executable")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hermes, perms).expect("chmod fake Hermes executable");
     }
     hermes
 }
@@ -688,6 +721,57 @@ async fn backend_setup_payload_uses_sign_in_command_and_versioned_tycode_probe()
             .contains(&fake_hermes.to_string_lossy().to_string()),
         "Hermes sign-in command should include resolved executable: {}",
         hermes_sign_in.command
+    );
+}
+
+#[tokio::test]
+async fn backend_setup_payload_reports_found_unusable_hermes_cli() {
+    let _env_guard = env_lock().lock().await;
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    let fake_hermes = write_unusable_hermes_cli(temp_home.path());
+    let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());
+    let _hermes = EnvVarGuard::set(
+        "HERMES_EXECUTABLE",
+        fake_hermes.to_string_lossy().to_string(),
+    );
+    let _hermes_python = EnvVarGuard::set("HERMES_PYTHON", "".to_string());
+
+    let mut fixture = Fixture::new_with_real_backend_probe().await;
+    let payload = fixture.bootstrap.backend_setup.clone();
+    expect_no_backend_setup_replay(&mut fixture.client).await;
+
+    let hermes = payload
+        .backends
+        .iter()
+        .find(|info| info.backend_kind == BackendKind::Hermes)
+        .expect("Hermes backend setup entry");
+    assert_eq!(hermes.status, BackendSetupStatus::Unavailable);
+    assert_eq!(hermes.installed_version, None);
+    assert!(hermes.sign_in_command.is_none());
+    let diagnostic = hermes.diagnostic.as_ref().expect("Hermes diagnostic");
+    assert_eq!(
+        diagnostic.code,
+        BackendSetupDiagnosticCode::MissingGatewayPython
+    );
+    assert!(
+        diagnostic.message.contains("Hermes Agent v9.9.9")
+            && diagnostic
+                .message
+                .contains(&fake_hermes.to_string_lossy().to_string()),
+        "diagnostic should name the found CLI and version: {}",
+        diagnostic.message
+    );
+    assert!(
+        !diagnostic.message.contains("so `hermes` is on PATH")
+            && !diagnostic.message.contains("set HERMES_EXECUTABLE"),
+        "found-unusable diagnostic should not recommend PATH/HERMES_EXECUTABLE remedies: {}",
+        diagnostic.message
+    );
+    assert!(
+        diagnostic.message.contains("Re-run the Hermes installer")
+            && diagnostic.message.contains("HERMES_PYTHON"),
+        "found-unusable diagnostic should include an actionable gateway-Python remedy: {}",
+        diagnostic.message
     );
 }
 

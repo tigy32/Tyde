@@ -22,31 +22,43 @@ Local sessions use explicit overrides authoritatively before auto-discovery:
    with a typed diagnostic and runtime launch fails with the same cause; Tyde
    does not fall back to another executable.
 2. `HERMES_EXECUTABLE`, when set, must point at a Hermes CLI whose `--version`
-   output reports a `Project:` root with a virtualenv that can import
-   `tui_gateway.entry`. If this probe fails, Tyde reports the explicit failure
-   instead of falling back to PATH or Python.
+   output reports a `Project:` root and whose wrapper/console script can be
+   traced to a Python interpreter that can import `tui_gateway.entry`. If this
+   probe fails, Tyde reports the explicit failure instead of falling back to
+   PATH or Python.
 3. Without explicit overrides, Tyde probes the Hermes CLI discovered from
    common user-bin locations such as `~/.local/bin` and the resolved host PATH.
 
 For executable probes, Tyde runs `hermes --version`, reads Hermes's reported
-project root, verifies that the project's virtualenv can import
-`tui_gateway.entry`, then launches that virtualenv Python as:
+project root, resolves the gateway Python from the Hermes executable itself
+(shell wrapper targets and console-script shebangs) and from legacy project
+virtualenv locations when present, then verifies that interpreter can import
+`tui_gateway.entry`. Tyde launches the verified interpreter as:
 
 ```text
-<hermes-project>/venv/bin/python -m tui_gateway.entry
+<resolved-hermes-python> -m tui_gateway.entry
 ```
 
 If no explicit override or verified CLI is available, setup reports Hermes as
 not installed with instructions to install Hermes or set `HERMES_EXECUTABLE` or
 `HERMES_PYTHON`. Tyde does not infer Hermes from `PYTHON`, `VIRTUAL_ENV`,
 workspace `.venv`/`venv`, `python3`, or `python`; those interpreters are only
-used when explicitly named by `HERMES_PYTHON`.
+used when explicitly named by `HERMES_PYTHON` or when the verified Hermes CLI
+wrapper/shebang itself names them.
 
 Setup diagnostics distinguish subprocess failures, probe timeouts, nonzero
-`--version`, missing `Project:`, missing Hermes virtualenv Python, and gateway
-import failures. The setup sign-in command uses the resolved Hermes executable
-path when Hermes was verified through `HERMES_EXECUTABLE` or PATH; if Hermes is
-only available through `HERMES_PYTHON`, Tyde does not invent a `hermes setup`
+`--version`, missing `Project:`, failure to resolve a gateway Python from the
+found CLI, and gateway import failures. A found CLI whose `--version` succeeds
+but whose gateway Python cannot be resolved or cannot import
+`tui_gateway.entry` is reported as unavailable, not not-installed; the
+diagnostic names the executable, version, and project when known and describes
+the gateway-Python/import problem. Its remedy is to re-run the Hermes installer
+to restore Hermes's Python environment, or set `HERMES_PYTHON` to a Python
+interpreter that can import `tui_gateway.entry`; it does not tell the user to
+put `hermes` on PATH or set `HERMES_EXECUTABLE` for a CLI that was already
+found. The setup sign-in command uses the resolved Hermes executable path when
+Hermes was verified through `HERMES_EXECUTABLE` or PATH; if Hermes is only
+available through `HERMES_PYTHON`, Tyde does not invent a `hermes setup`
 command.
 
 Remote `ssh://host/path` workspaces spawn the same module remotely. The remote

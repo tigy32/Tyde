@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 33;
+pub const PROTOCOL_VERSION: u32 = 35;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -22,6 +22,8 @@ pub const TYDE_VERSION: Version = Version {
 /// Shared MQTT-over-WebSocket-Secure endpoint reachable from both the native
 /// host and the browser/PWA client (no mixed content; broker terminates TLS).
 pub const DEFAULT_MOBILE_MQTT_BROKER_URL: &str = "wss://broker.emqx.io:8084/mqtt";
+pub const DEFAULT_SESSION_LIST_PAGE_LIMIT: u32 = 64;
+pub const MAX_SESSION_LIST_PAGE_LIMIT: u32 = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Version {
@@ -1230,6 +1232,7 @@ pub struct HostBootstrapPayload {
     #[serde(default)]
     pub launch_profile_catalog: LaunchProfileCatalog,
     pub sessions: Vec<SessionSummary>,
+    pub session_list: SessionListPageInfo,
     pub projects: Vec<Project>,
     pub mcp_servers: Vec<McpServerConfig>,
     pub skills: Vec<Skill>,
@@ -2440,8 +2443,61 @@ pub struct SessionHistoryPayload {
     pub oldest_seq: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ListSessionsPayload {}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionListGeneration(pub u64);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SessionListCursor {
+    pub generation: SessionListGeneration,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionListPageStatus {
+    #[default]
+    Complete,
+    More {
+        next_cursor: SessionListCursor,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionListPageInfo {
+    pub cursor: SessionListCursor,
+    pub limit: u32,
+    pub total_count: u32,
+    pub status: SessionListPageStatus,
+}
+
+impl Default for SessionListPageInfo {
+    fn default() -> Self {
+        Self {
+            cursor: SessionListCursor::default(),
+            limit: DEFAULT_SESSION_LIST_PAGE_LIMIT,
+            total_count: 0,
+            status: SessionListPageStatus::Complete,
+        }
+    }
+}
+
+impl SessionListPageInfo {
+    pub fn next_cursor(&self) -> Option<SessionListCursor> {
+        match self.status {
+            SessionListPageStatus::Complete => None,
+            SessionListPageStatus::More { next_cursor } => Some(next_cursor),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListSessionsPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<SessionListCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteSessionPayload {
@@ -2477,6 +2533,7 @@ pub struct SessionSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionListPayload {
     pub sessions: Vec<SessionSummary>,
+    pub page: SessionListPageInfo,
 }
 
 /// Input events that can be sent to a running agent.
@@ -5914,8 +5971,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_three() {
-        assert_eq!(PROTOCOL_VERSION, 33);
+    fn protocol_version_is_thirty_five() {
+        assert_eq!(PROTOCOL_VERSION, 35);
     }
 
     #[test]
@@ -6105,6 +6162,7 @@ mod search_serde_tests {
             backend_config_snapshots: Vec::new(),
             launch_profile_catalog: LaunchProfileCatalog::default(),
             sessions: Vec::new(),
+            session_list: Default::default(),
             projects: Vec::new(),
             mcp_servers: Vec::new(),
             skills: Vec::new(),

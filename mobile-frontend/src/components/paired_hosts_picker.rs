@@ -171,6 +171,7 @@ fn ConnectionPill(state: AppState, local_host_id: LocalHostId) -> impl IntoView 
         match status {
             ConnectionStatus::Connected => ("connected", "Online".to_string()),
             ConnectionStatus::Connecting => ("connecting", "Connecting…".to_string()),
+            ConnectionStatus::Bootstrapping => ("connecting", "Loading host…".to_string()),
             ConnectionStatus::Disconnected => ("disconnected", "Offline".to_string()),
             ConnectionStatus::Error(msg) => ("error", format!("Error: {msg}")),
             ConnectionStatus::UpdateRequired {
@@ -217,7 +218,9 @@ fn ConnectDisconnectButton(
     let is_connected = move || {
         matches!(
             status_for_connected(),
-            ConnectionStatus::Connected | ConnectionStatus::Connecting
+            ConnectionStatus::Connected
+                | ConnectionStatus::Connecting
+                | ConnectionStatus::Bootstrapping
         )
     };
     // A sticky incompatible-protocol reject can't be recovered by reconnecting
