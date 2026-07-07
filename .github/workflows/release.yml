@@ -88,13 +88,19 @@ jobs:
       # (server::mobile_access) catch immediately — the release had no test gate
       # at all. Retry up to 3x so a genuinely flaky test does not block a release,
       # while a real failure (which fails all 3 attempts) still does.
+      #
+      # tauri-shell and tyde-mobile-shell are excluded: their `generate_context!`
+      # macro needs the frontend `dist/` to exist at compile time, which only the
+      # `build` job produces (via trunk). They are thin GUI shells with no logic
+      # tests; every logic crate (server, client, protocol, tests, …) still runs.
       - name: Run workspace tests (retry flaky)
         shell: bash
         run: |
+          test_cmd="cargo test --workspace --exclude tauri-shell --exclude tyde-mobile-shell"
           attempts=3
           for i in $(seq 1 "$attempts"); do
-            echo "::group::cargo test --workspace (attempt $i of $attempts)"
-            if cargo test --workspace; then
+            echo "::group::$test_cmd (attempt $i of $attempts)"
+            if $test_cmd; then
               echo "::endgroup::"
               echo "workspace tests passed on attempt $i"
               exit 0
@@ -102,7 +108,7 @@ jobs:
             echo "::endgroup::"
             echo "::warning::cargo test attempt $i of $attempts failed; retrying"
           done
-          echo "::error::cargo test --workspace failed after $attempts attempts"
+          echo "::error::cargo test failed after $attempts attempts"
           exit 1
 
   build:
