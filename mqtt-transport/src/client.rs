@@ -20,7 +20,7 @@ use std::sync::atomic::AtomicUsize;
 use tokio::sync::Barrier;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::config::MqttConnectConfig;
+use crate::config::{ConnectionPlan, ManagedMqttConnectConfig, MqttConnectConfig};
 use crate::error::MqttTransportError;
 use crate::framing::SESSION_SALT_LEN;
 use crate::link_native::NativeMqttLink;
@@ -45,13 +45,33 @@ struct ConnectOverrides {
 }
 
 pub async fn connect(config: MqttConnectConfig) -> Result<EnvelopeStream, MqttTransportError> {
-    connect_inner(config, ConnectOverrides::default()).await
+    connect_plan(ConnectionPlan::legacy(config), ConnectOverrides::default()).await
+}
+
+pub async fn connect_managed(
+    config: ManagedMqttConnectConfig,
+) -> Result<EnvelopeStream, MqttTransportError> {
+    connect_plan(
+        ConnectionPlan::managed(config)?,
+        ConnectOverrides::default(),
+    )
+    .await
 }
 
 pub async fn connect_ephemeral(
     config: MqttConnectConfig,
 ) -> Result<EnvelopeStream, MqttTransportError> {
-    connect_ephemeral_inner(config, ConnectOverrides::default()).await
+    connect_ephemeral_plan(ConnectionPlan::legacy(config), ConnectOverrides::default()).await
+}
+
+pub async fn connect_managed_ephemeral(
+    config: ManagedMqttConnectConfig,
+) -> Result<EnvelopeStream, MqttTransportError> {
+    connect_ephemeral_plan(
+        ConnectionPlan::managed_ephemeral(config)?,
+        ConnectOverrides::default(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -62,8 +82,8 @@ pub(crate) async fn connect_with_test_overrides(
     subscribe_barrier: Option<Arc<Barrier>>,
     accepted_publish_count: Option<Arc<AtomicUsize>>,
 ) -> Result<EnvelopeStream, MqttTransportError> {
-    connect_inner(
-        config,
+    connect_plan(
+        ConnectionPlan::legacy(config),
         ConnectOverrides {
             tls_ca_pem: Some(tls_ca_pem),
             fixed_session_salt,
@@ -82,8 +102,8 @@ pub(crate) async fn connect_ephemeral_with_test_overrides(
     subscribe_barrier: Option<Arc<Barrier>>,
     accepted_publish_count: Option<Arc<AtomicUsize>>,
 ) -> Result<EnvelopeStream, MqttTransportError> {
-    connect_ephemeral_inner(
-        config,
+    connect_ephemeral_plan(
+        ConnectionPlan::legacy(config),
         ConnectOverrides {
             tls_ca_pem: Some(tls_ca_pem),
             fixed_session_salt,
@@ -94,18 +114,23 @@ pub(crate) async fn connect_ephemeral_with_test_overrides(
     .await
 }
 
-async fn connect_inner(
-    config: MqttConnectConfig,
+async fn connect_plan(
+    plan: ConnectionPlan,
     overrides: ConnectOverrides,
 ) -> Result<EnvelopeStream, MqttTransportError> {
+    let ConnectionPlan {
+        config,
+        broker,
+        topics,
+    } = plan;
     let local_salt = match overrides.fixed_session_salt {
         Some(salt) => salt,
         None => generate_session_salt(),
     };
 
-    let inbound_topic = config.role.inbound_topic(&config.room);
-    let outbound_topic = config.role.outbound_topic(&config.room);
-    let link = NativeMqttLink::connect(&config.endpoint, config.role, overrides.tls_ca_pem)?;
+    let inbound_topic = topics.inbound_topic(config.role, &config.room)?;
+    let outbound_topic = topics.outbound_topic(config.role, &config.room)?;
+    let link = NativeMqttLink::connect(&broker, overrides.tls_ca_pem)?;
     #[cfg(test)]
     let link = {
         let mut link = link;
@@ -146,20 +171,25 @@ async fn connect_inner(
     }
 }
 
-async fn connect_ephemeral_inner(
-    config: MqttConnectConfig,
+async fn connect_ephemeral_plan(
+    plan: ConnectionPlan,
     overrides: ConnectOverrides,
 ) -> Result<EnvelopeStream, MqttTransportError> {
-    let data = negotiate_ephemeral_data_room_native(&config, &overrides).await?;
+    let data = negotiate_ephemeral_data_room_native(&plan, &overrides).await?;
     let data_config = MqttConnectConfig {
-        endpoint: config.endpoint,
+        endpoint: plan.config.endpoint,
         room: data.room,
         psk: data.psk,
-        role: config.role,
+        role: plan.config.role,
+    };
+    let data_plan = ConnectionPlan {
+        config: data_config,
+        broker: plan.broker,
+        topics: plan.topics,
     };
     tokio::time::timeout(
         RENDEZVOUS_DATA_CONNECT_TIMEOUT,
-        connect_inner(data_config, overrides),
+        connect_plan(data_plan, overrides),
     )
     .await
     .map_err(|_| MqttTransportError::BrokerDisconnected {
@@ -173,13 +203,13 @@ async fn connect_ephemeral_inner(
 /// Construct the native link for the main (rendezvous) room and run the
 /// transport-agnostic negotiation over it.
 async fn negotiate_ephemeral_data_room_native(
-    config: &MqttConnectConfig,
+    plan: &ConnectionPlan,
     overrides: &ConnectOverrides,
 ) -> Result<EphemeralDataRoom, MqttTransportError> {
-    let inbound_topic = config.role.inbound_topic(&config.room);
-    let outbound_topic = config.role.outbound_topic(&config.room);
-    let mut link =
-        NativeMqttLink::connect(&config.endpoint, config.role, overrides.tls_ca_pem.clone())?;
+    let config = &plan.config;
+    let inbound_topic = plan.topics.inbound_topic(config.role, &config.room)?;
+    let outbound_topic = plan.topics.outbound_topic(config.role, &config.room)?;
+    let mut link = NativeMqttLink::connect(&plan.broker, overrides.tls_ca_pem.clone())?;
     #[cfg(test)]
     link.set_accepted_publish_count_for_test(overrides.accepted_publish_count.clone());
     negotiate_ephemeral_data_room(config, &inbound_topic, &outbound_topic, &mut link).await

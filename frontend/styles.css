@@ -7899,6 +7899,225 @@ kbd {
     margin-left: auto;
 }
 
+/* Backend-native (JSON-schema-driven) settings, e.g. Tycode's grouped settings.
+   Each group is a titled section; the whole page renders current server-owned
+   values, or an explicit unavailable state — never blank defaults. */
+.settings-native-settings {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+}
+
+.settings-native-group {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+}
+
+/* Tab strip for backends whose native settings span several groups (Core +
+   module groups). Only the active group's panel is shown. */
+.settings-native-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding-bottom: var(--space-2);
+    border-bottom: 1px solid var(--border-primary);
+    background: var(--surface-0, var(--surface-1));
+}
+
+.settings-native-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-3);
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    background: var(--surface-1);
+    border: 1px solid var(--border-primary);
+    border-radius: 999px;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.settings-native-tab:hover,
+.settings-native-tab:focus-visible {
+    color: var(--text-primary);
+    border-color: var(--border-focus, var(--border-primary));
+}
+
+.settings-native-tab-active {
+    color: var(--text-primary);
+    background: var(--surface-2);
+    border-color: var(--accent, var(--border-focus, var(--border-primary)));
+    font-weight: 600;
+}
+
+.settings-native-tab-badge {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-tertiary);
+}
+
+.settings-native-panels {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+}
+
+/* The class sets display:flex, which would otherwise beat the UA [hidden]
+   rule, so hide inactive panels explicitly. */
+.settings-native-group-panel[hidden] {
+    display: none;
+}
+
+.settings-native-group-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.settings-native-group-title {
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+}
+
+.settings-native-group-badge {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-tertiary);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    padding: 0 var(--space-2);
+}
+
+.settings-native-group-desc {
+    margin: 0;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.settings-native-fields {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+}
+
+.settings-native-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.settings-native-field .settings-description {
+    margin: 0;
+}
+
+.settings-native-input {
+    width: 100%;
+}
+
+.settings-native-json {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.settings-native-json-input {
+    width: 100%;
+    min-height: 5rem;
+    font-family: var(--font-mono, monospace);
+    font-size: 0.82rem;
+    white-space: pre;
+}
+
+.settings-native-json-readonly {
+    margin: 0;
+    padding: var(--space-2);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    font-family: var(--font-mono, monospace);
+    font-size: 0.82rem;
+    overflow-x: auto;
+}
+
+.settings-native-json-error {
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--danger, #e5534b);
+}
+
+.settings-native-json-note {
+    margin: 0;
+    font-size: 0.8rem;
+    color: var(--text-tertiary);
+}
+
+/* Explicit unset markers so a blank control is never read as a real value. */
+.settings-native-unset {
+    align-self: flex-start;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-tertiary);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    padding: 0 var(--space-2);
+}
+
+.settings-native-unset-note {
+    margin: 0;
+    font-size: 0.82rem;
+    color: var(--text-tertiary);
+}
+
+/* A native save replaces the whole document, so controls lock until the server
+   confirms — this banner explains the transient lock. */
+.settings-native-saving {
+    padding: var(--space-2) var(--space-3);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+}
+
+.settings-native-error {
+    padding: var(--space-2) var(--space-3);
+    background: rgba(229, 83, 75, 0.1);
+    border: 1px solid rgba(229, 83, 75, 0.35);
+    border-radius: 6px;
+    color: var(--danger, #e5534b);
+    font-size: 0.85rem;
+}
+
+/* Explicit unavailable diagnostic for backend-native settings: the server's own
+   reason is shown verbatim so current values never appear as blank defaults. */
+.settings-native-unavailable {
+    padding: var(--space-3);
+    background: rgba(232, 160, 50, 0.08);
+    border: 1px solid rgba(232, 160, 50, 0.3);
+    border-radius: 8px;
+}
+
+.settings-native-unavailable-text {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+}
+
 .settings-panel-header {
     display: flex;
     align-items: center;
@@ -8585,20 +8804,7 @@ kbd {
     flex-shrink: 0;
 }
 
-/* Cumulative session token usage, pinned to the right of the header row */
-.session-settings-usage {
-    margin-left: auto;
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    font-family: var(--font-mono);
-    font-size: 0.72rem;
-    font-variant-numeric: tabular-nums;
-    color: var(--text-tertiary);
-    flex-shrink: 0;
-}
-
-/* Header row wrapping the accordion toggle plus the aggregate task badge */
+/* Header row wrapping the accordion toggle plus the task usage display */
 .session-settings-header {
     display: flex;
     align-items: stretch;
@@ -8610,9 +8816,9 @@ kbd {
     min-width: 0;
 }
 
-/* Aggregate task usage (root agent + sub-agents), far right of the header.
-   margin-left: auto right-aligns it in rows without a flex: 1 sibling
-   (schema-status text rows, badge-only rows). */
+/* The single task-wide token usage display (root agent + sub-agents), far
+   right of the header. margin-left: auto right-aligns it in rows without a
+   flex: 1 sibling (schema-status text rows, badge-only rows). */
 .session-task-usage {
     position: relative;
     display: inline-flex;
@@ -8624,7 +8830,7 @@ kbd {
 .session-task-toggle {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     padding: 5px var(--space-3);
     background: transparent;
     border: none;
@@ -8644,7 +8850,19 @@ kbd {
     color: var(--text-secondary);
 }
 
-.session-task-label,
+/* "including N agents" suffix — subordinate to the token figures */
+.session-task-including {
+    color: var(--text-tertiary);
+    font-size: 0.68rem;
+}
+
+/* Muted marker shown in place of a figure when the whole task total is
+   unavailable — never a fabricated zero */
+.session-task-usage-unavailable {
+    color: var(--text-tertiary);
+    font-style: italic;
+}
+
 .session-task-status {
     font-size: 0.62rem;
     text-transform: uppercase;
@@ -8734,7 +8952,7 @@ kbd {
 }
 
 .session-task-row-unavailable {
-    color: var(--warning);
+    color: var(--text-tertiary);
     font-style: italic;
 }
 
@@ -8743,10 +8961,6 @@ kbd {
     align-items: center;
     gap: 8px;
     padding: 6px var(--space-3);
-}
-
-.session-task-total {
-    color: var(--text-secondary);
 }
 
 .session-settings-unavailable-text {

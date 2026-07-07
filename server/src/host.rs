@@ -18,31 +18,32 @@ use protocol::{
     AgentSystemTagAssignment, AgentSystemTagDescriptor, AgentSystemTagId, AgentTagsSnapshot,
     AgentTagsUpdate, AgentWorkflowMetadata, AgentsViewPreferencesNotifyPayload,
     AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate, BackendConfigSnapshot,
-    BackendConfigSnapshotsPayload, BackendKind, BackendSetupPayload, BrowseBootstrapListing,
-    BrowseBootstrapPayload, CancelWorkflowPayload, CodeIntelCancelReferencesPayload,
-    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
-    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
+    BackendConfigSnapshotsPayload, BackendKind, BackendNativeSettingsSnapshot, BackendSetupPayload,
+    BrowseBootstrapListing, BrowseBootstrapPayload, CancelWorkflowPayload,
+    CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
+    CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgent, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DEFAULT_SESSION_LIST_PAGE_LIMIT, FrameKind,
-    GitBranchName, HostAbsPath, HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload,
-    HostBrowseStartPayload, HostFilterId, HostLaunchProfileConfig, HostSettingsPayload, ImageData,
-    LOCAL_HOST_ID, LaunchProfile, LaunchProfileCatalog, LaunchProfileCatalogPayload,
-    LaunchProfileEntry, LaunchProfileId, LaunchProfileKind, ListSessionsPayload,
-    MAX_SESSION_LIST_PAGE_LIMIT, McpServerConfig, McpServerDeletePayload, McpServerId,
-    McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig, MobileDeviceRenamePayload,
-    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
-    ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
-    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
-    ProjectSearchCancelPayload, ProjectSearchCompletePayload, ProjectSearchFileResult,
-    ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
-    ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
-    ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT,
+    FrameKind, GitBranchName, HostAbsPath, HostBootstrapPayload, HostBrowseInitial,
+    HostBrowseListPayload, HostBrowseStartPayload, HostFilterId, HostLaunchProfileConfig,
+    HostSettingsPayload, ImageData, LOCAL_HOST_ID, LaunchProfile, LaunchProfileCatalog,
+    LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId, LaunchProfileKind,
+    ListSessionsPayload, MAX_SESSION_LIST_PAGE_LIMIT, McpServerConfig, McpServerDeletePayload,
+    McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig,
+    MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
+    NewAgentPayload, Project, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
+    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload,
+    ProjectGitCommitResultPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
+    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectRootPath, ProjectSearchCancelPayload,
+    ProjectSearchCompletePayload, ProjectSearchFileResult, ProjectSearchPayload,
+    ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload, ProjectStageHunkPayload,
+    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection,
+    ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
     SessionHistoryPayload, SessionId, SessionListCursor, SessionListGeneration,
-    SessionListPageInfo, SessionListPageStatus, SessionListPayload, SessionSchemaEntry,
-    SessionSchemasPayload, SessionSettingsSchema, SessionSummary, SetAgentGroupsPayload,
-    SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
+    SessionListPageInfo, SessionListPageStatus, SessionListPayload, SessionListScope,
+    SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema, SessionSummary,
+    SetAgentGroupsPayload, SetAgentPinsPayload, SetAgentTagsPayload, SetAgentsSmartViewsPayload,
     SetAgentsViewPreferencesPayload, SetSettingPayload, Skill, SkillNotifyPayload,
     SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, SteeringDeletePayload,
     SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
@@ -117,7 +118,9 @@ use crate::store::mcp_servers::{McpServerStore, RESERVED_MCP_SERVER_NAMES};
 use crate::store::mobile_pairings::MobilePairingsStore;
 use crate::store::project::{ProjectStore, ProjectStoreError};
 use crate::store::review::ReviewStore;
-use crate::store::session::{SessionRecord, SessionStore, session_record_is_resumable};
+use crate::store::session::{
+    SessionRecord, SessionStore, session_record_is_resumable, session_summary_matches_scope,
+};
 use crate::store::settings::HostSettingsStore;
 use crate::store::skills::SkillStore;
 use crate::store::steering::SteeringStore;
@@ -156,6 +159,7 @@ struct HostSubscriber {
     last_session_schemas: Option<Vec<SessionSchemaEntry>>,
     last_backend_config_schemas: Option<Vec<protocol::BackendConfigSchema>>,
     last_backend_config_snapshots: Option<Vec<BackendConfigSnapshot>>,
+    last_backend_native_settings_snapshots: Option<Vec<BackendNativeSettingsSnapshot>>,
     last_launch_profile_catalog: Option<LaunchProfileCatalog>,
 }
 
@@ -191,8 +195,15 @@ impl SessionListReplayMode {
         match agent_replay {
             AgentReplayMode::Eager => Self::Full,
             AgentReplayMode::Lazy => Self::Paged {
-                limit: DEFAULT_SESSION_LIST_PAGE_LIMIT,
+                limit: DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT,
             },
+        }
+    }
+
+    fn default_scope(self) -> SessionListScope {
+        match self {
+            Self::Full => SessionListScope::AllSessions,
+            Self::Paged { .. } => SessionListScope::RootSessions,
         }
     }
 }
@@ -200,6 +211,7 @@ impl SessionListReplayMode {
 #[derive(Clone, Debug)]
 struct SessionListSnapshot {
     generation: SessionListGeneration,
+    scope: SessionListScope,
     sessions: Vec<SessionSummary>,
 }
 
@@ -211,6 +223,7 @@ pub struct HostRuntimeConfig {
     pub workflow_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub kiro_probe_program: Option<String>,
     pub mobile_pairing_ttl: Option<std::time::Duration>,
+    pub mobile_managed_service_base_url: Option<String>,
     /// Skip probing the real backend CLIs (`<cli> --version`, codex model
     /// discovery, etc.) when collecting backend setup. Each probe spawns a
     /// real subprocess and codex discovery makes a network RPC, costing
@@ -231,6 +244,7 @@ impl Default for HostRuntimeConfig {
             workflow_mcp_bind_addr: None,
             kiro_probe_program: None,
             mobile_pairing_ttl: None,
+            mobile_managed_service_base_url: None,
             skip_real_backend_probe: false,
             agents_view_preferences_primary: true,
         }
@@ -393,6 +407,7 @@ pub(crate) struct HostState {
     kiro_session_schema: KiroSessionSchemaState,
     hermes_session_schema: HermesSessionSchemaState,
     backend_config_snapshots: Vec<BackendConfigSnapshot>,
+    backend_native_settings_snapshots: Vec<BackendNativeSettingsSnapshot>,
     kiro_probe_program: Option<String>,
     skip_real_backend_probe: bool,
     host_streams: HashMap<StreamPath, HostSubscriber>,
@@ -617,6 +632,7 @@ impl HostHandle {
                 last_session_schemas: None,
                 last_backend_config_schemas: None,
                 last_backend_config_snapshots: None,
+                last_backend_native_settings_snapshots: None,
                 last_launch_profile_catalog: None,
             },
         );
@@ -740,21 +756,31 @@ impl HostHandle {
             .map(|project| project.id.clone())
             .collect::<Vec<_>>();
 
-        let mut all_sessions = state
+        let session_list_scope = {
+            let subscriber = state.host_streams.get(&host_path).unwrap_or_else(|| {
+                panic!("host stream {host_path} disappeared before session bootstrap scope")
+            });
+            subscriber.session_list_replay.default_scope()
+        };
+        let mut session_summaries = state
             .session_store
             .lock()
             .await
-            .summaries()
+            .summaries_for_scope(session_list_scope)
             .unwrap_or_else(|err| panic!("failed to list sessions for host registration: {err}"));
-        normalize_antigravity_session_resumability(&mut all_sessions);
+        normalize_antigravity_session_resumability(&mut session_summaries);
         let (sessions, session_list) = {
             let subscriber = state.host_streams.get_mut(&host_path).unwrap_or_else(|| {
                 panic!("host stream {host_path} disappeared before session bootstrap paging")
             });
-            replace_session_list_snapshot(subscriber, all_sessions, None, "host_bootstrap")
-                .unwrap_or_else(|err| {
-                    panic!("failed to page sessions for host registration: {err}")
-                })
+            replace_session_list_snapshot(
+                subscriber,
+                session_list_scope,
+                session_summaries,
+                None,
+                "host_bootstrap",
+            )
+            .unwrap_or_else(|err| panic!("failed to page sessions for host registration: {err}"))
         };
 
         let mcp_servers = state
@@ -956,6 +982,7 @@ impl HostHandle {
             subscriber.last_backend_config_schemas = Some(bootstrap.backend_config_schemas.clone());
             subscriber.last_backend_config_snapshots =
                 Some(bootstrap.backend_config_snapshots.clone());
+            subscriber.last_backend_native_settings_snapshots = Some(Vec::new());
             subscriber.last_launch_profile_catalog = Some(bootstrap.launch_profile_catalog.clone());
             (
                 std::mem::take(&mut subscriber.pending_bootstrap_new_agents),
@@ -4780,22 +4807,36 @@ impl HostHandle {
                         format!("unknown host stream {}", host_output_stream.path()),
                     )
                 })?;
-            page_existing_session_list_snapshot(subscriber, cursor, payload.limit, OPERATION)?
+            page_existing_session_list_snapshot(
+                subscriber,
+                cursor,
+                payload.scope,
+                payload.limit,
+                OPERATION,
+            )?
         } else {
-            let session_store = {
+            let (session_store, scope) = {
                 let state = self.state.lock().await;
-                if !state.host_streams.contains_key(host_output_stream.path()) {
-                    return Err(AppError::invalid(
-                        OPERATION,
-                        format!("unknown host stream {}", host_output_stream.path()),
-                    ));
-                }
-                Arc::clone(&state.session_store)
+                let subscriber = state
+                    .host_streams
+                    .get(host_output_stream.path())
+                    .ok_or_else(|| {
+                        AppError::invalid(
+                            OPERATION,
+                            format!("unknown host stream {}", host_output_stream.path()),
+                        )
+                    })?;
+                (
+                    Arc::clone(&state.session_store),
+                    payload
+                        .scope
+                        .unwrap_or_else(|| subscriber.session_list_replay.default_scope()),
+                )
             };
             let mut sessions = session_store
                 .lock()
                 .await
-                .summaries()
+                .summaries_for_scope(scope)
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
             normalize_antigravity_session_resumability(&mut sessions);
             let mut state = self.state.lock().await;
@@ -4808,7 +4849,7 @@ impl HostHandle {
                         format!("unknown host stream {}", host_output_stream.path()),
                     )
                 })?;
-            replace_session_list_snapshot(subscriber, sessions, payload.limit, OPERATION)?
+            replace_session_list_snapshot(subscriber, scope, sessions, payload.limit, OPERATION)?
         };
 
         let payload = SessionListPayload { sessions, page };
@@ -4873,6 +4914,23 @@ impl HostHandle {
 
     pub(crate) async fn set_setting(&self, payload: SetSettingPayload) -> AppResult<()> {
         const OPERATION: &str = "set_setting";
+        if let protocol::HostSettingValue::BackendNativeSettings { backend, settings } =
+            &payload.setting
+        {
+            if *backend != BackendKind::Tycode {
+                return Err(AppError::invalid(
+                    OPERATION,
+                    format!("{backend:?} does not support backend-native settings saves"),
+                ));
+            }
+            crate::backend::tycode::persist_native_settings(settings.clone())
+                .await
+                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+            self.refresh_backend_config_snapshots_after_native_save()
+                .await;
+            return Ok(());
+        }
+
         if let protocol::HostSettingValue::BackendConfig { backend, values } = &payload.setting
             && *backend == BackendKind::Tycode
         {
@@ -4898,6 +4956,11 @@ impl HostHandle {
             crate::backend::tycode::persist_backend_config(persistence_values)
                 .await
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+        }
+
+        if let protocol::HostSettingValue::MobileBrokerUrl { broker_url } = &payload.setting {
+            crate::store::settings::validate_mobile_broker_url_for_write(broker_url.as_ref())
+                .map_err(|error| AppError::invalid(OPERATION, error))?;
         }
 
         let mut state = self.state.lock().await;
@@ -5190,6 +5253,16 @@ impl HostHandle {
     }
 
     pub(crate) async fn refresh_backend_config_snapshots(&self) {
+        self.refresh_backend_config_snapshots_with_fanout(false)
+            .await;
+    }
+
+    async fn refresh_backend_config_snapshots_after_native_save(&self) {
+        self.refresh_backend_config_snapshots_with_fanout(true)
+            .await;
+    }
+
+    async fn refresh_backend_config_snapshots_with_fanout(&self, force_emit: bool) {
         let (settings_store, skip_real_backend_probe) = {
             let state = self.state.lock().await;
             (
@@ -5206,13 +5279,14 @@ impl HostHandle {
             })
             .enabled_backends;
         let snapshots = if skip_real_backend_probe {
-            Vec::new()
+            BackendSettingsSnapshots::default()
         } else {
             backend_config_snapshots_for_enabled_backends(&enabled_backends).await
         };
         let mut state = self.state.lock().await;
-        state.backend_config_snapshots = snapshots;
-        fan_out_backend_config_snapshots(&mut state).await;
+        state.backend_config_snapshots = snapshots.backend_config;
+        state.backend_native_settings_snapshots = snapshots.native_settings;
+        fan_out_backend_config_snapshots(&mut state, force_emit).await;
     }
 
     pub(crate) async fn refresh_session_schemas(&self) {
@@ -9642,6 +9716,7 @@ fn spawn_host_inner(
             kiro_session_schema: KiroSessionSchemaState::Pending,
             hermes_session_schema: HermesSessionSchemaState::Pending,
             backend_config_snapshots: Vec::new(),
+            backend_native_settings_snapshots: Vec::new(),
             kiro_probe_program: runtime_config.kiro_probe_program.clone(),
             skip_real_backend_probe: runtime_config.skip_real_backend_probe,
             host_streams: HashMap::new(),
@@ -9666,6 +9741,7 @@ fn spawn_host_inner(
             pairing_ttl: runtime_config
                 .mobile_pairing_ttl
                 .unwrap_or(crate::mobile_access::DEFAULT_PAIRING_TTL),
+            managed_service_base_url: runtime_config.mobile_managed_service_base_url,
         },
     )?;
 
@@ -11458,6 +11534,7 @@ async fn emit_new_agent_for_stream(
 
 #[derive(Clone, Copy)]
 struct SessionPageRequest {
+    scope: SessionListScope,
     cursor: SessionListCursor,
     limit: Option<u32>,
 }
@@ -11465,12 +11542,14 @@ struct SessionPageRequest {
 impl SessionPageRequest {
     fn initial(
         generation: SessionListGeneration,
+        scope: SessionListScope,
         mode: SessionListReplayMode,
         total_count: usize,
         limit: Option<u32>,
         operation: &'static str,
     ) -> AppResult<Self> {
         Ok(Self {
+            scope,
             cursor: SessionListCursor {
                 generation,
                 offset: 0,
@@ -11481,12 +11560,14 @@ impl SessionPageRequest {
 
     fn continuing(
         cursor: SessionListCursor,
+        scope: SessionListScope,
         limit: Option<u32>,
         mode: SessionListReplayMode,
         total_count: usize,
         operation: &'static str,
     ) -> AppResult<Self> {
         Ok(Self {
+            scope,
             cursor,
             limit: session_page_limit(limit, mode, total_count, operation)?,
         })
@@ -11518,6 +11599,7 @@ fn session_page_limit(
 
 fn replace_session_list_snapshot(
     subscriber: &mut HostSubscriber,
+    scope: SessionListScope,
     sessions: Vec<SessionSummary>,
     limit: Option<u32>,
     operation: &'static str,
@@ -11530,6 +11612,7 @@ fn replace_session_list_snapshot(
         .unwrap_or(SessionListGeneration(1));
     let request = SessionPageRequest::initial(
         generation,
+        scope,
         subscriber.session_list_replay,
         sessions.len(),
         limit,
@@ -11537,6 +11620,7 @@ fn replace_session_list_snapshot(
     )?;
     subscriber.session_list_snapshot = Some(SessionListSnapshot {
         generation,
+        scope,
         sessions,
     });
     let snapshot = subscriber
@@ -11554,6 +11638,7 @@ fn replace_session_list_snapshot(
 fn page_existing_session_list_snapshot(
     subscriber: &HostSubscriber,
     cursor: SessionListCursor,
+    scope: Option<SessionListScope>,
     limit: Option<u32>,
     operation: &'static str,
 ) -> AppResult<(Vec<SessionSummary>, SessionListPageInfo)> {
@@ -11572,8 +11657,20 @@ fn page_existing_session_list_snapshot(
             ),
         ));
     }
+    if let Some(scope) = scope
+        && scope != snapshot.scope
+    {
+        return Err(AppError::invalid(
+            operation,
+            format!(
+                "session list cursor scope {scope:?} does not match snapshot scope {:?}",
+                snapshot.scope
+            ),
+        ));
+    }
     let request = SessionPageRequest::continuing(
         cursor,
+        snapshot.scope,
         limit,
         subscriber.session_list_replay,
         snapshot.sessions.len(),
@@ -11627,6 +11724,7 @@ fn page_session_summaries(
     Ok((
         page_sessions,
         SessionListPageInfo {
+            scope: request.scope,
             cursor: request.cursor,
             limit: requested_limit,
             total_count,
@@ -11651,9 +11749,20 @@ async fn fan_out_session_lists(state: &mut HostState) {
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
+        let scope = subscriber
+            .session_list_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.scope)
+            .unwrap_or_else(|| subscriber.session_list_replay.default_scope());
+        let scoped_sessions = sessions
+            .iter()
+            .filter(|summary| session_summary_matches_scope(summary, scope))
+            .cloned()
+            .collect::<Vec<_>>();
         let (page_sessions, page) = replace_session_list_snapshot(
             subscriber,
-            sessions.clone(),
+            scope,
+            scoped_sessions,
             None,
             "session_list_fanout",
         )
@@ -12615,9 +12724,15 @@ async fn fan_out_session_schemas(state: &mut HostState) {
     }
 }
 
+#[derive(Default)]
+struct BackendSettingsSnapshots {
+    backend_config: Vec<BackendConfigSnapshot>,
+    native_settings: Vec<BackendNativeSettingsSnapshot>,
+}
+
 async fn backend_config_snapshots_for_enabled_backends(
     enabled_backends: &[protocol::BackendKind],
-) -> Vec<BackendConfigSnapshot> {
+) -> BackendSettingsSnapshots {
     let workspace_roots = match hermes_probe_workspace_root() {
         Ok(root) => vec![root],
         Err(err) => {
@@ -12627,12 +12742,22 @@ async fn backend_config_snapshots_for_enabled_backends(
             Vec::new()
         }
     };
-    let mut snapshots = Vec::new();
+    let mut snapshots = BackendSettingsSnapshots::default();
     for kind in enabled_backends {
-        if let Some(snapshot) =
-            crate::backend::backend_config_snapshot_for_backend(*kind, &workspace_roots).await
-        {
-            snapshots.push(snapshot);
+        match kind {
+            BackendKind::Tycode => {
+                snapshots
+                    .native_settings
+                    .push(crate::backend::tycode::native_settings_snapshot().await);
+            }
+            _ => {
+                if let Some(snapshot) =
+                    crate::backend::backend_config_snapshot_for_backend(*kind, &workspace_roots)
+                        .await
+                {
+                    snapshots.backend_config.push(snapshot);
+                }
+            }
         }
     }
     snapshots
@@ -12660,8 +12785,9 @@ async fn fan_out_backend_config_schemas(state: &mut HostState) {
     }
 }
 
-async fn fan_out_backend_config_snapshots(state: &mut HostState) {
+async fn fan_out_backend_config_snapshots(state: &mut HostState, force_emit: bool) {
     let snapshots = state.backend_config_snapshots.clone();
+    let native_settings = state.backend_native_settings_snapshots.clone();
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
 
@@ -12669,9 +12795,14 @@ async fn fan_out_backend_config_snapshots(state: &mut HostState) {
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
-        if emit_backend_config_snapshots_for_subscriber(&snapshots, subscriber)
-            .await
-            .is_err()
+        if emit_backend_config_snapshots_for_subscriber(
+            &snapshots,
+            &native_settings,
+            subscriber,
+            force_emit,
+        )
+        .await
+        .is_err()
         {
             dead_paths.push(path);
         }
@@ -12730,17 +12861,24 @@ async fn emit_backend_config_schemas_for_subscriber(
 
 async fn emit_backend_config_snapshots_for_subscriber(
     snapshots: &[BackendConfigSnapshot],
+    native_settings: &[BackendNativeSettingsSnapshot],
     subscriber: &mut HostSubscriber,
+    force_emit: bool,
 ) -> Result<(), StreamClosed> {
-    if subscriber.last_backend_config_snapshots.as_deref() == Some(snapshots) {
+    if !force_emit
+        && subscriber.last_backend_config_snapshots.as_deref() == Some(snapshots)
+        && subscriber.last_backend_native_settings_snapshots.as_deref() == Some(native_settings)
+    {
         return Ok(());
     }
     let payload = serde_json::to_value(BackendConfigSnapshotsPayload {
         snapshots: snapshots.to_vec(),
+        native_settings: native_settings.to_vec(),
     })
     .expect("failed to serialize BackendConfigSnapshots payload for host stream fanout");
     emit_or_queue_host_frame(subscriber, FrameKind::BackendConfigSnapshots, payload)?;
     subscriber.last_backend_config_snapshots = Some(snapshots.to_vec());
+    subscriber.last_backend_native_settings_snapshots = Some(native_settings.to_vec());
     Ok(())
 }
 
@@ -13516,7 +13654,8 @@ mod tests {
     use crate::review::ReviewHandle;
     use crate::store::agent_teams::AgentTeamsStoreFile;
     use protocol::{
-        AgentErrorPayload, BackendKind, CustomAgentId, DiffContextMode, HostSettingValue,
+        AgentErrorPayload, BackendConfigSnapshotStatus, BackendConfigSnapshotsPayload, BackendKind,
+        BackendNativeSettingsSnapshot, CustomAgentId, DiffContextMode, HostSettingValue,
         ProjectDiffScope, ProjectGitDiffFile, ProjectGitDiffPayload, ProtocolValidator, Review,
         ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewStatus, TeamMemberCreateSpec,
         ToolPolicy,
@@ -14720,6 +14859,7 @@ mod tests {
             last_session_schemas: None,
             last_backend_config_schemas: None,
             last_backend_config_snapshots: None,
+            last_backend_native_settings_snapshots: None,
             last_launch_profile_catalog: None,
         };
 
@@ -14770,6 +14910,66 @@ mod tests {
         assert_eq!(second.kind, FrameKind::NewAgent);
         let payload: NewAgentPayload = second.parse_payload().expect("NewAgent payload");
         assert_eq!(payload.agent_id, agent_id);
+    }
+
+    #[tokio::test]
+    async fn forced_backend_config_snapshot_fanout_reemits_unchanged_native_settings() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let host_path = StreamPath(format!("/host/backend-config-{}", Uuid::new_v4()));
+        let stream = Stream::new(host_path, tx);
+        let mut subscriber = HostSubscriber {
+            stream,
+            bootstrapped: true,
+            agent_replay: AgentReplayMode::Eager,
+            session_list_replay: SessionListReplayMode::Full,
+            session_list_snapshot: None,
+            known_agent_streams: HashSet::new(),
+            attached_agent_streams: HashSet::new(),
+            bootstrapped_agent_streams: HashSet::new(),
+            pending_bootstrap_new_agents: Vec::new(),
+            pending_bootstrap_frames: Vec::new(),
+            last_session_schemas: None,
+            last_backend_config_schemas: None,
+            last_backend_config_snapshots: None,
+            last_backend_native_settings_snapshots: None,
+            last_launch_profile_catalog: None,
+        };
+        let native_settings = vec![BackendNativeSettingsSnapshot {
+            backend_kind: BackendKind::Tycode,
+            status: BackendConfigSnapshotStatus::Ready,
+            settings: Some(serde_json::json!({
+                "active_provider": "default",
+                "model_quality": "high",
+            })),
+            groups: Vec::new(),
+            message: None,
+        }];
+
+        emit_backend_config_snapshots_for_subscriber(&[], &native_settings, &mut subscriber, false)
+            .await
+            .expect("initial backend config snapshot fanout");
+        let first = rx.recv().await.expect("initial snapshot event");
+        assert_eq!(first.kind, FrameKind::BackendConfigSnapshots);
+
+        emit_backend_config_snapshots_for_subscriber(&[], &native_settings, &mut subscriber, false)
+            .await
+            .expect("unchanged backend config snapshot fanout");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "unchanged snapshots should still be deduped during ordinary refresh"
+        );
+
+        emit_backend_config_snapshots_for_subscriber(&[], &native_settings, &mut subscriber, true)
+            .await
+            .expect("forced backend config snapshot fanout");
+        let forced = rx.recv().await.expect("forced snapshot event");
+        assert_eq!(forced.kind, FrameKind::BackendConfigSnapshots);
+        let payload: BackendConfigSnapshotsPayload = forced
+            .parse_payload()
+            .expect("forced BackendConfigSnapshots payload");
+        assert_eq!(payload.native_settings, native_settings);
     }
 
     async fn wait_for_agent_idle(host: &HostHandle, agent_id: &AgentId) {

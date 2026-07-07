@@ -26,12 +26,37 @@ use mobile_shell_types::{
     RoomIdSummary,
 };
 use mqtt_transport::{BrokerAuth, BrokerEndpoint, PreSharedKey, RoomId};
+use protocol::ManagedBrokerEndpoint;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::idb;
 
 const HOSTS_KEY: &str = "all";
+
+/// tycode.dev managed pairing identity attached to a [`WebPairedHostRecord`].
+///
+/// Present only for managed (`tyde-pair://v2`) pairings; legacy records leave it
+/// `None`. The transport rendezvous params (broker URL, `room`, PSK) still live
+/// on the parent record's `broker`/`room`/`psk_keychain_key_id` fields so the
+/// paired-host summary and legacy code paths are unchanged — this only carries
+/// the extra managed-service identity needed to mint fresh broker credentials.
+///
+/// Only durable material lives here: the pairing/device ids, the managed broker
+/// endpoint, and a key-id reference to the durable `device_pairing_secret`. No
+/// Tyggs OAuth token or pass proof (locked decision #6), and — critically — no
+/// short-lived broker grant: ephemeral `ManagedBrokerCredentials` are minted
+/// fresh from `tycode.dev` on each connect and held only in memory, never
+/// persisted (dev-docs/30 "Subsequent reconnects": "Each side requests fresh
+/// short-lived broker credentials").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedPairingRecord {
+    pub pairing_id: String,
+    pub device_id: String,
+    pub broker: ManagedBrokerEndpoint,
+    pub device_secret_key_id: KeychainSecretId,
+}
 
 /// Browser-side mirror of the native `PairedHostRecord`. Stores no PSK material
 /// (only a key id + fingerprint), matching the native record so the same
@@ -47,6 +72,9 @@ pub struct WebPairedHostRecord {
     pub credential_fingerprint: String,
     pub auto_connect: bool,
     pub last_connected_at_ms: Option<u64>,
+    /// `Some` for managed (`tyde-pair://v2`) pairings; `None` for legacy ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<ManagedPairingRecord>,
 }
 
 impl WebPairedHostRecord {
@@ -216,6 +244,28 @@ fn decode_records(json: &str) -> Result<Vec<WebPairedHostRecord>, String> {
     serde_json::from_str(json).map_err(|error| format!("failed to parse paired hosts: {error}"))
 }
 
+// ── Device pairing-secret store ─────────────────────────────────────────────
+
+/// Persists the durable `device_pairing_secret` from a managed redeem in the
+/// same IndexedDB secret store as PSKs, returning a key-id reference for the
+/// managed host record. Kept out of the host record itself so the secret is not
+/// duplicated in the (JSON-serialized) paired-host list.
+pub async fn store_device_secret(secret: &str) -> Result<KeychainSecretId, String> {
+    let key_id = KeychainSecretId(format!("tyde-web-device-secret-{}", uuid::Uuid::new_v4()));
+    idb::put(idb::STORE_PSK, &key_id.0, secret).await?;
+    Ok(key_id)
+}
+
+pub async fn load_device_secret(key_id: &KeychainSecretId) -> Result<String, String> {
+    idb::get(idb::STORE_PSK, &key_id.0)
+        .await?
+        .ok_or_else(|| format!("no device pairing secret stored for {key_id}"))
+}
+
+pub async fn delete_device_secret(key_id: &KeychainSecretId) -> Result<(), String> {
+    idb::delete(idb::STORE_PSK, &key_id.0).await
+}
+
 // ── PSK store (seam for later WebCrypto hardening) ───────────────────────
 
 /// Storage seam for the long-term PSK. See the module docs: the only place
@@ -282,6 +332,7 @@ mod tests {
             credential_fingerprint: credential_fingerprint(&broker, &room, &psk),
             auto_connect: true,
             last_connected_at_ms: Some(42),
+            managed: None,
         }
     }
 
@@ -364,6 +415,7 @@ mod wasm_tests {
             credential_fingerprint: credential_fingerprint(&broker, &room, &psk),
             auto_connect: true,
             last_connected_at_ms: None,
+            managed: None,
         }
     }
 

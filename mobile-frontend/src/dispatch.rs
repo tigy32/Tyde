@@ -1970,14 +1970,25 @@ fn apply_session_list_page(state: &AppState, host: &LocalHostId, payload: Sessio
             SessionListLoadState::from_page(page, loaded_count),
         );
     });
-    request_next_session_page_if_needed(state, host, page);
 }
 
-fn request_next_session_page_if_needed(
-    state: &AppState,
-    host: &LocalHostId,
-    page: protocol::SessionListPageInfo,
-) {
+/// Request the next page of sessions for `host`, in response to an explicit
+/// user action ("Load older sessions"). The mobile client renders only the
+/// first server-provided page and never auto-drains the rest; this is the one
+/// path that fetches more. It reuses the server-owned cursor, limit, and
+/// authoritative scope from the currently-loaded page so the follow-up query
+/// stays coherent with what the UI is showing.
+pub fn load_next_session_page(state: &AppState, host: &LocalHostId) {
+    let Some(list) = state
+        .session_lists_by_host
+        .with_untracked(|map| map.get(host).cloned())
+    else {
+        return;
+    };
+    if list.loading_more {
+        return;
+    }
+    let page = list.page;
     let Some(next_cursor) = page.next_cursor() else {
         return;
     };
@@ -1990,17 +2001,18 @@ fn request_next_session_page_if_needed(
         state.command_errors_by_host.update(|map| {
             map.insert(host.clone(), message);
         });
-        state.session_lists_by_host.update(|map| {
-            if let Some(list) = map.get_mut(host) {
-                list.loading_more = false;
-            }
-        });
         return;
     };
+    state.session_lists_by_host.update(|map| {
+        if let Some(list) = map.get_mut(host) {
+            list.loading_more = true;
+        }
+    });
     let host = host.clone();
     let state_for_error = state.clone();
     wasm_bindgen_futures::spawn_local(async move {
         let payload = ListSessionsPayload {
+            scope: Some(page.scope),
             cursor: Some(next_cursor),
             limit: Some(page.limit),
         };
@@ -2093,7 +2105,6 @@ fn apply_host_bootstrap(
             SessionListLoadState::from_page(session_page, bootstrap_session_count),
         );
     });
-    request_next_session_page_if_needed(state, host, session_page);
     state.projects.update(|projects| {
         projects.retain(|p| p.local_host_id != *host);
         projects.extend(payload.projects.into_iter().map(|project| ProjectInfo {
@@ -2691,26 +2702,27 @@ mod wasm_tests {
         let state = AppState::new();
         let host = primed_host(&state, "mobile-session-list-error");
         state.session_lists_by_host.update(|lists| {
-            lists.insert(
-                host.clone(),
-                SessionListLoadState::from_page(
-                    protocol::SessionListPageInfo {
-                        cursor: protocol::SessionListCursor {
+            let mut list = SessionListLoadState::from_page(
+                protocol::SessionListPageInfo {
+                    scope: protocol::SessionListScope::RootSessions,
+                    cursor: protocol::SessionListCursor {
+                        generation: protocol::SessionListGeneration(1),
+                        offset: 0,
+                    },
+                    limit: 64,
+                    total_count: 100,
+                    status: protocol::SessionListPageStatus::More {
+                        next_cursor: protocol::SessionListCursor {
                             generation: protocol::SessionListGeneration(1),
-                            offset: 0,
-                        },
-                        limit: 64,
-                        total_count: 100,
-                        status: protocol::SessionListPageStatus::More {
-                            next_cursor: protocol::SessionListCursor {
-                                generation: protocol::SessionListGeneration(1),
-                                offset: 64,
-                            },
+                            offset: 64,
                         },
                     },
-                    64,
-                ),
+                },
+                64,
             );
+            // A user-triggered "load more" is in flight when the error arrives.
+            list.loading_more = true;
+            lists.insert(host.clone(), list);
         });
 
         dispatch_envelope(
@@ -2750,26 +2762,27 @@ mod wasm_tests {
         let state = AppState::new();
         let host = primed_host(&state, "mobile-session-list-parse-error");
         state.session_lists_by_host.update(|lists| {
-            lists.insert(
-                host.clone(),
-                SessionListLoadState::from_page(
-                    protocol::SessionListPageInfo {
-                        cursor: protocol::SessionListCursor {
+            let mut list = SessionListLoadState::from_page(
+                protocol::SessionListPageInfo {
+                    scope: protocol::SessionListScope::RootSessions,
+                    cursor: protocol::SessionListCursor {
+                        generation: protocol::SessionListGeneration(1),
+                        offset: 0,
+                    },
+                    limit: 64,
+                    total_count: 100,
+                    status: protocol::SessionListPageStatus::More {
+                        next_cursor: protocol::SessionListCursor {
                             generation: protocol::SessionListGeneration(1),
-                            offset: 0,
-                        },
-                        limit: 64,
-                        total_count: 100,
-                        status: protocol::SessionListPageStatus::More {
-                            next_cursor: protocol::SessionListCursor {
-                                generation: protocol::SessionListGeneration(1),
-                                offset: 64,
-                            },
+                            offset: 64,
                         },
                     },
-                    64,
-                ),
+                },
+                64,
             );
+            // A user-triggered "load more" is in flight when the error arrives.
+            list.loading_more = true;
+            lists.insert(host.clone(), list);
         });
 
         dispatch_envelope(
@@ -3307,6 +3320,7 @@ mod wasm_tests {
             launch_profile_catalog: Default::default(),
             sessions: vec![session.clone()],
             session_list: protocol::SessionListPageInfo {
+                scope: protocol::SessionListScope::RootSessions,
                 cursor: protocol::SessionListCursor {
                     generation: protocol::SessionListGeneration(1),
                     offset: 0,

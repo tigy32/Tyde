@@ -27,7 +27,11 @@ pub use mobile_shell_types::{
     KnownConnectionInstance, PairedHostConnectionStatusEvent, PairedHostsChangedEvent,
 };
 
-use crate::state::{LocalHostId, MobilePairingPreview, MobileShellError, PairedHostSummary};
+pub use web::RedeemOutcome;
+
+use crate::state::{
+    LocalHostId, MobileServiceAuthState, MobileShellError, PairedHostSummary, PairingOffer,
+};
 
 /// Result of a QR scan. Shared by both backends (Tauri decodes the native
 /// barcode-scanner result into it; web fills it from `BarcodeDetector`).
@@ -110,7 +114,7 @@ macro_rules! dispatch {
 dispatch!(list_paired_hosts() -> Result<Vec<PairedHostSummary>, String>);
 dispatch!(list_paired_host_connection_statuses() -> Result<Vec<PairedHostConnectionStatusEvent>, String>);
 dispatch!(list_pending_host_lines() -> Result<Vec<HostLineEvent>, String>);
-dispatch!(preview_pairing_uri(qr_uri: &str) -> Result<MobilePairingPreview, String>);
+dispatch!(classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String>);
 dispatch!(start_pairing(qr_uri: &str) -> Result<(), String>);
 dispatch!(connect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(disconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
@@ -153,6 +157,47 @@ pub fn take_pending_pairing_uri() -> Option<String> {
 pub fn request_loader_repair_version(release_version: &str) {
     if use_web_backend() {
         web::request_loader_repair_version(release_version);
+    }
+}
+
+/// Web-only: run the `tycode.dev` Tyggs auth (`POST /auth/session`) step of the
+/// managed pairing flow and return the resulting typed auth state. The native
+/// shell owns its own managed handshake and never reaches this path, so it
+/// returns a non-retryable `service_unavailable` rather than pretending to
+/// authenticate.
+pub async fn authenticate_managed(qr_uri: &str) -> MobileServiceAuthState {
+    if use_web_backend() {
+        web::authenticate_managed(qr_uri).await
+    } else {
+        MobileServiceAuthState::ServiceUnavailable {
+            message: "Managed pairing is handled by the native app shell.".to_owned(),
+            retryable: false,
+        }
+    }
+}
+
+/// Web-only: redeem a managed offer (`POST /pairings/redeem`) and connect to the
+/// managed broker. Native shells never reach this path (they produce a
+/// `DirectPairing` offer), so it returns a terminal outcome there.
+pub async fn redeem_managed_and_connect(qr_uri: &str) -> Result<(), RedeemOutcome> {
+    if use_web_backend() {
+        web::redeem_managed_and_connect(qr_uri).await
+    } else {
+        Err(RedeemOutcome::Terminal {
+            message: "Managed pairing is handled by the native app shell.".to_owned(),
+        })
+    }
+}
+
+/// Web-only: start the Tyggs sign-in through `tycode.dev` (see
+/// [`web::begin_tyggs_sign_in`]). Pass the scanned pairing URI to resume pairing
+/// after the redirect, or `None` to just re-authenticate an existing host.
+/// Native shells own their own sign-in, so this errors there.
+pub fn begin_tyggs_sign_in(resume_qr_uri: Option<&str>) -> Result<(), String> {
+    if use_web_backend() {
+        web::begin_tyggs_sign_in(resume_qr_uri)
+    } else {
+        Err("Tyggs sign-in is handled by the native app shell.".to_owned())
     }
 }
 

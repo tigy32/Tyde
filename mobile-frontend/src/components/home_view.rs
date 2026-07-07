@@ -103,6 +103,23 @@ pub fn HomeView() -> impl IntoView {
                 PillTone::Error,
                 "Update required",
             ),
+            ConnectionStatus::NeedsAction { code, .. } => {
+                if crate::state::needs_tyggs_sign_in(code) {
+                    (
+                        StatusTone::Error,
+                        "Sign-in required",
+                        PillTone::Error,
+                        "Sign in",
+                    )
+                } else {
+                    (
+                        StatusTone::Error,
+                        "Re-pair required",
+                        PillTone::Error,
+                        "Re-pair",
+                    )
+                }
+            }
         });
 
     let s_new_chat = state.clone();

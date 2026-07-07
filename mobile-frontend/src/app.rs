@@ -9,8 +9,8 @@ use crate::components;
 use crate::dispatch::{dispatch_envelope, reset_inbound_seq_for_host};
 use crate::send::{reset_seq_for_host, send_frame};
 use crate::state::{
-    AppMode, AppState, ConnectionStatus, LocalHostId, MobileShellError, MobileTab,
-    PairedHostConnectionStatus, PairedHostSummary, PairingScreen,
+    AppMode, AppState, ConnectionStatus, LocalHostId, MobileServiceAuthState, MobileShellError,
+    MobileTab, PairedHostConnectionStatus, PairedHostSummary, PairingOffer, PairingScreen,
 };
 use protocol::MobileAccessErrorCode;
 
@@ -137,11 +137,22 @@ fn spawn_boot_pairing_handoff(state: AppState) {
         return;
     };
     spawn_local(async move {
-        match bridge::preview_pairing_uri(&qr_uri).await {
-            Ok(preview) => {
-                state
-                    .app_mode
-                    .set(AppMode::Pairing(PairingScreen::Confirm { qr_uri, preview }));
+        match bridge::classify_pairing_offer(&qr_uri).await {
+            Ok(offer) => {
+                let screen = match offer {
+                    PairingOffer::ManagedService { host_label } => PairingScreen::ServiceAuth {
+                        qr_uri,
+                        host_label,
+                        auth: MobileServiceAuthState::Idle,
+                    },
+                    PairingOffer::RepairRequired { message } => {
+                        PairingScreen::RepairRequired { message }
+                    }
+                    PairingOffer::DirectPairing { preview } => {
+                        PairingScreen::Confirm { qr_uri, preview }
+                    }
+                };
+                state.app_mode.set(AppMode::Pairing(screen));
             }
             Err(error) => {
                 // Forged or stale handoff: ignore and stay in the normal flow.
@@ -624,9 +635,10 @@ fn apply_connection_status(
             });
             apply_disconnect(state, &host, Some(reason));
         }
-        PairedHostConnectionStatus::Failed { message, .. } => {
+        PairedHostConnectionStatus::Failed { code, message } => {
+            let status = crate::state::connection_failed_status(code, message.clone());
             state.connection_statuses.update(|m| {
-                m.insert(host.clone(), ConnectionStatus::Error(message.clone()));
+                m.insert(host.clone(), status);
             });
             state.active_connection_instance_ids.update(|m| {
                 m.remove(&host);

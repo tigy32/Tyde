@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    BackendKind, CustomAgentId, LaunchProfileId, ProjectId, SessionId, SessionSettingsValues,
-    SessionSummary,
+    BackendKind, CustomAgentId, LaunchProfileId, ProjectId, SessionId, SessionListScope,
+    SessionSettingsValues, SessionSummary,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -356,9 +356,17 @@ impl SessionStore {
     }
 
     pub fn summaries(&self) -> Result<Vec<SessionSummary>, String> {
+        self.summaries_for_scope(SessionListScope::AllSessions)
+    }
+
+    pub fn summaries_for_scope(
+        &self,
+        scope: SessionListScope,
+    ) -> Result<Vec<SessionSummary>, String> {
         let records = self.list()?;
         Ok(records
             .into_iter()
+            .filter(|record| session_record_matches_scope(record, scope))
             .map(|record| {
                 let resumable = session_record_is_resumable(&record);
                 SessionSummary {
@@ -581,6 +589,23 @@ pub(crate) fn session_record_is_resumable(record: &SessionRecord) -> bool {
     session_record_is_resumable_with(record, |session_id| {
         crate::backend::antigravity::is_antigravity_session_resumable(session_id)
     })
+}
+
+pub(crate) fn session_summary_matches_scope(
+    summary: &SessionSummary,
+    scope: SessionListScope,
+) -> bool {
+    match scope {
+        SessionListScope::RootSessions => summary.parent_id.is_none(),
+        SessionListScope::AllSessions => true,
+    }
+}
+
+fn session_record_matches_scope(record: &SessionRecord, scope: SessionListScope) -> bool {
+    match scope {
+        SessionListScope::RootSessions => record.parent_id.is_none(),
+        SessionListScope::AllSessions => true,
+    }
 }
 
 fn session_record_is_resumable_with<F>(record: &SessionRecord, is_antigravity_resumable: F) -> bool

@@ -18,13 +18,14 @@
       No third-party JS is ever allowed.
 
       `connect-src 'self' wss:` is intentionally narrow: the WASM app reaches
-      the broker over `wss://` and fetches the manifest/bundle from same-origin
-      (`'self'`). `https:` is deliberately omitted — add it back only if a
-      future feature needs cross-origin HTTPS. `style-src` allows inline styles
-      because the injected Leptos app styles itself with inline <style>/style=
-      (not a script-execution vector). `frame-ancestors` cannot be set via
-      <meta>; the Phase 6 deploy MUST also send it (and ideally this whole
-      policy) as an HTTP response header. See web/README.md.
+      the broker over `wss://` and fetches the manifest/bundle plus the
+      `tycode.dev` managed-service API from same-origin (`'self'`). `https:` is
+      deliberately omitted — add it back only if a future feature needs
+      cross-origin HTTPS. `style-src` allows inline styles because the injected
+      Leptos app styles itself with inline <style>/style= (not a
+      script-execution vector). `frame-ancestors` cannot be set via <meta>; the
+      Phase 6 deploy MUST also send it (and ideally this whole policy) as an
+      HTTP response header. See web/README.md.
     -->
     <meta
       http-equiv="Content-Security-Policy"
@@ -152,6 +153,15 @@
     <!-- The booted WASM app mounts here. Kept in the DOM (empty) from the start
          because the app does get_element_by_id("app-root") at boot. -->
     <div id="app-root"></div>
+
+    <!-- External public runtime config. Loaded as a same-origin classic script
+         before any app bundle can run so the strict CSP needs no inline config.
+         If this file is absent, the WASM client sees no service endpoint and
+         fails closed instead of falling back to a public broker. -->
+    <script
+      src="./mobile-service-config.js"
+      integrity="sha384-NPe4WU36cYQCMu7qcYqjVMbdsU1haTnfFoaK1BAu4Dk4wUOQFOwZbRbfFa6jIT5p"
+    ></script>
 
     <!-- Bundled pure-JS QR decoder (jsQR, Apache-2.0). Loaded as a same-origin
          classic <script> so it satisfies the strict CSP (script-src 'self'):

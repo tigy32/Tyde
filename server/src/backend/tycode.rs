@@ -11,22 +11,27 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use protocol::{
-    AgentInput, BackendAccessMode, BackendConfigField, BackendConfigFieldType,
-    BackendConfigPersistenceMode, BackendConfigSchema, BackendConfigValues, BackendKind, ChatEvent,
-    ChatMessage, MessageSender, OrchestrationEvent, SelectOption, SessionId, SessionSettingField,
-    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
-    StreamEndData, StreamTextDeltaData,
+    AgentInput, BackendAccessMode, BackendConfigSnapshotStatus, BackendConfigValues, BackendKind,
+    BackendNativeSettingsGroup, BackendNativeSettingsSnapshot, ChatEvent, ChatMessage,
+    ChatMessageId, MessageMetadataUpdateData, MessageSender, ModelInfo, OrchestrationEvent,
+    ReasoningData, SelectOption, SessionId, SessionSettingField, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
+    StreamTextDeltaData,
 };
 
 use super::{
     Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
     StartupMcpServer, StartupMcpTransport, apply_session_settings_update,
     backend_fork_unsupported_message, render_combined_spawn_instructions,
-    setup::{TYCODE_VERSION, resolve_tycode_binary_path},
+    setup::{
+        TYCODE_VERSION, ensure_tycode_command_compatible, resolve_tycode_binary_path,
+        tycode_settings_schema_release_blocker_message,
+        tycode_settings_schema_supported_by_pinned_release,
+    },
 };
 use crate::process_env;
 
-fn subprocess_bin() -> Result<String, String> {
+async fn subprocess_bin() -> Result<String, String> {
     #[cfg(test)]
     if let Some(path) = TEST_TYCODE_SUBPROCESS_BIN
         .lock()
@@ -36,7 +41,9 @@ fn subprocess_bin() -> Result<String, String> {
         return Ok(path);
     }
 
-    resolve_tycode_binary_path().ok_or_else(|| "tycode-subprocess not found".to_string())
+    let path =
+        resolve_tycode_binary_path().ok_or_else(|| "tycode-subprocess not found".to_string())?;
+    ensure_tycode_command_compatible(&path).await
 }
 
 #[cfg(test)]
@@ -199,125 +206,6 @@ pub(crate) fn resolve_session_settings(config: &BackendSpawnConfig) -> SessionSe
         apply_session_settings_update(&mut resolved, session_settings);
     }
     resolved
-}
-
-fn tycode_backend_config_schema() -> BackendConfigSchema {
-    BackendConfigSchema {
-        backend_kind: BackendKind::Tycode,
-        persistence_mode: BackendConfigPersistenceMode::BackendNative,
-        fields: vec![
-            BackendConfigField {
-                key: "active_provider".to_string(),
-                label: "Active Provider".to_string(),
-                description: Some(
-                    "Existing Tycode provider name to activate for new sessions. Tyde validates \
-                     the name against Tycode's returned providers and never edits provider \
-                     secrets or creates providers. Blank removes the Tyde-managed provider \
-                     override; Tycode's current setting is preserved unless this field was \
-                     previously saved through Tyde."
-                        .to_string(),
-                ),
-                field_type: BackendConfigFieldType::Text {
-                    default: None,
-                    placeholder: Some("default".to_string()),
-                    multiline: false,
-                },
-            },
-            BackendConfigField {
-                key: "model_quality".to_string(),
-                label: "Model Quality".to_string(),
-                description: Some(
-                    "Global Tycode model cost/quality ceiling. Auto removes the Tyde-managed \
-                     override; Tycode's current setting is preserved unless this field was \
-                     previously saved through Tyde."
-                        .to_string(),
-                ),
-                field_type: BackendConfigFieldType::Select {
-                    options: vec![
-                        select_option("free", "Free"),
-                        select_option("low", "Low"),
-                        select_option("medium", "Medium"),
-                        select_option("high", "High"),
-                        select_option("unlimited", "Unlimited"),
-                    ],
-                    default: None,
-                    nullable: true,
-                },
-            },
-            BackendConfigField {
-                key: "reasoning_effort".to_string(),
-                label: "Reasoning Effort".to_string(),
-                description: Some(
-                    "Global Tycode reasoning effort. Auto removes the Tyde-managed override; \
-                     Tycode's current setting is preserved unless this field was previously saved \
-                     through Tyde."
-                        .to_string(),
-                ),
-                field_type: BackendConfigFieldType::Select {
-                    options: vec![
-                        select_option("Off", "Off"),
-                        select_option("Low", "Low"),
-                        select_option("Medium", "Medium"),
-                        select_option("High", "High"),
-                        select_option("Max", "Max"),
-                    ],
-                    default: None,
-                    nullable: true,
-                },
-            },
-            BackendConfigField {
-                key: "autonomy_level".to_string(),
-                label: "Autonomy Level".to_string(),
-                description: Some(
-                    "Controls whether Tycode must ask for plan approval before implementing. \
-                     Auto removes the Tyde-managed override; Tycode's current setting is preserved \
-                     unless this field was previously saved through Tyde."
-                        .to_string(),
-                ),
-                field_type: BackendConfigFieldType::Select {
-                    options: vec![
-                        select_option("plan_approval_required", "Plan approval required"),
-                        select_option("fully_autonomous", "Fully autonomous"),
-                    ],
-                    default: None,
-                    nullable: true,
-                },
-            },
-            BackendConfigField {
-                key: "review_level".to_string(),
-                label: "Review Level".to_string(),
-                description: Some(
-                    "Controls Tycode's built-in review-agent behavior for completed coder tasks. \
-                     Auto removes the Tyde-managed override; Tycode's current setting is preserved \
-                     unless this field was previously saved through Tyde."
-                        .to_string(),
-                ),
-                field_type: BackendConfigFieldType::Select {
-                    options: vec![select_option("None", "None"), select_option("Task", "Task")],
-                    default: None,
-                    nullable: true,
-                },
-            },
-            BackendConfigField {
-                key: "spawn_context_mode".to_string(),
-                label: "Spawn Context Mode".to_string(),
-                description: Some(
-                    "Controls whether spawned Tycode sub-agents inherit parent conversation \
-                     context. Auto removes the Tyde-managed override; Tycode's current setting is \
-                     preserved unless this field was previously saved through Tyde."
-                        .to_string(),
-                ),
-                field_type: BackendConfigFieldType::Select {
-                    options: vec![
-                        select_option("Fork", "Fork"),
-                        select_option("Fresh", "Fresh"),
-                    ],
-                    default: None,
-                    nullable: true,
-                },
-            },
-        ],
-    }
 }
 
 fn select_option(value: &str, label: &str) -> SelectOption {
@@ -567,7 +455,7 @@ fn tycode_set_root_agent_supported() -> bool {
         return supported;
     }
 
-    false
+    true
 }
 
 fn tycode_root_agent_override_policy(config: &BackendSpawnConfig) -> TycodeRootAgentOverridePolicy {
@@ -748,8 +636,8 @@ impl TycodeStartupController {
                     TycodeRootAgentOverridePolicy::Supported => Ok(Some(agent.clone())),
                     TycodeRootAgentOverridePolicy::UnsupportedPinnedVersion => Err(format!(
                         "Tycode default_agent session setting requires SetRootAgent support, but \
-                         Tyde currently pins Tycode {TYCODE_VERSION} which does not support that \
-                         protocol"
+                         the selected tycode-subprocess does not support that protocol; Tyde \
+                         requires Tycode {TYCODE_VERSION}"
                     )),
                     TycodeRootAgentOverridePolicy::DisabledForReadOnly => Err(
                         "Tycode default_agent session setting cannot be used with read-only \
@@ -839,6 +727,379 @@ async fn await_tycode_startup(
     }
 }
 
+fn tycode_settings_schema_protocol_available() -> bool {
+    #[cfg(test)]
+    if TEST_TYCODE_SUBPROCESS_BIN
+        .lock()
+        .expect("test Tycode subprocess bin mutex poisoned")
+        .is_some()
+    {
+        return true;
+    }
+
+    tycode_settings_schema_supported_by_pinned_release()
+}
+
+fn tycode_settings_schema_unavailable_message() -> String {
+    tycode_settings_schema_release_blocker_message()
+        .unwrap_or_else(|| "Tycode grouped settings protocol is unavailable".to_string())
+}
+
+fn unavailable_native_settings_snapshot(message: String) -> BackendNativeSettingsSnapshot {
+    BackendNativeSettingsSnapshot {
+        backend_kind: BackendKind::Tycode,
+        status: BackendConfigSnapshotStatus::Unavailable,
+        settings: None,
+        groups: Vec::new(),
+        message: Some(message),
+    }
+}
+
+pub(crate) async fn native_settings_snapshot() -> BackendNativeSettingsSnapshot {
+    if !tycode_settings_schema_protocol_available() {
+        return unavailable_native_settings_snapshot(tycode_settings_schema_unavailable_message());
+    }
+
+    match probe_native_settings_snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => unavailable_native_settings_snapshot(error),
+    }
+}
+
+async fn probe_native_settings_snapshot() -> Result<BackendNativeSettingsSnapshot, String> {
+    let (ready_tx, ready_rx) =
+        tokio::sync::oneshot::channel::<Result<BackendNativeSettingsSnapshot, String>>();
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
+    let startup_status = new_tycode_startup_status();
+    let startup_status_task = Arc::clone(&startup_status);
+
+    tokio::spawn(async move {
+        let roots_json = serde_json::json!([]).to_string();
+        let subprocess_bin = match subprocess_bin().await {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!("{err}");
+                let _ = ready_tx.send(Err(err));
+                return;
+            }
+        };
+        let mut command = Command::new(&subprocess_bin);
+        command.arg("--workspace-roots").arg(&roots_json);
+        if let Some(path) = process_env::resolved_child_process_path() {
+            command.env("PATH", path);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match command.group_spawn() {
+            Ok(c) => c,
+            Err(err) => {
+                let _ = ready_tx.send(Err(format!(
+                    "Failed to spawn tycode-subprocess for native settings snapshot: {err}"
+                )));
+                return;
+            }
+        };
+
+        let mut stdin = match child.inner().stdin.take() {
+            Some(s) => s,
+            None => {
+                let _ = ready_tx.send(Err(
+                    "Failed to capture tycode-subprocess stdin for native settings snapshot"
+                        .to_string(),
+                ));
+                return;
+            }
+        };
+        let stdout = match child.inner().stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = ready_tx.send(Err(
+                    "Failed to capture tycode-subprocess stdout for native settings snapshot"
+                        .to_string(),
+                ));
+                return;
+            }
+        };
+        let stderr = match child.inner().stderr.take() {
+            Some(s) => s,
+            None => {
+                let _ = ready_tx.send(Err(
+                    "Failed to capture tycode-subprocess stderr for native settings snapshot"
+                        .to_string(),
+                ));
+                return;
+            }
+        };
+        let last_stderr_line = spawn_tycode_stderr_logger(stderr);
+        let mut lines = BufReader::new(stdout).lines();
+        let mut requested_settings_schema = false;
+        let mut ready_tx = Some(ready_tx);
+        set_tycode_startup_status(&startup_status_task, "waiting for SessionStarted");
+
+        loop {
+            let line = tokio::select! {
+                line = lines.next_line() => line,
+                shutdown = shutdown_rx.recv() => {
+                    if shutdown.is_some() {
+                        let _ = child.kill().await;
+                    }
+                    break;
+                }
+            };
+            let Ok(Some(line)) = line else {
+                break;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(
+                        event = %tycode_line_diagnostic(trimmed),
+                        "Failed to parse tycode-subprocess native settings snapshot event: {err}"
+                    );
+                    continue;
+                }
+            };
+            if let Some(error) = tycode_error_message(&value) {
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(Err(format!(
+                        "Tycode native settings snapshot failed before SettingsSchema: {error}"
+                    )));
+                }
+                let _ = child.kill().await;
+                return;
+            }
+            if !requested_settings_schema && tycode_session_started(&value).is_some() {
+                set_tycode_startup_status(
+                    &startup_status_task,
+                    "requesting SettingsSchema with GetSettingsSchema",
+                );
+                requested_settings_schema = true;
+                if !write_command(&mut stdin, &Value::String("GetSettingsSchema".to_string())).await
+                {
+                    if let Some(ready_tx) = ready_tx.take() {
+                        let _ = ready_tx.send(Err(
+                            "Failed to request Tycode native settings schema".to_string(),
+                        ));
+                    }
+                    let _ = child.kill().await;
+                    return;
+                }
+                continue;
+            }
+            if let Some(schema) = tycode_settings_schema_data(&value) {
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(tycode_native_settings_snapshot_from_schema(schema));
+                }
+                let _ = child.kill().await;
+                return;
+            }
+        }
+
+        if let Some(ready_tx) = ready_tx.take() {
+            let _ = ready_tx.send(Err(tycode_startup_exit_error(&last_stderr_line)));
+        }
+    });
+
+    let timeout = tycode_startup_timeout();
+    let result = match tokio::time::timeout(timeout, ready_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("Tycode native settings snapshot task ended early".to_string()),
+        Err(_) => {
+            let _ = shutdown_tx.send(());
+            let phase = *startup_status
+                .lock()
+                .expect("tycode startup status mutex poisoned");
+            Err(format!(
+                "Timed out after {} waiting for Tycode native settings snapshot: {phase}",
+                format_tycode_timeout(timeout)
+            ))
+        }
+    };
+    let _ = shutdown_tx.send(());
+    result
+}
+
+pub(crate) async fn persist_native_settings(settings: Value) -> Result<(), String> {
+    if !settings.is_object() {
+        return Err("Tycode native settings must be a JSON object".to_string());
+    }
+    if !tycode_settings_schema_protocol_available() {
+        return Err(tycode_settings_schema_unavailable_message());
+    }
+
+    let expected_settings = settings;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
+    let startup_status = new_tycode_startup_status();
+    let startup_status_task = Arc::clone(&startup_status);
+
+    tokio::spawn(async move {
+        let roots_json = serde_json::json!([]).to_string();
+        let subprocess_bin = match subprocess_bin().await {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::error!("{err}");
+                let _ = ready_tx.send(Err(err));
+                return;
+            }
+        };
+        let mut command = Command::new(&subprocess_bin);
+        command.arg("--workspace-roots").arg(&roots_json);
+        if let Some(path) = process_env::resolved_child_process_path() {
+            command.env("PATH", path);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match command.group_spawn() {
+            Ok(c) => c,
+            Err(err) => {
+                let _ = ready_tx.send(Err(format!(
+                    "Failed to spawn tycode-subprocess for native settings save: {err}"
+                )));
+                return;
+            }
+        };
+
+        let mut stdin = match child.inner().stdin.take() {
+            Some(s) => s,
+            None => {
+                let _ = ready_tx.send(Err(
+                    "Failed to capture tycode-subprocess stdin for native settings save"
+                        .to_string(),
+                ));
+                return;
+            }
+        };
+        let stdout = match child.inner().stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = ready_tx.send(Err(
+                    "Failed to capture tycode-subprocess stdout for native settings save"
+                        .to_string(),
+                ));
+                return;
+            }
+        };
+        let stderr = match child.inner().stderr.take() {
+            Some(s) => s,
+            None => {
+                let _ = ready_tx.send(Err(
+                    "Failed to capture tycode-subprocess stderr for native settings save"
+                        .to_string(),
+                ));
+                return;
+            }
+        };
+        let last_stderr_line = spawn_tycode_stderr_logger(stderr);
+        let mut lines = BufReader::new(stdout).lines();
+        let mut sent_save = false;
+        let mut ready_tx = Some(ready_tx);
+        set_tycode_startup_status(&startup_status_task, "waiting for SessionStarted");
+
+        loop {
+            let line = tokio::select! {
+                line = lines.next_line() => line,
+                shutdown = shutdown_rx.recv() => {
+                    if shutdown.is_some() {
+                        let _ = child.kill().await;
+                    }
+                    break;
+                }
+            };
+            let Ok(Some(line)) = line else {
+                break;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(
+                        event = %tycode_line_diagnostic(trimmed),
+                        "Failed to parse tycode-subprocess native settings save event: {err}"
+                    );
+                    continue;
+                }
+            };
+            if let Some(error) = tycode_error_message(&value) {
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(Err(format!(
+                        "Tycode native settings save failed before verification: {error}"
+                    )));
+                }
+                let _ = child.kill().await;
+                return;
+            }
+            if !sent_save && tycode_session_started(&value).is_some() {
+                set_tycode_startup_status(
+                    &startup_status_task,
+                    "saving native Settings with SaveSettings",
+                );
+                sent_save = true;
+                if !write_command(
+                    &mut stdin,
+                    &serde_json::json!({
+                        "SaveSettings": {
+                            "settings": expected_settings.clone(),
+                            "persist": true,
+                        }
+                    }),
+                )
+                .await
+                    || !write_command(&mut stdin, &Value::String("GetSettingsSchema".to_string()))
+                        .await
+                {
+                    if let Some(ready_tx) = ready_tx.take() {
+                        let _ =
+                            ready_tx.send(Err("Failed to save Tycode native settings".to_string()));
+                    }
+                    let _ = child.kill().await;
+                    return;
+                }
+                set_tycode_startup_status(
+                    &startup_status_task,
+                    "waiting for SettingsSchema verification after SaveSettings",
+                );
+                continue;
+            }
+            if let Some(schema) = tycode_settings_schema_data(&value) {
+                let verification = tycode_native_settings_snapshot_from_schema(schema).map(|_| ());
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(verification);
+                }
+                let _ = child.kill().await;
+                return;
+            }
+        }
+
+        if let Some(ready_tx) = ready_tx.take() {
+            let _ = ready_tx.send(Err(tycode_startup_exit_error(&last_stderr_line)));
+        }
+    });
+
+    let result = await_tycode_startup(
+        ready_rx,
+        &shutdown_tx,
+        "native settings save",
+        &startup_status,
+    )
+    .await;
+    let _ = shutdown_tx.send(());
+    result
+}
+
 pub(crate) async fn persist_backend_config(values: BackendConfigValues) -> Result<(), String> {
     if values.0.is_empty() {
         return Ok(());
@@ -851,7 +1112,7 @@ pub(crate) async fn persist_backend_config(values: BackendConfigValues) -> Resul
 
     tokio::spawn(async move {
         let roots_json = serde_json::json!([]).to_string();
-        let subprocess_bin = match subprocess_bin() {
+        let subprocess_bin = match subprocess_bin().await {
             Ok(path) => path,
             Err(err) => {
                 tracing::error!("{err}");
@@ -953,7 +1214,8 @@ pub(crate) async fn persist_backend_config(values: BackendConfigValues) -> Resul
                 Ok(value) => value,
                 Err(err) => {
                     tracing::warn!(
-                        "Failed to parse tycode-subprocess settings-save event: {err} — line: {trimmed}"
+                        event = %tycode_line_diagnostic(trimmed),
+                        "Failed to parse tycode-subprocess settings-save event: {err}"
                     );
                     continue;
                 }
@@ -990,6 +1252,7 @@ pub(crate) async fn persist_backend_config(values: BackendConfigValues) -> Resul
     result
 }
 
+#[cfg(test)]
 pub(crate) async fn backend_config_snapshot() -> Result<BackendConfigValues, String> {
     let (ready_tx, ready_rx) =
         tokio::sync::oneshot::channel::<Result<BackendConfigValues, String>>();
@@ -999,7 +1262,7 @@ pub(crate) async fn backend_config_snapshot() -> Result<BackendConfigValues, Str
 
     tokio::spawn(async move {
         let roots_json = serde_json::json!([]).to_string();
-        let subprocess_bin = match subprocess_bin() {
+        let subprocess_bin = match subprocess_bin().await {
             Ok(path) => path,
             Err(err) => {
                 tracing::error!("{err}");
@@ -1081,7 +1344,8 @@ pub(crate) async fn backend_config_snapshot() -> Result<BackendConfigValues, Str
                 Ok(value) => value,
                 Err(err) => {
                     tracing::warn!(
-                        "Failed to parse tycode-subprocess settings-snapshot event: {err} — line: {trimmed}"
+                        event = %tycode_line_diagnostic(trimmed),
+                        "Failed to parse tycode-subprocess settings-snapshot event: {err}"
                     );
                     continue;
                 }
@@ -1144,6 +1408,7 @@ pub(crate) async fn backend_config_snapshot() -> Result<BackendConfigValues, Str
     result
 }
 
+#[cfg(test)]
 fn tycode_backend_config_snapshot_values(settings: &Value) -> BackendConfigValues {
     let mut values = BackendConfigValues::default();
     for key in TYCODE_MANAGED_SETTINGS {
@@ -1212,6 +1477,36 @@ fn tycode_settings_data(value: &Value) -> Option<&Value> {
     (value.get("kind").and_then(Value::as_str) == Some("Settings"))
         .then(|| value.get("data"))
         .flatten()
+}
+
+fn tycode_settings_schema_data(value: &Value) -> Option<&Value> {
+    (value.get("kind").and_then(Value::as_str) == Some("SettingsSchema"))
+        .then(|| value.get("data"))
+        .flatten()
+        .and_then(|data| data.get("schema"))
+}
+
+fn tycode_native_settings_snapshot_from_schema(
+    schema: &Value,
+) -> Result<BackendNativeSettingsSnapshot, String> {
+    let settings = schema
+        .get("settings")
+        .cloned()
+        .ok_or_else(|| "Tycode SettingsSchema event missing current settings".to_string())?;
+    let groups_value = schema
+        .get("groups")
+        .cloned()
+        .ok_or_else(|| "Tycode SettingsSchema event missing groups".to_string())?;
+    let groups = serde_json::from_value::<Vec<BackendNativeSettingsGroup>>(groups_value)
+        .map_err(|err| format!("Failed to parse Tycode SettingsSchema groups: {err}"))?;
+
+    Ok(BackendNativeSettingsSnapshot {
+        backend_kind: BackendKind::Tycode,
+        status: BackendConfigSnapshotStatus::Ready,
+        settings: Some(settings),
+        groups,
+        message: None,
+    })
 }
 
 fn tycode_error_message(value: &Value) -> Option<String> {
@@ -1327,10 +1622,6 @@ impl Backend for TycodeBackend {
         tycode_session_settings_schema()
     }
 
-    fn backend_config_schema() -> Option<BackendConfigSchema> {
-        Some(tycode_backend_config_schema())
-    }
-
     async fn spawn(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
@@ -1362,7 +1653,7 @@ impl Backend for TycodeBackend {
                 workspace_roots.push(root.path.to_string_lossy().to_string());
             }
             let roots_json = serde_json::json!(workspace_roots).to_string();
-            let subprocess_bin = match subprocess_bin() {
+            let subprocess_bin = match subprocess_bin().await {
                 Ok(path) => path,
                 Err(err) => {
                     tracing::error!("{err}");
@@ -1496,8 +1787,7 @@ impl Backend for TycodeBackend {
 
             // Read stdout line by line — the subprocess emits ChatEvent JSON directly
             let mut lines = BufReader::new(stdout).lines();
-            let mut stream_open = false;
-            let mut accumulated_text = String::new();
+            let mut stream_state = TycodeStreamState::default();
             let mut runtime_settings = None;
             let mut settings_updates_open = true;
             let mut ready_tx = Some(ready_tx);
@@ -1538,7 +1828,8 @@ impl Backend for TycodeBackend {
                     Ok(value) => value,
                     Err(err) => {
                         tracing::warn!(
-                            "Failed to parse tycode-subprocess event: {err} — line: {trimmed}"
+                            event = %tycode_line_diagnostic(trimmed),
+                            "Failed to parse tycode-subprocess event: {err}"
                         );
                         continue;
                     }
@@ -1588,8 +1879,7 @@ impl Backend for TycodeBackend {
                     continue;
                 }
 
-                for event in events {
-                    update_tycode_stream_state(&event, &mut stream_open, &mut accumulated_text);
+                for event in tycode_events_with_synthesized_completion(events, &mut stream_state) {
                     if events_tx.send(event).is_err() {
                         break;
                     }
@@ -1601,23 +1891,8 @@ impl Backend for TycodeBackend {
 
             // Some tycode builds terminate without emitting StreamEnd. Synthesize
             // one so downstream callers don't hang waiting for end-of-turn.
-            if stream_open {
-                let _ = events_tx.send(ChatEvent::StreamEnd(StreamEndData {
-                    message: ChatMessage {
-                        message_id: None,
-                        timestamp: unix_now_ms(),
-                        sender: MessageSender::Assistant {
-                            agent: "tycode".to_string(),
-                        },
-                        content: accumulated_text,
-                        reasoning: None,
-                        tool_calls: Vec::new(),
-                        model_info: None,
-                        token_usage: None,
-                        context_breakdown: None,
-                        images: None,
-                    },
-                }));
+            if stream_state.open {
+                let _ = events_tx.send(stream_state.synthetic_stream_end());
             }
 
             if let Some(ready_tx) = ready_tx.take() {
@@ -1670,7 +1945,7 @@ impl Backend for TycodeBackend {
                 workspace_roots.push(root.path.to_string_lossy().to_string());
             }
             let roots_json = serde_json::json!(workspace_roots).to_string();
-            let subprocess_bin = match subprocess_bin() {
+            let subprocess_bin = match subprocess_bin().await {
                 Ok(path) => path,
                 Err(err) => {
                     tracing::error!("{err}");
@@ -1803,8 +2078,7 @@ impl Backend for TycodeBackend {
             });
 
             let mut lines = BufReader::new(stdout).lines();
-            let mut stream_open = false;
-            let mut accumulated_text = String::new();
+            let mut stream_state = TycodeStreamState::default();
             let mut runtime_settings = None;
             let mut settings_updates_open = true;
             let mut replay_barrier =
@@ -1848,7 +2122,8 @@ impl Backend for TycodeBackend {
                     Ok(value) => value,
                     Err(err) => {
                         tracing::warn!(
-                            "Failed to parse tycode-subprocess resume event: {err} — line: {trimmed}"
+                            event = %tycode_line_diagnostic(trimmed),
+                            "Failed to parse tycode-subprocess resume event: {err}"
                         );
                         continue;
                     }
@@ -1894,31 +2169,15 @@ impl Backend for TycodeBackend {
                     continue;
                 }
 
-                for event in events {
-                    update_tycode_stream_state(&event, &mut stream_open, &mut accumulated_text);
+                for event in tycode_events_with_synthesized_completion(events, &mut stream_state) {
                     if events_tx.send(event).is_err() {
                         break;
                     }
                 }
             }
 
-            if stream_open {
-                let _ = events_tx.send(ChatEvent::StreamEnd(StreamEndData {
-                    message: ChatMessage {
-                        message_id: None,
-                        timestamp: unix_now_ms(),
-                        sender: MessageSender::Assistant {
-                            agent: "tycode".to_string(),
-                        },
-                        content: accumulated_text,
-                        reasoning: None,
-                        tool_calls: Vec::new(),
-                        model_info: None,
-                        token_usage: None,
-                        context_breakdown: None,
-                        images: None,
-                    },
-                }));
+            if stream_state.open {
+                let _ = events_tx.send(stream_state.synthetic_stream_end());
             }
 
             if let Some(ready_tx) = ready_tx.take() {
@@ -2100,11 +2359,165 @@ fn spawn_tycode_stderr_logger(
             if trimmed.is_empty() {
                 continue;
             }
-            tracing::warn!("tycode-subprocess stderr: {trimmed}");
-            *sink.lock().expect("tycode stderr mutex poisoned") = Some(trimmed.to_string());
+            let diagnostic = tycode_text_diagnostic(trimmed);
+            tracing::warn!(stderr = %diagnostic, "tycode-subprocess stderr");
+            *sink.lock().expect("tycode stderr mutex poisoned") = Some(diagnostic);
         }
     });
     last_stderr_line
+}
+
+const TYCODE_DIAGNOSTIC_PREVIEW_CHARS: usize = 240;
+
+fn tycode_line_diagnostic(line: &str) -> String {
+    if let Some(kind) = extract_json_string_field(line, "kind")
+        && matches!(
+            kind.as_str(),
+            "Settings"
+                | "SettingsSchema"
+                | "MessageAdded"
+                | "StreamDelta"
+                | "StreamReasoningDelta"
+                | "StreamEnd"
+        )
+    {
+        return format!("{{\"kind\":\"{kind}\",\"data\":\"<redacted>\"}}");
+    }
+
+    tycode_text_diagnostic(line)
+}
+
+fn tycode_event_diagnostic(value: &Value) -> String {
+    tycode_diagnostic_preview(
+        &serde_json::to_string(&sanitize_tycode_value_for_diagnostics(value))
+            .unwrap_or_else(|_| "<unserializable Tycode event>".to_string()),
+    )
+}
+
+fn sanitize_tycode_value_for_diagnostics(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sanitized = serde_json::Map::new();
+            for (key, value) in map {
+                if tycode_diagnostic_key_is_sensitive(key) {
+                    sanitized.insert(key.clone(), Value::String("<redacted>".to_string()));
+                } else {
+                    sanitized.insert(key.clone(), sanitize_tycode_value_for_diagnostics(value));
+                }
+            }
+            Value::Object(sanitized)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(sanitize_tycode_value_for_diagnostics)
+                .collect(),
+        ),
+        Value::String(value) => Value::String(tycode_text_diagnostic(value)),
+        _ => value.clone(),
+    }
+}
+
+fn tycode_diagnostic_key_is_sensitive(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "api_key"
+            | "apikey"
+            | "authorization"
+            | "bearer"
+            | "content"
+            | "credential"
+            | "credentials"
+            | "images"
+            | "input"
+            | "arguments"
+            | "message"
+            | "password"
+            | "prompt"
+            | "providers"
+            | "reasoning"
+            | "secret"
+            | "settings"
+            | "text"
+            | "token"
+            | "tool_calls"
+            | "userinput"
+            | "savesettings"
+    ) || key.ends_with("_key")
+        || key.ends_with("_token")
+}
+
+fn tycode_text_diagnostic(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for marker in [
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "password",
+        "secret",
+        "token",
+        "credential",
+        "userinput",
+        "save_settings",
+        "savesettings",
+    ] {
+        if let Some(index) = lower.find(marker) {
+            return tycode_diagnostic_preview(&format!(
+                "{} <redacted>",
+                trimmed[..index + marker.len()].trim_end()
+            ));
+        }
+    }
+
+    tycode_diagnostic_preview(trimmed)
+}
+
+fn tycode_diagnostic_preview(text: &str) -> String {
+    let mut preview = String::new();
+    let mut chars = text.chars();
+    for _ in 0..TYCODE_DIAGNOSTIC_PREVIEW_CHARS {
+        let Some(ch) = chars.next() else {
+            return preview;
+        };
+        preview.push(ch);
+    }
+    if chars.next().is_some() {
+        preview.push('…');
+    }
+    preview
+}
+
+fn extract_json_string_field(line: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let field_start = line.find(&needle)?;
+    let after_field = &line[field_start + needle.len()..];
+    let colon_index = after_field.find(':')?;
+    let after_colon = after_field[colon_index + 1..].trim_start();
+    let mut chars = after_colon.chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+    let mut value = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            value.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(value),
+            _ => value.push(ch),
+        }
+    }
+    None
 }
 
 fn tycode_startup_exit_error(last_stderr_line: &Arc<std::sync::Mutex<Option<String>>>) -> String {
@@ -2296,30 +2709,138 @@ fn map_tycode_value_to_chat_events(value: &Value) -> Vec<ChatEvent> {
         return map_tycode_orchestration_event(value);
     }
 
-    if let Ok(event) = serde_json::from_value::<ChatEvent>(value.clone()) {
+    let normalized = normalize_tycode_event_value(value);
+    if let Ok(event) = serde_json::from_value::<ChatEvent>(normalized) {
         return vec![event];
     }
 
     let Some(kind) = value.get("kind").and_then(Value::as_str) else {
-        tracing::warn!(raw = %value, "Ignoring Tycode event without kind");
+        tracing::warn!(
+            event = %tycode_event_diagnostic(value),
+            "Ignoring Tycode event without kind"
+        );
         return Vec::new();
     };
 
+    if is_known_tycode_typed_chat_event_kind(kind) {
+        let err = serde_json::from_value::<ChatEvent>(normalize_tycode_event_value(value))
+            .expect_err("known Tycode event failed to deserialize above");
+        tracing::error!(
+            kind,
+            error = %err,
+            event = %tycode_event_diagnostic(value),
+            "Malformed Tycode chat event"
+        );
+        let error_event = tycode_error_chat_event(format!("Malformed Tycode {kind} event: {err}"));
+        if kind == "StreamEnd" {
+            return vec![error_event, tycode_malformed_stream_end_event()];
+        }
+        return vec![error_event];
+    }
+
     match kind {
         "Settings"
+        | "SettingsSchema"
         | "ConversationCleared"
         | "SessionsList"
         | "ProfilesList"
         | "TimingUpdate"
         | "ModuleSchemas"
         | "SessionStarted"
-        | "RootAgentChanged"
-        | "Error" => Vec::new(),
+        | "RootAgentChanged" => Vec::new(),
+        "Error" => {
+            let Some(message) = value.get("data").and_then(Value::as_str) else {
+                tracing::error!(
+                    event = %tycode_event_diagnostic(value),
+                    "Malformed Tycode Error event"
+                );
+                return vec![tycode_error_chat_event(
+                    "Malformed Tycode Error event: data must be a string",
+                )];
+            };
+            vec![tycode_error_chat_event(message)]
+        }
         other => {
-            tracing::warn!(kind = %other, raw = %value, "Ignoring unsupported Tycode event");
+            tracing::warn!(
+                kind = %other,
+                event = %tycode_event_diagnostic(value),
+                "Ignoring unsupported Tycode event"
+            );
             Vec::new()
         }
     }
+}
+
+fn normalize_tycode_event_value(value: &Value) -> Value {
+    let mut normalized = value.clone();
+    match normalized.get("kind").and_then(Value::as_str) {
+        Some("MessageAdded") => {
+            if let Some(message) = normalized.get_mut("data") {
+                normalize_tycode_chat_message(message);
+            }
+        }
+        Some("StreamEnd") => {
+            if let Some(message) = normalized
+                .get_mut("data")
+                .and_then(|data| data.get_mut("message"))
+            {
+                normalize_tycode_chat_message(message);
+            }
+        }
+        _ => {}
+    }
+    normalized
+}
+
+fn normalize_tycode_chat_message(message: &mut Value) {
+    let Some(token_usage) = message.get_mut("token_usage") else {
+        return;
+    };
+    let Value::Object(usage) = token_usage else {
+        return;
+    };
+    if usage.contains_key("request")
+        || usage.contains_key("turn")
+        || usage.contains_key("cumulative")
+        || !(usage.contains_key("input_tokens")
+            && usage.contains_key("output_tokens")
+            && usage.contains_key("total_tokens"))
+    {
+        return;
+    }
+
+    let flat_usage = Value::Object(usage.clone());
+    *token_usage = serde_json::json!({
+        "request": {
+            "kind": "known",
+            "usage": flat_usage.clone(),
+        },
+        "turn": {
+            "kind": "known",
+            "usage": flat_usage,
+        },
+        "cumulative": {
+            "kind": "unavailable",
+            "reason": "backend_did_not_report",
+        },
+    });
+}
+
+fn is_known_tycode_typed_chat_event_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "MessageAdded"
+            | "TypingStatusChanged"
+            | "StreamStart"
+            | "StreamDelta"
+            | "StreamReasoningDelta"
+            | "StreamEnd"
+            | "ToolRequest"
+            | "ToolExecutionCompleted"
+            | "OperationCancelled"
+            | "RetryAttempt"
+            | "TaskUpdate"
+    )
 }
 
 fn map_tycode_orchestration_event(value: &Value) -> Vec<ChatEvent> {
@@ -2329,7 +2850,10 @@ fn map_tycode_orchestration_event(value: &Value) -> Vec<ChatEvent> {
         .and_then(|payload| payload.get("kind"))
         .and_then(Value::as_str)
     else {
-        tracing::error!(raw = %value, "Malformed Tycode Orchestration event missing payload kind");
+        tracing::error!(
+            event = %tycode_event_diagnostic(value),
+            "Malformed Tycode Orchestration event missing payload kind"
+        );
         return vec![tycode_error_chat_event(
             "Malformed Tycode Orchestration event: missing data.payload.kind",
         )];
@@ -2338,7 +2862,7 @@ fn map_tycode_orchestration_event(value: &Value) -> Vec<ChatEvent> {
     if !is_known_tycode_orchestration_payload_kind(payload_kind) {
         tracing::warn!(
             payload_kind,
-            raw = %value,
+            event = %tycode_event_diagnostic(value),
             "Ignoring unknown Tycode Orchestration payload kind"
         );
         return Vec::new();
@@ -2354,7 +2878,12 @@ fn map_tycode_orchestration_event(value: &Value) -> Vec<ChatEvent> {
         }) {
         Ok(event) => vec![ChatEvent::Orchestration(event)],
         Err(err) => {
-            tracing::error!(payload_kind, error = %err, raw = %value, "Malformed Tycode Orchestration event");
+            tracing::error!(
+                payload_kind,
+                error = %err,
+                event = %tycode_event_diagnostic(value),
+                "Malformed Tycode Orchestration event"
+            );
             vec![tycode_error_chat_event(format!(
                 "Malformed Tycode Orchestration event ({payload_kind}): {err}"
             ))]
@@ -2393,24 +2922,219 @@ fn tycode_error_chat_event(message: impl Into<String>) -> ChatEvent {
     })
 }
 
-fn update_tycode_stream_state(
-    event: &ChatEvent,
-    stream_open: &mut bool,
-    accumulated_text: &mut String,
-) {
-    match event {
-        ChatEvent::StreamStart(_) => {
-            *stream_open = true;
-            accumulated_text.clear();
+fn tycode_malformed_stream_end_event() -> ChatEvent {
+    tycode_stream_end_event(String::new())
+}
+
+fn tycode_stream_end_event(content: String) -> ChatEvent {
+    ChatEvent::StreamEnd(StreamEndData {
+        message: ChatMessage {
+            message_id: None,
+            timestamp: unix_now_ms(),
+            sender: MessageSender::Assistant {
+                agent: "tycode".to_string(),
+            },
+            content,
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        },
+    })
+}
+
+#[derive(Debug, Default)]
+struct TycodeStreamState {
+    open: bool,
+    message_id: Option<String>,
+    agent: Option<String>,
+    model: Option<String>,
+    accumulated_text: String,
+    accumulated_reasoning: String,
+    synthetic_completion: Option<SyntheticTycodeCompletion>,
+}
+
+#[derive(Debug)]
+struct SyntheticTycodeCompletion {
+    message_id: Option<ChatMessageId>,
+    content: String,
+    reasoning_text: Option<String>,
+}
+
+impl TycodeStreamState {
+    fn events_with_synthesized_completion(&mut self, events: Vec<ChatEvent>) -> Vec<ChatEvent> {
+        let mut output = Vec::new();
+        for event in events {
+            if let Some(events) = self.late_authoritative_stream_end_events(&event) {
+                output.extend(events);
+                continue;
+            }
+            if let Some(stream_end) = self.synthesize_stream_end_before(&event) {
+                output.push(stream_end);
+            }
+            self.update(&event);
+            output.push(event);
         }
-        ChatEvent::StreamDelta(StreamTextDeltaData { text, .. }) if *stream_open => {
-            accumulated_text.push_str(text);
-        }
-        ChatEvent::StreamEnd(_) => {
-            *stream_open = false;
-        }
-        _ => {}
+
+        output
     }
+
+    fn late_authoritative_stream_end_events(
+        &mut self,
+        event: &ChatEvent,
+    ) -> Option<Vec<ChatEvent>> {
+        let ChatEvent::StreamEnd(end) = event else {
+            return None;
+        };
+        if self.open {
+            return None;
+        }
+        let synthetic = self.synthetic_completion.take()?;
+        self.warn_if_late_stream_end_has_unmerged_fields(&synthetic, &end.message);
+
+        let message_id = synthetic
+            .message_id
+            .clone()
+            .or_else(|| end.message.message_id.clone());
+        let Some(message_id) = message_id else {
+            tracing::warn!(
+                "Forwarding delayed Tycode StreamEnd after synthesized completion because no \
+                 message_id is available for metadata merge"
+            );
+            return Some(vec![event.clone()]);
+        };
+
+        if end.message.model_info.is_none()
+            && end.message.token_usage.is_none()
+            && end.message.context_breakdown.is_none()
+        {
+            return Some(Vec::new());
+        }
+
+        Some(vec![ChatEvent::MessageMetadataUpdated(
+            MessageMetadataUpdateData {
+                message_id,
+                model_info: end.message.model_info.clone(),
+                token_usage: end.message.token_usage.clone(),
+                context_breakdown: end.message.context_breakdown.clone(),
+            },
+        )])
+    }
+
+    fn synthesize_stream_end_before(&mut self, event: &ChatEvent) -> Option<ChatEvent> {
+        if matches!(event, ChatEvent::TypingStatusChanged(false)) && self.open {
+            let stream_end = self.synthetic_stream_end();
+            if let ChatEvent::StreamEnd(end) = &stream_end {
+                self.synthetic_completion = Some(SyntheticTycodeCompletion {
+                    message_id: end.message.message_id.clone(),
+                    content: end.message.content.clone(),
+                    reasoning_text: end
+                        .message
+                        .reasoning
+                        .as_ref()
+                        .map(|reasoning| reasoning.text.clone()),
+                });
+            }
+            self.open = false;
+            return Some(stream_end);
+        }
+
+        None
+    }
+
+    fn synthetic_stream_end(&self) -> ChatEvent {
+        ChatEvent::StreamEnd(StreamEndData {
+            message: ChatMessage {
+                message_id: self.message_id.clone().map(ChatMessageId),
+                timestamp: unix_now_ms(),
+                sender: MessageSender::Assistant {
+                    agent: self.agent.clone().unwrap_or_else(|| "tycode".to_string()),
+                },
+                content: self.accumulated_text.clone(),
+                reasoning: (!self.accumulated_reasoning.is_empty()).then(|| ReasoningData {
+                    text: self.accumulated_reasoning.clone(),
+                    tokens: None,
+                    signature: None,
+                    blob: None,
+                }),
+                tool_calls: Vec::new(),
+                model_info: self.model.clone().map(|model| ModelInfo { model }),
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+        })
+    }
+
+    fn update(&mut self, event: &ChatEvent) {
+        match event {
+            ChatEvent::TypingStatusChanged(true) | ChatEvent::StreamStart(_) => {
+                if let ChatEvent::StreamStart(start) = event {
+                    self.open = true;
+                    self.message_id.clone_from(&start.message_id);
+                    self.agent = Some(start.agent.clone());
+                    self.model.clone_from(&start.model);
+                    self.accumulated_text.clear();
+                    self.accumulated_reasoning.clear();
+                }
+                self.synthetic_completion = None;
+            }
+            ChatEvent::StreamDelta(StreamTextDeltaData { message_id, text }) if self.open => {
+                if let Some(message_id) = message_id {
+                    self.message_id = Some(message_id.clone());
+                }
+                self.accumulated_text.push_str(text);
+            }
+            ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
+                message_id, text, ..
+            }) if self.open => {
+                if let Some(message_id) = message_id {
+                    self.message_id = Some(message_id.clone());
+                }
+                self.accumulated_reasoning.push_str(text);
+            }
+            ChatEvent::StreamEnd(_) => {
+                self.open = false;
+                self.synthetic_completion = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn warn_if_late_stream_end_has_unmerged_fields(
+        &self,
+        synthetic: &SyntheticTycodeCompletion,
+        message: &ChatMessage,
+    ) {
+        let authoritative_reasoning = message
+            .reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.text.as_str());
+        if message.content != synthetic.content
+            || authoritative_reasoning != synthetic.reasoning_text.as_deref()
+            || !message.tool_calls.is_empty()
+            || message
+                .images
+                .as_ref()
+                .is_some_and(|images| !images.is_empty())
+        {
+            tracing::warn!(
+                message_id = ?message.message_id,
+                "Delayed Tycode StreamEnd after synthesized completion contains content fields \
+                 that cannot be merged into the already visible assistant message without a \
+                 duplicate StreamEnd"
+            );
+        }
+    }
+}
+
+fn tycode_events_with_synthesized_completion(
+    events: Vec<ChatEvent>,
+    stream_state: &mut TycodeStreamState,
+) -> Vec<ChatEvent> {
+    stream_state.events_with_synthesized_completion(events)
 }
 
 fn unix_now_ms() -> u64 {
@@ -2426,7 +3150,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use protocol::{OrchestrationAgentOrigin, OrchestrationPayload, SendMessagePayload};
+    use protocol::{
+        OrchestrationAgentOrigin, OrchestrationPayload, SendMessagePayload, TokenUsageScope,
+        TokenUsageUnavailableReason,
+    };
     use tempfile::TempDir;
 
     const TEST_TYCODE_STARTUP_TIMEOUT_DURATION: Duration = Duration::from_secs(2);
@@ -2501,80 +3228,8 @@ mod tests {
     }
 
     #[test]
-    fn tycode_backend_config_schema_exposes_runtime_json_settings() {
-        let schema = tycode_backend_config_schema();
-        assert_eq!(schema.backend_kind, BackendKind::Tycode);
-        assert_eq!(
-            schema.persistence_mode,
-            BackendConfigPersistenceMode::BackendNative
-        );
-        let keys = schema
-            .fields
-            .iter()
-            .map(|field| field.key.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            keys,
-            vec![
-                "active_provider",
-                "model_quality",
-                "reasoning_effort",
-                "autonomy_level",
-                "review_level",
-                "spawn_context_mode",
-            ]
-        );
-
-        let active_provider = schema
-            .fields
-            .iter()
-            .find(|field| field.key == "active_provider")
-            .expect("active_provider field");
-        assert!(matches!(
-            &active_provider.field_type,
-            BackendConfigFieldType::Text { .. }
-        ));
-
-        let model_quality = schema
-            .fields
-            .iter()
-            .find(|field| field.key == "model_quality")
-            .expect("model_quality field");
-        match &model_quality.field_type {
-            BackendConfigFieldType::Select {
-                options, nullable, ..
-            } => {
-                assert!(*nullable);
-                assert_eq!(
-                    options
-                        .iter()
-                        .map(|option| option.value.as_str())
-                        .collect::<Vec<_>>(),
-                    vec!["free", "low", "medium", "high", "unlimited"]
-                );
-            }
-            other => panic!("model_quality should be Select, got {other:?}"),
-        }
-
-        let auto_selects = schema
-            .fields
-            .iter()
-            .filter(|field| {
-                matches!(
-                    field.key.as_str(),
-                    "autonomy_level" | "review_level" | "spawn_context_mode"
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(auto_selects.len(), 3);
-        assert!(auto_selects.iter().all(|field| matches!(
-            &field.field_type,
-            BackendConfigFieldType::Select {
-                default: None,
-                nullable: true,
-                ..
-            }
-        )));
+    fn tycode_omits_legacy_backend_config_schema() {
+        assert!(TycodeBackend::backend_config_schema().is_none());
     }
 
     #[test]
@@ -2740,6 +3395,412 @@ mod tests {
             runtime_settings.expect("runtime settings")["default_agent"],
             "tycode"
         );
+    }
+
+    #[test]
+    fn tycode_message_added_flat_token_usage_maps_to_typed_usage_scopes() {
+        let events = map_tycode_value_to_chat_events(&tycode_message_added_with_flat_usage());
+
+        assert_eq!(events.len(), 1);
+        let ChatEvent::MessageAdded(message) = &events[0] else {
+            panic!("expected MessageAdded, got {:?}", events[0]);
+        };
+        assert_flat_usage_mapped(message);
+    }
+
+    #[test]
+    fn tycode_stream_end_flat_token_usage_maps_to_typed_usage_scopes() {
+        let events = map_tycode_value_to_chat_events(&serde_json::json!({
+            "kind": "StreamEnd",
+            "data": {
+                "message": tycode_assistant_message_with_flat_usage()
+            }
+        }));
+
+        assert_eq!(events.len(), 1);
+        let ChatEvent::StreamEnd(end) = &events[0] else {
+            panic!("expected StreamEnd, got {:?}", events[0]);
+        };
+        assert_flat_usage_mapped(&end.message);
+    }
+
+    #[test]
+    fn tycode_malformed_known_event_surfaces_error_message() {
+        let events = map_tycode_value_to_chat_events(&serde_json::json!({
+            "kind": "StreamEnd",
+            "data": {
+                "message": {
+                    "timestamp": "not a number"
+                }
+            }
+        }));
+
+        assert_eq!(events.len(), 2);
+        let ChatEvent::MessageAdded(message) = &events[0] else {
+            panic!("expected visible error message, got {:?}", events[0]);
+        };
+        assert!(matches!(&message.sender, MessageSender::Error));
+        assert!(
+            message.content.contains("Malformed Tycode StreamEnd event"),
+            "unexpected error content: {}",
+            message.content
+        );
+        assert!(
+            matches!(events[1], ChatEvent::StreamEnd(_)),
+            "malformed StreamEnd should still close the stream, got {:?}",
+            events[1]
+        );
+        let mut stream_state = TycodeStreamState {
+            open: true,
+            accumulated_text: "partial".to_string(),
+            ..Default::default()
+        };
+        for event in &events {
+            stream_state.update(event);
+        }
+        assert!(
+            !stream_state.open,
+            "malformed StreamEnd must not leave cursor active"
+        );
+    }
+
+    #[test]
+    fn tycode_typing_false_synthesizes_stream_end_before_idle() {
+        let raw_events = [
+            serde_json::json!({
+                "kind": "TypingStatusChanged",
+                "data": true
+            }),
+            serde_json::json!({
+                "kind": "StreamStart",
+                "data": {
+                    "message_id": "m1",
+                    "agent": "tycode",
+                    "model": "ClaudeSonnet46"
+                }
+            }),
+            serde_json::json!({
+                "kind": "StreamDelta",
+                "data": {
+                    "message_id": "m1",
+                    "text": "Acknowledged."
+                }
+            }),
+            serde_json::json!({
+                "kind": "TypingStatusChanged",
+                "data": false
+            }),
+        ];
+        let mut stream_state = TycodeStreamState::default();
+        let mut emitted = Vec::new();
+        for raw_event in raw_events {
+            emitted.extend(tycode_events_with_synthesized_completion(
+                map_tycode_value_to_chat_events(&raw_event),
+                &mut stream_state,
+            ));
+        }
+
+        assert_eq!(
+            event_kinds(&emitted),
+            vec![
+                "TypingStatusChanged(true)",
+                "StreamStart",
+                "StreamDelta",
+                "StreamEnd",
+                "TypingStatusChanged(false)",
+            ]
+        );
+        let ChatEvent::StreamEnd(end) = &emitted[3] else {
+            panic!("expected synthesized StreamEnd, got {:?}", emitted[3]);
+        };
+        assert_eq!(end.message.content, "Acknowledged.");
+        assert!(matches!(
+            &end.message.sender,
+            MessageSender::Assistant { agent } if agent == "tycode"
+        ));
+        assert!(!stream_state.open);
+    }
+
+    #[test]
+    fn tycode_late_real_stream_end_updates_synthetic_completion_metadata() {
+        let raw_events = [
+            serde_json::json!({
+                "kind": "StreamStart",
+                "data": {
+                    "message_id": "m1",
+                    "agent": "tycode",
+                    "model": "stream-model"
+                }
+            }),
+            serde_json::json!({
+                "kind": "StreamDelta",
+                "data": {
+                    "message_id": "m1",
+                    "text": "Authoritative content."
+                }
+            }),
+            serde_json::json!({
+                "kind": "TypingStatusChanged",
+                "data": false
+            }),
+            serde_json::json!({
+                "kind": "StreamEnd",
+                "data": {
+                    "message": {
+                        "message_id": "m1",
+                        "timestamp": 1776827246365_u64,
+                        "sender": {
+                            "Assistant": {
+                                "agent": "tycode"
+                            }
+                        },
+                        "content": "Authoritative content.",
+                        "reasoning": null,
+                        "tool_calls": [],
+                        "model_info": {
+                            "model": "authoritative-model"
+                        },
+                        "token_usage": {
+                            "input_tokens": 11,
+                            "output_tokens": 7,
+                            "total_tokens": 18
+                        },
+                        "context_breakdown": {
+                            "system_prompt_bytes": 101,
+                            "tool_io_bytes": 102,
+                            "conversation_history_bytes": 103,
+                            "reasoning_bytes": 104,
+                            "context_injection_bytes": 105,
+                            "input_tokens": 11,
+                            "context_window": 200000
+                        },
+                        "images": []
+                    }
+                }
+            }),
+        ];
+        let mut stream_state = TycodeStreamState::default();
+        let mut emitted = Vec::new();
+        for raw_event in raw_events {
+            emitted.extend(tycode_events_with_synthesized_completion(
+                map_tycode_value_to_chat_events(&raw_event),
+                &mut stream_state,
+            ));
+        }
+
+        assert_eq!(
+            event_kinds(&emitted),
+            vec![
+                "StreamStart",
+                "StreamDelta",
+                "StreamEnd",
+                "TypingStatusChanged(false)",
+                "MessageMetadataUpdated",
+            ]
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::StreamEnd(_)))
+                .count(),
+            1,
+            "delayed real StreamEnd must not create a duplicate visible message"
+        );
+        let ChatEvent::StreamEnd(end) = &emitted[2] else {
+            panic!("expected synthesized StreamEnd, got {:?}", emitted[2]);
+        };
+        assert_eq!(
+            end.message.message_id,
+            Some(ChatMessageId("m1".to_string()))
+        );
+        assert_eq!(end.message.content, "Authoritative content.");
+
+        let ChatEvent::MessageMetadataUpdated(update) = &emitted[4] else {
+            panic!("expected late metadata update, got {:?}", emitted[4]);
+        };
+        assert_eq!(update.message_id, ChatMessageId("m1".to_string()));
+        assert_eq!(
+            update.model_info.as_ref().map(|model| model.model.as_str()),
+            Some("authoritative-model")
+        );
+        let usage = update
+            .token_usage
+            .as_ref()
+            .expect("late real StreamEnd token usage should be preserved");
+        for scope in [&usage.request, &usage.turn] {
+            let TokenUsageScope::Known { usage } = scope else {
+                panic!("request and turn usage should be known, got {scope:?}");
+            };
+            assert_eq!(usage.input_tokens, 11);
+            assert_eq!(usage.output_tokens, 7);
+            assert_eq!(usage.total_tokens, 18);
+        }
+        let context = update
+            .context_breakdown
+            .as_ref()
+            .expect("late real StreamEnd context should be preserved");
+        assert_eq!(context.system_prompt_bytes, 101);
+        assert_eq!(context.tool_io_bytes, 102);
+        assert_eq!(context.conversation_history_bytes, 103);
+        assert_eq!(context.reasoning_bytes, 104);
+        assert_eq!(context.context_injection_bytes, 105);
+        assert_eq!(context.input_tokens, 11);
+        assert_eq!(context.context_window, 200000);
+    }
+
+    #[test]
+    fn tycode_real_stream_end_prevents_typing_false_synthesis() {
+        let mut stream_state = TycodeStreamState::default();
+        let emitted = tycode_events_with_synthesized_completion(
+            vec![
+                ChatEvent::TypingStatusChanged(true),
+                ChatEvent::StreamStart(protocol::StreamStartData {
+                    message_id: Some("m1".to_string()),
+                    agent: "tycode".to_string(),
+                    model: Some("ClaudeSonnet46".to_string()),
+                }),
+                ChatEvent::StreamDelta(StreamTextDeltaData {
+                    message_id: Some("m1".to_string()),
+                    text: "Acknowledged.".to_string(),
+                }),
+                ChatEvent::StreamEnd(StreamEndData {
+                    message: tycode_assistant_chat_message("Real end."),
+                }),
+                ChatEvent::TypingStatusChanged(false),
+            ],
+            &mut stream_state,
+        );
+
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::StreamEnd(_)))
+                .count(),
+            1
+        );
+        let ChatEvent::StreamEnd(end) = &emitted[3] else {
+            panic!("expected real StreamEnd, got {:?}", emitted[3]);
+        };
+        assert_eq!(end.message.content, "Real end.");
+        assert_eq!(event_kinds(&emitted)[4], "TypingStatusChanged(false)");
+    }
+
+    #[test]
+    fn tycode_diagnostics_redact_settings_payloads_but_keep_event_kind() {
+        let diagnostic = tycode_line_diagnostic(
+            r#"{"kind":"Settings","data":{"providers":{"openrouter":{"api_key":"secret"}}}}"#,
+        );
+
+        assert_eq!(diagnostic, r#"{"kind":"Settings","data":"<redacted>"}"#);
+    }
+
+    #[test]
+    fn tycode_stderr_diagnostics_preserve_sanitized_context() {
+        let diagnostic =
+            tycode_text_diagnostic("Fatal provider setup failed: api_key sk-secret-value invalid");
+
+        assert!(diagnostic.contains("Fatal provider setup failed"));
+        assert!(diagnostic.contains("api_key"));
+        assert!(!diagnostic.contains("sk-secret-value"));
+    }
+
+    fn tycode_message_added_with_flat_usage() -> Value {
+        serde_json::json!({
+            "kind": "MessageAdded",
+            "data": tycode_assistant_message_with_flat_usage()
+        })
+    }
+
+    fn tycode_assistant_message_with_flat_usage() -> Value {
+        serde_json::json!({
+            "timestamp": 123,
+            "sender": {
+                "Assistant": {
+                    "agent": "tycode"
+                }
+            },
+            "content": "done",
+            "reasoning": null,
+            "tool_calls": [],
+            "model_info": {
+                "model": "claude-fable",
+                "version": "claude-fable-5"
+            },
+            "token_usage": {
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "total_tokens": 18,
+                "cached_prompt_tokens": 3,
+                "cache_creation_input_tokens": 5,
+                "reasoning_tokens": 2
+            },
+            "context_breakdown": null,
+            "images": []
+        })
+    }
+
+    fn assert_flat_usage_mapped(message: &ChatMessage) {
+        let usage = message
+            .token_usage
+            .as_ref()
+            .expect("flat usage should map to MessageTokenUsage");
+        for scope in [&usage.request, &usage.turn] {
+            let TokenUsageScope::Known { usage } = scope else {
+                panic!("request and turn usage should be known, got {scope:?}");
+            };
+            assert_eq!(usage.input_tokens, 11);
+            assert_eq!(usage.output_tokens, 7);
+            assert_eq!(usage.total_tokens, 18);
+            assert_eq!(usage.cached_prompt_tokens, Some(3));
+            assert_eq!(usage.cache_creation_input_tokens, Some(5));
+            assert_eq!(usage.reasoning_tokens, Some(2));
+        }
+        assert_eq!(
+            usage.cumulative,
+            TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport
+            }
+        );
+    }
+
+    fn event_kinds(events: &[ChatEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .map(|event| match event {
+                ChatEvent::TypingStatusChanged(true) => "TypingStatusChanged(true)",
+                ChatEvent::TypingStatusChanged(false) => "TypingStatusChanged(false)",
+                ChatEvent::StreamStart(_) => "StreamStart",
+                ChatEvent::StreamDelta(_) => "StreamDelta",
+                ChatEvent::StreamEnd(_) => "StreamEnd",
+                ChatEvent::MessageAdded(_) => "MessageAdded",
+                ChatEvent::MessageMetadataUpdated(_) => "MessageMetadataUpdated",
+                ChatEvent::StreamReasoningDelta(_) => "StreamReasoningDelta",
+                ChatEvent::ToolRequest(_) => "ToolRequest",
+                ChatEvent::ToolProgress(_) => "ToolProgress",
+                ChatEvent::ToolExecutionCompleted(_) => "ToolExecutionCompleted",
+                ChatEvent::TaskUpdate(_) => "TaskUpdate",
+                ChatEvent::OperationCancelled(_) => "OperationCancelled",
+                ChatEvent::RetryAttempt(_) => "RetryAttempt",
+                ChatEvent::Orchestration(_) => "Orchestration",
+            })
+            .collect()
+    }
+
+    fn tycode_assistant_chat_message(content: &str) -> ChatMessage {
+        ChatMessage {
+            message_id: None,
+            timestamp: 123,
+            sender: MessageSender::Assistant {
+                agent: "tycode".to_string(),
+            },
+            content: content.to_string(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        }
     }
 
     #[test]
@@ -3101,7 +4162,7 @@ mod tests {
         });
         let fake = write_fake_tycode_subprocess_dropping_unknown_settings(dir.path(), &settings);
         let log = dir.path().join("commands.jsonl");
-        let _guard = TestTycodeSubprocessGuard::set(fake);
+        let _guard = TestTycodeSubprocessGuard::set_without_root_agent_support(fake);
 
         let mut session_settings = SessionSettingsValues::default();
         session_settings.0.insert(
@@ -3244,6 +4305,99 @@ mod tests {
         assert_eq!(save["settings"]["review_level"], "Task");
         assert_eq!(save["settings"]["spawn_context_mode"], "Fresh");
         assert_eq!(save["settings"]["providers"], settings["providers"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tycode_native_settings_snapshot_carries_current_values_and_groups() {
+        let dir = TempDir::new().expect("tempdir");
+        let settings = serde_json::json!({
+            "active_provider": "other",
+            "providers": {
+                "default": { "type": "mock" },
+                "other": { "type": "openrouter", "api_key": "secret" }
+            },
+            "model_quality": "high",
+            "reasoning_effort": "Max",
+            "modules": {
+                "memory": { "enabled": true }
+            },
+            "unrelated": { "keep": true }
+        });
+        let fake = write_fake_tycode_subprocess(dir.path(), &settings);
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        let snapshot = native_settings_snapshot().await;
+
+        assert_eq!(snapshot.status, BackendConfigSnapshotStatus::Ready);
+        assert_eq!(snapshot.settings.as_ref(), Some(&settings));
+        assert!(
+            snapshot
+                .groups
+                .iter()
+                .any(|group| group.id == "providers" && group.settings_path.is_empty()),
+            "providers group should be carried through: {:?}",
+            snapshot.groups
+        );
+        assert!(
+            snapshot.groups.iter().any(|group| {
+                group.id == "module:memory"
+                    && group.settings_path == vec!["modules".to_string(), "memory".to_string()]
+            }),
+            "module group should be carried through: {:?}",
+            snapshot.groups
+        );
+        assert_eq!(
+            read_fake_commands(&log),
+            vec![Value::String("GetSettingsSchema".to_string())]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tycode_native_settings_save_accepts_canonicalized_post_save_snapshot() {
+        let dir = TempDir::new().expect("tempdir");
+        let initial_settings = serde_json::json!({
+            "active_provider": "default",
+            "providers": {
+                "default": { "type": "mock" },
+                "other": { "type": "openrouter", "api_key": "secret" }
+            },
+            "model_quality": "high",
+            "reasoning_effort": "Max",
+            "modules": {
+                "memory": { "enabled": true }
+            },
+            "unrelated": { "keep": true }
+        });
+        let saved_settings = serde_json::json!({
+            "active_provider": "other",
+            "providers": initial_settings["providers"].clone(),
+            "model_quality": "low",
+            "reasoning_effort": "Max",
+            "modules": {
+                "memory": { "enabled": true }
+            },
+            "unrelated": { "keep": true }
+        });
+        let fake = write_fake_tycode_subprocess_canonicalizing_native_settings(
+            dir.path(),
+            &initial_settings,
+        );
+        let log = dir.path().join("commands.jsonl");
+        let _guard = TestTycodeSubprocessGuard::set(fake);
+
+        persist_native_settings(saved_settings.clone())
+            .await
+            .expect("persist native Tycode settings");
+
+        let commands = read_fake_commands(&log);
+        assert_eq!(commands.len(), 2, "commands: {commands:#?}");
+        let save = commands[0]
+            .get("SaveSettings")
+            .expect("SaveSettings command");
+        assert_eq!(save["persist"], true);
+        assert_eq!(save["settings"], saved_settings);
+        assert_eq!(commands[1], Value::String("GetSettingsSchema".to_string()));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3755,6 +4909,10 @@ mod tests {
             Self::set_with_options_inner(path, None, None, Some(true))
         }
 
+        fn set_without_root_agent_support(path: String) -> Self {
+            Self::set_with_options_inner(path, None, None, Some(false))
+        }
+
         fn set_with_options(
             path: String,
             sessions_dir: Option<PathBuf>,
@@ -3828,18 +4986,25 @@ mod tests {
     }
 
     fn write_fake_tycode_subprocess(dir: &Path, settings: &Value) -> String {
-        write_fake_tycode_subprocess_with_options(dir, settings, false, false)
+        write_fake_tycode_subprocess_with_options(dir, settings, false, false, false)
     }
 
     fn write_fake_tycode_subprocess_dropping_unknown_settings(
         dir: &Path,
         settings: &Value,
     ) -> String {
-        write_fake_tycode_subprocess_with_options(dir, settings, true, false)
+        write_fake_tycode_subprocess_with_options(dir, settings, true, false, false)
     }
 
     fn write_fake_tycode_subprocess_rejecting_root_agent(dir: &Path, settings: &Value) -> String {
-        write_fake_tycode_subprocess_with_options(dir, settings, false, true)
+        write_fake_tycode_subprocess_with_options(dir, settings, false, true, false)
+    }
+
+    fn write_fake_tycode_subprocess_canonicalizing_native_settings(
+        dir: &Path,
+        settings: &Value,
+    ) -> String {
+        write_fake_tycode_subprocess_with_options(dir, settings, false, false, true)
     }
 
     fn write_fake_tycode_subprocess_with_options(
@@ -3847,6 +5012,7 @@ mod tests {
         settings: &Value,
         drop_unknown_settings: bool,
         reject_root_agent: bool,
+        canonicalize_native_settings: bool,
     ) -> String {
         let script = dir.join("fake_tycode_subprocess.py");
         let log = dir.join("commands.jsonl");
@@ -3859,6 +5025,11 @@ mod tests {
             "False"
         };
         let reject_root_agent_literal = if reject_root_agent { "True" } else { "False" };
+        let canonicalize_native_settings_literal = if canonicalize_native_settings {
+            "True"
+        } else {
+            "False"
+        };
         let body = r#"#!/usr/bin/env python3
 import json
 import sys
@@ -3867,7 +5038,50 @@ settings = json.loads(__SETTINGS__)
 known_settings_keys = set(settings.keys())
 drop_unknown_settings = __DROP_UNKNOWN_SETTINGS__
 reject_root_agent = __REJECT_ROOT_AGENT__
+canonicalize_native_settings = __CANONICALIZE_NATIVE_SETTINGS__
 log_path = __LOG__
+
+settings_groups = [
+    {
+        "id": "general",
+        "title": "General",
+        "kind": "core",
+        "settings_path": [],
+        "description": "General settings",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "model_quality": {"type": ["string", "null"]},
+                "reasoning_effort": {"type": ["string", "null"]},
+            },
+        },
+    },
+    {
+        "id": "providers",
+        "title": "Providers",
+        "kind": "core",
+        "settings_path": [],
+        "description": "Provider settings",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "active_provider": {"type": ["string", "null"]},
+                "providers": {"type": "object"},
+            },
+        },
+    },
+    {
+        "id": "module:memory",
+        "title": "Memory",
+        "kind": "module",
+        "settings_path": ["modules", "memory"],
+        "description": "Memory module settings",
+        "schema": {
+            "type": "object",
+            "properties": {"enabled": {"type": "boolean"}},
+        },
+    },
+]
 
 def emit(value):
     print(json.dumps(value, separators=(",", ":")), flush=True)
@@ -3899,6 +5113,8 @@ for raw_line in sys.stdin:
     command = json.loads(line)
     if command == "GetSettings":
         emit({"kind": "Settings", "data": settings})
+    elif command == "GetSettingsSchema":
+        emit({"kind": "SettingsSchema", "data": {"schema": {"settings": settings, "groups": settings_groups}}})
     elif isinstance(command, dict) and "SaveSettings" in command:
         incoming_settings = command["SaveSettings"]["settings"]
         if drop_unknown_settings:
@@ -3909,6 +5125,9 @@ for raw_line in sys.stdin:
             }
         else:
             settings = incoming_settings
+        if canonicalize_native_settings:
+            settings = dict(settings)
+            settings["profile"] = "default"
     elif isinstance(command, dict) and "ChangeProvider" in command:
         emit(message("System", f"Switched to provider: {command['ChangeProvider']}"))
     elif isinstance(command, dict) and "SetRootAgent" in command:
@@ -3930,6 +5149,10 @@ for raw_line in sys.stdin:
         .replace("__SETTINGS__", &settings_literal)
         .replace("__DROP_UNKNOWN_SETTINGS__", drop_unknown_literal)
         .replace("__REJECT_ROOT_AGENT__", reject_root_agent_literal)
+        .replace(
+            "__CANONICALIZE_NATIVE_SETTINGS__",
+            canonicalize_native_settings_literal,
+        )
         .replace("__LOG__", &log_literal);
         std::fs::write(&script, body).expect("write fake Tycode script");
         #[cfg(unix)]

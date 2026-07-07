@@ -2153,7 +2153,10 @@ mod tests {
             host_stream(),
             FrameKind::BackendConfigSnapshots,
             1,
-            &BackendConfigSnapshotsPayload { snapshots: vec![] },
+            &BackendConfigSnapshotsPayload {
+                snapshots: vec![],
+                native_settings: vec![],
+            },
         )
         .expect("serialize BackendConfigSnapshots");
 

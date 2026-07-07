@@ -129,18 +129,22 @@ pub fn SessionsView() -> impl IntoView {
                                 />
                             }.into_any();
                         }
+                        // Search only covers loaded sessions. If the current
+                        // page has no matches but the server reports older
+                        // pages exist, still surface the load-more affordance
+                        // so the user isn't stranded on "No matches".
                         return view! {
-                            <EmptyState
-                                title="No matches"
-                                body="No sessions match that search. Try a different name or backend."
-                                icon="\u{1F50D}"
-                                data_mobile_test="sessions-empty-search"
-                            />
+                            <div>
+                                <EmptyState
+                                    title="No matches"
+                                    body="No sessions match that search. Try a different name or backend."
+                                    icon="\u{1F50D}"
+                                    data_mobile_test="sessions-empty-search"
+                                />
+                                {load_more_affordance(&state)}
+                            </div>
                         }.into_any();
                     }
-                    let loading_more = state
-                        .active_session_list_state()
-                        .is_some_and(|list| list.loading_more);
                     view! {
                         <div class="session-list" data-mobile-test="sessions-list">
                             {sessions.into_iter().map(|session| {
@@ -251,24 +255,59 @@ pub fn SessionsView() -> impl IntoView {
                                     </Card>
                                 }
                             }).collect::<Vec<_>>()}
-                            {if loading_more {
-                                view! {
-                                    <div class="view-loading-inline" data-mobile-test="sessions-loading-more">
-                                        <Spinner
-                                            aria_label="Loading more sessions".to_string()
-                                            data_mobile_test="sessions-loading-more-spinner"
-                                        />
-                                        <span>"Loading more sessions…"</span>
-                                    </div>
-                                }.into_any()
-                            } else {
-                                view! { <div></div> }.into_any()
-                            }}
+                            {load_more_affordance(&state)}
                         </div>
                     }.into_any()
                 }}
             </div>
         </div>
+    }
+}
+
+/// Renders the explicit "load more" affordance for the active host's session
+/// page: a spinner while a load is in flight, a "Load older sessions" button
+/// when the server reports `More` pages, and nothing otherwise. Shared by the
+/// populated list and the no-search-match state so older pages stay reachable
+/// even when the currently-loaded page has no matches. Signal reads happen at
+/// call time inside the caller's reactive closure, so this stays a live
+/// projection of state — it is not a snapshot.
+fn load_more_affordance(state: &AppState) -> AnyView {
+    let list_state = state.active_session_list_state();
+    let loading_more = list_state.as_ref().is_some_and(|list| list.loading_more);
+    let has_more = list_state.as_ref().is_some_and(|list| list.has_more());
+    let state_for_more = state.clone();
+    let on_load_more = Callback::new(move |_: ()| {
+        if let Some(host) = state_for_more.active_local_host_id.get_untracked() {
+            crate::dispatch::load_next_session_page(&state_for_more, &host);
+        }
+    });
+    if loading_more {
+        view! {
+            <div class="view-loading-inline" data-mobile-test="sessions-loading-more">
+                <Spinner
+                    aria_label="Loading more sessions".to_string()
+                    data_mobile_test="sessions-loading-more-spinner"
+                />
+                <span>"Loading more sessions…"</span>
+            </div>
+        }
+        .into_any()
+    } else if has_more {
+        view! {
+            <div class="sessions-load-more" data-mobile-test="sessions-load-more">
+                <Button
+                    label="Load older sessions"
+                    variant=ButtonVariant::Secondary
+                    size=ButtonSize::Compact
+                    full_width=true
+                    data_mobile_test="sessions-load-more-button"
+                    on_click=on_load_more
+                />
+            </div>
+        }
+        .into_any()
+    } else {
+        view! { <div></div> }.into_any()
     }
 }
 
@@ -546,6 +585,7 @@ mod wasm_tests {
                     host_for_mount.clone(),
                     SessionListLoadState::from_page(
                         protocol::SessionListPageInfo {
+                            scope: protocol::SessionListScope::RootSessions,
                             cursor: protocol::SessionListCursor {
                                 generation: protocol::SessionListGeneration(1),
                                 offset: 0,
@@ -593,6 +633,292 @@ mod wasm_tests {
             count.text_content().unwrap_or_default(),
             "1",
             "active search should show filtered result count"
+        );
+    }
+
+    fn more_page(limit: u32, total: u32, next_offset: u32) -> protocol::SessionListPageInfo {
+        protocol::SessionListPageInfo {
+            scope: protocol::SessionListScope::RootSessions,
+            cursor: protocol::SessionListCursor {
+                generation: protocol::SessionListGeneration(1),
+                offset: 0,
+            },
+            limit,
+            total_count: total,
+            status: protocol::SessionListPageStatus::More {
+                next_cursor: protocol::SessionListCursor {
+                    generation: protocol::SessionListGeneration(1),
+                    offset: next_offset,
+                },
+            },
+        }
+    }
+
+    /// When the server reports more pages available (`status == More`) and no
+    /// load is in flight, the list surfaces an explicit "Load older sessions"
+    /// affordance rather than auto-draining. Once a load is in flight
+    /// (`loading_more`), that affordance is replaced by the loading spinner.
+    #[wasm_bindgen_test]
+    async fn sessions_load_more_affordance_toggles_with_load_state() {
+        let host = LocalHostId("host-more".to_owned());
+        let container = make_container();
+        let host_for_mount = host.clone();
+        let state_handle = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let sink = state_handle.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.sessions.set(vec![
+                fixture(&host_for_mount, "s-1", "Code review"),
+                fixture(&host_for_mount, "s-2", "Onboarding draft"),
+            ]);
+            state.session_lists_by_host.update(|lists| {
+                lists.insert(
+                    host_for_mount.clone(),
+                    SessionListLoadState::from_page(more_page(2, 5, 2), 2),
+                );
+            });
+            *sink.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <SessionsView /> }
+        });
+        next_tick().await;
+
+        // More pages available, nothing loading -> explicit button, no spinner.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-load-more-button']")
+                .unwrap()
+                .is_some(),
+            "a 'Load older sessions' button must render when more pages exist"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-loading-more']")
+                .unwrap()
+                .is_none(),
+            "no in-flight spinner before the user asks for more"
+        );
+
+        // Flip to an in-flight load -> spinner replaces the button.
+        let state = state_handle.borrow().clone().unwrap();
+        state.session_lists_by_host.update(|lists| {
+            if let Some(list) = lists.get_mut(&host) {
+                list.loading_more = true;
+            }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-loading-more']")
+                .unwrap()
+                .is_some(),
+            "in-flight load must show the loading spinner"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-load-more-button']")
+                .unwrap()
+                .is_none(),
+            "the load-more button must hide while a load is in flight"
+        );
+    }
+
+    /// Search only covers loaded sessions. When the current page has no
+    /// matches for the active query but the server reports older pages
+    /// (`status == More`), the no-match state must still offer "Load older
+    /// sessions" so the user isn't stranded — and while that load is in
+    /// flight the spinner replaces the button, same as the populated list.
+    #[wasm_bindgen_test]
+    async fn sessions_no_match_still_offers_load_more_when_more_pages_exist() {
+        let host = LocalHostId("host-no-match-more".to_owned());
+        let container = make_container();
+        let host_for_mount = host.clone();
+        let state_handle = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let sink = state_handle.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.sessions.set(vec![
+                fixture(&host_for_mount, "s-1", "Code review"),
+                fixture(&host_for_mount, "s-2", "Onboarding draft"),
+            ]);
+            state.session_lists_by_host.update(|lists| {
+                lists.insert(
+                    host_for_mount.clone(),
+                    SessionListLoadState::from_page(more_page(2, 5, 2), 2),
+                );
+            });
+            *sink.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <SessionsView /> }
+        });
+        next_tick().await;
+
+        // Type a query that matches none of the loaded sessions.
+        let input: web_sys::HtmlInputElement = container
+            .query_selector("[data-mobile-test='sessions-search']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.set_value("zzzz-no-match");
+        let ev = web_sys::Event::new("input").unwrap();
+        input.dispatch_event(&ev).unwrap();
+        next_tick().await;
+
+        // No-match state is shown, but the load-more affordance rides along.
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-empty-search']")
+                .unwrap()
+                .is_some(),
+            "no-match state must render for an unmatched query"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-load-more-button']")
+                .unwrap()
+                .is_some(),
+            "no-match state must still offer 'Load older sessions' when more pages exist"
+        );
+
+        // While a load is in flight, the spinner replaces the button here too.
+        let state = state_handle.borrow().clone().unwrap();
+        state.session_lists_by_host.update(|lists| {
+            if let Some(list) = lists.get_mut(&host) {
+                list.loading_more = true;
+            }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-loading-more']")
+                .unwrap()
+                .is_some(),
+            "in-flight load must show the spinner in the no-match state"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-load-more-button']")
+                .unwrap()
+                .is_none(),
+            "the load-more button must hide while a load is in flight in the no-match state"
+        );
+    }
+
+    /// A no-match search on a `Complete` page has no older pages to fetch, so
+    /// it must not offer a load-more affordance — that would falsely imply
+    /// more sessions exist to search.
+    #[wasm_bindgen_test]
+    async fn sessions_no_match_has_no_load_more_on_complete_page() {
+        let host = LocalHostId("host-no-match-complete".to_owned());
+        let container = make_container();
+        let host_for_mount = host.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state
+                .sessions
+                .set(vec![fixture(&host_for_mount, "s-1", "Code review")]);
+            state.session_lists_by_host.update(|lists| {
+                lists.insert(
+                    host_for_mount.clone(),
+                    SessionListLoadState::from_page(
+                        protocol::SessionListPageInfo {
+                            scope: protocol::SessionListScope::RootSessions,
+                            cursor: protocol::SessionListCursor {
+                                generation: protocol::SessionListGeneration(1),
+                                offset: 0,
+                            },
+                            limit: 20,
+                            total_count: 1,
+                            status: protocol::SessionListPageStatus::Complete,
+                        },
+                        1,
+                    ),
+                );
+            });
+            provide_context(state);
+            view! { <SessionsView /> }
+        });
+        next_tick().await;
+
+        let input: web_sys::HtmlInputElement = container
+            .query_selector("[data-mobile-test='sessions-search']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.set_value("zzzz-no-match");
+        let ev = web_sys::Event::new("input").unwrap();
+        input.dispatch_event(&ev).unwrap();
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-empty-search']")
+                .unwrap()
+                .is_some(),
+            "no-match state must render for an unmatched query"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-load-more-button']")
+                .unwrap()
+                .is_none(),
+            "a complete page must not offer load-more in the no-match state"
+        );
+    }
+
+    /// A complete page (`status == Complete`) offers no "load more" affordance
+    /// and shows no in-flight spinner — the list is fully rendered.
+    #[wasm_bindgen_test]
+    async fn sessions_complete_page_has_no_load_more_affordance() {
+        let host = LocalHostId("host-complete".to_owned());
+        let container = make_container();
+        let host_for_mount = host.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state
+                .sessions
+                .set(vec![fixture(&host_for_mount, "s-1", "Code review")]);
+            state.session_lists_by_host.update(|lists| {
+                lists.insert(
+                    host_for_mount.clone(),
+                    SessionListLoadState::from_page(
+                        protocol::SessionListPageInfo {
+                            scope: protocol::SessionListScope::RootSessions,
+                            cursor: protocol::SessionListCursor {
+                                generation: protocol::SessionListGeneration(1),
+                                offset: 0,
+                            },
+                            limit: 20,
+                            total_count: 1,
+                            status: protocol::SessionListPageStatus::Complete,
+                        },
+                        1,
+                    ),
+                );
+            });
+            provide_context(state);
+            view! { <SessionsView /> }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-load-more-button']")
+                .unwrap()
+                .is_none(),
+            "a complete page must not offer a load-more button"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='sessions-loading-more']")
+                .unwrap()
+                .is_none(),
+            "a complete page must not show an in-flight spinner"
         );
     }
 

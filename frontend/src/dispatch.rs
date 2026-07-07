@@ -35,11 +35,11 @@ use protocol::{
 use crate::line_source::FileLines;
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, ActiveTerminalRef, AgentInfo, AppState, ChatMessageEntry,
-    CodeIntelKey, ConnectionStatus, OpenFile, OrchestrationRecord, ProjectInfo,
-    ProjectReferencesMode, ProjectReferencesUiState, ReviewActionTarget, SessionHistoryState,
-    SessionInfo, StreamingState, StreamingToolRequest, TabContent, TerminalInfo, ToolCallId,
-    ToolRequestEntry, TransientEvent, WorkflowPanelError, reduce_diff_response, root_display_name,
-    sort_project_infos,
+    CodeIntelKey, ConnectionStatus, NativeSettingsSaveState, OpenFile, OrchestrationRecord,
+    ProjectInfo, ProjectReferencesMode, ProjectReferencesUiState, ReviewActionTarget,
+    SessionHistoryState, SessionInfo, StreamingState, StreamingToolRequest, TabContent,
+    TerminalInfo, ToolCallId, ToolRequestEntry, TransientEvent, WorkflowPanelError,
+    reduce_diff_response, root_display_name, sort_project_infos,
 };
 
 struct FrontendSeqValidator {
@@ -551,6 +551,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     errors.insert(host_id.to_string(), message);
                 });
                 clear_session_history_loading_on_error(state, host_id, &payload);
+                // A backend-native settings save is a `SetSetting` whose result
+                // only lands via a refreshed native snapshot. If the server
+                // rejects it (e.g. Tycode SaveSettings fails), no snapshot is
+                // emitted, so an in-flight `Pending` save would leave the native
+                // settings page stuck in "Saving…" forever. Flip it to `Failed`
+                // so controls unlock and the server's reason is shown.
+                fail_native_settings_pending_on_error(state, host_id, &payload);
                 // Release any review-side pending gate the rejected
                 // command was holding. Without this, a server-side
                 // failure (unknown project, git error, malformed
@@ -800,6 +807,39 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                             host_snapshots.insert(snapshot.backend_kind, snapshot);
                         }
                     });
+                    // The server force-emits a native-settings snapshot after
+                    // every native save (bypassing dedup), so a frame always
+                    // arrives even when the saved document is unchanged (an
+                    // accepted no-op or a canonicalize-to-current). Any in-flight
+                    // native save for a backend in this frame is therefore
+                    // complete — clear its pending gate so the settings page
+                    // unlocks instead of sitting in "Saving…" waiting for a
+                    // settings-value change that will never come.
+                    let native_backends: Vec<_> = payload
+                        .native_settings
+                        .iter()
+                        .map(|snapshot| snapshot.backend_kind)
+                        .collect();
+                    state.backend_native_settings.update(|snapshots_by_host| {
+                        let host_snapshots =
+                            snapshots_by_host.entry(host_id.to_string()).or_default();
+                        host_snapshots.clear();
+                        for snapshot in payload.native_settings {
+                            host_snapshots.insert(snapshot.backend_kind, snapshot);
+                        }
+                    });
+                    if !native_backends.is_empty() {
+                        state.native_settings_save_state.update(|states_by_host| {
+                            if let Some(by_kind) = states_by_host.get_mut(host_id) {
+                                for kind in &native_backends {
+                                    by_kind.remove(kind);
+                                }
+                                if by_kind.is_empty() {
+                                    states_by_host.remove(host_id);
+                                }
+                            }
+                        });
+                    }
                 }
                 Err(error) => report_dispatch_error(
                     state,
@@ -3450,6 +3490,45 @@ fn clear_workflow_error_for_kinds(state: &AppState, host_id: &str, kinds: &[Fram
 /// Submit/Cancel/AddComment/etc. gates, keyed by review id and target).
 /// Anything else is ignored — those frames don't have a per-request UI
 /// gate to release.
+/// Release the native-settings save gate when a `SetSetting` command is rejected
+/// by the server. A native save's result only arrives via a refreshed native
+/// snapshot; a server-side rejection emits none, so any in-flight `Pending` save
+/// would otherwise keep the native settings page disabled and stuck in
+/// "Saving…". `CommandError` carries no backend/setting discriminator, so mark
+/// every `Pending` native save on this host `Failed` with the server's message —
+/// conservative and scoped to native settings (existing `Failed` entries and
+/// non-native command errors are left untouched).
+fn fail_native_settings_pending_on_error(
+    state: &AppState,
+    host_id: &str,
+    payload: &CommandErrorPayload,
+) {
+    if !matches!(payload.request_kind, FrameKind::SetSetting) {
+        return;
+    }
+    let has_pending = state.native_settings_save_state.with_untracked(|states| {
+        states.get(host_id).is_some_and(|by_kind| {
+            by_kind
+                .values()
+                .any(|save| matches!(save, NativeSettingsSaveState::Pending { .. }))
+        })
+    });
+    if !has_pending {
+        return;
+    }
+    state.native_settings_save_state.update(|states| {
+        if let Some(by_kind) = states.get_mut(host_id) {
+            for save in by_kind.values_mut() {
+                if matches!(save, NativeSettingsSaveState::Pending { .. }) {
+                    *save = NativeSettingsSaveState::Failed {
+                        message: payload.message.clone(),
+                    };
+                }
+            }
+        }
+    });
+}
+
 fn clear_review_pending_on_error(state: &AppState, host_id: &str, payload: &CommandErrorPayload) {
     match payload.request_kind {
         FrameKind::ReviewCreate => {
@@ -4716,6 +4795,18 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
         for snapshot in payload.backend_config_snapshots {
             host_snapshots.insert(snapshot.backend_kind, snapshot);
         }
+    });
+    // Bootstrap doesn't carry backend-native settings (they arrive via a later
+    // BackendConfigSnapshots frame once probed). Clear any stale entries from a
+    // prior connection so the native settings page never shows old values before
+    // the follow-up snapshot lands.
+    state.backend_native_settings.update(|snapshots_by_host| {
+        if let Some(host_snapshots) = snapshots_by_host.get_mut(host_id) {
+            host_snapshots.clear();
+        }
+    });
+    state.native_settings_save_state.update(|states_by_host| {
+        states_by_host.remove(host_id);
     });
     state.sessions.update(|sessions| {
         sessions.retain(|session| session.host_id != host_id);

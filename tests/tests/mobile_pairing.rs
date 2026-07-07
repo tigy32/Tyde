@@ -343,60 +343,53 @@ async fn mqtt_mobile_duplicate_load_agent_reports_command_error() {
 }
 
 #[tokio::test]
-async fn enabling_mobile_uses_default_emqx_mqtt_broker() {
+async fn enabling_mobile_without_pairing_fails_closed() {
     let harness = Harness::new().await;
     let mut desktop = harness.connect_desktop().await;
     expect_initial_replay(&mut desktop).await;
 
     set_mobile_enabled(&mut desktop, true).await;
-    let online = wait_for_mobile_state(
-        &mut desktop,
-        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
-        "MobileBrokerStatus::Online",
-    )
-    .await;
-    match online.broker_status {
-        MobileBrokerStatus::Online { broker_url } => {
-            assert_eq!(
-                broker_url.as_str(),
-                mqtt_transport::DEFAULT_MOBILE_MQTT_BROKER_URL
-            );
-            assert_ne!(broker_url.as_str(), "wss://broker.tyde.dev/relay");
-        }
-        other => panic!("expected Online broker status, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn plaintext_public_mqtt_url_is_rejected() {
-    let harness = Harness::new().await;
-    let mut desktop = harness.connect_desktop().await;
-    expect_initial_replay(&mut desktop).await;
-
-    set_mobile_broker_url(
-        &mut desktop,
-        Some(BrokerUrl::new("mqtt://broker.example.test:1883").expect("broker URL")),
-    )
-    .await;
-    set_mobile_enabled(&mut desktop, true).await;
-    let error = wait_for_mobile_state(
+    let repair = wait_for_mobile_state(
         &mut desktop,
         |state| {
             matches!(
                 state.broker_status,
-                MobileBrokerStatus::Error {
-                    code: MobileAccessErrorCode::InvalidConfig,
+                MobileBrokerStatus::RepairRequired {
+                    code: MobileAccessErrorCode::RepairRequired,
                     ..
                 }
             )
         },
-        "MobileBrokerStatus::Error",
+        "MobileBrokerStatus::RepairRequired",
     )
     .await;
-    let MobileBrokerStatus::Error { message, .. } = error.broker_status else {
-        panic!("expected Error broker status");
-    };
-    assert!(message.contains("insecure"));
+    match repair.broker_status {
+        MobileBrokerStatus::RepairRequired { message, .. } => {
+            assert!(message.contains("tycode.dev"));
+        }
+        other => panic!("expected RepairRequired broker status, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn plaintext_public_mqtt_url_is_rejected_at_settings_write() {
+    let harness = Harness::new().await;
+    let mut desktop = harness.connect_desktop().await;
+    expect_initial_replay(&mut desktop).await;
+
+    desktop
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::MobileBrokerUrl {
+                broker_url: Some(
+                    BrokerUrl::new("mqtt://broker.example.test:1883").expect("broker URL"),
+                ),
+            },
+        })
+        .await
+        .expect("send invalid broker setting");
+    let error = wait_for_command_error(&mut desktop, "invalid mobile broker setting").await;
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(error.message.contains("insecure"));
 }
 
 #[tokio::test]
@@ -591,10 +584,14 @@ async fn mqtt_mobile_bootstrap_pages_large_session_store() {
         .expect("serialize mobile HostBootstrap envelope")
         .len();
     let bootstrap: HostBootstrapPayload = env.parse_payload().expect("parse HostBootstrap");
+    assert_eq!(
+        bootstrap.session_list.scope,
+        protocol::SessionListScope::RootSessions
+    );
     assert_eq!(bootstrap.session_list.total_count, 300);
     assert_eq!(
         bootstrap.sessions.len(),
-        protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT as usize
+        protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT as usize
     );
     assert!(
         serialized_len < 128 * 1024,
@@ -611,8 +608,9 @@ async fn mqtt_mobile_bootstrap_pages_large_session_store() {
             &mut mobile,
             FrameKind::ListSessions,
             &ListSessionsPayload {
+                scope: Some(protocol::SessionListScope::RootSessions),
                 cursor: Some(next_cursor),
-                limit: Some(protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT),
+                limit: Some(protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT),
             },
         )
         .await;
@@ -623,6 +621,7 @@ async fn mqtt_mobile_bootstrap_pages_large_session_store() {
         )
         .await;
         let page: protocol::SessionListPayload = env.parse_payload().expect("parse SessionList");
+        assert_eq!(page.page.scope, protocol::SessionListScope::RootSessions);
         assert_eq!(page.page.total_count, 300);
         loaded += page.sessions.len();
         match page.page.status {

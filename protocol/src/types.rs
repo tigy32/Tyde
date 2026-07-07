@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::str::FromStr;
 
 use schemars::JsonSchema;
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeOwned, Error as DeError};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 /// Prerelease-capable, traversal-safe release identifier used as the versioned
@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 35;
+pub const PROTOCOL_VERSION: u32 = 36;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -23,6 +23,7 @@ pub const TYDE_VERSION: Version = Version {
 /// host and the browser/PWA client (no mixed content; broker terminates TLS).
 pub const DEFAULT_MOBILE_MQTT_BROKER_URL: &str = "wss://broker.emqx.io:8084/mqtt";
 pub const DEFAULT_SESSION_LIST_PAGE_LIMIT: u32 = 64;
+pub const DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT: u32 = 20;
 pub const MAX_SESSION_LIST_PAGE_LIMIT: u32 = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -121,8 +122,222 @@ impl fmt::Display for BrokerUrl {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ManagedBrokerRegion(String);
+
+impl ManagedBrokerRegion {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ProtocolTypeError::EmptyIdentifier {
+                type_name: "ManagedBrokerRegion",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ManagedBrokerRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for ManagedBrokerRegion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedBrokerRegion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ManagedBrokerAuthorizerName(String);
+
+impl ManagedBrokerAuthorizerName {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ProtocolTypeError::EmptyIdentifier {
+                type_name: "ManagedBrokerAuthorizerName",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ManagedBrokerAuthorizerName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for ManagedBrokerAuthorizerName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedBrokerAuthorizerName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ManagedBrokerGrantId(String);
+
+impl ManagedBrokerGrantId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ProtocolTypeError::EmptyIdentifier {
+                type_name: "ManagedBrokerGrantId",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ManagedBrokerGrantId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for ManagedBrokerGrantId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedBrokerGrantId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ManagedBrokerClientId(String);
+
+impl ManagedBrokerClientId {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ProtocolTypeError::EmptyIdentifier {
+                type_name: "ManagedBrokerClientId",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ManagedBrokerClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for ManagedBrokerClientId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedBrokerClientId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ManagedBrokerTopicNamespace(String);
+
+impl ManagedBrokerTopicNamespace {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ProtocolTypeError::EmptyIdentifier {
+                type_name: "ManagedBrokerTopicNamespace",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ManagedBrokerTopicNamespace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for ManagedBrokerTopicNamespace {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedBrokerTopicNamespace {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MobilePairingOfferId(pub String);
 
 impl MobilePairingOfferId {
@@ -144,6 +359,24 @@ impl MobilePairingOfferId {
 impl fmt::Display for MobilePairingOfferId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl Serialize for MobilePairingOfferId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MobilePairingOfferId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
     }
 }
 
@@ -1928,6 +2161,12 @@ pub enum HostSettingValue {
         backend: BackendKind,
         values: BackendConfigValues,
     },
+    /// Replace a backend-native settings document through the backend's own
+    /// settings protocol. Tyde does not persist this payload in host settings.
+    BackendNativeSettings {
+        backend: BackendKind,
+        settings: Value,
+    },
     /// Replace all explicit server-owned Launch Profiles.
     LaunchProfiles {
         profiles: Vec<HostLaunchProfileConfig>,
@@ -2051,6 +2290,46 @@ pub struct BackendConfigSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendConfigSnapshotsPayload {
     pub snapshots: Vec<BackendConfigSnapshot>,
+    /// Backend-native, JSON-schema-driven settings snapshots. These carry the
+    /// backend's current settings document and grouped schemas as one typed
+    /// server-owned state update for UIs that render backend-native settings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_settings: Vec<BackendNativeSettingsSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendNativeSettingsGroupKind {
+    Core,
+    Module,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendNativeSettingsGroup {
+    pub id: String,
+    pub title: String,
+    pub kind: BackendNativeSettingsGroupKind,
+    /// Path inside the backend settings object whose value this group edits.
+    /// Empty means the group's schema properties are top-level settings fields.
+    #[serde(default)]
+    pub settings_path: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub schema: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendNativeSettingsSnapshot {
+    pub backend_kind: BackendKind,
+    pub status: BackendConfigSnapshotStatus,
+    /// Current backend-native settings values. Omitted when unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Value>,
+    /// Grouped JSON schemas that describe editable regions of `settings`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<BackendNativeSettingsGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2094,6 +2373,71 @@ pub struct MobilePairingOfferPayload {
     pub expires_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedBrokerProvider {
+    AwsIotCore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedBrokerRole {
+    Host,
+    Mobile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedBrokerEndpoint {
+    pub endpoint: BrokerUrl,
+    pub provider: ManagedBrokerProvider,
+    pub region: ManagedBrokerRegion,
+    pub authorizer_name: ManagedBrokerAuthorizerName,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedBrokerConnectAuth {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket_url: Option<BrokerUrl>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for ManagedBrokerConnectAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ManagedBrokerConnectAuth")
+            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field(
+                "websocket_url",
+                &self.websocket_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("header_count", &self.headers.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedBrokerCredentialScope {
+    pub namespace: ManagedBrokerTopicNamespace,
+    pub role: ManagedBrokerRole,
+    pub publish: Vec<String>,
+    pub subscribe: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedBrokerCredentials {
+    pub grant_id: ManagedBrokerGrantId,
+    pub client_id: ManagedBrokerClientId,
+    pub connect: ManagedBrokerConnectAuth,
+    pub scope: ManagedBrokerCredentialScope,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MobileBrokerStatus {
@@ -2106,6 +2450,10 @@ pub enum MobileBrokerStatus {
     },
     Error {
         broker_url: Option<BrokerUrl>,
+        code: MobileAccessErrorCode,
+        message: String,
+    },
+    RepairRequired {
         code: MobileAccessErrorCode,
         message: String,
     },
@@ -2133,6 +2481,36 @@ pub enum MobilePairingState {
         code: MobileAccessErrorCode,
         message: String,
     },
+    RepairRequired {
+        code: MobileAccessErrorCode,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileServiceAuthStatePayload {
+    pub state: MobileServiceAuthState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MobileServiceAuthState {
+    Idle,
+    Authenticating,
+    Authenticated {
+        expires_at_ms: u64,
+    },
+    PassRequired {
+        message: String,
+        paywall_url: String,
+    },
+    AuthFailed {
+        message: String,
+    },
+    ServiceUnavailable {
+        message: String,
+        retryable: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2141,12 +2519,18 @@ pub enum MobileDeviceState {
     Paired,
     Connected,
     Revoked,
+    RepairRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MobileAccessErrorCode {
     InvalidConfig,
+    PassRequired,
+    RepairRequired,
+    ServiceAuthRequired,
+    ServiceAuthFailed,
+    ServiceUnavailable,
     BrokerUnavailable,
     BrokerConnectionFailed,
     BrokerProtocol,
@@ -2454,6 +2838,14 @@ pub struct SessionListCursor {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionListScope {
+    RootSessions,
+    #[default]
+    AllSessions,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionListPageStatus {
     #[default]
@@ -2465,6 +2857,8 @@ pub enum SessionListPageStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionListPageInfo {
+    #[serde(default)]
+    pub scope: SessionListScope,
     pub cursor: SessionListCursor,
     pub limit: u32,
     pub total_count: u32,
@@ -2474,6 +2868,7 @@ pub struct SessionListPageInfo {
 impl Default for SessionListPageInfo {
     fn default() -> Self {
         Self {
+            scope: SessionListScope::AllSessions,
             cursor: SessionListCursor::default(),
             limit: DEFAULT_SESSION_LIST_PAGE_LIMIT,
             total_count: 0,
@@ -2493,6 +2888,8 @@ impl SessionListPageInfo {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListSessionsPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<SessionListScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<SessionListCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5971,8 +6368,162 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_five() {
-        assert_eq!(PROTOCOL_VERSION, 35);
+    fn protocol_version_is_thirty_six() {
+        assert_eq!(PROTOCOL_VERSION, 36);
+    }
+
+    #[test]
+    fn session_list_scope_round_trips_and_defaults_to_all() {
+        let payload = ListSessionsPayload {
+            scope: Some(SessionListScope::RootSessions),
+            cursor: None,
+            limit: Some(20),
+        };
+        let encoded = serde_json::to_value(&payload).expect("serialize ListSessionsPayload");
+        assert_eq!(encoded["scope"], serde_json::json!("root_sessions"));
+        let decoded: ListSessionsPayload =
+            serde_json::from_value(encoded).expect("deserialize ListSessionsPayload");
+        assert_eq!(decoded.scope, Some(SessionListScope::RootSessions));
+
+        let legacy_page = serde_json::json!({
+            "cursor": { "generation": 1, "offset": 0 },
+            "limit": 64,
+            "total_count": 0,
+            "status": { "kind": "complete" },
+        });
+        let page: SessionListPageInfo =
+            serde_json::from_value(legacy_page).expect("deserialize SessionListPageInfo");
+        assert_eq!(page.scope, SessionListScope::AllSessions);
+    }
+
+    #[test]
+    fn managed_broker_credentials_round_trip_without_debug_secret_leak() {
+        let mut headers = BTreeMap::new();
+        headers.insert("x-tycode-grant".to_owned(), "signed-grant-token".to_owned());
+        let credentials = ManagedBrokerCredentials {
+            grant_id: ManagedBrokerGrantId::new("grant_01J").expect("grant id"),
+            client_id: ManagedBrokerClientId::new("tyde/prod/pair_01J/host/grant_01J")
+                .expect("client id"),
+            connect: ManagedBrokerConnectAuth {
+                username: Some(
+                    "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant"
+                        .to_owned(),
+                ),
+                password: Some("signed-grant-token".to_owned()),
+                websocket_url: Some(
+                    BrokerUrl::new(
+                        "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=signed-grant-token"
+                    )
+                    .expect("websocket url"),
+                ),
+                headers,
+            },
+            scope: ManagedBrokerCredentialScope {
+                namespace: ManagedBrokerTopicNamespace::new("tyde/prod/pair_01J")
+                    .expect("namespace"),
+                role: ManagedBrokerRole::Host,
+                publish: vec!["tyde/prod/pair_01J/rooms/+/host-to-client".to_owned()],
+                subscribe: vec!["tyde/prod/pair_01J/rooms/+/client-to-host".to_owned()],
+            },
+            issued_at_ms: 1_760_000_000_000,
+            expires_at_ms: 1_760_000_900_000,
+        };
+
+        let json = serde_json::to_value(&credentials).expect("serialize credentials");
+        assert_eq!(json["grant_id"], "grant_01J");
+        assert_eq!(json["scope"]["role"], "host");
+        assert_eq!(
+            json["connect"]["headers"]["x-tycode-grant"],
+            "signed-grant-token"
+        );
+        assert_eq!(
+            json["connect"]["websocket_url"],
+            "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=signed-grant-token"
+        );
+        assert_eq!(
+            serde_json::from_value::<ManagedBrokerCredentials>(json)
+                .expect("deserialize credentials"),
+            credentials
+        );
+
+        let debug = format!("{:?}", credentials.connect);
+        assert!(
+            !debug.contains("signed-grant-token"),
+            "debug output leaked managed broker grant: {debug}"
+        );
+        assert!(
+            !debug.contains("a1234567890-ats.iot.us-west-2.amazonaws.com"),
+            "debug output leaked managed broker websocket URL: {debug}"
+        );
+        assert!(
+            !debug.contains("tycode-grant") && !debug.contains("x-tycode-grant"),
+            "debug output leaked managed broker grant/header details: {debug}"
+        );
+    }
+
+    #[test]
+    fn mobile_managed_access_states_are_protocol_typed() {
+        let repair = MobileAccessStatePayload {
+            broker_status: MobileBrokerStatus::RepairRequired {
+                code: MobileAccessErrorCode::RepairRequired,
+                message: "Legacy public broker pairing must be repaired".to_owned(),
+            },
+            pairing: MobilePairingState::RepairRequired {
+                code: MobileAccessErrorCode::RepairRequired,
+                message: "Legacy public broker pairing must be repaired".to_owned(),
+            },
+            paired_devices: vec![MobileDeviceSummary {
+                device_id: MobileDeviceId("dev_01J".to_owned()),
+                label: "Mike's iPhone".to_owned(),
+                key_fingerprint: "sha256:abc".to_owned(),
+                created_at_ms: 1,
+                last_seen_at_ms: None,
+                state: MobileDeviceState::RepairRequired,
+            }],
+        };
+
+        let json = serde_json::to_value(&repair).expect("serialize mobile access state");
+        assert_eq!(json["broker_status"]["kind"], "repair_required");
+        assert_eq!(json["pairing"]["kind"], "repair_required");
+        assert_eq!(json["paired_devices"][0]["state"], "repair_required");
+        assert_eq!(
+            serde_json::from_value::<MobileAccessStatePayload>(json)
+                .expect("deserialize mobile access state"),
+            repair
+        );
+    }
+
+    #[test]
+    fn mobile_service_auth_state_carries_paywall_outside_host_state() {
+        let auth = MobileServiceAuthStatePayload {
+            state: MobileServiceAuthState::PassRequired {
+                message: "A Tyggs Pass is required".to_owned(),
+                paywall_url: "https://tyggs.com/pass".to_owned(),
+            },
+        };
+
+        let json = serde_json::to_value(&auth).expect("serialize mobile service auth");
+        assert_eq!(json["state"]["kind"], "pass_required");
+        assert_eq!(json["state"]["paywall_url"], "https://tyggs.com/pass");
+        assert_eq!(
+            serde_json::from_value::<MobileServiceAuthStatePayload>(json)
+                .expect("deserialize mobile service auth"),
+            auth
+        );
+    }
+
+    #[test]
+    fn managed_semantic_newtypes_reject_empty_deserialization() {
+        assert!(serde_json::from_value::<ManagedBrokerRegion>(serde_json::json!("")).is_err());
+        assert!(
+            serde_json::from_value::<ManagedBrokerAuthorizerName>(serde_json::json!("")).is_err()
+        );
+        assert!(serde_json::from_value::<ManagedBrokerGrantId>(serde_json::json!("")).is_err());
+        assert!(serde_json::from_value::<ManagedBrokerClientId>(serde_json::json!("")).is_err());
+        assert!(
+            serde_json::from_value::<ManagedBrokerTopicNamespace>(serde_json::json!("")).is_err()
+        );
+        assert!(serde_json::from_value::<MobilePairingOfferId>(serde_json::json!("")).is_err());
     }
 
     #[test]

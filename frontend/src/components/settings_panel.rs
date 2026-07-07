@@ -5,21 +5,23 @@ use wasm_bindgen_futures::spawn_local;
 use crate::app::{connect_one_host, refresh_configured_hosts};
 use crate::bridge::{self, HostTransportConfig as BridgeHostTransportConfig};
 use crate::send::send_frame;
-use crate::state::{AppState, DiffViewMode, ToolOutputMode};
+use crate::state::{AppState, DiffViewMode, NativeSettingsSaveState, ToolOutputMode};
 
 use protocol::{
     BackendConfigField, BackendConfigFieldType, BackendConfigPersistenceMode,
-    BackendConfigSnapshotStatus, BackendConfigValues, BackendKind, BackendSetupAction,
+    BackendConfigSnapshotStatus, BackendConfigValues, BackendKind, BackendNativeSettingsGroup,
+    BackendNativeSettingsGroupKind, BackendNativeSettingsSnapshot, BackendSetupAction,
     BackendSetupInfo, BackendSetupStatus, BackgroundAgentFeature, BrokerUrl, CodeIntelProviderId,
-    CustomAgent, CustomAgentId, DEFAULT_MOBILE_MQTT_BROKER_URL, DiffContextMode, FrameKind,
-    HostExecutablePath, HostLaunchProfileConfig, HostSettingValue, LaunchProfileId,
-    McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus,
-    MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState,
-    ProjectId, RunBackendSetupPayload, SelectOption, SessionSchemaEntry, SessionSettingFieldType,
+    CustomAgent, CustomAgentId, DiffContextMode, FrameKind, HostExecutablePath,
+    HostLaunchProfileConfig, HostSettingValue, LaunchProfileId, McpServerConfig, McpServerId,
+    McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState,
+    MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState, ProjectId,
+    RunBackendSetupPayload, SelectOption, SessionSchemaEntry, SessionSettingFieldType,
     SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, SetSettingPayload, Skill,
     SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
 };
 
+use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
 use crate::components::session_settings::SessionSettingsControls;
@@ -31,14 +33,20 @@ use crate::send::{
 
 const RESERVED_MCP_NAMES: &[&str] = &["tyde-debug", "tyde-agent-control", "tyde-review-feedback"];
 
-/// Frontend-side mirror of `mqtt-transport::validate_broker_url`'s
-/// scheme acceptance rules. We intentionally check ONLY the scheme
-/// here (a coarse, low-risk filter) — the server is still the
-/// authoritative validator and will reject finer-grained problems
-/// like fragments or embedded credentials. Keeping this filter narrow
-/// means the user gets immediate visible feedback on the most common
-/// mistake ("mqtt://" vs "mqtts://") without the UI duplicating the
-/// full URL grammar the server checks.
+/// Frontend-side mirror of the server's broker-URL acceptance rules for the
+/// `mobile_broker_url` **dev override**. The server
+/// (`server::mobile_access::dev_broker_endpoint`, over
+/// `mqtt-transport::validate_broker_url`) is the authoritative validator; this
+/// mirror gives the user immediate inline feedback instead of a value that is
+/// accepted here but rejected on write.
+///
+/// Rules mirrored:
+/// - scheme must be `mqtts://` or `wss://` (no insecure/unknown schemes);
+/// - no embedded credentials (`@`) or fragments (`#`);
+/// - the URL must point at a **loopback** host (`localhost`, an IPv4 loopback
+///   like `127.0.0.1`, or the `[::1]` IPv6 loopback). Custom broker URLs are
+///   dev/test-only; the public default and any other host are rejected because
+///   production mobile access uses tycode.dev-managed AWS IoT.
 fn validate_broker_url_input(raw: &str) -> Result<(), &'static str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -61,6 +69,16 @@ fn validate_broker_url_input(raw: &str) -> Result<(), &'static str> {
         if after_scheme.contains('#') {
             return Err("Broker URL fragments (#…) are not supported.");
         }
+        // Dev-override loopback rule — matches the server, which fails closed
+        // for public/free/custom production brokers.
+        if !broker_url_host(after_scheme)
+            .as_deref()
+            .is_some_and(is_loopback_host)
+        {
+            return Err(
+                "Custom broker URLs are dev/test-only and must be a loopback host (localhost / 127.0.0.1). Leave blank for tycode.dev-managed access.",
+            );
+        }
         Ok(())
     } else if lower.starts_with("mqtt://")
         || lower.starts_with("ws://")
@@ -72,6 +90,40 @@ fn validate_broker_url_input(raw: &str) -> Result<(), &'static str> {
     } else {
         Err("Broker URL must start with mqtts:// or wss://.")
     }
+}
+
+/// Extracts the host from the part of a broker URL after `://`. The server
+/// parses the URL with the `url` crate and applies the same loopback check to
+/// `url::Url::host()`; this string extraction yields the same host for the
+/// broker URLs the field accepts. Callers have already rejected embedded
+/// credentials (`@`) and fragments (`#`). Returns `None` when no host is present.
+fn broker_url_host(after_scheme: &str) -> Option<String> {
+    // Authority is everything before the first path/query separator.
+    let authority = after_scheme.split(['/', '?']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    // IPv6 literal: "[::1]:8883" -> host "::1".
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest
+            .split_once(']')
+            .map(|(host, _)| host.to_owned())
+            .filter(|host| !host.is_empty());
+    }
+    // "host" or "host:port" -> host up to the first ':'.
+    let host = authority.split(':').next().unwrap_or("");
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
+/// Mirror of the server's `is_loopback_url` host check: `localhost` (case
+/// insensitive) or any IP literal whose address is a loopback address (covers
+/// `127.0.0.0/8` and `::1`).
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|addr| addr.is_loopback())
+            .unwrap_or(false)
 }
 
 /// Render the pairing `qr_uri` as an inline SVG QR code. Returns an
@@ -137,6 +189,9 @@ fn broker_status_line(status: &MobileBrokerStatus) -> String {
         MobileBrokerStatus::Connecting { .. } => "Connecting to broker…".to_owned(),
         MobileBrokerStatus::Online { .. } => "Broker online".to_owned(),
         MobileBrokerStatus::Error { message, .. } => format!("Broker error: {message}"),
+        MobileBrokerStatus::RepairRequired { message, .. } => {
+            format!("Repair required: {message}")
+        }
     }
 }
 
@@ -147,6 +202,7 @@ fn broker_status_slug(status: &MobileBrokerStatus) -> &'static str {
         MobileBrokerStatus::Connecting { .. } => "connecting",
         MobileBrokerStatus::Online { .. } => "online",
         MobileBrokerStatus::Error { .. } => "error",
+        MobileBrokerStatus::RepairRequired { .. } => "error",
     }
 }
 
@@ -165,6 +221,9 @@ fn pairing_status_line(phase: &MobilePairingState) -> Option<String> {
         }
         MobilePairingState::Cancelled { .. } => Some("Pairing cancelled.".to_owned()),
         MobilePairingState::Failed { message, .. } => Some(format!("Pairing failed: {message}")),
+        MobilePairingState::RepairRequired { message, .. } => {
+            Some(format!("Repair required: {message}"))
+        }
     }
 }
 
@@ -308,26 +367,48 @@ mod diff_pref_tests {
 
     // ---- broker URL validator ----
     //
-    // These tests mirror the rules the server-side `validate_broker_url`
-    // enforces in `mqtt-transport`. The frontend's filter is intentionally
-    // coarser (scheme + common shape) — the server is the authoritative
-    // validator. If the server tightens its rules and the frontend
-    // doesn't, a typed URL will still hit a server-side error and the
-    // existing inline-error path will surface it.
+    // These tests mirror the rules the server enforces for the dev-override
+    // `mobile_broker_url` (`server::mobile_access::dev_broker_endpoint` over
+    // `mqtt-transport::validate_broker_url`): secure scheme, no embedded
+    // credentials/fragments, and a loopback-only host. The server remains the
+    // authoritative validator; this mirror surfaces the same rejection inline.
 
     #[test]
     fn broker_url_validator_accepts_empty() {
-        // Empty input = "use host default", not an error.
+        // Empty input = "use managed access", not an error.
         assert!(validate_broker_url_input("").is_ok());
         assert!(validate_broker_url_input("   ").is_ok());
     }
 
     #[test]
-    fn broker_url_validator_accepts_mqtts_and_wss() {
-        assert!(validate_broker_url_input("mqtts://broker.example:8883").is_ok());
-        assert!(validate_broker_url_input("wss://broker.example/relay").is_ok());
-        // Case-insensitive on scheme — URLs are case-insensitive there.
-        assert!(validate_broker_url_input("MQTTS://broker.example:8883").is_ok());
+    fn broker_url_validator_accepts_loopback_hosts() {
+        // Loopback dev overrides are the only accepted custom brokers.
+        assert!(validate_broker_url_input("mqtts://localhost:8883").is_ok());
+        assert!(validate_broker_url_input("wss://127.0.0.1:8083/mqtt").is_ok());
+        assert!(validate_broker_url_input("wss://localhost/relay").is_ok());
+        // IPv6 loopback literal.
+        assert!(validate_broker_url_input("mqtts://[::1]:8883").is_ok());
+        // Case-insensitive on scheme and on the `localhost` host.
+        assert!(validate_broker_url_input("MQTTS://LOCALHOST:8883").is_ok());
+    }
+
+    #[test]
+    fn broker_url_validator_rejects_non_loopback_custom_broker() {
+        // A valid-scheme, valid-shape URL at a non-loopback host must be
+        // rejected inline — the server fails closed for it.
+        for bad in [
+            "mqtts://broker.example.test:8883",
+            "wss://broker.emqx.io:8084/mqtt",
+            "wss://192.168.1.10:8083/mqtt",
+            "mqtts://10.0.0.5:8883",
+        ] {
+            let err = validate_broker_url_input(bad)
+                .expect_err(&format!("expected non-loopback {bad:?} to be rejected"));
+            assert!(
+                err.contains("loopback"),
+                "error for {bad:?} must explain the loopback rule: {err}"
+            );
+        }
     }
 
     #[test]
@@ -668,10 +749,12 @@ impl SettingsTab {
                 "Mobile",
                 "Mobile connections",
                 "Enable mobile connections",
+                "Managed access",
+                "tycode.dev",
+                "AWS IoT",
                 "Broker URL",
-                "Public MQTT broker",
-                "MQTT",
-                "broker.emqx.io",
+                "Tyggs Pass",
+                "Repair",
                 "Encryption",
                 "Metadata",
                 "QR",
@@ -736,28 +819,33 @@ enum SettingsPage {
 }
 
 /// Backends that get their own sidebar page on the selected host, in the
-/// canonical backend order. Derived purely from the server-owned schema
-/// catalog — never from `enabled_backends`, and never hardcoded per backend.
+/// canonical backend order. Derived purely from server-owned state — never
+/// from `enabled_backends`, and never hardcoded per backend. A backend earns a
+/// page if it exposes a typed deep-config schema *or* the server has published
+/// a backend-native settings snapshot for it (e.g. Tycode's grouped settings).
 fn schema_backends(state: &AppState) -> Vec<BackendKind> {
     let Some(host_id) = state.selected_host_id.get() else {
         return Vec::new();
     };
     let schemas = state.backend_config_schemas.get();
-    let Some(host_schemas) = schemas.get(&host_id) else {
-        return Vec::new();
-    };
+    let host_schemas = schemas.get(&host_id);
+    let native = state.backend_native_settings.get();
+    let host_native = native.get(&host_id);
     all_backends()
         .into_iter()
         .filter(|kind| {
-            host_schemas
-                .get(kind)
-                .is_some_and(|schema| !schema.fields.is_empty())
+            let has_schema = host_schemas
+                .and_then(|m| m.get(kind))
+                .is_some_and(|schema| !schema.fields.is_empty());
+            let has_native = host_native.is_some_and(|m| m.contains_key(kind));
+            has_schema || has_native
         })
         .collect()
 }
 
 /// Search matching for a per-backend page: the backend's name plus the
-/// server-provided schema field labels and descriptions.
+/// server-provided schema field labels/descriptions and native settings group
+/// titles/descriptions.
 fn backend_page_matches_query(state: &AppState, kind: BackendKind, query: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -770,16 +858,28 @@ fn backend_page_matches_query(state: &AppState, kind: BackendKind, query: &str) 
         return false;
     };
     let schemas = state.backend_config_schemas.get();
-    let Some(schema) = schemas.get(&host_id).and_then(|m| m.get(&kind)) else {
-        return false;
-    };
-    schema.fields.iter().any(|field| {
-        field.label.to_lowercase().contains(&q)
-            || field
-                .description
-                .as_ref()
-                .is_some_and(|d| d.to_lowercase().contains(&q))
-    })
+    if let Some(schema) = schemas.get(&host_id).and_then(|m| m.get(&kind))
+        && schema.fields.iter().any(|field| {
+            field.label.to_lowercase().contains(&q)
+                || field
+                    .description
+                    .as_ref()
+                    .is_some_and(|d| d.to_lowercase().contains(&q))
+        })
+    {
+        return true;
+    }
+    let native = state.backend_native_settings.get();
+    if let Some(snapshot) = native.get(&host_id).and_then(|m| m.get(&kind)) {
+        return snapshot.groups.iter().any(|group| {
+            group.title.to_lowercase().contains(&q)
+                || group
+                    .description
+                    .as_ref()
+                    .is_some_and(|d| d.to_lowercase().contains(&q))
+        });
+    }
+    false
 }
 
 #[component]
@@ -2572,6 +2672,14 @@ fn BackendSettingsPage(kind: BackendKind) -> impl IntoView {
     let state = expect_context::<AppState>();
     let state_for_body = state.clone();
     let state_for_status = state.clone();
+    // The selected native-settings group (by id) lives at the page level, not
+    // inside the body closure, so it survives the body's reactive rerenders
+    // (a save marking `native_settings_save_state` Pending, or a fresh snapshot
+    // arriving) instead of snapping the user back to the Core tab each time.
+    // `None` means "use the first/Core group"; it's not backend state, just this
+    // page's view selection, and it resets when the user navigates to a
+    // different backend page (a new `BackendSettingsPage` instance).
+    let active_native_group = RwSignal::new(Option::<String>::None);
     let setup_info = move || {
         state_for_status
             .selected_host_backend_setup()
@@ -2611,11 +2719,15 @@ fn BackendSettingsPage(kind: BackendKind) -> impl IntoView {
 
         <p class="settings-description settings-panel-intro">{intro}</p>
 
-        {move || backend_page_body(&state_for_body, kind)}
+        {move || backend_page_body(&state_for_body, kind, active_native_group)}
     }
 }
 
-fn backend_page_body(state: &AppState, kind: BackendKind) -> AnyView {
+fn backend_page_body(
+    state: &AppState,
+    kind: BackendKind,
+    active_native_group: RwSignal<Option<String>>,
+) -> AnyView {
     let Some(host_id) = state.selected_host_id.get() else {
         return view! {
             <p class="settings-description">"Select a host to configure this backend."</p>
@@ -2630,8 +2742,19 @@ fn backend_page_body(state: &AppState, kind: BackendKind) -> AnyView {
     };
     let schemas = state.backend_config_schemas.get();
     let Some(schema) = schemas.get(&host_id).and_then(|m| m.get(&kind)).cloned() else {
-        // Transient: the nav fallback effect returns to Overview when the
-        // selected host's catalog no longer carries this backend.
+        // No typed deep-config schema. The backend may instead publish a
+        // backend-native settings snapshot (e.g. Tycode's grouped settings) —
+        // render that when present. Otherwise this is the transient window the
+        // nav fallback effect handles by returning to Overview.
+        if let Some(snapshot) = state
+            .backend_native_settings
+            .get()
+            .get(&host_id)
+            .and_then(|m| m.get(&kind))
+            .cloned()
+        {
+            return backend_native_settings_body(state, kind, &snapshot, active_native_group);
+        }
         return view! {
             <p class="settings-description">
                 "No configuration is available for this backend on the selected host."
@@ -3106,6 +3229,847 @@ fn update_backend_config(
     );
 }
 
+// ---- Backend-native, JSON-schema-driven settings (e.g. Tycode) ----
+
+/// Secret-like key markers. Native settings groups carry raw JSON schema, which
+/// is not guaranteed to flag secrets in a typed way, so mask defensively by key
+/// name and by the JSON-schema hints a backend might set.
+const NATIVE_SECRET_MARKERS: [&str; 6] = [
+    "api_key",
+    "apikey",
+    "password",
+    "secret",
+    "token",
+    "access_key",
+];
+
+/// Placeholder shown in place of any redacted secret value in JSON views.
+const SECRET_REDACTION: &str = "••••••••";
+
+/// Whether a key *name* alone marks a secret. Used for recursive redaction of
+/// nested JSON where no per-key schema is available.
+fn is_secret_key_name(key: &str) -> bool {
+    let lowered = key.to_lowercase();
+    NATIVE_SECRET_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+/// Whether a native settings property is a secret whose value must be masked and
+/// never rendered. Considers the key name plus JSON-schema secret hints.
+fn is_secret_native_key(key: &str, prop_schema: &Value) -> bool {
+    is_secret_key_name(key)
+        || prop_schema.get("format").and_then(Value::as_str) == Some("password")
+        || prop_schema.get("writeOnly").and_then(Value::as_bool) == Some(true)
+}
+
+/// Whether `value` contains any secret-like key at any depth.
+fn contains_secret(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, child)| is_secret_key_name(key) || contains_secret(child)),
+        Value::Array(items) => items.iter().any(contains_secret),
+        _ => false,
+    }
+}
+
+/// A copy of `value` with every secret-like key's value replaced by a redaction
+/// marker, recursively. Never exposes a stored secret in a rendered JSON view.
+fn redact_secrets(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, child)| {
+                    let redacted = if is_secret_key_name(key) {
+                        Value::String(SECRET_REDACTION.to_owned())
+                    } else {
+                        redact_secrets(child)
+                    };
+                    (key.clone(), redacted)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact_secrets).collect()),
+        other => other.clone(),
+    }
+}
+
+/// The primitive JSON-schema type for a property, unwrapping nullable type
+/// arrays like `["string", "null"]` to the first non-null type so nullable
+/// fields still render a typed control instead of falling through to raw JSON.
+fn native_primitive_type(prop_schema: &Value) -> Option<String> {
+    match prop_schema.get("type") {
+        Some(Value::String(single)) => Some(single.clone()),
+        Some(Value::Array(types)) => types
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|candidate| *candidate != "null")
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// Reactive save indicator for a backend's native settings on the selected host,
+/// derived from server-owned state. Returns `(saving, error)`: `saving` is true
+/// while a save is in flight (a `Pending` save whose base still equals the
+/// current server settings document, i.e. the server hasn't published the result
+/// yet); `error` carries the last failed-save reason.
+fn native_save_indicator(
+    state: &AppState,
+    kind: BackendKind,
+    settings: &Value,
+) -> (bool, Option<String>) {
+    let Some(host_id) = state.selected_host_id.get() else {
+        return (false, None);
+    };
+    match state
+        .native_settings_save_state
+        .get()
+        .get(&host_id)
+        .and_then(|m| m.get(&kind))
+    {
+        Some(NativeSettingsSaveState::Pending { base }) => (base == settings, None),
+        Some(NativeSettingsSaveState::Failed { message }) => (false, Some(message.clone())),
+        None => (false, None),
+    }
+}
+
+/// Sub-value of the settings document that a group edits: the whole document
+/// when `path` is empty, else the nested value at `path`.
+fn native_value_at_path<'a>(settings: &'a Value, path: &[String]) -> Option<&'a Value> {
+    let mut cursor = settings;
+    for segment in path {
+        cursor = cursor.get(segment)?;
+    }
+    Some(cursor)
+}
+
+/// The freshest full settings document for a backend's native snapshot, read
+/// untracked (edit-time read, not a reactive dependency). `None` when the server
+/// has not published a readable settings document.
+fn native_settings_root(state: &AppState, kind: BackendKind) -> Option<Value> {
+    let host_id = state.selected_host_id.get_untracked()?;
+    state
+        .backend_native_settings
+        .get_untracked()
+        .get(&host_id)
+        .and_then(|m| m.get(&kind))
+        .and_then(|snapshot| snapshot.settings.clone())
+}
+
+/// Set `value` at `path`/`key` inside `root`, creating intermediate objects as
+/// needed so an edit always lands somewhere well-formed.
+fn set_native_value(root: &mut Value, path: &[String], key: &str, value: Value) {
+    let mut cursor = root;
+    for segment in path {
+        if !cursor.is_object() {
+            *cursor = Value::Object(Map::new());
+        }
+        cursor = cursor
+            .as_object_mut()
+            .expect("cursor forced to object above")
+            .entry(segment.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+    }
+    if !cursor.is_object() {
+        *cursor = Value::Object(Map::new());
+    }
+    cursor
+        .as_object_mut()
+        .expect("cursor forced to object above")
+        .insert(key.to_owned(), value);
+}
+
+/// Apply one native-settings edit and send the whole updated document to the
+/// server via `HostSettingValue::BackendNativeSettings`. The backend replaces its
+/// native settings document wholesale (Tycode `SaveSettings { persist: true }`),
+/// so the full object is sent rather than a partial patch.
+///
+/// A native save is a full-document replace, so a second edit based on the same
+/// (now stale) snapshot would clobber the first. The edit is recorded as
+/// `Pending` against the pre-edit `base` document; the UI disables native
+/// controls until the server force-emits a fresh native-settings snapshot
+/// (which it does after every native save, even an unchanged one — see the
+/// `BackendConfigSnapshots` dispatch handler that clears the pending gate). On
+/// send failure the state flips to `Failed` so the controls re-enable and the
+/// error surfaces. Values are never logged.
+fn commit_native_setting(
+    state: &AppState,
+    kind: BackendKind,
+    path: &[String],
+    key: &str,
+    value: Value,
+) {
+    let Some(base) = native_settings_root(state, kind) else {
+        log::error!(
+            "cannot edit backend-native settings for {kind:?}: no current settings document"
+        );
+        return;
+    };
+    // Guard the wire path: if a save against this same base is already in flight,
+    // drop the edit (the controls are disabled, but synthetic events could still
+    // reach here).
+    let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
+        log::error!("cannot save backend-native settings for {kind:?}: no selected host stream");
+        return;
+    };
+    let already_pending = state
+        .native_settings_save_state
+        .get_untracked()
+        .get(&host_id)
+        .and_then(|m| m.get(&kind))
+        .is_some_and(
+            |save| matches!(save, NativeSettingsSaveState::Pending { base: b } if *b == base),
+        );
+    if already_pending {
+        return;
+    }
+
+    let mut root = base.clone();
+    set_native_value(&mut root, path, key, value);
+
+    // No-op: the edit didn't change the document. Don't send or lock — a save
+    // that leaves the document unchanged is pointless, and locking on it risks
+    // stranding the page in "Saving…".
+    if root == base {
+        return;
+    }
+
+    state.native_settings_save_state.update(|states| {
+        states
+            .entry(host_id.clone())
+            .or_default()
+            .insert(kind, NativeSettingsSaveState::Pending { base });
+    });
+
+    let state = state.clone();
+    let host_for_error = host_id.clone();
+    spawn_local(async move {
+        let payload = SetSettingPayload {
+            setting: HostSettingValue::BackendNativeSettings {
+                backend: kind,
+                settings: root,
+            },
+        };
+        if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SetSetting, &payload).await
+        {
+            log::error!("failed to send BackendNativeSettings for {kind:?}: {error}");
+            state.native_settings_save_state.update(|states| {
+                states.entry(host_for_error).or_default().insert(
+                    kind,
+                    NativeSettingsSaveState::Failed {
+                        message: "Failed to save settings. Check the connection and try again."
+                            .to_owned(),
+                    },
+                );
+            });
+        }
+    });
+}
+
+/// One backend's native settings page body. Explicit unavailable/ready states —
+/// current values never render as blank/default before the server publishes
+/// them, and an unavailable snapshot shows the server's own reason verbatim.
+fn backend_native_settings_body(
+    state: &AppState,
+    kind: BackendKind,
+    snapshot: &BackendNativeSettingsSnapshot,
+    active_native_group: RwSignal<Option<String>>,
+) -> AnyView {
+    match snapshot.status {
+        BackendConfigSnapshotStatus::Unavailable => {
+            let message = snapshot.message.clone().unwrap_or_else(|| {
+                format!(
+                    "{}'s native settings are unavailable on the selected host.",
+                    backend_label(kind)
+                )
+            });
+            return view! {
+                <div class="settings-native-unavailable">
+                    <p class="settings-native-unavailable-text">{message}</p>
+                </div>
+            }
+            .into_any();
+        }
+        BackendConfigSnapshotStatus::Ready => {}
+    }
+
+    let Some(settings) = snapshot.settings.clone() else {
+        // Ready but no document — never fabricate defaults; say so explicitly.
+        return view! {
+            <p class="settings-description">
+                "This backend reported its native settings are ready but sent no current values."
+            </p>
+        }
+        .into_any();
+    };
+
+    if snapshot.groups.is_empty() {
+        return view! {
+            <p class="settings-description">
+                "This backend exposes native settings but no editable groups."
+            </p>
+        }
+        .into_any();
+    }
+
+    // A native save replaces the whole document, so while one is in flight the
+    // controls are disabled until the server publishes a newer snapshot — a
+    // second edit off the stale snapshot would clobber the first.
+    let (saving, error) = native_save_indicator(state, kind, &settings);
+    let saving_banner = saving.then(|| {
+        view! {
+            <div class="settings-native-saving" role="status">
+                "Saving… settings are locked until the backend confirms the change."
+            </div>
+        }
+    });
+    let error_banner = error.map(|message| {
+        view! {
+            <div class="settings-native-error" role="alert">
+                {message}
+            </div>
+        }
+    });
+
+    // Order groups Core-first, then Modules, preserving the server's order
+    // within each kind. Core is the anchor page; module groups sit beside it as
+    // tabs so a big backend (e.g. Tycode with per-provider modules) never
+    // renders as one long flat form.
+    let mut ordered: Vec<&BackendNativeSettingsGroup> = snapshot
+        .groups
+        .iter()
+        .filter(|group| group.kind == BackendNativeSettingsGroupKind::Core)
+        .collect();
+    ordered.extend(
+        snapshot
+            .groups
+            .iter()
+            .filter(|group| group.kind == BackendNativeSettingsGroupKind::Module),
+    );
+
+    // A single group needs no tab strip — render it with its own header.
+    if ordered.len() == 1 {
+        let group = native_settings_group(state, kind, ordered[0], &settings, saving);
+        return view! {
+            <div class="settings-native-settings">
+                {error_banner}
+                {saving_banner}
+                {group}
+            </div>
+        }
+        .into_any();
+    }
+
+    // The active tab is tracked by group id (not index) so the selection is
+    // stable if the group set changes. The selection lives in the page-level
+    // `active_native_group` signal so it survives this body being rebuilt on
+    // save-state/snapshot changes. `None` (or a stale id no longer in the
+    // group set) resolves to the first (Core) group. Only the active group's
+    // fields are visible; the rest stay mounted-but-hidden so tab switches keep
+    // their in-progress edits.
+    let ordered_ids: Vec<String> = ordered.iter().map(|group| group.id.clone()).collect();
+    let default_id = ordered_ids[0].clone();
+    let effective_active = Signal::derive(move || {
+        active_native_group
+            .get()
+            .filter(|id| ordered_ids.contains(id))
+            .unwrap_or_else(|| default_id.clone())
+    });
+
+    let tabs = ordered
+        .iter()
+        .map(|group| {
+            let id = group.id.clone();
+            let is_active = {
+                let id = id.clone();
+                Signal::derive(move || effective_active.get() == id)
+            };
+            let on_click = {
+                let id = id.clone();
+                move |_| active_native_group.set(Some(id.clone()))
+            };
+            view! {
+                <button
+                    type="button"
+                    role="tab"
+                    class=move || {
+                        if is_active.get() {
+                            "settings-native-tab settings-native-tab-active"
+                        } else {
+                            "settings-native-tab"
+                        }
+                    }
+                    aria-selected=move || is_active.get().to_string()
+                    on:click=on_click
+                >
+                    <span class="settings-native-tab-label">{group.title.clone()}</span>
+                    <span class="settings-native-tab-badge">
+                        {native_group_badge(group.kind)}
+                    </span>
+                </button>
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let panels = ordered
+        .iter()
+        .map(|group| {
+            let id = group.id.clone();
+            let hidden = move || effective_active.get() != id;
+            let content = native_settings_group_content(state, kind, group, &settings, saving);
+            view! {
+                <div
+                    class="settings-native-group settings-native-group-panel"
+                    role="tabpanel"
+                    hidden=hidden
+                >
+                    {content}
+                </div>
+            }
+        })
+        .collect::<Vec<_>>();
+
+    view! {
+        <div class="settings-native-settings">
+            {error_banner}
+            {saving_banner}
+            <div class="settings-native-tabs" role="tablist">{tabs}</div>
+            <div class="settings-native-panels">{panels}</div>
+        </div>
+    }
+    .into_any()
+}
+
+/// Short badge text distinguishing a Core group from a Module group. Shared by
+/// the single-group header and the multi-group tab strip.
+fn native_group_badge(kind: BackendNativeSettingsGroupKind) -> &'static str {
+    match kind {
+        BackendNativeSettingsGroupKind::Core => "Core",
+        BackendNativeSettingsGroupKind::Module => "Module",
+    }
+}
+
+/// The description + editable fields for one native-settings group, without any
+/// title header. Reused by both the single-group section (which adds its own
+/// header) and the tabbed multi-group panels (whose header lives in the tab).
+fn native_settings_group_content(
+    state: &AppState,
+    kind: BackendKind,
+    group: &BackendNativeSettingsGroup,
+    settings: &Value,
+    disabled: bool,
+) -> AnyView {
+    let group_value = native_value_at_path(settings, &group.settings_path);
+    let description = group
+        .description
+        .clone()
+        .map(|text| view! { <p class="settings-native-group-desc">{text}</p> });
+
+    let body = match group.schema.get("properties").and_then(Value::as_object) {
+        Some(properties) => {
+            // Distinguish "this group's path is absent (or explicit null) in the
+            // document" from "the path is present but a property is unset" —
+            // neither may render as a blank/default control that looks like a
+            // real current value.
+            let path_present = group_value.is_some_and(|value| !value.is_null());
+            let empty = Map::new();
+            let obj = group_value.and_then(Value::as_object).unwrap_or(&empty);
+            let missing_note = (!path_present).then(|| {
+                view! {
+                    <p class="settings-native-unset-note">
+                        "These settings are not present in the current document. Fields below are unset until you set a value."
+                    </p>
+                }
+            });
+            let fields = properties
+                .iter()
+                .map(|(key, prop_schema)| {
+                    native_settings_field(
+                        state,
+                        kind,
+                        &group.settings_path,
+                        key,
+                        prop_schema,
+                        obj.get(key),
+                        disabled,
+                    )
+                })
+                .collect::<Vec<_>>();
+            view! {
+                {missing_note}
+                <div class="settings-native-fields">{fields}</div>
+            }
+            .into_any()
+        }
+        None => {
+            // No property map — don't drop the group. Render its whole value as a
+            // read-only JSON view with secrets recursively redacted so nothing is
+            // silently hidden and no secret leaks. An absent (or explicit-null)
+            // path is stated explicitly rather than shown as a bare `null`.
+            match group_value.filter(|value| !value.is_null()) {
+                None => view! {
+                    <p class="settings-native-unset-note">
+                        "These settings are not present in the current document."
+                    </p>
+                }
+                .into_any(),
+                Some(value) => {
+                    let json = pretty_json(&redact_secrets(value));
+                    view! { <pre class="settings-native-json-readonly">{json}</pre> }.into_any()
+                }
+            }
+        }
+    };
+
+    view! {
+        {description}
+        {body}
+    }
+    .into_any()
+}
+
+/// A single native-settings group rendered with its own titled header. Used when
+/// a backend exposes exactly one group, where a tab strip would be noise.
+fn native_settings_group(
+    state: &AppState,
+    kind: BackendKind,
+    group: &BackendNativeSettingsGroup,
+    settings: &Value,
+    disabled: bool,
+) -> AnyView {
+    let content = native_settings_group_content(state, kind, group, settings, disabled);
+    view! {
+        <section class="settings-native-group">
+            <div class="settings-native-group-header">
+                <span class="settings-native-group-title">{group.title.clone()}</span>
+                <span class="settings-native-group-badge">
+                    {native_group_badge(group.kind)}
+                </span>
+            </div>
+            {content}
+        </section>
+    }
+    .into_any()
+}
+
+/// One editable native settings field, generated from a JSON-schema property.
+/// Renders a typed control for primitives/enums, masks secret keys, and falls
+/// back to a visible JSON editor for object/array/unknown shapes so no field is
+/// dropped.
+fn native_settings_field(
+    state: &AppState,
+    kind: BackendKind,
+    path: &[String],
+    key: &str,
+    prop_schema: &Value,
+    current: Option<&Value>,
+    disabled: bool,
+) -> AnyView {
+    let label = prop_schema
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or(key)
+        .to_owned();
+    let description = prop_schema
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let secret = is_secret_native_key(key, prop_schema);
+    // Nullable type arrays (e.g. `["string", "null"]`) still resolve to a typed
+    // control rather than falling through to raw JSON editing.
+    let schema_type = native_primitive_type(prop_schema);
+    let schema_type = schema_type.as_deref();
+    let enum_values: Vec<String> = prop_schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // A field is "configured" only when the server actually holds a value for
+    // it. An absent key and an explicit JSON `null` are both unset — surfaced
+    // explicitly so a blank/unchecked control is never mistaken for a real
+    // current value. Controls stay editable either way so the user can set one.
+    let present = current.is_some_and(|value| !value.is_null());
+
+    let path = path.to_vec();
+    let key = key.to_owned();
+
+    let control = if secret {
+        let has_value = current
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        let placeholder = if has_value {
+            "•••••••• (stored — type to replace)".to_owned()
+        } else if present {
+            String::new()
+        } else {
+            "Not set".to_owned()
+        };
+        let state = state.clone();
+        let on_change = move |ev: web_sys::Event| {
+            if disabled {
+                return;
+            }
+            let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
+            commit_native_setting(&state, kind, &path, &key, Value::String(el.value()));
+        };
+        view! {
+            <input
+                type="password"
+                class="settings-input settings-native-input"
+                placeholder=placeholder
+                autocomplete="off"
+                disabled=disabled
+                on:change=on_change
+            />
+        }
+        .into_any()
+    } else if !enum_values.is_empty() {
+        let current = current
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let option_views = enum_values
+            .iter()
+            .map(|value| view! { <option value=value.clone()>{value.clone()}</option> })
+            .collect::<Vec<_>>();
+        let state = state.clone();
+        let on_change = move |ev: web_sys::Event| {
+            if disabled {
+                return;
+            }
+            let el: web_sys::HtmlSelectElement = ev.target().unwrap().unchecked_into();
+            commit_native_setting(&state, kind, &path, &key, Value::String(el.value()));
+        };
+        view! {
+            <select
+                class="settings-select"
+                prop:value=current
+                disabled=disabled
+                on:change=on_change
+            >
+                {(!present).then(|| view! { <option value="">"Not set"</option> })}
+                {option_views}
+            </select>
+        }
+        .into_any()
+    } else {
+        match schema_type {
+            Some("boolean") => {
+                let current = current.and_then(Value::as_bool).unwrap_or(false);
+                let state = state.clone();
+                let on_change = move |ev: web_sys::Event| {
+                    if disabled {
+                        return;
+                    }
+                    let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
+                    commit_native_setting(&state, kind, &path, &key, Value::Bool(el.checked()));
+                };
+                view! {
+                    <label class="settings-toggle">
+                        <input
+                            type="checkbox"
+                            prop:checked=current
+                            disabled=disabled
+                            on:change=on_change
+                        />
+                        <span class="settings-toggle-slider"></span>
+                    </label>
+                }
+                .into_any()
+            }
+            Some("integer") => {
+                let current = current.and_then(Value::as_i64);
+                let state = state.clone();
+                let on_change = move |ev: web_sys::Event| {
+                    if disabled {
+                        return;
+                    }
+                    let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
+                    if let Ok(parsed) = el.value().parse::<i64>() {
+                        commit_native_setting(&state, kind, &path, &key, Value::from(parsed));
+                    }
+                };
+                view! {
+                    <input
+                        type="number"
+                        step="1"
+                        class="settings-input settings-native-input"
+                        prop:value=move || current.map(|n| n.to_string()).unwrap_or_default()
+                        placeholder=(!present).then(|| "Not set".to_owned())
+                        autocomplete="off"
+                        disabled=disabled
+                        on:change=on_change
+                    />
+                }
+                .into_any()
+            }
+            Some("number") => {
+                let current = current.and_then(Value::as_f64);
+                let state = state.clone();
+                let on_change = move |ev: web_sys::Event| {
+                    if disabled {
+                        return;
+                    }
+                    let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
+                    if let Ok(parsed) = el.value().parse::<f64>()
+                        && let Some(number) = serde_json::Number::from_f64(parsed)
+                    {
+                        commit_native_setting(&state, kind, &path, &key, Value::Number(number));
+                    }
+                };
+                view! {
+                    <input
+                        type="number"
+                        step="any"
+                        class="settings-input settings-native-input"
+                        prop:value=move || current.map(|n| n.to_string()).unwrap_or_default()
+                        placeholder=(!present).then(|| "Not set".to_owned())
+                        autocomplete="off"
+                        disabled=disabled
+                        on:change=on_change
+                    />
+                }
+                .into_any()
+            }
+            Some("string") => {
+                let current = current
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let state = state.clone();
+                let on_change = move |ev: web_sys::Event| {
+                    if disabled {
+                        return;
+                    }
+                    let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
+                    commit_native_setting(&state, kind, &path, &key, Value::String(el.value()));
+                };
+                view! {
+                    <input
+                        type="text"
+                        class="settings-input settings-native-input"
+                        prop:value=current
+                        placeholder=(!present).then(|| "Not set".to_owned())
+                        autocomplete="off"
+                        spellcheck="false"
+                        disabled=disabled
+                        on:change=on_change
+                    />
+                }
+                .into_any()
+            }
+            _ => native_json_field_control(state, kind, path, key, current, disabled),
+        }
+    };
+
+    // Explicit unset marker so a blank control is never read as a real value.
+    let unset_caption =
+        (!present).then(|| view! { <span class="settings-native-unset">"Unset"</span> });
+
+    view! {
+        <div class="settings-native-field">
+            <span class="settings-tier-select-label">{label}</span>
+            {control}
+            {unset_caption}
+            {description.map(|text| view! { <p class="settings-description">{text}</p> })}
+        </div>
+    }
+    .into_any()
+}
+
+/// Conservative editor/view for object/array/unknown native settings.
+///
+/// - Absent value → an explicit "not set" JSON editor seeded empty (never a
+///   `null` that looks like a real value).
+/// - Value containing a secret at any depth → a read-only, recursively redacted
+///   JSON view. Editing is refused because saving the redacted document would
+///   clobber the real secret.
+/// - Otherwise → a JSON textarea that commits on valid parse and surfaces a
+///   parse error inline rather than silently discarding the edit.
+///
+/// The editor is also disabled while a native save is in flight.
+fn native_json_field_control(
+    state: &AppState,
+    kind: BackendKind,
+    path: Vec<String>,
+    key: String,
+    current: Option<&Value>,
+    disabled: bool,
+) -> AnyView {
+    if let Some(value) = current
+        && contains_secret(value)
+    {
+        let json = pretty_json(&redact_secrets(value));
+        return view! {
+            <div class="settings-native-json">
+                <pre class="settings-native-json-readonly">{json}</pre>
+                <p class="settings-native-json-note">
+                    "Contains secret values and can't be edited here — change it through the backend directly so the stored secret isn't overwritten."
+                </p>
+            </div>
+        }
+        .into_any();
+    }
+
+    // An absent value and an explicit JSON `null` are both unset: show an empty
+    // editor with a "not set" hint rather than a literal `null` that reads as a
+    // real value.
+    let present = current.is_some_and(|value| !value.is_null());
+    let initial = current
+        .filter(|value| !value.is_null())
+        .map(pretty_json)
+        .unwrap_or_default();
+    let error = RwSignal::new(Option::<String>::None);
+    let state = state.clone();
+    let on_change = move |ev: web_sys::Event| {
+        if disabled {
+            return;
+        }
+        let el: web_sys::HtmlTextAreaElement = ev.target().unwrap().unchecked_into();
+        let raw = el.value();
+        if raw.trim().is_empty() {
+            error.set(Some("Enter JSON to set a value.".to_owned()));
+            return;
+        }
+        match serde_json::from_str::<Value>(&raw) {
+            Ok(parsed) => {
+                error.set(None);
+                commit_native_setting(&state, kind, &path, &key, parsed);
+            }
+            Err(err) => error.set(Some(format!("Invalid JSON: {err}"))),
+        }
+    };
+    view! {
+        <div class="settings-native-json">
+            <textarea
+                class="settings-input settings-native-json-input"
+                prop:value=initial
+                placeholder=(!present).then(|| "Not set — enter JSON to set a value".to_owned())
+                spellcheck="false"
+                disabled=disabled
+                on:change=on_change
+            ></textarea>
+            {move || {
+                error
+                    .get()
+                    .map(|message| view! { <p class="settings-native-json-error">{message}</p> })
+            }}
+        </div>
+    }
+    .into_any()
+}
+
 #[component]
 fn DebugTab() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -3201,23 +4165,22 @@ fn DebugTab() -> impl IntoView {
     }
 }
 
-/// Mobile pairing / broker settings. Two host-scoped settings live here:
+/// Mobile pairing settings for `tycode.dev`-managed AWS IoT access.
+/// Two host-scoped settings live here:
 ///   * `enable_mobile_connections` — master kill switch.
-///   * `mobile_broker_url` — optional override for the public MQTT
-///     broker the host uses for the relay path. The default is a free
-///     public broker (`wss://broker.emqx.io:8084/mqtt`); the user can
-///     point at their own broker by overriding here. Empty input
-///     resets to "use server default" (None on the wire).
+///   * `mobile_broker_url` — **dev/test-only** broker override. Production
+///     mobile access is provisioned through `tycode.dev` managed pairing
+///     onto AWS IoT Core; the server only honours this override for a
+///     loopback broker in local development and fails closed for public /
+///     free / custom production brokers. Empty input (the default) means
+///     "use managed access" (None on the wire).
 ///
-/// The Tyde end-to-end encryption layer (paired session keys) sits on
-/// top of MQTT and is independent of the broker chosen. The warning
-/// block makes that contract explicit and reminds the user that
-/// metadata (their IP, message timing, topic names) is still visible
-/// to whoever runs the broker.
-///
-/// Frontend never claims to operate the broker — copy uses "Public
-/// MQTT broker" / "Broker URL" wording. "Tyde broker" is forbidden:
-/// Tyde is the client, not the operator of `broker.emqx.io`.
+/// All mobile-access behaviour is server-owned: the frontend renders the
+/// typed `MobileAccessStatePayload` (`broker_status` / `pairing`) and never
+/// infers broker semantics or chooses a broker itself. Starting a pairing
+/// initiates a server-owned managed pairing; the server decides managed vs.
+/// the explicit loopback dev override, so the UI can never trigger an
+/// unmanaged/public-broker fallback.
 #[component]
 fn MobileTab() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -3437,11 +4400,15 @@ fn MobileTab() -> impl IntoView {
         });
     };
 
-    // Hide-or-disable rules:
-    // * Start button is *visible* when the host has settings loaded
-    //   AND mobile is enabled AND broker is Online AND we're not
-    //   already mid-pairing (Active offer or a Start in flight).
-    // * Cancel button is visible when we have an Active offer.
+    // Start-pairing enablement is a pure function of typed server state:
+    // enable Start whenever mobile is enabled and no pairing is already in
+    // flight. It does NOT require the broker to be `Online` — in the managed
+    // flow the broker only reaches `Online` *after* a pairing exists, so a
+    // `Connecting` / `RepairRequired` (no pairing yet, or a stored pairing that
+    // needs re-pairing) / `Error` broker status is exactly when the user needs
+    // to start a fresh managed pairing. Starting is server-owned and cannot pick
+    // an unmanaged/public broker, so gating it on broker status would only block
+    // the (re-)pairing that resolves those states.
     let pairing_phase = move || -> Option<MobilePairingState> {
         mobile_state_for_host().map(|state| state.pairing)
     };
@@ -3463,17 +4430,16 @@ fn MobileTab() -> impl IntoView {
         if !enabled {
             return false;
         }
-        let online = matches!(broker_phase(), Some(MobileBrokerStatus::Online { .. }));
         let in_flight = mobile_start_pending()
             || matches!(pairing_phase(), Some(MobilePairingState::Active { .. }));
-        online && !in_flight
+        !in_flight
     };
 
     view! {
         <h2 class="settings-panel-title">"Mobile"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "Pair the Tyde mobile app with this host. The pairing QR carries the broker URL the mobile app should use, so the mobile app does not need any preconfigured Tyde infrastructure."
+            "Pair the Tyde mobile app with this host over tycode.dev managed access. Pairing provisions a scoped, tycode.dev-signed AWS IoT broker connection — there is no public or free MQTT broker. Your mobile device signs in with a Tyggs Pass to complete pairing; this host is never asked for Tyggs credentials."
         </p>
 
         <div class="settings-field">
@@ -3481,7 +4447,7 @@ fn MobileTab() -> impl IntoView {
                 <div>
                     <label class="settings-label">"Enable mobile connections"</label>
                     <p class="settings-description">
-                        "When enabled, this host can accept pairing requests from the Tyde mobile app and route mobile traffic over the broker below."
+                        "When enabled, this host can accept pairing requests from the Tyde mobile app and connect through tycode.dev-managed AWS IoT access."
                     </p>
                 </div>
                 <label class="settings-toggle">
@@ -3499,7 +4465,7 @@ fn MobileTab() -> impl IntoView {
         <div class="settings-field settings-mobile-pairing">
             <label class="settings-label">"Pair a mobile device"</label>
             <p class="settings-description">
-                "Start a pairing session, then scan the QR code with the Tyde mobile app. The QR carries the broker URL and a one-shot pre-shared key; the pairing session expires after a couple of minutes."
+                "Start a pairing session, then scan the QR code with the Tyde mobile app. The QR carries a one-time managed pairing offer, the managed broker endpoint, and a one-shot pre-shared key; the mobile app redeems the offer with tycode.dev to obtain scoped AWS IoT credentials. The pairing session expires after a couple of minutes."
             </p>
             // Broker status pill — surfaces broker_status from the
             // MobileAccessState snapshot. Keeps the user informed when
@@ -3575,13 +4541,11 @@ fn MobileTab() -> impl IntoView {
                 // active offer to settle).
                 let can = can_start_pairing();
                 let title = if can {
-                    "Start a fresh pairing session"
+                    "Start a fresh managed pairing session"
                 } else if mobile_start_pending() {
                     "Starting pairing…"
                 } else if matches!(pairing_phase(), Some(MobilePairingState::Active { .. })) {
                     "A pairing session is already active — cancel it first"
-                } else if !matches!(broker_phase(), Some(MobileBrokerStatus::Online { .. })) {
-                    "Broker is not online yet"
                 } else {
                     "Enable mobile connections to pair a device"
                 };
@@ -3610,12 +4574,15 @@ fn MobileTab() -> impl IntoView {
                         </p>
                         <ul class="settings-mobile-pairing-devices-list">
                             {devices.into_iter().map(|device| {
-                                let state_label = match device.state {
-                                    MobileDeviceState::Connected => "connected",
-                                    MobileDeviceState::Paired => "offline",
-                                    MobileDeviceState::Revoked => "revoked",
+                                let (state_label, state_slug) = match device.state {
+                                    MobileDeviceState::Connected => ("connected", "connected"),
+                                    MobileDeviceState::Paired => ("offline", "offline"),
+                                    MobileDeviceState::Revoked => ("revoked", "revoked"),
+                                    MobileDeviceState::RepairRequired => {
+                                        ("repair required", "repair-required")
+                                    }
                                 };
-                                let state_class = format!("settings-mobile-pairing-device-state settings-mobile-pairing-device-state-{state_label}");
+                                let state_class = format!("settings-mobile-pairing-device-state settings-mobile-pairing-device-state-{state_slug}");
                                 let device_label = device.label.clone();
                                 let device_id = device.device_id.clone();
                                 let state_for_remove = state.clone();
@@ -3664,21 +4631,21 @@ fn MobileTab() -> impl IntoView {
         </div>
 
         <div class="settings-field">
-            <label class="settings-label">"Broker URL"</label>
+            <label class="settings-label">"Broker URL (dev override)"</label>
             <p class="settings-description">
-                "Public MQTT broker used to ferry pairing offers and encrypted traffic between this host and the mobile app. Leave blank to use the host default — the pairing QR will carry whichever broker URL is active, so the mobile app does not need to be preconfigured."
+                "Advanced, local-development only. Production mobile access uses tycode.dev-managed AWS IoT, and the server fails closed for public, free, or custom production brokers. This override is honoured only for a loopback broker (localhost / 127.0.0.1) during local development. Leave blank for managed access."
             </p>
             <div class="settings-mobile-broker-row">
                 <input
                     type="text"
                     class="settings-input settings-mobile-broker-input"
                     prop:value=broker_value
-                    placeholder=DEFAULT_MOBILE_MQTT_BROKER_URL
+                    placeholder="wss://127.0.0.1:8083/mqtt"
                     disabled=broker_disabled_for_input
                     autocapitalize="none"
                     autocomplete="off"
                     spellcheck="false"
-                    aria-label="Broker URL"
+                    aria-label="Broker URL (dev override)"
                     aria-invalid=move || if broker_error.get().is_some() { "true" } else { "false" }
                     on:input=on_broker_input
                     on:change=on_broker_commit
@@ -3688,10 +4655,10 @@ fn MobileTab() -> impl IntoView {
                     type="button"
                     class="filter-toggle settings-mobile-broker-reset"
                     disabled=broker_disabled_for_button
-                    title="Use the host default broker"
+                    title="Clear the dev override and use managed access"
                     on:click=on_broker_reset
                 >
-                    "Use default"
+                    "Use managed"
                 </button>
             </div>
             {move || broker_error.get().map(|message| view! {
@@ -3701,10 +4668,10 @@ fn MobileTab() -> impl IntoView {
 
         <div class="settings-mobile-warning" role="note">
             <p class="settings-mobile-warning-heading">
-                "Public broker — encrypted contents, visible metadata"
+                "Managed access — encrypted contents, visible metadata"
             </p>
             <p class="settings-description">
-                "The broker is run by a third party and is untrusted. Tyde end-to-end encrypts every message between this host and your paired mobile devices, so the broker operator cannot read your chats, files, or commands. However, metadata like your IP address, connection timing, topic names, and message sizes is visible to the broker operator. Point this at your own MQTT broker if you need to hide that metadata too."
+                "Tyde end-to-end encrypts every message between this host and your paired mobile devices, so neither tycode.dev nor AWS IoT can read your chats, files, or commands. AWS IoT still sees connection metadata — client id, topic names, connection timing, and message sizes. tycode.dev mints short-lived, scoped broker credentials and never receives your Tyggs tokens or Tyde message contents."
             </p>
         </div>
     }
@@ -5782,15 +6749,11 @@ mod wasm_tests {
             .unwrap()
     }
 
-    /// When the host has no `mobile_broker_url` override, the broker
-    /// URL input must render empty but display the
-    /// `wss://broker.emqx.io:8084/mqtt` placeholder so the user can see
-    /// what the host default resolves to. This is the foundation of
-    /// the "QR carries the broker URL even when the user hasn't set
-    /// one" contract — the placeholder is purely informational so
-    /// the user knows what they're opting into.
+    /// With no `mobile_broker_url` override the input renders empty. Its
+    /// placeholder must advertise the dev-only loopback override — never a
+    /// public / free broker (managed access is the production path).
     #[wasm_bindgen_test]
-    async fn mobile_tab_broker_default_placeholder_when_no_override() {
+    async fn mobile_tab_broker_override_placeholder_is_loopback_not_public() {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -5809,10 +6772,14 @@ mod wasm_tests {
             "",
             "broker URL input must be empty when no host override exists"
         );
-        assert_eq!(
-            input.get_attribute("placeholder").as_deref(),
-            Some(DEFAULT_MOBILE_MQTT_BROKER_URL),
-            "broker URL placeholder must surface the public default"
+        let placeholder = input.get_attribute("placeholder").unwrap_or_default();
+        assert!(
+            placeholder.contains("127.0.0.1") || placeholder.contains("localhost"),
+            "broker override placeholder must be a loopback dev example; got {placeholder:?}"
+        );
+        assert!(
+            !placeholder.contains("emqx") && !placeholder.to_lowercase().contains("public"),
+            "broker override placeholder must not advertise a public/free broker; got {placeholder:?}"
         );
     }
 
@@ -5840,14 +6807,14 @@ mod wasm_tests {
         );
     }
 
-    /// The warning copy must call out: (1) the broker is public /
-    /// untrusted, (2) Tyde contents are encrypted, (3) metadata may
-    /// be visible. Tests on user-perceived text content, not on a
-    /// CSS class — if a future refactor moves the warning into a
-    /// different element the assertion still passes as long as the
-    /// content is reachable.
+    /// The Mobile tab copy must reflect **managed** tycode.dev / AWS IoT
+    /// access: (1) it names managed access (tycode.dev / AWS IoT), (2) it
+    /// mentions Tyde end-to-end encryption, (3) it calls out visible metadata,
+    /// and (4) it must NOT frame the broker as a public / free / custom MQTT
+    /// broker (that model no longer exists — the server fails closed for it).
+    /// Tests user-perceived text, not CSS classes.
     #[wasm_bindgen_test]
-    async fn mobile_tab_warning_covers_public_encrypted_metadata() {
+    async fn mobile_tab_copy_reflects_managed_access_not_public_broker() {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -5862,34 +6829,37 @@ mod wasm_tests {
 
         let text = container.text_content().unwrap_or_default().to_lowercase();
         assert!(
-            text.contains("public"),
-            "mobile warning must call the broker public; got: {text:?}"
+            text.contains("tycode.dev") || text.contains("aws iot") || text.contains("managed"),
+            "mobile copy must describe managed tycode.dev / AWS IoT access; got: {text:?}"
         );
         assert!(
-            text.contains("end-to-end encrypt") || text.contains("encrypt"),
-            "mobile warning must mention encryption; got: {text:?}"
+            text.contains("encrypt"),
+            "mobile copy must mention encryption; got: {text:?}"
         );
         assert!(
             text.contains("metadata"),
-            "mobile warning must call out metadata leakage; got: {text:?}"
+            "mobile copy must call out visible metadata; got: {text:?}"
         );
-        // Inverse: must NOT imply Tyde runs the broker.
+        // Inverse: no public/free/custom-broker framing, and Tyde is never the
+        // broker operator.
+        assert!(
+            !text.contains("public mqtt broker")
+                && !text.contains("public broker")
+                && !text.contains("free public")
+                && !text.contains("emqx"),
+            "mobile copy must not present a public/free MQTT broker; got: {text:?}"
+        );
         assert!(
             !text.contains("tyde broker"),
-            "mobile copy must not say 'Tyde broker' (we are the client, not the operator); got: {text:?}"
-        );
-        // The "untrusted" framing should be present in some form.
-        assert!(
-            text.contains("untrusted") || text.contains("third party"),
-            "mobile warning must frame the broker as untrusted/third-party; got: {text:?}"
+            "mobile copy must not say 'Tyde broker' (Tyde is the client); got: {text:?}"
         );
     }
 
-    /// The "Use default" button must always be present alongside the
-    /// broker URL input so the user can revert to the host default
-    /// without manually clearing the field.
+    /// The "Use managed" button must always be present alongside the broker
+    /// URL override input so the user can clear a dev override and return to
+    /// tycode.dev-managed access without manually clearing the field.
     #[wasm_bindgen_test]
-    async fn mobile_tab_has_use_default_button() {
+    async fn mobile_tab_has_use_managed_button() {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -5911,14 +6881,14 @@ mod wasm_tests {
             let Ok(el) = node.dyn_into::<HtmlElement>() else {
                 continue;
             };
-            if el.text_content().as_deref().map(str::trim) == Some("Use default") {
+            if el.text_content().as_deref().map(str::trim) == Some("Use managed") {
                 found = true;
                 break;
             }
         }
         assert!(
             found,
-            "Mobile tab must surface a 'Use default' button to revert the broker override"
+            "Mobile tab must surface a 'Use managed' button to clear the dev broker override"
         );
     }
 
@@ -6059,12 +7029,12 @@ mod wasm_tests {
         dispatch_event_from_js(input, "keydown", Some("Enter"));
     }
 
-    /// Pressing Enter on a valid override commits a `SetSetting` frame
-    /// whose payload is `MobileBrokerUrl { broker_url: Some(...) }`.
-    /// Load-bearing assertion that the typed-URL commit path actually
-    /// reaches the wire.
+    /// Pressing Enter on a valid **loopback** override commits a `SetSetting`
+    /// frame whose payload is `MobileBrokerUrl { broker_url: Some(...) }`.
+    /// Load-bearing assertion that the typed-URL commit path actually reaches
+    /// the wire for the only broker kind the server accepts.
     #[wasm_bindgen_test]
-    async fn mobile_tab_enter_commits_valid_broker_url() {
+    async fn mobile_tab_enter_commits_valid_loopback_broker_url() {
         let calls = install_settings_send_stub();
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
@@ -6079,7 +7049,7 @@ mod wasm_tests {
         next_tick().await;
 
         let input = broker_input(&container);
-        input.set_value("mqtts://override.example:8883");
+        input.set_value("mqtts://127.0.0.1:8883");
         dispatch_enter(&input);
         for _ in 0..4 {
             next_tick().await;
@@ -6089,20 +7059,19 @@ mod wasm_tests {
         let mobile = settings
             .iter()
             .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("mobile_broker_url"))
-            .expect("Enter on a valid broker URL must emit a MobileBrokerUrl SetSetting frame");
+            .expect("Enter on a valid loopback broker URL must emit a MobileBrokerUrl frame");
         let broker_url = mobile
             .get("broker_url")
             .and_then(|v| v.as_str())
             .expect("MobileBrokerUrl payload must carry the URL on commit");
-        assert_eq!(broker_url, "mqtts://override.example:8883");
+        assert_eq!(broker_url, "mqtts://127.0.0.1:8883");
     }
 
-    /// Clicking "Use default" commits `MobileBrokerUrl { broker_url:
-    /// None }`. The server resolves None to the host's built-in
-    /// default, so this is how the user reverts an override without
-    /// manually clearing the field.
+    /// Clicking "Use managed" commits `MobileBrokerUrl { broker_url: None }`.
+    /// The server resolves None to tycode.dev-managed access, so this is how
+    /// the user clears a dev override without manually clearing the field.
     #[wasm_bindgen_test]
-    async fn mobile_tab_use_default_button_commits_none() {
+    async fn mobile_tab_use_managed_button_commits_none() {
         let calls = install_settings_send_stub();
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
@@ -6126,13 +7095,13 @@ mod wasm_tests {
             let Ok(el) = node.dyn_into::<HtmlElement>() else {
                 continue;
             };
-            if el.text_content().as_deref().map(str::trim) == Some("Use default") {
+            if el.text_content().as_deref().map(str::trim) == Some("Use managed") {
                 el.click();
                 clicked = true;
                 break;
             }
         }
-        assert!(clicked, "Use default button must be present and clickable");
+        assert!(clicked, "Use managed button must be present and clickable");
         for _ in 0..4 {
             next_tick().await;
         }
@@ -6259,6 +7228,67 @@ mod wasm_tests {
         let aria_invalid = input.get_attribute("aria-invalid");
         assert_eq!(
             aria_invalid.as_deref(),
+            Some("true"),
+            "Broker URL input must set aria-invalid=true while showing the error"
+        );
+    }
+
+    /// QA finding: a valid-scheme, valid-shape but **non-loopback** broker URL
+    /// (which the server now rejects at write time) must fail closed inline —
+    /// (a) no `MobileBrokerUrl` frame is sent, (b) the `settings-mobile-broker-error`
+    /// message renders and names the loopback rule, and (c) the field flips
+    /// `aria-invalid`. Previously this URL was sent and the rejection only
+    /// appeared in the global header.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_non_loopback_broker_shows_inline_error_and_suppresses_send() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, true);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let input = broker_input(&container);
+        input.set_value("mqtts://broker.example.test:8883");
+        dispatch_enter(&input);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        // (a) Nothing is committed to the wire.
+        let settings = recorded_set_setting_payloads(&calls);
+        assert!(
+            settings
+                .iter()
+                .all(|s| s.get("kind").and_then(|k| k.as_str()) != Some("mobile_broker_url")),
+            "Non-loopback broker URL must not be committed; recorded settings: {settings:?}"
+        );
+
+        // (b) Inline error renders in the field's own error element and the copy
+        // explains the loopback/managed rule so the user isn't left guessing.
+        let error_el = container
+            .query_selector(".settings-mobile-broker-error")
+            .unwrap()
+            .expect("Non-loopback broker URL must surface an inline error message");
+        let error_text = error_el.text_content().unwrap_or_default().to_lowercase();
+        assert!(
+            error_text.contains("loopback"),
+            "Inline error must explain the loopback rule; got: {error_text:?}"
+        );
+        assert!(
+            error_text.contains("managed") || error_text.contains("localhost"),
+            "Inline error should point the user at managed access / loopback; got: {error_text:?}"
+        );
+
+        // (c) aria-invalid announces the problem to assistive tech.
+        assert_eq!(
+            input.get_attribute("aria-invalid").as_deref(),
             Some("true"),
             "Broker URL input must set aria-invalid=true while showing the error"
         );
@@ -6587,11 +7617,14 @@ mod wasm_tests {
         );
     }
 
-    /// When the broker is in Error state, the pairing card surfaces
-    /// the server error message via the broker status pill, and the
-    /// Start button is disabled even when mobile is enabled.
+    /// When the managed broker is in Error state, the pairing card surfaces the
+    /// server error message via the broker status pill AND keeps Start pairing
+    /// enabled: in the managed flow, (re-)pairing is exactly how the user
+    /// recovers from a broker error, so gating Start on broker health would only
+    /// block the fix. (Starting is server-owned, so it can't pick an
+    /// unmanaged/public broker.)
     #[wasm_bindgen_test]
-    async fn mobile_tab_broker_error_disables_start_and_shows_message() {
+    async fn mobile_tab_broker_error_keeps_start_enabled_and_shows_message() {
         let _calls = install_settings_send_stub();
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
@@ -6620,13 +7653,59 @@ mod wasm_tests {
         let btn = find_button_by_text(&container, "Start pairing")
             .expect("Start pairing button must render even on broker error");
         assert!(
-            btn.has_attribute("disabled"),
-            "Start pairing must be disabled while the broker is in error state"
+            !btn.has_attribute("disabled"),
+            "Start pairing must stay enabled on broker error so the user can re-pair"
         );
         let text = container.text_content().unwrap_or_default();
         assert!(
             text.contains("broker unreachable"),
             "Broker error message must surface in the pairing card; got: {text:?}"
+        );
+    }
+
+    /// First managed pairing: before any pairing exists the server reports
+    /// `MobileBrokerStatus::RepairRequired` (there is no `Online` broker yet).
+    /// Start pairing MUST be enabled in this state — otherwise the user can
+    /// never start their first managed pairing — and the repair message must
+    /// surface so the state is self-explanatory.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_repair_required_enables_start_for_first_pairing() {
+        let _calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, true);
+            let payload = protocol::MobileAccessStatePayload {
+                broker_status: MobileBrokerStatus::RepairRequired {
+                    code: protocol::MobileAccessErrorCode::RepairRequired,
+                    message:
+                        "Mobile access requires a tycode.dev managed pairing before connecting"
+                            .to_owned(),
+                },
+                pairing: MobilePairingState::Idle,
+                paired_devices: Vec::new(),
+            };
+            state.mobile_access_state.update(|m| {
+                m.insert("host-mobile".to_owned(), payload);
+            });
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let btn = find_button_by_text(&container, "Start pairing")
+            .expect("Start pairing button must render when a managed pairing is required");
+        assert!(
+            !btn.has_attribute("disabled"),
+            "Start pairing must be enabled so the first managed pairing can begin"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("managed pairing"),
+            "the repair-required message must surface; got: {text:?}"
         );
     }
 
@@ -8627,6 +9706,1377 @@ mod wasm_tests {
         assert!(
             warning.contains("not enabled") && warning.contains("New Chat"),
             "disabled backend must show a clear inline warning: {warning:?}"
+        );
+    }
+
+    // ---- Backend-native (Tycode) settings page ----
+
+    /// Install a connected host with Tycode enabled but *no* legacy deep-config
+    /// schema, plus a caller-supplied backend-native settings snapshot, and
+    /// select it — the setup for exercising the Tycode native settings page.
+    fn install_tycode_native_host(state: &AppState, snapshot: BackendNativeSettingsSnapshot) {
+        let host_id = "host-tyc-native".to_owned();
+        state.selected_host_id.set(Some(host_id.clone()));
+        state.host_streams.update(|m| {
+            m.insert(
+                host_id.clone(),
+                protocol::StreamPath(format!("/host/{host_id}")),
+            );
+        });
+        state.connection_statuses.update(|m| {
+            m.insert(host_id.clone(), crate::state::ConnectionStatus::Connected);
+        });
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                host_id.clone(),
+                host_settings_with_hermes_config(
+                    std::collections::HashMap::new(),
+                    vec![BackendKind::Tycode],
+                ),
+            );
+        });
+        state.backend_setup_by_host.update(|m| {
+            m.insert(
+                host_id.clone(),
+                vec![backend_setup_info(
+                    BackendKind::Tycode,
+                    BackendSetupStatus::Installed,
+                )],
+            );
+        });
+        state.backend_native_settings.update(|m| {
+            m.entry(host_id)
+                .or_default()
+                .insert(BackendKind::Tycode, snapshot);
+        });
+    }
+
+    /// A Ready snapshot with a top-level Core group (an enum control) and a
+    /// nested Module group carrying a secret `api_key` and a plain `model`.
+    fn tycode_ready_snapshot() -> BackendNativeSettingsSnapshot {
+        let settings = serde_json::json!({
+            "active_provider": "anthropic",
+            "providers": {
+                "anthropic": { "api_key": "sk-secret-value", "model": "claude" }
+            }
+        });
+        BackendNativeSettingsSnapshot {
+            backend_kind: BackendKind::Tycode,
+            status: BackendConfigSnapshotStatus::Ready,
+            settings: Some(settings),
+            groups: vec![
+                BackendNativeSettingsGroup {
+                    id: "core".to_owned(),
+                    title: "Core".to_owned(),
+                    kind: BackendNativeSettingsGroupKind::Core,
+                    settings_path: Vec::new(),
+                    description: Some("Top-level settings".to_owned()),
+                    schema: serde_json::json!({
+                        "properties": {
+                            "active_provider": {
+                                "type": "string",
+                                "title": "Active Provider",
+                                "enum": ["anthropic", "bedrock"]
+                            }
+                        }
+                    }),
+                },
+                BackendNativeSettingsGroup {
+                    id: "anthropic".to_owned(),
+                    title: "Anthropic".to_owned(),
+                    kind: BackendNativeSettingsGroupKind::Module,
+                    settings_path: vec!["providers".to_owned(), "anthropic".to_owned()],
+                    description: None,
+                    schema: serde_json::json!({
+                        "properties": {
+                            "api_key": { "type": "string", "title": "API Key" },
+                            "model": { "type": "string", "title": "Model" }
+                        }
+                    }),
+                },
+            ],
+            message: None,
+        }
+    }
+
+    /// Most recent `backend_native_settings` SetSetting payload, if any.
+    fn last_native_settings(calls: &js_sys::Array) -> Option<serde_json::Value> {
+        recorded_set_setting_payloads(calls)
+            .into_iter()
+            .rev()
+            .find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("backend_native_settings"))
+    }
+
+    /// When Tycode's native settings are unavailable (e.g. the pinned Tycode
+    /// predates `GetSettingsSchema`), the Tycode page appears in the Backends
+    /// sidebar and shows the server's own reason verbatim — never blank/default
+    /// value controls.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_unavailable_shows_server_message() {
+        let container = make_container();
+        let message = "Tycode 0.9.2-pre.1 predates GetSettingsSchema; native settings unavailable";
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                BackendNativeSettingsSnapshot {
+                    backend_kind: BackendKind::Tycode,
+                    status: BackendConfigSnapshotStatus::Unavailable,
+                    settings: None,
+                    groups: Vec::new(),
+                    message: Some(message.to_owned()),
+                },
+            );
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+
+        // The native snapshot alone (no legacy schema) must earn a sidebar page.
+        click_tab(&container, "Tycode");
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains(message),
+            "the server's unavailable reason must be surfaced verbatim: {text:?}"
+        );
+        assert_eq!(
+            container
+                .query_selector_all("input.settings-native-input")
+                .unwrap()
+                .length(),
+            0,
+            "unavailable native settings must not render blank/default value controls"
+        );
+    }
+
+    /// A Ready snapshot renders each server-provided group with its current
+    /// values seeded from the settings document — a top-level enum and nested
+    /// module fields — and never invents defaults.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_render_grouped_current_values() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(&state, tycode_ready_snapshot());
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Core") && text.contains("Anthropic"),
+            "both server-provided groups must render, none dropped: {text:?}"
+        );
+
+        // The top-level enum control reflects the current settings value.
+        let select: HtmlSelectElement = container
+            .query_selector(".settings-native-group select")
+            .unwrap()
+            .expect("the enum control must render for active_provider")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            select.value(),
+            "anthropic",
+            "the enum control must seed from the current settings value"
+        );
+
+        // The nested `model` text field reflects the current value.
+        let model: HtmlInputElement = container
+            .query_selector("input[type=\"text\"].settings-native-input")
+            .unwrap()
+            .expect("the model text control must render")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            model.value(),
+            "claude",
+            "a nested field must seed from the value at its group's settings_path"
+        );
+    }
+
+    /// Secret-named keys (`api_key`) render as masked password inputs and their
+    /// value is never placed in the DOM — no secret leakage into the page.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_mask_secret_keys() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(&state, tycode_ready_snapshot());
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let secret: HtmlInputElement = container
+            .query_selector("input[type=\"password\"].settings-native-input")
+            .unwrap()
+            .expect("a secret-named key must render as a masked password input")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            secret.value(),
+            "",
+            "the stored secret value must never be pre-filled into the control"
+        );
+        let html = container.inner_html();
+        assert!(
+            !html.contains("sk-secret-value"),
+            "the secret value must not appear anywhere in the rendered page"
+        );
+    }
+
+    /// Editing a native settings field sends `BackendNativeSettings` carrying the
+    /// full updated settings object (not a partial patch) so the backend can
+    /// `SaveSettings { persist: true }`. Sibling values, including untouched
+    /// secrets, are preserved in the sent document.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_save_sends_full_object() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(&state, tycode_ready_snapshot());
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let model: HtmlInputElement = container
+            .query_selector("input[type=\"text\"].settings-native-input")
+            .unwrap()
+            .expect("the model text control must render")
+            .dyn_into()
+            .unwrap();
+        set_and_change(&model, "opus");
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let setting = last_native_settings(&calls)
+            .expect("an edit must emit a backend_native_settings frame");
+        assert_eq!(
+            setting.get("backend").and_then(|b| b.as_str()),
+            Some("tycode"),
+            "the edit must target the Tycode backend: {setting:?}"
+        );
+        let settings = setting.get("settings").expect("the full settings object");
+        assert_eq!(
+            settings
+                .pointer("/providers/anthropic/model")
+                .and_then(|v| v.as_str()),
+            Some("opus"),
+            "the edited nested value must be updated in place: {settings:?}"
+        );
+        assert_eq!(
+            settings
+                .pointer("/active_provider")
+                .and_then(|v| v.as_str()),
+            Some("anthropic"),
+            "sibling top-level values must be preserved in the full object: {settings:?}"
+        );
+        assert_eq!(
+            settings
+                .pointer("/providers/anthropic/api_key")
+                .and_then(|v| v.as_str()),
+            Some("sk-secret-value"),
+            "an untouched sibling secret must be preserved in the full object: {settings:?}"
+        );
+    }
+
+    /// A group whose schema has no typed `properties` map must not be silently
+    /// dropped: its whole value renders in a visible read-only JSON view.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_render_untyped_group_as_json() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                BackendNativeSettingsSnapshot {
+                    backend_kind: BackendKind::Tycode,
+                    status: BackendConfigSnapshotStatus::Ready,
+                    settings: Some(serde_json::json!({ "raw": { "nested": [1, 2, 3] } })),
+                    groups: vec![BackendNativeSettingsGroup {
+                        id: "raw".to_owned(),
+                        title: "Raw Module".to_owned(),
+                        kind: BackendNativeSettingsGroupKind::Module,
+                        settings_path: vec!["raw".to_owned()],
+                        description: None,
+                        // No "properties" — an opaque schema.
+                        schema: serde_json::json!({ "type": "object" }),
+                    }],
+                    message: None,
+                },
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let pre = container
+            .query_selector(".settings-native-json-readonly")
+            .unwrap()
+            .expect("an untyped group must render as a visible JSON view, not vanish");
+        let json = pre.text_content().unwrap_or_default();
+        assert!(
+            json.contains("nested") && json.contains('1'),
+            "the group's current value must be shown, not dropped: {json:?}"
+        );
+    }
+
+    /// A legacy backend (Hermes, with a typed deep-config schema and no native
+    /// snapshot) is unaffected by the native settings surface: it keeps its
+    /// legacy config inputs and emits `backend_config`, never the native form.
+    #[wasm_bindgen_test]
+    async fn hermes_legacy_page_unaffected_by_native_settings() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_backend_config_host(
+                &state,
+                BackendConfigValues::default(),
+                vec![BackendKind::Hermes],
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Hermes /> }
+        });
+        next_tick().await;
+
+        assert_eq!(
+            container
+                .query_selector_all("input.settings-backend-config-input")
+                .unwrap()
+                .length(),
+            3,
+            "Hermes legacy schema fields must still render"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-settings")
+                .unwrap()
+                .is_none(),
+            "a legacy backend must not render the native settings surface"
+        );
+
+        let inputs = container
+            .query_selector_all("input.settings-backend-config-input")
+            .unwrap();
+        let provider: HtmlInputElement = inputs.item(1).unwrap().dyn_into().unwrap();
+        set_and_change(&provider, "openrouter");
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            last_backend_config(&calls).is_some(),
+            "Hermes must keep persisting via backend_config, not backend_native_settings"
+        );
+        assert!(
+            last_native_settings(&calls).is_none(),
+            "a legacy backend edit must never emit a backend_native_settings frame"
+        );
+    }
+
+    // ---- Native settings: secret redaction, save-locking, unset, nullable ----
+
+    /// An object-typed property whose value contains a nested secret renders as a
+    /// read-only, recursively redacted JSON view — the raw secret never reaches
+    /// the DOM and the value can't be edited (which would clobber the secret).
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_redact_nested_secret_in_json() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                BackendNativeSettingsSnapshot {
+                    backend_kind: BackendKind::Tycode,
+                    status: BackendConfigSnapshotStatus::Ready,
+                    settings: Some(serde_json::json!({
+                        "auth": { "token": "sk-super-secret", "scope": "repo" }
+                    })),
+                    groups: vec![BackendNativeSettingsGroup {
+                        id: "core".to_owned(),
+                        title: "Core".to_owned(),
+                        kind: BackendNativeSettingsGroupKind::Core,
+                        settings_path: Vec::new(),
+                        description: None,
+                        schema: serde_json::json!({
+                            "properties": { "auth": { "type": "object", "title": "Auth" } }
+                        }),
+                    }],
+                    message: None,
+                },
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let html = container.inner_html();
+        assert!(
+            !html.contains("sk-super-secret"),
+            "a nested secret must never reach the DOM: {html:?}"
+        );
+        let pre = container
+            .query_selector(".settings-native-json-readonly")
+            .unwrap()
+            .expect("secret-bearing object must render as a read-only JSON view");
+        let json = pre.text_content().unwrap_or_default();
+        assert!(
+            json.contains("scope") && json.contains(SECRET_REDACTION),
+            "non-secret keys stay visible while the secret is redacted: {json:?}"
+        );
+        // No editable textarea for secret-bearing JSON — editing would clobber it.
+        assert!(
+            container
+                .query_selector("textarea.settings-native-json-input")
+                .unwrap()
+                .is_none(),
+            "secret-bearing JSON must not be editable"
+        );
+    }
+
+    /// An opaque group (schema without `properties`) whose value contains a
+    /// secret renders redacted, not raw.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_redact_secret_in_opaque_group() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                BackendNativeSettingsSnapshot {
+                    backend_kind: BackendKind::Tycode,
+                    status: BackendConfigSnapshotStatus::Ready,
+                    settings: Some(serde_json::json!({
+                        "providers": { "anthropic": { "api_key": "sk-leak", "model": "claude" } }
+                    })),
+                    groups: vec![BackendNativeSettingsGroup {
+                        id: "anthropic".to_owned(),
+                        title: "Anthropic".to_owned(),
+                        kind: BackendNativeSettingsGroupKind::Module,
+                        settings_path: vec!["providers".to_owned(), "anthropic".to_owned()],
+                        description: None,
+                        schema: serde_json::json!({ "type": "object" }),
+                    }],
+                    message: None,
+                },
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let html = container.inner_html();
+        assert!(
+            !html.contains("sk-leak"),
+            "an opaque group's nested secret must never reach the DOM: {html:?}"
+        );
+        let pre = container
+            .query_selector(".settings-native-json-readonly")
+            .unwrap()
+            .expect("opaque group must still render its value, redacted");
+        let json = pre.text_content().unwrap_or_default();
+        assert!(
+            json.contains("model") && json.contains(SECRET_REDACTION),
+            "the redacted view keeps non-secret keys: {json:?}"
+        );
+    }
+
+    /// While a native save is in flight, every native control is disabled and a
+    /// saving affordance shows — a second edit off the stale snapshot can't be
+    /// made. Once the server publishes a newer snapshot the controls re-enable.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_disable_controls_while_saving() {
+        let _calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_tycode_native_host(&state, tycode_ready_snapshot());
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let model: HtmlInputElement = container
+            .query_selector("input[type=\"text\"].settings-native-input")
+            .unwrap()
+            .expect("the model control must render")
+            .dyn_into()
+            .unwrap();
+        set_and_change(&model, "opus");
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".settings-native-saving")
+                .unwrap()
+                .is_some(),
+            "an in-flight save must show a saving affordance"
+        );
+        let select: HtmlSelectElement = container
+            .query_selector(".settings-native-group select")
+            .unwrap()
+            .expect("the enum control must render")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            select.disabled(),
+            "sibling native controls must lock while a save is in flight"
+        );
+        let inputs = container
+            .query_selector_all(".settings-native-input")
+            .unwrap();
+        for i in 0..inputs.length() {
+            let input: HtmlInputElement = inputs.item(i).unwrap().dyn_into().unwrap();
+            assert!(
+                input.disabled(),
+                "every native input must lock while saving"
+            );
+        }
+
+        // Server publishes a newer snapshot reflecting the save → controls unlock.
+        state.backend_native_settings.update(|m| {
+            let snapshot = m
+                .get_mut("host-tyc-native")
+                .and_then(|h| h.get_mut(&BackendKind::Tycode))
+                .expect("snapshot present");
+            snapshot.settings = Some(serde_json::json!({
+                "active_provider": "anthropic",
+                "providers": { "anthropic": { "api_key": "sk-secret-value", "model": "opus" } }
+            }));
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".settings-native-saving")
+                .unwrap()
+                .is_none(),
+            "the saving affordance clears once the server confirms"
+        );
+        let select: HtmlSelectElement = container
+            .query_selector(".settings-native-group select")
+            .unwrap()
+            .expect("the enum control must still render")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            !select.disabled(),
+            "controls must unlock once a newer server snapshot arrives"
+        );
+    }
+
+    /// A failed native save surfaces an explicit error and leaves controls
+    /// editable so the user can retry.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_failed_save_surfaces_error() {
+        let container = make_container();
+        let state = AppState::new();
+        install_tycode_native_host(&state, tycode_ready_snapshot());
+        state.native_settings_save_state.update(|m| {
+            m.entry("host-tyc-native".to_owned()).or_default().insert(
+                BackendKind::Tycode,
+                NativeSettingsSaveState::Failed {
+                    message: "Failed to save settings. Check the connection and try again."
+                        .to_owned(),
+                },
+            );
+        });
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let error = container
+            .query_selector(".settings-native-error")
+            .unwrap()
+            .expect("a failed save must surface an explicit error");
+        assert!(
+            error
+                .text_content()
+                .unwrap_or_default()
+                .contains("Failed to save settings")
+        );
+        let select: HtmlSelectElement = container
+            .query_selector(".settings-native-group select")
+            .unwrap()
+            .expect("the enum control must render")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            !select.disabled(),
+            "controls must stay editable after a failed save so the user can retry"
+        );
+    }
+
+    /// Absent properties render an explicit unset state (marker + "Not set"
+    /// placeholder), never a blank/default control that reads as a real value.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_missing_values_show_unset() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                BackendNativeSettingsSnapshot {
+                    backend_kind: BackendKind::Tycode,
+                    status: BackendConfigSnapshotStatus::Ready,
+                    settings: Some(serde_json::json!({
+                        "providers": { "anthropic": { "model": "claude" } }
+                    })),
+                    groups: vec![BackendNativeSettingsGroup {
+                        id: "anthropic".to_owned(),
+                        title: "Anthropic".to_owned(),
+                        kind: BackendNativeSettingsGroupKind::Module,
+                        settings_path: vec!["providers".to_owned(), "anthropic".to_owned()],
+                        description: None,
+                        schema: serde_json::json!({
+                            "properties": {
+                                "model": { "type": "string", "title": "Model" },
+                                "region": { "type": "string", "title": "Region" }
+                            }
+                        }),
+                    }],
+                    message: None,
+                },
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Unset"),
+            "an absent property must be marked unset: {text:?}"
+        );
+        // The present `model` seeds a real value; the absent `region` is unset.
+        let inputs = container
+            .query_selector_all("input[type=\"text\"].settings-native-input")
+            .unwrap();
+        assert_eq!(inputs.length(), 2, "both string fields render");
+        // Fields are alphabetical (serde_json map order): model (0), region (1).
+        let model: HtmlInputElement = inputs.item(0).unwrap().dyn_into().unwrap();
+        let region: HtmlInputElement = inputs.item(1).unwrap().dyn_into().unwrap();
+        assert_eq!(
+            model.value(),
+            "claude",
+            "the present value seeds its control"
+        );
+        assert_eq!(region.value(), "", "the absent value is not invented");
+        assert_eq!(
+            region.get_attribute("placeholder").as_deref(),
+            Some("Not set"),
+            "the absent field is explicitly marked Not set"
+        );
+    }
+
+    /// A group whose settings_path is absent from the document states that
+    /// explicitly instead of showing invented empty values.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_absent_group_path_shows_note() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                BackendNativeSettingsSnapshot {
+                    backend_kind: BackendKind::Tycode,
+                    status: BackendConfigSnapshotStatus::Ready,
+                    settings: Some(serde_json::json!({ "active_provider": "anthropic" })),
+                    groups: vec![BackendNativeSettingsGroup {
+                        id: "anthropic".to_owned(),
+                        title: "Anthropic".to_owned(),
+                        kind: BackendNativeSettingsGroupKind::Module,
+                        settings_path: vec!["providers".to_owned(), "anthropic".to_owned()],
+                        description: None,
+                        schema: serde_json::json!({
+                            "properties": { "model": { "type": "string" } }
+                        }),
+                    }],
+                    message: None,
+                },
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let note = container
+            .query_selector(".settings-native-unset-note")
+            .unwrap()
+            .expect("an absent group path must be stated explicitly");
+        assert!(
+            note.text_content()
+                .unwrap_or_default()
+                .contains("not present"),
+            "the note must say the settings are not present"
+        );
+    }
+
+    /// Nullable JSON-schema type arrays (`["string", "null"]`, `["boolean",
+    /// "null"]`) still render typed controls rather than a raw JSON editor.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_nullable_type_renders_typed_controls() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                BackendNativeSettingsSnapshot {
+                    backend_kind: BackendKind::Tycode,
+                    status: BackendConfigSnapshotStatus::Ready,
+                    settings: Some(serde_json::json!({
+                        "endpoint": "https://api.example",
+                        "verbose": true
+                    })),
+                    groups: vec![BackendNativeSettingsGroup {
+                        id: "core".to_owned(),
+                        title: "Core".to_owned(),
+                        kind: BackendNativeSettingsGroupKind::Core,
+                        settings_path: Vec::new(),
+                        description: None,
+                        schema: serde_json::json!({
+                            "properties": {
+                                "endpoint": { "type": ["string", "null"], "title": "Endpoint" },
+                                "verbose": { "type": ["boolean", "null"], "title": "Verbose" }
+                            }
+                        }),
+                    }],
+                    message: None,
+                },
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        // No raw JSON editor — nullable primitives resolve to typed controls.
+        assert!(
+            container
+                .query_selector("textarea.settings-native-json-input")
+                .unwrap()
+                .is_none(),
+            "nullable primitive types must not fall through to JSON editing"
+        );
+        let endpoint: HtmlInputElement = container
+            .query_selector("input[type=\"text\"].settings-native-input")
+            .unwrap()
+            .expect("a nullable string renders a text control")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(endpoint.value(), "https://api.example");
+        let checkbox: HtmlInputElement = container
+            .query_selector("input[type=\"checkbox\"]")
+            .unwrap()
+            .expect("a nullable boolean renders a checkbox")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            checkbox.checked(),
+            "the nullable boolean seeds from its current value"
+        );
+    }
+
+    /// A server-side rejection of a native save (a `CommandError` for
+    /// `SetSetting` after the save reached the server) must unlock the controls
+    /// and surface the server's error. The save's result otherwise only lands via
+    /// a refreshed native snapshot, and a rejection emits none — so without this
+    /// the page stays stuck in "Saving…" forever.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_server_rejection_unlocks_and_shows_error() {
+        let container = make_container();
+        let state = AppState::new();
+        // Prime the inbound validators first (this dispatches a synthetic
+        // HostBootstrap, which clears native state for the host), then install the
+        // snapshot and mark a save in flight.
+        crate::dispatch::prime_host_for_tests(&state, "host-tyc-native");
+        install_tycode_native_host(&state, tycode_ready_snapshot());
+        let base = state
+            .backend_native_settings
+            .get_untracked()
+            .get("host-tyc-native")
+            .and_then(|m| m.get(&BackendKind::Tycode))
+            .and_then(|s| s.settings.clone())
+            .expect("installed snapshot settings");
+        state.native_settings_save_state.update(|m| {
+            m.entry("host-tyc-native".to_owned()).or_default().insert(
+                BackendKind::Tycode,
+                NativeSettingsSaveState::Pending { base },
+            );
+        });
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".settings-native-saving")
+                .unwrap()
+                .is_some(),
+            "the page starts in the in-flight saving state"
+        );
+
+        // The server rejects the SetSetting (e.g. Tycode SaveSettings fails). No
+        // refreshed snapshot follows, so only this CommandError can release the
+        // gate.
+        let env = protocol::Envelope::from_payload(
+            protocol::StreamPath("/host/host-tyc-native".to_owned()),
+            protocol::FrameKind::CommandError,
+            0,
+            &protocol::CommandErrorPayload {
+                stream: protocol::StreamPath("/host/host-tyc-native".to_owned()),
+                request_kind: protocol::FrameKind::SetSetting,
+                operation: "set_setting".to_owned(),
+                code: protocol::CommandErrorCode::Internal,
+                message: "Tycode SaveSettings rejected: provider unavailable".to_owned(),
+                fatal: false,
+            },
+        )
+        .expect("synthetic CommandError");
+        crate::dispatch::dispatch_envelope(&state, "host-tyc-native", env);
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".settings-native-saving")
+                .unwrap()
+                .is_none(),
+            "a server rejection must clear the saving state (no snapshot will)"
+        );
+        let error = container
+            .query_selector(".settings-native-error")
+            .unwrap()
+            .expect("the server rejection must surface an error on the settings page");
+        assert!(
+            error
+                .text_content()
+                .unwrap_or_default()
+                .contains("provider unavailable"),
+            "the server's error message must be shown"
+        );
+        let select: HtmlSelectElement = container
+            .query_selector(".settings-native-group select")
+            .unwrap()
+            .expect("the enum control must render")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            !select.disabled(),
+            "controls must unlock after a server rejection so the user can retry"
+        );
+    }
+
+    /// An explicit JSON `null` from the server is unset, not a concrete value:
+    /// a nullable boolean shows unchecked-and-marked-unset (not a real `false`),
+    /// an enum shows "Not set" (not a real option), and a string shows empty with
+    /// a "Not set" hint. Non-null siblings still render their real value.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_explicit_null_renders_unset() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                BackendNativeSettingsSnapshot {
+                    backend_kind: BackendKind::Tycode,
+                    status: BackendConfigSnapshotStatus::Ready,
+                    settings: Some(serde_json::json!({
+                        "active_provider": null,
+                        "endpoint": null,
+                        "verbose": null,
+                        "model": "claude"
+                    })),
+                    groups: vec![BackendNativeSettingsGroup {
+                        id: "core".to_owned(),
+                        title: "Core".to_owned(),
+                        kind: BackendNativeSettingsGroupKind::Core,
+                        settings_path: Vec::new(),
+                        description: None,
+                        schema: serde_json::json!({
+                            "properties": {
+                                "active_provider": {
+                                    "type": ["string", "null"],
+                                    "enum": ["anthropic", "bedrock"]
+                                },
+                                "endpoint": { "type": ["string", "null"] },
+                                "verbose": { "type": ["boolean", "null"] },
+                                "model": { "type": "string" }
+                            }
+                        }),
+                    }],
+                    message: None,
+                },
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        // Three null fields are marked unset; the non-null `model` is not.
+        assert_eq!(
+            container
+                .query_selector_all(".settings-native-unset")
+                .unwrap()
+                .length(),
+            3,
+            "each explicit-null field is marked unset; the non-null one is not"
+        );
+
+        // Enum null → "Not set" (empty), not a real option.
+        let select: HtmlSelectElement = container
+            .query_selector(".settings-native-group select")
+            .unwrap()
+            .expect("the enum control must render")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            select.value(),
+            "",
+            "an explicit-null enum shows Not set, not a concrete option"
+        );
+
+        // Boolean null → unchecked AND marked unset, never a concrete false.
+        let checkbox: HtmlInputElement = container
+            .query_selector("input[type=\"checkbox\"]")
+            .unwrap()
+            .expect("a nullable boolean renders a checkbox")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            !checkbox.checked(),
+            "an explicit-null boolean must not render as a concrete checked value"
+        );
+
+        // Field order is alphabetical: endpoint (0), model (1).
+        let text_inputs = container
+            .query_selector_all("input[type=\"text\"].settings-native-input")
+            .unwrap();
+        let endpoint: HtmlInputElement = text_inputs.item(0).unwrap().dyn_into().unwrap();
+        assert_eq!(endpoint.value(), "", "an explicit-null string is empty");
+        assert_eq!(
+            endpoint.get_attribute("placeholder").as_deref(),
+            Some("Not set"),
+            "an explicit-null string is marked Not set, not a blank default"
+        );
+        let model: HtmlInputElement = text_inputs.item(1).unwrap().dyn_into().unwrap();
+        assert_eq!(
+            model.value(),
+            "claude",
+            "a non-null sibling still renders its real value"
+        );
+    }
+
+    /// An accepted no-op edit (re-entering the current value) neither sends a
+    /// save nor locks the page — otherwise it would strand the page in
+    /// "Saving…" waiting for a change that never happened.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_noop_save_does_not_lock() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(&state, tycode_ready_snapshot());
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        // Re-enter the current value: `model` is already "claude".
+        let model: HtmlInputElement = container
+            .query_selector("input[type=\"text\"].settings-native-input")
+            .unwrap()
+            .expect("the model control must render")
+            .dyn_into()
+            .unwrap();
+        set_and_change(&model, "claude");
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        assert!(
+            last_native_settings(&calls).is_none(),
+            "a no-op edit must not send a BackendNativeSettings save"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-saving")
+                .unwrap()
+                .is_none(),
+            "a no-op edit must not lock the page in a saving state"
+        );
+        assert!(
+            !model.disabled(),
+            "controls must remain editable after a no-op edit"
+        );
+    }
+
+    /// The server force-emits a native-settings snapshot after every save, even
+    /// when the saved document is unchanged (an accepted no-op or a
+    /// canonicalize-to-current). Receiving that snapshot must clear the pending
+    /// gate and unlock the page even though the settings value equals the base
+    /// the save started from.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_forced_snapshot_clears_saving_when_unchanged() {
+        let _calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        // Prime the inbound validators first (this dispatches a synthetic
+        // HostBootstrap, which clears native state for the host), then install the
+        // snapshot.
+        crate::dispatch::prime_host_for_tests(&state, "host-tyc-native");
+        install_tycode_native_host(&state, tycode_ready_snapshot());
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        // A real edit puts a save in flight and locks the controls.
+        let model: HtmlInputElement = container
+            .query_selector("input[type=\"text\"].settings-native-input")
+            .unwrap()
+            .expect("the model control must render")
+            .dyn_into()
+            .unwrap();
+        set_and_change(&model, "opus");
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".settings-native-saving")
+                .unwrap()
+                .is_some(),
+            "the edit must put a save in flight"
+        );
+
+        // The server accepted the save but the resulting document is unchanged
+        // (canonicalized back to the base), and force-emits the snapshot anyway.
+        // The frame carries settings equal to the base the save started from.
+        let env = protocol::Envelope::from_payload(
+            protocol::StreamPath("/host/host-tyc-native".to_owned()),
+            protocol::FrameKind::BackendConfigSnapshots,
+            0,
+            &protocol::BackendConfigSnapshotsPayload {
+                snapshots: Vec::new(),
+                native_settings: vec![tycode_ready_snapshot()],
+            },
+        )
+        .expect("synthetic BackendConfigSnapshots");
+        crate::dispatch::dispatch_envelope(&state, "host-tyc-native", env);
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".settings-native-saving")
+                .unwrap()
+                .is_none(),
+            "an unchanged force-emitted snapshot must clear the saving gate"
+        );
+        let select: HtmlSelectElement = container
+            .query_selector(".settings-native-group select")
+            .unwrap()
+            .expect("the enum control must render")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            !select.disabled(),
+            "controls must unlock once the server confirms, even when unchanged"
+        );
+    }
+
+    // ---- Native settings: grouped tab strip ----
+
+    /// Native-settings tab labels in DOM order.
+    fn native_tab_labels(container: &HtmlElement) -> Vec<String> {
+        let tabs = container.query_selector_all("[role=\"tab\"]").unwrap();
+        (0..tabs.length())
+            .map(|i| tabs.item(i).unwrap().text_content().unwrap_or_default())
+            .collect()
+    }
+
+    /// The one native-settings tab whose label contains `needle`.
+    fn native_tab_by_label(container: &HtmlElement, needle: &str) -> HtmlElement {
+        let tabs = container.query_selector_all("[role=\"tab\"]").unwrap();
+        for i in 0..tabs.length() {
+            let el: HtmlElement = tabs.item(i).unwrap().dyn_into().unwrap();
+            if el.text_content().unwrap_or_default().contains(needle) {
+                return el;
+            }
+        }
+        panic!("no native settings tab labelled {needle:?}");
+    }
+
+    /// The group panels in DOM order (Core first).
+    fn native_panels(container: &HtmlElement) -> Vec<HtmlElement> {
+        let panels = container
+            .query_selector_all(".settings-native-group-panel")
+            .unwrap();
+        (0..panels.length())
+            .map(|i| panels.item(i).unwrap().dyn_into().unwrap())
+            .collect()
+    }
+
+    /// A backend whose native settings span several groups renders them as a tab
+    /// strip (one tab per group, Core first) with only the active group's panel
+    /// visible — never one long flat form.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_render_group_tabs() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(&state, tycode_ready_snapshot());
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let labels = native_tab_labels(&container);
+        assert_eq!(
+            labels.len(),
+            2,
+            "one tab per server-provided group: {labels:?}"
+        );
+        assert!(
+            labels[0].contains("Core"),
+            "the Core group anchors the strip: {labels:?}"
+        );
+        assert!(
+            labels[1].contains("Anthropic"),
+            "module groups follow Core: {labels:?}"
+        );
+
+        let panels = native_panels(&container);
+        assert_eq!(panels.len(), 2, "one panel per group");
+        assert!(!panels[0].hidden(), "the Core panel is visible by default");
+        assert!(
+            panels[1].hidden(),
+            "only the active group's fields show; the module panel is hidden"
+        );
+    }
+
+    /// Clicking a module tab reveals its fields and hides the previously active
+    /// group — the module's controls (mounted but hidden) become visible.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_tab_click_switches_panel() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(&state, tycode_ready_snapshot());
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let anthropic_tab = native_tab_by_label(&container, "Anthropic");
+        anthropic_tab.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let panels = native_panels(&container);
+        assert!(
+            panels[0].hidden(),
+            "the Core panel hides once a module tab is active"
+        );
+        assert!(
+            !panels[1].hidden(),
+            "the clicked module panel becomes visible"
+        );
+        assert_eq!(
+            anthropic_tab.get_attribute("aria-selected").as_deref(),
+            Some("true"),
+            "the active tab reports itself selected"
+        );
+    }
+
+    /// The Core group is the leftmost tab even when the server lists module
+    /// groups ahead of it, so the anchor page is always first.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_core_group_ordered_first() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let mut snapshot = tycode_ready_snapshot();
+            snapshot.groups.reverse(); // Module now precedes Core in server order.
+            install_tycode_native_host(&state, snapshot);
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        let labels = native_tab_labels(&container);
+        assert!(
+            labels[0].contains("Core"),
+            "Core anchors the strip regardless of server order: {labels:?}"
+        );
+        let panels = native_panels(&container);
+        assert!(
+            !panels[0].hidden(),
+            "the Core panel is the default-visible one"
+        );
+    }
+
+    /// A backend that exposes exactly one native group renders it directly with
+    /// its titled header and no tab strip.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_single_group_has_no_tabs() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_tycode_native_host(
+                &state,
+                BackendNativeSettingsSnapshot {
+                    backend_kind: BackendKind::Tycode,
+                    status: BackendConfigSnapshotStatus::Ready,
+                    settings: Some(serde_json::json!({ "active_provider": "anthropic" })),
+                    groups: vec![BackendNativeSettingsGroup {
+                        id: "core".to_owned(),
+                        title: "Core".to_owned(),
+                        kind: BackendNativeSettingsGroupKind::Core,
+                        settings_path: Vec::new(),
+                        description: None,
+                        schema: serde_json::json!({
+                            "properties": {
+                                "active_provider": {
+                                    "type": "string",
+                                    "title": "Active Provider"
+                                }
+                            }
+                        }),
+                    }],
+                    message: None,
+                },
+            );
+            provide_context(state);
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[role=\"tab\"]")
+                .unwrap()
+                .is_none(),
+            "a single native group must not grow a tab strip"
+        );
+        assert!(
+            container
+                .query_selector(".settings-native-group-header")
+                .unwrap()
+                .is_some(),
+            "the single group keeps its titled header"
+        );
+    }
+
+    /// Regression: the selected module tab must survive the native body being
+    /// rebuilt by a save (which flips `native_settings_save_state` to Pending)
+    /// and by the forced snapshot the server emits afterward — the user is never
+    /// snapped back to the Core tab mid-edit.
+    #[wasm_bindgen_test]
+    async fn tycode_native_settings_active_tab_survives_save_and_snapshot() {
+        let _calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        // Prime validators so the forced BackendConfigSnapshots dispatch is
+        // accepted later.
+        crate::dispatch::prime_host_for_tests(&state, "host-tyc-native");
+        install_tycode_native_host(&state, tycode_ready_snapshot());
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+        });
+        next_tick().await;
+
+        // Switch to the Anthropic module tab.
+        let anthropic_tab = native_tab_by_label(&container, "Anthropic");
+        anthropic_tab.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            !native_panels(&container)[1].hidden(),
+            "the module panel is active before editing"
+        );
+
+        // Edit the module's model field → a save goes in flight (Pending), which
+        // rebuilds the native body.
+        let model: HtmlInputElement = container
+            .query_selector("input[type=\"text\"].settings-native-input")
+            .unwrap()
+            .expect("the model control renders in the active module panel")
+            .dyn_into()
+            .unwrap();
+        set_and_change(&model, "opus");
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".settings-native-saving")
+                .unwrap()
+                .is_some(),
+            "the edit must put a save in flight"
+        );
+        let panels = native_panels(&container);
+        assert!(
+            panels[0].hidden(),
+            "Core stays hidden while a save is in flight"
+        );
+        assert!(
+            !panels[1].hidden(),
+            "the module tab stays active through the save rerender, not reset to Core"
+        );
+
+        // The server force-emits a fresh snapshot; the body rebuilds again.
+        let env = protocol::Envelope::from_payload(
+            protocol::StreamPath("/host/host-tyc-native".to_owned()),
+            protocol::FrameKind::BackendConfigSnapshots,
+            0,
+            &protocol::BackendConfigSnapshotsPayload {
+                snapshots: Vec::new(),
+                native_settings: vec![tycode_ready_snapshot()],
+            },
+        )
+        .expect("synthetic BackendConfigSnapshots");
+        crate::dispatch::dispatch_envelope(&state, "host-tyc-native", env);
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".settings-native-saving")
+                .unwrap()
+                .is_none(),
+            "the forced snapshot clears the saving gate"
+        );
+        let panels = native_panels(&container);
+        assert!(
+            panels[0].hidden(),
+            "Core is still hidden after the snapshot rebuild"
+        );
+        assert!(
+            !panels[1].hidden(),
+            "the module tab remains active after the forced snapshot"
+        );
+        let anthropic_tab = native_tab_by_label(&container, "Anthropic");
+        assert_eq!(
+            anthropic_tab.get_attribute("aria-selected").as_deref(),
+            Some("true"),
+            "the module tab is still marked selected after the snapshot"
         );
     }
 }

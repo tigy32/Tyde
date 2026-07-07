@@ -186,6 +186,14 @@ fn ConnectionPill(state: AppState, local_host_id: LocalHostId) -> impl IntoView 
                     release_version.as_ref(),
                 ),
             ),
+            ConnectionStatus::NeedsAction { code, message } => {
+                let prefix = if crate::state::needs_tyggs_sign_in(code) {
+                    "Sign-in required"
+                } else {
+                    "Re-pair required"
+                };
+                ("error", format!("{prefix}: {message}"))
+            }
         }
     };
     view! {
@@ -226,7 +234,16 @@ fn ConnectDisconnectButton(
     // A sticky incompatible-protocol reject can't be recovered by reconnecting
     // (the app-level handshake would just be rejected again), so the picker must
     // not offer a no-op Connect affordance for it.
-    let needs_update = move || matches!(status(), ConnectionStatus::UpdateRequired { .. });
+    let status_for_update = status.clone();
+    let needs_update =
+        move || matches!(status_for_update(), ConnectionStatus::UpdateRequired { .. });
+    // A managed pairing that stopped needing sign-in / re-pair: offer the exact
+    // action instead of a no-op Connect (findings #3/#7).
+    let status_for_action = status.clone();
+    let managed_action = move || match status_for_action() {
+        ConnectionStatus::NeedsAction { code, .. } => Some(crate::state::needs_tyggs_sign_in(code)),
+        _ => None,
+    };
 
     // Phase C MEDIUM: do NOT optimistically write Connecting/Error into
     // `connection_statuses` — that signal is owned by the
@@ -264,8 +281,20 @@ fn ConnectDisconnectButton(
             }
         });
     });
-    // `state` is also held inside the closures above via clones; this binding
-    // anchors the prop without compiler warnings.
+
+    // Re-pair: send the user back to the scanner to pair this host afresh through
+    // tycode.dev. Forgetting is handled by the row's separate Delete button.
+    let state_for_repair = state.clone();
+    let on_repair = Callback::new(move |_: ()| {
+        state_for_repair
+            .app_mode
+            .set(AppMode::Pairing(PairingScreen::Scanner));
+    });
+    let on_sign_in = Callback::new(move |_: ()| {
+        if let Err(error) = bridge::begin_tyggs_sign_in(None) {
+            log::error!("failed to start Tyggs sign-in: {error}");
+        }
+    });
     let _ = state;
     let _ = pending_invoke;
 
@@ -280,6 +309,28 @@ fn ConnectDisconnectButton(
                     data_mobile_test="paired-host-update-required"
                 />
             }.into_any()
+        } else if let Some(sign_in) = managed_action() {
+            if sign_in {
+                view! {
+                    <Button
+                        label="Sign in with Tyggs"
+                        variant=ButtonVariant::Primary
+                        full_width=true
+                        data_mobile_test="paired-host-sign-in"
+                        on_click=on_sign_in
+                    />
+                }.into_any()
+            } else {
+                view! {
+                    <Button
+                        label="Re-pair"
+                        variant=ButtonVariant::Primary
+                        full_width=true
+                        data_mobile_test="paired-host-repair"
+                        on_click=on_repair
+                    />
+                }.into_any()
+            }
         } else if is_connected() {
             view! {
                 <Button
@@ -436,6 +487,85 @@ mod wasm_tests {
         assert!(
             text.contains("0.8.19-beta.15"),
             "host build should surface: {text}"
+        );
+    }
+
+    /// A managed host that needs a fresh Tyggs session offers an explicit
+    /// "Sign in with Tyggs" action — not a no-op Connect (findings #3/#7).
+    #[wasm_bindgen_test]
+    async fn service_auth_required_host_offers_sign_in_not_connect() {
+        let container = make_container();
+        let host = LocalHostId("h-auth".to_owned());
+        let host_for_mount = host.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state
+                .paired_hosts
+                .set(vec![fixture_host("h-auth", "Studio")]);
+            state.connection_statuses.update(|m| {
+                m.insert(
+                    host_for_mount.clone(),
+                    ConnectionStatus::NeedsAction {
+                        code: protocol::MobileAccessErrorCode::ServiceAuthRequired,
+                        message: "Sign in with your Tyggs account again.".to_owned(),
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <PairedHostsPicker /> }
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='paired-host-sign-in']")
+                .unwrap()
+                .is_some(),
+            "an auth-required host must offer a Tyggs sign-in action"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains(">Connect<") && text.contains("Sign-in required"),
+            "no bare Connect; the pill must name the required action: {text}"
+        );
+    }
+
+    /// A managed host that needs re-pairing offers an explicit "Re-pair" action.
+    #[wasm_bindgen_test]
+    async fn repair_required_host_offers_repair_action() {
+        let container = make_container();
+        let host = LocalHostId("h-repair".to_owned());
+        let host_for_mount = host.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state
+                .paired_hosts
+                .set(vec![fixture_host("h-repair", "Studio")]);
+            state.connection_statuses.update(|m| {
+                m.insert(
+                    host_for_mount.clone(),
+                    ConnectionStatus::NeedsAction {
+                        code: protocol::MobileAccessErrorCode::RepairRequired,
+                        message: "Re-pair from the host's current QR code.".to_owned(),
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <PairedHostsPicker /> }
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='paired-host-repair']")
+                .unwrap()
+                .is_some(),
+            "a repair-required host must offer a Re-pair action"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Re-pair required"),
+            "the pill must name the required action: {text}"
         );
     }
 

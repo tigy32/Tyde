@@ -9,6 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -22,6 +23,10 @@ const loaderJs = readFileSync(
 );
 const loaderCss = readFileSync(
   fileURLToPath(new URL("../loader.css", import.meta.url)),
+  "utf8",
+);
+const serviceConfigJs = readFileSync(
+  fileURLToPath(new URL("../mobile-service-config.js", import.meta.url)),
   "utf8",
 );
 
@@ -77,4 +82,40 @@ test("loader.js boots Trunk-style: dynamic import + init({module_or_path})", () 
 
 test("loader.css hides #loader-shell when the hidden attribute is set", () => {
   assert.match(loaderCss, /#loader-shell\[hidden\]\s*\{\s*display:\s*none/);
+});
+
+test("index.html loads external service config before the loader module", () => {
+  const configIndex = html.indexOf('src="./mobile-service-config.js"');
+  const loaderIndex = html.indexOf('type="module" src="./loader.js"');
+  assert.ok(configIndex >= 0, "expected an external mobile-service config script");
+  assert.ok(loaderIndex >= 0, "expected the loader module script");
+  assert.ok(configIndex < loaderIndex, "service config must load before the loader module");
+  assert.doesNotMatch(html, /window\.__TYDE_MOBILE_SERVICE__\s*=/);
+});
+
+test("service config script SRI matches its external file", () => {
+  const tag = html.match(
+    /<script\s+src="\.\/mobile-service-config\.js"\s+integrity="([^"]+)"\s*><\/script>/,
+  );
+  assert.ok(tag, "expected SRI-pinned mobile-service-config.js script");
+  const digest = createHash("sha384").update(serviceConfigJs).digest("base64");
+  assert.equal(tag[1], `sha384-${digest}`);
+});
+
+test("service config is public same-origin endpoint metadata only", () => {
+  assert.match(serviceConfigJs, /window\.__TYDE_MOBILE_SERVICE__/);
+  assert.match(serviceConfigJs, /baseUrl:\s*new URL\("\/api\/tyde\/mobile\/v1", window\.location\.origin\)\.href/);
+  assert.match(serviceConfigJs, /provider:\s*"google"/);
+  assert.doesNotMatch(serviceConfigJs, /provider:\s*"tyggs"/);
+  assert.match(serviceConfigJs, /paywallUrl:\s*"https:\/\/tyggs\.com\/pass"/);
+  assert.doesNotMatch(serviceConfigJs, /stubAuth|stubRedeem/);
+  assert.doesNotMatch(serviceConfigJs, /(?:token|secret|password|grant)\s*:/i);
+});
+
+test("CSP permits the external config without inline script or cross-origin connect", () => {
+  const csp = html.match(/Content-Security-Policy"[\s\S]*?content="([^"]+)"/);
+  assert.ok(csp, "expected a CSP meta tag");
+  assert.match(csp[1], /script-src 'self' 'wasm-unsafe-eval'/);
+  assert.doesNotMatch(csp[1], /script-src[^;]*'unsafe-inline'/);
+  assert.match(csp[1], /connect-src 'self' wss:/);
 });

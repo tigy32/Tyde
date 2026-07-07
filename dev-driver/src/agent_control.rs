@@ -9,9 +9,9 @@ use protocol::{
     AgentRenamedPayload, AgentStartPayload, BackendAccessMode, BackendConfigSchemasPayload,
     BackendKind, ChatEvent, Envelope, FrameKind, HostBootstrapPayload, HostSettings,
     HostSettingsPayload, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
-    LaunchProfileId, NewAgentPayload, ProjectId, SendMessagePayload, SessionSchemaEntry,
-    SessionSchemasPayload, SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload,
-    SpawnCostHint, StreamPath,
+    LaunchProfileId, MessageSender, NewAgentPayload, ProjectId, SendMessagePayload,
+    SessionSchemaEntry, SessionSchemasPayload, SessionSettingsValues, SpawnAgentParams,
+    SpawnAgentPayload, SpawnCostHint, StreamPath,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -881,8 +881,15 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 ChatEvent::OperationCancelled(_) => {
                     agent.turn_completed = true;
                 }
-                ChatEvent::MessageAdded(_)
-                | ChatEvent::MessageMetadataUpdated(_)
+                ChatEvent::MessageAdded(message) => {
+                    if matches!(
+                        message.sender,
+                        MessageSender::Assistant { .. } | MessageSender::Error
+                    ) {
+                        agent.turn_completed = true;
+                    }
+                }
+                ChatEvent::MessageMetadataUpdated(_)
                 | ChatEvent::ToolRequest(_)
                 | ChatEvent::ToolProgress(_)
                 | ChatEvent::ToolExecutionCompleted(_)
@@ -1771,6 +1778,24 @@ mod tests {
             .expect("agent-control runtime should bootstrap")
     }
 
+    async fn connect_client(host: server::HostHandle) -> client::Connection {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let server_config = server::ServerConfig::current();
+
+        tokio::spawn(async move {
+            let conn = server::accept(&server_config, server_stream)
+                .await
+                .expect("server handshake failed");
+            if let Err(err) = server::run_connection(conn, host).await {
+                panic!("server connection loop failed: {err:?}");
+            }
+        });
+
+        client::connect(&ClientConfig::current(), client_stream)
+            .await
+            .expect("client handshake failed")
+    }
+
     fn test_host() -> (server::HostHandle, tempfile::TempDir) {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let session_path = tempdir.path().join("sessions.json");
@@ -1811,6 +1836,108 @@ mod tests {
             read.events
         );
         read.next_after_seq
+    }
+
+    fn completed_chat_event_contains(event: &ChatEvent, expected_text: &str) -> bool {
+        match event {
+            ChatEvent::StreamEnd(data) => data.message.content.contains(expected_text),
+            ChatEvent::MessageAdded(message) => message.content.contains(expected_text),
+            _ => false,
+        }
+    }
+
+    async fn wait_for_completed_agent_idle(
+        client: &mut client::Connection,
+        expected_text: &str,
+    ) -> AgentId {
+        timeout(Duration::from_secs(10), async {
+            let mut agent_id = None;
+            let mut saw_expected_text = false;
+            loop {
+                let env = client
+                    .next_event()
+                    .await
+                    .expect("read event while waiting for completed agent")
+                    .expect("connection closed while waiting for completed agent");
+                match env.kind {
+                    FrameKind::NewAgent => {
+                        let payload: NewAgentPayload =
+                            env.parse_payload().expect("parse NewAgent payload");
+                        if payload.name == "late-replay-agent" {
+                            agent_id = Some(payload.agent_id);
+                        }
+                    }
+                    FrameKind::AgentBootstrap => {
+                        let payload: AgentBootstrapPayload =
+                            env.parse_payload().expect("parse AgentBootstrap payload");
+                        for event in payload.events {
+                            if let AgentBootstrapEvent::ChatEvent(chat) = event {
+                                if completed_chat_event_contains(&chat, expected_text) {
+                                    saw_expected_text = true;
+                                }
+                                if saw_expected_text
+                                    && matches!(chat, ChatEvent::TypingStatusChanged(false))
+                                {
+                                    return agent_id.unwrap_or_else(|| {
+                                        parse_agent_id_from_stream(&env.stream)
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    FrameKind::ChatEvent => {
+                        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+                        if completed_chat_event_contains(&event, expected_text) {
+                            saw_expected_text = true;
+                        }
+                        if saw_expected_text
+                            && matches!(event, ChatEvent::TypingStatusChanged(false))
+                        {
+                            return agent_id
+                                .unwrap_or_else(|| parse_agent_id_from_stream(&env.stream));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for completed agent")
+    }
+
+    fn assert_replayed_completed_message_without_stream_end(
+        read: &ReadAgentResult,
+        expected_text: &str,
+    ) {
+        let mut saw_message_added = false;
+        let mut saw_stream_end = false;
+        for env in &read.events {
+            if env.kind != FrameKind::ChatEvent {
+                continue;
+            }
+            match env
+                .parse_payload::<ChatEvent>()
+                .expect("ChatEvent should parse")
+            {
+                ChatEvent::MessageAdded(message) if message.content.contains(expected_text) => {
+                    saw_message_added = true;
+                }
+                ChatEvent::StreamEnd(data) if data.message.content.contains(expected_text) => {
+                    saw_stream_end = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_message_added,
+            "late replay should include completed MessageAdded for {expected_text:?}, got {:?}",
+            read.events
+        );
+        assert!(
+            !saw_stream_end,
+            "late replay should not include StreamEnd for {expected_text:?}, got {:?}",
+            read.events
+        );
     }
 
     #[test]
@@ -1898,6 +2025,61 @@ mod tests {
             "mock backend response to: hello",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn await_agents_treats_late_replayed_completed_message_as_ready() {
+        let (host, _tempdir) = test_host();
+        let mut client = connect_client(host.clone()).await;
+        let env = client
+            .next_event()
+            .await
+            .expect("initial host bootstrap read failed")
+            .expect("connection closed before initial host bootstrap");
+        assert_eq!(env.kind, FrameKind::HostBootstrap);
+
+        let prompt = "__mock_slow__ late replay hello";
+        let expected_text = "mock backend response to: __mock_slow__ late replay hello";
+        client
+            .spawn_agent(SpawnAgentPayload {
+                name: Some("late-replay-agent".to_string()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::New {
+                    workspace_roots: vec!["/tmp/test".to_string()],
+                    prompt: prompt.to_string(),
+                    images: None,
+                    backend_kind: BackendKind::Claude,
+                    launch_profile_id: None,
+                    cost_hint: None,
+                    access_mode: BackendAccessMode::Unrestricted,
+                    session_settings: None,
+                },
+            })
+            .await
+            .expect("spawn late replay agent");
+        let agent_id = wait_for_completed_agent_idle(&mut client, expected_text).await;
+
+        let control = connect_runtime(host).await;
+        let replay = control
+            .read_agent(agent_id.clone(), None, None)
+            .await
+            .expect("late replayed agent output should be readable");
+        assert_replayed_completed_message_without_stream_end(&replay, expected_text);
+        let awaited = control
+            .await_agents(Some(vec![agent_id.clone()]), Some(5_000))
+            .await
+            .expect("await should succeed for late replayed completed turn");
+
+        assert!(
+            awaited.still_thinking.is_empty(),
+            "late replayed completed turn should not stay thinking: {awaited:?}"
+        );
+        assert_eq!(awaited.ready.len(), 1);
+        assert_eq!(awaited.ready[0].agent_id, agent_id.0);
+        assert_eq!(awaited.ready[0].status, AgentControlStatus::Idle);
+        read_agent_contains(&control, agent_id, None, expected_text).await;
     }
 
     #[tokio::test]

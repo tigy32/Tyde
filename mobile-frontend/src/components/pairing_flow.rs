@@ -2,8 +2,9 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
+use crate::bridge::RedeemOutcome;
 use crate::components::ui::{Button, ButtonVariant};
-use crate::state::{AppMode, AppState, PairingScreen};
+use crate::state::{AppMode, AppState, MobileServiceAuthState, PairingOffer, PairingScreen};
 
 /// Top-level dispatcher for the pairing experience. The current step lives in
 /// `state.app_mode` as `AppMode::Pairing(PairingScreen)`. Each sub-screen
@@ -21,11 +22,38 @@ pub fn PairingFlow(screen: PairingScreen) -> impl IntoView {
             <InProgressScreen qr_uri=qr_uri preview=preview />
         }
         .into_any(),
+        PairingScreen::ServiceAuth {
+            qr_uri,
+            host_label,
+            auth,
+        } => view! {
+            <ServiceAuthScreen qr_uri=qr_uri host_label=host_label initial_auth=auth />
+        }
+        .into_any(),
+        PairingScreen::RepairRequired { message } => view! {
+            <RepairRequiredScreen message=message />
+        }
+        .into_any(),
         PairingScreen::Failed { message } => view! {
             <FailedScreen message=message />
         }
         .into_any(),
     }
+}
+
+/// Routes a classified [`PairingOffer`] onto the right pairing screen. Shared by
+/// the scanner and the manual-paste path so both branch identically.
+fn route_offer(state: &AppState, qr_uri: String, offer: PairingOffer) {
+    let screen = match offer {
+        PairingOffer::ManagedService { host_label } => PairingScreen::ServiceAuth {
+            qr_uri,
+            host_label,
+            auth: MobileServiceAuthState::Idle,
+        },
+        PairingOffer::RepairRequired { message } => PairingScreen::RepairRequired { message },
+        PairingOffer::DirectPairing { preview } => PairingScreen::Confirm { qr_uri, preview },
+    };
+    state.app_mode.set(AppMode::Pairing(screen));
 }
 
 /// Live scanner. Calls the Tauri barcode-scanner plugin via `bridge::scan_qr`;
@@ -54,13 +82,8 @@ fn ScannerScreen() -> impl IntoView {
                 match bridge::scan_qr().await {
                     Ok(result) => {
                         let trimmed = result.content.trim().to_owned();
-                        match bridge::preview_pairing_uri(&trimmed).await {
-                            Ok(preview) => {
-                                state.app_mode.set(AppMode::Pairing(PairingScreen::Confirm {
-                                    qr_uri: trimmed,
-                                    preview,
-                                }));
-                            }
+                        match bridge::classify_pairing_offer(&trimmed).await {
+                            Ok(offer) => route_offer(&state, trimmed, offer),
                             Err(e) => {
                                 error.set(Some(format!(
                                     "Scanned code isn't a Tyde pairing QR: {e}"
@@ -154,13 +177,8 @@ fn ManualPasteScreen() -> impl IntoView {
         error.set(None);
         let state = state_for_continue.clone();
         spawn_local(async move {
-            match bridge::preview_pairing_uri(&trimmed).await {
-                Ok(preview) => {
-                    state.app_mode.set(AppMode::Pairing(PairingScreen::Confirm {
-                        qr_uri: trimmed,
-                        preview,
-                    }));
-                }
+            match bridge::classify_pairing_offer(&trimmed).await {
+                Ok(offer) => route_offer(&state, trimmed, offer),
                 Err(e) => error.set(Some(format!("Invalid pairing URI: {e}"))),
             }
             pending.set(false);
@@ -180,7 +198,7 @@ fn ManualPasteScreen() -> impl IntoView {
                 <textarea
                     class="pairing-paste-input"
                     rows=4
-                    placeholder="tyde-pair://v1?..."
+                    placeholder="tyde-pair://..."
                     prop:value=move || pasted.get()
                     on:input=move |ev| pasted.set(event_target_value(&ev))
                 />
@@ -300,6 +318,249 @@ fn InProgressScreen(qr_uri: String, preview: crate::state::MobilePairingPreview)
     }
 }
 
+/// Drives the managed (`tyde-pair://v2`) auth + redeem sequence against
+/// `tycode.dev`. The pre-transport Tyggs sign-in runs first; only once
+/// `tycode.dev` confirms a valid Tyggs Pass does the offer redeem + managed
+/// broker connect proceed. Every terminal state renders an explicit card — a
+/// paywall link, a retry, or a re-pair prompt — so the user is never left on an
+/// indefinite spinner.
+#[component]
+fn ServiceAuthScreen(
+    qr_uri: String,
+    host_label: String,
+    initial_auth: MobileServiceAuthState,
+) -> impl IntoView {
+    let state = use_context::<AppState>().expect("AppState context");
+    let auth = RwSignal::new(initial_auth);
+    // True while an auth or redeem call is in flight, so the card shows a bounded
+    // "working" spinner and retry buttons stay disabled.
+    let busy = RwSignal::new(false);
+    let started = RwSignal::new(false);
+
+    let qr_for_run = qr_uri.clone();
+    let state_for_run = state.clone();
+    // Runs sign-in, then (on success) redeem + connect. Callable from the initial
+    // effect and from every retry button.
+    let run = Callback::new(move |_: ()| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        let qr_uri = qr_for_run.clone();
+        let state = state_for_run.clone();
+        spawn_local(async move {
+            let authenticated = bridge::authenticate_managed(&qr_uri).await;
+            auth.set(authenticated.clone());
+            if !matches!(authenticated, MobileServiceAuthState::Authenticated { .. }) {
+                busy.set(false);
+                return;
+            }
+            match bridge::redeem_managed_and_connect(&qr_uri).await {
+                Ok(()) => {
+                    // The paired-hosts-changed event drives the picker; drop back
+                    // to the workspace so it renders the freshly paired host.
+                    state.app_mode.set(AppMode::Workspace);
+                }
+                Err(RedeemOutcome::Auth(next)) => {
+                    auth.set(next);
+                    busy.set(false);
+                }
+                Err(RedeemOutcome::Repair { message }) => {
+                    state
+                        .app_mode
+                        .set(AppMode::Pairing(PairingScreen::RepairRequired { message }));
+                }
+                Err(RedeemOutcome::Terminal { message }) => {
+                    state
+                        .app_mode
+                        .set(AppMode::Pairing(PairingScreen::Failed { message }));
+                }
+            }
+        });
+    });
+
+    // Kick off sign-in on first render.
+    Effect::new(move |_| {
+        if started.get_untracked() {
+            return;
+        }
+        started.set(true);
+        run.run(());
+    });
+
+    // Not-signed-in state: navigate to the tycode.dev-hosted Tyggs OAuth start,
+    // stashing the pairing URI so the flow resumes when the redirect returns.
+    let qr_for_sign_in = qr_uri.clone();
+    let on_sign_in = Callback::new(move |_: ()| {
+        if let Err(error) = bridge::begin_tyggs_sign_in(Some(&qr_for_sign_in)) {
+            log::error!("failed to start Tyggs sign-in: {error}");
+        }
+    });
+
+    let state_for_cancel = state.clone();
+    let host_label_for_title = host_label.clone();
+
+    view! {
+        <div class="view pairing-view">
+            <div class="view-header">
+                <h1 class="view-title">{format!("Connect {host_label_for_title}")}</h1>
+                <button
+                    class="header-action"
+                    data-mobile-test="pairing-service-cancel"
+                    on:click=move |_| state_for_cancel.app_mode.set(AppMode::Workspace)
+                >"Cancel"</button>
+            </div>
+            <div class="view-body">
+                {move || view! {
+                    <ServiceAuthCard
+                        auth=auth.get()
+                        busy=busy.get()
+                        on_retry=run
+                        on_sign_in=on_sign_in
+                    />
+                }}
+            </div>
+        </div>
+    }
+}
+
+/// Pure projection of a [`MobileServiceAuthState`] onto the managed-auth card.
+/// Split out from [`ServiceAuthScreen`] so the render for each state — spinner,
+/// paywall, sign-in, retry — is deterministic and testable without the async
+/// authenticate/redeem orchestration. `on_retry` re-runs the auth sequence;
+/// `on_sign_in` starts the Tyggs OAuth redirect for the signed-out state.
+#[component]
+fn ServiceAuthCard(
+    auth: MobileServiceAuthState,
+    busy: bool,
+    on_retry: Callback<()>,
+    on_sign_in: Callback<()>,
+) -> impl IntoView {
+    match auth {
+        MobileServiceAuthState::Idle | MobileServiceAuthState::Authenticating => view! {
+            <ServiceWorking message="Signing in with Tyggs…".to_owned() />
+        }
+        .into_any(),
+        MobileServiceAuthState::Authenticated { .. } => view! {
+            <ServiceWorking message="Setting up secure access…".to_owned() />
+        }
+        .into_any(),
+        MobileServiceAuthState::PassRequired {
+            message,
+            paywall_url,
+        } => view! {
+            <div class="pairing-card pairing-paywall" data-mobile-test="pairing-paywall">
+                <h2 class="pairing-card-title">"Tyggs Pass required"</h2>
+                <p class="pairing-card-body">{message}</p>
+                <a
+                    class="ui-button ui-button-primary ui-button-full"
+                    href=paywall_url
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    data-mobile-test="pairing-paywall-link"
+                >
+                    <span class="ui-button-label">"Get a Tyggs Pass"</span>
+                </a>
+                <Button
+                    label="I have a Pass — try again"
+                    variant=ButtonVariant::Secondary
+                    full_width=true
+                    disabled=busy
+                    data_mobile_test="pairing-paywall-retry"
+                    on_click=on_retry
+                />
+            </div>
+        }
+        .into_any(),
+        MobileServiceAuthState::AuthFailed { message } => view! {
+            <div class="pairing-card" data-mobile-test="pairing-auth-failed">
+                <h2 class="pairing-card-title">"Sign in with Tyggs"</h2>
+                <p class="pairing-card-body">{message}</p>
+                <Button
+                    label="Sign in with Tyggs"
+                    variant=ButtonVariant::Primary
+                    full_width=true
+                    disabled=busy
+                    data_mobile_test="pairing-auth-sign-in"
+                    on_click=on_sign_in
+                />
+            </div>
+        }
+        .into_any(),
+        MobileServiceAuthState::ServiceUnavailable { message, retryable } => view! {
+            <div class="pairing-card" data-mobile-test="pairing-service-unavailable">
+                <h2 class="pairing-card-title">"Service unavailable"</h2>
+                <p class="pairing-card-body">{message}</p>
+                {retryable.then(|| view! {
+                    <Button
+                        label="Try again"
+                        variant=ButtonVariant::Primary
+                        full_width=true
+                        disabled=busy
+                        data_mobile_test="pairing-service-retry"
+                        on_click=on_retry
+                    />
+                })}
+            </div>
+        }
+        .into_any(),
+    }
+}
+
+/// Bounded working state shown while a `tycode.dev` call is in flight. Distinct
+/// from a stuck spinner: it only renders between a request and its typed reply.
+#[component]
+fn ServiceWorking(message: String) -> impl IntoView {
+    view! {
+        <div class="pairing-progress" data-mobile-test="pairing-service-working">
+            <span class="pairing-spinner">"…"</span>
+            <p class="pairing-instruction">{message}</p>
+        </div>
+    }
+}
+
+/// Terminal screen for a legacy public-broker QR or stored record. Explains why
+/// it can't connect and points the user at a fresh re-pair — never a spinner or
+/// a silent public-broker connect.
+#[component]
+fn RepairRequiredScreen(message: String) -> impl IntoView {
+    let state = use_context::<AppState>().expect("AppState context");
+    let state_for_rescan = state.clone();
+    let state_for_cancel = state.clone();
+    let on_rescan = Callback::new(move |_: ()| {
+        state_for_rescan
+            .app_mode
+            .set(AppMode::Pairing(PairingScreen::Scanner))
+    });
+    let on_cancel = Callback::new(move |_: ()| state_for_cancel.app_mode.set(AppMode::Workspace));
+
+    view! {
+        <div class="view pairing-view">
+            <div class="view-header">
+                <h1 class="view-title">"Re-pair required"</h1>
+            </div>
+            <div class="view-body">
+                <div class="pairing-card" data-mobile-test="pairing-repair-required">
+                    <p class="pairing-card-body">{message}</p>
+                </div>
+                <Button
+                    label="Scan the new QR code"
+                    variant=ButtonVariant::Primary
+                    full_width=true
+                    data_mobile_test="pairing-repair-rescan"
+                    on_click=on_rescan
+                />
+                <Button
+                    label="Cancel"
+                    variant=ButtonVariant::Secondary
+                    full_width=true
+                    on_click=on_cancel
+                />
+            </div>
+        </div>
+    }
+}
+
 #[component]
 fn FailedScreen(message: String) -> impl IntoView {
     let state = use_context::<AppState>().expect("AppState context");
@@ -393,5 +654,132 @@ mod wasm_tests {
             "expected confirmation prompt: {text}"
         );
         assert!(text.contains("Pair"), "expected Pair button: {text}");
+    }
+
+    /// A `pass_required` auth state renders the paywall card with a working
+    /// purchase link pointing at the `tycode.dev`-provided URL — never a spinner,
+    /// never a redeem attempt. Mounts the pure card so the assertion is
+    /// deterministic and independent of the async authenticate orchestration.
+    #[wasm_bindgen_test]
+    async fn service_auth_card_pass_required_renders_paywall_link() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <ServiceAuthCard
+                    auth=MobileServiceAuthState::PassRequired {
+                        message: "A Tyggs Pass is required.".to_owned(),
+                        paywall_url: "https://tyggs.com/go".to_owned(),
+                    }
+                    busy=false
+                    on_retry=Callback::new(|_: ()| {})
+                        on_sign_in=Callback::new(|_: ()| {})
+                />
+            }
+        });
+        next_tick().await;
+
+        let link: HtmlElement = container
+            .query_selector("[data-mobile-test='pairing-paywall-link']")
+            .unwrap()
+            .expect("pass_required must render a paywall link")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            link.get_attribute("href").as_deref(),
+            Some("https://tyggs.com/go"),
+            "paywall link must point at the tycode.dev-provided paywall URL",
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Tyggs Pass required"),
+            "paywall card must be explicit: {text}"
+        );
+    }
+
+    /// A retryable `service_unavailable` renders a retry affordance; a
+    /// non-retryable one does not — the user is never stuck on a spinner nor
+    /// offered a futile retry.
+    #[wasm_bindgen_test]
+    async fn service_auth_card_service_unavailable_retry_tracks_retryable() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <div>
+                    <ServiceAuthCard
+                        auth=MobileServiceAuthState::ServiceUnavailable {
+                            message: "Temporarily down.".to_owned(),
+                            retryable: true,
+                        }
+                        busy=false
+                        on_retry=Callback::new(|_: ()| {})
+                        on_sign_in=Callback::new(|_: ()| {})
+                    />
+                </div>
+            }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='pairing-service-retry']")
+                .unwrap()
+                .is_some(),
+            "retryable service_unavailable must offer a retry button"
+        );
+
+        // A non-retryable variant offers no retry.
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            view! {
+                <div>
+                    <ServiceAuthCard
+                        auth=MobileServiceAuthState::ServiceUnavailable {
+                            message: "Not configured.".to_owned(),
+                            retryable: false,
+                        }
+                        busy=false
+                        on_retry=Callback::new(|_: ()| {})
+                        on_sign_in=Callback::new(|_: ()| {})
+                    />
+                </div>
+            }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='pairing-service-retry']")
+                .unwrap()
+                .is_none(),
+            "a non-retryable service_unavailable must not offer a futile retry"
+        );
+    }
+
+    /// The repair-required screen explains the failure and offers a re-scan —
+    /// never a spinner or a silent legacy connect.
+    #[wasm_bindgen_test]
+    async fn repair_required_screen_offers_rescan() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            provide_context(state);
+            view! {
+                <PairingFlow screen=PairingScreen::RepairRequired {
+                    message: "Re-pair from the host's current QR code.".to_owned(),
+                } />
+            }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("Re-pair from the host's current QR code."),
+            "repair screen must render the actionable message: {text}"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='pairing-repair-rescan']")
+                .unwrap()
+                .is_some(),
+            "repair screen must offer a re-scan affordance"
+        );
     }
 }

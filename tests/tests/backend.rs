@@ -760,7 +760,7 @@ async fn empty_workspace_spawn_is_accepted_for_all_backends() {
 }
 
 #[tokio::test]
-async fn tycode_session_schema_omits_default_agent_until_supported() {
+async fn tycode_session_schema_exposes_default_agent() {
     init_tracing();
 
     let mut fixture = Fixture::new().await;
@@ -804,31 +804,46 @@ async fn tycode_session_schema_omits_default_agent_until_supported() {
     let SessionSchemaEntry::Ready { schema } = tycode_schema else {
         panic!("expected Tycode schema to be ready");
     };
-    assert!(
-        schema
-            .fields
+    let field = schema
+        .fields
+        .iter()
+        .find(|field| field.key == "default_agent")
+        .unwrap_or_else(|| panic!("Tycode SetRootAgent control should be exposed: {schema:?}"));
+    assert!(field.use_slider);
+    let protocol::SessionSettingFieldType::Select {
+        options,
+        default,
+        nullable,
+    } = &field.field_type
+    else {
+        panic!("default_agent should be a select field: {field:?}");
+    };
+    assert_eq!(default.as_deref(), Some("tycode"));
+    assert!(!nullable);
+    assert_eq!(
+        options
             .iter()
-            .all(|field| field.key != "default_agent"),
-        "unreleased Tycode SetRootAgent control must not be exposed: {schema:?}"
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["one_shot", "tycode", "builder", "swarm"]
     );
-    assert!(schema.fields.is_empty());
 }
 
 #[tokio::test]
-async fn tycode_explicit_default_agent_spawn_is_rejected_by_schema() {
+async fn tycode_explicit_invalid_default_agent_spawn_is_rejected_by_schema() {
     init_tracing();
 
     let mut fixture = Fixture::new().await;
     let mut session_settings = SessionSettingsValues::default();
     session_settings.0.insert(
         "default_agent".to_string(),
-        SessionSettingValue::String("swarm".to_string()),
+        SessionSettingValue::String("legacy_swarm".to_string()),
     );
 
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
-            name: Some("Tycode stale explicit root".to_string()),
+            name: Some("Tycode invalid explicit root".to_string()),
             custom_agent_id: None,
             parent_agent_id: None,
             project_id: None,
@@ -844,10 +859,11 @@ async fn tycode_explicit_default_agent_spawn_is_rejected_by_schema() {
             },
         })
         .await
-        .expect("send Tycode spawn with stale explicit default_agent");
+        .expect("send Tycode spawn with invalid explicit default_agent");
 
     let new_agent = loop {
-        let env = expect_fixture_event(&mut fixture.client, "Tycode stale explicit NewAgent").await;
+        let env =
+            expect_fixture_event(&mut fixture.client, "Tycode invalid explicit NewAgent").await;
         if fixture::is_builtin_team_custom_agent_notify(&env) {
             continue;
         }
@@ -855,7 +871,7 @@ async fn tycode_explicit_default_agent_spawn_is_rejected_by_schema() {
             FrameKind::NewAgent => {
                 let payload: NewAgentPayload = env
                     .parse_payload()
-                    .expect("parse Tycode stale explicit NewAgent");
+                    .expect("parse Tycode invalid explicit NewAgent");
                 if payload.backend_kind == BackendKind::Tycode {
                     break payload;
                 }
@@ -863,9 +879,9 @@ async fn tycode_explicit_default_agent_spawn_is_rejected_by_schema() {
             FrameKind::CommandError => {
                 let error = env
                     .parse_payload::<CommandErrorPayload>()
-                    .expect("parse unexpected Tycode stale explicit CommandError");
+                    .expect("parse unexpected Tycode invalid explicit CommandError");
                 panic!(
-                    "Tycode stale explicit setting should become agent startup failure, not CommandError: {error:?}"
+                    "Tycode invalid explicit setting should become agent startup failure, not CommandError: {error:?}"
                 );
             }
             _ => {}
@@ -873,12 +889,15 @@ async fn tycode_explicit_default_agent_spawn_is_rejected_by_schema() {
     };
 
     let bootstrap: AgentBootstrapPayload = loop {
-        let env =
-            expect_fixture_event(&mut fixture.client, "Tycode stale explicit AgentBootstrap").await;
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "Tycode invalid explicit AgentBootstrap",
+        )
+        .await;
         if env.kind == FrameKind::AgentBootstrap && env.stream == new_agent.instance_stream {
             break env
                 .parse_payload()
-                .expect("parse Tycode stale explicit AgentBootstrap");
+                .expect("parse Tycode invalid explicit AgentBootstrap");
         }
     };
     let error = bootstrap
@@ -888,27 +907,27 @@ async fn tycode_explicit_default_agent_spawn_is_rejected_by_schema() {
             AgentBootstrapEvent::AgentError(error) => Some(error),
             _ => None,
         })
-        .expect("Tycode stale explicit bootstrap must include AgentError");
+        .expect("Tycode invalid explicit bootstrap must include AgentError");
     assert_eq!(error.code, AgentErrorCode::Internal);
     assert!(error.fatal);
     assert!(
         error.message.contains("invalid supplied session settings"),
-        "unexpected Tycode stale explicit error: {error:?}"
+        "unexpected Tycode invalid explicit error: {error:?}"
     );
     assert!(
         error
             .message
-            .contains("unknown session setting 'default_agent'"),
-        "unexpected Tycode stale explicit error: {error:?}"
+            .contains("invalid session setting 'default_agent' value 'legacy_swarm'"),
+        "unexpected Tycode invalid explicit error: {error:?}"
     );
 }
 
 #[tokio::test]
-async fn tycode_stale_stored_default_agent_resume_is_rejected() {
+async fn tycode_stale_stored_invalid_default_agent_resume_is_rejected() {
     init_tracing();
 
     let mut fixture = Fixture::new().await;
-    let session_id = SessionId("stale-tycode-default-agent".to_string());
+    let session_id = SessionId("stale-tycode-invalid-default-agent".to_string());
     let session_store =
         server::store::session::SessionStore::load(fixture.store_dir().join("sessions.json"))
             .expect("load fixture session store");
@@ -918,7 +937,7 @@ async fn tycode_stale_stored_default_agent_resume_is_rejected() {
                 id: session_id.clone(),
                 backend_kind: BackendKind::Tycode,
                 workspace_roots: Vec::new(),
-                title: Some("Stale Tycode root".to_string()),
+                title: Some("Stale Tycode invalid root".to_string()),
                 token_count: None,
                 created_at_ms: Some(1),
                 updated_at_ms: Some(2),
@@ -933,16 +952,16 @@ async fn tycode_stale_stored_default_agent_resume_is_rejected() {
     let mut stored_settings = SessionSettingsValues::default();
     stored_settings.0.insert(
         "default_agent".to_string(),
-        SessionSettingValue::String("swarm".to_string()),
+        SessionSettingValue::String("legacy_swarm".to_string()),
     );
     session_store
         .set_session_settings(&session_id, stored_settings)
-        .expect("store stale Tycode default_agent");
+        .expect("store stale invalid Tycode default_agent");
 
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
-            name: Some("Resume stale Tycode root".to_string()),
+            name: Some("Resume stale Tycode invalid root".to_string()),
             custom_agent_id: None,
             parent_agent_id: None,
             project_id: None,
@@ -952,17 +971,18 @@ async fn tycode_stale_stored_default_agent_resume_is_rejected() {
             },
         })
         .await
-        .expect("send Tycode stale resume");
+        .expect("send Tycode stale invalid resume");
 
     let resumed_agent = loop {
-        let env = expect_fixture_event(&mut fixture.client, "Tycode stale resume NewAgent").await;
+        let env =
+            expect_fixture_event(&mut fixture.client, "Tycode stale invalid resume NewAgent").await;
         if fixture::is_builtin_team_custom_agent_notify(&env) {
             continue;
         }
         if env.kind == FrameKind::NewAgent {
             let payload: NewAgentPayload = env
                 .parse_payload()
-                .expect("parse Tycode stale resume NewAgent");
+                .expect("parse Tycode stale invalid resume NewAgent");
             if payload.session_id.as_ref() == Some(&session_id) {
                 break payload;
             }
@@ -970,12 +990,15 @@ async fn tycode_stale_stored_default_agent_resume_is_rejected() {
     };
 
     let bootstrap: AgentBootstrapPayload = loop {
-        let env =
-            expect_fixture_event(&mut fixture.client, "Tycode stale resume AgentBootstrap").await;
+        let env = expect_fixture_event(
+            &mut fixture.client,
+            "Tycode stale invalid resume AgentBootstrap",
+        )
+        .await;
         if env.kind == FrameKind::AgentBootstrap && env.stream == resumed_agent.instance_stream {
             break env
                 .parse_payload()
-                .expect("parse Tycode stale resume AgentBootstrap");
+                .expect("parse Tycode stale invalid resume AgentBootstrap");
         }
     };
     let error = bootstrap
@@ -985,18 +1008,18 @@ async fn tycode_stale_stored_default_agent_resume_is_rejected() {
             AgentBootstrapEvent::AgentError(error) => Some(error),
             _ => None,
         })
-        .expect("Tycode stale resume bootstrap must include AgentError");
+        .expect("Tycode stale invalid resume bootstrap must include AgentError");
     assert_eq!(error.code, AgentErrorCode::Internal);
     assert!(error.fatal);
     assert!(
         error.message.contains("invalid stored session settings"),
-        "unexpected Tycode stale resume error: {error:?}"
+        "unexpected Tycode stale invalid resume error: {error:?}"
     );
     assert!(
         error
             .message
-            .contains("unknown session setting 'default_agent'"),
-        "unexpected Tycode stale resume error: {error:?}"
+            .contains("invalid session setting 'default_agent' value 'legacy_swarm'"),
+        "unexpected Tycode stale invalid resume error: {error:?}"
     );
 }
 
@@ -1092,7 +1115,7 @@ async fn tycode_live_default_agent_update_is_rejected() {
     assert!(
         error
             .message
-            .contains("unknown session setting 'default_agent'"),
+            .contains("cannot be changed on a running session"),
         "unexpected Tycode live settings rejection: {error:?}"
     );
 }

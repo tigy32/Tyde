@@ -83,7 +83,7 @@ fn write_fake_tycode_binary(home: &Path) -> PathBuf {
     let path = home
         .join(".tyde")
         .join("tycode")
-        .join("0.7.7")
+        .join("0.9.2-pre.1")
         .join("tycode-subprocess");
     std::fs::create_dir_all(path.parent().expect("fake Tycode parent"))
         .expect("create fake Tycode install dir");
@@ -104,7 +104,7 @@ import json
 import sys
 
 if "--version" in sys.argv:
-    print("tycode-subprocess 0.7.7")
+    print("tycode-subprocess 0.9.2-pre.1")
     sys.exit(0)
 
 settings = json.loads(__SETTINGS__)
@@ -454,35 +454,16 @@ fn backend_config_updates_merge_and_clear_explicitly_in_store() {
         "active_provider".to_owned(),
         SessionSettingValue::String("default".to_owned()),
     );
-    store
+    let err = store
         .apply(HostSettingValue::BackendConfig {
             backend: BackendKind::Tycode,
             values: tycode_provider,
         })
-        .expect("set Tycode active provider");
-
-    let mut tycode_quality = BackendConfigValues::default();
-    tycode_quality.0.insert(
-        "model_quality".to_owned(),
-        SessionSettingValue::String("high".to_owned()),
-    );
-    let settings = store
-        .apply(HostSettingValue::BackendConfig {
-            backend: BackendKind::Tycode,
-            values: tycode_quality,
-        })
-        .expect("merge Tycode model quality");
-    let values = settings
-        .backend_config
-        .get(&BackendKind::Tycode)
-        .expect("Tycode backend config");
-    assert_eq!(
-        values.0.get("active_provider"),
-        Some(&SessionSettingValue::String("default".to_owned()))
-    );
-    assert_eq!(
-        values.0.get("model_quality"),
-        Some(&SessionSettingValue::String("high".to_owned()))
+        .expect_err("Tycode no longer stores native settings in Tyde host settings");
+    assert!(
+        err.contains("does not support backend configuration")
+            || err.contains("not defined by its schema"),
+        "unexpected Tycode backend-config store error: {err}"
     );
 }
 
@@ -646,7 +627,11 @@ async fn backend_setup_payload_uses_sign_in_command_and_versioned_tycode_probe()
     assert_eq!(tycode.status, BackendSetupStatus::Installed);
     assert_eq!(
         tycode.installed_version.as_deref(),
-        Some("tycode-subprocess 0.7.7")
+        Some("tycode-subprocess 0.9.2-pre.1")
+    );
+    assert!(
+        tycode.diagnostic.is_none(),
+        "Tycode setup diagnostics should report install/setup issues only"
     );
     assert!(tycode.sign_in_command.is_none());
 
@@ -776,7 +761,7 @@ async fn backend_setup_payload_reports_found_unusable_hermes_cli() {
 }
 
 #[tokio::test]
-async fn backend_config_snapshots_report_native_tycode_settings() {
+async fn backend_config_snapshots_report_tycode_settings_schema_release_blocker() {
     let _env_guard = env_lock().lock().await;
     let temp_home = tempfile::tempdir().expect("create temp HOME");
     write_fake_tycode_binary(temp_home.path());
@@ -799,18 +784,26 @@ async fn backend_config_snapshots_report_native_tycode_settings() {
         }
     };
 
+    assert!(
+        payload
+            .snapshots
+            .iter()
+            .all(|snapshot| snapshot.backend_kind != BackendKind::Tycode),
+        "Tycode should no longer expose the legacy hardcoded backend-config subset"
+    );
     let tycode = payload
-        .snapshots
+        .native_settings
         .iter()
         .find(|snapshot| snapshot.backend_kind == BackendKind::Tycode)
-        .expect("Tycode native backend config snapshot");
-    assert_eq!(tycode.status, BackendConfigSnapshotStatus::Ready);
-    assert_eq!(
-        tycode.values.0.get("active_provider"),
-        Some(&SessionSettingValue::String("native-provider".to_string()))
+        .expect("Tycode native settings snapshot");
+    assert_eq!(tycode.status, BackendConfigSnapshotStatus::Unavailable);
+    let message = tycode.message.as_deref().expect("Tycode blocker message");
+    assert!(
+        message.contains("GetSettingsSchema")
+            && message.contains("0.9.2-pre.1")
+            && message.contains("0.10.0"),
+        "Tycode native settings snapshot should surface release blocker: {message}"
     );
-    assert_eq!(
-        tycode.values.0.get("model_quality"),
-        Some(&SessionSettingValue::String("high".to_string()))
-    );
+    assert!(tycode.settings.is_none());
+    assert!(tycode.groups.is_empty());
 }

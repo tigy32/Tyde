@@ -55,6 +55,7 @@ readonly MANIFEST_CACHE_CONTROL="no-store, max-age=0, must-revalidate"
 readonly -a LOADER_SHELL_KEYS=(
   "index.html"
   "sw.js"
+  "mobile-service-config.js"
   "loader.js"
   "loader.css"
   "cbor.js"

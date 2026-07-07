@@ -1,8 +1,9 @@
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use protocol::{
-    BackendKind, BackgroundAgentFeature, CodeIntelSettings, HostLaunchProfileConfig,
+    BackendKind, BackgroundAgentFeature, BrokerUrl, CodeIntelSettings, HostLaunchProfileConfig,
     HostSettingValue, HostSettings, LaunchProfileId,
 };
 use serde::{Deserialize, Serialize};
@@ -302,12 +303,7 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
             settings.enable_mobile_connections = enabled;
         }
         HostSettingValue::MobileBrokerUrl { broker_url } => {
-            if broker_url
-                .as_ref()
-                .is_some_and(|url| url.as_str().trim().is_empty())
-            {
-                return Err("mobile_broker_url must not be empty".to_owned());
-            }
+            validate_mobile_broker_url_for_write(broker_url.as_ref())?;
             settings.mobile_broker_url = broker_url;
         }
         HostSettingValue::TydeDebugMcpEnabled { enabled } => {
@@ -340,6 +336,11 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
             } else {
                 settings.backend_config.insert(backend, merged);
             }
+        }
+        HostSettingValue::BackendNativeSettings { backend, .. } => {
+            return Err(format!(
+                "{backend:?} native settings are owned by the backend and are not stored in Tyde host settings"
+            ));
         }
         HostSettingValue::LaunchProfiles { profiles } => {
             settings.launch_profiles = validate_launch_profile_configs(profiles)?;
@@ -570,6 +571,52 @@ fn backend_slug(backend_kind: BackendKind) -> &'static str {
     }
 }
 
+pub(crate) fn validate_mobile_broker_url_for_write(
+    broker_url: Option<&BrokerUrl>,
+) -> Result<(), String> {
+    let Some(url) = broker_url else {
+        return Ok(());
+    };
+    if url.as_str().trim().is_empty() {
+        return Err("mobile_broker_url must not be empty".to_owned());
+    }
+    mqtt_transport::validate_broker_url(url).map_err(|err| err.to_string())?;
+    if url.as_str() == protocol::DEFAULT_MOBILE_MQTT_BROKER_URL {
+        return Err(
+            "the public default mobile broker is no longer supported; pair through tycode.dev"
+                .to_owned(),
+        );
+    }
+    if !is_loopback_broker_url(url) {
+        return Err(
+            "custom mobile broker URLs are dev/test-only; production mobile access uses tycode.dev"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn is_loopback_broker_url(url: &BrokerUrl) -> bool {
+    url::Url::parse(url.as_str())
+        .ok()
+        .is_some_and(|parsed| is_loopback_url(&parsed))
+}
+
+fn is_loopback_url(parsed: &url::Url) -> bool {
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<IpAddr>()
+                    .map(|addr| addr.is_loopback())
+                    .unwrap_or(false)
+        }
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
+}
+
 fn normalize_backend_list(backends: Vec<BackendKind>) -> Vec<BackendKind> {
     CANONICAL_BACKENDS
         .into_iter()
@@ -635,6 +682,76 @@ mod tests {
         assert!(
             !path.exists(),
             "no file is written so a later launch can seed once a CLI is installed"
+        );
+    }
+
+    #[test]
+    fn mobile_broker_url_write_accepts_only_loopback_dev_brokers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        let store = HostSettingsStore::load(path.clone()).expect("load empty store");
+
+        let public = BrokerUrl::new("mqtts://broker.example.test:8883").expect("broker URL");
+        let err = store
+            .apply(HostSettingValue::MobileBrokerUrl {
+                broker_url: Some(public),
+            })
+            .expect_err("public custom broker must be rejected at write time");
+        assert!(err.contains("dev/test-only"), "unexpected error: {err}");
+        assert!(!path.exists(), "rejected setting must not be persisted");
+
+        let default_public =
+            BrokerUrl::new(protocol::DEFAULT_MOBILE_MQTT_BROKER_URL).expect("broker URL");
+        let err = store
+            .apply(HostSettingValue::MobileBrokerUrl {
+                broker_url: Some(default_public),
+            })
+            .expect_err("default public broker must be rejected at write time");
+        assert!(
+            err.contains("public default mobile broker"),
+            "unexpected error: {err}"
+        );
+
+        let public_ipv6 = BrokerUrl::new("mqtts://[2001:db8::1]:8883").expect("broker URL");
+        let err = store
+            .apply(HostSettingValue::MobileBrokerUrl {
+                broker_url: Some(public_ipv6),
+            })
+            .expect_err("non-loopback IPv6 broker must be rejected at write time");
+        assert!(err.contains("dev/test-only"), "unexpected error: {err}");
+
+        let ipv6_loopback = BrokerUrl::new("mqtts://[::1]:8883").expect("broker URL");
+        let settings = store
+            .apply(HostSettingValue::MobileBrokerUrl {
+                broker_url: Some(ipv6_loopback.clone()),
+            })
+            .expect("IPv6 loopback dev broker remains allowed");
+        assert_eq!(settings.mobile_broker_url, Some(ipv6_loopback));
+
+        let loopback = BrokerUrl::new("mqtts://127.0.0.1:8883").expect("broker URL");
+        let settings = store
+            .apply(HostSettingValue::MobileBrokerUrl {
+                broker_url: Some(loopback.clone()),
+            })
+            .expect("loopback dev broker remains allowed");
+        assert_eq!(settings.mobile_broker_url, Some(loopback));
+    }
+
+    #[test]
+    fn legacy_public_mobile_broker_url_still_loads_for_repair_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"settings":{"enabled_backends":[],"default_backend":null,"mobile_broker_url":"mqtts://broker.example.test:8883"}}"#,
+        )
+        .expect("write legacy public broker setting");
+
+        let store = HostSettingsStore::load(path).expect("legacy public broker setting loads");
+        let settings = store.get().expect("get settings");
+        assert_eq!(
+            settings.mobile_broker_url.as_ref().map(BrokerUrl::as_str),
+            Some("mqtts://broker.example.test:8883")
         );
     }
 

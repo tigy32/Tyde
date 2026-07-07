@@ -374,41 +374,33 @@ pub fn SessionSettingsBar() -> impl IntoView {
         })
     };
 
-    // Cumulative token usage for the active session: the `token_usage.cumulative`
-    // scope carried on the most recent assistant message that reported it. Summed
-    // server-side, so the latest known value is the session total.
-    let cumulative_usage = {
-        let state = state.clone();
-        Signal::derive(move || -> Option<protocol::TokenUsage> {
-            let agent_ref = state.active_agent.get()?;
-            state.chat_rows.with(|rows| {
-                rows.get(&agent_ref.agent_id).and_then(|handles| {
-                    handles.iter().rev().find_map(|handle| {
-                        handle.entry.with(|entry| {
-                            entry
-                                .message
-                                .token_usage
-                                .as_ref()
-                                .and_then(|usage| usage.cumulative.known_usage().cloned())
-                        })
-                    })
-                })
-            })
-        })
-    };
-
-    // Server rollup for the active agent's task; only tasks with descendants
-    // get a badge. `has_task_rollup` is the deduped presence bit the outer
-    // view keys off — payload-content changes must not recreate the header
-    // (that would reset the badge's open/hover state every server tick).
+    // Server rollup for the active agent's whole task (root + sub-agents). This
+    // is the single authoritative token-usage source for the footer; the
+    // frontend never sums chat rows. The rollup is keyed by root agent, so when
+    // the active agent is a root we hit it directly; when it's a selected
+    // sub-agent we fall back to the same-host rollup whose breakdown contains
+    // it, so the footer always reflects the task-wide total. `has_task_rollup`
+    // is the deduped presence bit the outer view keys off — payload-content
+    // changes must not recreate the header (that would reset the display's
+    // open/hover state every server tick).
     let task_rollup = {
         let state = state.clone();
         Memo::new(move |_| -> Option<TaskTokenUsagePayload> {
             let agent_ref = state.active_agent.get()?;
-            let payload = state
-                .task_token_usage
-                .with(|map| map.get(&agent_ref).cloned())?;
-            (payload.descendant_count > 0).then_some(payload)
+            state.task_token_usage.with(|map| {
+                if let Some(payload) = map.get(&agent_ref) {
+                    return Some(payload.clone());
+                }
+                map.iter()
+                    .find(|(key, payload)| {
+                        key.host_id == agent_ref.host_id
+                            && payload
+                                .breakdown
+                                .iter()
+                                .any(|entry| entry.agent_id == agent_ref.agent_id)
+                    })
+                    .map(|(_, payload)| payload.clone())
+            })
         })
     };
     let has_task_rollup = Memo::new(move |_| task_rollup.with(|payload| payload.is_some()));
@@ -426,8 +418,8 @@ pub fn SessionSettingsBar() -> impl IntoView {
     });
 
     // A schema-status text row (pending/unavailable/missing) with the task
-    // badge on the right. These rows keep rendering even without a rollup —
-    // the badge just renders nothing then.
+    // token usage on the right. These rows keep rendering even without a
+    // rollup — the usage display just renders nothing then.
     fn status_row(text: String, rollup: Memo<Option<TaskTokenUsagePayload>>) -> AnyView {
         view! {
             <div class="session-settings-accordion session-settings-unavailable">
@@ -438,9 +430,9 @@ pub fn SessionSettingsBar() -> impl IntoView {
         .into_any()
     }
 
-    // A header row carrying only the task badge, for agents whose backend has
-    // no session-settings surface (empty schema, or none yet). Rendered only
-    // when a rollup exists so there's never a useless empty footer row.
+    // A header row carrying only the task token usage, for agents whose backend
+    // has no session-settings surface (empty schema, or none yet). Rendered
+    // only when a rollup exists so there's never a useless empty footer row.
     fn badge_only_row(
         has_rollup: bool,
         rollup: Memo<Option<TaskTokenUsagePayload>>,
@@ -476,15 +468,6 @@ pub fn SessionSettingsBar() -> impl IntoView {
                                         {move || if expanded.get() { "▼" } else { "▶" }}
                                     </span>
                                     {label}
-                                    {move || cumulative_usage.get().map(|tu| {
-                                        let (input_text, output_text, tooltip) = token_badge_data(&tu);
-                                        view! {
-                                            <span class="session-settings-usage" title=tooltip>
-                                                <span class="token-stat token-stat-input">{input_text}</span>
-                                                <span class="token-stat token-stat-output">{output_text}</span>
-                                            </span>
-                                        }
-                                    })}
                                 </button>
                                 <TaskUsageBadge rollup=task_rollup />
                             </div>
@@ -528,14 +511,6 @@ fn task_usage_unavailable_text(reason: TaskTokenUsageUnavailableReason) -> &'sta
         TaskTokenUsageUnavailableReason::BackendDidNotReport => "backend did not report",
         TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous => "provider scope ambiguous",
         TaskTokenUsageUnavailableReason::AgentUnavailable => "agent unavailable",
-    }
-}
-
-fn task_status_label(status: &TaskTokenUsageStatus) -> Option<&'static str> {
-    match status {
-        TaskTokenUsageStatus::Known => None,
-        TaskTokenUsageStatus::Partial { .. } => Some("partial"),
-        TaskTokenUsageStatus::Unavailable { .. } => Some("unavailable"),
     }
 }
 
@@ -591,13 +566,16 @@ fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
 /// so hover users can cross into it and scroll/copy without it vanishing.
 const HOVER_CLOSE_DELAY_MS: u64 = 250;
 
-/// Compact aggregate token usage for the active agent's whole task (root +
-/// sub-agents), rendered at the right edge of the session-settings footer.
-/// Renders nothing without a rollup with descendants. The server total is
-/// authoritative; this never sums breakdown rows. Click/Enter toggles the
-/// breakdown popover; mouse hover also reveals it (with a close delay so the
-/// pointer can travel into it); touch pointers never latch hover state.
-/// Escape and pointer-down outside dismiss it.
+/// The single task-wide token usage display for the active agent's whole task
+/// (root + sub-agents), rendered once at the right edge of the session-settings
+/// footer. It shows a left-style `↑input ↓output` string sourced from the
+/// server's authoritative `TaskTokenUsagePayload.total` — never summed from
+/// chat rows — and appends `including N agents` for multi-agent tasks (N is the
+/// breakdown length). Partial totals carry a subtle `partial` marker; an
+/// all-unavailable total shows a muted marker rather than a fabricated zero.
+/// Click/Enter toggles the per-agent breakdown popover; mouse hover also
+/// reveals it (with a close delay so the pointer can travel into it); touch
+/// pointers never latch hover state. Escape and pointer-down outside dismiss it.
 #[component]
 fn TaskUsageBadge(rollup: Memo<Option<TaskTokenUsagePayload>>) -> impl IntoView {
     let open = RwSignal::new(false);
@@ -650,21 +628,20 @@ fn TaskUsageBadge(rollup: Memo<Option<TaskTokenUsagePayload>>) -> impl IntoView 
     view! {
         {move || {
             let payload = rollup.get()?;
-            let status = task_status_label(&payload.total.status);
-            // The compact figure is the server's combined task total. An
-            // all-unavailable aggregate carries no real figure — show only
-            // the status marker, never a fabricated Σ0.
-            let total_text = match &payload.total.status {
+            let agent_total = payload.breakdown.len();
+            let multi_agent = agent_total > 1;
+            // The figure is the server's authoritative combined task total,
+            // formatted in the same left-style `↑input ↓output` string the
+            // per-message badges use. An all-unavailable aggregate carries no
+            // real figure — show a muted marker, never a fabricated zero.
+            let usage_texts = match &payload.total.status {
                 TaskTokenUsageStatus::Unavailable { .. } => None,
-                TaskTokenUsageStatus::Known | TaskTokenUsageStatus::Partial { .. } => Some(
-                    format!("\u{03a3}{}", format_compact(payload.total.usage.total_tokens)),
-                ),
+                TaskTokenUsageStatus::Known | TaskTokenUsageStatus::Partial { .. } => {
+                    Some(task_amount_texts(&payload.total.usage))
+                }
             };
-            let count_text = if payload.descendant_count == 1 {
-                "+1 agent".to_owned()
-            } else {
-                format!("+{} agents", payload.descendant_count)
-            };
+            let partial = matches!(payload.total.status, TaskTokenUsageStatus::Partial { .. });
+            let including_text = multi_agent.then(|| format!("including {agent_total} agents"));
             let status_note = match &payload.total.status {
                 TaskTokenUsageStatus::Known => None,
                 TaskTokenUsageStatus::Partial {
@@ -675,7 +652,6 @@ fn TaskUsageBadge(rollup: Memo<Option<TaskTokenUsagePayload>>) -> impl IntoView 
             let popover_id = format!("session-task-popover-{}", payload.root_agent_id);
             let popover_id_attr = popover_id.clone();
             let breakdown = payload.breakdown.clone();
-            let agent_total = breakdown.len();
             Some(view! {
                 <span
                     class="session-task-usage"
@@ -712,14 +688,27 @@ fn TaskUsageBadge(rollup: Memo<Option<TaskTokenUsagePayload>>) -> impl IntoView 
                         aria-controls=popover_id_attr
                         on:click=move |_| open.update(|o| *o = !*o)
                     >
-                        <span class="session-task-label">"task"</span>
-                        {total_text.map(|text| view! {
-                            <span class="token-stat session-task-total">{text}</span>
+                        {match usage_texts {
+                            Some((input_text, output_text)) => view! {
+                                <>
+                                    <span class="token-stat token-stat-input">{input_text}</span>
+                                    {output_text.map(|text| view! {
+                                        <span class="token-stat token-stat-output">{text}</span>
+                                    })}
+                                </>
+                            }.into_any(),
+                            None => view! {
+                                <span class="session-task-usage-unavailable">
+                                    "usage unavailable"
+                                </span>
+                            }.into_any(),
+                        }}
+                        {including_text.map(|text| view! {
+                            <span class="session-task-including">{text}</span>
                         })}
-                        <span class="session-task-count">{count_text}</span>
-                        {status.map(|s| view! {
-                            <span class=format!("session-task-status session-task-status-{s}")>
-                                {s}
+                        {partial.then(|| view! {
+                            <span class="session-task-status session-task-status-partial">
+                                "partial"
                             </span>
                         })}
                     </button>
@@ -731,7 +720,10 @@ fn TaskUsageBadge(rollup: Memo<Option<TaskTokenUsagePayload>>) -> impl IntoView 
                             aria-label="Task token usage breakdown"
                         >
                             <div class="session-task-popover-title">
-                                <span>{format!("Task usage \u{b7} {agent_total} agents")}</span>
+                                <span>{format!(
+                                    "Task usage \u{b7} {agent_total} agent{}",
+                                    if agent_total == 1 { "" } else { "s" },
+                                )}</span>
                                 {status_note.clone().map(|note| view! {
                                     <span class="session-task-popover-status">{note}</span>
                                 })}
@@ -1016,13 +1008,14 @@ mod wasm_tests {
             .map(|el| el.dyn_into().unwrap())
     }
 
-    /// A rollup without descendants must leave the settings header exactly as
-    /// before: no task badge, no popover — only the existing toggle (with its
-    /// label) renders.
+    /// A single-agent task (no descendants) still renders exactly one combined
+    /// token display: the left-style `↑input ↓output` sourced from the server
+    /// rollup total, with no `including N agents` suffix and no separate legacy
+    /// cumulative badge. The settings toggle keeps its label.
     #[wasm_bindgen_test]
-    async fn no_task_marker_without_descendants() {
+    async fn single_agent_shows_combined_usage_without_agent_suffix() {
         let container = make_container();
-        let state = make_state_with_active_agent("h-task-none", "root");
+        let state = make_state_with_active_agent("h-task-solo", "root");
         let mut rollup = partial_rollup("root", 500, 100);
         rollup.descendant_count = 0;
         rollup.breakdown.truncate(1);
@@ -1030,7 +1023,7 @@ mod wasm_tests {
             usage: known_amount(500, 100),
             status: TaskTokenUsageStatus::Known,
         };
-        dispatch_task_usage(&state, "h-task-none", 0, &rollup);
+        dispatch_task_usage(&state, "h-task-solo", 0, &rollup);
         let _handle = mount_bar(&container, state);
         for _ in 0..4 {
             next_tick().await;
@@ -1045,20 +1038,44 @@ mod wasm_tests {
                 .contains("Session Settings (Claude)"),
             "existing header label must be unchanged"
         );
+
+        let badge = query(&container, ".session-task-toggle")
+            .expect("the combined token display renders for a single-agent task");
+        let badge_text = badge.text_content().unwrap_or_default();
         assert!(
-            query(&container, ".session-task-toggle").is_none(),
-            "no task badge may appear for a rollup without descendants"
+            badge_text.contains("\u{2191}500") && badge_text.contains("\u{2193}100"),
+            "single-agent display must show the rollup total as ↑input ↓output, got: {badge_text}"
         );
         assert!(
-            query(&container, ".session-task-popover").is_none(),
-            "no breakdown popover may exist without a task badge"
+            !badge_text.contains("including"),
+            "a single-agent task must not append an agent-count suffix, got: {badge_text}"
+        );
+        assert!(
+            !badge_text.contains('\u{03a3}'),
+            "the combined display uses arrows, not a Σ total, got: {badge_text}"
+        );
+
+        // Exactly one token display: the legacy cumulative badge is gone.
+        assert!(
+            query(&container, ".session-settings-usage").is_none(),
+            "the separate cumulative usage badge must be removed"
+        );
+        assert_eq!(
+            container
+                .query_selector_all(".session-task-toggle")
+                .unwrap()
+                .length(),
+            1,
+            "there must be exactly one task usage display, not two"
         );
     }
 
-    /// With descendants the compact task total appears (marker + partial
-    /// status), clicking it opens the breakdown (rows in server order,
-    /// indented by depth, unavailable reason spelled out), a live server
-    /// update re-renders the open popover, and clicking again closes it.
+    /// A multi-agent task renders the combined left-style total sourced from
+    /// the server rollup (not summed chat rows), with an `including N agents`
+    /// suffix (N = breakdown length) and a `partial` marker. Clicking opens the
+    /// breakdown (rows in server order, indented by depth, unavailable reason
+    /// spelled out), a live server update re-renders the open popover, and
+    /// clicking again closes it.
     #[wasm_bindgen_test]
     async fn task_marker_and_breakdown_render_for_descendants() {
         let container = make_container();
@@ -1071,17 +1088,18 @@ mod wasm_tests {
 
         let badge = query(&container, ".session-task-toggle").expect("task badge should render");
         let badge_text = badge.text_content().unwrap_or_default();
+        // Server total = self(500,100) + child-a(1000,200); child-b unavailable.
         assert!(
-            badge_text.contains("Σ1.8K"),
-            "badge must show the server task total (500+100+1000+200), got: {badge_text}"
+            badge_text.contains("\u{2191}1.5K") && badge_text.contains("\u{2193}300"),
+            "badge must show the server task total as ↑input ↓output, got: {badge_text}"
         );
         assert!(
-            !badge_text.contains('↑') && !badge_text.contains('↓'),
-            "compact badge shows one unambiguous total, not split arrows, got: {badge_text}"
+            !badge_text.contains('\u{03a3}'),
+            "the combined display uses arrows, not a Σ total, got: {badge_text}"
         );
         assert!(
-            badge_text.contains("+2 agents"),
-            "badge should carry the descendant-count marker, got: {badge_text}"
+            badge_text.contains("including 3 agents"),
+            "badge should carry the breakdown-length agent count, got: {badge_text}"
         );
         assert!(
             badge_text.contains("partial"),
@@ -1185,8 +1203,9 @@ mod wasm_tests {
         let badge = query(&container, ".session-task-toggle").expect("badge still rendered");
         let updated_badge_text = badge.text_content().unwrap_or_default();
         assert!(
-            updated_badge_text.contains("Σ701.3K"),
-            "badge must show the updated server total exactly, got: {updated_badge_text}"
+            updated_badge_text.contains("\u{2191}701.0K")
+                && updated_badge_text.contains("\u{2193}300"),
+            "badge must show the updated server total as ↑input ↓output, got: {updated_badge_text}"
         );
 
         let badge = query(&container, ".session-task-toggle").expect("badge still rendered");
@@ -1248,10 +1267,10 @@ mod wasm_tests {
         );
     }
 
-    /// The task badge must not depend on the session-settings surface: a
-    /// backend with an empty settings schema (Tycode-style) renders nothing
-    /// while there is no rollup, then a badge-only footer row once the
-    /// server reports a task with descendants — never a settings toggle.
+    /// The task usage display must not depend on the session-settings surface:
+    /// a backend with an empty settings schema (Tycode-style) renders nothing
+    /// while there is no rollup, then a display-only footer row once the
+    /// server reports a task — never a settings toggle.
     #[wasm_bindgen_test]
     async fn task_badge_renders_without_settings_schema() {
         let container = make_container();
@@ -1275,13 +1294,13 @@ mod wasm_tests {
             next_tick().await;
         }
         let badge = query(&container, ".session-task-toggle")
-            .expect("task badge should render without any settings schema");
+            .expect("task display should render without any settings schema");
         assert!(
             badge
                 .text_content()
                 .unwrap_or_default()
-                .contains("+2 agents"),
-            "badge should render the rollup marker"
+                .contains("including 3 agents"),
+            "display should render the rollup agent count"
         );
         assert!(
             query(&container, ".session-settings-toggle").is_none(),
@@ -1294,7 +1313,50 @@ mod wasm_tests {
         }
         assert!(
             query(&container, ".session-task-popover").is_some(),
-            "breakdown must open from the badge-only row too"
+            "breakdown must open from the display-only row too"
+        );
+    }
+
+    /// When a sub-agent's tab is active, the footer still shows the whole
+    /// task's total: rollups are keyed by the root agent, so the display
+    /// resolves the same-host rollup whose breakdown contains the active
+    /// sub-agent, rather than showing nothing.
+    #[wasm_bindgen_test]
+    async fn sub_agent_tab_resolves_parent_rollup() {
+        let container = make_container();
+        // Active tab is the sub-agent "child-a"; the task rollup is keyed by
+        // the root "root" and lists child-a among its breakdown entries.
+        let state = make_state_with_active_agent("h-task-sub", "child-a");
+        dispatch_task_usage(&state, "h-task-sub", 0, &partial_rollup("root", 500, 100));
+        let _handle = mount_bar(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let badge = query(&container, ".session-task-toggle")
+            .expect("sub-agent tab must resolve the parent task rollup");
+        let badge_text = badge.text_content().unwrap_or_default();
+        assert!(
+            badge_text.contains("\u{2191}1.5K") && badge_text.contains("\u{2193}300"),
+            "sub-agent footer must show the whole-task total, got: {badge_text}"
+        );
+        assert!(
+            badge_text.contains("including 3 agents"),
+            "sub-agent footer must still count all task agents, got: {badge_text}"
+        );
+
+        badge.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let popover = query(&container, ".session-task-popover")
+            .expect("breakdown opens from a sub-agent tab too");
+        let popover_text = popover.text_content().unwrap_or_default();
+        assert!(
+            popover_text.contains("Root")
+                && popover_text.contains("Child A")
+                && popover_text.contains("Child B"),
+            "breakdown must list the full task tree, got: {popover_text}"
         );
     }
 

@@ -40,10 +40,12 @@ always re-read the current `ETag` immediately before an `--if-match` update.
 The CSP mirrors the loader's `index.html` `<meta>` CSP **plus** `frame-ancestors
 'none'` (which `<meta>` cannot express). Load-bearing directives:
 `script-src 'self' 'wasm-unsafe-eval'` (same-origin JS + WASM compile, **no**
-general `unsafe-eval`), `connect-src 'self' wss:` (broker over wss + same-origin
-fetch), `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`. HSTS
-is added here too (it cannot be set via `<meta>`). CORS is included so the
-loader's `crossorigin="anonymous"` + SRI fetches always succeed.
+general `unsafe-eval`), `connect-src 'self' wss:` (broker over wss,
+same-origin manifest/bundle fetches, and the same-origin
+`/api/tyde/mobile/v1` managed-service API), `object-src 'none'`, `base-uri
+'none'`, `frame-ancestors 'none'`. HSTS is added here too (it cannot be set via
+`<meta>`). CORS is included so the loader's `crossorigin="anonymous"` + SRI
+fetches always succeed.
 
 Save this as `tyde-rhp.json`:
 
@@ -175,8 +177,10 @@ curl -sI https://tycode.dev/index.html | grep -i 'content-security-policy' || ec
   use; the header from this RHP is the authoritative one in production and adds
   `frame-ancestors` + HSTS. Keep the two in sync if you edit either — the header
   string above is the `<meta>` policy plus `frame-ancestors 'none'`.
-- **`connect-src 'self' wss:`** intentionally omits `https:`. If a future feature
-  needs cross-origin HTTPS, add it in both this RHP and `web/loader/index.html`.
+- **`connect-src 'self' wss:`** intentionally omits `https:`. The managed
+  mobile service config must keep the API same-origin under
+  `/api/tyde/mobile/v1`; if a future feature needs cross-origin HTTPS, add it in
+  both this RHP and `web/loader/index.html`.
 - **Don't touch** the `tyggs.*` assets, the marketing keys at the bucket root, or
   the default behavior. This change is purely additive: one new origin-less
   behavior + one new RHP.

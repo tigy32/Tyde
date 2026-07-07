@@ -1,7 +1,7 @@
 use leptos::prelude::*;
 
 use crate::components::ui::{Spinner, StatusDot, StatusTone};
-use crate::state::{AppState, ConnectionStatus};
+use crate::state::{AppMode, AppState, ConnectionStatus, PairingScreen};
 
 /// Floating connection indicator. The healthy connected state stays
 /// dot-only so it does not take vertical space from the workspace; states
@@ -109,6 +109,63 @@ pub fn ConnectionBanner() -> impl IntoView {
                                     data_mobile_test="connection-banner-dot-update-required"
                                 />
                                 <span class="status-text">{message}</span>
+                            </div>
+                        }.into_any()
+                    }
+                    // Sticky, terminal managed-access failure. The connection actor
+                    // has stopped retrying, so there is no dismiss — the user must
+                    // sign in with Tyggs again or re-pair. Sign-in navigates to the
+                    // tycode.dev OAuth redirect; re-pair happens from the host list.
+                    ConnectionStatus::NeedsAction { code, message } => {
+                        let show_sign_in = crate::state::needs_tyggs_sign_in(code);
+                        let repair_state = status_state.clone();
+                        view! {
+                            <div
+                                class="connection-banner-inner error"
+                                role="alert"
+                                data-mobile-test="connection-banner-needs-action"
+                            >
+                                <StatusDot
+                                    label="Action required".to_string()
+                                    tone=StatusTone::Error
+                                    data_mobile_test="connection-banner-dot-needs-action"
+                                />
+                                <span class="status-text">{message}</span>
+                                {if show_sign_in {
+                                    // ServiceAuthRequired / PassRequired → navigate to
+                                    // the tycode.dev-hosted Tyggs OAuth redirect.
+                                    view! {
+                                        <button
+                                            type="button"
+                                            class="connection-banner-action"
+                                            data-mobile-test="connection-banner-sign-in"
+                                            on:click=move |_| {
+                                                if let Err(error) = crate::bridge::begin_tyggs_sign_in(None) {
+                                                    log::error!("failed to start Tyggs sign-in: {error}");
+                                                }
+                                            }
+                                        >
+                                            "Sign in with Tyggs"
+                                        </button>
+                                    }.into_any()
+                                } else {
+                                    // RepairRequired → send the user to the scanner to
+                                    // re-pair this host through tycode.dev.
+                                    view! {
+                                        <button
+                                            type="button"
+                                            class="connection-banner-action"
+                                            data-mobile-test="connection-banner-repair"
+                                            on:click=move |_| {
+                                                repair_state.app_mode.set(
+                                                    AppMode::Pairing(PairingScreen::Scanner),
+                                                );
+                                            }
+                                        >
+                                            "Re-pair"
+                                        </button>
+                                    }.into_any()
+                                }}
                             </div>
                         }.into_any()
                     }
@@ -353,6 +410,99 @@ mod wasm_tests {
                 .unwrap()
                 .is_none(),
             "update-required is sticky and must not offer a dismiss control"
+        );
+    }
+
+    /// A `RepairRequired` managed failure offers a Re-pair action in the banner
+    /// (not a Sign-in), and tapping it routes to the pairing scanner.
+    #[wasm_bindgen_test]
+    async fn needs_action_repair_offers_repair_action() {
+        let host = LocalHostId("host-repair".to_owned());
+        let host_for_mount = host.clone();
+        let container = make_container();
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let state_handle_for_mount = state_handle.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.connection_statuses.update(|statuses| {
+                statuses.insert(
+                    host_for_mount.clone(),
+                    ConnectionStatus::NeedsAction {
+                        code: protocol::MobileAccessErrorCode::RepairRequired,
+                        message: "Re-pair from the host's current QR code.".to_owned(),
+                    },
+                );
+            });
+            *state_handle_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <ConnectionBanner /> }
+        });
+        next_tick().await;
+
+        let repair: HtmlElement = container
+            .query_selector("[data-mobile-test='connection-banner-repair']")
+            .unwrap()
+            .expect("repair-required banner must offer a Re-pair action")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            container
+                .query_selector("[data-mobile-test='connection-banner-sign-in']")
+                .unwrap()
+                .is_none(),
+            "a repair (non-auth) failure must not offer a sign-in action"
+        );
+        repair.click();
+        next_tick().await;
+
+        let state = state_handle.borrow().as_ref().unwrap().clone();
+        assert!(
+            matches!(
+                state.app_mode.get_untracked(),
+                AppMode::Pairing(PairingScreen::Scanner)
+            ),
+            "tapping Re-pair must route to the pairing scanner"
+        );
+    }
+
+    /// A sign-in-required managed failure offers Sign in (not Re-pair).
+    #[wasm_bindgen_test]
+    async fn needs_action_auth_offers_sign_in_action() {
+        let host = LocalHostId("host-auth".to_owned());
+        let host_for_mount = host.clone();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.connection_statuses.update(|statuses| {
+                statuses.insert(
+                    host_for_mount.clone(),
+                    ConnectionStatus::NeedsAction {
+                        code: protocol::MobileAccessErrorCode::ServiceAuthRequired,
+                        message: "Sign in with Tyggs again.".to_owned(),
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <ConnectionBanner /> }
+        });
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector("[data-mobile-test='connection-banner-sign-in']")
+                .unwrap()
+                .is_some(),
+            "an auth-required failure must offer a sign-in action"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='connection-banner-repair']")
+                .unwrap()
+                .is_none(),
+            "an auth-required failure must not offer a Re-pair action"
         );
     }
 

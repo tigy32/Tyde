@@ -54,6 +54,18 @@ pub enum ConnectionStatus {
     Error(String),
 }
 
+/// In-flight/failed state for a backend-native settings save. See
+/// [`AppState::native_settings_save_state`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum NativeSettingsSaveState {
+    /// A save is in flight. `base` is the settings document the save was applied
+    /// to; the save is considered landed once the server publishes a snapshot
+    /// whose settings document differs from `base`.
+    Pending { base: serde_json::Value },
+    /// The last save failed to send; carries a user-facing reason.
+    Failed { message: String },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentInfo {
     pub host_id: String,
@@ -1431,6 +1443,23 @@ pub struct AppState {
     /// `HostSettings.backend_config`. Backends without deep config are absent.
     pub backend_config_snapshots:
         RwSignal<HashMap<String, HashMap<BackendKind, protocol::BackendConfigSnapshot>>>,
+    /// Server-owned backend-native settings snapshots (JSON-schema-driven,
+    /// grouped), keyed by host id then backend kind. Each snapshot carries the
+    /// backend's current settings document and grouped schemas, or an explicit
+    /// unavailable status with a reason. Distinct from `backend_config_snapshots`
+    /// (typed flat fields) and from the Tyde-managed overrides in
+    /// `HostSettings.backend_config`. Backends without native settings are absent.
+    pub backend_native_settings:
+        RwSignal<HashMap<String, HashMap<BackendKind, protocol::BackendNativeSettingsSnapshot>>>,
+    /// In-flight/failed state for backend-native settings saves, keyed by host id
+    /// then backend kind. A native save sends the whole settings document, so a
+    /// second edit based on the same (now stale) snapshot would clobber the first.
+    /// While a save is `Pending`, the native controls are disabled until the
+    /// server publishes a newer snapshot (detected by the settings document
+    /// differing from the `base` the save was applied to) — so the "saving" state
+    /// stays a projection of server-owned state, not an invented client model.
+    pub native_settings_save_state:
+        RwSignal<HashMap<String, HashMap<BackendKind, NativeSettingsSaveState>>>,
     /// Host id for which the next `NewTerminal` should steal focus. Set when the
     /// user clicks Install/Sign-in; consumed in the dispatcher so the new
     /// terminal becomes active even if another terminal was already selected.
@@ -1759,6 +1788,8 @@ impl AppState {
             schemas_loaded_for_host: RwSignal::new(HashMap::new()),
             backend_config_schemas: RwSignal::new(HashMap::new()),
             backend_config_snapshots: RwSignal::new(HashMap::new()),
+            backend_native_settings: RwSignal::new(HashMap::new()),
+            native_settings_save_state: RwSignal::new(HashMap::new()),
             pending_terminal_focus: RwSignal::new(None),
             agent_session_settings: RwSignal::new(HashMap::new()),
             draft_session_settings: RwSignal::new(SessionSettingsValues::default()),
@@ -2925,6 +2956,12 @@ impl AppState {
         });
         self.backend_config_snapshots.update(|snapshots| {
             snapshots.remove(host_id);
+        });
+        self.backend_native_settings.update(|snapshots| {
+            snapshots.remove(host_id);
+        });
+        self.native_settings_save_state.update(|states| {
+            states.remove(host_id);
         });
         self.schemas_loaded_for_host.update(|loaded| {
             loaded.remove(host_id);

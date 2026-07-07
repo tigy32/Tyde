@@ -24,12 +24,14 @@ use std::net::IpAddr;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 use crate::chunking::MAX_PLAINTEXT_CHUNK_LEN;
-use crate::config::ParticipantRole;
+use crate::config::{
+    LinkBrokerAuth, LinkBrokerConfig, LinkClientId, ParticipantRole, validate_websocket_header,
+};
 use crate::error::{MqttTransportError, PublishRejection};
 use crate::link::{
     IncomingPublish, LinkEvent, MQTT_QOS1_WINDOW, MqttLink, PublishAck, PublishToken,
 };
-use crate::types::{BrokerAuth, BrokerEndpoint};
+use crate::types::BrokerAuth;
 use protocol::BrokerUrl;
 use std::time::Duration;
 
@@ -51,11 +53,10 @@ pub(crate) struct NativeMqttLink {
 
 impl NativeMqttLink {
     pub(crate) fn connect(
-        endpoint: &BrokerEndpoint,
-        role: ParticipantRole,
+        broker: &LinkBrokerConfig,
         tls_ca_pem: Option<Vec<u8>>,
     ) -> Result<Self, MqttTransportError> {
-        let options = mqtt_options(&endpoint.url, &endpoint.auth, role, tls_ca_pem)?;
+        let options = mqtt_options_for_link(broker, tls_ca_pem)?;
         let (client, eventloop) = AsyncClient::new(options, EVENTLOOP_REQUEST_CAPACITY);
         Ok(Self {
             client,
@@ -261,10 +262,37 @@ fn suback_reason(reason: SubscribeReasonCode, properties: Option<&SubAckProperti
     }
 }
 
+#[cfg(test)]
 pub(crate) fn mqtt_options(
     broker_url: &BrokerUrl,
     auth: &BrokerAuth,
     role: ParticipantRole,
+    tls_ca_pem: Option<Vec<u8>>,
+) -> Result<MqttOptions, MqttTransportError> {
+    mqtt_options_inner(
+        broker_url,
+        &LinkBrokerAuth::Legacy(auth.clone()),
+        LinkClientId::Random(role),
+        tls_ca_pem,
+    )
+}
+
+pub(crate) fn mqtt_options_for_link(
+    broker: &LinkBrokerConfig,
+    tls_ca_pem: Option<Vec<u8>>,
+) -> Result<MqttOptions, MqttTransportError> {
+    mqtt_options_inner(
+        &broker.url,
+        &broker.auth,
+        broker.client_id.clone(),
+        tls_ca_pem,
+    )
+}
+
+fn mqtt_options_inner(
+    broker_url: &BrokerUrl,
+    auth: &LinkBrokerAuth,
+    client_id: LinkClientId,
     tls_ca_pem: Option<Vec<u8>>,
 ) -> Result<MqttOptions, MqttTransportError> {
     let parsed =
@@ -286,7 +314,10 @@ pub(crate) fn mqtt_options(
         });
     }
 
-    let client_id = random_client_id(role);
+    let client_id = match client_id {
+        LinkClientId::Random(role) => random_client_id(role),
+        LinkClientId::Exact(client_id) => client_id.as_str().to_owned(),
+    };
     let mut options = match parsed.scheme() {
         "mqtts" => mqtts_options(&parsed, client_id, tls_ca_pem)?,
         "wss" => wss_options(&parsed, client_id, tls_ca_pem),
@@ -318,13 +349,73 @@ pub(crate) fn mqtt_options(
     options.set_receive_maximum(Some(MQTT_QOS1_WINDOW as u16));
 
     match auth {
-        BrokerAuth::Anonymous => {}
-        BrokerAuth::UsernamePassword { username, password } => {
+        LinkBrokerAuth::Legacy(BrokerAuth::Anonymous) => {}
+        LinkBrokerAuth::Legacy(BrokerAuth::UsernamePassword { username, password }) => {
             options.set_credentials(username.clone(), password.clone());
+        }
+        LinkBrokerAuth::Managed(auth) => {
+            apply_managed_auth(&mut options, &parsed, auth)?;
         }
     }
 
     Ok(options)
+}
+
+fn apply_managed_auth(
+    options: &mut MqttOptions,
+    parsed: &url::Url,
+    auth: &protocol::ManagedBrokerConnectAuth,
+) -> Result<(), MqttTransportError> {
+    if let Some(username) = &auth.username {
+        options.set_credentials(username.clone(), auth.password.clone().unwrap_or_default());
+    } else if auth.password.is_some() {
+        return Err(MqttTransportError::Configuration {
+            message: "managed broker MQTT password cannot be sent without a username".to_owned(),
+        });
+    }
+
+    if auth.headers.is_empty() {
+        return Ok(());
+    }
+    if parsed.scheme() != "wss" {
+        return Err(MqttTransportError::Configuration {
+            message: "managed broker WebSocket headers require a wss:// broker endpoint".to_owned(),
+        });
+    }
+    for (name, value) in &auth.headers {
+        validate_websocket_header(name, value)?;
+    }
+
+    let headers = auth
+        .headers
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    options.set_request_modifier(move |mut request| {
+        let headers = headers.clone();
+        async move {
+            for (name, value) in headers {
+                match value.parse() {
+                    Ok(header_value) => {
+                        // rumqttc exposes the WebSocket request but not the
+                        // `http::HeaderName` type; HeaderMap accepts dynamic
+                        // names only as validated leaked `'static` strings here.
+                        let header_name =
+                            Box::leak(name.to_ascii_lowercase().into_boxed_str()) as &'static str;
+                        request.headers_mut().insert(header_name, header_value);
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            header_name = %name,
+                            "validated managed broker WebSocket header value could not be encoded"
+                        );
+                    }
+                }
+            }
+            request
+        }
+    });
+    Ok(())
 }
 
 fn mqtt_plaintext_options(
@@ -450,6 +541,67 @@ fn lower_hex(bytes: &[u8]) -> String {
         output.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+#[cfg(test)]
+mod managed_auth_tests {
+    use std::collections::BTreeMap;
+
+    use protocol::{ManagedBrokerClientId, ManagedBrokerConnectAuth};
+
+    use super::*;
+    use crate::config::{LinkBrokerAuth, LinkBrokerConfig, LinkClientId};
+
+    #[test]
+    fn managed_wss_options_use_exact_client_id_and_headers() {
+        let mut headers = BTreeMap::new();
+        headers.insert("x-tycode-grant".to_owned(), "signed-grant".to_owned());
+        let broker = LinkBrokerConfig {
+            url: BrokerUrl::new("wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt")
+                .expect("broker url"),
+            auth: LinkBrokerAuth::Managed(ManagedBrokerConnectAuth {
+                username: Some("x-amz-customauthorizer-name=tycode-mobile-v1".to_owned()),
+                password: Some("signed-grant".to_owned()),
+                websocket_url: None,
+                headers,
+            }),
+            client_id: LinkClientId::Exact(
+                ManagedBrokerClientId::new("tyde/prod/pair_01J/host/grant_01J").expect("client id"),
+            ),
+        };
+
+        let options = mqtt_options_for_link(&broker, None).expect("managed mqtt options");
+        assert_eq!(
+            options.client_id(),
+            "tyde/prod/pair_01J/host/grant_01J".to_owned()
+        );
+        assert!(
+            options.request_modifier().is_some(),
+            "managed WebSocket headers must be wired into rumqttc"
+        );
+    }
+
+    #[test]
+    fn managed_headers_fail_closed_on_non_websocket_transport() {
+        let mut headers = BTreeMap::new();
+        headers.insert("x-tycode-grant".to_owned(), "signed-grant".to_owned());
+        let broker = LinkBrokerConfig {
+            url: BrokerUrl::new("mqtts://broker.example.test").expect("broker url"),
+            auth: LinkBrokerAuth::Managed(ManagedBrokerConnectAuth {
+                username: Some("user".to_owned()),
+                password: Some("password".to_owned()),
+                websocket_url: None,
+                headers,
+            }),
+            client_id: LinkClientId::Exact(
+                ManagedBrokerClientId::new("tyde/prod/pair_01J/host/grant_01J").expect("client id"),
+            ),
+        };
+
+        let err =
+            mqtt_options_for_link(&broker, None).expect_err("headers on mqtts must fail closed");
+        assert!(err.to_string().contains("WebSocket headers"));
+    }
 }
 
 /// Codec-parity tests for the Phase-2 wasm backend. These run natively (no wasm

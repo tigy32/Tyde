@@ -15,16 +15,17 @@ use crate::backend::codex::discover_models;
 use crate::browse_stream::host_platform;
 use crate::process_env;
 
-pub(crate) const TYCODE_VERSION: &str = "0.7.7";
+pub(crate) const TYCODE_VERSION: &str = "0.9.2-pre.1";
+pub(crate) const TYCODE_SETTINGS_SCHEMA_MIN_VERSION: &str = "0.10.0";
 const TYCODE_RELEASE_BASE_URL: &str = "https://github.com/tigy32/Tycode/releases/download";
 const TYCODE_SUBPROCESS_SHA256_AARCH64_APPLE_DARWIN: &str =
-    "98432d32d35db6a3023e3bf873a0de79a10a157d3db024419ccdd4271401ab63";
+    "78e068456cd6dbdd1c0e2e4c27da4f409e7874c2c3e8d770d01c15d49341452b";
 const TYCODE_SUBPROCESS_SHA256_X86_64_APPLE_DARWIN: &str =
-    "fed5df197e80a4a1f9f77578d758d679209021990b2a8218328c653121ba2b77";
+    "46e2e7803c7e3ab91094ece81af3e894122af56971e1933f37b4d826582738a8";
 const TYCODE_SUBPROCESS_SHA256_AARCH64_UNKNOWN_LINUX_MUSL: &str =
-    "1a3d002df92934ea28c9a3afd6a68285ff39192bf38d20879c19f60ec6724ee7";
+    "6e72b738dc5dbf3ec158dc8e8e8cfad2f30a0a7f615fdf64b41a3f2dc0207db2";
 const TYCODE_SUBPROCESS_SHA256_X86_64_UNKNOWN_LINUX_MUSL: &str =
-    "a8c77a3ef76d04ce4b99912becdbce5dafba9210ced04cfc959e9f4e808a5e5a";
+    "05e440903a6d44fc7d6fd74be2f748aff12f443506959725c6179379ec393dab";
 const CLAUDE_CLI_CANDIDATES: &[&str] = &["claude"];
 const CODEX_CLI_CANDIDATES: &[&str] = &["codex"];
 const ANTIGRAVITY_CLI_CANDIDATES: &[&str] = &["agy"];
@@ -181,6 +182,21 @@ fn backend_setup_info_from_probe(
     }
 }
 
+pub(crate) fn tycode_settings_schema_supported_by_pinned_release() -> bool {
+    false
+}
+
+pub(crate) fn tycode_settings_schema_release_blocker_message() -> Option<String> {
+    (!tycode_settings_schema_supported_by_pinned_release()).then(|| {
+        format!(
+            "Tyde currently pins tycode-subprocess {TYCODE_VERSION}, but Tycode's grouped \
+             GetSettingsSchema settings protocol was added after that release. Tycode native \
+             settings are unavailable until Tyde pins a Tycode release containing that protocol \
+             (expected {TYCODE_SETTINGS_SCHEMA_MIN_VERSION} or newer)."
+        )
+    })
+}
+
 fn backend_setup_status_for_probe(
     probe_status: BackendSetupStatus,
     has_install_command: bool,
@@ -244,10 +260,15 @@ impl ProbeResult {
 
 async fn probe_tycode_candidates(candidates: &[String]) -> ProbeResult {
     for candidate in candidates {
-        let Some(version) = probe_tycode_command(candidate).await else {
-            continue;
-        };
-        return ProbeResult::installed(version);
+        match validate_tycode_command(candidate).await {
+            TycodeCommandValidation::Compatible { version } => {
+                return ProbeResult::installed(Some(version));
+            }
+            TycodeCommandValidation::Incompatible { diagnostic } => {
+                return ProbeResult::unavailable(diagnostic);
+            }
+            TycodeCommandValidation::Unavailable => continue,
+        }
     }
     ProbeResult::not_installed()
 }
@@ -260,14 +281,6 @@ async fn probe_candidates(candidates: &[String]) -> ProbeResult {
         return ProbeResult::installed(version);
     }
     ProbeResult::not_installed()
-}
-
-async fn probe_tycode_command(command: &str) -> Option<Option<String>> {
-    let output = run_version_command(command).await?;
-    let Some((stdout, stderr)) = output else {
-        return Some(None);
-    };
-    Some(parse_tycode_version_output(&stdout, &stderr))
 }
 
 async fn probe_command(command: &str) -> Option<Option<String>> {
@@ -319,6 +332,71 @@ async fn run_version_command(command: &str) -> Option<Option<(String, String)>> 
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     let _ = status;
     Some(Some((stdout, stderr)))
+}
+
+enum TycodeCommandValidation {
+    Compatible { version: String },
+    Incompatible { diagnostic: BackendSetupDiagnostic },
+    Unavailable,
+}
+
+pub(crate) async fn ensure_tycode_command_compatible(command: &str) -> Result<String, String> {
+    match validate_tycode_command(command).await {
+        TycodeCommandValidation::Compatible { version: _ } => Ok(command.to_string()),
+        TycodeCommandValidation::Incompatible { diagnostic } => Err(diagnostic.message),
+        TycodeCommandValidation::Unavailable => Err(format!(
+            "Failed to run tycode-subprocess --version for {command}"
+        )),
+    }
+}
+
+async fn validate_tycode_command(command: &str) -> TycodeCommandValidation {
+    let Some(output) = run_version_command(command).await else {
+        return TycodeCommandValidation::Unavailable;
+    };
+    let Some((stdout, stderr)) = output else {
+        return TycodeCommandValidation::Incompatible {
+            diagnostic: BackendSetupDiagnostic {
+                code: BackendSetupDiagnosticCode::CommandFailed,
+                message: format!(
+                    "Tycode command {command} did not complete a --version probe; Tyde requires tycode-subprocess {TYCODE_VERSION}"
+                ),
+            },
+        };
+    };
+    let Some(version_line) = parse_tycode_version_output(&stdout, &stderr) else {
+        return TycodeCommandValidation::Incompatible {
+            diagnostic: BackendSetupDiagnostic {
+                code: BackendSetupDiagnosticCode::CommandFailed,
+                message: format!(
+                    "Tycode command {command} did not report a parseable --version; Tyde requires tycode-subprocess {TYCODE_VERSION}"
+                ),
+            },
+        };
+    };
+    let Some(version) = parse_tycode_reported_version(&version_line) else {
+        return TycodeCommandValidation::Incompatible {
+            diagnostic: BackendSetupDiagnostic {
+                code: BackendSetupDiagnosticCode::CommandFailed,
+                message: format!(
+                    "Tycode command {command} reported unparseable version line {version_line:?}; Tyde requires tycode-subprocess {TYCODE_VERSION}"
+                ),
+            },
+        };
+    };
+    if version == TYCODE_VERSION {
+        return TycodeCommandValidation::Compatible {
+            version: version_line,
+        };
+    }
+    TycodeCommandValidation::Incompatible {
+        diagnostic: BackendSetupDiagnostic {
+            code: BackendSetupDiagnosticCode::CommandFailed,
+            message: format!(
+                "Tycode command {command} reported version {version}, but Tyde requires tycode-subprocess {TYCODE_VERSION}; install the pinned Tycode release artifact"
+            ),
+        },
+    }
 }
 
 async fn probe_explicit_hermes_python(candidate: &str) -> ProbeResult {
@@ -465,6 +543,19 @@ fn parse_tycode_plain_text_version_line(line: &str) -> Option<String> {
         return None;
     }
     Some(line.to_string())
+}
+
+fn parse_tycode_reported_version(line: &str) -> Option<&str> {
+    let mut parts = line.split_whitespace();
+    let binary = parts.next()?;
+    let version = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if binary != "tycode-subprocess" && binary != "tycode" {
+        return None;
+    }
+    looks_like_semver(version).then_some(version)
 }
 
 fn parse_tycode_version_frame(line: &str) -> Option<String> {
@@ -852,6 +943,17 @@ mod tests {
     }
 
     #[test]
+    fn tycode_version_parser_accepts_prerelease_pin() {
+        let line = format!("tycode-subprocess {TYCODE_VERSION}");
+        let parsed = parse_tycode_version_output(&line, "");
+        assert_eq!(parsed.as_deref(), Some(line.as_str()));
+        assert_eq!(
+            parsed.as_deref().and_then(parse_tycode_reported_version),
+            Some(TYCODE_VERSION)
+        );
+    }
+
+    #[test]
     fn tycode_never_exposes_a_sign_in_command() {
         assert!(sign_in_command(BackendKind::Tycode, None).is_none());
     }
@@ -881,16 +983,59 @@ mod tests {
         let info = backend_setup_info_from_probe(
             BackendKind::Tycode,
             HostPlatform::Windows,
-            ProbeResult::installed(Some("tycode-subprocess 0.7.7".to_string())),
+            ProbeResult::installed(Some(format!("tycode-subprocess {TYCODE_VERSION}"))),
         );
 
         assert_eq!(info.status, BackendSetupStatus::Installed);
+        let expected_version = format!("tycode-subprocess {TYCODE_VERSION}");
         assert_eq!(
             info.installed_version.as_deref(),
-            Some("tycode-subprocess 0.7.7")
+            Some(expected_version.as_str())
         );
         assert!(info.install_command.is_none());
         assert!(info.diagnostic.is_none());
+    }
+
+    #[tokio::test]
+    async fn tycode_probe_accepts_pinned_version() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let command = dir.path().join("tycode-subprocess");
+        write_executable(
+            &command,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'tycode-subprocess {TYCODE_VERSION}\\n'; exit 0; fi\nexit 1\n"
+            ),
+        );
+
+        let result = probe_tycode_candidates(&[command.to_string_lossy().to_string()]).await;
+
+        assert_eq!(result.status, BackendSetupStatus::Installed);
+        let expected_version = format!("tycode-subprocess {TYCODE_VERSION}");
+        assert_eq!(result.version.as_deref(), Some(expected_version.as_str()));
+        assert!(result.diagnostic.is_none());
+    }
+
+    #[tokio::test]
+    async fn tycode_probe_rejects_mismatched_version() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let command = dir.path().join("tycode-subprocess");
+        write_executable(
+            &command,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'tycode-subprocess 0.7.7\\n'; exit 0; fi\nexit 1\n",
+        );
+
+        let result = probe_tycode_candidates(&[command.to_string_lossy().to_string()]).await;
+
+        assert_eq!(result.status, BackendSetupStatus::Unavailable);
+        assert_eq!(result.version, None);
+        let diagnostic = result.diagnostic.expect("diagnostic");
+        assert_eq!(diagnostic.code, BackendSetupDiagnosticCode::CommandFailed);
+        assert!(
+            diagnostic.message.contains("reported version 0.7.7")
+                && diagnostic.message.contains(TYCODE_VERSION),
+            "diagnostic should name reported and required versions: {}",
+            diagnostic.message
+        );
     }
 
     #[test]

@@ -296,6 +296,19 @@ input, textarea, select {
     height: 22px;
 }
 
+/* Sign-in / re-pair action inside the sticky needs-action banner. */
+.connection-banner-action {
+    margin-left: auto;
+    padding: 4px 10px;
+    font-size: 13px;
+    font-weight: 600;
+    border-radius: 6px;
+    border: 1px solid var(--accent-primary);
+    background: var(--accent-primary);
+    color: #fff;
+    white-space: nowrap;
+}
+
 /* ── Bottom Navigation ──────────────────────────────────────────────── */
 
 .bottom-nav {
@@ -712,6 +725,35 @@ input, textarea, select {
     font-size: 32px;
     color: var(--accent-primary);
     animation: pulse 1s ease-in-out infinite;
+}
+
+/* Managed pairing / repair cards: paywall link, retry, re-pair prompt. */
+.pairing-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-4);
+    border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.12));
+    border-radius: var(--radius-lg, 12px);
+    background: var(--surface-raised, rgba(255, 255, 255, 0.04));
+}
+
+.pairing-paywall {
+    border-color: var(--accent-primary);
+}
+
+.pairing-card-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.pairing-card-body {
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    margin: 0;
 }
 
 .home-section {
@@ -1781,6 +1823,12 @@ input, textarea, select {
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
+}
+
+.sessions-load-more {
+    display: flex;
+    justify-content: center;
+    padding: var(--space-2) 0 var(--space-4);
 }
 
 .session-card {

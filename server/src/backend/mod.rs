@@ -367,8 +367,11 @@ pub(crate) async fn backend_config_snapshot_for_backend(
 ) -> Option<BackendConfigSnapshot> {
     let result = match backend_kind {
         BackendKind::Hermes => hermes::probe_backend_config_snapshot(workspace_roots).await,
-        BackendKind::Tycode => tycode::backend_config_snapshot().await,
-        BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex | BackendKind::Antigravity => {
+        BackendKind::Tycode
+        | BackendKind::Kiro
+        | BackendKind::Claude
+        | BackendKind::Codex
+        | BackendKind::Antigravity => {
             return None;
         }
     };
@@ -786,10 +789,6 @@ mod tests {
     fn backend_config_schema_catalog_includes_configurable_backends_only() {
         let schemas = backend_config_schema_catalog();
 
-        let tycode = schemas
-            .iter()
-            .find(|schema| schema.backend_kind == BackendKind::Tycode)
-            .expect("Tycode config schema");
         let hermes = schemas
             .iter()
             .find(|schema| schema.backend_kind == BackendKind::Hermes)
@@ -800,11 +799,7 @@ mod tests {
                 .iter()
                 .map(|schema| schema.backend_kind)
                 .collect::<Vec<_>>(),
-            vec![BackendKind::Tycode, BackendKind::Hermes]
-        );
-        assert_eq!(
-            tycode.persistence_mode,
-            BackendConfigPersistenceMode::BackendNative
+            vec![BackendKind::Hermes]
         );
         assert_eq!(
             hermes.persistence_mode,

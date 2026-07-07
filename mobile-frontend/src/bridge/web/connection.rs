@@ -33,13 +33,15 @@ use mobile_shell_types::{
     LocalHostId, PairedHostConnectionStatus, PairedHostConnectionStatusEvent,
 };
 use mqtt_transport::{
-    MqttConnectConfig, MqttReconnectBackoff, MqttTransportError, ParticipantRole, PreSharedKey,
+    ManagedMqttConnectConfig, MqttReconnectBackoff, MqttTransportError, ParticipantRole,
+    PreSharedKey,
 };
 use protocol::MobileAccessErrorCode;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 use super::events;
+use super::service::ManagedCredentialError;
 use super::store::{IndexedDbHostStore, IndexedDbPskStore, PskStore, WebPairedHostRecord};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -400,6 +402,9 @@ enum ConnectErr {
     Io(std::io::Error),
     Timeout,
     NeedsRepair(String),
+    /// The managed pairing could not obtain broker credentials from `tycode.dev`
+    /// (session expired, service unavailable, pairing revoked, …).
+    ManagedCredentials(ManagedCredentialError),
 }
 
 impl std::fmt::Display for ConnectErr {
@@ -412,6 +417,7 @@ impl std::fmt::Display for ConnectErr {
                 "MQTT connection attempt timed out after {CONNECT_ATTEMPT_TIMEOUT:?}"
             ),
             Self::NeedsRepair(message) => write!(f, "{message}"),
+            Self::ManagedCredentials(error) => write!(f, "{}", error.message),
         }
     }
 }
@@ -423,6 +429,7 @@ impl ConnectErr {
             Self::Io(error) => io_error_is_retryable(error),
             Self::Timeout => true,
             Self::NeedsRepair(_) => false,
+            Self::ManagedCredentials(error) => error.retryable,
         }
     }
 
@@ -433,7 +440,8 @@ impl ConnectErr {
                 .map(transport_error_code)
                 .unwrap_or(MobileAccessErrorCode::TransportFailed),
             Self::Timeout => MobileAccessErrorCode::BrokerConnectionFailed,
-            Self::NeedsRepair(_) => MobileAccessErrorCode::InvalidConfig,
+            Self::NeedsRepair(_) => MobileAccessErrorCode::RepairRequired,
+            Self::ManagedCredentials(error) => error.code,
         }
     }
 }
@@ -544,28 +552,50 @@ async fn connect_once(
     record: &WebPairedHostRecord,
     psk: &PreSharedKey,
 ) -> Result<mqtt_transport::EnvelopeStream, ConnectErr> {
-    if !record.broker.url.as_str().starts_with("wss://") {
-        return Err(ConnectErr::NeedsRepair(format!(
-            "host \"{}\" was paired for a non-WebSocket broker ({}); the browser client requires a wss:// broker — re-pair from the host's QR",
-            record.host_label,
-            record.broker.url.as_str()
-        )));
+    // Managed (`tyde-pair://v2`) pairings are the ONLY connectable records. They
+    // mint fresh tycode.dev-signed broker credentials and connect over the AWS
+    // IoT managed broker with the scanned rendezvous room + PSK.
+    match &record.managed {
+        Some(_) => connect_managed_once(record, psk).await,
+        // Any unmanaged stored record — a retired public broker OR a custom
+        // WSS broker from a legacy pairing — fails closed (findings #2/#8,
+        // locked decision #8). There is no unmanaged/public-broker connect
+        // path; the record must be re-paired through tycode.dev.
+        None => Err(ConnectErr::NeedsRepair(format!(
+            "\"{}\" was paired before managed mobile access and can't connect anymore. Re-pair from the host's current QR code (Settings → Hosts) to move it to managed access, or forget it.",
+            record.host_label
+        ))),
     }
-    let config = MqttConnectConfig {
-        endpoint: record.broker.clone(),
+}
+
+async fn connect_managed_once(
+    record: &WebPairedHostRecord,
+    psk: &PreSharedKey,
+) -> Result<mqtt_transport::EnvelopeStream, ConnectErr> {
+    let (broker, credentials) =
+        super::service::obtain_managed_credentials(record, now_ms()).await?;
+    let config = ManagedMqttConnectConfig {
+        broker,
+        credentials,
         room: record.room,
         psk: psk.clone(),
         role: ParticipantRole::Client,
     };
     match timeout(
         CONNECT_ATTEMPT_TIMEOUT,
-        mqtt_transport::connect_ephemeral(config),
+        mqtt_transport::connect_managed_ephemeral(config),
     )
     .await
     {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(error)) => Err(ConnectErr::Transport(error)),
         Err(_) => Err(ConnectErr::Timeout),
+    }
+}
+
+impl From<ManagedCredentialError> for ConnectErr {
+    fn from(error: ManagedCredentialError) -> Self {
+        ConnectErr::ManagedCredentials(error)
     }
 }
 
@@ -710,10 +740,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn needs_repair_is_terminal_and_invalid_config() {
+    fn needs_repair_is_terminal_and_repair_required() {
         let error = ConnectErr::NeedsRepair("re-pair required".to_owned());
         assert!(!error.is_retryable());
-        assert_eq!(error.error_code(), MobileAccessErrorCode::InvalidConfig);
+        assert_eq!(error.error_code(), MobileAccessErrorCode::RepairRequired);
+    }
+
+    /// Finding #2: an unmanaged stored record — even a custom `wss://` broker —
+    /// must fail closed to a terminal repair-required error, never connect.
+    // Native-only: uses the tokio test runtime, which the wasm target lacks.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn unmanaged_custom_wss_record_fails_closed_with_repair() {
+        use mqtt_transport::{BrokerAuth, BrokerEndpoint, PreSharedKey, RoomId};
+        let record = WebPairedHostRecord {
+            local_host_id: LocalHostId("h-legacy".to_owned()),
+            host_label: "Legacy Custom Broker".to_owned(),
+            broker: BrokerEndpoint {
+                url: protocol::BrokerUrl::new("wss://custom.example.test/mqtt").unwrap(),
+                auth: BrokerAuth::Anonymous,
+            },
+            room: RoomId([1_u8; 16]),
+            psk_keychain_key_id: mobile_shell_types::KeychainSecretId("k".to_owned()),
+            credential_fingerprint: "fp".to_owned(),
+            auto_connect: false,
+            last_connected_at_ms: None,
+            managed: None,
+        };
+        let psk = PreSharedKey::from_slice(&[2_u8; 32]).unwrap();
+        let error = match connect_once(&record, &psk).await {
+            Ok(_) => panic!("unmanaged records must fail closed"),
+            Err(error) => error,
+        };
+        assert!(!error.is_retryable(), "repair is terminal, not retryable");
+        assert_eq!(error.error_code(), MobileAccessErrorCode::RepairRequired);
     }
 
     #[test]

@@ -15,7 +15,9 @@ use mobile_shell_types::{
 };
 
 use super::{BarcodeScanResult, UnlistenHandle};
-use crate::state::{LocalHostId, MobilePairingPreview, MobileShellError, PairedHostSummary};
+use crate::state::{
+    LocalHostId, MobilePairingPreview, MobileShellError, PairedHostSummary, PairingOffer,
+};
 
 // --- Tauri JS bindings ---
 
@@ -124,6 +126,15 @@ pub async fn preview_pairing_uri(qr_uri: &str) -> Result<MobilePairingPreview, S
         .await
         .map_err(format_invoke_error)?;
     serde_wasm_bindgen::from_value(value).map_err(|error| format!("decode failed: {error}"))
+}
+
+/// The native shell owns its own managed-pairing handshake, so from the shared
+/// pairing flow's perspective every native offer is a direct pairing: preview it
+/// and let the existing confirm → `start_pairing` path run. The managed/legacy
+/// split is a web-bundle concern (see `web::classify_pairing_offer`).
+pub async fn classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String> {
+    let preview = preview_pairing_uri(qr_uri).await?;
+    Ok(PairingOffer::DirectPairing { preview })
 }
 
 pub async fn start_pairing(qr_uri: &str) -> Result<(), String> {

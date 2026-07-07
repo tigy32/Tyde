@@ -23,6 +23,7 @@ test("loader shell upload rewrites metadata for unchanged files", () => {
 test("loader shell and manifest cache headers are validated", () => {
   assert.match(SCRIPT, /"index\.html"/);
   assert.match(SCRIPT, /"sw\.js"/);
+  assert.match(SCRIPT, /"mobile-service-config\.js"/);
   assert.match(SCRIPT, /"loader\.js"/);
   assert.match(SCRIPT, /--key "\$\{PREFIX\}\/\$\{shell_key\}"/);
   assert.match(SCRIPT, /--query CacheControl/);
@@ -32,4 +33,11 @@ test("loader shell and manifest cache headers are validated", () => {
     SCRIPT,
     /\[ "\$\{manifest_cache_control\}" = "\$\{MANIFEST_CACHE_CONTROL\}" \]/,
   );
+});
+
+test("mobile service config deploys as loader shell, not manifest authority", () => {
+  assert.match(SCRIPT, /"mobile-service-config\.js"/);
+  assert.match(SCRIPT, /aws s3 cp "\$\{LOADER_DIR\}\/" "\$\{S3_LOADER\}"/);
+  assert.match(SCRIPT, /--exclude 'manifest\.json'/);
+  assert.doesNotMatch(SCRIPT, /mobile-service-config\.js.*MANIFEST_CACHE_CONTROL/);
 });

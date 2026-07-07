@@ -14,7 +14,7 @@ use futures_channel::mpsc::channel;
 use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::config::MqttConnectConfig;
+use crate::config::{ConnectionPlan, ManagedMqttConnectConfig, MqttConnectConfig};
 use crate::error::MqttTransportError;
 use crate::link_wasm::WasmMqttLink;
 use crate::protocol_driver::{
@@ -28,10 +28,25 @@ const INBOUND_EVENT_CAPACITY: usize = 64;
 const RENDEZVOUS_DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub async fn connect(config: MqttConnectConfig) -> Result<EnvelopeStream, MqttTransportError> {
+    connect_plan(ConnectionPlan::legacy(config)).await
+}
+
+pub async fn connect_managed(
+    config: ManagedMqttConnectConfig,
+) -> Result<EnvelopeStream, MqttTransportError> {
+    connect_plan(ConnectionPlan::managed(config)?).await
+}
+
+async fn connect_plan(plan: ConnectionPlan) -> Result<EnvelopeStream, MqttTransportError> {
+    let ConnectionPlan {
+        config,
+        broker,
+        topics,
+    } = plan;
     let local_salt = generate_session_salt();
-    let inbound_topic = config.role.inbound_topic(&config.room);
-    let outbound_topic = config.role.outbound_topic(&config.room);
-    let link = WasmMqttLink::connect(&config.endpoint, config.role).await?;
+    let inbound_topic = topics.inbound_topic(config.role, &config.room)?;
+    let outbound_topic = topics.outbound_topic(config.role, &config.room)?;
+    let link = WasmMqttLink::connect(&broker).await?;
 
     let (outbound_tx, outbound_rx) = channel::<OutboundChunk>(OUTBOUND_CHUNK_CAPACITY);
     let (inbound_tx, inbound_rx) = mpsc::channel::<InboundEvent>(INBOUND_EVENT_CAPACITY);
@@ -67,14 +82,31 @@ pub async fn connect(config: MqttConnectConfig) -> Result<EnvelopeStream, MqttTr
 pub async fn connect_ephemeral(
     config: MqttConnectConfig,
 ) -> Result<EnvelopeStream, MqttTransportError> {
-    let data = negotiate_ephemeral_data_room_wasm(&config).await?;
+    connect_ephemeral_plan(ConnectionPlan::legacy(config)).await
+}
+
+pub async fn connect_managed_ephemeral(
+    config: ManagedMqttConnectConfig,
+) -> Result<EnvelopeStream, MqttTransportError> {
+    connect_ephemeral_plan(ConnectionPlan::managed_ephemeral(config)?).await
+}
+
+async fn connect_ephemeral_plan(
+    plan: ConnectionPlan,
+) -> Result<EnvelopeStream, MqttTransportError> {
+    let data = negotiate_ephemeral_data_room_wasm(&plan).await?;
     let data_config = MqttConnectConfig {
-        endpoint: config.endpoint,
+        endpoint: plan.config.endpoint,
         room: data.room,
         psk: data.psk,
-        role: config.role,
+        role: plan.config.role,
     };
-    wasmtimer::tokio::timeout(RENDEZVOUS_DATA_CONNECT_TIMEOUT, connect(data_config))
+    let data_plan = ConnectionPlan {
+        config: data_config,
+        broker: plan.broker,
+        topics: plan.topics,
+    };
+    wasmtimer::tokio::timeout(RENDEZVOUS_DATA_CONNECT_TIMEOUT, connect_plan(data_plan))
         .await
         .map_err(|_| MqttTransportError::BrokerDisconnected {
             reason: format!(
@@ -87,10 +119,11 @@ pub async fn connect_ephemeral(
 /// Construct the wasm link for the main (rendezvous) room and run the
 /// transport-agnostic negotiation over it.
 async fn negotiate_ephemeral_data_room_wasm(
-    config: &MqttConnectConfig,
+    plan: &ConnectionPlan,
 ) -> Result<EphemeralDataRoom, MqttTransportError> {
-    let inbound_topic = config.role.inbound_topic(&config.room);
-    let outbound_topic = config.role.outbound_topic(&config.room);
-    let mut link = WasmMqttLink::connect(&config.endpoint, config.role).await?;
+    let config = &plan.config;
+    let inbound_topic = plan.topics.inbound_topic(config.role, &config.room)?;
+    let outbound_topic = plan.topics.outbound_topic(config.role, &config.room)?;
+    let mut link = WasmMqttLink::connect(&plan.broker).await?;
     negotiate_ephemeral_data_room(config, &inbound_topic, &outbound_topic, &mut link).await
 }

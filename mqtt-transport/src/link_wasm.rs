@@ -20,21 +20,21 @@ use bytes::BytesMut;
 use futures_channel::mpsc::{UnboundedReceiver, unbounded};
 use futures_util::StreamExt;
 use mqttbytes::QoS;
-use mqttbytes::v5::{Connect, ConnectProperties, ConnectReturnCode, Packet, Publish, read};
-use rand::RngCore;
-use rand::rngs::OsRng;
+use mqttbytes::v5::{ConnectReturnCode, Packet, Publish, read};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
 
 use crate::chunking::MAX_PLAINTEXT_CHUNK_LEN;
-use crate::config::ParticipantRole;
+use crate::config::{
+    BrowserConnectPacketOptions, LinkBrokerConfig, browser_link_broker_url,
+    encode_browser_connect_packet,
+};
 use crate::error::MqttTransportError;
 use crate::link::{
     IncomingPublish, LinkEvent, MQTT_QOS1_WINDOW, MqttLink, PublishAck, PublishToken,
 };
 use crate::time::{Instant, Interval, interval_at};
-use crate::types::{BrokerAuth, BrokerEndpoint};
 use crate::wasm_codec::{
     PubAckMatch, SubAckMatch, classify_puback, classify_suback, encode_disconnect, encode_pingreq,
     incoming_publish_puback,
@@ -104,23 +104,20 @@ pub(crate) struct WasmMqttLink {
 impl WasmMqttLink {
     /// Open the WebSocket, perform the MQTT5 CONNECT/CONNACK handshake, and return
     /// a link ready for `subscribe`/`publish`/`poll`.
-    pub(crate) async fn connect(
-        endpoint: &BrokerEndpoint,
-        role: ParticipantRole,
-    ) -> Result<Self, MqttTransportError> {
-        let url = endpoint.url.as_str();
+    pub(crate) async fn connect(broker: &LinkBrokerConfig) -> Result<Self, MqttTransportError> {
+        let websocket_url = browser_link_broker_url(broker)?;
+        let url = websocket_url.as_str();
         if !url.starts_with("wss://") {
             // The wasm backend can only reach the broker over wss (mixed-content
             // and TLS-termination constraints); a stored mqtts:// host needs re-pair.
             return Err(MqttTransportError::Configuration {
-                message: format!(
-                    "wasm MQTT transport requires a wss:// broker URL; got {url:?} (re-pair needed)"
-                ),
+                message: "wasm MQTT transport requires a wss:// broker URL (re-pair needed)"
+                    .to_owned(),
             });
         }
 
         let ws = WebSocket::new_with_str(url, "mqtt")
-            .map_err(|err| connect_err(format!("failed to open WebSocket: {}", js_debug(&err))))?;
+            .map_err(|_err| connect_err("failed to open WebSocket"))?;
         ws.set_binary_type(BinaryType::Arraybuffer);
 
         let (tx, rx) = unbounded::<WsSignal>();
@@ -180,7 +177,7 @@ impl WasmMqttLink {
         };
 
         link.await_open().await?;
-        link.send_connect(role, &endpoint.auth)?;
+        link.send_connect(broker)?;
         link.await_connack().await?;
         Ok(link)
     }
@@ -232,33 +229,15 @@ impl WasmMqttLink {
         }
     }
 
-    fn send_connect(
-        &mut self,
-        role: ParticipantRole,
-        auth: &BrokerAuth,
-    ) -> Result<(), MqttTransportError> {
-        let mut connect = Connect::new(random_client_id(role));
-        connect.keep_alive = KEEP_ALIVE.as_secs() as u16;
-        connect.clean_session = true;
-        connect.properties = Some(ConnectProperties {
-            session_expiry_interval: Some(0),
-            receive_maximum: Some(MQTT_QOS1_WINDOW as u16),
-            max_packet_size: Some(MAX_MQTT_PACKET_SIZE as u32),
-            topic_alias_max: None,
-            request_response_info: None,
-            request_problem_info: None,
-            user_properties: Vec::new(),
-            authentication_method: None,
-            authentication_data: None,
-        });
-        if let BrokerAuth::UsernamePassword { username, password } = auth {
-            connect.set_login(username.clone(), password.clone());
-        }
-
-        let mut buffer = BytesMut::new();
-        connect
-            .write(&mut buffer)
-            .map_err(|err| connect_err(format!("failed to encode CONNECT: {err:?}")))?;
+    fn send_connect(&mut self, broker: &LinkBrokerConfig) -> Result<(), MqttTransportError> {
+        let buffer = encode_browser_connect_packet(
+            broker,
+            BrowserConnectPacketOptions {
+                keep_alive_secs: KEEP_ALIVE.as_secs() as u16,
+                receive_maximum: MQTT_QOS1_WINDOW as u16,
+                max_packet_size: MAX_MQTT_PACKET_SIZE as u32,
+            },
+        )?;
         self.send_bytes(&buffer)
             .map_err(|err| connect_err(format!("failed to send CONNECT: {err}")))
     }
@@ -435,18 +414,6 @@ impl MqttLink for WasmMqttLink {
         }
         let _close_result = self.ws.close();
     }
-}
-
-fn random_client_id(role: ParticipantRole) -> String {
-    let mut random = [0_u8; 16];
-    OsRng.fill_bytes(&mut random);
-    let mut hex = String::with_capacity(random.len() * 2);
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    for byte in random {
-        hex.push(DIGITS[(byte >> 4) as usize] as char);
-        hex.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    format!("{}-{}", role.client_id_prefix(), hex)
 }
 
 fn js_debug(value: &wasm_bindgen::JsValue) -> String {

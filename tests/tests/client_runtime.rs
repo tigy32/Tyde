@@ -46,14 +46,15 @@ async fn runtime_accepts_backend_config_schema_catalog() {
                     .iter()
                     .map(|schema| schema.backend_kind)
                     .collect::<Vec<_>>(),
-                vec![BackendKind::Tycode, BackendKind::Hermes]
+                vec![BackendKind::Hermes]
             );
+            let hermes_schema = payload
+                .backend_config_schemas
+                .iter()
+                .find(|schema| schema.backend_kind == BackendKind::Hermes)
+                .expect("Hermes backend config schema");
             assert_eq!(
-                payload.backend_config_schemas[0].persistence_mode,
-                BackendConfigPersistenceMode::BackendNative
-            );
-            assert_eq!(
-                payload.backend_config_schemas[1].persistence_mode,
+                hermes_schema.persistence_mode,
                 BackendConfigPersistenceMode::TydeSettingsStore
             );
         }

@@ -142,6 +142,52 @@ fn seed_session_store(path: &std::path::Path, count: u32) {
     }
 }
 
+fn seed_session_store_with_children(path: &std::path::Path, root_count: u32, child_count: u32) {
+    let store = SessionStore::load(path.to_owned()).expect("load session store");
+    for index in 0..root_count {
+        store
+            .upsert_backend_session(
+                &BackendSession {
+                    id: SessionId(format!("root-session-{index:04}")),
+                    backend_kind: BackendKind::Claude,
+                    workspace_roots: vec![format!("/workspace/root/{index}")],
+                    title: Some(format!("Root Session {index:04}")),
+                    token_count: Some(index as u64),
+                    created_at_ms: Some(index as u64),
+                    updated_at_ms: Some((root_count - index) as u64),
+                    resumable: true,
+                },
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("seed root backend session");
+    }
+
+    let parent_id = SessionId("root-session-0000".to_owned());
+    for index in 0..child_count {
+        store
+            .upsert_backend_session(
+                &BackendSession {
+                    id: SessionId(format!("child-session-{index:04}")),
+                    backend_kind: BackendKind::Claude,
+                    workspace_roots: vec![format!("/workspace/child/{index}")],
+                    title: Some(format!("Child Session {index:04}")),
+                    token_count: Some(index as u64),
+                    created_at_ms: Some((root_count + index) as u64),
+                    updated_at_ms: Some((root_count + child_count + index) as u64),
+                    resumable: true,
+                },
+                Some(parent_id.clone()),
+                None,
+                None,
+                None,
+            )
+            .expect("seed child backend session");
+    }
+}
+
 fn write_enabled_backends_settings(path: &std::path::Path, backends: &[BackendKind]) {
     write_host_settings(path, backends, None);
 }
@@ -267,10 +313,14 @@ async fn mobile_bootstrap_pages_large_session_store() {
         .expect("serialize mobile HostBootstrap envelope")
         .len();
     let bootstrap: HostBootstrapPayload = env.parse_payload().expect("host bootstrap payload");
+    assert_eq!(
+        bootstrap.session_list.scope,
+        protocol::SessionListScope::RootSessions
+    );
     assert_eq!(bootstrap.session_list.total_count, 300);
     assert_eq!(
         bootstrap.sessions.len(),
-        protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT as usize
+        protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT as usize
     );
     assert!(
         serialized_len < 128 * 1024,
@@ -282,13 +332,14 @@ async fn mobile_bootstrap_pages_large_session_store() {
     };
     assert_eq!(
         next_cursor.offset,
-        protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT
+        protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT
     );
 
     client
         .list_sessions(protocol::ListSessionsPayload {
+            scope: Some(protocol::SessionListScope::RootSessions),
             cursor: Some(next_cursor),
-            limit: Some(protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT),
+            limit: Some(protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT),
         })
         .await
         .expect("request second session page");
@@ -301,12 +352,13 @@ async fn mobile_bootstrap_pages_large_session_store() {
     let page: SessionListPayload = env.parse_payload().expect("parse SessionList");
     assert_eq!(
         page.page.cursor.offset,
-        protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT
+        protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT
     );
+    assert_eq!(page.page.scope, protocol::SessionListScope::RootSessions);
     assert_eq!(page.page.total_count, 300);
     assert_eq!(
         page.sessions.len(),
-        protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT as usize
+        protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT as usize
     );
     assert!(matches!(
         page.page.status,
@@ -342,7 +394,7 @@ async fn mobile_session_pages_use_stable_snapshot_when_sessions_reorder() {
             .sessions
             .last()
             .map(|session| session.id.0.as_str()),
-        Some("session-0063")
+        Some("session-0019")
     );
     let mut all_ids = bootstrap
         .sessions
@@ -365,8 +417,9 @@ async fn mobile_session_pages_use_stable_snapshot_when_sessions_reorder() {
     loop {
         client
             .list_sessions(protocol::ListSessionsPayload {
+                scope: Some(protocol::SessionListScope::RootSessions),
                 cursor: Some(next_cursor),
-                limit: Some(protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT),
+                limit: Some(protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT),
             })
             .await
             .expect("request next session page");
@@ -376,11 +429,11 @@ async fn mobile_session_pages_use_stable_snapshot_when_sessions_reorder() {
             page.page.cursor.generation, first_generation,
             "continuation pages must come from the original snapshot"
         );
-        if page.page.cursor.offset == protocol::DEFAULT_SESSION_LIST_PAGE_LIMIT {
+        if page.page.cursor.offset == protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT {
             assert_eq!(
                 page.sessions.first().map(|session| session.id.0.as_str()),
-                Some("session-0064"),
-                "fresh offset paging would duplicate session-0063 and silently skip a later session"
+                Some("session-0020"),
+                "fresh offset paging would duplicate session-0019 and silently skip a later session"
             );
         }
         all_ids.extend(page.sessions.into_iter().map(|session| session.id));
@@ -396,6 +449,149 @@ async fn mobile_session_pages_use_stable_snapshot_when_sessions_reorder() {
     assert!(
         unique_ids.contains(&SessionId("session-0129".to_owned())),
         "stable snapshot paging must not silently truncate the old tail"
+    );
+}
+
+#[tokio::test]
+async fn mobile_session_lists_default_to_root_scope_and_can_request_all_scope() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session_path = dir.path().join("sessions.json");
+    seed_session_store_with_children(&session_path, 25, 5);
+    let host = server::spawn_host_with_mock_backend(
+        session_path,
+        dir.path().join("projects.json"),
+        dir.path().join("settings.json"),
+    )
+    .expect("spawn host");
+    let mut client = connect_mobile_raw(host).await;
+
+    let env = next_env(&mut client, "mobile host bootstrap").await;
+    assert_eq!(env.kind, FrameKind::HostBootstrap);
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("host bootstrap payload");
+    assert_eq!(
+        bootstrap.session_list.scope,
+        protocol::SessionListScope::RootSessions
+    );
+    assert_eq!(bootstrap.session_list.total_count, 25);
+    assert_eq!(
+        bootstrap.sessions.len(),
+        protocol::DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT as usize
+    );
+    assert!(
+        bootstrap
+            .sessions
+            .iter()
+            .all(|session| session.parent_id.is_none()),
+        "mobile bootstrap must exclude child sessions by default"
+    );
+    let next_cursor = match bootstrap.session_list.status {
+        SessionListPageStatus::More { next_cursor } => next_cursor,
+        SessionListPageStatus::Complete => panic!("root session bootstrap should be paged"),
+    };
+
+    client
+        .list_sessions(protocol::ListSessionsPayload {
+            scope: Some(protocol::SessionListScope::RootSessions),
+            cursor: Some(next_cursor),
+            limit: None,
+        })
+        .await
+        .expect("request root continuation page");
+    let env = next_kind(
+        &mut client,
+        FrameKind::SessionList,
+        "root continuation SessionList",
+    )
+    .await;
+    let root_page: SessionListPayload = env.parse_payload().expect("parse root SessionList");
+    assert_eq!(
+        root_page.page.scope,
+        protocol::SessionListScope::RootSessions
+    );
+    assert_eq!(root_page.page.total_count, 25);
+    assert_eq!(root_page.sessions.len(), 5);
+    assert!(
+        root_page
+            .sessions
+            .iter()
+            .all(|session| session.parent_id.is_none())
+    );
+    assert!(matches!(
+        root_page.page.status,
+        SessionListPageStatus::Complete
+    ));
+
+    client
+        .list_sessions(protocol::ListSessionsPayload {
+            scope: Some(protocol::SessionListScope::AllSessions),
+            cursor: None,
+            limit: Some(40),
+        })
+        .await
+        .expect("request all session page");
+    let env = next_kind(&mut client, FrameKind::SessionList, "all SessionList").await;
+    let all_page: SessionListPayload = env.parse_payload().expect("parse all SessionList");
+    assert_eq!(all_page.page.scope, protocol::SessionListScope::AllSessions);
+    assert_eq!(all_page.page.total_count, 30);
+    assert_eq!(all_page.sessions.len(), 30);
+    assert!(
+        all_page
+            .sessions
+            .iter()
+            .any(|session| session.parent_id.is_some()),
+        "explicit all-session scope should include child sessions"
+    );
+}
+
+#[tokio::test]
+async fn desktop_session_bootstrap_and_default_list_still_include_children() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session_path = dir.path().join("sessions.json");
+    seed_session_store_with_children(&session_path, 2, 1);
+    let host = server::spawn_host_with_mock_backend(
+        session_path,
+        dir.path().join("projects.json"),
+        dir.path().join("settings.json"),
+    )
+    .expect("spawn host");
+    let mut client = connect_raw(host).await;
+
+    let env = next_env(&mut client, "desktop host bootstrap").await;
+    assert_eq!(env.kind, FrameKind::HostBootstrap);
+    let bootstrap: HostBootstrapPayload = env.parse_payload().expect("host bootstrap payload");
+    assert_eq!(
+        bootstrap.session_list.scope,
+        protocol::SessionListScope::AllSessions
+    );
+    assert_eq!(bootstrap.session_list.total_count, 3);
+    assert_eq!(bootstrap.sessions.len(), 3);
+    assert!(
+        bootstrap
+            .sessions
+            .iter()
+            .any(|session| session.parent_id.is_some()),
+        "desktop bootstrap should keep the historical all-session behavior"
+    );
+
+    client
+        .list_sessions(protocol::ListSessionsPayload::default())
+        .await
+        .expect("request desktop default session list");
+    let env = next_kind(
+        &mut client,
+        FrameKind::SessionList,
+        "desktop default SessionList",
+    )
+    .await;
+    let list: SessionListPayload = env.parse_payload().expect("parse desktop SessionList");
+    assert_eq!(list.page.scope, protocol::SessionListScope::AllSessions);
+    assert_eq!(list.page.total_count, 3);
+    assert_eq!(list.sessions.len(), 3);
+    assert!(
+        list.sessions
+            .iter()
+            .any(|session| session.parent_id.is_some()),
+        "desktop default ListSessions should keep returning all sessions"
     );
 }
 
@@ -425,14 +621,15 @@ async fn host_bootstrap_includes_backend_config_schema_catalog() {
             .iter()
             .map(|schema| schema.backend_kind)
             .collect::<Vec<_>>(),
-        vec![BackendKind::Tycode, BackendKind::Hermes]
+        vec![BackendKind::Hermes]
     );
+    let hermes_schema = bootstrap
+        .backend_config_schemas
+        .iter()
+        .find(|schema| schema.backend_kind == BackendKind::Hermes)
+        .expect("Hermes backend config schema");
     assert_eq!(
-        bootstrap.backend_config_schemas[0].persistence_mode,
-        BackendConfigPersistenceMode::BackendNative
-    );
-    assert_eq!(
-        bootstrap.backend_config_schemas[1].persistence_mode,
+        hermes_schema.persistence_mode,
         BackendConfigPersistenceMode::TydeSettingsStore
     );
     assert!(bootstrap.backend_config_snapshots.is_empty());

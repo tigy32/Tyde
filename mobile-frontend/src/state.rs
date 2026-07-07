@@ -5,19 +5,20 @@ pub use mobile_shell_types::{
     LocalHostId, MobilePairingPreview, MobileShellError, PairedHostConnectionStatus,
     PairedHostSummary,
 };
+pub use protocol::MobileServiceAuthState;
 use protocol::types::AgentCompactNotifyPayload;
 use protocol::{
     AgentId, AgentOrigin, BackendKind, BackendSetupInfo, ChatMessage, ChatMessageId, CustomAgent,
     CustomAgentId, DiffContextMode, HostAbsPath, HostBrowseEntriesPayload, HostBrowseErrorPayload,
     HostBrowseOpenedPayload, HostSettings, McpServerConfig, McpServerId, MessageMetadataUpdateData,
-    Project, ProjectDiffScope, ProjectFileContentsPayload, ProjectGitDiffFile, ProjectId,
-    ProjectPath, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath, QueuedMessageEntry,
-    Review, ReviewErrorPayload, ReviewId, ReviewSummary, SessionId, SessionListCursor,
-    SessionListPageInfo, SessionListPageStatus, SessionSchemaEntry, SessionSettingsValues,
-    SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath, TaskList, Team,
-    TeamCompactNotifyPayload, TeamDraft, TeamDraftId, TeamMember, TeamMemberBindingPayload,
-    TeamMemberId, TeamMemberShuffleSuggestion, TeamPresetCatalog, ToolExecutionCompletedData,
-    ToolRequest, TydeReleaseVersion,
+    MobileAccessErrorCode, Project, ProjectDiffScope, ProjectFileContentsPayload,
+    ProjectGitDiffFile, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing,
+    ProjectRootPath, QueuedMessageEntry, Review, ReviewErrorPayload, ReviewId, ReviewSummary,
+    SessionId, SessionListCursor, SessionListPageInfo, SessionListPageStatus, SessionSchemaEntry,
+    SessionSettingsValues, SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath,
+    TaskList, Team, TeamCompactNotifyPayload, TeamDraft, TeamDraftId, TeamMember,
+    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion, TeamPresetCatalog,
+    ToolExecutionCompletedData, ToolRequest, TydeReleaseVersion,
 };
 
 // ── Tool output viewing mode ───────────────────────────────────────────
@@ -55,6 +56,37 @@ pub enum ConnectionStatus {
         app_protocol: u32,
         release_version: Option<TydeReleaseVersion>,
     },
+    /// A managed pairing stopped with a terminal, user-actionable failure: it
+    /// needs the user to sign in with Tyggs again (`ServiceAuthRequired` /
+    /// `PassRequired`) or re-pair (`RepairRequired`). The connection actor has
+    /// stopped retrying, so the picker renders an explicit action (sign-in /
+    /// re-pair / forget) instead of a spinner or a dismissible generic error
+    /// (findings #3/#7). Carries the typed code so the UI picks the right action.
+    NeedsAction {
+        code: MobileAccessErrorCode,
+        message: String,
+    },
+}
+
+/// Whether `code` is a terminal, user-actionable managed-access failure that the
+/// UI should surface with a sign-in / re-pair affordance rather than a generic
+/// error or an endless spinner.
+pub fn is_actionable_managed_failure(code: MobileAccessErrorCode) -> bool {
+    matches!(
+        code,
+        MobileAccessErrorCode::ServiceAuthRequired
+            | MobileAccessErrorCode::PassRequired
+            | MobileAccessErrorCode::RepairRequired
+    )
+}
+
+/// Whether the actionable failure is specifically a "sign in with Tyggs again"
+/// case (vs. a "re-pair" case). Drives which button the UI shows.
+pub fn needs_tyggs_sign_in(code: MobileAccessErrorCode) -> bool {
+    matches!(
+        code,
+        MobileAccessErrorCode::ServiceAuthRequired | MobileAccessErrorCode::PassRequired
+    )
 }
 
 /// Actionable, user-facing message for an incompatible-protocol reject. Shared
@@ -82,8 +114,21 @@ impl From<PairedHostConnectionStatus> for ConnectionStatus {
             PairedHostConnectionStatus::Connecting => ConnectionStatus::Connecting,
             PairedHostConnectionStatus::Connected => ConnectionStatus::Bootstrapping,
             PairedHostConnectionStatus::Disconnected { .. } => ConnectionStatus::Disconnected,
-            PairedHostConnectionStatus::Failed { message, .. } => ConnectionStatus::Error(message),
+            PairedHostConnectionStatus::Failed { code, message } => {
+                connection_failed_status(code, message)
+            }
         }
+    }
+}
+
+/// Maps a terminal `Failed { code, message }` onto the connection status the UI
+/// renders: an actionable [`ConnectionStatus::NeedsAction`] for sign-in / re-pair
+/// cases, otherwise a plain error.
+pub fn connection_failed_status(code: MobileAccessErrorCode, message: String) -> ConnectionStatus {
+    if is_actionable_managed_failure(code) {
+        ConnectionStatus::NeedsAction { code, message }
+    } else {
+        ConnectionStatus::Error(message)
     }
 }
 
@@ -93,17 +138,56 @@ impl From<PairedHostConnectionStatus> for ConnectionStatus {
 pub enum PairingScreen {
     Scanner,
     ManualPaste,
+    /// Direct-pairing confirmation (legacy v1 native-shell path). The QR already
+    /// carries the room + PSK, so tapping Pair stores the credential and starts
+    /// the encrypted MQTT connection immediately (no `tycode.dev` round-trip).
     Confirm {
         qr_uri: String,
         preview: MobilePairingPreview,
     },
+    /// Runs the direct-pairing MQTT connect for [`PairingScreen::Confirm`].
     InProgress {
         qr_uri: String,
         preview: MobilePairingPreview,
     },
+    /// A managed (`tyde-pair://v2`) offer: authenticate with `tycode.dev`
+    /// (Tyggs OAuth → pass proof → mobile session) and, once authenticated,
+    /// redeem the offer and connect to the managed broker. `auth` is the typed
+    /// server-owned auth state driving which card renders (spinner / paywall /
+    /// retry / redeeming).
+    ServiceAuth {
+        qr_uri: String,
+        host_label: String,
+        auth: MobileServiceAuthState,
+    },
+    /// A legacy public-broker QR or stored record that fails closed: the user
+    /// must re-pair from the host's current QR. Never a spinner, never a silent
+    /// public-broker connect.
+    RepairRequired {
+        message: String,
+    },
     Failed {
         message: String,
     },
+}
+
+/// Classification of a scanned/pasted pairing URI, produced by
+/// [`crate::bridge::classify_pairing_offer`] via
+/// `mqtt_transport::parse_mobile_pairing_qr_offer`. The pairing flow renders a
+/// different screen per variant, so the UI branches on typed offer data rather
+/// than on which bridge backend is active.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PairingOffer {
+    /// A `tycode.dev` managed-service offer (`tyde-pair://v2`). Requires the
+    /// pre-transport Tyggs auth + redeem sequence before connecting.
+    ManagedService { host_label: String },
+    /// A legacy public-broker QR (`tyde-pair://v1`). Cannot connect; the user
+    /// must re-pair from the host's updated QR.
+    RepairRequired { message: String },
+    /// Native-shell direct pairing: the existing preview → confirm →
+    /// `start_pairing` path. The native shell owns its own managed handshake, so
+    /// the web bundle never produces this variant.
+    DirectPairing { preview: MobilePairingPreview },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -407,18 +491,26 @@ pub struct SessionListLoadState {
 }
 
 impl SessionListLoadState {
+    /// Build a load state from a freshly-applied server page. `loading_more`
+    /// tracks an **explicit** in-flight "load more" request, so it starts
+    /// `false` — the mobile client no longer auto-drains remaining pages, it
+    /// waits for the user to ask (see [`crate::dispatch::load_next_session_page`]).
     pub fn from_page(page: SessionListPageInfo, loaded_count: usize) -> Self {
         let loaded_count = u32::try_from(loaded_count).unwrap_or(u32::MAX);
-        let loading_more = matches!(page.status, SessionListPageStatus::More { .. });
         Self {
             page,
             loaded_count,
-            loading_more,
+            loading_more: false,
         }
     }
 
     pub fn next_cursor(&self) -> Option<SessionListCursor> {
         self.page.next_cursor()
+    }
+
+    /// Whether the server reports additional pages beyond what's loaded.
+    pub fn has_more(&self) -> bool {
+        matches!(self.page.status, SessionListPageStatus::More { .. })
     }
 }
 

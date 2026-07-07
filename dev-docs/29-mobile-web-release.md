@@ -4,6 +4,12 @@ The mobile web/PWA bundle is release-owned infrastructure. A desktop/server
 release must not publish without a matching `/tyde/v<release>/` mobile web
 bundle built from the same source protocol.
 
+Managed Tyggs Pass + AWS MQTT access is specified in
+`30-mobile-managed-broker.md`. Release automation still owns bundle/protocol
+coherence; the managed broker plan adds the requirement that a production
+mobile bundle authenticate with Tyggs through `tycode.dev` before redeeming a
+pairing offer.
+
 ## Source of truth
 
 - Wire protocol version: `protocol/src/types.rs::PROTOCOL_VERSION`.
