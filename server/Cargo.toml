@@ -27,7 +27,7 @@ indexmap = "2"
 regex = "1"
 notify = "8"
 portable-pty = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 rmcp = { version = "0.15.0", default-features = false, features = ["macros", "schemars", "server", "transport-streamable-http-server"] }
 serde.workspace = true
 serde_json.workspace = true
