@@ -25,6 +25,10 @@ fn main() {
     // Record this binary's real release version so the mobile Welcome/Reject/QR
     // payloads advertise the correct web/PWA bundle key.
     server::set_host_release_version(env!("CARGO_PKG_VERSION"));
+    // The server's reqwest client uses no-provider rustls and panics ("No
+    // provider set") at build time unless a default crypto provider is already
+    // installed. Do this before any dispatch so every mode is covered.
+    server::install_default_crypto_provider();
     raise_fd_limit();
     match parse_cli_mode(std::env::args().skip(1)) {
         CliMode::HostStdio => exit_on_error(run_host_stdio()),

@@ -59,8 +59,54 @@ jobs:
             gh release create "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$GITHUB_SHA" "${create_prerelease_flag[@]}"
           fi
 
-  build:
+  test:
     needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The workspace compiles the Tauri GUI crates (tauri-shell,
+      # tyde-mobile-shell), so the native test build needs the same system libs
+      # the release build installs.
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential \
+            curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf musl-tools
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      # Run the native (logic) test suite BEFORE any expensive matrix build or
+      # code signing. beta 20 shipped a startup panic that these very tests
+      # (server::mobile_access) catch immediately — the release had no test gate
+      # at all. Retry up to 3x so a genuinely flaky test does not block a release,
+      # while a real failure (which fails all 3 attempts) still does.
+      - name: Run workspace tests (retry flaky)
+        shell: bash
+        run: |
+          attempts=3
+          for i in $(seq 1 "$attempts"); do
+            echo "::group::cargo test --workspace (attempt $i of $attempts)"
+            if cargo test --workspace; then
+              echo "::endgroup::"
+              echo "workspace tests passed on attempt $i"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::cargo test attempt $i of $attempts failed; retrying"
+          done
+          echo "::error::cargo test --workspace failed after $attempts attempts"
+          exit 1
+
+  build:
+    needs: [create-release, test]
     env:
       RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
       TYDE_RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
@@ -268,6 +314,61 @@ jobs:
 
       - name: Build headless Tyde Server binary
         run: cargo build --release --target ${{ matrix.server-target }} -p tyde-server --bin tyde-server
+
+      # Smoke-test the freshly built binary before signing/packaging. beta 20
+      # built cleanly but panicked on startup ("No provider set"), so a build
+      # that never runs the binary shipped a 100%-broken release. This runs it.
+      - name: Smoke test headless binary (Unix)
+        if: matrix.platform != 'windows-latest'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.server-target }}/release/tyde-server"
+          EXPECTED="${RELEASE_TAG#v}"
+
+          # 1. The binary must load and report the version compiled into it.
+          VERSION="$("$BIN" --version)"
+          echo "tyde-server --version -> $VERSION"
+          if [[ "$VERSION" != "$EXPECTED" ]]; then
+            echo "::error::version mismatch: binary=$VERSION expected=$EXPECTED"
+            exit 1
+          fi
+
+          # 2. The host must actually start and open its UDS socket. This is the
+          #    exact path that panicked in beta 20: startup builds the mobile
+          #    reqwest client, which needs a rustls crypto provider installed.
+          SOCK="/tmp/tyde-smoke-$$.sock"
+          rm -f "$SOCK"
+          TYDE_SOCKET_PATH="$SOCK" "$BIN" host --uds &
+          SRV_PID=$!
+          ready=0
+          for _ in $(seq 1 100); do
+            if [[ -S "$SOCK" ]]; then ready=1; break; fi
+            if ! kill -0 "$SRV_PID" 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          kill "$SRV_PID" 2>/dev/null || true
+          wait "$SRV_PID" 2>/dev/null || true
+          rm -f "$SOCK"
+          if [[ "$ready" != "1" ]]; then
+            echo "::error::tyde-server host --uds never opened its socket — startup crash?"
+            exit 1
+          fi
+          echo "headless host opened its socket — startup smoke passed"
+
+      - name: Smoke test headless binary (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          # Windows has no UDS host mode, so verify the binary loads and reports
+          # the right version (catches a link/startup panic in the CLI path).
+          $bin = "target/${{ matrix.server-target }}/release/tyde-server.exe"
+          $version = (& $bin --version).Trim()
+          Write-Host "tyde-server --version -> $version"
+          $expected = "${{ env.RELEASE_TAG }}".TrimStart('v')
+          if ($version -ne $expected) {
+            Write-Error "version mismatch: binary=$version expected=$expected"
+            exit 1
+          }
 
       - name: Build macOS app with Tauri
         if: startsWith(matrix.platform, 'macos')

@@ -451,6 +451,11 @@ struct ManagedServiceBaseUrl {
 
 impl ManagedMobileServiceClient {
     fn new(configured_base_url: Option<String>) -> Result<Self, String> {
+        // `reqwest` uses no-provider rustls; ensure a default crypto provider is
+        // installed before building the client or `Client::new` panics with
+        // "No provider set". Idempotent, so binaries that already installed one
+        // at startup are unaffected.
+        crate::install_default_crypto_provider();
         Ok(Self {
             base: ManagedServiceBaseUrl::new(configured_base_url)?,
             http: reqwest::Client::new(),

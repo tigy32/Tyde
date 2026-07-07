@@ -84,6 +84,28 @@ pub fn host_release_version() -> Option<protocol::TydeReleaseVersion> {
     HOST_RELEASE_VERSION.get().cloned()
 }
 
+/// Install the process-wide default rustls [`CryptoProvider`] (aws-lc-rs).
+///
+/// The server's `reqwest` client is built with the
+/// `rustls-tls-webpki-roots-no-provider` feature, which deliberately does *not*
+/// bundle a crypto provider: reqwest calls `CryptoProvider::get_default()` when
+/// it constructs the client and panics with "No provider set" if none has been
+/// installed. rustls itself only pulls in aws-lc-rs here (ring appears only for
+/// webpki cert math, not as a provider), so install aws-lc-rs as the process
+/// default *before* any TLS client — the mobile `reqwest` client or the MQTT
+/// stack — is constructed.
+///
+/// Idempotent and safe to call from every entry point (binaries and tests): if
+/// a provider is already installed, the redundant install is ignored.
+pub fn install_default_crypto_provider() {
+    use rustls::crypto::{CryptoProvider, aws_lc_rs};
+    if CryptoProvider::get_default().is_none() {
+        // `install_default` returns `Err` if another thread installed one first;
+        // either way a provider is set afterward, so the result is ignored.
+        let _ = aws_lc_rs::default_provider().install_default();
+    }
+}
+
 pub struct Connection {
     pub reader: Box<dyn AsyncBufRead + Unpin + Send>,
     pub writer: Box<dyn AsyncWrite + Unpin + Send>,

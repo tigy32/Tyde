@@ -14,6 +14,11 @@ fn main() {
     // Record this binary's real release version so the mobile Welcome/Reject/QR
     // payloads advertise the correct web/PWA bundle key.
     server::set_host_release_version(env!("CARGO_PKG_VERSION"));
+    // The server's reqwest client uses no-provider rustls and panics ("No
+    // provider set") at build time unless a default crypto provider is already
+    // installed. Do this before any dispatch so every mode (GUI + host) is
+    // covered.
+    server::install_default_crypto_provider();
     match parse_cli_mode(std::env::args().skip(1)) {
         CliMode::Gui => tauri_shell::run(),
         CliMode::HostStdio => {

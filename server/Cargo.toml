@@ -29,6 +29,7 @@ notify = "8"
 portable-pty = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 rmcp = { version = "0.15.0", default-features = false, features = ["macros", "schemars", "server", "transport-streamable-http-server"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml = "0.9"
