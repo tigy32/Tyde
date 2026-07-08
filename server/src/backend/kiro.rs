@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+use protocol::TokenUsageUnavailableReason;
+
 use crate::acp::{
     AcpBridge, AcpInbound, AcpSpawnSpec, acp_mcp_servers_json, extract_message_id,
     extract_text_from_update, extract_tool_call_id, map_plan_status, normalize_update_type,
@@ -1707,6 +1709,9 @@ impl KiroInner {
                 .unwrap_or_else(|| "kiro".to_string())
         };
         let normalized_usage = normalize_token_usage(token_usage.as_ref());
+        let token_usage_unavailable_reason = normalized_usage
+            .is_none()
+            .then_some(TokenUsageUnavailableReason::BackendDidNotReport);
         let context_breakdown = normalized_usage
             .as_ref()
             .map(estimate_context_breakdown_from_usage)
@@ -1720,6 +1725,7 @@ impl KiroInner {
             request_usage: normalized_usage.clone(),
             turn_usage: normalized_usage,
             cumulative_usage: None,
+            token_usage_unavailable_reason,
             reasoning: None,
             tool_calls: tool_calls.clone(),
             context_breakdown: if context_breakdown.is_null() {
@@ -3755,6 +3761,30 @@ mod tests {
     }
 
     #[test]
+    fn kiro_normalize_token_usage_maps_reported_counts() {
+        let usage = normalize_token_usage(Some(&json!({
+            "tokenUsage": {
+                "inputTokens": 15,
+                "cachedInputTokens": 4,
+                "cacheCreationInputTokens": 3,
+                "outputTokens": 7,
+                "totalTokens": 22,
+                "reasoningTokens": 2
+            },
+            "contextWindow": 200000
+        })))
+        .expect("reported usage should normalize");
+
+        assert_eq!(usage["input_tokens"], json!(8));
+        assert_eq!(usage["output_tokens"], json!(7));
+        assert_eq!(usage["total_tokens"], json!(22));
+        assert_eq!(usage["cached_prompt_tokens"], json!(4));
+        assert_eq!(usage["cache_creation_input_tokens"], json!(3));
+        assert_eq!(usage["reasoning_tokens"], json!(2));
+        assert_eq!(usage["context_window"], json!(200000));
+    }
+
+    #[test]
     fn test_execute_completion_maps_to_run_command() {
         let completion = crate::acp::AcpToolCallCompletion {
             tool_call_id: "tooluse_JlKHotZOrwGPRT9StkV4hw".to_string(),
@@ -4194,6 +4224,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
         let stream_delta = stream_delta.expect("stream delta checked above");
         let stream_end = stream_end.expect("stream end checked above");
         let typing_false = typing_false.expect("typing false checked above");
+        assert_eq!(
+            events[stream_end]
+                .pointer("/data/message/token_usage/turn/reason")
+                .and_then(Value::as_str),
+            Some("backend_did_not_report"),
+            "Kiro StreamEnd without reported counts must be explicitly unavailable: {events:?}"
+        );
         assert!(
             first_typing_true < stream_start
                 && stream_start < stream_delta

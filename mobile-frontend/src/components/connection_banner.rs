@@ -1,5 +1,6 @@
 use leptos::prelude::*;
 
+use crate::bridge::AuthProvider;
 use crate::components::ui::{Spinner, StatusDot, StatusTone};
 use crate::state::{AppMode, AppState, ConnectionStatus, PairingScreen};
 
@@ -134,20 +135,7 @@ pub fn ConnectionBanner() -> impl IntoView {
                                 {if show_sign_in {
                                     // ServiceAuthRequired / PassRequired → navigate to
                                     // the tycode.dev-hosted Tyggs OAuth redirect.
-                                    view! {
-                                        <button
-                                            type="button"
-                                            class="connection-banner-action"
-                                            data-mobile-test="connection-banner-sign-in"
-                                            on:click=move |_| {
-                                                if let Err(error) = crate::bridge::begin_tyggs_sign_in(None) {
-                                                    log::error!("failed to start Tyggs sign-in: {error}");
-                                                }
-                                            }
-                                        >
-                                            "Sign in with Tyggs"
-                                        </button>
-                                    }.into_any()
+                                    connection_banner_auth_provider_buttons()
                                 } else {
                                     // RepairRequired → send the user to the scanner to
                                     // re-pair this host through tycode.dev.
@@ -192,6 +180,60 @@ pub fn ConnectionBanner() -> impl IntoView {
                 })
             }}
         </div>
+    }
+}
+
+fn connection_banner_auth_provider_buttons() -> AnyView {
+    match crate::bridge::tyggs_auth_providers() {
+        Ok(providers) => view! {
+            <span class="connection-banner-provider-actions">
+                {providers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, provider)| {
+                        let test_id = if index == 0 {
+                            "connection-banner-sign-in"
+                        } else {
+                            connection_banner_auth_provider_test_id(provider)
+                        };
+                        view! {
+                            <button
+                                type="button"
+                                class="connection-banner-action"
+                                data-mobile-test=test_id
+                                data-mobile-auth-provider=provider.as_str()
+                                aria-label=provider.sign_in_label()
+                                on:click=move |_| {
+                                    if let Err(error) = crate::bridge::begin_tyggs_sign_in(provider, None) {
+                                        log::error!("failed to start Tyggs sign-in: {error}");
+                                    }
+                                }
+                            >
+                                {provider.sign_in_label()}
+                            </button>
+                        }
+                    })
+                    .collect::<Vec<_>>()}
+            </span>
+        }
+        .into_any(),
+        Err(message) => view! {
+            <span
+                class="connection-banner-action-error"
+                role="alert"
+                data-mobile-test="connection-banner-provider-error"
+            >
+                {message}
+            </span>
+        }
+        .into_any(),
+    }
+}
+
+fn connection_banner_auth_provider_test_id(provider: AuthProvider) -> &'static str {
+    match provider {
+        AuthProvider::Apple => "connection-banner-sign-in-apple",
+        AuthProvider::Google => "connection-banner-sign-in-google",
     }
 }
 
@@ -242,6 +284,26 @@ mod wasm_tests {
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn force_web_backend() {
+        let window = web_sys::window().expect("window");
+        let _ = js_sys::Reflect::delete_property(
+            &window,
+            &wasm_bindgen::JsValue::from_str("__TAURI__"),
+        );
+    }
+
+    fn set_service_config(json: &str) {
+        force_web_backend();
+        let window = web_sys::window().expect("window");
+        let key = wasm_bindgen::JsValue::from_str("__TYDE_MOBILE_SERVICE__");
+        if json.is_empty() {
+            let _ = js_sys::Reflect::delete_property(&window, &key);
+            return;
+        }
+        let value = js_sys::JSON::parse(json).expect("parse service config");
+        js_sys::Reflect::set(&window, &key, &value).expect("install service config");
     }
 
     #[wasm_bindgen_test]
@@ -470,6 +532,7 @@ mod wasm_tests {
     /// A sign-in-required managed failure offers Sign in (not Re-pair).
     #[wasm_bindgen_test]
     async fn needs_action_auth_offers_sign_in_action() {
+        force_web_backend();
         let host = LocalHostId("host-auth".to_owned());
         let host_for_mount = host.clone();
         let container = make_container();
@@ -504,6 +567,69 @@ mod wasm_tests {
                 .is_none(),
             "an auth-required failure must not offer a Re-pair action"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn needs_action_auth_renders_provider_buttons_in_order() {
+        set_service_config(r#"{"providers":["apple","google"]}"#);
+        let host = LocalHostId("host-auth-providers".to_owned());
+        let host_for_mount = host.clone();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(host_for_mount.clone()));
+            state.connection_statuses.update(|statuses| {
+                statuses.insert(
+                    host_for_mount.clone(),
+                    ConnectionStatus::NeedsAction {
+                        code: protocol::MobileAccessErrorCode::ServiceAuthRequired,
+                        message: "Sign in with Tyggs again.".to_owned(),
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <ConnectionBanner /> }
+        });
+        next_tick().await;
+
+        let legacy: HtmlElement = container
+            .query_selector("[data-mobile-test='connection-banner-sign-in']")
+            .unwrap()
+            .expect("legacy selector must point at the first provider button")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(legacy.tag_name(), "BUTTON");
+        assert_eq!(
+            legacy.get_attribute("data-mobile-auth-provider").as_deref(),
+            Some("apple")
+        );
+        let apple: HtmlElement = container
+            .query_selector("[data-mobile-auth-provider='apple']")
+            .unwrap()
+            .expect("Apple sign-in button")
+            .dyn_into()
+            .unwrap();
+        let google: HtmlElement = container
+            .query_selector("[data-mobile-auth-provider='google']")
+            .unwrap()
+            .expect("Google sign-in button")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(apple.tag_name(), "BUTTON");
+        assert_eq!(google.tag_name(), "BUTTON");
+        assert_eq!(
+            google.get_attribute("data-mobile-test").as_deref(),
+            Some("connection-banner-sign-in-google")
+        );
+        let text = container.text_content().unwrap_or_default();
+        let apple_index = text.find("Continue with Apple").expect("Apple label");
+        let google_index = text.find("Continue with Google").expect("Google label");
+        assert!(
+            apple_index < google_index,
+            "provider buttons must follow config order: {text}"
+        );
+
+        set_service_config("");
     }
 
     #[wasm_bindgen_test]

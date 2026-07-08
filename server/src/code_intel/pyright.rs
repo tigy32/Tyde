@@ -109,9 +109,9 @@ mod tests {
     use std::time::Duration;
 
     use protocol::{
-        CodeIntelProviderId, CodeIntelResourceMode, CodeIntelSettings, CodeIntelState,
-        CodeIntelStatusPayload, FrameKind, HostExecutablePath, ProjectFileVersion, ProjectPath,
-        ProjectRootPath, StreamPath,
+        CodeIntelErrorPayload, CodeIntelProviderId, CodeIntelResourceMode, CodeIntelSettings,
+        CodeIntelState, CodeIntelStatusPayload, FrameKind, HostExecutablePath, ProjectFileVersion,
+        ProjectPath, ProjectRootPath, StreamPath,
     };
     use tokio::sync::mpsc;
 
@@ -226,10 +226,19 @@ mod tests {
 
     /// pyright-gated end-to-end test: drive the **same generic engine** with the
     /// python config over a tiny project with a type error and assert an error
-    /// diagnostic eventually arrives. Skips-with-log when pyright is not
-    /// installed — never a silent pass, never a hard failure without pyright.
+    /// diagnostic eventually arrives. Opt-in with `TYDE_RUN_REAL_LSP_TESTS=1`;
+    /// skips-with-log when pyright is not installed — never a hard failure
+    /// without pyright.
     #[tokio::test]
+    #[ignore = "real external LSP test; use --ignored and TYDE_RUN_REAL_LSP_TESTS=1"]
     async fn pyright_emits_diagnostics_for_broken_file() {
+        if std::env::var("TYDE_RUN_REAL_LSP_TESTS").ok().as_deref() != Some("1") {
+            eprintln!(
+                "SKIP pyright_emits_diagnostics_for_broken_file: set TYDE_RUN_REAL_LSP_TESTS=1 to run"
+            );
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path();
         if matches!(discover_pyright(root), ServerDiscovery::Absent { .. }) {
@@ -274,8 +283,14 @@ mod tests {
                 FrameKind::CodeIntelStatus => {
                     let status: CodeIntelStatusPayload =
                         serde_json::from_value(envelope.payload).expect("status payload");
-                    // Never silently Unavailable when pyright was discovered.
-                    assert_ne!(status.state, CodeIntelState::Unsupported);
+                    if matches!(
+                        status.state,
+                        CodeIntelState::Unsupported
+                            | CodeIntelState::Unavailable
+                            | CodeIntelState::Failed
+                    ) {
+                        panic!("pyright reached terminal status before diagnostics: {status:?}");
+                    }
                     if status.state == CodeIntelState::Ready {
                         saw_ready_or_diag = true;
                     }
@@ -291,6 +306,11 @@ mod tests {
                         return; // success: an error diagnostic flowed through the generic path
                     }
                     saw_ready_or_diag = true;
+                }
+                FrameKind::CodeIntelError => {
+                    let error: CodeIntelErrorPayload =
+                        serde_json::from_value(envelope.payload).expect("error payload");
+                    panic!("pyright emitted CodeIntelError before diagnostics: {error:?}");
                 }
                 _ => {}
             }

@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 36;
+pub const PROTOCOL_VERSION: u32 = 37;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -3284,6 +3284,11 @@ pub enum TaskTokenUsageScope {
     Known {
         usage: Box<TaskTokenUsageAmount>,
     },
+    Partial {
+        usage: Box<TaskTokenUsageAmount>,
+        unavailable_count: u32,
+        reasons: Vec<TaskTokenUsageUnavailableReason>,
+    },
     Unavailable {
         reason: TaskTokenUsageUnavailableReason,
     },
@@ -3293,6 +3298,13 @@ impl TaskTokenUsageScope {
     pub fn known_usage(&self) -> Option<&TaskTokenUsageAmount> {
         match self {
             Self::Known { usage } => Some(usage),
+            Self::Partial { .. } | Self::Unavailable { .. } => None,
+        }
+    }
+
+    pub fn reported_usage(&self) -> Option<&TaskTokenUsageAmount> {
+        match self {
+            Self::Known { usage } | Self::Partial { usage, .. } => Some(usage),
             Self::Unavailable { .. } => None,
         }
     }
@@ -6368,8 +6380,8 @@ mod search_serde_tests {
     }
 
     #[test]
-    fn protocol_version_is_thirty_six() {
-        assert_eq!(PROTOCOL_VERSION, 36);
+    fn protocol_version_is_thirty_seven() {
+        assert_eq!(PROTOCOL_VERSION, 37);
     }
 
     #[test]
@@ -6675,6 +6687,17 @@ mod search_serde_tests {
         };
 
         assert_eq!(round_trip(&payload), payload);
+        let partial_scope = TaskTokenUsageScope::Partial {
+            usage: Box::new(usage.clone()),
+            unavailable_count: 2,
+            reasons: vec![
+                TaskTokenUsageUnavailableReason::BackendDidNotReport,
+                TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous,
+            ],
+        };
+        assert_eq!(round_trip(&partial_scope), partial_scope);
+        assert_eq!(partial_scope.known_usage(), None);
+        assert_eq!(partial_scope.reported_usage(), Some(&usage));
         let mut entry_without_agent_id =
             serde_json::to_value(&payload.breakdown[0]).expect("serialize entry");
         entry_without_agent_id

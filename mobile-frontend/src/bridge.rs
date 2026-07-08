@@ -27,7 +27,7 @@ pub use mobile_shell_types::{
     KnownConnectionInstance, PairedHostConnectionStatusEvent, PairedHostsChangedEvent,
 };
 
-pub use web::RedeemOutcome;
+pub use web::{AuthProvider, RedeemOutcome};
 
 use crate::state::{
     LocalHostId, MobileServiceAuthState, MobileShellError, PairedHostSummary, PairingOffer,
@@ -190,12 +190,24 @@ pub async fn redeem_managed_and_connect(qr_uri: &str) -> Result<(), RedeemOutcom
 }
 
 /// Web-only: start the Tyggs sign-in through `tycode.dev` (see
-/// [`web::begin_tyggs_sign_in`]). Pass the scanned pairing URI to resume pairing
-/// after the redirect, or `None` to just re-authenticate an existing host.
-/// Native shells own their own sign-in, so this errors there.
-pub fn begin_tyggs_sign_in(resume_qr_uri: Option<&str>) -> Result<(), String> {
+/// [`web::begin_tyggs_sign_in`]) for an explicitly selected configured
+/// provider. Pass the scanned pairing URI to resume pairing after the redirect,
+/// or `None` to just re-authenticate an existing host. Native shells own their
+/// own sign-in, so this errors there.
+pub fn tyggs_auth_providers() -> Result<Vec<AuthProvider>, String> {
     if use_web_backend() {
-        web::begin_tyggs_sign_in(resume_qr_uri)
+        web::tyggs_auth_providers()
+    } else {
+        Err("Tyggs sign-in is handled by the native app shell.".to_owned())
+    }
+}
+
+pub fn begin_tyggs_sign_in(
+    provider: AuthProvider,
+    resume_qr_uri: Option<&str>,
+) -> Result<(), String> {
+    if use_web_backend() {
+        web::begin_tyggs_sign_in(provider, resume_qr_uri)
     } else {
         Err("Tyggs sign-in is handled by the native app shell.".to_owned())
     }

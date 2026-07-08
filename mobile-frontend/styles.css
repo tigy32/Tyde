@@ -227,6 +227,8 @@ input, textarea, select {
 }
 
 .connection-banner-inner.error {
+    flex-wrap: wrap;
+    align-items: flex-start;
     padding: 5px 9px;
     background: var(--accent-error-bg);
     border: 1px solid var(--accent-error);
@@ -244,6 +246,8 @@ input, textarea, select {
 /* Error messages carry diagnostics (e.g. which protocol version the client
    sent) — wrap instead of ellipsizing so the tail is readable on a phone. */
 .connection-banner-inner.error .status-text {
+    flex: 1 1 140px;
+    min-width: 0;
     white-space: normal;
     overflow-wrap: anywhere;
 }
@@ -307,6 +311,34 @@ input, textarea, select {
     background: var(--accent-primary);
     color: #fff;
     white-space: nowrap;
+    pointer-events: auto;
+}
+
+.connection-banner-provider-actions {
+    flex: 1 0 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-1);
+    min-width: 0;
+    max-width: 100%;
+    margin-left: 0;
+    pointer-events: auto;
+}
+
+.connection-banner-provider-actions .connection-banner-action {
+    width: 100%;
+    margin-left: 0;
+    text-align: center;
+}
+
+.connection-banner-action-error {
+    flex: 1 0 100%;
+    min-width: 0;
+    font-size: 12px;
+    line-height: 1.35;
+    color: var(--accent-error);
+    overflow-wrap: anywhere;
 }
 
 /* ── Bottom Navigation ──────────────────────────────────────────────── */
@@ -547,6 +579,15 @@ input, textarea, select {
     grid-template-columns: 1fr 1fr;
 }
 
+.paired-host-provider-sign-in {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+    width: 100%;
+}
+
 .picker-pair-another {
     margin-top: var(--space-4);
 }
@@ -754,6 +795,14 @@ input, textarea, select {
     line-height: 1.5;
     color: var(--text-secondary);
     margin: 0;
+}
+
+.auth-provider-actions {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+    width: 100%;
 }
 
 .home-section {

@@ -13,7 +13,7 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use protocol::BackendAccessMode;
+use protocol::{BackendAccessMode, TokenUsageUnavailableReason};
 
 use crate::backend::agent_control_progress::{
     await_progress_data_for_tool, is_tyde_agent_control_spawn_tool_name,
@@ -387,6 +387,7 @@ impl CodexSession {
                 pending_tool_call_ids: HashSet::new(),
                 close_active_stream_when_tools_idle: false,
                 pending_message_metadata: None,
+                completed_message_metadata_by_turn: HashMap::new(),
                 token_usage_by_turn: HashMap::new(),
                 turn_context_by_turn: HashMap::new(),
                 file_change_call_ids: HashMap::new(),
@@ -395,6 +396,7 @@ impl CodexSession {
                 conversation_bytes_total: 0,
                 subagent_emitter: None,
                 subagent_streams: HashMap::new(),
+                completed_subagent_streams: HashMap::new(),
             }),
             steering_tempfile,
         });
@@ -715,6 +717,26 @@ struct CodexSubAgentStream {
     emitter: Arc<TurnEmitter>,
     receiver_thread_id: Option<String>,
     external_agent_id: Option<String>,
+    active_turn_id: Option<String>,
+    current_message_id: Option<String>,
+    pending_message_metadata: Option<PendingCodexMessageMetadata>,
+    token_usage_by_turn: HashMap<String, Value>,
+}
+
+struct CompletedCodexSubAgentStream {
+    emitter: Arc<TurnEmitter>,
+    receiver_thread_id: Option<String>,
+    external_agent_id: Option<String>,
+    pending_message_metadata: Option<PendingCodexMessageMetadata>,
+}
+
+fn completed_codex_subagent_stream(stream: CodexSubAgentStream) -> CompletedCodexSubAgentStream {
+    CompletedCodexSubAgentStream {
+        emitter: stream.emitter,
+        receiver_thread_id: stream.receiver_thread_id,
+        external_agent_id: stream.external_agent_id,
+        pending_message_metadata: stream.pending_message_metadata,
+    }
 }
 
 struct CodexSubAgentSpawnInfo {
@@ -743,6 +765,7 @@ struct CodexState {
     pending_tool_call_ids: HashSet<String>,
     close_active_stream_when_tools_idle: bool,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
+    completed_message_metadata_by_turn: HashMap<String, PendingCodexMessageMetadata>,
     token_usage_by_turn: HashMap<String, Value>,
     turn_context_by_turn: HashMap<String, TurnContextEstimate>,
     file_change_call_ids: HashMap<String, Vec<String>>,
@@ -751,6 +774,7 @@ struct CodexState {
     conversation_bytes_total: u64,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     subagent_streams: HashMap<String, CodexSubAgentStream>,
+    completed_subagent_streams: HashMap<String, CompletedCodexSubAgentStream>,
 }
 
 struct CodexInner {
@@ -817,6 +841,7 @@ impl CodexInner {
             request_usage: None,
             turn_usage: None,
             cumulative_usage: None,
+            token_usage_unavailable_reason: None,
             reasoning: segment.reasoning,
             tool_calls: Vec::new(),
             context_breakdown: None,
@@ -1429,12 +1454,7 @@ impl CodexInner {
                 self.handle_plan_update(params);
             }
             "thread/tokenUsage/updated" => {
-                let mut state = self.state.lock().await;
-                if let Some((turn_id, token_usage)) =
-                    extract_turn_token_usage(params, state.model.as_deref())
-                {
-                    state.token_usage_by_turn.insert(turn_id, token_usage);
-                }
+                self.handle_root_token_usage_updated(params).await;
             }
             "model/rerouted" => {
                 if let Some(model) = params.get("toModel").and_then(Value::as_str) {
@@ -1452,25 +1472,78 @@ impl CodexInner {
         }
     }
 
+    async fn handle_root_token_usage_updated(&self, params: &Value) {
+        let metadata_update = {
+            let mut state = self.state.lock().await;
+            let Some((turn_id, token_usage)) =
+                extract_turn_token_usage(params, state.model.as_deref())
+            else {
+                return;
+            };
+
+            if let Some(pending) = state.completed_message_metadata_by_turn.remove(&turn_id) {
+                let context_breakdown = estimate_context_breakdown(
+                    Some(&token_usage),
+                    &pending.turn_context,
+                    Some(&pending.model),
+                );
+                Some((pending, token_usage, context_breakdown))
+            } else if state.active_turn_id.as_deref() == Some(turn_id.as_str())
+                || state
+                    .active_stream
+                    .as_ref()
+                    .is_some_and(|stream| stream.turn_id == turn_id)
+                || state
+                    .pending_message_metadata
+                    .as_ref()
+                    .is_some_and(|pending| pending.turn_id == turn_id)
+            {
+                state.token_usage_by_turn.insert(turn_id, token_usage);
+                None
+            } else {
+                None
+            }
+        };
+
+        if let Some((pending, token_usage, context_breakdown)) = metadata_update {
+            emit_codex_message_metadata_update(
+                &self.emitter,
+                pending,
+                Some(token_usage),
+                context_breakdown,
+            );
+        }
+    }
+
     async fn handle_subagent_notification_if_needed(&self, method: &str, params: &Value) -> bool {
         let Some(thread_id) = extract_notification_thread_id(params) else {
             return false;
         };
 
-        let (emitter, model) = {
+        let (stream_key, model, is_active_stream) = {
             let state = self.state.lock().await;
             if thread_id == state.thread_id {
                 return false;
             }
-            let Some(emitter) = find_subagent_emitter_for_thread(&state, &thread_id) else {
-                return false;
-            };
             let model = state.model.clone().unwrap_or_else(|| "codex".to_string());
-            (emitter, model)
+            if let Some(stream_key) = find_subagent_stream_key_for_thread(&state, &thread_id) {
+                (stream_key, model, true)
+            } else if let Some(stream_key) =
+                find_completed_subagent_stream_key_for_thread(&state, &thread_id)
+            {
+                (stream_key, model, false)
+            } else {
+                return false;
+            }
         };
 
-        self.handle_subagent_notification(method, params, emitter.as_ref(), &model)
-            .await;
+        if is_active_stream {
+            self.handle_subagent_notification(method, params, &stream_key, &model)
+                .await;
+        } else {
+            self.handle_completed_subagent_notification(method, params, &stream_key, &model)
+                .await;
+        }
         true
     }
 
@@ -1478,17 +1551,22 @@ impl CodexInner {
         &self,
         method: &str,
         params: &Value,
-        emitter: &TurnEmitter,
+        stream_key: &str,
         model: &str,
     ) {
         match method {
             "turn/started" => {
-                let turn_id = params
-                    .get("turn")
-                    .and_then(|v| v.get("id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("turn")
-                    .to_string();
+                let turn_id = extract_turn_id(params).unwrap_or_else(|| "turn".to_string());
+                let Some(emitter) = self
+                    .update_codex_subagent_stream(stream_key, |stream| {
+                        stream.active_turn_id = Some(turn_id.clone());
+                        stream.current_message_id = None;
+                        stream.pending_message_metadata = None;
+                    })
+                    .await
+                else {
+                    return;
+                };
                 emitter.typing_status_changed(true);
                 emitter.stream_start(&turn_id, AgentName(CODEX_AGENT_NAME), Some(model));
             }
@@ -1504,8 +1582,17 @@ impl CodexInner {
                 let message_id = params
                     .get("itemId")
                     .and_then(Value::as_str)
-                    .unwrap_or("assistant");
-                emitter.stream_delta(message_id, &delta);
+                    .unwrap_or("assistant")
+                    .to_string();
+                let Some(emitter) = self
+                    .update_codex_subagent_stream(stream_key, |stream| {
+                        stream.current_message_id = Some(message_id.clone());
+                    })
+                    .await
+                else {
+                    return;
+                };
+                emitter.stream_delta(&message_id, &delta);
             }
             reasoning_method if is_reasoning_notification_method(reasoning_method) => {
                 let Some(delta) = extract_codex_reasoning_delta_text(params) else {
@@ -1514,14 +1601,27 @@ impl CodexInner {
                 let message_id = params
                     .get("itemId")
                     .and_then(Value::as_str)
-                    .unwrap_or("assistant");
-                emitter.stream_reasoning_delta(message_id, &delta);
+                    .unwrap_or("assistant")
+                    .to_string();
+                let Some(emitter) = self
+                    .update_codex_subagent_stream(stream_key, |stream| {
+                        stream.current_message_id = Some(message_id.clone());
+                    })
+                    .await
+                else {
+                    return;
+                };
+                emitter.stream_reasoning_delta(&message_id, &delta);
             }
             "item/started" => {
-                self.handle_subagent_item_started(params, emitter);
+                let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
+                    return;
+                };
+                self.handle_subagent_item_started(params, emitter.as_ref());
             }
             "item/completed" => {
-                self.handle_subagent_item_completed(params, emitter, model);
+                self.handle_subagent_item_completed(params, stream_key, model)
+                    .await;
             }
             "turn/plan/updated" => {
                 let tasks = codex_plan_update_task_list_from_params(params).unwrap_or_else(|| {
@@ -1530,10 +1630,18 @@ impl CodexInner {
                         tasks: Vec::new(),
                     }
                 });
+                let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
+                    return;
+                };
                 emitter.task_update(&tasks);
             }
+            "thread/tokenUsage/updated" => {
+                self.handle_subagent_token_usage_updated(params, stream_key, model)
+                    .await;
+            }
             "turn/completed" => {
-                self.handle_subagent_turn_completed(params, emitter);
+                self.handle_subagent_turn_completed(params, stream_key, model)
+                    .await;
             }
             "error" => {
                 let message = params
@@ -1541,11 +1649,49 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .unwrap_or("Codex error")
                     .to_string();
+                let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
+                    return;
+                };
                 emitter.backend_error(&message);
                 emitter.typing_status_changed(false);
             }
             _ => {}
         }
+    }
+
+    async fn handle_completed_subagent_notification(
+        &self,
+        method: &str,
+        params: &Value,
+        stream_key: &str,
+        model: &str,
+    ) {
+        match method {
+            "thread/tokenUsage/updated" | "turn/completed" => {
+                self.handle_completed_subagent_token_usage(params, stream_key, model)
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn codex_subagent_emitter(&self, stream_key: &str) -> Option<Arc<TurnEmitter>> {
+        let state = self.state.lock().await;
+        state
+            .subagent_streams
+            .get(stream_key)
+            .map(|stream| Arc::clone(&stream.emitter))
+    }
+
+    async fn update_codex_subagent_stream(
+        &self,
+        stream_key: &str,
+        update: impl FnOnce(&mut CodexSubAgentStream),
+    ) -> Option<Arc<TurnEmitter>> {
+        let mut state = self.state.lock().await;
+        let stream = state.subagent_streams.get_mut(stream_key)?;
+        update(stream);
+        Some(Arc::clone(&stream.emitter))
     }
 
     fn handle_subagent_item_started(&self, params: &Value, emitter: &TurnEmitter) {
@@ -1617,7 +1763,7 @@ impl CodexInner {
         }
     }
 
-    fn handle_subagent_item_completed(&self, params: &Value, emitter: &TurnEmitter, model: &str) {
+    async fn handle_subagent_item_completed(&self, params: &Value, stream_key: &str, model: &str) {
         let Some(item) = params.get("item") else {
             return;
         };
@@ -1632,19 +1778,35 @@ impl CodexInner {
             "agentMessage" => {
                 let text = extract_codex_item_text(item);
                 let reasoning = extract_codex_item_reasoning(item);
+                let turn_id_from_params = extract_turn_id(params);
+                let Some((emitter, token_usage, unavailable_reason)) = self
+                    .complete_subagent_message(
+                        stream_key,
+                        turn_id_from_params,
+                        item_id.clone(),
+                        model.to_string(),
+                    )
+                    .await
+                else {
+                    return;
+                };
                 emitter.stream_end(StreamEndPayload {
                     content: text,
                     agent: Some(AgentName(CODEX_AGENT_NAME)),
                     model: Some(model.to_string()),
-                    request_usage: None,
-                    turn_usage: None,
+                    request_usage: token_usage.clone(),
+                    turn_usage: token_usage,
                     cumulative_usage: None,
+                    token_usage_unavailable_reason: unavailable_reason,
                     reasoning,
                     tool_calls: Vec::new(),
                     context_breakdown: None,
                 });
             }
             "reasoning" => {
+                let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
+                    return;
+                };
                 let Some(reasoning_text) = extract_codex_item_reasoning(item) else {
                     return;
                 };
@@ -1654,6 +1816,9 @@ impl CodexInner {
                 emitter.stream_reasoning_delta(&item_id, &reasoning_text);
             }
             "commandExecution" => {
+                let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
+                    return;
+                };
                 let exit_code = item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1) as i32;
                 let output = item
                     .get("aggregatedOutput")
@@ -1680,6 +1845,9 @@ impl CodexInner {
                 });
             }
             "fileChange" => {
+                let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
+                    return;
+                };
                 let success = item.get("status").and_then(Value::as_str) == Some("completed");
                 let file_changes = parse_codex_file_changes(item);
                 let err_str = if success {
@@ -1717,6 +1885,9 @@ impl CodexInner {
                 }
             }
             "mcpToolCall" | "dynamicToolCall" => {
+                let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
+                    return;
+                };
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
@@ -1740,6 +1911,9 @@ impl CodexInner {
                 });
             }
             "collabToolCall" | "collabAgentToolCall" => {
+                let Some(emitter) = self.codex_subagent_emitter(stream_key).await else {
+                    return;
+                };
                 let tool_name = item
                     .get("tool")
                     .and_then(Value::as_str)
@@ -1765,13 +1939,177 @@ impl CodexInner {
         }
     }
 
-    fn handle_subagent_turn_completed(&self, params: &Value, emitter: &TurnEmitter) {
+    async fn complete_subagent_message(
+        &self,
+        stream_key: &str,
+        turn_id_from_params: Option<String>,
+        message_id: String,
+        model: String,
+    ) -> Option<(
+        Arc<TurnEmitter>,
+        Option<Value>,
+        Option<TokenUsageUnavailableReason>,
+    )> {
+        let mut state = self.state.lock().await;
+        let stream = state.subagent_streams.get_mut(stream_key)?;
+        let turn_id = turn_id_from_params
+            .or_else(|| stream.active_turn_id.clone())
+            .unwrap_or_else(|| "turn".to_string());
+        stream.current_message_id = Some(message_id.clone());
+        let token_usage = stream.token_usage_by_turn.remove(&turn_id);
+        let unavailable_reason = if token_usage.is_some() {
+            None
+        } else {
+            stream.pending_message_metadata = Some(PendingCodexMessageMetadata {
+                turn_id,
+                message_id,
+                model,
+                turn_context: TurnContextEstimate::default(),
+            });
+            Some(TokenUsageUnavailableReason::BackendDidNotReport)
+        };
+        Some((Arc::clone(&stream.emitter), token_usage, unavailable_reason))
+    }
+
+    async fn handle_subagent_token_usage_updated(
+        &self,
+        params: &Value,
+        stream_key: &str,
+        model: &str,
+    ) {
+        let Some((turn_id, token_usage)) = extract_turn_token_usage(params, Some(model)) else {
+            return;
+        };
+        if let Some((emitter, pending, token_usage, context_breakdown)) = self
+            .record_subagent_token_usage(stream_key, turn_id, token_usage)
+            .await
+        {
+            emit_codex_message_metadata_update(
+                emitter.as_ref(),
+                pending,
+                Some(token_usage),
+                context_breakdown,
+            );
+        }
+    }
+
+    async fn record_subagent_token_usage(
+        &self,
+        stream_key: &str,
+        turn_id: String,
+        token_usage: Value,
+    ) -> Option<(Arc<TurnEmitter>, PendingCodexMessageMetadata, Value, Value)> {
+        let mut state = self.state.lock().await;
+        let stream = state.subagent_streams.get_mut(stream_key)?;
+        stream
+            .token_usage_by_turn
+            .insert(turn_id.clone(), token_usage.clone());
+        let pending_ready = stream
+            .pending_message_metadata
+            .as_ref()
+            .is_some_and(|pending| pending.turn_id == turn_id);
+        if !pending_ready {
+            return None;
+        }
+        let pending = stream.pending_message_metadata.take()?;
+        let token_usage = stream.token_usage_by_turn.remove(&turn_id)?;
+        let context_breakdown = estimate_context_breakdown(
+            Some(&token_usage),
+            &pending.turn_context,
+            Some(&pending.model),
+        );
+        Some((
+            Arc::clone(&stream.emitter),
+            pending,
+            token_usage,
+            context_breakdown,
+        ))
+    }
+
+    async fn handle_completed_subagent_token_usage(
+        &self,
+        params: &Value,
+        stream_key: &str,
+        model: &str,
+    ) {
+        let Some((turn_id, token_usage)) = extract_turn_token_usage(params, Some(model)) else {
+            return;
+        };
+        if let Some((emitter, pending, token_usage, context_breakdown)) = self
+            .record_completed_subagent_token_usage(stream_key, turn_id, token_usage)
+            .await
+        {
+            emit_codex_message_metadata_update(
+                emitter.as_ref(),
+                pending,
+                Some(token_usage),
+                context_breakdown,
+            );
+        }
+    }
+
+    async fn record_completed_subagent_token_usage(
+        &self,
+        stream_key: &str,
+        turn_id: String,
+        token_usage: Value,
+    ) -> Option<(Arc<TurnEmitter>, PendingCodexMessageMetadata, Value, Value)> {
+        let mut state = self.state.lock().await;
+        let stream = state.completed_subagent_streams.get_mut(stream_key)?;
+        let pending_ready = stream
+            .pending_message_metadata
+            .as_ref()
+            .is_some_and(|pending| pending.turn_id == turn_id);
+        if !pending_ready {
+            return None;
+        }
+        let pending = stream.pending_message_metadata.take()?;
+        let context_breakdown = estimate_context_breakdown(
+            Some(&token_usage),
+            &pending.turn_context,
+            Some(&pending.model),
+        );
+        Some((
+            Arc::clone(&stream.emitter),
+            pending,
+            token_usage,
+            context_breakdown,
+        ))
+    }
+
+    async fn handle_subagent_turn_completed(&self, params: &Value, stream_key: &str, model: &str) {
         let turn_status = params
             .get("turn")
             .and_then(|v| v.get("status"))
             .and_then(Value::as_str)
             .unwrap_or("completed")
             .to_string();
+        if let Some((turn_id, token_usage)) = extract_turn_token_usage(params, Some(model))
+            && let Some((emitter, pending, token_usage, context_breakdown)) = self
+                .record_subagent_token_usage(stream_key, turn_id, token_usage)
+                .await
+        {
+            emit_codex_message_metadata_update(
+                emitter.as_ref(),
+                pending,
+                Some(token_usage),
+                context_breakdown,
+            );
+        }
+        let Some(emitter) = self
+            .update_codex_subagent_stream(stream_key, |stream| {
+                if extract_turn_id(params)
+                    .as_ref()
+                    .is_none_or(|turn_id| stream.active_turn_id.as_ref() == Some(turn_id))
+                {
+                    stream.active_turn_id = None;
+                    stream.current_message_id = None;
+                }
+            })
+            .await
+        else {
+            return;
+        };
 
         if turn_status == "interrupted" {
             emitter.operation_cancelled("Operation cancelled");
@@ -2332,6 +2670,7 @@ impl CodexInner {
                     request_usage: None,
                     turn_usage: None,
                     cumulative_usage: None,
+                    token_usage_unavailable_reason: None,
                     reasoning,
                     tool_calls: Vec::new(),
                     context_breakdown: None,
@@ -2601,12 +2940,20 @@ impl CodexInner {
                 emitter,
                 receiver_thread_id: spawn.receiver_thread_id,
                 external_agent_id: None,
+                active_turn_id: None,
+                current_message_id: None,
+                pending_message_metadata: None,
+                token_usage_by_turn: HashMap::new(),
             });
     }
 
     async fn complete_codex_subagent_if_needed(&self, item_id: &str) {
         let mut state = self.state.lock().await;
-        state.subagent_streams.remove(item_id);
+        if let Some(stream) = state.subagent_streams.remove(item_id) {
+            state
+                .completed_subagent_streams
+                .insert(item_id.to_string(), completed_codex_subagent_stream(stream));
+        }
     }
 
     async fn record_codex_subagent_spawn_result_if_needed(&self, item_id: &str, item: &Value) {
@@ -2676,14 +3023,26 @@ impl CodexInner {
             None
         };
 
-        if let Some(item_id) = direct_match.or(fallback_single_unknown) {
-            state.subagent_streams.remove(&item_id);
+        if let Some(item_id) = direct_match.or(fallback_single_unknown)
+            && let Some(mut stream) = state.subagent_streams.remove(&item_id)
+        {
+            if stream.external_agent_id.is_none() {
+                stream.external_agent_id = Some(external_agent_id.to_string());
+            }
+            state
+                .completed_subagent_streams
+                .insert(item_id, completed_codex_subagent_stream(stream));
         }
     }
 
     async fn complete_all_codex_subagents(&self) {
         let mut state = self.state.lock().await;
-        state.subagent_streams.clear();
+        let streams = state.subagent_streams.drain().collect::<Vec<_>>();
+        for (item_id, stream) in streams {
+            state
+                .completed_subagent_streams
+                .insert(item_id, completed_codex_subagent_stream(stream));
+        }
     }
 
     fn handle_plan_update(&self, params: &Value) {
@@ -2782,6 +3141,11 @@ impl CodexInner {
                             &pending.turn_context,
                             Some(&pending.model),
                         );
+                        if token_usage.is_none() {
+                            state
+                                .completed_message_metadata_by_turn
+                                .insert(turn_id.clone(), pending.clone());
+                        }
                         metadata_update = Some((pending, token_usage, context_breakdown));
                     }
                 } else if state
@@ -2790,6 +3154,7 @@ impl CodexInner {
                     .is_some_and(|pending| pending.turn_id == turn_id)
                 {
                     state.pending_message_metadata = None;
+                    state.completed_message_metadata_by_turn.remove(&turn_id);
                 }
                 state.turn_context_by_turn.remove(&turn_id);
                 state.token_usage_by_turn.remove(&turn_id);
@@ -2810,6 +3175,7 @@ impl CodexInner {
                 request_usage: None,
                 turn_usage: None,
                 cumulative_usage: None,
+                token_usage_unavailable_reason: None,
                 reasoning: segment.reasoning,
                 tool_calls: Vec::new(),
                 context_breakdown: None,
@@ -2963,20 +3329,17 @@ fn extract_notification_thread_id(params: &Value) -> Option<String> {
         .map(|id| id.to_string())
 }
 
-fn find_subagent_emitter_for_thread(
-    state: &CodexState,
-    thread_id: &str,
-) -> Option<Arc<TurnEmitter>> {
+fn find_subagent_stream_key_for_thread(state: &CodexState, thread_id: &str) -> Option<String> {
     let thread_id = thread_id.trim();
     if thread_id.is_empty() {
         return None;
     }
 
-    if let Some(stream) = state.subagent_streams.values().find(|stream| {
+    if let Some((stream_key, _)) = state.subagent_streams.iter().find(|(_, stream)| {
         stream.receiver_thread_id.as_deref() == Some(thread_id)
             || stream.external_agent_id.as_deref() == Some(thread_id)
     }) {
-        return Some(Arc::clone(&stream.emitter));
+        return Some(stream_key.clone());
     }
 
     // Early in a spawn, Codex may start emitting sub-agent notifications before
@@ -2984,14 +3347,35 @@ fn find_subagent_emitter_for_thread(
     // unresolved, route to that stream.
     let mut unresolved = state
         .subagent_streams
-        .values()
-        .filter(|stream| stream.receiver_thread_id.is_none() && stream.external_agent_id.is_none())
-        .map(|stream| Arc::clone(&stream.emitter));
+        .iter()
+        .filter(|(_, stream)| {
+            stream.receiver_thread_id.is_none() && stream.external_agent_id.is_none()
+        })
+        .map(|(stream_key, _)| stream_key.clone());
     let first = unresolved.next()?;
     if unresolved.next().is_some() {
         return None;
     }
     Some(first)
+}
+
+fn find_completed_subagent_stream_key_for_thread(
+    state: &CodexState,
+    thread_id: &str,
+) -> Option<String> {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return None;
+    }
+
+    state
+        .completed_subagent_streams
+        .iter()
+        .find_map(|(key, stream)| {
+            (stream.receiver_thread_id.as_deref() == Some(thread_id)
+                || stream.external_agent_id.as_deref() == Some(thread_id))
+            .then(|| key.clone())
+        })
 }
 
 fn codex_plan_update_task_list_from_params(params: &Value) -> Option<protocol::TaskList> {
@@ -4116,6 +4500,29 @@ fn usage_u64(value: &Value, keys: &[&str]) -> Option<u64> {
         .find_map(|key| value.get(*key).and_then(Value::as_u64))
 }
 
+const CODEX_TOKEN_USAGE_COUNTER_KEYS: &[&str] = &[
+    "inputTokens",
+    "input_tokens",
+    "prompt_tokens",
+    "outputTokens",
+    "output_tokens",
+    "completion_tokens",
+    "totalTokens",
+    "total_tokens",
+    "cachedInputTokens",
+    "cached_prompt_tokens",
+    "cacheCreationInputTokens",
+    "cache_creation_input_tokens",
+    "reasoningOutputTokens",
+    "reasoning_tokens",
+];
+
+fn has_numeric_token_usage_counter(value: &Value) -> bool {
+    CODEX_TOKEN_USAGE_COUNTER_KEYS
+        .iter()
+        .any(|key| value.get(*key).and_then(Value::as_u64).is_some())
+}
+
 fn extract_turn_id(params: &Value) -> Option<String> {
     params
         .get("turnId")
@@ -4156,21 +4563,22 @@ fn extract_turn_token_usage_value(params: &Value) -> Option<&Value> {
 fn extract_turn_token_usage(params: &Value, model_hint: Option<&str>) -> Option<(String, Value)> {
     let turn_id = extract_turn_id(params)?;
     let usage = extract_turn_token_usage_value(params)?;
-    Some((
-        turn_id,
-        normalize_token_usage_with_envelope(usage, Some(params), model_hint),
-    ))
+    let normalized = normalize_token_usage_with_envelope(usage, Some(params), model_hint)?;
+    Some((turn_id, normalized))
 }
 
 fn normalize_token_usage_with_envelope(
     raw: &Value,
     envelope: Option<&Value>,
     model_hint: Option<&str>,
-) -> Value {
+) -> Option<Value> {
     let source = raw
         .get("last")
         .filter(|value| value.is_object())
         .unwrap_or(raw);
+    if !has_numeric_token_usage_counter(source) {
+        return None;
+    }
 
     // OpenAI convention: `inputTokens` is the TOTAL including cached tokens,
     // and `cachedInputTokens` is a subset.  Our internal contract (matching
@@ -4220,7 +4628,7 @@ fn normalize_token_usage_with_envelope(
             std::cmp::max(model_estimate, prompt_tokens_total.max(1))
         });
 
-    json!({
+    Some(json!({
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
@@ -4228,7 +4636,7 @@ fn normalize_token_usage_with_envelope(
         "cache_creation_input_tokens": cache_creation_input_tokens,
         "reasoning_tokens": reasoning_tokens,
         "context_window": context_window
-    })
+    }))
 }
 
 fn context_window_from_token_usage(
@@ -5183,6 +5591,7 @@ enum CodexAgentMessageCompletionDisposition {
     SkipDuplicateCompleted,
 }
 
+#[derive(Clone)]
 struct CodexLoopPendingMessageMetadata {
     turn_id: String,
     message_id: String,
@@ -5393,6 +5802,7 @@ fn maybe_finish_codex_loop_segment(
         request_usage: None,
         turn_usage: None,
         cumulative_usage: None,
+        token_usage_unavailable_reason: None,
         reasoning,
         tool_calls: Vec::new(),
         context_breakdown: None,
@@ -5832,6 +6242,10 @@ impl Backend for CodexBackend {
             let mut pending_tool_call_ids: HashSet<String> = HashSet::new();
             let mut close_stream_when_tools_idle = false;
             let mut pending_message_metadata: Option<CodexLoopPendingMessageMetadata> = None;
+            let mut completed_message_metadata_by_turn: HashMap<
+                String,
+                CodexLoopPendingMessageMetadata,
+            > = HashMap::new();
             let mut token_usage_by_turn: HashMap<String, Value> = HashMap::new();
             let mut turn_context_by_turn: HashMap<String, TurnContextEstimate> = HashMap::new();
             let mut pending_user_input_bytes = initial_message.len() as u64;
@@ -5919,341 +6333,423 @@ impl Backend for CodexBackend {
 
             loop {
                 tokio::select! {
-                        notif = notif_rx.recv() => {
-                            let Some(inbound) = notif else { break };
-                            let (method, params) = match inbound {
-                                CodexInbound::Notification { method, params } => (method, params),
-                                CodexInbound::ServerRequest { id, method, params } => {
-                                    respond_codex_spawn_server_request(
-                                        &stdin_for_input,
-                                        id,
-                                        &method,
-                                        &params,
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                                CodexInbound::Stderr(line) => {
-                                    tracing::warn!("Codex stderr: {line}");
-                                    continue;
-                                }
-                                CodexInbound::Closed { exit_code } => {
-                                    tracing::warn!(?exit_code, "Codex app-server closed");
-                                    break;
-                                }
-                            };
-                            if is_reasoning_notification_method(method.as_str()) {
-                                reasoning_notification_count = reasoning_notification_count.saturating_add(1);
+                    notif = notif_rx.recv() => {
+                        let Some(inbound) = notif else { break };
+                        let (method, params) = match inbound {
+                            CodexInbound::Notification { method, params } => (method, params),
+                            CodexInbound::ServerRequest { id, method, params } => {
+                                respond_codex_spawn_server_request(
+                                    &stdin_for_input,
+                                    id,
+                                    &method,
+                                    &params,
+                                )
+                                .await;
+                                continue;
                             }
+                            CodexInbound::Stderr(line) => {
+                                tracing::warn!("Codex stderr: {line}");
+                                continue;
+                            }
+                            CodexInbound::Closed { exit_code } => {
+                                tracing::warn!(?exit_code, "Codex app-server closed");
+                                break;
+                            }
+                        };
+                        if is_reasoning_notification_method(method.as_str()) {
+                            reasoning_notification_count = reasoning_notification_count.saturating_add(1);
+                        }
 
-                            match method.as_str() {
-                                "turn/started" => {
-                                    let turn_id = params
-                                        .get("turn")
-                                        .and_then(|v| v.get("id"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("turn")
-                                        .to_string();
-                                    active_turn_id = Some(turn_id.clone());
-                                    current_message_id = Some(turn_id.clone());
+                        match method.as_str() {
+                            "turn/started" => {
+                                let turn_id = params
+                                    .get("turn")
+                                    .and_then(|v| v.get("id"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("turn")
+                                    .to_string();
+                                active_turn_id = Some(turn_id.clone());
+                                current_message_id = Some(turn_id.clone());
+                                accumulated_text.clear();
+                                accumulated_reasoning.clear();
+                                pending_tool_call_ids.clear();
+                                close_stream_when_tools_idle = false;
+                                pending_message_metadata = None;
+                                let pending_user_input = pending_user_input_bytes;
+                                pending_user_input_bytes = 0;
+                                conversation_bytes_total = conversation_bytes_total
+                                    .saturating_add(pending_user_input);
+                                turn_context_by_turn.insert(
+                                    turn_id.clone(),
+                                    TurnContextEstimate {
+                                        conversation_history_bytes: conversation_bytes_total,
+                                        ..TurnContextEstimate::default()
+                                    },
+                                );
+                                saw_agent_message_delta = false;
+                                saw_agent_message_completed = false;
+                                stream_closed_by_turn_completion = false;
+                                reasoning_notification_count = 0;
+                                started_item_types.clear();
+                                completed_item_types.clear();
+                                if !typing_status_active {
+                                    emitter.typing_status_changed(true);
+                                    typing_status_active = true;
+                                }
+                                emitter.stream_start(
+                                    &turn_id,
+                                    AgentName(CODEX_AGENT_NAME),
+                                    Some(&model_name),
+                                );
+                            }
+                            "item/agentMessage/delta" => {
+                                let delta = params
+                                    .get("delta")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                if delta.is_empty() {
+                                    continue;
+                                }
+                                saw_agent_message_delta = true;
+                                emit_codex_loop_agent_message_delta(
+                                    &emitter,
+                                    CodexLoopAgentMessageDeltaState {
+                                        current_message_id: &mut current_message_id,
+                                        accumulated_text: &mut accumulated_text,
+                                        stream_closed_by_turn_completion:
+                                            &mut stream_closed_by_turn_completion,
+                                        typing_status_active: &mut typing_status_active,
+                                    },
+                                    &params,
+                                    &delta,
+                                    &model_name,
+                                );
+                            }
+                            reasoning_method if is_reasoning_notification_method(reasoning_method) => {
+                                let Some(delta) = extract_codex_reasoning_delta_text(&params) else {
+                                    continue;
+                                };
+                                let delta = merge_reasoning_delta(&accumulated_reasoning, &delta);
+                                if delta.is_empty() {
+                                    continue;
+                                }
+                                let message_id = codex_loop_reasoning_message_id(
+                                    &params,
+                                    current_message_id.as_deref(),
+                                    active_turn_id.as_deref(),
+                                );
+                                if current_message_id.is_none() {
+                                    stream_closed_by_turn_completion = false;
                                     accumulated_text.clear();
                                     accumulated_reasoning.clear();
-                                    pending_tool_call_ids.clear();
                                     close_stream_when_tools_idle = false;
-                                    pending_message_metadata = None;
-                                    let pending_user_input = pending_user_input_bytes;
-                                    pending_user_input_bytes = 0;
-                                    conversation_bytes_total = conversation_bytes_total
-                                        .saturating_add(pending_user_input);
-                                    turn_context_by_turn.insert(
-                                        turn_id.clone(),
-                                        TurnContextEstimate {
-                                            conversation_history_bytes: conversation_bytes_total,
-                                            ..TurnContextEstimate::default()
-                                        },
-                                    );
-                                    saw_agent_message_delta = false;
-                                    saw_agent_message_completed = false;
-                                    stream_closed_by_turn_completion = false;
-                                    reasoning_notification_count = 0;
-                                    started_item_types.clear();
-                                    completed_item_types.clear();
                                     if !typing_status_active {
                                         emitter.typing_status_changed(true);
                                         typing_status_active = true;
                                     }
                                     emitter.stream_start(
-                                        &turn_id,
+                                        &message_id,
                                         AgentName(CODEX_AGENT_NAME),
                                         Some(&model_name),
                                     );
                                 }
-                                "item/agentMessage/delta" => {
-                                    let delta = params
-                                        .get("delta")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    if delta.is_empty() {
-                                        continue;
-                                    }
-                                    saw_agent_message_delta = true;
-                                    emit_codex_loop_agent_message_delta(
-                                        &emitter,
-                                        CodexLoopAgentMessageDeltaState {
-                                            current_message_id: &mut current_message_id,
-                                            accumulated_text: &mut accumulated_text,
-                                            stream_closed_by_turn_completion:
-                                                &mut stream_closed_by_turn_completion,
-                                            typing_status_active: &mut typing_status_active,
-                                        },
-                                        &params,
-                                        &delta,
-                                        &model_name,
-                                    );
-                                }
-                                reasoning_method if is_reasoning_notification_method(reasoning_method) => {
-                                    let Some(delta) = extract_codex_reasoning_delta_text(&params) else {
-                                        continue;
-                                    };
-                                    let delta = merge_reasoning_delta(&accumulated_reasoning, &delta);
-                                    if delta.is_empty() {
-                                        continue;
-                                    }
-                                    let message_id = codex_loop_reasoning_message_id(
-                                        &params,
-                                        current_message_id.as_deref(),
-                                        active_turn_id.as_deref(),
-                                    );
-                                    if current_message_id.is_none() {
-                                        stream_closed_by_turn_completion = false;
-                                        accumulated_text.clear();
-                                        accumulated_reasoning.clear();
-                                        close_stream_when_tools_idle = false;
-                                        if !typing_status_active {
-                                            emitter.typing_status_changed(true);
-                                            typing_status_active = true;
-                                        }
-                                        emitter.stream_start(
-                                            &message_id,
-                                            AgentName(CODEX_AGENT_NAME),
+                                current_message_id = Some(message_id.clone());
+                                accumulated_reasoning.push_str(&delta);
+                                add_codex_loop_turn_reasoning_bytes(
+                                    &mut turn_context_by_turn,
+                                    active_turn_id.as_deref(),
+                                    delta.len() as u64,
+                                );
+                                emitter.stream_reasoning_delta(&message_id, &delta);
+                            }
+                            "thread/tokenUsage/updated" => {
+                                if let Some((turn_id, token_usage)) =
+                                    extract_turn_token_usage(&params, Some(&model_name))
+                                {
+                                    if let Some(pending) =
+                                        completed_message_metadata_by_turn.remove(&turn_id)
+                                    {
+                                        let context_breakdown = estimate_context_breakdown(
+                                            Some(&token_usage),
+                                            &pending.turn_context,
                                             Some(&model_name),
                                         );
-                                    }
-                                    current_message_id = Some(message_id.clone());
-                                    accumulated_reasoning.push_str(&delta);
-                                    add_codex_loop_turn_reasoning_bytes(
-                                        &mut turn_context_by_turn,
-                                        active_turn_id.as_deref(),
-                                        delta.len() as u64,
-                                    );
-                                    emitter.stream_reasoning_delta(&message_id, &delta);
-                                }
-                                "thread/tokenUsage/updated" => {
-                                    if let Some((turn_id, token_usage)) =
-                                        extract_turn_token_usage(&params, Some(&model_name))
-                                    {
+                                        emitter.message_metadata_updated(
+                                            MessageMetadataUpdatePayload {
+                                                message_id: pending.message_id,
+                                                model_info: Some(json!({
+                                                    "model": model_name.clone()
+                                                })),
+                                                request_usage: Some(token_usage.clone()),
+                                                turn_usage: Some(token_usage),
+                                                cumulative_usage: None,
+                                                context_breakdown: Some(context_breakdown),
+                                            },
+                                        );
+                                    } else {
                                         token_usage_by_turn.insert(turn_id, token_usage);
                                     }
                                 }
-                                "item/completed" => {
-                                    let item_type = params
-                                        .get("item")
-                                        .and_then(|v| v.get("type"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("");
-                                    let item = params.get("item").cloned().unwrap_or(Value::Null);
-                                    let item_id = item
-                                        .get("id")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("item")
-                                        .to_string();
-                                    if !item_type.is_empty() && completed_item_types.len() < 8 {
-                                        completed_item_types.push(item_type.to_string());
-                                    }
-                                    match item_type {
-                                        "agentMessage" => {
-                                            let text = item
-                                                .get("text")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("")
-                                                .to_string();
-                                            let disposition =
-                                                codex_agent_message_completion_disposition(
-                                                    current_message_id.is_some(),
-                                                    saw_agent_message_completed,
-                                                    stream_closed_by_turn_completion,
-                                                    &text,
+                            }
+                            "item/completed" => {
+                                let item_type = params
+                                    .get("item")
+                                    .and_then(|v| v.get("type"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("");
+                                let item = params.get("item").cloned().unwrap_or(Value::Null);
+                                let item_id = item
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("item")
+                                    .to_string();
+                                if !item_type.is_empty() && completed_item_types.len() < 8 {
+                                    completed_item_types.push(item_type.to_string());
+                                }
+                                match item_type {
+                                    "agentMessage" => {
+                                        let text = item
+                                            .get("text")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let disposition =
+                                            codex_agent_message_completion_disposition(
+                                                current_message_id.is_some(),
+                                                saw_agent_message_completed,
+                                                stream_closed_by_turn_completion,
+                                                &text,
+                                            );
+                                        match disposition {
+                                            CodexAgentMessageCompletionDisposition::SkipDuplicateEmpty => {
+                                                tracing::warn!(
+                                                    turn_id = ?active_turn_id,
+                                                    item_id = %item_id,
+                                                    "Codex emitted an empty agentMessage completion after the turn was already closed; skipping duplicate StreamEnd"
                                                 );
-                                            match disposition {
-                                                CodexAgentMessageCompletionDisposition::SkipDuplicateEmpty => {
-                                                    tracing::warn!(
-                                                        turn_id = ?active_turn_id,
-                                                        item_id = %item_id,
-                                                        "Codex emitted an empty agentMessage completion after the turn was already closed; skipping duplicate StreamEnd"
-                                                    );
-                                                    saw_agent_message_completed = true;
+                                                saw_agent_message_completed = true;
+                                                stream_closed_by_turn_completion = false;
+                                                continue;
+                                            }
+                                            CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted => {
+                                                tracing::warn!(
+                                                    turn_id = ?active_turn_id,
+                                                    item_id = %item_id,
+                                                    text_len = text.len(),
+                                                    "Codex emitted a duplicate agentMessage completion; skipping duplicate StreamEnd"
+                                                );
+                                                continue;
+                                            }
+                                            CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart => {
+                                                let start_message_id = item_id.clone();
+                                                current_message_id = Some(start_message_id.clone());
+                                                emitter.stream_start(
+                                                    &start_message_id,
+                                                    AgentName(CODEX_AGENT_NAME),
+                                                    Some(&model_name),
+                                                );
+                                            }
+                                            CodexAgentMessageCompletionDisposition::EmitOnOpenStream => {}
+                                        }
+                                        saw_agent_message_completed = true;
+                                        let final_text = if text.is_empty() {
+                                            std::mem::take(&mut accumulated_text)
+                                        } else {
+                                            accumulated_text.clear();
+                                            text
+                                        };
+                                        let reasoning = contains_non_whitespace(
+                                            &accumulated_reasoning,
+                                        )
+                                        .then(|| std::mem::take(&mut accumulated_reasoning));
+                                        conversation_bytes_total = conversation_bytes_total
+                                            .saturating_add(final_text.len() as u64);
+                                        let message_id_for_metadata = current_message_id
+                                            .clone()
+                                            .unwrap_or_else(|| item_id.clone());
+                                        if let Some(turn_id) = active_turn_id.clone() {
+                                            let turn_context = turn_context_by_turn
+                                                .get(&turn_id)
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            if let Some(metadata) = metadata_target_for_visible_message(
+                                                turn_id,
+                                                message_id_for_metadata,
+                                                &final_text,
+                                                reasoning.as_deref(),
+                                                model_name.clone(),
+                                                turn_context,
+                                            ) {
+                                                pending_message_metadata =
+                                                    Some(CodexLoopPendingMessageMetadata {
+                                                        turn_id: metadata.turn_id,
+                                                        message_id: metadata.message_id,
+                                                        turn_context: metadata.turn_context,
+                                                    });
+                                            }
+                                        }
+                                        emitter.stream_end(StreamEndPayload {
+                                            content: final_text,
+                                            agent: Some(AgentName(CODEX_AGENT_NAME)),
+                                            model: Some(model_name.clone()),
+                                            request_usage: None,
+                                            turn_usage: None,
+                                            cumulative_usage: None,
+                                            token_usage_unavailable_reason: None,
+                                            reasoning,
+                                            tool_calls: Vec::new(),
+                                            context_breakdown: None,
+                                        });
+                                        current_message_id = None;
+                                        stream_closed_by_turn_completion = false;
+                                    }
+                                    "reasoning" => {
+                                        if let Some(reasoning_text) = extract_codex_item_reasoning(&item)
+                                            && contains_non_whitespace(&reasoning_text)
+                                        {
+                                            let delta = merge_reasoning_delta(
+                                                &accumulated_reasoning,
+                                                &reasoning_text,
+                                            );
+                                            if !delta.is_empty() {
+                                                let message_id = item_id.clone();
+                                                if current_message_id.is_none() {
                                                     stream_closed_by_turn_completion = false;
-                                                    continue;
-                                                }
-                                                CodexAgentMessageCompletionDisposition::SkipDuplicateCompleted => {
-                                                    tracing::warn!(
-                                                        turn_id = ?active_turn_id,
-                                                        item_id = %item_id,
-                                                        text_len = text.len(),
-                                                        "Codex emitted a duplicate agentMessage completion; skipping duplicate StreamEnd"
-                                                    );
-                                                    continue;
-                                                }
-                                                CodexAgentMessageCompletionDisposition::EmitWithSyntheticStart => {
-                                                    let start_message_id = item_id.clone();
-                                                    current_message_id = Some(start_message_id.clone());
+                                                    accumulated_text.clear();
+                                                    accumulated_reasoning.clear();
+                                                    if !typing_status_active {
+                                                        emitter.typing_status_changed(true);
+                                                        typing_status_active = true;
+                                                    }
                                                     emitter.stream_start(
-                                                        &start_message_id,
+                                                        &message_id,
                                                         AgentName(CODEX_AGENT_NAME),
                                                         Some(&model_name),
                                                     );
                                                 }
-                                                CodexAgentMessageCompletionDisposition::EmitOnOpenStream => {}
-                                            }
-                                            saw_agent_message_completed = true;
-                                            let final_text = if text.is_empty() {
-                                                std::mem::take(&mut accumulated_text)
-                                            } else {
-                                                accumulated_text.clear();
-                                                text
-                                            };
-                                            let reasoning = contains_non_whitespace(
-                                                &accumulated_reasoning,
-                                            )
-                                            .then(|| std::mem::take(&mut accumulated_reasoning));
-                                            conversation_bytes_total = conversation_bytes_total
-                                                .saturating_add(final_text.len() as u64);
-                                            let message_id_for_metadata = current_message_id
-                                                .clone()
-                                                .unwrap_or_else(|| item_id.clone());
-                                            if let Some(turn_id) = active_turn_id.clone() {
-                                                let turn_context = turn_context_by_turn
-                                                    .get(&turn_id)
-                                                    .cloned()
-                                                    .unwrap_or_default();
-                                                if let Some(metadata) = metadata_target_for_visible_message(
-                                                    turn_id,
-                                                    message_id_for_metadata,
-                                                    &final_text,
-                                                    reasoning.as_deref(),
-                                                    model_name.clone(),
-                                                    turn_context,
-                                                ) {
-                                                    pending_message_metadata =
-                                                        Some(CodexLoopPendingMessageMetadata {
-                                                            turn_id: metadata.turn_id,
-                                                            message_id: metadata.message_id,
-                                                            turn_context: metadata.turn_context,
-                                                        });
-                                                }
-                                            }
-                                            emitter.stream_end(StreamEndPayload {
-                                                content: final_text,
-                                                agent: Some(AgentName(CODEX_AGENT_NAME)),
-                                                model: Some(model_name.clone()),
-                                                request_usage: None,
-                turn_usage: None,
-                cumulative_usage: None,
-                                                reasoning,
-                                                tool_calls: Vec::new(),
-                                                context_breakdown: None,
-                                            });
-                                            current_message_id = None;
-                                            stream_closed_by_turn_completion = false;
-                                        }
-                                        "reasoning" => {
-                                            if let Some(reasoning_text) = extract_codex_item_reasoning(&item)
-                                                && contains_non_whitespace(&reasoning_text)
-                                            {
-                                                let delta = merge_reasoning_delta(
-                                                    &accumulated_reasoning,
-                                                    &reasoning_text,
+                                                current_message_id = Some(message_id.clone());
+                                                accumulated_reasoning.push_str(&delta);
+                                                add_codex_loop_turn_reasoning_bytes(
+                                                    &mut turn_context_by_turn,
+                                                    active_turn_id.as_deref(),
+                                                    delta.len() as u64,
                                                 );
-                                                if !delta.is_empty() {
-                                                    let message_id = item_id.clone();
-                                                    if current_message_id.is_none() {
-                                                        stream_closed_by_turn_completion = false;
-                                                        accumulated_text.clear();
-                                                        accumulated_reasoning.clear();
-                                                        if !typing_status_active {
-                                                            emitter.typing_status_changed(true);
-                                                            typing_status_active = true;
-                                                        }
-                                                        emitter.stream_start(
-                                                            &message_id,
-                                                            AgentName(CODEX_AGENT_NAME),
-                                                            Some(&model_name),
-                                                        );
-                                                    }
-                                                    current_message_id = Some(message_id.clone());
-                                                    accumulated_reasoning.push_str(&delta);
-                                                    add_codex_loop_turn_reasoning_bytes(
-                                                        &mut turn_context_by_turn,
-                                                        active_turn_id.as_deref(),
-                                                        delta.len() as u64,
+                                                emitter.stream_reasoning_delta(&message_id, &delta);
+                                            }
+                                            close_stream_when_tools_idle = true;
+                                            maybe_finish_codex_loop_segment(
+                                                &emitter,
+                                                CodexLoopSegmentState {
+                                                    current_message_id: &mut current_message_id,
+                                                    accumulated_text: &mut accumulated_text,
+                                                    accumulated_reasoning: &mut accumulated_reasoning,
+                                                    close_stream_when_tools_idle:
+                                                        &mut close_stream_when_tools_idle,
+                                                    pending_message_metadata:
+                                                        &mut pending_message_metadata,
+                                                },
+                                                CodexLoopSegmentContext {
+                                                    pending_tool_call_ids: &pending_tool_call_ids,
+                                                    active_turn_id: active_turn_id.as_deref(),
+                                                    turn_context_by_turn: &turn_context_by_turn,
+                                                    model_name: &model_name,
+                                                },
+                                            );
+                                        }
+                                    }
+                                    "commandExecution" => {
+                                        add_codex_loop_turn_tool_bytes(
+                                            &mut turn_context_by_turn,
+                                            active_turn_id.as_deref(),
+                                            estimate_command_execution_tool_bytes(&item),
+                                        );
+                                        let exit_code =
+                                            item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1)
+                                                as i32;
+                                        let output = item
+                                            .get("aggregatedOutput")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let success = exit_code == 0;
+                                        let error_message = if success {
+                                            None
+                                        } else {
+                                            Some(format!("Command failed with exit code {exit_code}"))
+                                        };
+                                        emitter.tool_completed(ToolCompletedPayload {
+                                            tool_call_id: &item_id,
+                                            tool_name: "run_command",
+                                            tool_result: json!({
+                                                "kind": "RunCommand",
+                                                "exit_code": exit_code,
+                                                "stdout": output,
+                                                "stderr": "",
+                                            }),
+                                            success,
+                                            error: error_message.as_deref(),
+                                        });
+                                        pending_tool_call_ids.remove(&item_id);
+                                        maybe_finish_codex_loop_segment(
+                                            &emitter,
+                                            CodexLoopSegmentState {
+                                                current_message_id: &mut current_message_id,
+                                                accumulated_text: &mut accumulated_text,
+                                                accumulated_reasoning: &mut accumulated_reasoning,
+                                                close_stream_when_tools_idle:
+                                                    &mut close_stream_when_tools_idle,
+                                                pending_message_metadata: &mut pending_message_metadata,
+                                            },
+                                            CodexLoopSegmentContext {
+                                                pending_tool_call_ids: &pending_tool_call_ids,
+                                                active_turn_id: active_turn_id.as_deref(),
+                                                turn_context_by_turn: &turn_context_by_turn,
+                                                model_name: &model_name,
+                                            },
+                                        );
+                                    }
+                                    "fileChange" => {
+                                        add_codex_loop_turn_tool_bytes(
+                                            &mut turn_context_by_turn,
+                                            active_turn_id.as_deref(),
+                                            estimate_file_change_tool_bytes(&item),
+                                        );
+                                        let file_changes = parse_codex_file_changes(&item);
+                                        let success =
+                                            item.get("status").and_then(Value::as_str) == Some("completed");
+                                        let known_call_ids =
+                                            file_change_call_ids.remove(&item_id).unwrap_or_default();
+                                        let completions = codex_file_change_completion_plan(
+                                            &item_id,
+                                            &known_call_ids,
+                                            &file_changes,
+                                        );
+                                        if !completions.is_empty() {
+                                            for completion in completions {
+                                                if let Some(change) = completion.request.as_ref() {
+                                                    emit_modify_file_request_to(
+                                                        &emitter,
+                                                        &completion.call_id,
+                                                        &change.path,
+                                                        &change.before,
+                                                        &change.after,
                                                     );
-                                                    emitter.stream_reasoning_delta(&message_id, &delta);
                                                 }
-                                                close_stream_when_tools_idle = true;
-                                                maybe_finish_codex_loop_segment(
-                                                    &emitter,
-                                                    CodexLoopSegmentState {
-                                                        current_message_id: &mut current_message_id,
-                                                        accumulated_text: &mut accumulated_text,
-                                                        accumulated_reasoning: &mut accumulated_reasoning,
-                                                        close_stream_when_tools_idle:
-                                                            &mut close_stream_when_tools_idle,
-                                                        pending_message_metadata:
-                                                            &mut pending_message_metadata,
-                                                    },
-                                                    CodexLoopSegmentContext {
-                                                        pending_tool_call_ids: &pending_tool_call_ids,
-                                                        active_turn_id: active_turn_id.as_deref(),
-                                                        turn_context_by_turn: &turn_context_by_turn,
-                                                        model_name: &model_name,
-                                                    },
-                                                );
+                                                emitter.tool_completed(ToolCompletedPayload {
+                                                    tool_call_id: &completion.call_id,
+                                                    tool_name: "modify_file",
+                                                    tool_result: json!({
+                                                        "kind": "ModifyFile",
+                                                        "lines_added": completion.lines_added,
+                                                        "lines_removed": completion.lines_removed,
+                                                    }),
+                                                    success,
+                                                    error: (!success)
+                                                        .then_some("File changes were not applied"),
+                                                });
+                                                pending_tool_call_ids.remove(&completion.call_id);
                                             }
-                                        }
-                                        "commandExecution" => {
-                                            add_codex_loop_turn_tool_bytes(
-                                                &mut turn_context_by_turn,
-                                                active_turn_id.as_deref(),
-                                                estimate_command_execution_tool_bytes(&item),
-                                            );
-                                            let exit_code =
-                                                item.get("exitCode").and_then(Value::as_i64).unwrap_or(-1)
-                                                    as i32;
-                                            let output = item
-                                                .get("aggregatedOutput")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("")
-                                                .to_string();
-                                            let success = exit_code == 0;
-                                            let error_message = if success {
-                                                None
-                                            } else {
-                                                Some(format!("Command failed with exit code {exit_code}"))
-                                            };
-                                            emitter.tool_completed(ToolCompletedPayload {
-                                                tool_call_id: &item_id,
-                                                tool_name: "run_command",
-                                                tool_result: json!({
-                                                    "kind": "RunCommand",
-                                                    "exit_code": exit_code,
-                                                    "stdout": output,
-                                                    "stderr": "",
-                                                }),
-                                                success,
-                                                error: error_message.as_deref(),
-                                            });
-                                            pending_tool_call_ids.remove(&item_id);
                                             maybe_finish_codex_loop_segment(
                                                 &emitter,
                                                 CodexLoopSegmentState {
@@ -6262,7 +6758,8 @@ impl Backend for CodexBackend {
                                                     accumulated_reasoning: &mut accumulated_reasoning,
                                                     close_stream_when_tools_idle:
                                                         &mut close_stream_when_tools_idle,
-                                                    pending_message_metadata: &mut pending_message_metadata,
+                                                    pending_message_metadata:
+                                                        &mut pending_message_metadata,
                                                 },
                                                 CodexLoopSegmentContext {
                                                     pending_tool_call_ids: &pending_tool_call_ids,
@@ -6272,439 +6769,387 @@ impl Backend for CodexBackend {
                                                 },
                                             );
                                         }
-                                        "fileChange" => {
-                                            add_codex_loop_turn_tool_bytes(
-                                                &mut turn_context_by_turn,
-                                                active_turn_id.as_deref(),
-                                                estimate_file_change_tool_bytes(&item),
-                                            );
-                                            let file_changes = parse_codex_file_changes(&item);
-                                            let success =
-                                                item.get("status").and_then(Value::as_str) == Some("completed");
-                                            let known_call_ids =
-                                                file_change_call_ids.remove(&item_id).unwrap_or_default();
-                                            let completions = codex_file_change_completion_plan(
-                                                &item_id,
-                                                &known_call_ids,
-                                                &file_changes,
-                                            );
-                                            if !completions.is_empty() {
-                                                for completion in completions {
-                                                    if let Some(change) = completion.request.as_ref() {
-                                                        emit_modify_file_request_to(
-                                                            &emitter,
-                                                            &completion.call_id,
-                                                            &change.path,
-                                                            &change.before,
-                                                            &change.after,
-                                                        );
-                                                    }
-                                                    emitter.tool_completed(ToolCompletedPayload {
-                                                        tool_call_id: &completion.call_id,
-                                                        tool_name: "modify_file",
-                                                        tool_result: json!({
-                                                            "kind": "ModifyFile",
-                                                            "lines_added": completion.lines_added,
-                                                            "lines_removed": completion.lines_removed,
-                                                        }),
-                                                        success,
-                                                        error: (!success)
-                                                            .then_some("File changes were not applied"),
-                                                    });
-                                                    pending_tool_call_ids.remove(&completion.call_id);
-                                                }
-                                                maybe_finish_codex_loop_segment(
-                                                    &emitter,
-                                                    CodexLoopSegmentState {
-                                                        current_message_id: &mut current_message_id,
-                                                        accumulated_text: &mut accumulated_text,
-                                                        accumulated_reasoning: &mut accumulated_reasoning,
-                                                        close_stream_when_tools_idle:
-                                                            &mut close_stream_when_tools_idle,
-                                                        pending_message_metadata:
-                                                            &mut pending_message_metadata,
-                                                    },
-                                                    CodexLoopSegmentContext {
-                                                        pending_tool_call_ids: &pending_tool_call_ids,
-                                                        active_turn_id: active_turn_id.as_deref(),
-                                                        turn_context_by_turn: &turn_context_by_turn,
-                                                        model_name: &model_name,
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
-                                        | "dynamicToolCall" => {
-                                            let tool_name = item
-                                                .get("tool")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or(item_type)
-                                                .to_string();
-                                            let success =
-                                                item.get("status").and_then(Value::as_str) == Some("completed")
-                                                    || item.get("success").and_then(Value::as_bool)
-                                                        == Some(true);
-                                            let error_message =
-                                                (!success).then(|| format!("{tool_name} failed"));
-                                            if success {
-                                                emit_agent_control_spawn_progress_to(
-                                                    &emitter,
-                                                    &item_id,
-                                                    &tool_name,
-                                                    &item,
-                                                );
-                                            }
-                                            emitter.tool_completed(ToolCompletedPayload {
-                                                tool_call_id: &item_id,
-                                                tool_name: &tool_name,
-                                                tool_result: json!({
-                                                    "kind": "Other",
-                                                    "result": item,
-                                                }),
-                                                success,
-                                                error: error_message.as_deref(),
-                                            });
-                                            pending_tool_call_ids.remove(&item_id);
-                                            maybe_finish_codex_loop_segment(
+                                    }
+                                    "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
+                                    | "dynamicToolCall" => {
+                                        let tool_name = item
+                                            .get("tool")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or(item_type)
+                                            .to_string();
+                                        let success =
+                                            item.get("status").and_then(Value::as_str) == Some("completed")
+                                                || item.get("success").and_then(Value::as_bool)
+                                                    == Some(true);
+                                        let error_message =
+                                            (!success).then(|| format!("{tool_name} failed"));
+                                        if success {
+                                            emit_agent_control_spawn_progress_to(
                                                 &emitter,
-                                                CodexLoopSegmentState {
-                                                    current_message_id: &mut current_message_id,
-                                                    accumulated_text: &mut accumulated_text,
-                                                    accumulated_reasoning: &mut accumulated_reasoning,
-                                                    close_stream_when_tools_idle:
-                                                        &mut close_stream_when_tools_idle,
-                                                    pending_message_metadata: &mut pending_message_metadata,
-                                                },
-                                                CodexLoopSegmentContext {
-                                                    pending_tool_call_ids: &pending_tool_call_ids,
-                                                    active_turn_id: active_turn_id.as_deref(),
-                                                    turn_context_by_turn: &turn_context_by_turn,
-                                                    model_name: &model_name,
-                                                },
-                                            );
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                "item/started" => {
-                                    let item = params.get("item").cloned().unwrap_or(Value::Null);
-                                    let item_type = item
-                                        .get("type")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or_default();
-                                    let item_id = item
-                                        .get("id")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("tool-call")
-                                        .to_string();
-                                    if !item_type.is_empty() && started_item_types.len() < 8 {
-                                        started_item_types.push(item_type.to_string());
-                                    }
-                                    match item_type {
-                                        "commandExecution" => {
-                                            let command = item
-                                                .get("command")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("")
-                                                .to_string();
-                                            let cwd = item
-                                                .get("cwd")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("")
-                                                .to_string();
-                                            pending_tool_call_ids.insert(item_id.clone());
-                                            emitter.tool_request(
-                                                &item_id,
-                                                "run_command",
-                                                json!({
-                                                    "kind": "RunCommand",
-                                                    "command": command,
-                                                    "working_directory": cwd,
-                                                }),
-                                            );
-                                        }
-                                        "fileChange" => {
-                                            let file_changes = parse_codex_file_changes(&item);
-                                            if file_changes.is_empty() {
-                                                continue;
-                                            }
-                                            let total = file_changes.len();
-                                            let call_ids = file_changes
-                                                .iter()
-                                                .enumerate()
-                                                .map(|(idx, _)| {
-                                                    codex_file_change_call_id(&item_id, idx, total)
-                                                })
-                                                .collect::<Vec<_>>();
-                                            file_change_call_ids
-                                                .insert(item_id.clone(), call_ids.clone());
-                                            pending_tool_call_ids.extend(call_ids.iter().cloned());
-                                            for (change, call_id) in
-                                                file_changes.into_iter().zip(call_ids.into_iter())
-                                            {
-                                                emit_modify_file_request_to(
-                                                    &emitter,
-                                                    &call_id,
-                                                    &change.path,
-                                                    &change.before,
-                                                    &change.after,
-                                                );
-                                            }
-                                        }
-                                        "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
-                                        | "dynamicToolCall" => {
-                                            add_codex_loop_turn_tool_bytes(
-                                                &mut turn_context_by_turn,
-                                                active_turn_id.as_deref(),
-                                                estimate_generic_tool_bytes(&item),
-                                            );
-                                            let tool_name = item
-                                                .get("tool")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or(item_type)
-                                                .to_string();
-                                            pending_tool_call_ids.insert(item_id.clone());
-                                            emitter.tool_request(
                                                 &item_id,
                                                 &tool_name,
-                                                json!({
-                                                    "kind": "Other",
-                                                    "args": item,
-                                                }),
-                                            );
-                                            emit_agent_control_await_progress_to(
-                                                &emitter, &item_id, &tool_name, &item,
+                                                &item,
                                             );
                                         }
-                                        _ => {}
-                                    }
-                                }
-                                "turn/completed" => {
-                                    let turn_status = params
-                                        .get("turn")
-                                        .and_then(|v| v.get("status"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("completed");
-                                    let turn_id_for_log = active_turn_id.clone();
-                                    if let Some((turn_id, token_usage)) =
-                                        extract_turn_token_usage(&params, Some(&model_name))
-                                    {
-                                        token_usage_by_turn.insert(turn_id, token_usage);
-                                    }
-                                    let turn_error_message = (turn_status == "failed").then(|| {
-                                        params
-                                            .get("turn")
-                                            .and_then(|v| v.get("error"))
-                                            .and_then(|v| v.get("message"))
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("Codex turn failed")
-                                            .to_string()
-                                    });
-                                    active_turn_id = None;
-                                    if current_message_id.is_some() && turn_status != "interrupted" {
-                                        let final_text = std::mem::take(&mut accumulated_text);
-                                        let reasoning = contains_non_whitespace(&accumulated_reasoning)
-                                            .then(|| std::mem::take(&mut accumulated_reasoning));
-                                        let had_assistant_content = !final_text.trim().is_empty()
-                                            || saw_agent_message_delta
-                                            || saw_agent_message_completed;
-                                        let should_emit_empty_stream_end =
-                                            !had_assistant_content && turn_status != "failed";
-                                        if !had_assistant_content && !should_emit_empty_stream_end {
-                                            tracing::warn!(
-                                                turn_id = ?turn_id_for_log,
-                                                turn_status,
-                                                model = %model_name,
-                                                model_override = ?model_override,
-                                                reasoning_effort = ?effort_override,
-                                                reasoning_notification_count,
-                                                started_item_types = ?started_item_types,
-                                                completed_item_types = ?completed_item_types,
-                                                turn_error_message = ?turn_error_message,
-                                                "Codex turn completed without any assistant message content"
-                                            );
-                                        }
-                                        if had_assistant_content || should_emit_empty_stream_end {
-                                            if let Some(turn_id) = turn_id_for_log.as_ref() {
-                                                let turn_context = turn_context_by_turn
-                                                    .get(turn_id)
-                                                    .cloned()
-                                                    .unwrap_or_default();
-                                                if let Some(metadata) = metadata_target_for_visible_message(
-                                                    turn_id.clone(),
-                                                    current_message_id.clone().unwrap_or_default(),
-                                                    &final_text,
-                                                    reasoning.as_deref(),
-                                                    model_name.clone(),
-                                                    turn_context,
-                                                ) {
-                                                    pending_message_metadata =
-                                                        Some(CodexLoopPendingMessageMetadata {
-                                                            turn_id: metadata.turn_id,
-                                                            message_id: metadata.message_id,
-                                                            turn_context: metadata.turn_context,
-                                                        });
-                                                }
-                                            }
-                                            emitter.stream_end(StreamEndPayload {
-                                                content: final_text,
-                                                agent: Some(AgentName(CODEX_AGENT_NAME)),
-                                                model: Some(model_name.clone()),
-                                                request_usage: None,
-                turn_usage: None,
-                cumulative_usage: None,
-                                                reasoning,
-                                                tool_calls: Vec::new(),
-                                                context_breakdown: None,
-                                            });
-                                            stream_closed_by_turn_completion = true;
-                                        }
-                                        current_message_id = None;
-                                    }
-                                    if turn_status != "interrupted"
-                                        && let Some(turn_id) = turn_id_for_log.as_ref()
-                                        && pending_message_metadata
-                                            .as_ref()
-                                            .is_some_and(|pending| pending.turn_id == *turn_id)
-                                        && let Some(pending) = pending_message_metadata.take()
-                                    {
-                                        let usage = token_usage_by_turn.remove(turn_id);
-                                        let context_breakdown = estimate_context_breakdown(
-                                            usage.as_ref(),
-                                            &pending.turn_context,
-                                            Some(&model_name),
-                                        );
-                                        emitter.message_metadata_updated(MessageMetadataUpdatePayload {
-                                            message_id: pending.message_id,
-                                            model_info: Some(json!({ "model": model_name.clone() })),
-                                            request_usage: usage.clone(),
-                                            turn_usage: usage,
-                                            cumulative_usage: None,
-                                            context_breakdown: Some(context_breakdown),
+                                        emitter.tool_completed(ToolCompletedPayload {
+                                            tool_call_id: &item_id,
+                                            tool_name: &tool_name,
+                                            tool_result: json!({
+                                                "kind": "Other",
+                                                "result": item,
+                                            }),
+                                            success,
+                                            error: error_message.as_deref(),
                                         });
+                                        pending_tool_call_ids.remove(&item_id);
+                                        maybe_finish_codex_loop_segment(
+                                            &emitter,
+                                            CodexLoopSegmentState {
+                                                current_message_id: &mut current_message_id,
+                                                accumulated_text: &mut accumulated_text,
+                                                accumulated_reasoning: &mut accumulated_reasoning,
+                                                close_stream_when_tools_idle:
+                                                    &mut close_stream_when_tools_idle,
+                                                pending_message_metadata: &mut pending_message_metadata,
+                                            },
+                                            CodexLoopSegmentContext {
+                                                pending_tool_call_ids: &pending_tool_call_ids,
+                                                active_turn_id: active_turn_id.as_deref(),
+                                                turn_context_by_turn: &turn_context_by_turn,
+                                                model_name: &model_name,
+                                            },
+                                        );
                                     }
-                                    if turn_status == "interrupted" {
-                                        pending_message_metadata = None;
-                                        emitter.operation_cancelled("Operation cancelled");
-                                        typing_status_active = false;
-                                    }
-                                    if let Some(message) = turn_error_message {
-                                        emitter.error_message(&message);
-                                    }
-                                    if typing_status_active {
-                                        emitter.typing_status_changed(false);
-                                        typing_status_active = false;
-                                    }
-                                    pending_tool_call_ids.clear();
-                                    close_stream_when_tools_idle = false;
-                                    if let Some(turn_id) = turn_id_for_log.as_ref() {
-                                        token_usage_by_turn.remove(turn_id);
-                                        turn_context_by_turn.remove(turn_id);
-                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
-                        }
-                        input = input_rx.recv() => {
-                            let Some(input) = input else { break };
-                            match input {
-                                AgentInput::SendMessage(payload) => {
-                                    let backend_message = payload.message;
-                                    pending_user_input_bytes = backend_message.len() as u64;
-                                    let visible_message = backend_message.clone();
-                                    let visible_images = payload.images.clone();
-                                    let images = protocol_images_to_attachments(payload.images);
-                                    emitter.user_message(
-                                        &visible_message,
-                                        backend_user_image_values(visible_images),
-                                    );
-                                    let mut input_items = vec![json!({
-                                        "type": "text",
-                                        "text": backend_message,
-                                    })];
-                                    if let Some(imgs) = images {
-                                        for image in imgs {
-                                            let path = match persist_temp_image(&image).await {
-                                                Ok(path) => path,
-                                                Err(err) => {
-                                                    tracing::error!(
-                                                        "Failed to persist Codex image attachment: {err}"
-                                                    );
-                                                    continue;
-                                                }
-                                            };
-                                            input_items.push(json!({
-                                                "type": "localImage",
-                                                "path": path,
-                                            }));
+                            "item/started" => {
+                                let item = params.get("item").cloned().unwrap_or(Value::Null);
+                                let item_type = item
+                                    .get("type")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                let item_id = item
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("tool-call")
+                                    .to_string();
+                                if !item_type.is_empty() && started_item_types.len() < 8 {
+                                    started_item_types.push(item_type.to_string());
+                                }
+                                match item_type {
+                                    "commandExecution" => {
+                                        let command = item
+                                            .get("command")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let cwd = item
+                                            .get("cwd")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        pending_tool_call_ids.insert(item_id.clone());
+                                        emitter.tool_request(
+                                            &item_id,
+                                            "run_command",
+                                            json!({
+                                                "kind": "RunCommand",
+                                                "command": command,
+                                                "working_directory": cwd,
+                                            }),
+                                        );
+                                    }
+                                    "fileChange" => {
+                                        let file_changes = parse_codex_file_changes(&item);
+                                        if file_changes.is_empty() {
+                                            continue;
+                                        }
+                                        let total = file_changes.len();
+                                        let call_ids = file_changes
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(idx, _)| {
+                                                codex_file_change_call_id(&item_id, idx, total)
+                                            })
+                                            .collect::<Vec<_>>();
+                                        file_change_call_ids
+                                            .insert(item_id.clone(), call_ids.clone());
+                                        pending_tool_call_ids.extend(call_ids.iter().cloned());
+                                        for (change, call_id) in
+                                            file_changes.into_iter().zip(call_ids.into_iter())
+                                        {
+                                            emit_modify_file_request_to(
+                                                &emitter,
+                                                &call_id,
+                                                &change.path,
+                                                &change.before,
+                                                &change.after,
+                                            );
                                         }
                                     }
-                                    let mut turn_params = json!({
-                                        "threadId": thread_id_for_input,
-                                        "input": input_items,
-                                    });
-                                    if let Some(model) = model_for_input.clone() {
-                                        turn_params["model"] = Value::String(model);
-                                    }
-                                    if let Some(effort) = effort_for_input.clone() {
-                                        turn_params["effort"] = Value::String(effort);
-                                    }
-                                    turn_params["summary"] =
-                                        Value::String(CODEX_REASONING_SUMMARY_LEVEL.to_string());
-                                    turn_params["approvalPolicy"] =
-                                        Value::String(CODEX_FORCED_APPROVAL_POLICY.to_string());
-                                    turn_params["sandboxPolicy"] =
-                                        codex_sandbox_policy(
-                                            access_mode_for_input,
-                                            turn_network_access,
+                                    "collabToolCall" | "collabAgentToolCall" | "mcpToolCall"
+                                    | "dynamicToolCall" => {
+                                        add_codex_loop_turn_tool_bytes(
+                                            &mut turn_context_by_turn,
+                                            active_turn_id.as_deref(),
+                                            estimate_generic_tool_bytes(&item),
                                         );
-                                    let _ = rpc_request(
-                                        &stdin_for_input,
-                                        &pending_for_input,
-                                        &next_id_for_input,
-                                        "turn/start",
-                                        turn_params,
-                                    )
-                                    .await;
-                                }
-                                AgentInput::UpdateSessionSettings(payload) => {
-                                    let _ = rpc_request(
-                                        &stdin_for_input,
-                                        &pending_for_input,
-                                        &next_id_for_input,
-                                        "thread/update",
-                                        json!({
-                                            "threadId": thread_id_for_input,
-                                            "settings": session_settings_to_json(&payload.values),
-                                        }),
-                                    )
-                                    .await;
-                                }
-                                AgentInput::EditQueuedMessage(_)
-                                | AgentInput::CancelQueuedMessage(_)
-                                | AgentInput::SendQueuedMessageNow(_) => {
-                                    panic!(
-                                        "queued-message inputs must be handled by the agent actor before reaching the backend"
-                                    );
+                                        let tool_name = item
+                                            .get("tool")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or(item_type)
+                                            .to_string();
+                                        pending_tool_call_ids.insert(item_id.clone());
+                                        emitter.tool_request(
+                                            &item_id,
+                                            &tool_name,
+                                            json!({
+                                                "kind": "Other",
+                                                "args": item,
+                                            }),
+                                        );
+                                        emit_agent_control_await_progress_to(
+                                            &emitter, &item_id, &tool_name, &item,
+                                        );
+                                    }
+                                    _ => {}
                                 }
                             }
-                        }
-                        interrupt = interrupt_rx.recv() => {
-                            let Some(()) = interrupt else { break };
-                            let Some(turn_id) = active_turn_id.clone() else { continue };
-                            let _ = rpc_request(
-                                &stdin_for_input,
-                                &pending_for_input,
-                                &next_id_for_input,
-                                "turn/interrupt",
-                                json!({
-                                    "threadId": thread_id_for_input,
-                                    "turnId": turn_id,
-                                }),
-                            )
-                            .await;
+                            "turn/completed" => {
+                                let turn_status = params
+                                    .get("turn")
+                                    .and_then(|v| v.get("status"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("completed");
+                                let turn_id_for_log = active_turn_id.clone();
+                                if let Some((turn_id, token_usage)) =
+                                    extract_turn_token_usage(&params, Some(&model_name))
+                                {
+                                    token_usage_by_turn.insert(turn_id, token_usage);
+                                }
+                                let turn_error_message = (turn_status == "failed").then(|| {
+                                    params
+                                        .get("turn")
+                                        .and_then(|v| v.get("error"))
+                                        .and_then(|v| v.get("message"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("Codex turn failed")
+                                        .to_string()
+                                });
+                                active_turn_id = None;
+                                if current_message_id.is_some() && turn_status != "interrupted" {
+                                    let final_text = std::mem::take(&mut accumulated_text);
+                                    let reasoning = contains_non_whitespace(&accumulated_reasoning)
+                                        .then(|| std::mem::take(&mut accumulated_reasoning));
+                                    let had_assistant_content = !final_text.trim().is_empty()
+                                        || saw_agent_message_delta
+                                        || saw_agent_message_completed;
+                                    let should_emit_empty_stream_end =
+                                        !had_assistant_content && turn_status != "failed";
+                                    if !had_assistant_content && !should_emit_empty_stream_end {
+                                        tracing::warn!(
+                                            turn_id = ?turn_id_for_log,
+                                            turn_status,
+                                            model = %model_name,
+                                            model_override = ?model_override,
+                                            reasoning_effort = ?effort_override,
+                                            reasoning_notification_count,
+                                            started_item_types = ?started_item_types,
+                                            completed_item_types = ?completed_item_types,
+                                            turn_error_message = ?turn_error_message,
+                                            "Codex turn completed without any assistant message content"
+                                        );
+                                    }
+                                    if had_assistant_content || should_emit_empty_stream_end {
+                                        if let Some(turn_id) = turn_id_for_log.as_ref() {
+                                            let turn_context = turn_context_by_turn
+                                                .get(turn_id)
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            if let Some(metadata) = metadata_target_for_visible_message(
+                                                turn_id.clone(),
+                                                current_message_id.clone().unwrap_or_default(),
+                                                &final_text,
+                                                reasoning.as_deref(),
+                                                model_name.clone(),
+                                                turn_context,
+                                            ) {
+                                                pending_message_metadata =
+                                                    Some(CodexLoopPendingMessageMetadata {
+                                                        turn_id: metadata.turn_id,
+                                                        message_id: metadata.message_id,
+                                                        turn_context: metadata.turn_context,
+                                                    });
+                                            }
+                                        }
+                                        emitter.stream_end(StreamEndPayload {
+                                            content: final_text,
+                                            agent: Some(AgentName(CODEX_AGENT_NAME)),
+                                            model: Some(model_name.clone()),
+                                            request_usage: None,
+                                            turn_usage: None,
+                                            cumulative_usage: None,
+                                            token_usage_unavailable_reason: None,
+                                            reasoning,
+                                            tool_calls: Vec::new(),
+                                            context_breakdown: None,
+                                        });
+                                        stream_closed_by_turn_completion = true;
+                                    }
+                                    current_message_id = None;
+                                }
+                                if turn_status != "interrupted"
+                                    && let Some(turn_id) = turn_id_for_log.as_ref()
+                                    && pending_message_metadata
+                                        .as_ref()
+                                        .is_some_and(|pending| pending.turn_id == *turn_id)
+                                    && let Some(pending) = pending_message_metadata.take()
+                                {
+                                    let usage = token_usage_by_turn.remove(turn_id);
+                                    let context_breakdown = estimate_context_breakdown(
+                                        usage.as_ref(),
+                                        &pending.turn_context,
+                                        Some(&model_name),
+                                    );
+                                    if usage.is_none() {
+                                        completed_message_metadata_by_turn
+                                            .insert(turn_id.clone(), pending.clone());
+                                    }
+                                    emitter.message_metadata_updated(MessageMetadataUpdatePayload {
+                                        message_id: pending.message_id,
+                                        model_info: Some(json!({ "model": model_name.clone() })),
+                                        request_usage: usage.clone(),
+                                        turn_usage: usage,
+                                        cumulative_usage: None,
+                                        context_breakdown: Some(context_breakdown),
+                                    });
+                                }
+                                if turn_status == "interrupted" {
+                                    pending_message_metadata = None;
+                                    if let Some(turn_id) = turn_id_for_log.as_ref() {
+                                        completed_message_metadata_by_turn.remove(turn_id);
+                                    }
+                                    emitter.operation_cancelled("Operation cancelled");
+                                    typing_status_active = false;
+                                }
+                                if let Some(message) = turn_error_message {
+                                    emitter.error_message(&message);
+                                }
+                                if typing_status_active {
+                                    emitter.typing_status_changed(false);
+                                    typing_status_active = false;
+                                }
+                                pending_tool_call_ids.clear();
+                                close_stream_when_tools_idle = false;
+                                if let Some(turn_id) = turn_id_for_log.as_ref() {
+                                    token_usage_by_turn.remove(turn_id);
+                                    turn_context_by_turn.remove(turn_id);
+                                }
+                            }
+                            _ => {}
                         }
                     }
+                    input = input_rx.recv() => {
+                        let Some(input) = input else { break };
+                        match input {
+                            AgentInput::SendMessage(payload) => {
+                                let backend_message = payload.message;
+                                pending_user_input_bytes = backend_message.len() as u64;
+                                let visible_message = backend_message.clone();
+                                let visible_images = payload.images.clone();
+                                let images = protocol_images_to_attachments(payload.images);
+                                emitter.user_message(
+                                    &visible_message,
+                                    backend_user_image_values(visible_images),
+                                );
+                                let mut input_items = vec![json!({
+                                    "type": "text",
+                                    "text": backend_message,
+                                })];
+                                if let Some(imgs) = images {
+                                    for image in imgs {
+                                        let path = match persist_temp_image(&image).await {
+                                            Ok(path) => path,
+                                            Err(err) => {
+                                                tracing::error!(
+                                                    "Failed to persist Codex image attachment: {err}"
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        input_items.push(json!({
+                                            "type": "localImage",
+                                            "path": path,
+                                        }));
+                                    }
+                                }
+                                let mut turn_params = json!({
+                                    "threadId": thread_id_for_input,
+                                    "input": input_items,
+                                });
+                                if let Some(model) = model_for_input.clone() {
+                                    turn_params["model"] = Value::String(model);
+                                }
+                                if let Some(effort) = effort_for_input.clone() {
+                                    turn_params["effort"] = Value::String(effort);
+                                }
+                                turn_params["summary"] =
+                                    Value::String(CODEX_REASONING_SUMMARY_LEVEL.to_string());
+                                turn_params["approvalPolicy"] =
+                                    Value::String(CODEX_FORCED_APPROVAL_POLICY.to_string());
+                                turn_params["sandboxPolicy"] =
+                                    codex_sandbox_policy(
+                                        access_mode_for_input,
+                                        turn_network_access,
+                                    );
+                                let _ = rpc_request(
+                                    &stdin_for_input,
+                                    &pending_for_input,
+                                    &next_id_for_input,
+                                    "turn/start",
+                                    turn_params,
+                                )
+                                .await;
+                            }
+                            AgentInput::UpdateSessionSettings(payload) => {
+                                let _ = rpc_request(
+                                    &stdin_for_input,
+                                    &pending_for_input,
+                                    &next_id_for_input,
+                                    "thread/update",
+                                    json!({
+                                        "threadId": thread_id_for_input,
+                                        "settings": session_settings_to_json(&payload.values),
+                                    }),
+                                )
+                                .await;
+                            }
+                            AgentInput::EditQueuedMessage(_)
+                            | AgentInput::CancelQueuedMessage(_)
+                            | AgentInput::SendQueuedMessageNow(_) => {
+                                panic!(
+                                    "queued-message inputs must be handled by the agent actor before reaching the backend"
+                                );
+                            }
+                        }
+                    }
+                    interrupt = interrupt_rx.recv() => {
+                        let Some(()) = interrupt else { break };
+                        let Some(turn_id) = active_turn_id.clone() else { continue };
+                        let _ = rpc_request(
+                            &stdin_for_input,
+                            &pending_for_input,
+                            &next_id_for_input,
+                            "turn/interrupt",
+                            json!({
+                                "threadId": thread_id_for_input,
+                                "turnId": turn_id,
+                            }),
+                        )
+                        .await;
+                    }
+                }
             }
         });
 
@@ -7130,8 +7575,8 @@ mod tests {
         AgentId, AgentOrigin, AgentStartPayload, BackendKind, BackendSetupPayload, ChatEvent,
         Envelope, FrameKind, HostBootstrapPayload, HostSettings, MobileAccessStatePayload,
         MobileBrokerStatus, MobilePairingState, NewAgentPayload, PROTOCOL_VERSION,
-        ProtocolValidator, StreamPath, TeamPresetCatalog, ToolProgressUpdate, Version,
-        WelcomePayload,
+        ProtocolValidator, StreamPath, TeamPresetCatalog, TokenUsageScope, ToolProgressUpdate,
+        Version, WelcomePayload,
     };
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7388,6 +7833,62 @@ for line in sys.stdin:
                     "turn": {
                         "id": "turn-fresh",
                         "status": "completed"
+                    }
+                }
+            })
+        elif MODE == "fresh_late_token_usage":
+            send({
+                "jsonrpc": "2.0",
+                "method": "turn/started",
+                "params": {
+                    "threadId": "fresh-thread-id",
+                    "turn": {
+                        "id": "turn-fresh-late-usage"
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "fresh-thread-id",
+                    "itemId": "msg-fresh-late-usage",
+                    "delta": "fresh late done"
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "threadId": "fresh-thread-id",
+                    "item": {
+                        "id": "msg-fresh-late-usage",
+                        "type": "agentMessage",
+                        "text": "fresh late done"
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "fresh-thread-id",
+                    "turn": {
+                        "id": "turn-fresh-late-usage",
+                        "status": "completed"
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "fresh-thread-id",
+                    "turnId": "turn-fresh-late-usage",
+                    "tokenUsage": {
+                        "input_tokens": 31,
+                        "output_tokens": 10,
+                        "total_tokens": 41
                     }
                 }
             })
@@ -8137,6 +8638,7 @@ for line in sys.stdin:
             pending_tool_call_ids: HashSet::new(),
             close_active_stream_when_tools_idle: false,
             pending_message_metadata: None,
+            completed_message_metadata_by_turn: HashMap::new(),
             token_usage_by_turn: HashMap::new(),
             turn_context_by_turn: HashMap::new(),
             file_change_call_ids: HashMap::new(),
@@ -8145,6 +8647,7 @@ for line in sys.stdin:
             conversation_bytes_total: 0,
             subagent_emitter: None,
             subagent_streams: HashMap::new(),
+            completed_subagent_streams: HashMap::new(),
         }
     }
 
@@ -8195,6 +8698,30 @@ for line in sys.stdin:
             out.push(event);
         }
         out
+    }
+
+    async fn attach_test_codex_subagent(
+        inner: &Arc<CodexInner>,
+        subagent_tx: mpsc::UnboundedSender<Value>,
+        receiver_thread_id: &str,
+    ) {
+        let mut state = inner.state.lock().await;
+        state.thread_id = "thread-parent".to_string();
+        state.subagent_streams.insert(
+            "spawn-1".to_string(),
+            CodexSubAgentStream {
+                emitter: Arc::new(TurnEmitter::new_for_agent(
+                    subagent_tx,
+                    AgentName(CODEX_AGENT_NAME),
+                )),
+                receiver_thread_id: Some(receiver_thread_id.to_string()),
+                external_agent_id: Some(receiver_thread_id.to_string()),
+                active_turn_id: None,
+                current_message_id: None,
+                pending_message_metadata: None,
+                token_usage_by_turn: HashMap::new(),
+            },
+        );
     }
 
     fn event_kinds(events: &[Value]) -> Vec<&str> {
@@ -8357,6 +8884,92 @@ for line in sys.stdin:
         assert!(
             saw_spawn,
             "fresh Codex inline loop did not emit Spawn progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_backend_spawn_inline_loop_patches_late_token_usage_after_turn_completed() {
+        let fake = CodexFakeAppServer::new("fresh_late_token_usage", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_root = workspace.path().to_string_lossy().to_string();
+
+        let (backend, mut events) = <CodexBackend as Backend>::spawn(
+            vec![workspace_root],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: "start".to_string(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("Codex fresh spawn should start against fake app-server");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_stream_end = false;
+        let mut saw_pre_usage_metadata = false;
+        let mut saw_late_usage_metadata = false;
+        while tokio::time::Instant::now() < deadline && !saw_late_usage_metadata {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Some(ChatEvent::StreamEnd(data))) => {
+                    if data.message.content == "fresh late done" {
+                        saw_stream_end = true;
+                        assert!(
+                            data.message.token_usage.is_none(),
+                            "fresh Codex StreamEnd should not fabricate usage before late update"
+                        );
+                    }
+                }
+                Ok(Some(ChatEvent::MessageMetadataUpdated(update))) => {
+                    if update.message_id.0 != "msg-fresh-late-usage" {
+                        continue;
+                    }
+                    let Some(token_usage) = update.token_usage.as_ref() else {
+                        saw_pre_usage_metadata = true;
+                        continue;
+                    };
+                    match &token_usage.request {
+                        TokenUsageScope::Known { usage } => {
+                            assert_eq!(usage.total_tokens, 41);
+                        }
+                        other => panic!("expected known request usage patch, got {other:?}"),
+                    }
+                    match &token_usage.turn {
+                        TokenUsageScope::Known { usage } => {
+                            assert_eq!(usage.total_tokens, 41);
+                        }
+                        other => panic!("expected known turn usage patch, got {other:?}"),
+                    }
+                    assert!(
+                        !matches!(
+                            &token_usage.turn,
+                            TokenUsageScope::Known { usage } if usage.total_tokens == 0
+                        ),
+                        "late Codex usage must not be fabricated as Known(0)"
+                    );
+                    saw_late_usage_metadata = true;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        backend.shutdown().await;
+        assert!(
+            saw_stream_end,
+            "fresh Codex inline loop did not emit StreamEnd"
+        );
+        assert!(
+            saw_pre_usage_metadata,
+            "fresh Codex inline loop did not emit completed-turn metadata before late usage"
+        );
+        assert!(
+            saw_late_usage_metadata,
+            "fresh Codex inline loop did not patch late token usage metadata"
         );
     }
 
@@ -8566,6 +9179,7 @@ for line in sys.stdin:
             request_usage: None,
             turn_usage: None,
             cumulative_usage: None,
+            token_usage_unavailable_reason: None,
             reasoning,
             tool_calls: Vec::new(),
             context_breakdown: None,
@@ -9492,21 +10106,7 @@ Do not describe the tool, and do not skip the tool call."#;
             let (inner, mut parent_rx) = test_codex_inner();
             let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
 
-            {
-                let mut state = inner.state.lock().await;
-                state.thread_id = "thread-parent".to_string();
-                state.subagent_streams.insert(
-                    "spawn-1".to_string(),
-                    CodexSubAgentStream {
-                        emitter: Arc::new(TurnEmitter::new_for_agent(
-                            subagent_tx,
-                            AgentName(CODEX_AGENT_NAME),
-                        )),
-                        receiver_thread_id: Some("thread-sub-1".to_string()),
-                        external_agent_id: Some("thread-sub-1".to_string()),
-                    },
-                );
-            }
+            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-1").await;
 
             inner
                 .handle_notification(
@@ -9611,6 +10211,556 @@ Do not describe the tool, and do not skip the tool call."#;
                             == Some("LIVE_SUBAGENT_OK")
                 }),
                 "expected sub-agent StreamEnd with final message, got events={subagent_events:?}"
+            );
+
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn root_late_token_usage_after_turn_completed_updates_message_metadata() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut rx) = test_codex_inner();
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turn": { "id": "turn-root-late-usage" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "msg-root-late-usage",
+                            "text": "root done"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turn": {
+                            "id": "turn-root-late-usage",
+                            "status": "completed"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "thread/tokenUsage/updated",
+                    &json!({
+                        "threadId": "thread-test",
+                        "turnId": "turn-root-late-usage",
+                        "tokenUsage": {
+                            "input_tokens": 19,
+                            "output_tokens": 8,
+                            "total_tokens": 27
+                        }
+                    }),
+                )
+                .await;
+
+            let events = drain_events(&mut rx);
+            let metadata_updates = events
+                .iter()
+                .filter(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("MessageMetadataUpdated")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                metadata_updates.len(),
+                2,
+                "expected initial metadata plus late token usage patch: {events:?}"
+            );
+            let known_updates = metadata_updates
+                .iter()
+                .filter(|event| {
+                    event
+                        .pointer("/data/token_usage/turn/usage/total_tokens")
+                        .and_then(Value::as_u64)
+                        == Some(27)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                known_updates.len(),
+                1,
+                "late root usage should emit exactly one known metadata patch: {events:?}"
+            );
+            assert_eq!(
+                known_updates[0]
+                    .pointer("/data/message_id")
+                    .and_then(Value::as_str),
+                Some("turn-root-late-usage")
+            );
+            {
+                let state = inner.state.lock().await;
+                assert!(
+                    state.token_usage_by_turn.is_empty(),
+                    "late usage should not remain orphaned in root state"
+                );
+                assert!(
+                    state.completed_message_metadata_by_turn.is_empty(),
+                    "late usage target should be consumed after patching"
+                );
+            }
+
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn subagent_stream_end_uses_token_usage_reported_before_completion() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
+            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-usage").await;
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "thread-sub-usage",
+                        "turn": { "id": "turn-sub-usage" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "thread/tokenUsage/updated",
+                    &json!({
+                        "threadId": "thread-sub-usage",
+                        "turnId": "turn-sub-usage",
+                        "tokenUsage": {
+                            "input_tokens": 8,
+                            "output_tokens": 4,
+                            "total_tokens": 12
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-sub-usage",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "msg-sub-usage",
+                            "text": "sub done"
+                        }
+                    }),
+                )
+                .await;
+
+            let parent_events = drain_events(&mut parent_rx);
+            assert!(
+                parent_events.is_empty(),
+                "child token usage must not emit into parent stream: {parent_events:?}"
+            );
+
+            let subagent_events = drain_events(&mut subagent_rx);
+            let stream_end = subagent_events
+                .iter()
+                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
+                .expect("sub-agent StreamEnd");
+            assert_eq!(
+                stream_end
+                    .pointer("/data/message/token_usage/request/usage/total_tokens")
+                    .and_then(Value::as_u64),
+                Some(12)
+            );
+            assert_eq!(
+                stream_end
+                    .pointer("/data/message/token_usage/turn/usage/total_tokens")
+                    .and_then(Value::as_u64),
+                Some(12)
+            );
+
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn subagent_empty_token_usage_becomes_explicitly_unavailable() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
+            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-empty-usage").await;
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "thread-sub-empty-usage",
+                        "turn": { "id": "turn-sub-empty-usage" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "thread/tokenUsage/updated",
+                    &json!({
+                        "threadId": "thread-sub-empty-usage",
+                        "turnId": "turn-sub-empty-usage",
+                        "tokenUsage": {}
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-sub-empty-usage",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "msg-sub-empty-usage",
+                            "text": "sub done"
+                        }
+                    }),
+                )
+                .await;
+
+            let parent_events = drain_events(&mut parent_rx);
+            assert!(
+                parent_events.is_empty(),
+                "empty child token usage must not emit into parent stream: {parent_events:?}"
+            );
+
+            let subagent_events = drain_events(&mut subagent_rx);
+            let stream_end = subagent_events
+                .iter()
+                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
+                .expect("sub-agent StreamEnd");
+            assert_eq!(
+                stream_end
+                    .pointer("/data/message/token_usage/turn/kind")
+                    .and_then(Value::as_str),
+                Some("unavailable")
+            );
+            assert_eq!(
+                stream_end
+                    .pointer("/data/message/token_usage/turn/reason")
+                    .and_then(Value::as_str),
+                Some("backend_did_not_report")
+            );
+            assert!(
+                stream_end
+                    .pointer("/data/message/token_usage/turn/usage/total_tokens")
+                    .is_none(),
+                "empty usage must not be emitted as Known(0): {stream_end:?}"
+            );
+
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn subagent_late_token_usage_after_removal_patches_child_not_parent() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
+            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-removed-usage").await;
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "thread-sub-removed-usage",
+                        "turn": { "id": "turn-sub-removed-usage" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-sub-removed-usage",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "msg-sub-removed-usage",
+                            "text": "sub done"
+                        }
+                    }),
+                )
+                .await;
+            inner.complete_codex_subagent_if_needed("spawn-1").await;
+            inner
+                .handle_notification(
+                    "thread/tokenUsage/updated",
+                    &json!({
+                        "threadId": "thread-sub-removed-usage",
+                        "turnId": "turn-sub-removed-usage",
+                        "tokenUsage": {
+                            "input_tokens": 11,
+                            "output_tokens": 6,
+                            "total_tokens": 17
+                        }
+                    }),
+                )
+                .await;
+
+            let parent_events = drain_events(&mut parent_rx);
+            assert!(
+                parent_events.is_empty(),
+                "removed child token usage must not emit into parent stream: {parent_events:?}"
+            );
+            {
+                let state = inner.state.lock().await;
+                assert!(
+                    state.token_usage_by_turn.is_empty(),
+                    "removed child token usage must not pollute root pending usage"
+                );
+            }
+
+            let subagent_events = drain_events(&mut subagent_rx);
+            let stream_end = subagent_events
+                .iter()
+                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
+                .expect("sub-agent StreamEnd");
+            assert_eq!(
+                stream_end
+                    .pointer("/data/message/token_usage/turn/reason")
+                    .and_then(Value::as_str),
+                Some("backend_did_not_report")
+            );
+
+            let metadata_update = subagent_events
+                .iter()
+                .find(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("MessageMetadataUpdated")
+                })
+                .expect("sub-agent MessageMetadataUpdated");
+            assert_eq!(
+                metadata_update
+                    .pointer("/data/message_id")
+                    .and_then(Value::as_str),
+                Some("msg-sub-removed-usage")
+            );
+            assert_eq!(
+                metadata_update
+                    .pointer("/data/token_usage/turn/usage/total_tokens")
+                    .and_then(Value::as_u64),
+                Some(17)
+            );
+
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn subagent_turn_completed_usage_after_removal_patches_child_not_parent() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
+            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-removed-turn").await;
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "thread-sub-removed-turn",
+                        "turn": { "id": "turn-sub-removed-turn" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-sub-removed-turn",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "msg-sub-removed-turn",
+                            "text": "sub done"
+                        }
+                    }),
+                )
+                .await;
+            inner.complete_codex_subagent_if_needed("spawn-1").await;
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({
+                        "threadId": "thread-sub-removed-turn",
+                        "turn": {
+                            "id": "turn-sub-removed-turn",
+                            "status": "completed",
+                            "usage": {
+                                "input_tokens": 23,
+                                "output_tokens": 5,
+                                "total_tokens": 28
+                            }
+                        }
+                    }),
+                )
+                .await;
+
+            let parent_events = drain_events(&mut parent_rx);
+            assert!(
+                parent_events.is_empty(),
+                "removed child turn usage must not emit into parent stream: {parent_events:?}"
+            );
+            {
+                let state = inner.state.lock().await;
+                assert!(
+                    state.token_usage_by_turn.is_empty(),
+                    "removed child turn usage must not pollute root pending usage"
+                );
+            }
+
+            let subagent_events = drain_events(&mut subagent_rx);
+            let metadata_update = subagent_events
+                .iter()
+                .find(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("MessageMetadataUpdated")
+                })
+                .expect("sub-agent MessageMetadataUpdated");
+            assert_eq!(
+                metadata_update
+                    .pointer("/data/message_id")
+                    .and_then(Value::as_str),
+                Some("msg-sub-removed-turn")
+            );
+            assert_eq!(
+                metadata_update
+                    .pointer("/data/token_usage/turn/usage/total_tokens")
+                    .and_then(Value::as_u64),
+                Some(28)
+            );
+
+            inner.rpc.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn subagent_turn_completed_usage_updates_subagent_message_metadata() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (inner, mut parent_rx) = test_codex_inner();
+            let (subagent_tx, mut subagent_rx) = mpsc::unbounded_channel::<Value>();
+            attach_test_codex_subagent(&inner, subagent_tx, "thread-sub-late-usage").await;
+
+            inner
+                .handle_notification(
+                    "turn/started",
+                    &json!({
+                        "threadId": "thread-sub-late-usage",
+                        "turn": { "id": "turn-sub-late-usage" }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "item/completed",
+                    &json!({
+                        "threadId": "thread-sub-late-usage",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "msg-sub-late-usage",
+                            "text": "sub done"
+                        }
+                    }),
+                )
+                .await;
+            inner
+                .handle_notification(
+                    "turn/completed",
+                    &json!({
+                        "threadId": "thread-sub-late-usage",
+                        "turn": {
+                            "id": "turn-sub-late-usage",
+                            "status": "completed",
+                            "usage": {
+                                "input_tokens": 13,
+                                "output_tokens": 8,
+                                "total_tokens": 21
+                            }
+                        }
+                    }),
+                )
+                .await;
+
+            let parent_events = drain_events(&mut parent_rx);
+            assert!(
+                parent_events.is_empty(),
+                "late child token usage must not emit into parent stream: {parent_events:?}"
+            );
+
+            let subagent_events = drain_events(&mut subagent_rx);
+            let stream_end = subagent_events
+                .iter()
+                .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
+                .expect("sub-agent StreamEnd");
+            assert_eq!(
+                stream_end
+                    .pointer("/data/message/token_usage/turn/reason")
+                    .and_then(Value::as_str),
+                Some("backend_did_not_report")
+            );
+
+            let metadata_update = subagent_events
+                .iter()
+                .find(|event| {
+                    event.get("kind").and_then(Value::as_str) == Some("MessageMetadataUpdated")
+                })
+                .expect("sub-agent MessageMetadataUpdated");
+            assert_eq!(
+                metadata_update
+                    .pointer("/data/message_id")
+                    .and_then(Value::as_str),
+                Some("msg-sub-late-usage")
+            );
+            assert_eq!(
+                metadata_update
+                    .pointer("/data/token_usage/request/usage/total_tokens")
+                    .and_then(Value::as_u64),
+                Some(21)
+            );
+            assert_eq!(
+                metadata_update
+                    .pointer("/data/token_usage/turn/usage/total_tokens")
+                    .and_then(Value::as_u64),
+                Some(21)
             );
 
             inner.rpc.shutdown().await;
@@ -10565,7 +11715,8 @@ Do not describe the tool, and do not skip the tool call."#;
             }),
             None,
             None,
-        );
+        )
+        .expect("valid token usage");
 
         assert_eq!(normalized["input_tokens"], json!(120));
         assert_eq!(normalized["output_tokens"], json!(80));
@@ -10574,6 +11725,33 @@ Do not describe the tool, and do not skip the tool call."#;
         assert_eq!(normalized["cache_creation_input_tokens"], json!(5));
         assert_eq!(normalized["reasoning_tokens"], json!(7));
         assert_eq!(normalized["context_window"], json!(200000));
+    }
+
+    #[test]
+    fn extract_turn_token_usage_ignores_null_empty_and_context_only_usage() {
+        let null_usage = json!({
+            "turn": {
+                "id": "turn_null",
+                "usage": Value::Null
+            }
+        });
+        assert!(extract_turn_token_usage(&null_usage, None).is_none());
+
+        let empty_usage = json!({
+            "turnId": "turn_empty",
+            "tokenUsage": {}
+        });
+        assert!(extract_turn_token_usage(&empty_usage, None).is_none());
+
+        let context_only_usage = json!({
+            "turn": {
+                "id": "turn_context",
+                "usage": {
+                    "contextWindow": 400_000
+                }
+            }
+        });
+        assert!(extract_turn_token_usage(&context_only_usage, None).is_none());
     }
 
     #[test]

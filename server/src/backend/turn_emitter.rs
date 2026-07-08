@@ -35,7 +35,7 @@ use indexmap::IndexMap;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use protocol::TaskList;
+use protocol::{TaskList, TokenUsageUnavailableReason};
 
 /// Sender half of the wire channel. Kept private to this module; every
 /// emission must go through the typed methods below.
@@ -73,6 +73,7 @@ pub struct StreamEndPayload<'a> {
     pub request_usage: Option<Value>,
     pub turn_usage: Option<Value>,
     pub cumulative_usage: Option<Value>,
+    pub token_usage_unavailable_reason: Option<TokenUsageUnavailableReason>,
     pub reasoning: Option<String>,
     pub tool_calls: Vec<Value>,
     pub context_breakdown: Option<Value>,
@@ -511,6 +512,7 @@ impl TurnEmitterState {
             payload.request_usage,
             payload.turn_usage,
             payload.cumulative_usage,
+            None,
         );
         self.send(json!({
             "kind": "MessageMetadataUpdated",
@@ -715,6 +717,7 @@ fn build_stream_end_value(
         payload.request_usage.clone(),
         payload.turn_usage.clone(),
         payload.cumulative_usage.clone(),
+        payload.token_usage_unavailable_reason,
     );
     let reasoning_value = payload
         .reasoning
@@ -770,6 +773,7 @@ fn build_assistant_message_value(payload: &AssistantMessagePayload<'_>) -> Value
                 payload.request_usage.clone(),
                 payload.turn_usage.clone(),
                 payload.cumulative_usage.clone(),
+                None,
             ),
             "context_breakdown": payload.context_breakdown.clone().unwrap_or(Value::Null),
             "images": payload.images,
@@ -781,9 +785,18 @@ fn build_message_token_usage_value(
     request_usage: Option<Value>,
     turn_usage: Option<Value>,
     cumulative_usage: Option<Value>,
+    unavailable_reason: Option<TokenUsageUnavailableReason>,
 ) -> Value {
     if request_usage.is_none() && turn_usage.is_none() && cumulative_usage.is_none() {
-        return Value::Null;
+        return unavailable_reason
+            .map(|reason| {
+                json!({
+                    "request": token_usage_unavailable_scope_value(reason),
+                    "turn": token_usage_unavailable_scope_value(reason),
+                    "cumulative": token_usage_unavailable_scope_value(reason),
+                })
+            })
+            .unwrap_or(Value::Null);
     }
     json!({
         "request": token_usage_scope_value(request_usage),
@@ -795,10 +808,23 @@ fn build_message_token_usage_value(
 fn token_usage_scope_value(usage: Option<Value>) -> Value {
     match usage {
         Some(usage) => json!({ "kind": "known", "usage": usage }),
-        None => json!({
-            "kind": "unavailable",
-            "reason": "backend_did_not_report",
-        }),
+        None => {
+            token_usage_unavailable_scope_value(TokenUsageUnavailableReason::BackendDidNotReport)
+        }
+    }
+}
+
+fn token_usage_unavailable_scope_value(reason: TokenUsageUnavailableReason) -> Value {
+    json!({
+        "kind": "unavailable",
+        "reason": token_usage_unavailable_reason_str(reason),
+    })
+}
+
+fn token_usage_unavailable_reason_str(reason: TokenUsageUnavailableReason) -> &'static str {
+    match reason {
+        TokenUsageUnavailableReason::BackendDidNotReport => "backend_did_not_report",
+        TokenUsageUnavailableReason::ProviderScopeAmbiguous => "provider_scope_ambiguous",
     }
 }
 
@@ -1101,6 +1127,7 @@ mod tests {
             request_usage: None,
             turn_usage: None,
             cumulative_usage: None,
+            token_usage_unavailable_reason: None,
             reasoning: None,
             tool_calls: Vec::new(),
             context_breakdown: None,
@@ -1162,6 +1189,41 @@ mod tests {
                 .pointer("/data/token_usage/turn/usage/total_tokens")
                 .and_then(Value::as_u64),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn stream_end_emits_explicit_unavailable_token_usage_when_requested() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let emitter = TurnEmitter::new(tx);
+        emitter.stream_end(StreamEndPayload {
+            content: "done".to_string(),
+            token_usage_unavailable_reason: Some(TokenUsageUnavailableReason::BackendDidNotReport),
+            ..StreamEndPayload::default()
+        });
+        drop(emitter);
+
+        let events = recv_events(&mut rx);
+        assert_protocol_valid(&events);
+        let stream_end = events
+            .iter()
+            .find(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
+            .expect("StreamEnd event");
+        assert_eq!(
+            stream_end.pointer("/data/message/token_usage/request/kind"),
+            Some(&Value::String("unavailable".to_string()))
+        );
+        assert_eq!(
+            stream_end
+                .pointer("/data/message/token_usage/turn/reason")
+                .and_then(Value::as_str),
+            Some("backend_did_not_report")
+        );
+        assert_eq!(
+            stream_end
+                .pointer("/data/message/token_usage/cumulative/reason")
+                .and_then(Value::as_str),
+            Some("backend_did_not_report")
         );
     }
 

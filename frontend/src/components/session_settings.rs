@@ -553,6 +553,26 @@ fn task_scope_view(scope: &TaskTokenUsageScope) -> AnyView {
             }
             .into_any()
         }
+        TaskTokenUsageScope::Partial {
+            usage,
+            unavailable_count,
+            ..
+        } => {
+            let (input_text, output_text) = task_amount_texts(usage);
+            let marker = format!("partial \u{b7} {unavailable_count} unreported");
+            view! {
+                <span class="session-task-row-usage">
+                    <span class="token-stat token-stat-input">{input_text}</span>
+                    {output_text.map(|text| view! {
+                        <span class="token-stat token-stat-output">{text}</span>
+                    })}
+                    <span class="session-task-status session-task-status-partial">
+                        {marker}
+                    </span>
+                </span>
+            }
+            .into_any()
+        }
         TaskTokenUsageScope::Unavailable { reason } => view! {
             <span class="session-task-row-usage session-task-row-unavailable">
                 {task_usage_unavailable_text(*reason)}
@@ -916,6 +936,14 @@ mod wasm_tests {
         }
     }
 
+    fn partial_scope(input: u64, output: u64) -> TaskTokenUsageScope {
+        TaskTokenUsageScope::Partial {
+            usage: Box::new(known_amount(input, output)),
+            unavailable_count: 1,
+            reasons: vec![TaskTokenUsageUnavailableReason::BackendDidNotReport],
+        }
+    }
+
     fn entry(
         agent_id: &str,
         parent_agent_id: Option<&str>,
@@ -1106,6 +1134,10 @@ mod wasm_tests {
             "a Partial rollup must be visibly marked, got: {badge_text}"
         );
         assert!(
+            !badge_text.contains("unavailable"),
+            "a Partial rollup with a known total must not look all-unavailable, got: {badge_text}"
+        );
+        assert!(
             query(&container, ".session-task-popover").is_none(),
             "breakdown must not be shown before click/hover"
         );
@@ -1216,6 +1248,59 @@ mod wasm_tests {
         assert!(
             query(&container, ".session-task-popover").is_none(),
             "clicking the badge again must close the breakdown"
+        );
+    }
+
+    /// A row-level Partial scope is not an all-unavailable row: it carries the
+    /// reported number and a visible unreported marker in the breakdown.
+    #[wasm_bindgen_test]
+    async fn task_partial_breakdown_row_shows_number_and_unreported_marker() {
+        let container = make_container();
+        let state = make_state_with_active_agent("h-task-row-partial", "root");
+        let mut rollup = partial_rollup("root", 500, 100);
+        rollup.breakdown[1].usage = partial_scope(1_000, 200);
+        rollup.total.status = TaskTokenUsageStatus::Partial {
+            unavailable_count: 2,
+            reasons: vec![TaskTokenUsageUnavailableReason::BackendDidNotReport],
+        };
+        rollup.descendant_usage.status = TaskTokenUsageStatus::Partial {
+            unavailable_count: 2,
+            reasons: vec![TaskTokenUsageUnavailableReason::BackendDidNotReport],
+        };
+        dispatch_task_usage(&state, "h-task-row-partial", 0, &rollup);
+        let _handle = mount_bar(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let badge = query(&container, ".session-task-toggle").expect("task badge should render");
+        badge.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let rows = container
+            .query_selector_all(".session-task-row")
+            .expect("rows query");
+        let row_texts: Vec<String> = (0..rows.length())
+            .map(|i| rows.item(i).unwrap().text_content().unwrap_or_default())
+            .collect();
+        let child_a_text = row_texts
+            .iter()
+            .find(|text| text.contains("Child A"))
+            .expect("child A row rendered");
+
+        assert!(
+            child_a_text.contains("\u{2191}1.0K") && child_a_text.contains("\u{2193}200"),
+            "partial row must show the reported token figure, got: {child_a_text}"
+        );
+        assert!(
+            child_a_text.contains("partial") && child_a_text.contains("1 unreported"),
+            "partial row must show an unreported marker, got: {child_a_text}"
+        );
+        assert!(
+            !child_a_text.contains("usage unavailable")
+                && !child_a_text.contains("backend did not report"),
+            "partial row must not render as all-unavailable, got: {child_a_text}"
         );
     }
 

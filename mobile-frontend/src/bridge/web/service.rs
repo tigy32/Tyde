@@ -41,7 +41,8 @@
 //! ```js
 //! window.__TYDE_MOBILE_SERVICE__ = {
 //!   baseUrl: "https://tycode.dev/api/tyde/mobile/v1",   // enables the live client
-//!   provider: "google",                                 // "google" | "apple"
+//!   providers: ["apple", "google"],                     // ordered sign-in choices
+//!   // Legacy deployed configs may still use provider: "google" | "apple".
 //!   // Dev/test-only deterministic outcomes (used by wasm tests):
 //!   stubAuth: "authenticated" | "pass_required" | "auth_failed" | "service_unavailable",
 //!   stubRedeem: "ok" | "repair_required" | "pass_required" | "service_unavailable",
@@ -91,6 +92,25 @@ const DEFAULT_AUTH_PROVIDER: AuthProvider = AuthProvider::Google;
 /// dance. Read from the query string or the URL fragment, stripped immediately,
 /// and exchanged for the session cookie via `POST /auth/session`.
 const HANDOFF_CODE_KEY: &str = "handoffCode";
+const AUTH_CALLBACK_PARAM_KEYS: &[&str] = &[
+    "oauth",
+    "provider",
+    "code",
+    "error",
+    "error_code",
+    "error_description",
+    "message",
+    "auth",
+    "auth_error",
+    "oauth_error",
+];
+const RETURN_TO_SECRET_PARAM_KEYS: &[&str] = &[
+    HANDOFF_CODE_KEY,
+    "offer_secret",
+    "offerSecret",
+    "room",
+    "psk",
+];
 /// Refresh managed broker credentials this long before they expire so a
 /// reconnect never hands the transport an already-dead grant.
 const CREDENTIAL_REFRESH_MARGIN_MS: u64 = 30_000;
@@ -169,24 +189,31 @@ pub fn clear_cached_credentials(local_host_id: &LocalHostId) {
 // ── Config ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthProvider {
-    Google,
+pub enum AuthProvider {
     Apple,
+    Google,
 }
 
 impl AuthProvider {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
-            "google" => Ok(Self::Google),
             "apple" => Ok(Self::Apple),
+            "google" => Ok(Self::Google),
             other => Err(format!("unsupported Tyggs OAuth provider {other:?}")),
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Google => "google",
             Self::Apple => "apple",
+            Self::Google => "google",
+        }
+    }
+
+    pub fn sign_in_label(self) -> &'static str {
+        match self {
+            Self::Apple => "Continue with Apple",
+            Self::Google => "Continue with Google",
         }
     }
 }
@@ -194,7 +221,7 @@ impl AuthProvider {
 #[derive(Debug, Clone)]
 struct ServiceConfig {
     base_url: Option<String>,
-    provider: Result<AuthProvider, String>,
+    providers: Result<Vec<AuthProvider>, String>,
     stub_auth: Option<String>,
     stub_redeem: Option<String>,
     paywall_url: Option<String>,
@@ -204,7 +231,7 @@ impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             base_url: None,
-            provider: Ok(DEFAULT_AUTH_PROVIDER),
+            providers: Ok(vec![DEFAULT_AUTH_PROVIDER]),
             stub_auth: None,
             stub_redeem: None,
             paywall_url: None,
@@ -231,13 +258,70 @@ fn load_config() -> ServiceConfig {
     ServiceConfig {
         base_url: read_string_field(&config, "baseUrl")
             .map(|url| url.trim_end_matches('/').to_owned()),
-        provider: read_string_field(&config, "provider")
-            .map(|provider| AuthProvider::parse(&provider))
-            .unwrap_or(Ok(DEFAULT_AUTH_PROVIDER)),
+        providers: read_auth_providers(&config),
         stub_auth: read_string_field(&config, "stubAuth"),
         stub_redeem: read_string_field(&config, "stubRedeem"),
         paywall_url: read_string_field(&config, "paywallUrl"),
     }
+}
+
+fn read_auth_providers(config: &JsValue) -> Result<Vec<AuthProvider>, String> {
+    if let Ok(value) = js_sys::Reflect::get(config, &JsValue::from_str("providers"))
+        && !value.is_undefined()
+        && !value.is_null()
+    {
+        return parse_provider_array(&value);
+    }
+
+    if let Ok(value) = js_sys::Reflect::get(config, &JsValue::from_str("provider"))
+        && !value.is_undefined()
+        && !value.is_null()
+    {
+        let raw = value.as_string().ok_or_else(|| {
+            "managed mobile auth config field `provider` must be a string".to_owned()
+        })?;
+        let provider = raw.trim();
+        if provider.is_empty() {
+            return Err("managed mobile auth config field `provider` must not be empty".to_owned());
+        }
+        return AuthProvider::parse(provider).map(|provider| vec![provider]);
+    }
+
+    Ok(vec![DEFAULT_AUTH_PROVIDER])
+}
+
+fn parse_provider_array(value: &JsValue) -> Result<Vec<AuthProvider>, String> {
+    if !js_sys::Array::is_array(value) {
+        return Err(
+            "managed mobile auth config field `providers` must be a non-empty array".to_owned(),
+        );
+    }
+    let array = js_sys::Array::from(value);
+    if array.length() == 0 {
+        return Err("managed mobile auth config field `providers` must not be empty".to_owned());
+    }
+
+    let mut providers = Vec::new();
+    for index in 0..array.length() {
+        let raw = array
+            .get(index)
+            .as_string()
+            .ok_or_else(|| format!("managed mobile auth provider #{index} must be a string"))?;
+        let provider = raw.trim();
+        if provider.is_empty() {
+            return Err(format!(
+                "managed mobile auth provider #{index} must not be empty"
+            ));
+        }
+        let provider = AuthProvider::parse(provider)?;
+        if providers.contains(&provider) {
+            return Err(format!(
+                "managed mobile auth provider {provider:?} is configured more than once"
+            ));
+        }
+        providers.push(provider);
+    }
+    Ok(providers)
 }
 
 fn paywall_url(config: &ServiceConfig) -> String {
@@ -279,26 +363,33 @@ pub async fn authenticate(qr_uri: &str) -> MobileServiceAuthState {
     }
 }
 
-/// The full-page URL that starts the Tyggs sign-in through `tycode.dev`. `None`
-/// when no service endpoint is configured (so the UI fails closed instead of
-/// navigating nowhere). `provider` selects the OAuth provider (defaults to
-/// [`DEFAULT_AUTH_PROVIDER`]); `return_to` brings the browser back to the current
-/// app URL, where the appended one-time `handoffCode` is exchanged for the
-/// session cookie (see [`complete_handoff`]).
-pub fn tyggs_sign_in_url() -> Option<String> {
+/// Configured OAuth providers for the Tyggs sign-in UI, in display order.
+pub fn auth_providers() -> Result<Vec<AuthProvider>, String> {
+    load_config().providers
+}
+
+/// The full-page URL that starts the Tyggs sign-in through `tycode.dev` for an
+/// explicitly selected, configured provider. `return_to` brings the browser back
+/// to the current app URL, where the appended one-time `handoffCode` is
+/// exchanged for the session cookie (see [`complete_handoff`]).
+pub fn tyggs_sign_in_url(provider: AuthProvider) -> Result<String, String> {
     let config = load_config();
-    let base_url = config.base_url.clone()?;
-    let provider = match config.provider {
-        Ok(provider) => provider,
-        Err(message) => {
-            log::error!("invalid managed mobile auth provider: {message}");
-            return None;
-        }
-    };
-    let return_to = sanitized_return_to_url()?;
+    let base_url = config.base_url.clone().ok_or_else(|| {
+        "Tyde managed mobile access isn't configured in this build, so sign-in can't start."
+            .to_owned()
+    })?;
+    let providers = config.providers?;
+    if !providers.contains(&provider) {
+        return Err(format!(
+            "Tyggs OAuth provider {:?} is not enabled in this build",
+            provider.as_str()
+        ));
+    }
+    let return_to =
+        sanitized_return_to_url().ok_or_else(|| "failed to read the current app URL".to_owned())?;
     let encoded_provider = js_sys::encode_uri_component(provider.as_str());
     let encoded_return = js_sys::encode_uri_component(&return_to);
-    Some(format!(
+    Ok(format!(
         "{base_url}/auth/start?provider={encoded_provider}&return_to={encoded_return}"
     ))
 }
@@ -308,17 +399,71 @@ fn sanitized_return_to_url() -> Option<String> {
     let href = window.location().href().ok()?;
     let url = web_sys::Url::new(&href).ok()?;
     url.set_protocol("https:");
+    strip_return_to_search_params(&url);
     url.set_hash("");
-    for key in [
-        HANDOFF_CODE_KEY,
-        "offer_secret",
-        "offerSecret",
-        "room",
-        "psk",
-    ] {
+    Some(url.href())
+}
+
+fn strip_return_to_search_params(url: &web_sys::Url) {
+    strip_search_params(url, RETURN_TO_SECRET_PARAM_KEYS);
+    strip_search_params(url, AUTH_CALLBACK_PARAM_KEYS);
+}
+
+fn strip_search_params(url: &web_sys::Url, keys: &[&str]) {
+    for key in keys {
         url.search_params().delete(key);
     }
-    Some(url.href())
+}
+
+fn strip_auth_callback_params(url: &web_sys::Url) {
+    strip_search_params(url, AUTH_CALLBACK_PARAM_KEYS);
+    strip_fragment_params(url, AUTH_CALLBACK_PARAM_KEYS);
+}
+
+fn strip_fragment_params(url: &web_sys::Url, keys: &[&str]) {
+    let hash = url.hash();
+    let fragment = hash.strip_prefix('#').unwrap_or(&hash);
+    if fragment.is_empty() {
+        return;
+    }
+
+    let mut kept = Vec::new();
+    let mut changed = false;
+    for part in fragment.split('&') {
+        let key = part.split_once('=').map_or(part, |(key, _)| key);
+        let key = decode_uri_component(key);
+        if keys.contains(&key.as_str()) {
+            changed = true;
+        } else {
+            kept.push(part);
+        }
+    }
+    if !changed {
+        return;
+    }
+    if kept.is_empty() {
+        url.set_hash("");
+    } else {
+        url.set_hash(&kept.join("&"));
+    }
+}
+
+fn cleanup_current_auth_callback_url() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let location = window.location();
+    let Ok(href) = location.href() else {
+        return;
+    };
+    let Ok(url) = web_sys::Url::new(&href) else {
+        return;
+    };
+    let before = url.href();
+    strip_auth_callback_params(&url);
+    if url.href() != before {
+        replace_url(&window, &url);
+    }
 }
 
 /// Redeems the scanned offer against `tycode.dev` (`POST /pairings/redeem`,
@@ -387,6 +532,7 @@ async fn authenticate_live(base_url: &str, config: &ServiceConfig) -> MobileServ
     if let Some(handoff_code) = take_handoff_code() {
         return complete_handoff(base_url, config, &handoff_code).await;
     }
+    cleanup_current_auth_callback_url();
     let url = format!("{base_url}/auth/session");
     match send(HttpMethod::Get, &url, None, &[]).await {
         Ok(HttpJson { status, body }) if status < 300 => {
@@ -503,6 +649,7 @@ fn take_handoff_code() -> Option<String> {
         .filter(|value| !value.is_empty())
     {
         url.search_params().delete(HANDOFF_CODE_KEY);
+        strip_return_to_search_params(&url);
         url.set_hash("");
         replace_url(&window, &url);
         return Some(code);
@@ -524,6 +671,7 @@ fn take_handoff_code() -> Option<String> {
         }
     }
     let code = found?;
+    strip_return_to_search_params(&url);
     url.set_hash("");
     replace_url(&window, &url);
     Some(code)
@@ -2103,13 +2251,16 @@ mod wasm_tests {
         set_config("");
     }
 
-    /// The Tyggs sign-in URL must carry the configured provider and a
-    /// `return_to` back to the app, so `tycode.dev` can run OAuth server-side and
-    /// redirect the handoff marker back here (consensus contract).
+    /// The Tyggs sign-in URL must carry the explicitly selected provider and a
+    /// `return_to` back to the app, so `tycode.dev` can run OAuth server-side
+    /// and redirect the handoff marker back here (consensus contract).
     #[wasm_bindgen_test]
-    fn sign_in_url_carries_provider_and_return_to() {
-        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"apple"}"#);
-        let url = tyggs_sign_in_url().expect("a configured build yields a sign-in url");
+    fn sign_in_url_carries_explicit_provider_and_return_to() {
+        set_config(
+            r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","providers":["apple","google"]}"#,
+        );
+        let url = tyggs_sign_in_url(AuthProvider::Apple)
+            .expect("a configured build yields a sign-in url");
         assert!(
             url.starts_with("https://tycode.dev/api/tyde/mobile/v1/auth/start?"),
             "sign-in must hit the same-origin /auth/start endpoint: {url}"
@@ -2125,12 +2276,64 @@ mod wasm_tests {
         set_config("");
     }
 
-    /// With no `provider` configured the start URL falls back to the single
-    /// default provider rather than omitting the parameter the contract requires.
+    #[wasm_bindgen_test]
+    fn provider_list_parses_ordered_apple_then_google() {
+        set_config(
+            r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","providers":["apple","google"]}"#,
+        );
+
+        assert_eq!(
+            auth_providers().expect("valid provider list"),
+            vec![AuthProvider::Apple, AuthProvider::Google]
+        );
+        let apple = tyggs_sign_in_url(AuthProvider::Apple).expect("apple url");
+        let google = tyggs_sign_in_url(AuthProvider::Google).expect("google url");
+        assert!(
+            apple.contains("provider=apple"),
+            "Apple sign-in must select Apple: {apple}"
+        );
+        assert!(
+            google.contains("provider=google"),
+            "Google sign-in must select Google: {google}"
+        );
+
+        set_config("");
+    }
+
+    /// Legacy single-provider config remains supported for already-deployed
+    /// loader shells.
+    #[wasm_bindgen_test]
+    fn legacy_provider_config_produces_single_choice() {
+        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
+
+        assert_eq!(
+            auth_providers().expect("legacy provider config"),
+            vec![AuthProvider::Google]
+        );
+        let url = tyggs_sign_in_url(AuthProvider::Google).expect("google url");
+        assert!(
+            url.contains("provider=google"),
+            "legacy config must still build a Google URL: {url}"
+        );
+        assert!(
+            tyggs_sign_in_url(AuthProvider::Apple).is_err(),
+            "legacy Google-only config must not allow Apple implicitly"
+        );
+
+        set_config("");
+    }
+
+    /// With no provider config the start URL falls back to the single default
+    /// provider rather than omitting the parameter the contract requires.
     #[wasm_bindgen_test]
     fn sign_in_url_defaults_provider() {
         set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1"}"#);
-        let url = tyggs_sign_in_url().expect("a configured build yields a sign-in url");
+        assert_eq!(
+            auth_providers().expect("default provider"),
+            vec![DEFAULT_AUTH_PROVIDER]
+        );
+        let url = tyggs_sign_in_url(DEFAULT_AUTH_PROVIDER)
+            .expect("a configured build yields a sign-in url");
         assert!(
             url.contains(&format!("provider={}", DEFAULT_AUTH_PROVIDER.as_str())),
             "the default provider must be applied: {url}"
@@ -2141,13 +2344,31 @@ mod wasm_tests {
     /// The live config/default must use a service-accepted provider rather than
     /// the old product label (`tyggs`), and invalid provider config fails closed.
     #[wasm_bindgen_test]
-    fn sign_in_url_rejects_unknown_provider() {
-        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"tyggs"}"#);
-        assert!(
-            tyggs_sign_in_url().is_none(),
-            "unsupported provider config must not fall back to a different provider"
-        );
-        set_config("");
+    fn provider_config_errors_fail_closed() {
+        for config in [
+            r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"tyggs"}"#,
+            r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":""}"#,
+            r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":7}"#,
+            r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","providers":[]}"#,
+            r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","providers":["apple","apple"]}"#,
+            r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","providers":["apple","tyggs"],"provider":"google"}"#,
+            r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","providers":"google","provider":"google"}"#,
+        ] {
+            set_config(config);
+            assert!(
+                auth_providers().is_err(),
+                "invalid provider config must surface an error: {config}"
+            );
+            assert!(
+                tyggs_sign_in_url(AuthProvider::Google).is_err(),
+                "invalid provider config must not fall back to Google: {config}"
+            );
+            assert!(
+                tyggs_sign_in_url(AuthProvider::Apple).is_err(),
+                "invalid provider config must not fall back to Apple: {config}"
+            );
+            set_config("");
+        }
     }
 
     /// `return_to` must never send the QR fragment to tycode.dev/Tyggs OAuth
@@ -2161,12 +2382,14 @@ mod wasm_tests {
             .replace_state_with_url(
                 &JsValue::NULL,
                 "",
-                Some("/tyde/?theme=dark&psk=query-psk#tyde-pair://v2?offer_secret=secret&room=room&psk=fragment-psk"),
+                Some("/tyde/?theme=dark&handoffCode=stale&offer_secret=query-secret&offerSecret=query-secret&room=query-room&psk=query-psk#tyde-pair://v2?offer_secret=secret&room=room&psk=fragment-psk"),
             )
             .expect("seed QR fragment");
-        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
+        set_config(
+            r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","providers":["apple","google"]}"#,
+        );
 
-        let sign_in = tyggs_sign_in_url().expect("sign-in url");
+        let sign_in = tyggs_sign_in_url(AuthProvider::Google).expect("sign-in url");
         let sign_in = web_sys::Url::new(&sign_in).expect("parse sign-in url");
         let return_to = sign_in
             .search_params()
@@ -2187,6 +2410,57 @@ mod wasm_tests {
                 "return_to leaked {secret:?}: {return_to}"
             );
         }
+        let return_url = web_sys::Url::new(&return_to).expect("parse return_to");
+        for key in RETURN_TO_SECRET_PARAM_KEYS {
+            assert!(
+                return_url.search_params().get(*key).is_none(),
+                "return_to leaked query secret {key:?}: {return_to}"
+            );
+        }
+
+        set_config("");
+        history
+            .replace_state_with_url(&JsValue::NULL, "", Some(&original))
+            .expect("restore url");
+    }
+
+    /// Stale Tyggs/Account OAuth callback params in the current app URL must
+    /// not be embedded in a new `return_to`, or Account rejects the handoff.
+    #[wasm_bindgen_test]
+    fn sign_in_url_cleans_oauth_callback_params_from_return_to() {
+        let window = web_sys::window().expect("window");
+        let history = window.history().expect("history");
+        let original = window.location().href().expect("href");
+        history
+            .replace_state_with_url(
+                &JsValue::NULL,
+                "",
+                Some("/tyde/?theme=dark&oauth=1&provider=google&code=abc&error=bad&error_code=e&error_description=desc&message=msg&auth=1&auth_error=auth&oauth_error=oauth"),
+            )
+            .expect("seed OAuth callback params");
+        set_config(
+            r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","providers":["apple","google"]}"#,
+        );
+
+        let sign_in = tyggs_sign_in_url(AuthProvider::Google).expect("sign-in url");
+        let sign_in = web_sys::Url::new(&sign_in).expect("parse sign-in url");
+        let return_to = sign_in
+            .search_params()
+            .get("return_to")
+            .expect("return_to param");
+        let return_url = web_sys::Url::new(&return_to).expect("parse return_to");
+
+        assert_eq!(
+            return_url.search_params().get("theme").as_deref(),
+            Some("dark"),
+            "safe app params must be preserved: {return_to}"
+        );
+        for key in AUTH_CALLBACK_PARAM_KEYS {
+            assert!(
+                return_url.search_params().get(*key).is_none(),
+                "return_to leaked stale OAuth callback param {key:?}: {return_to}"
+            );
+        }
 
         set_config("");
         history
@@ -2200,7 +2474,7 @@ mod wasm_tests {
     fn sign_in_url_none_without_base_url() {
         set_config("{}");
         assert!(
-            tyggs_sign_in_url().is_none(),
+            tyggs_sign_in_url(AuthProvider::Google).is_err(),
             "no endpoint configured → no sign-in url"
         );
         set_config("");
@@ -2273,6 +2547,68 @@ mod wasm_tests {
             .expect("restore url");
     }
 
+    /// If Account redirects back without a `handoffCode`, auth processing still
+    /// must scrub stale OAuth callback params so a later login builds a clean
+    /// `return_to`.
+    #[wasm_bindgen_test]
+    async fn auth_probe_without_handoff_strips_oauth_callback_params() {
+        let window = web_sys::window().expect("window");
+        let history = window.history().expect("history");
+        let original = window.location().href().expect("href");
+        history
+            .replace_state_with_url(
+                &JsValue::NULL,
+                "",
+                Some("/tyde/?theme=dark&oauth=1&provider=google&code=abc&error=bad&error_code=e&error_description=desc&message=msg&auth=1&auth_error=auth&oauth_error=oauth#oauth=frag&provider=google&code=frag-code&keep=1"),
+            )
+            .expect("seed stale callback params");
+        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
+        let fetch = install_fetch_mock(vec![(200, r#"{"authenticated":false}"#)]);
+
+        let uri = super::super::tests_support::sample_managed_uri();
+        assert!(matches!(
+            authenticate(&uri).await,
+            MobileServiceAuthState::AuthFailed { .. }
+        ));
+        assert_eq!(
+            fetch.calls(),
+            vec![FetchCall {
+                method: "GET".to_owned(),
+                url: "https://tycode.dev/api/tyde/mobile/v1/auth/session".to_owned(),
+            }],
+            "no handoff should use the cookie-only auth probe"
+        );
+
+        let after = window.location().href().expect("href");
+        let after_url = web_sys::Url::new(&after).expect("parse cleaned url");
+        assert_eq!(
+            after_url.search_params().get("theme").as_deref(),
+            Some("dark"),
+            "safe app query state must survive cleanup: {after}"
+        );
+        assert_eq!(
+            after_url.hash(),
+            "#keep=1",
+            "non-callback fragment state must survive cleanup: {after}"
+        );
+        for key in AUTH_CALLBACK_PARAM_KEYS {
+            assert!(
+                after_url.search_params().get(*key).is_none(),
+                "visible URL leaked query callback param {key:?}: {after}"
+            );
+            assert!(
+                !after_url.hash().contains(*key),
+                "visible URL leaked fragment callback param {key:?}: {after}"
+            );
+        }
+
+        drop(fetch);
+        set_config("");
+        history
+            .replace_state_with_url(&JsValue::NULL, "", Some(&original))
+            .expect("restore url");
+    }
+
     /// OAuth return handling must exchange the one-time handoff marker for the
     /// HttpOnly cookie-only session and strip all QR-secret-bearing URL parts
     /// before the network call completes.
@@ -2285,7 +2621,7 @@ mod wasm_tests {
             .replace_state_with_url(
                 &JsValue::NULL,
                 "",
-                Some("/tyde/?handoffCode=ok#tyde-pair://v2?offer_secret=secret&room=room&psk=psk"),
+                Some("/tyde/?handoffCode=ok&oauth=1&provider=google&code=abc&offer_secret=query-secret&room=query-room&psk=query-psk#tyde-pair://v2?offer_secret=secret&room=room&psk=psk"),
             )
             .expect("seed handoff");
         set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
@@ -2311,6 +2647,13 @@ mod wasm_tests {
             assert!(
                 !after.contains(secret),
                 "handoff cleanup leaked {secret:?}: {after}"
+            );
+        }
+        let after_url = web_sys::Url::new(&after).expect("parse cleaned url");
+        for key in AUTH_CALLBACK_PARAM_KEYS {
+            assert!(
+                after_url.search_params().get(*key).is_none(),
+                "handoff cleanup leaked callback param {key:?}: {after}"
             );
         }
 

@@ -2,7 +2,7 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
-use crate::bridge::RedeemOutcome;
+use crate::bridge::{AuthProvider, RedeemOutcome};
 use crate::components::ui::{Button, ButtonVariant};
 use crate::state::{AppMode, AppState, MobileServiceAuthState, PairingOffer, PairingScreen};
 
@@ -391,8 +391,8 @@ fn ServiceAuthScreen(
     // Not-signed-in state: navigate to the tycode.dev-hosted Tyggs OAuth start,
     // stashing the pairing URI so the flow resumes when the redirect returns.
     let qr_for_sign_in = qr_uri.clone();
-    let on_sign_in = Callback::new(move |_: ()| {
-        if let Err(error) = bridge::begin_tyggs_sign_in(Some(&qr_for_sign_in)) {
+    let on_sign_in = Callback::new(move |provider: AuthProvider| {
+        if let Err(error) = bridge::begin_tyggs_sign_in(provider, Some(&qr_for_sign_in)) {
             log::error!("failed to start Tyggs sign-in: {error}");
         }
     });
@@ -434,7 +434,7 @@ fn ServiceAuthCard(
     auth: MobileServiceAuthState,
     busy: bool,
     on_retry: Callback<()>,
-    on_sign_in: Callback<()>,
+    on_sign_in: Callback<AuthProvider>,
 ) -> impl IntoView {
     match auth {
         MobileServiceAuthState::Idle | MobileServiceAuthState::Authenticating => view! {
@@ -476,14 +476,12 @@ fn ServiceAuthCard(
             <div class="pairing-card" data-mobile-test="pairing-auth-failed">
                 <h2 class="pairing-card-title">"Sign in with Tyggs"</h2>
                 <p class="pairing-card-body">{message}</p>
-                <Button
-                    label="Sign in with Tyggs"
-                    variant=ButtonVariant::Primary
-                    full_width=true
-                    disabled=busy
-                    data_mobile_test="pairing-auth-sign-in"
-                    on_click=on_sign_in
-                />
+                {auth_provider_buttons(
+                    "pairing-auth-sign-in",
+                    busy,
+                    on_sign_in,
+                    pairing_auth_provider_test_id,
+                )}
             </div>
         }
         .into_any(),
@@ -504,6 +502,63 @@ fn ServiceAuthCard(
             </div>
         }
         .into_any(),
+    }
+}
+
+fn auth_provider_buttons(
+    legacy_test_id: &'static str,
+    busy: bool,
+    on_sign_in: Callback<AuthProvider>,
+    provider_test_id: fn(AuthProvider) -> &'static str,
+) -> AnyView {
+    match bridge::tyggs_auth_providers() {
+        Ok(providers) => view! {
+            <div class="auth-provider-actions">
+                {providers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, provider)| {
+                        let test_id = if index == 0 {
+                            legacy_test_id
+                        } else {
+                            provider_test_id(provider)
+                        };
+                        view! {
+                            <button
+                                type="button"
+                                class="ui-button ui-button-primary ui-button-full"
+                                data-mobile-test=test_id
+                                data-mobile-auth-provider=provider.as_str()
+                                disabled=busy
+                                aria-disabled=if busy { "true" } else { "false" }
+                                aria-label=provider.sign_in_label()
+                                on:click=move |_| {
+                                    if !busy {
+                                        on_sign_in.run(provider);
+                                    }
+                                }
+                            >
+                                <span class="ui-button-label">{provider.sign_in_label()}</span>
+                            </button>
+                        }
+                    })
+                    .collect::<Vec<_>>()}
+            </div>
+        }
+        .into_any(),
+        Err(message) => view! {
+            <p class="pairing-error" role="alert" data-mobile-test="pairing-auth-provider-error">
+                {message}
+            </p>
+        }
+        .into_any(),
+    }
+}
+
+fn pairing_auth_provider_test_id(provider: AuthProvider) -> &'static str {
+    match provider {
+        AuthProvider::Apple => "pairing-auth-sign-in-apple",
+        AuthProvider::Google => "pairing-auth-sign-in-google",
     }
 }
 
@@ -632,6 +687,26 @@ mod wasm_tests {
         }
     }
 
+    fn force_web_backend() {
+        let window = web_sys::window().expect("window");
+        let _ = js_sys::Reflect::delete_property(
+            &window,
+            &wasm_bindgen::JsValue::from_str("__TAURI__"),
+        );
+    }
+
+    fn set_service_config(json: &str) {
+        force_web_backend();
+        let window = web_sys::window().expect("window");
+        let key = wasm_bindgen::JsValue::from_str("__TYDE_MOBILE_SERVICE__");
+        if json.is_empty() {
+            let _ = js_sys::Reflect::delete_property(&window, &key);
+            return;
+        }
+        let value = js_sys::JSON::parse(json).expect("parse service config");
+        js_sys::Reflect::set(&window, &key, &value).expect("install service config");
+    }
+
     #[wasm_bindgen_test]
     async fn confirm_screen_shows_host_label() {
         let preview = fixture_preview("Living Room");
@@ -672,7 +747,7 @@ mod wasm_tests {
                     }
                     busy=false
                     on_retry=Callback::new(|_: ()| {})
-                        on_sign_in=Callback::new(|_: ()| {})
+                    on_sign_in=Callback::new(|_: AuthProvider| {})
                 />
             }
         });
@@ -696,6 +771,83 @@ mod wasm_tests {
         );
     }
 
+    /// Signed-out managed auth renders one button per configured provider in
+    /// config order, so Apple/Google account handoff stays an explicit choice.
+    #[wasm_bindgen_test]
+    async fn service_auth_card_auth_failed_renders_configured_provider_buttons() {
+        set_service_config(r#"{"providers":["apple","google"]}"#);
+        let container = make_container();
+        let clicked: std::sync::Arc<std::sync::Mutex<Vec<AuthProvider>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let clicked_for_mount = clicked.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let clicked = clicked_for_mount.clone();
+            view! {
+                <ServiceAuthCard
+                    auth=MobileServiceAuthState::AuthFailed {
+                        message: "Sign in to continue.".to_owned(),
+                    }
+                    busy=false
+                    on_retry=Callback::new(|_: ()| {})
+                    on_sign_in=Callback::new(move |provider: AuthProvider| {
+                        clicked.lock().unwrap().push(provider);
+                    })
+                />
+            }
+        });
+        next_tick().await;
+
+        let legacy: HtmlElement = container
+            .query_selector("[data-mobile-test='pairing-auth-sign-in']")
+            .unwrap()
+            .expect("legacy selector must point at the first provider button")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            legacy.tag_name(),
+            "BUTTON",
+            "legacy selector must remain a clickable button target"
+        );
+        assert_eq!(
+            legacy.get_attribute("data-mobile-auth-provider").as_deref(),
+            Some("apple"),
+            "first configured provider should keep the legacy click target"
+        );
+        let apple_button: HtmlElement = container
+            .query_selector("[data-mobile-auth-provider='apple']")
+            .unwrap()
+            .expect("Apple sign-in button must render")
+            .dyn_into()
+            .unwrap();
+        let google_button: HtmlElement = container
+            .query_selector("[data-mobile-auth-provider='google']")
+            .unwrap()
+            .expect("Google sign-in button must render")
+            .dyn_into()
+            .unwrap();
+        let text = container.text_content().unwrap_or_default();
+        let apple_label = text.find("Continue with Apple").expect("Apple label");
+        let google_label = text.find("Continue with Google").expect("Google label");
+        assert!(
+            apple_label < google_label,
+            "buttons must preserve provider config order: {text}"
+        );
+        assert_eq!(
+            google_button.get_attribute("data-mobile-test").as_deref(),
+            Some("pairing-auth-sign-in-google"),
+            "non-default provider keeps a provider-specific test selector"
+        );
+        apple_button.click();
+        google_button.click();
+        assert_eq!(
+            clicked.lock().unwrap().as_slice(),
+            &[AuthProvider::Apple, AuthProvider::Google],
+            "provider buttons must invoke the selected provider callback"
+        );
+
+        set_service_config("");
+    }
+
     /// A retryable `service_unavailable` renders a retry affordance; a
     /// non-retryable one does not — the user is never stuck on a spinner nor
     /// offered a futile retry.
@@ -712,7 +864,7 @@ mod wasm_tests {
                         }
                         busy=false
                         on_retry=Callback::new(|_: ()| {})
-                        on_sign_in=Callback::new(|_: ()| {})
+                        on_sign_in=Callback::new(|_: AuthProvider| {})
                     />
                 </div>
             }
@@ -738,7 +890,7 @@ mod wasm_tests {
                         }
                         busy=false
                         on_retry=Callback::new(|_: ()| {})
-                        on_sign_in=Callback::new(|_: ()| {})
+                        on_sign_in=Callback::new(|_: AuthProvider| {})
                     />
                 </div>
             }

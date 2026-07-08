@@ -2242,6 +2242,7 @@ impl ClaudeInner {
             request_usage: usage.request,
             turn_usage: usage.turn,
             cumulative_usage: usage.cumulative,
+            token_usage_unavailable_reason: None,
             reasoning,
             tool_calls,
             context_breakdown,
@@ -2895,7 +2896,7 @@ async fn read_claude_stdout_persistent(
     for (_tool_use_id, mut stream) in subagent_streams.drain() {
         flush_pending_tool_uses(&mut stream.summary, &mut stream.segment);
         if phase_has_pending_output(&stream.summary, &stream.segment) {
-            close_current_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
+            close_current_subagent_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
         }
     }
 
@@ -4311,12 +4312,27 @@ async fn detect_subagent_completions(value: &Value, streams: &mut HashMap<String
 fn finalize_subagent_stream(mut stream: SubAgentStream) {
     flush_pending_tool_uses(&mut stream.summary, &mut stream.segment);
     if phase_has_pending_output(&stream.summary, &stream.segment) {
-        close_current_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
+        close_current_subagent_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
     }
     // Unthrottled final update with the closing stats.
     stream
         .parent_emitter
         .tool_progress(&subagent_progress_data(&stream, true));
+}
+
+fn close_current_subagent_phase(
+    summary: &mut ClaudeStdoutSummary,
+    segment: &mut SegmentState,
+    inner: &ClaudeInner,
+) {
+    let turn_usage = summary
+        .result_cumulative_usage
+        .clone()
+        .map(|usage| ClaudeTurnUsage {
+            turn: usage.clone(),
+            cumulative: usage,
+        });
+    close_current_phase_with_turn_usage(summary, segment, inner, turn_usage);
 }
 
 /// Finalize a background sub-agent when its `task_notification` completion
@@ -4889,10 +4905,21 @@ fn close_current_phase(
     segment: &mut SegmentState,
     inner: &ClaudeInner,
 ) {
+    close_current_phase_with_turn_usage(summary, segment, inner, None);
+}
+
+fn close_current_phase_with_turn_usage(
+    summary: &mut ClaudeStdoutSummary,
+    segment: &mut SegmentState,
+    inner: &ClaudeInner,
+    turn_usage: Option<ClaudeTurnUsage>,
+) {
     flush_pending_tool_uses(summary, segment);
     enrich_exit_plan_mode_tool_calls(summary);
 
     if let Some(phase) = take_phase_emission(summary) {
+        let turn = turn_usage.as_ref().map(|usage| usage.turn.clone());
+        let cumulative = turn_usage.map(|usage| usage.cumulative);
         let tool_calls = phase
             .tool_calls
             .iter()
@@ -4909,8 +4936,8 @@ fn close_current_phase(
             phase.model,
             ClaudeMessageUsage {
                 request: phase.usage,
-                turn: None,
-                cumulative: None,
+                turn,
+                cumulative,
             },
             phase.reasoning,
             tool_calls,
@@ -9308,6 +9335,60 @@ for raw_line in sys.stdin:
 
     fn stream_end_cumulative_total_tokens(event: &Value) -> Option<u64> {
         stream_end_usage_scope_total_tokens(event, "cumulative")
+    }
+
+    #[test]
+    fn subagent_final_stream_end_uses_child_result_usage() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let (child_inner, mut child_rx) = make_test_inner();
+            let child_inner = Arc::new(child_inner);
+            let (parent_emitter, _parent_rx) = test_parent_emitter();
+            let mut stream = SubAgentStream {
+                summary: ClaudeStdoutSummary {
+                    streamed_text: "child done".to_string(),
+                    model: Some("claude-test".to_string()),
+                    usage: Some(json!({
+                        "input_tokens": 2,
+                        "output_tokens": 3,
+                        "total_tokens": 5,
+                        "cached_prompt_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "reasoning_tokens": 0
+                    })),
+                    result_cumulative_usage: Some(json!({
+                        "input_tokens": 7,
+                        "output_tokens": 10,
+                        "total_tokens": 17,
+                        "cached_prompt_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "reasoning_tokens": 0
+                    })),
+                    ..ClaudeStdoutSummary::default()
+                },
+                segment: SegmentState::default(),
+                message_id: "subagent-toolu_1".to_string(),
+                has_explicit_task_prompt: false,
+                inner: child_inner,
+                parent_tool_use_id: "toolu_1".to_string(),
+                agent_id: protocol::AgentId("child-agent".to_string()),
+                agent_name: "Child".to_string(),
+                parent_emitter,
+                last_progress_emit: std::time::Instant::now(),
+                background: false,
+            };
+
+            close_current_subagent_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
+
+            let stream_end = recv_until_kind(&mut child_rx, "StreamEnd").await;
+            assert_eq!(stream_end_request_total_tokens(&stream_end), Some(5));
+            assert_eq!(stream_end_turn_total_tokens(&stream_end), Some(17));
+            assert_eq!(stream_end_cumulative_total_tokens(&stream_end), Some(17));
+        });
     }
 
     fn emit_test_phase_end(inner: &ClaudeInner, summary: &mut ClaudeStdoutSummary) {

@@ -898,6 +898,27 @@ fn assert_unavailable_turn_usage(usage: &Option<MessageTokenUsage>) {
     }
 }
 
+fn assert_known_turn_usage_with_unavailable_cumulative(
+    usage: &Option<MessageTokenUsage>,
+    expected_this_turn_total: u64,
+) {
+    let usage = usage.as_ref().expect("expected token usage");
+    assert_eq!(
+        usage
+            .turn
+            .known_usage()
+            .expect("expected known turn usage")
+            .total_tokens,
+        expected_this_turn_total
+    );
+    match &usage.cumulative {
+        TokenUsageScope::Unavailable {
+            reason: TokenUsageUnavailableReason::BackendDidNotReport,
+        } => {}
+        other => panic!("expected unavailable cumulative token usage, got {other:?}"),
+    }
+}
+
 async fn expect_task_token_usage_matching(
     client: &mut client::Connection,
     root_agent_id: &protocol::AgentId,
@@ -941,6 +962,28 @@ fn assert_known_task_scope(scope: &TaskTokenUsageScope, expected_total: u64) {
             assert_eq!(usage.total_tokens, expected_total);
         }
         other => panic!("expected known task token usage, got {other:?}"),
+    }
+}
+
+fn assert_partial_task_scope(
+    scope: &TaskTokenUsageScope,
+    expected_total: u64,
+    expected_unavailable_count: u32,
+) {
+    match scope {
+        TaskTokenUsageScope::Partial {
+            usage,
+            unavailable_count,
+            reasons,
+        } => {
+            assert_eq!(usage.total_tokens, expected_total);
+            assert_eq!(*unavailable_count, expected_unavailable_count);
+            assert_eq!(
+                reasons,
+                &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+            );
+        }
+        other => panic!("expected partial task token usage, got {other:?}"),
     }
 }
 
@@ -1082,15 +1125,69 @@ async fn expect_completed_turn_on_stream(
     end
 }
 
-async fn expect_metadata_update_on_stream(
+async fn expect_metadata_update_and_task_token_usage_on_stream(
     client: &mut client::Connection,
     stream: &StreamPath,
-) -> MessageMetadataUpdateData {
+    root_agent_id: &protocol::AgentId,
+    expected_total: u64,
+    context: &str,
+) -> (MessageMetadataUpdateData, TaskTokenUsagePayload) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut update = None;
+    let mut token_usage = None;
+    let mut typing_finished = false;
     loop {
-        let env = expect_chat_event_on_stream(client, stream, "MessageMetadataUpdated").await;
-        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
-        if let ChatEvent::MessageMetadataUpdated(update) = event {
-            return update;
+        if typing_finished && let Some(found_update) = update.take() {
+            if let Some(found_usage) = token_usage.take() {
+                return (found_update, found_usage);
+            }
+            update = Some(found_update);
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "timed out waiting for {context}");
+        let env = match tokio::time::timeout(remaining, client.next_event()).await {
+            Ok(Ok(Some(env))) => env,
+            Ok(Ok(None)) => panic!("connection closed before {context}"),
+            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
+            Err(_) => panic!("timed out waiting for {context}"),
+        };
+        if fixture::is_builtin_team_custom_agent_notify(&env) {
+            continue;
+        }
+        if env.kind == FrameKind::AgentBootstrap {
+            let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("AgentBootstrap");
+            let _ = record_agent_bootstrap_events(&env.stream, bootstrap);
+            continue;
+        }
+        match env.kind {
+            FrameKind::ChatEvent if env.stream == *stream => {
+                let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+                match event {
+                    ChatEvent::MessageMetadataUpdated(metadata) => update = Some(metadata),
+                    ChatEvent::TypingStatusChanged(false) => typing_finished = true,
+                    other => push_pending_agent_event(
+                        protocol::Envelope::from_payload(
+                            stream.clone(),
+                            FrameKind::ChatEvent,
+                            env.seq,
+                            &other,
+                        )
+                        .expect("serialize pending ChatEvent"),
+                    ),
+                }
+            }
+            FrameKind::ChatEvent => push_pending_agent_event(env),
+            FrameKind::TaskTokenUsage => {
+                let payload: TaskTokenUsagePayload = env.parse_payload().expect("TaskTokenUsage");
+                if payload.root_agent_id == *root_agent_id
+                    && payload.total.usage.total_tokens == expected_total
+                    && matches!(payload.total.status, TaskTokenUsageStatus::Known)
+                {
+                    token_usage = Some(payload);
+                }
+            }
+            FrameKind::SessionList | FrameKind::AgentActivityStats => {}
+            _ => {}
         }
     }
 }
@@ -1876,8 +1973,14 @@ async fn late_metadata_usage_updates_cumulative_without_double_counting() {
     .await;
     assert_unavailable_turn_usage(&stream_end.message.token_usage);
 
-    let update =
-        expect_metadata_update_on_stream(&mut fixture.client, &new_agent.instance_stream).await;
+    let (update, late_rollup) = expect_metadata_update_and_task_token_usage_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        &new_agent.agent_id,
+        MOCK_TURN_TOKEN_TOTAL,
+        "late metadata token usage and task rollup",
+    )
+    .await;
     assert_eq!(
         update
             .token_usage
@@ -1894,7 +1997,9 @@ async fn late_metadata_usage_updates_cumulative_without_double_counting() {
         MOCK_TURN_TOKEN_TOTAL,
         MOCK_TURN_TOKEN_TOTAL,
     );
-    expect_typing_false_on_stream(&mut fixture.client, &new_agent.instance_stream).await;
+    assert_eq!(late_rollup.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL);
+    assert_known_task_status(&late_rollup.total.status);
+    assert_known_task_scope(&late_rollup.self_usage, MOCK_TURN_TOKEN_TOTAL);
 
     fixture
         .client
@@ -1999,6 +2104,83 @@ async fn missing_backend_usage_is_unavailable_not_zero() {
     )
     .await;
     assert_unavailable_turn_usage(&stream_end.message.token_usage);
+}
+
+#[tokio::test]
+async fn task_token_usage_stays_partial_after_prior_missing_turn_usage() {
+    let mut fixture = Fixture::new().await;
+    let new_agent = spawn_token_usage_agent(
+        &mut fixture.client,
+        "mixed-token-usage-agent",
+        &format!("first missing usage {MOCK_NO_USAGE_SENTINEL}"),
+    )
+    .await;
+
+    let first = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "mock backend response to: first missing usage",
+    )
+    .await;
+    assert_unavailable_turn_usage(&first.message.token_usage);
+
+    fixture
+        .client
+        .send_message(&new_agent.instance_stream, "second known usage".to_owned())
+        .await
+        .expect("send known usage follow-up");
+    let second = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "mock backend response to: second known usage",
+    )
+    .await;
+    assert_known_turn_usage_with_unavailable_cumulative(
+        &second.message.token_usage,
+        MOCK_TURN_TOKEN_TOTAL,
+    );
+
+    let payload = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &new_agent.agent_id,
+        "mixed known and missing self usage",
+        |payload| {
+            matches!(
+                &payload.total.status,
+                TaskTokenUsageStatus::Partial {
+                    unavailable_count: 1,
+                    reasons
+                } if reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+            ) && matches!(
+                &payload.self_usage,
+                TaskTokenUsageScope::Partial {
+                    usage,
+                    unavailable_count: 1,
+                    reasons
+                } if usage.total_tokens == MOCK_TURN_TOKEN_TOTAL
+                    && reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+            )
+        },
+    )
+    .await;
+    assert_eq!(payload.total.usage.total_tokens, MOCK_TURN_TOKEN_TOTAL);
+    match &payload.total.status {
+        TaskTokenUsageStatus::Partial {
+            unavailable_count,
+            reasons,
+        } => {
+            assert_eq!(*unavailable_count, 1);
+            assert_eq!(
+                reasons,
+                &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+            );
+        }
+        other => panic!("expected partial mixed-source aggregate, got {other:?}"),
+    }
+    assert_partial_task_scope(&payload.self_usage, MOCK_TURN_TOKEN_TOTAL, 1);
+    assert_eq!(payload.descendant_count, 0);
+    assert_eq!(payload.breakdown.len(), 1);
+    assert_partial_task_scope(&payload.breakdown[0].usage, MOCK_TURN_TOKEN_TOTAL, 1);
 }
 
 #[tokio::test]
@@ -2154,6 +2336,196 @@ async fn task_token_usage_marks_missing_descendant_usage_partial() {
             reason: TaskTokenUsageUnavailableReason::BackendDidNotReport
         }
     ));
+}
+
+#[tokio::test]
+async fn task_token_usage_marks_partial_descendant_usage_partial() {
+    let mut fixture = Fixture::new().await;
+    let root =
+        spawn_token_usage_agent(&mut fixture.client, "partial-descendant-root", "root usage").await;
+    let _ = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &root.instance_stream,
+        "mock backend response to: root usage",
+    )
+    .await;
+    let child = spawn_user_child(
+        &mut fixture.client,
+        &root.agent_id,
+        "partial-descendant-child",
+        &format!("child first missing usage {MOCK_NO_USAGE_SENTINEL}"),
+        "/tmp/partial-descendant-child",
+    )
+    .await;
+
+    fixture
+        .client
+        .send_message(
+            &child.instance_stream,
+            "child second known usage".to_owned(),
+        )
+        .await
+        .expect("send child known usage follow-up");
+    let second_child = expect_completed_turn_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "mock backend response to: child second known usage",
+    )
+    .await;
+    assert_known_turn_usage_with_unavailable_cumulative(
+        &second_child.message.token_usage,
+        MOCK_TURN_TOKEN_TOTAL,
+    );
+
+    let payload = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &root.agent_id,
+        "partial descendant aggregate",
+        |payload| {
+            payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 2
+                && matches!(
+                    &payload.descendant_usage.status,
+                    TaskTokenUsageStatus::Partial {
+                        unavailable_count: 1,
+                        reasons
+                    } if reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+                )
+                && payload.breakdown.iter().any(|entry| {
+                    entry.agent_id == child.agent_id
+                        && matches!(
+                            &entry.usage,
+                            TaskTokenUsageScope::Partial {
+                                usage,
+                                unavailable_count: 1,
+                                reasons
+                            } if usage.total_tokens == MOCK_TURN_TOKEN_TOTAL
+                                && reasons == &vec![
+                                    TaskTokenUsageUnavailableReason::BackendDidNotReport
+                                ]
+                        )
+                })
+        },
+    )
+    .await;
+    match &payload.total.status {
+        TaskTokenUsageStatus::Partial {
+            unavailable_count,
+            reasons,
+        } => {
+            assert_eq!(*unavailable_count, 1);
+            assert_eq!(
+                reasons,
+                &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+            );
+        }
+        other => panic!("expected partial aggregate, got {other:?}"),
+    }
+    match &payload.descendant_usage.status {
+        TaskTokenUsageStatus::Partial {
+            unavailable_count,
+            reasons,
+        } => {
+            assert_eq!(*unavailable_count, 1);
+            assert_eq!(
+                reasons,
+                &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+            );
+        }
+        other => panic!("expected partial descendant usage, got {other:?}"),
+    }
+    assert_known_task_scope(&payload.self_usage, MOCK_TURN_TOKEN_TOTAL);
+    assert_eq!(
+        payload.descendant_usage.usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL
+    );
+    let child_entry = payload
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id.eq(&child.agent_id))
+        .expect("child breakdown entry");
+    assert_partial_task_scope(&child_entry.usage, MOCK_TURN_TOKEN_TOTAL, 1);
+
+    fixture
+        .client
+        .close_agent(&child.instance_stream)
+        .await
+        .expect("close partial child");
+    let closed = expect_kind(
+        &mut fixture.client,
+        FrameKind::AgentClosed,
+        "partial child AgentClosed",
+    )
+    .await;
+    let closed: AgentClosedPayload = closed.parse_payload().expect("AgentClosed payload");
+    assert_eq!(closed.agent_id, child.agent_id);
+
+    let after_close = expect_task_token_usage_matching(
+        &mut fixture.client,
+        &root.agent_id,
+        "partial aggregate after child close",
+        |payload| {
+            payload.total.usage.total_tokens == MOCK_TURN_TOKEN_TOTAL * 2
+                && payload.breakdown.iter().any(|entry| {
+                    entry.agent_id == child.agent_id
+                        && matches!(
+                            &entry.usage,
+                            TaskTokenUsageScope::Partial {
+                                usage,
+                                unavailable_count: 1,
+                                reasons
+                            } if usage.total_tokens == MOCK_TURN_TOKEN_TOTAL
+                                && reasons == &vec![
+                                    TaskTokenUsageUnavailableReason::BackendDidNotReport
+                                ]
+                        )
+                })
+        },
+    )
+    .await;
+    assert_eq!(after_close.descendant_count, 1);
+    match &after_close.descendant_usage.status {
+        TaskTokenUsageStatus::Partial {
+            unavailable_count,
+            reasons,
+        } => {
+            assert_eq!(*unavailable_count, 1);
+            assert_eq!(
+                reasons,
+                &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+            );
+        }
+        other => panic!("expected partial descendant usage after close, got {other:?}"),
+    }
+
+    let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let bootstrapped = bootstrap
+        .task_token_usages
+        .iter()
+        .find(|usage| usage.root_agent_id == root.agent_id)
+        .expect("HostBootstrap should include partial root task token usage");
+    assert_eq!(
+        bootstrapped.total.usage.total_tokens,
+        MOCK_TURN_TOKEN_TOTAL * 2
+    );
+    match &bootstrapped.total.status {
+        TaskTokenUsageStatus::Partial {
+            unavailable_count,
+            reasons,
+        } => {
+            assert_eq!(*unavailable_count, 1);
+            assert_eq!(
+                reasons,
+                &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+            );
+        }
+        other => panic!("expected partial bootstrapped total usage, got {other:?}"),
+    }
+    let child_entry = bootstrapped
+        .breakdown
+        .iter()
+        .find(|entry| entry.agent_id.eq(&child.agent_id))
+        .expect("bootstrapped closed child breakdown entry");
+    assert_partial_task_scope(&child_entry.usage, MOCK_TURN_TOKEN_TOTAL, 1);
 }
 
 #[tokio::test]

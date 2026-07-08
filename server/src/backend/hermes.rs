@@ -11,9 +11,9 @@ use protocol::{
     ChatMessage, MessageSender, MessageTokenUsage, ModelInfo, OperationCancelledData, SelectOption,
     SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
     SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
-    StreamStartData, StreamTextDeltaData, TokenUsage, ToolExecutionCompletedData,
-    ToolExecutionResult, ToolProgressData, ToolProgressUpdate, ToolRequest, ToolRequestType,
-    ToolUseData,
+    StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionResult, ToolProgressData, ToolProgressUpdate,
+    ToolRequest, ToolRequestType, ToolUseData,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -847,18 +847,20 @@ impl HermesSessionActor {
             return payload;
         };
         let turn_usage = token_usage_delta(self.mapper.last_cumulative_usage.as_ref(), &cumulative);
-        self.mapper.last_cumulative_usage = Some(cumulative);
-
-        if has_turn_usage {
-            return payload;
-        }
+        self.mapper.last_cumulative_usage = Some(cumulative.clone());
 
         match payload {
             Some(mut payload) => {
                 if let Some(object) = payload.as_object_mut() {
+                    if !has_turn_usage {
+                        object.insert(
+                            "usage".to_string(),
+                            token_usage_to_gateway_value(&turn_usage),
+                        );
+                    }
                     object.insert(
-                        "usage".to_string(),
-                        token_usage_to_gateway_value(&turn_usage),
+                        "cumulative_usage".to_string(),
+                        token_usage_to_gateway_value(&cumulative),
                     );
                 }
                 Some(payload)
@@ -1290,7 +1292,7 @@ impl HermesEventMapper {
     fn fail_active_turn(&mut self, message: impl Into<String>) -> Vec<ChatEvent> {
         let mut events = Vec::new();
         if self.current_message_id.is_some() {
-            events.extend(self.finish_stream_events(None, None));
+            events.extend(self.finish_stream_events(None, None, None));
         }
         events.extend(self.complete_pending_tools_as_cancelled(
             "Hermes protocol error closed the active turn before the tool completed",
@@ -1341,7 +1343,7 @@ impl HermesEventMapper {
     fn map_message_start(&mut self) -> Result<Vec<ChatEvent>, String> {
         let mut events = Vec::new();
         if self.current_message_id.is_some() {
-            events.extend(self.finish_stream_events(None, None));
+            events.extend(self.finish_stream_events(None, None, None));
             events.push(ChatEvent::MessageAdded(error_message(
                 "Hermes emitted message.start before completing the previous message".to_string(),
             )));
@@ -1442,6 +1444,9 @@ impl HermesEventMapper {
         }
         let final_text = optional_raw_string(&payload, &["text"], "message.complete")?;
         let usage = payload.get("usage").and_then(token_usage_from_value);
+        let cumulative_usage = payload
+            .get("cumulative_usage")
+            .and_then(token_usage_from_value);
         let stream_final_text = final_text
             .as_ref()
             .filter(|text| !text.trim().is_empty())
@@ -1460,11 +1465,19 @@ impl HermesEventMapper {
         }
         match status.as_str() {
             "interrupted" => {
-                events.extend(self.finish_stream_events(stream_final_text, usage));
+                events.extend(self.finish_stream_events(
+                    stream_final_text,
+                    usage,
+                    cumulative_usage,
+                ));
                 events.extend(self.cancel_events("Operation cancelled"));
             }
             "error" | "failed" => {
-                events.extend(self.finish_stream_events(stream_final_text.clone(), usage));
+                events.extend(self.finish_stream_events(
+                    stream_final_text.clone(),
+                    usage,
+                    cumulative_usage,
+                ));
                 if let Some(error_text) =
                     optional_string(&payload, &["error"]).or_else(|| stream_final_text.clone())
                 {
@@ -1477,7 +1490,11 @@ impl HermesEventMapper {
                 events.push(ChatEvent::TypingStatusChanged(false));
             }
             "complete" | "completed" => {
-                events.extend(self.finish_stream_events(stream_final_text, usage));
+                events.extend(self.finish_stream_events(
+                    stream_final_text,
+                    usage,
+                    cumulative_usage,
+                ));
                 if !has_visible_text {
                     if has_reasoning {
                         events.push(ChatEvent::MessageAdded(warning_message(
@@ -1492,7 +1509,11 @@ impl HermesEventMapper {
                 events.push(ChatEvent::TypingStatusChanged(false));
             }
             other => {
-                events.extend(self.finish_stream_events(stream_final_text, usage));
+                events.extend(self.finish_stream_events(
+                    stream_final_text,
+                    usage,
+                    cumulative_usage,
+                ));
                 events.push(ChatEvent::MessageAdded(error_message(format!(
                     "Hermes message.complete returned unknown status '{other}'"
                 ))));
@@ -1632,12 +1653,28 @@ impl HermesEventMapper {
         &mut self,
         final_text: Option<String>,
         usage: Option<TokenUsage>,
+        cumulative_usage: Option<TokenUsage>,
     ) -> Vec<ChatEvent> {
         let content = final_text.unwrap_or_else(|| self.current_text.clone());
         let message_id = self.current_message_id.take().map(protocol::ChatMessageId);
         let reasoning = None;
         self.current_text.clear();
         self.current_reasoning_seen = false;
+        let turn_usage = usage;
+        let token_usage = match (turn_usage, cumulative_usage) {
+            (Some(turn), Some(cumulative)) => Some(
+                MessageTokenUsage::request_and_turn_known(turn.clone(), turn)
+                    .with_cumulative(cumulative),
+            ),
+            (Some(turn), None) => Some(MessageTokenUsage::request_and_turn_known(
+                turn.clone(),
+                turn,
+            )),
+            (None, _) => Some(MessageTokenUsage::unavailable(
+                TokenUsageUnavailableReason::BackendDidNotReport,
+            )),
+        };
+
         vec![ChatEvent::StreamEnd(StreamEndData {
             message: ChatMessage {
                 message_id,
@@ -1649,9 +1686,7 @@ impl HermesEventMapper {
                 reasoning,
                 tool_calls: self.tool_uses_for_message(),
                 model_info: self.model.clone().map(|model| ModelInfo { model }),
-                token_usage: usage
-                    .clone()
-                    .map(|usage| MessageTokenUsage::request_and_turn_known(usage.clone(), usage)),
+                token_usage,
                 context_breakdown: None,
                 images: None,
             },
@@ -1661,7 +1696,7 @@ impl HermesEventMapper {
     fn cancel_events(&mut self, message: &str) -> Vec<ChatEvent> {
         let mut events = Vec::new();
         if self.current_message_id.is_some() {
-            events.extend(self.finish_stream_events(None, None));
+            events.extend(self.finish_stream_events(None, None, None));
         }
         events.extend(
             self.complete_pending_tools_as_cancelled("Tool execution was cancelled by user"),
@@ -4154,6 +4189,104 @@ for line in sys.stdin:
                 .iter()
                 .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
         );
+    }
+
+    #[test]
+    fn hermes_message_complete_maps_turn_and_cumulative_usage() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event("message.start", None);
+
+        let events = mapper.map_event(
+            "message.complete",
+            Some(json!({
+                "text": "ok",
+                "status": "complete",
+                "usage": { "input": 3, "output": 4, "total": 7 },
+                "cumulative_usage": { "input": 10, "output": 15, "total": 25 }
+            })),
+        );
+
+        let end = events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::StreamEnd(data) => Some(data),
+                _ => None,
+            })
+            .expect("StreamEnd");
+        let usage = end.message.token_usage.as_ref().expect("token usage");
+        assert_eq!(
+            usage
+                .turn
+                .known_usage()
+                .expect("known turn usage")
+                .total_tokens,
+            7
+        );
+        assert_eq!(
+            usage
+                .cumulative
+                .known_usage()
+                .expect("known cumulative usage")
+                .total_tokens,
+            25
+        );
+    }
+
+    #[test]
+    fn hermes_message_complete_without_usage_emits_unavailable() {
+        let mut mapper = HermesEventMapper::default();
+        let _ = mapper.map_event("message.start", None);
+
+        let events = mapper.map_event(
+            "message.complete",
+            Some(json!({ "text": "ok", "status": "complete" })),
+        );
+
+        let end = events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::StreamEnd(data) => Some(data),
+                _ => None,
+            })
+            .expect("StreamEnd");
+        let usage = end.message.token_usage.as_ref().expect("token usage");
+        assert!(matches!(
+            usage.turn,
+            protocol::TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport
+            }
+        ));
+    }
+
+    #[test]
+    fn hermes_token_usage_delta_subtracts_cumulative_counts() {
+        let previous = token_usage_from_value(&json!({
+            "input": 10,
+            "output": 5,
+            "total": 15,
+            "cached_prompt_tokens": 2,
+            "cache_creation_input_tokens": 3,
+            "reasoning_tokens": 4
+        }))
+        .expect("previous usage");
+        let current = token_usage_from_value(&json!({
+            "input": 18,
+            "output": 13,
+            "total": 31,
+            "cached_prompt_tokens": 7,
+            "cache_creation_input_tokens": 8,
+            "reasoning_tokens": 9
+        }))
+        .expect("current usage");
+
+        let delta = token_usage_delta(Some(&previous), &current);
+
+        assert_eq!(delta.input_tokens, 8);
+        assert_eq!(delta.output_tokens, 8);
+        assert_eq!(delta.total_tokens, 16);
+        assert_eq!(delta.cached_prompt_tokens, Some(5));
+        assert_eq!(delta.cache_creation_input_tokens, Some(5));
+        assert_eq!(delta.reasoning_tokens, Some(5));
     }
 
     #[test]

@@ -10,10 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use command_group::AsyncCommandGroup;
 use protocol::{
-    AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, MessageSender, ModelInfo,
-    OperationCancelledData, SelectOption, SessionId, SessionSettingField, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
-    StreamEndData, StreamStartData, StreamTextDeltaData,
+    AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, MessageSender,
+    MessageTokenUsage, ModelInfo, OperationCancelledData, SelectOption, SessionId,
+    SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
+    SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
+    TokenUsageUnavailableReason,
 };
 use serde_json::{Map, Value, json, to_value};
 use tokio::io::{AsyncReadExt, BufReader};
@@ -793,7 +794,9 @@ impl AntigravityInner {
                 model_info: model.map(|model| ModelInfo {
                     model: model.to_string(),
                 }),
-                token_usage: None,
+                token_usage: Some(MessageTokenUsage::unavailable(
+                    TokenUsageUnavailableReason::BackendDidNotReport,
+                )),
                 context_breakdown: None,
                 images: None,
             },
@@ -2132,6 +2135,44 @@ mod tests {
                 active_turn: None,
             }),
         })
+    }
+
+    #[test]
+    fn stream_end_without_upstream_usage_is_explicitly_unavailable() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let inner = AntigravityInner {
+            events_tx,
+            state: Mutex::new(AntigravityState {
+                session_id: None,
+                primary_root: "/tmp".to_string(),
+                extra_roots: Vec::new(),
+                startup_mcp_servers: Vec::new(),
+                combined_instructions: None,
+                session_settings: SessionSettingsValues::default(),
+                access_mode: BackendAccessMode::Unrestricted,
+                active_turn: None,
+            }),
+        };
+
+        inner.emit_stream_end("message-1", "done".to_string(), Some("agy-model"));
+
+        let event = events_rx.try_recv().expect("StreamEnd event");
+        let ChatEvent::StreamEnd(data) = event else {
+            panic!("expected StreamEnd, got {event:?}");
+        };
+        let usage = data.message.token_usage.expect("explicit token usage");
+        assert!(matches!(
+            usage.turn,
+            protocol::TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport
+            }
+        ));
+        assert!(matches!(
+            usage.cumulative,
+            protocol::TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport
+            }
+        ));
     }
 
     #[test]

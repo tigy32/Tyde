@@ -430,21 +430,70 @@ impl AgentActivityStatsTracker {
     }
 
     fn usage_snapshot(&self) -> (TaskTokenUsageScope, Option<String>) {
-        let usage = if self.token_usage_by_source.is_empty() {
-            TaskTokenUsageScope::Unavailable {
-                reason: TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted,
+        self.usage_snapshot_with_reported_usage_floor(None)
+    }
+
+    fn usage_snapshot_with_reported_usage_floor(
+        &self,
+        reported_usage_floor: Option<&TokenUsage>,
+    ) -> (TaskTokenUsageScope, Option<String>) {
+        if self.token_usage_by_source.is_empty() {
+            return (
+                TaskTokenUsageScope::Unavailable {
+                    reason: TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted,
+                },
+                self.latest_model.clone(),
+            );
+        }
+
+        let reported_usage = reported_usage_floor
+            .filter(|floor| floor.total_tokens > self.stats.token_usage.total_tokens)
+            .unwrap_or(&self.stats.token_usage);
+        let has_reported_usage_floor =
+            reported_usage.total_tokens > self.stats.token_usage.total_tokens;
+        let mut has_reported_usage = false;
+        let mut partial_seen = false;
+        let mut unavailable_count = 0_u32;
+        let mut reasons = Vec::new();
+        for usage in self.token_usage_by_source.values() {
+            match usage {
+                TaskTokenUsageScope::Known { .. } => {
+                    has_reported_usage = true;
+                }
+                TaskTokenUsageScope::Partial {
+                    unavailable_count: count,
+                    reasons: partial_reasons,
+                    ..
+                } => {
+                    has_reported_usage = true;
+                    partial_seen = true;
+                    unavailable_count = unavailable_count.saturating_add(*count);
+                    extend_task_token_usage_reasons(&mut reasons, partial_reasons);
+                }
+                TaskTokenUsageScope::Unavailable { reason } => {
+                    unavailable_count = unavailable_count.saturating_add(1);
+                    extend_task_token_usage_reasons(&mut reasons, &[*reason]);
+                }
             }
-        } else if let Some(reason) = self
-            .token_usage_by_source
-            .values()
-            .find_map(task_token_usage_unavailable_reason)
-        {
-            TaskTokenUsageScope::Unavailable { reason }
+        }
+        has_reported_usage |= has_reported_usage_floor;
+        reasons.sort();
+        let usage = if !has_reported_usage {
+            TaskTokenUsageScope::Unavailable {
+                reason: reasons
+                    .first()
+                    .copied()
+                    .unwrap_or(TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted),
+            }
+        } else if partial_seen || unavailable_count > 0 {
+            TaskTokenUsageScope::Partial {
+                usage: Box::new(TaskTokenUsageAmount::from_token_usage(reported_usage)),
+                unavailable_count,
+                reasons,
+            }
         } else {
             TaskTokenUsageScope::Known {
-                usage: Box::new(TaskTokenUsageAmount::from_token_usage(
-                    &self.stats.token_usage,
-                )),
+                usage: Box::new(TaskTokenUsageAmount::from_token_usage(reported_usage)),
             }
         };
         (usage, self.latest_model.clone())
@@ -585,8 +634,13 @@ impl AgentActivityStatsTracker {
                 .retain(|_, usage| matches!(usage, TaskTokenUsageScope::Known { .. }));
         } else {
             self.refresh_token_usage();
-            token_usage.cumulative = TokenUsageScope::Known {
-                usage: Box::new(self.stats.token_usage.clone()),
+            token_usage.cumulative = match synthesized_cumulative_unavailable_reason(
+                self.token_usage_by_source.values(),
+            ) {
+                Some(reason) => TokenUsageScope::Unavailable { reason },
+                None => TokenUsageScope::Known {
+                    usage: Box::new(self.stats.token_usage.clone()),
+                },
             };
         }
         self.stats.source_through_seq = Some(source_seq);
@@ -594,22 +648,22 @@ impl AgentActivityStatsTracker {
     }
 
     fn refresh_token_usage(&mut self) {
-        self.stats.token_usage =
-            total_task_token_usage(self.token_usage_by_source.values().filter_map(|usage| {
-                match usage {
-                    TaskTokenUsageScope::Known { usage } => Some(usage.as_ref()),
-                    TaskTokenUsageScope::Unavailable { .. } => None,
-                }
-            }));
+        self.stats.token_usage = total_task_token_usage(
+            self.token_usage_by_source
+                .values()
+                .filter_map(|usage| usage.reported_usage()),
+        );
     }
 }
 
-fn task_token_usage_unavailable_reason(
-    usage: &TaskTokenUsageScope,
-) -> Option<TaskTokenUsageUnavailableReason> {
-    match usage {
-        TaskTokenUsageScope::Known { .. } => None,
-        TaskTokenUsageScope::Unavailable { reason } => Some(*reason),
+fn extend_task_token_usage_reasons(
+    reasons: &mut Vec<TaskTokenUsageUnavailableReason>,
+    additions: &[TaskTokenUsageUnavailableReason],
+) {
+    for reason in additions {
+        if !reasons.contains(reason) {
+            reasons.push(*reason);
+        }
     }
 }
 
@@ -622,6 +676,56 @@ fn task_token_usage_reason_from_message_reason(
         }
         TokenUsageUnavailableReason::ProviderScopeAmbiguous => {
             TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous
+        }
+    }
+}
+
+fn synthesized_cumulative_unavailable_reason<'a>(
+    usages: impl Iterator<Item = &'a TaskTokenUsageScope>,
+) -> Option<TokenUsageUnavailableReason> {
+    let mut reason = None;
+    for usage in usages {
+        let Some(candidate) = (match usage {
+            TaskTokenUsageScope::Known { .. } => None,
+            TaskTokenUsageScope::Partial {
+                reasons: task_reasons,
+                ..
+            } => Some(token_usage_reason_from_task_reasons(task_reasons)),
+            TaskTokenUsageScope::Unavailable {
+                reason: task_reason,
+            } => Some(token_usage_reason_from_task_reason(*task_reason)),
+        }) else {
+            continue;
+        };
+        if candidate == TokenUsageUnavailableReason::ProviderScopeAmbiguous {
+            return Some(candidate);
+        }
+        reason = reason.or(Some(candidate));
+    }
+    reason
+}
+
+fn token_usage_reason_from_task_reasons(
+    reasons: &[TaskTokenUsageUnavailableReason],
+) -> TokenUsageUnavailableReason {
+    if reasons.contains(&TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous) {
+        TokenUsageUnavailableReason::ProviderScopeAmbiguous
+    } else {
+        TokenUsageUnavailableReason::BackendDidNotReport
+    }
+}
+
+fn token_usage_reason_from_task_reason(
+    reason: TaskTokenUsageUnavailableReason,
+) -> TokenUsageUnavailableReason {
+    match reason {
+        TaskTokenUsageUnavailableReason::ProviderScopeAmbiguous => {
+            TokenUsageUnavailableReason::ProviderScopeAmbiguous
+        }
+        TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted
+        | TaskTokenUsageUnavailableReason::BackendDidNotReport
+        | TaskTokenUsageUnavailableReason::AgentUnavailable => {
+            TokenUsageUnavailableReason::BackendDidNotReport
         }
     }
 }
@@ -4739,17 +4843,55 @@ fn agent_usage_snapshot_from_log(
     start: &AgentStartPayload,
     event_log: &[Envelope],
 ) -> AgentUsageSnapshot {
-    let mut stats = AgentActivityStats::default();
+    let mut tracker = AgentActivityStatsTracker::default();
+    let mut active_stream_text = String::new();
+    let mut saw_replayable_usage_event = false;
+    let mut latest_stats = None;
     for envelope in event_log {
-        if envelope.kind != FrameKind::AgentActivityStats {
-            continue;
-        }
-        if let Ok(payload) =
-            serde_json::from_value::<AgentActivityStatsPayload>(envelope.payload.clone())
-        {
-            stats = payload.stats;
+        match envelope.kind {
+            FrameKind::ChatEvent => {
+                let Ok(mut event) = serde_json::from_value::<ChatEvent>(envelope.payload.clone())
+                else {
+                    continue;
+                };
+                if chat_event_can_reconstruct_usage(&event) {
+                    saw_replayable_usage_event = true;
+                }
+                strip_replayed_cumulative_token_usage(&mut event);
+                match &event {
+                    ChatEvent::StreamStart(_) => active_stream_text.clear(),
+                    ChatEvent::StreamDelta(delta) => active_stream_text.push_str(&delta.text),
+                    _ => {}
+                }
+                tracker.observe_chat_event(&mut event, envelope.seq, &active_stream_text);
+                if matches!(event, ChatEvent::StreamEnd(_)) {
+                    active_stream_text.clear();
+                }
+            }
+            FrameKind::AgentActivityStats => {
+                if let Ok(payload) =
+                    serde_json::from_value::<AgentActivityStatsPayload>(envelope.payload.clone())
+                {
+                    latest_stats = Some(payload.stats);
+                }
+            }
+            _ => {}
         }
     }
+    if saw_replayable_usage_event {
+        let reported_usage_floor = latest_stats.as_ref().map(|stats| &stats.token_usage);
+        let (usage, model) = tracker.usage_snapshot_with_reported_usage_floor(reported_usage_floor);
+        return AgentUsageSnapshot {
+            start: start.clone(),
+            usage,
+            model,
+        };
+    }
+
+    // Legacy logs can contain only the coalesced activity snapshot. In that
+    // case there is no replayable source-level usage state, so keep the old
+    // stats-only reconstruction path explicit.
+    let stats = latest_stats.unwrap_or_default();
     let usage = if stats.token_usage.total_tokens > 0 {
         TaskTokenUsageScope::Known {
             usage: Box::new(TaskTokenUsageAmount::from_token_usage(&stats.token_usage)),
@@ -4763,6 +4905,30 @@ fn agent_usage_snapshot_from_log(
         start: start.clone(),
         usage,
         model: None,
+    }
+}
+
+fn chat_event_can_reconstruct_usage(event: &ChatEvent) -> bool {
+    match event {
+        ChatEvent::MessageAdded(message) | ChatEvent::StreamEnd(StreamEndData { message }) => {
+            matches!(message.sender, MessageSender::Assistant { .. })
+        }
+        ChatEvent::MessageMetadataUpdated(update) => update.token_usage.is_some(),
+        _ => false,
+    }
+}
+
+fn strip_replayed_cumulative_token_usage(event: &mut ChatEvent) {
+    let token_usage = match event {
+        ChatEvent::MessageAdded(message) => message.token_usage.as_mut(),
+        ChatEvent::StreamEnd(data) => data.message.token_usage.as_mut(),
+        ChatEvent::MessageMetadataUpdated(update) => update.token_usage.as_mut(),
+        _ => None,
+    };
+    if let Some(token_usage) = token_usage {
+        token_usage.cumulative = TokenUsageScope::Unavailable {
+            reason: TokenUsageUnavailableReason::BackendDidNotReport,
+        };
     }
 }
 
@@ -5404,7 +5570,9 @@ mod tests {
         AgentId, AgentInput, AgentStartPayload, ChatEvent, ChatMessage, ChatMessageId, FrameKind,
         MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, ReasoningData,
         SessionId, StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
-        TokenUsage, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType,
+        TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
+        TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
+        ToolRequestType,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -5977,6 +6145,53 @@ mod tests {
     }
 
     #[test]
+    fn activity_stats_does_not_synthesize_known_cumulative_from_incomplete_sources() {
+        let mut stats = AgentActivityStatsTracker::default();
+        let mut missing = assistant_message("missing usage");
+        missing.message_id = Some(ChatMessageId("missing-usage".to_owned()));
+        observe_stats(&mut stats, ChatEvent::MessageAdded(missing), 0, "");
+
+        let mut known = assistant_message("known usage");
+        known.message_id = Some(ChatMessageId("known-usage".to_owned()));
+        known.token_usage = Some(scoped_token_usage(10));
+        let mut event = ChatEvent::MessageAdded(known);
+
+        assert!(stats.observe_chat_event(&mut event, 1, ""));
+        let ChatEvent::MessageAdded(message) = event else {
+            panic!("expected MessageAdded")
+        };
+        let usage = message.token_usage.expect("message token usage");
+        assert_eq!(
+            usage.turn.known_usage().map(|usage| usage.total_tokens),
+            Some(10)
+        );
+        assert!(matches!(
+            usage.cumulative,
+            TokenUsageScope::Unavailable {
+                reason: TokenUsageUnavailableReason::BackendDidNotReport
+            }
+        ));
+        assert_eq!(stats.snapshot().token_usage.total_tokens, 10);
+
+        let (usage, _) = stats.usage_snapshot();
+        match usage {
+            TaskTokenUsageScope::Partial {
+                usage,
+                unavailable_count,
+                reasons,
+            } => {
+                assert_eq!(usage.total_tokens, 10);
+                assert_eq!(unavailable_count, 1);
+                assert_eq!(
+                    reasons,
+                    vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+                );
+            }
+            other => panic!("expected partial usage snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn activity_stats_preserves_request_only_usage_without_inventing_turn() {
         let mut stats = AgentActivityStatsTracker::default();
         let mut message = assistant_message("intermediate");
@@ -5996,6 +6211,261 @@ mod tests {
         assert!(usage.turn.known_usage().is_none());
         assert!(usage.cumulative.known_usage().is_none());
         assert_eq!(stats.snapshot().token_usage, TokenUsage::default());
+    }
+
+    #[test]
+    fn usage_snapshot_empty_reports_no_completed_assistant_turn() {
+        let stats = AgentActivityStatsTracker::default();
+
+        let (usage, _) = stats.usage_snapshot();
+
+        assert!(matches!(
+            usage,
+            TaskTokenUsageScope::Unavailable {
+                reason: TaskTokenUsageUnavailableReason::NoAssistantTurnCompleted
+            }
+        ));
+    }
+
+    #[test]
+    fn usage_snapshot_all_unavailable_reports_unavailable_reason() {
+        let mut stats = AgentActivityStatsTracker::default();
+        let mut message = assistant_message("missing usage");
+        message.message_id = Some(ChatMessageId("missing-usage".to_owned()));
+
+        observe_stats(&mut stats, ChatEvent::MessageAdded(message), 0, "");
+        let (usage, _) = stats.usage_snapshot();
+
+        assert!(matches!(
+            usage,
+            TaskTokenUsageScope::Unavailable {
+                reason: TaskTokenUsageUnavailableReason::BackendDidNotReport
+            }
+        ));
+        assert_eq!(stats.snapshot().token_usage, TokenUsage::default());
+    }
+
+    #[test]
+    fn usage_snapshot_mixed_known_and_unavailable_sources_is_partial() {
+        let mut stats = AgentActivityStatsTracker::default();
+        let mut missing = assistant_message("missing usage");
+        missing.message_id = Some(ChatMessageId("missing-usage".to_owned()));
+        observe_stats(&mut stats, ChatEvent::MessageAdded(missing), 0, "");
+
+        let mut known = assistant_message("known usage");
+        known.message_id = Some(ChatMessageId("known-usage".to_owned()));
+        known.token_usage = Some(scoped_token_usage(10));
+        observe_stats(&mut stats, ChatEvent::MessageAdded(known), 1, "");
+        let (usage, _) = stats.usage_snapshot();
+
+        match usage {
+            TaskTokenUsageScope::Partial {
+                usage,
+                unavailable_count,
+                reasons,
+            } => {
+                assert_eq!(usage.total_tokens, 10);
+                assert_eq!(usage.input_tokens, Some(5));
+                assert_eq!(usage.output_tokens, Some(5));
+                assert_eq!(unavailable_count, 1);
+                assert_eq!(
+                    reasons,
+                    vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+                );
+            }
+            other => panic!("expected partial mixed-source usage snapshot, got {other:?}"),
+        }
+        assert_eq!(stats.snapshot().token_usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn usage_snapshot_from_log_preserves_mixed_source_partial_usage() {
+        let start = test_agent_start("log-usage-agent");
+        let stream = StreamPath("/agent/log-usage-agent".to_owned());
+        let mut missing = assistant_message("missing usage");
+        missing.message_id = Some(ChatMessageId("missing-usage".to_owned()));
+        let mut known = assistant_message("known usage");
+        known.message_id = Some(ChatMessageId("known-usage".to_owned()));
+        known.token_usage = Some(scoped_token_usage(10).with_cumulative(token_usage(10)));
+        let events = [
+            ChatEvent::MessageAdded(missing),
+            ChatEvent::MessageAdded(known),
+        ];
+        let event_log = events
+            .iter()
+            .enumerate()
+            .map(|(seq, event)| {
+                protocol::Envelope::from_payload(
+                    stream.clone(),
+                    FrameKind::ChatEvent,
+                    seq as u64,
+                    event,
+                )
+                .expect("serialize ChatEvent")
+            })
+            .collect::<Vec<_>>();
+
+        let snapshot = agent_usage_snapshot_from_log(&start, &event_log);
+
+        match snapshot.usage {
+            TaskTokenUsageScope::Partial {
+                usage,
+                unavailable_count,
+                reasons,
+            } => {
+                assert_eq!(usage.total_tokens, 10);
+                assert_eq!(unavailable_count, 1);
+                assert_eq!(
+                    reasons,
+                    vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+                );
+            }
+            other => panic!("expected partial log usage snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_snapshot_from_log_uses_latest_stats_total_as_numeric_floor() {
+        let start = test_agent_start("truncated-log-usage-agent");
+        let stream = StreamPath("/agent/truncated-log-usage-agent".to_owned());
+        let stats = AgentActivityStatsPayload {
+            agent_id: start.agent_id.clone(),
+            stats: AgentActivityStats {
+                last_output_line: None,
+                tool_calls: 0,
+                token_usage: token_usage(30),
+                source_through_seq: Some(7),
+            },
+        };
+        let mut missing = assistant_message("visible missing usage");
+        missing.message_id = Some(ChatMessageId("visible-missing-usage".to_owned()));
+        let mut known = assistant_message("visible known usage");
+        known.message_id = Some(ChatMessageId("visible-known-usage".to_owned()));
+        known.token_usage = Some(scoped_token_usage(10).with_cumulative(token_usage(10)));
+        let event_log = vec![
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                FrameKind::AgentActivityStats,
+                0,
+                &stats,
+            )
+            .expect("serialize AgentActivityStats"),
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                FrameKind::ChatEvent,
+                1,
+                &ChatEvent::MessageAdded(missing),
+            )
+            .expect("serialize missing ChatEvent"),
+            protocol::Envelope::from_payload(
+                stream,
+                FrameKind::ChatEvent,
+                2,
+                &ChatEvent::MessageAdded(known),
+            )
+            .expect("serialize known ChatEvent"),
+        ];
+
+        let snapshot = agent_usage_snapshot_from_log(&start, &event_log);
+
+        match snapshot.usage {
+            TaskTokenUsageScope::Partial {
+                usage,
+                unavailable_count,
+                reasons,
+            } => {
+                assert_eq!(usage.total_tokens, 30);
+                assert_eq!(unavailable_count, 1);
+                assert_eq!(
+                    reasons,
+                    vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+                );
+            }
+            other => panic!("expected partial log usage snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_snapshot_from_log_combines_visible_unavailable_with_stats_total() {
+        let start = test_agent_start("truncated-log-unavailable-agent");
+        let stream = StreamPath("/agent/truncated-log-unavailable-agent".to_owned());
+        let stats = AgentActivityStatsPayload {
+            agent_id: start.agent_id.clone(),
+            stats: AgentActivityStats {
+                last_output_line: None,
+                tool_calls: 0,
+                token_usage: token_usage(30),
+                source_through_seq: Some(7),
+            },
+        };
+        let mut missing = assistant_message("visible missing usage");
+        missing.message_id = Some(ChatMessageId("visible-missing-usage".to_owned()));
+        let event_log = vec![
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                FrameKind::AgentActivityStats,
+                0,
+                &stats,
+            )
+            .expect("serialize AgentActivityStats"),
+            protocol::Envelope::from_payload(
+                stream,
+                FrameKind::ChatEvent,
+                1,
+                &ChatEvent::MessageAdded(missing),
+            )
+            .expect("serialize missing ChatEvent"),
+        ];
+
+        let snapshot = agent_usage_snapshot_from_log(&start, &event_log);
+
+        match snapshot.usage {
+            TaskTokenUsageScope::Partial {
+                usage,
+                unavailable_count,
+                reasons,
+            } => {
+                assert_eq!(usage.total_tokens, 30);
+                assert_eq!(unavailable_count, 1);
+                assert_eq!(
+                    reasons,
+                    vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+                );
+            }
+            other => panic!("expected partial log usage snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_snapshot_from_log_uses_stats_fallback_without_chat_usage() {
+        let start = test_agent_start("legacy-stats-agent");
+        let payload = AgentActivityStatsPayload {
+            agent_id: start.agent_id.clone(),
+            stats: AgentActivityStats {
+                last_output_line: None,
+                tool_calls: 0,
+                token_usage: token_usage(12),
+                source_through_seq: Some(7),
+            },
+        };
+        let event_log = vec![
+            protocol::Envelope::from_payload(
+                StreamPath("/agent/legacy-stats-agent".to_owned()),
+                FrameKind::AgentActivityStats,
+                0,
+                &payload,
+            )
+            .expect("serialize AgentActivityStats"),
+        ];
+
+        let snapshot = agent_usage_snapshot_from_log(&start, &event_log);
+
+        match snapshot.usage {
+            TaskTokenUsageScope::Known { usage } => {
+                assert_eq!(usage.total_tokens, 12);
+            }
+            other => panic!("expected stats-only fallback usage, got {other:?}"),
+        }
     }
 
     #[test]

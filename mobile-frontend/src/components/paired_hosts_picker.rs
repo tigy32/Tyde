@@ -2,6 +2,7 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
+use crate::bridge::AuthProvider;
 use crate::components::ui::{Button, ButtonVariant};
 use crate::state::{AppMode, AppState, ConnectionStatus, LocalHostId, PairingScreen};
 
@@ -290,8 +291,8 @@ fn ConnectDisconnectButton(
             .app_mode
             .set(AppMode::Pairing(PairingScreen::Scanner));
     });
-    let on_sign_in = Callback::new(move |_: ()| {
-        if let Err(error) = bridge::begin_tyggs_sign_in(None) {
+    let on_sign_in = Callback::new(move |provider: AuthProvider| {
+        if let Err(error) = bridge::begin_tyggs_sign_in(provider, None) {
             log::error!("failed to start Tyggs sign-in: {error}");
         }
     });
@@ -311,15 +312,7 @@ fn ConnectDisconnectButton(
             }.into_any()
         } else if let Some(sign_in) = managed_action() {
             if sign_in {
-                view! {
-                    <Button
-                        label="Sign in with Tyggs"
-                        variant=ButtonVariant::Primary
-                        full_width=true
-                        data_mobile_test="paired-host-sign-in"
-                        on_click=on_sign_in
-                    />
-                }.into_any()
+                auth_provider_buttons(on_sign_in)
             } else {
                 view! {
                     <Button
@@ -350,6 +343,52 @@ fn ConnectDisconnectButton(
                 />
             }.into_any()
         }}
+    }
+}
+
+fn auth_provider_buttons(on_sign_in: Callback<AuthProvider>) -> AnyView {
+    match bridge::tyggs_auth_providers() {
+        Ok(providers) => view! {
+            <div class="paired-host-provider-sign-in">
+                {providers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, provider)| {
+                        let test_id = if index == 0 {
+                            "paired-host-sign-in"
+                        } else {
+                            paired_host_auth_provider_test_id(provider)
+                        };
+                        view! {
+                            <button
+                                type="button"
+                                class="ui-button ui-button-primary ui-button-full"
+                                data-mobile-test=test_id
+                                data-mobile-auth-provider=provider.as_str()
+                                aria-label=provider.sign_in_label()
+                                on:click=move |_| on_sign_in.run(provider)
+                            >
+                                <span class="ui-button-label">{provider.sign_in_label()}</span>
+                            </button>
+                        }
+                    })
+                    .collect::<Vec<_>>()}
+            </div>
+        }
+        .into_any(),
+        Err(message) => view! {
+            <p class="pairing-error" role="alert" data-mobile-test="paired-host-provider-error">
+                {message}
+            </p>
+        }
+        .into_any(),
+    }
+}
+
+fn paired_host_auth_provider_test_id(provider: AuthProvider) -> &'static str {
+    match provider {
+        AuthProvider::Apple => "paired-host-sign-in-apple",
+        AuthProvider::Google => "paired-host-sign-in-google",
     }
 }
 
@@ -384,6 +423,26 @@ mod wasm_tests {
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn force_web_backend() {
+        let window = web_sys::window().expect("window");
+        let _ = js_sys::Reflect::delete_property(
+            &window,
+            &wasm_bindgen::JsValue::from_str("__TAURI__"),
+        );
+    }
+
+    fn set_service_config(json: &str) {
+        force_web_backend();
+        let window = web_sys::window().expect("window");
+        let key = wasm_bindgen::JsValue::from_str("__TYDE_MOBILE_SERVICE__");
+        if json.is_empty() {
+            let _ = js_sys::Reflect::delete_property(&window, &key);
+            return;
+        }
+        let value = js_sys::JSON::parse(json).expect("parse service config");
+        js_sys::Reflect::set(&window, &key, &value).expect("install service config");
     }
 
     fn fixture_host(id: &str, label: &str) -> PairedHostSummary {
@@ -494,6 +553,7 @@ mod wasm_tests {
     /// "Sign in with Tyggs" action — not a no-op Connect (findings #3/#7).
     #[wasm_bindgen_test]
     async fn service_auth_required_host_offers_sign_in_not_connect() {
+        force_web_backend();
         let container = make_container();
         let host = LocalHostId("h-auth".to_owned());
         let host_for_mount = host.clone();
@@ -528,6 +588,71 @@ mod wasm_tests {
             !text.contains(">Connect<") && text.contains("Sign-in required"),
             "no bare Connect; the pill must name the required action: {text}"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn service_auth_required_host_renders_provider_buttons_in_order() {
+        set_service_config(r#"{"providers":["apple","google"]}"#);
+        let container = make_container();
+        let host = LocalHostId("h-auth-providers".to_owned());
+        let host_for_mount = host.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state
+                .paired_hosts
+                .set(vec![fixture_host("h-auth-providers", "Studio")]);
+            state.connection_statuses.update(|m| {
+                m.insert(
+                    host_for_mount.clone(),
+                    ConnectionStatus::NeedsAction {
+                        code: protocol::MobileAccessErrorCode::ServiceAuthRequired,
+                        message: "Sign in with your Tyggs account again.".to_owned(),
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <PairedHostsPicker /> }
+        });
+        next_tick().await;
+
+        let legacy: HtmlElement = container
+            .query_selector("[data-mobile-test='paired-host-sign-in']")
+            .unwrap()
+            .expect("legacy selector must point at the first provider button")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(legacy.tag_name(), "BUTTON");
+        assert_eq!(
+            legacy.get_attribute("data-mobile-auth-provider").as_deref(),
+            Some("apple")
+        );
+        let apple: HtmlElement = container
+            .query_selector("[data-mobile-auth-provider='apple']")
+            .unwrap()
+            .expect("Apple sign-in button")
+            .dyn_into()
+            .unwrap();
+        let google: HtmlElement = container
+            .query_selector("[data-mobile-auth-provider='google']")
+            .unwrap()
+            .expect("Google sign-in button")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(apple.tag_name(), "BUTTON");
+        assert_eq!(google.tag_name(), "BUTTON");
+        assert_eq!(
+            google.get_attribute("data-mobile-test").as_deref(),
+            Some("paired-host-sign-in-google")
+        );
+        let text = container.text_content().unwrap_or_default();
+        let apple_index = text.find("Continue with Apple").expect("Apple label");
+        let google_index = text.find("Continue with Google").expect("Google label");
+        assert!(
+            apple_index < google_index,
+            "provider buttons must follow config order: {text}"
+        );
+
+        set_service_config("");
     }
 
     /// A managed host that needs re-pairing offers an explicit "Re-pair" action.

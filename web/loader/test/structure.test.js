@@ -105,7 +105,8 @@ test("service config script SRI matches its external file", () => {
 test("service config is public same-origin endpoint metadata only", () => {
   assert.match(serviceConfigJs, /window\.__TYDE_MOBILE_SERVICE__/);
   assert.match(serviceConfigJs, /baseUrl:\s*new URL\("\/api\/tyde\/mobile\/v1", window\.location\.origin\)\.href/);
-  assert.match(serviceConfigJs, /provider:\s*"google"/);
+  assert.match(serviceConfigJs, /providers:\s*Object\.freeze\(\["apple", "google"\]\)/);
+  assert.doesNotMatch(serviceConfigJs, /provider:\s*"google"/);
   assert.doesNotMatch(serviceConfigJs, /provider:\s*"tyggs"/);
   assert.match(serviceConfigJs, /paywallUrl:\s*"https:\/\/tyggs\.com\/pass"/);
   assert.doesNotMatch(serviceConfigJs, /stubAuth|stubRedeem/);

@@ -27,7 +27,7 @@ use super::UnlistenHandle;
 use store::{IndexedDbHostStore, IndexedDbPskStore, PskStore, WebPairedHostRecord};
 
 pub use qr::{ensure_camera_permission, scan_qr};
-pub use service::{RedeemOutcome, authenticate as authenticate_managed};
+pub use service::{AuthProvider, RedeemOutcome, authenticate as authenticate_managed};
 
 // ── Paired-host queries ───────────────────────────────────────────────────
 
@@ -204,14 +204,19 @@ pub async fn forget_paired_host(local_host_id: &LocalHostId) -> Result<(), Strin
 /// Web-only: start the Tyggs sign-in through `tycode.dev`. When `resume_qr_uri`
 /// is `Some` (mid-pairing), the scanned URI is stashed so the flow resumes after
 /// the redirect; when `None` (reconnecting an already-paired host), only the
-/// sign-in redirect happens. Navigates the whole page to the `tycode.dev`-hosted
-/// OAuth start URL; `tycode.dev` completes the Tyggs dance and sets the session
-/// cookie — no Tyggs secret ever reaches JS.
-pub fn begin_tyggs_sign_in(resume_qr_uri: Option<&str>) -> Result<(), String> {
-    let url = service::tyggs_sign_in_url().ok_or_else(|| {
-        "Tyde managed mobile access isn't configured in this build, so sign-in can't start."
-            .to_owned()
-    })?;
+/// sign-in redirect happens. The selected provider is validated against the
+/// loader config before the page navigates to the `tycode.dev`-hosted OAuth
+/// start URL; `tycode.dev` completes the Tyggs dance and sets the session cookie
+/// — no Tyggs secret ever reaches JS.
+pub fn tyggs_auth_providers() -> Result<Vec<AuthProvider>, String> {
+    service::auth_providers()
+}
+
+pub fn begin_tyggs_sign_in(
+    provider: AuthProvider,
+    resume_qr_uri: Option<&str>,
+) -> Result<(), String> {
+    let url = service::tyggs_sign_in_url(provider)?;
     if let Some(qr_uri) = resume_qr_uri {
         stash_pending_pairing_uri(qr_uri);
     }

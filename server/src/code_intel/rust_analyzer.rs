@@ -43,8 +43,9 @@ mod tests {
     use std::time::Duration;
 
     use protocol::{
-        CodeIntelDiagnosticsPayload, CodeIntelSeverity, FrameKind, ProjectFileVersion, ProjectPath,
-        ProjectRootPath, StreamPath,
+        CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelSeverity, CodeIntelState,
+        CodeIntelStatusPayload, FrameKind, ProjectFileVersion, ProjectPath, ProjectRootPath,
+        StreamPath,
     };
     use tokio::sync::mpsc;
 
@@ -70,10 +71,18 @@ mod tests {
     /// rust-analyzer-gated end-to-end test, now driving the **generic**
     /// [`LspProvider`] with the rust config: spin up a real RA over a tiny Cargo
     /// project with a deliberate type error and assert an error diagnostic
-    /// eventually arrives. Skips-with-log when RA is not installed — never a
-    /// silent pass, never a hard failure on a machine without RA.
+    /// eventually arrives. Opt-in with `TYDE_RUN_REAL_LSP_TESTS=1`; skips-with-log
+    /// when RA is not installed — never a hard failure on a machine without RA.
     #[tokio::test]
+    #[ignore = "real external LSP test; use --ignored and TYDE_RUN_REAL_LSP_TESTS=1"]
     async fn rust_analyzer_emits_diagnostics_for_broken_file() {
+        if std::env::var("TYDE_RUN_REAL_LSP_TESTS").ok().as_deref() != Some("1") {
+            eprintln!(
+                "SKIP rust_analyzer_emits_diagnostics_for_broken_file: set TYDE_RUN_REAL_LSP_TESTS=1 to run"
+            );
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path();
         if matches!(
@@ -122,17 +131,38 @@ mod tests {
                 Ok(None) => panic!("output stream closed before diagnostics arrived"),
                 Err(_) => panic!("timed out waiting for diagnostics"),
             };
-            if envelope.kind != FrameKind::CodeIntelDiagnostics {
-                continue;
-            }
-            let payload: CodeIntelDiagnosticsPayload =
-                serde_json::from_value(envelope.payload).expect("diagnostics payload");
-            if payload
-                .diagnostics
-                .iter()
-                .any(|d| d.severity == CodeIntelSeverity::Error)
-            {
-                return; // success
+            match envelope.kind {
+                FrameKind::CodeIntelDiagnostics => {
+                    let payload: CodeIntelDiagnosticsPayload =
+                        serde_json::from_value(envelope.payload).expect("diagnostics payload");
+                    if payload
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.severity == CodeIntelSeverity::Error)
+                    {
+                        return; // success
+                    }
+                }
+                FrameKind::CodeIntelError => {
+                    let error: CodeIntelErrorPayload =
+                        serde_json::from_value(envelope.payload).expect("error payload");
+                    panic!("rust-analyzer emitted CodeIntelError before diagnostics: {error:?}");
+                }
+                FrameKind::CodeIntelStatus => {
+                    let status: CodeIntelStatusPayload =
+                        serde_json::from_value(envelope.payload).expect("status payload");
+                    if matches!(
+                        status.state,
+                        CodeIntelState::Unsupported
+                            | CodeIntelState::Unavailable
+                            | CodeIntelState::Failed
+                    ) {
+                        panic!(
+                            "rust-analyzer reached terminal status before diagnostics: {status:?}"
+                        );
+                    }
+                }
+                _ => {}
             }
         }
     }

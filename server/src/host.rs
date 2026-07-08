@@ -12048,41 +12048,62 @@ fn aggregate_task_token_usage<'a>(
     usages: impl Iterator<Item = &'a TaskTokenUsageScope>,
 ) -> TaskTokenUsageAggregate {
     let mut usage = TaskTokenUsageAmount::zero();
-    let mut known_count = 0_u32;
+    let mut reported_count = 0_u32;
+    let mut partial_seen = false;
     let mut reasons = Vec::new();
     let mut unavailable_count = 0_u32;
 
     for scope in usages {
         match scope {
             TaskTokenUsageScope::Known { usage: known } => {
-                known_count = known_count.saturating_add(1);
+                reported_count = reported_count.saturating_add(1);
                 usage.saturating_add(known);
+            }
+            TaskTokenUsageScope::Partial {
+                usage: partial,
+                unavailable_count: partial_unavailable_count,
+                reasons: partial_reasons,
+            } => {
+                reported_count = reported_count.saturating_add(1);
+                partial_seen = true;
+                usage.saturating_add(partial);
+                unavailable_count = unavailable_count.saturating_add(*partial_unavailable_count);
+                extend_task_token_usage_reasons(&mut reasons, partial_reasons);
             }
             TaskTokenUsageScope::Unavailable { reason } => {
                 unavailable_count = unavailable_count.saturating_add(1);
-                if !reasons.contains(reason) {
-                    reasons.push(*reason);
-                }
+                extend_task_token_usage_reasons(&mut reasons, &[*reason]);
             }
         }
     }
     reasons.sort();
 
-    let status = if unavailable_count == 0 {
-        TaskTokenUsageStatus::Known
-    } else if known_count == 0 {
+    let status = if reported_count == 0 && unavailable_count > 0 {
         usage = TaskTokenUsageAmount::total_only(0);
         TaskTokenUsageStatus::Unavailable {
             unavailable_count,
             reasons,
         }
-    } else {
+    } else if partial_seen || unavailable_count > 0 {
         TaskTokenUsageStatus::Partial {
             unavailable_count,
             reasons,
         }
+    } else {
+        TaskTokenUsageStatus::Known
     };
     TaskTokenUsageAggregate { usage, status }
+}
+
+fn extend_task_token_usage_reasons(
+    reasons: &mut Vec<TaskTokenUsageUnavailableReason>,
+    additions: &[TaskTokenUsageUnavailableReason],
+) {
+    for reason in additions {
+        if !reasons.contains(reason) {
+            reasons.push(*reason);
+        }
+    }
 }
 
 fn normalize_antigravity_session_resumability(sessions: &mut [SessionSummary]) {
@@ -14667,6 +14688,92 @@ mod tests {
         .await
         .expect("set default backend");
         CompactFixture { _dir: dir, host }
+    }
+
+    fn task_usage_amount(input_tokens: u64, output_tokens: u64) -> TaskTokenUsageAmount {
+        TaskTokenUsageAmount {
+            total_tokens: input_tokens + output_tokens,
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            cached_prompt_tokens: None,
+            cache_creation_input_tokens: None,
+            reasoning_tokens: None,
+        }
+    }
+
+    fn task_usage_start(
+        agent_id: AgentId,
+        parent_agent_id: Option<AgentId>,
+        created_at_ms: u64,
+    ) -> AgentStartPayload {
+        AgentStartPayload {
+            agent_id,
+            name: "Task Usage Agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            workspace_roots: Vec::new(),
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            project_id: None,
+            parent_agent_id,
+            session_id: None,
+            workflow: None,
+            created_at_ms,
+        }
+    }
+
+    #[test]
+    fn task_token_usage_rollup_preserves_partial_root_self_usage() {
+        let root_id = AgentId("partial-root".to_owned());
+        let snapshots = vec![AgentUsageSnapshot {
+            start: task_usage_start(root_id.clone(), None, 1),
+            usage: TaskTokenUsageScope::Partial {
+                usage: Box::new(task_usage_amount(30, 12)),
+                unavailable_count: 1,
+                reasons: vec![TaskTokenUsageUnavailableReason::BackendDidNotReport],
+            },
+            model: Some("mock".to_owned()),
+        }];
+        let live_agent_ids = HashSet::from([root_id.clone()]);
+        let agent_sessions = HashMap::new();
+
+        let payloads =
+            task_token_usage_rollups_from_snapshots(snapshots, &live_agent_ids, &agent_sessions);
+
+        assert_eq!(payloads.len(), 1);
+        let payload = &payloads[0];
+        assert_eq!(payload.root_agent_id, root_id);
+        assert_eq!(payload.total.usage.total_tokens, 42);
+        assert_eq!(payload.total.usage.input_tokens, Some(30));
+        assert_eq!(payload.total.usage.output_tokens, Some(12));
+        assert!(matches!(
+            payload.total.status,
+            TaskTokenUsageStatus::Partial {
+                unavailable_count: 1,
+                ref reasons
+            } if reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+        ));
+        assert!(matches!(
+            payload.self_usage,
+            TaskTokenUsageScope::Partial {
+                ref usage,
+                unavailable_count: 1,
+                ref reasons
+            } if usage.total_tokens == 42
+                && reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+        ));
+        assert_eq!(payload.breakdown.len(), 1);
+        assert!(matches!(
+            payload.breakdown[0].usage,
+            TaskTokenUsageScope::Partial {
+                ref usage,
+                unavailable_count: 1,
+                ref reasons
+            } if usage.total_tokens == 42
+                && reasons == &vec![TaskTokenUsageUnavailableReason::BackendDidNotReport]
+        ));
     }
 
     async fn spawn_idle_user_agent(host: &HostHandle, prompt: &str) -> (AgentId, SessionId) {

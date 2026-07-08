@@ -9,7 +9,7 @@
 
   window.__TYDE_MOBILE_SERVICE__ = Object.freeze({
     baseUrl: new URL("/api/tyde/mobile/v1", window.location.origin).href,
-    provider: "google",
+    providers: Object.freeze(["apple", "google"]),
     paywallUrl: "https://tyggs.com/pass",
   });
 })();
