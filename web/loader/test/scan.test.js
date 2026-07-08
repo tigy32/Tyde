@@ -94,7 +94,9 @@ test("decodeQrImageData fails closed without a decoder or image", () => {
 
 test("isPairingScanValue accepts raw and HTTPS-fragment pairing forms", () => {
   assert.equal(isPairingScanValue("tyde-pair://v1?abc"), true);
+  assert.equal(isPairingScanValue("tyde-pair://v2?abc"), true);
   assert.equal(isPairingScanValue("https://tycode.dev/tyde/#tyde-pair://v1?abc"), true);
+  assert.equal(isPairingScanValue("https://tycode.dev/tyde/#tyde-pair://v2?abc"), true);
   assert.equal(isPairingScanValue("https://example.com/"), false);
   assert.equal(isPairingScanValue(""), false);
   assert.equal(isPairingScanValue(undefined), false);

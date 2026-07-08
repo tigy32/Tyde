@@ -61,9 +61,8 @@ const {
   REPAIR_VERSION_KEY,
   resolvePairingFragment,
 } = await import("../loader.js");
-const { REAL_WITH_PRERELEASE, EXAMPLE_MANIFEST, makePairingUri } = await import(
-  "./fixtures.js"
-);
+const { REAL_WITH_PRERELEASE, REAL_MANAGED_V2, EXAMPLE_MANIFEST, makePairingUri } =
+  await import("./fixtures.js");
 
 // EXAMPLE_MANIFEST stamps protocolVersion 13 on 0.8.19-beta.2; REAL_WITH_PRERELEASE
 // is a protocol-13 QR, so the happy path matches. These helpers derive drift
@@ -72,6 +71,13 @@ function manifestWithBetaProtocol(pv) {
   const m = structuredClone(EXAMPLE_MANIFEST);
   if (pv === undefined) delete m.versions["0.8.19-beta.2"].protocolVersion;
   else m.versions["0.8.19-beta.2"].protocolVersion = pv;
+  return m;
+}
+
+function manifestWithStableProtocol(pv) {
+  const m = structuredClone(EXAMPLE_MANIFEST);
+  if (pv === undefined) delete m.versions["0.8.19"].protocolVersion;
+  else m.versions["0.8.19"].protocolVersion = pv;
   return m;
 }
 
@@ -91,9 +97,23 @@ test("handlePairingUri stashes the INNER tyde-pair URI from the HTTPS QR form", 
   assert.equal(sessionStore[PAIR_URI_KEY], REAL_WITH_PRERELEASE);
 });
 
+test("handlePairingUri stashes managed v2 from the HTTPS QR fragment", async () => {
+  delete sessionStore[PAIR_URI_KEY];
+  const url = `https://tycode.dev/tyde/#${REAL_MANAGED_V2}`;
+  await handlePairingUri(url, manifestWithStableProtocol(37));
+  assert.equal(sessionStore[PAIR_URI_KEY], REAL_MANAGED_V2);
+});
+
 test("handlePairingUri does NOT stash when the URI is not a pairing code", async () => {
   delete sessionStore[PAIR_URI_KEY];
   await handlePairingUri("https://evil.example/", EXAMPLE_MANIFEST);
+  assert.equal(sessionStore[PAIR_URI_KEY], undefined);
+});
+
+test("handlePairingUri does NOT stash unsupported pairing URI versions", async () => {
+  delete sessionStore[PAIR_URI_KEY];
+  const unsupported = REAL_MANAGED_V2.replace("tyde-pair://v2?", "tyde-pair://v3?");
+  await handlePairingUri(unsupported, manifestWithStableProtocol(37));
   assert.equal(sessionStore[PAIR_URI_KEY], undefined);
 });
 

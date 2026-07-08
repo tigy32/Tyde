@@ -19,6 +19,7 @@ import {
   REAL_WITH_PRERELEASE,
   REAL_STABLE,
   REAL_NO_RELEASE,
+  REAL_MANAGED_V2,
   makePairingUri,
   EXAMPLE_MANIFEST,
 } from "./fixtures.js";
@@ -86,10 +87,34 @@ test("parsePairingUri extracts version from real host URIs", () => {
   assert.equal(none.v, 2);
 });
 
+test("parsePairingUri extracts loader fields from real managed v2 URIs", () => {
+  const parsed = parsePairingUri(REAL_MANAGED_V2);
+  assert.deepEqual(Object.keys(parsed).sort(), [
+    "protocolVersion",
+    "releaseVersion",
+    "releaseVersionRaw",
+    "v",
+  ]);
+  assert.equal(parsed.v, 3);
+  assert.equal(parsed.protocolVersion, 37);
+  assert.equal(parsed.releaseVersion, "0.8.19");
+  assert.equal(parsed.releaseVersionRaw, "0.8.19");
+  assert.equal(Object.hasOwn(parsed, "offer_secret"), false);
+  assert.equal(Object.hasOwn(parsed, "broker"), false);
+});
+
 test("parsePairingUri rejects non-pairing and malformed URIs", () => {
   assert.throws(() => parsePairingUri("https://evil.example/"));
   assert.throws(() => parsePairingUri("tyde-pair://v1?")); // empty payload
+  assert.throws(() => parsePairingUri("tyde-pair://v2?")); // empty payload
   assert.throws(() => parsePairingUri("tyde-pair://v1?!!!not-base64!!!"));
+  assert.throws(
+    () =>
+      parsePairingUri(
+        REAL_MANAGED_V2.replace("tyde-pair://v2?", "tyde-pair://v3?"),
+      ),
+    /unsupported tyde-pair URI version v3/,
+  );
   assert.throws(() => parsePairingUri(42));
 });
 
@@ -112,6 +137,7 @@ test("parsePairingUri returns null version for embedded injection strings", () =
 
 test("extractPairingUri returns the raw tyde-pair:// URI unchanged", () => {
   assert.equal(extractPairingUri(REAL_STABLE), REAL_STABLE);
+  assert.equal(extractPairingUri(REAL_MANAGED_V2), REAL_MANAGED_V2);
   // Surrounding whitespace is trimmed.
   assert.equal(extractPairingUri(`  ${REAL_STABLE}  `), REAL_STABLE);
 });
@@ -122,6 +148,8 @@ test("extractPairingUri pulls the inner URI out of the HTTPS fragment form", () 
   // With a path/query before the fragment.
   const withQuery = `https://tycode.dev/tyde/?utm=x#${REAL_WITH_PRERELEASE}`;
   assert.equal(extractPairingUri(withQuery), REAL_WITH_PRERELEASE);
+  const managed = `https://tycode.dev/tyde/#${REAL_MANAGED_V2}`;
+  assert.equal(extractPairingUri(managed), REAL_MANAGED_V2);
 });
 
 test("extractPairingUri decodes a percent-encoded fragment", () => {

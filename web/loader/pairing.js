@@ -1,4 +1,4 @@
-// Parsing + validation for the `tyde-pair://v1?` pairing URI.
+// Parsing + validation for supported `tyde-pair://` pairing URIs.
 //
 // This module is intentionally pure (no DOM, no network) so it can be unit
 // tested under `node --test` and reused in the browser unchanged.
@@ -9,13 +9,17 @@
 // the SAME rules as Rust's `host-config::TydeReleaseVersion`
 // (`host-config/src/lib.rs::validate_release_version`) before it is ever used.
 
-import { decodeFirst, MAX_CBOR_BYTES } from "./cbor.js";
+import { MAX_CBOR_BYTES } from "./cbor.js";
 
-export const PAIRING_PREFIX = "tyde-pair://v1?";
+export const PAIRING_V1_PREFIX = "tyde-pair://v1?";
+export const PAIRING_V2_PREFIX = "tyde-pair://v2?";
+export const PAIRING_PREFIX = PAIRING_V1_PREFIX;
+
+const SUPPORTED_PAIRING_PREFIXES = [PAIRING_V1_PREFIX, PAIRING_V2_PREFIX];
 
 // Pulls the inner `tyde-pair://…` pairing URI out of whatever was scanned or
 // pasted. The host's QR is now a generic HTTPS link
-// (`https://tycode.dev/tyde/#tyde-pair://v1?<payload>`) so the native iOS/
+// (`https://tycode.dev/tyde/#tyde-pair://v2?<payload>`) so the native iOS/
 // Android Camera can open it; the PSK-bearing URI rides in the URL FRAGMENT
 // (after `#`) and so is never sent to the origin. This accepts either form:
 //   - a raw `tyde-pair://…` string (legacy QR / in-app scanner / paste), or
@@ -49,6 +53,8 @@ export function extractPairingUri(raw) {
 export const MAX_URI_LEN = 4096;
 const MAX_B64_LEN = 6144; // ~ MAX_CBOR_BYTES * 4/3, with slack
 const MAX_RELEASE_VERSION_LEN = 256;
+const MAX_CBOR_DEPTH = 32;
+const MAX_CBOR_ITEMS = 4096;
 
 // Unicode White_Space code points — the EXACT set Rust's `str::trim`
 // (`char::is_whitespace`) strips: U+0009-000D, U+0020, U+0085, U+00A0, U+1680,
@@ -136,6 +142,197 @@ export function validateReleaseVersion(raw) {
   return value;
 }
 
+function pairingPrefix(uri) {
+  for (const prefix of SUPPORTED_PAIRING_PREFIXES) {
+    if (uri.startsWith(prefix)) return prefix;
+  }
+
+  const match = /^tyde-pair:\/\/v([^?]+)\?/.exec(uri);
+  if (match) {
+    throw new Error(`unsupported tyde-pair URI version v${match[1]}`);
+  }
+  throw new Error("not a supported tyde-pair pairing URI");
+}
+
+function decodePairingLoaderFields(bytes) {
+  const decoder = new PairingCborFieldDecoder(bytes);
+  return decoder.readTopLevelFields();
+}
+
+class PairingCborFieldDecoder {
+  constructor(bytes) {
+    this.bytes = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    if (this.bytes.length > MAX_CBOR_BYTES) {
+      throw new Error(`CBOR: input exceeds ${MAX_CBOR_BYTES}-byte cap`);
+    }
+    this.pos = 0;
+    this.items = 0;
+  }
+
+  readTopLevelFields() {
+    const header = this.readHeader(0);
+    if (header.major !== 5) {
+      this.skipBody(header, 0);
+      throw new Error("pairing payload is not a CBOR map");
+    }
+
+    const len = this.readArg(header.info);
+    if (len > MAX_CBOR_ITEMS) {
+      throw new Error(`CBOR: item count exceeds ${MAX_CBOR_ITEMS} cap`);
+    }
+
+    let v = null;
+    let protocolVersion = null;
+    let releaseVersionRaw = null;
+    for (let i = 0; i < len; i++) {
+      const key = this.readTextOrNull(1);
+      if (key === "v") {
+        v = this.readIntegerOrNull(1);
+      } else if (key === "protocol_version") {
+        protocolVersion = this.readIntegerOrNull(1);
+      } else if (key === "release_version") {
+        releaseVersionRaw = this.readTextOrNull(1);
+      } else {
+        this.skipItem(1);
+      }
+    }
+
+    return { v, protocolVersion, releaseVersionRaw };
+  }
+
+  readHeader(depth) {
+    if (depth > MAX_CBOR_DEPTH) {
+      throw new Error(`CBOR: nesting exceeds ${MAX_CBOR_DEPTH} levels`);
+    }
+    if (++this.items > MAX_CBOR_ITEMS) {
+      throw new Error(`CBOR: item count exceeds ${MAX_CBOR_ITEMS} cap`);
+    }
+    const initial = this.byte();
+    return { major: initial >> 5, info: initial & 0x1f };
+  }
+
+  byte() {
+    if (this.pos >= this.bytes.length) {
+      throw new Error("CBOR: unexpected end of input");
+    }
+    return this.bytes[this.pos++];
+  }
+
+  take(n) {
+    if (n < 0 || this.pos + n > this.bytes.length) {
+      throw new Error("CBOR: length exceeds input");
+    }
+    const slice = this.bytes.subarray(this.pos, this.pos + n);
+    this.pos += n;
+    return slice;
+  }
+
+  readArg(info) {
+    if (info < 24) return info;
+    if (info === 24) return this.byte();
+    if (info === 25) {
+      const b = this.take(2);
+      return (b[0] << 8) | b[1];
+    }
+    if (info === 26) {
+      const b = this.take(4);
+      return b[0] * 0x1000000 + ((b[1] << 16) | (b[2] << 8) | b[3]);
+    }
+    if (info === 27) {
+      const b = this.take(8);
+      const hi = b[0] * 0x1000000 + ((b[1] << 16) | (b[2] << 8) | b[3]);
+      const lo = b[4] * 0x1000000 + ((b[5] << 16) | (b[6] << 8) | b[7]);
+      return hi * 0x100000000 + lo;
+    }
+    throw new Error("CBOR: indefinite or reserved length is not supported");
+  }
+
+  readTextOrNull(depth) {
+    const header = this.readHeader(depth);
+    if (header.major !== 3) {
+      this.skipBody(header, depth);
+      return null;
+    }
+    const len = this.readArg(header.info);
+    return new TextDecoder("utf-8", { fatal: true }).decode(this.take(len));
+  }
+
+  readIntegerOrNull(depth) {
+    const header = this.readHeader(depth);
+    if (header.major === 0) return this.readArg(header.info);
+    if (header.major === 1) return -1 - this.readArg(header.info);
+    this.skipBody(header, depth);
+    return null;
+  }
+
+  skipItem(depth) {
+    const header = this.readHeader(depth);
+    this.skipBody(header, depth);
+  }
+
+  skipBody(header, depth) {
+    switch (header.major) {
+      case 0:
+      case 1:
+        this.readArg(header.info);
+        return;
+      case 2:
+      case 3:
+        this.take(this.readArg(header.info));
+        return;
+      case 4: {
+        const len = this.readArg(header.info);
+        if (len > MAX_CBOR_ITEMS) {
+          throw new Error(`CBOR: item count exceeds ${MAX_CBOR_ITEMS} cap`);
+        }
+        for (let i = 0; i < len; i++) this.skipItem(depth + 1);
+        return;
+      }
+      case 5: {
+        const len = this.readArg(header.info);
+        if (len > MAX_CBOR_ITEMS) {
+          throw new Error(`CBOR: item count exceeds ${MAX_CBOR_ITEMS} cap`);
+        }
+        for (let i = 0; i < len; i++) {
+          this.skipItem(depth + 1);
+          this.skipItem(depth + 1);
+        }
+        return;
+      }
+      case 6:
+        this.readArg(header.info);
+        this.skipItem(depth + 1);
+        return;
+      case 7:
+        this.skipSimple(header.info);
+        return;
+      default:
+        throw new Error("CBOR: unknown major type");
+    }
+  }
+
+  skipSimple(info) {
+    if (info < 24) return;
+    if (info === 24) {
+      this.take(1);
+      return;
+    }
+    if (info === 25) {
+      this.take(2);
+      return;
+    }
+    if (info === 26) {
+      this.take(4);
+      return;
+    }
+    if (info === 27) {
+      this.take(8);
+      return;
+    }
+    throw new Error("CBOR: unsupported simple value or break code");
+  }
+}
+
 // Parses a pairing URI and extracts only the fields the loader needs. Throws on
 // structural problems (bad prefix, bad base64, non-map CBOR). The returned
 // `releaseVersion` is the validated/normalized string, or `null` if the field
@@ -149,25 +346,14 @@ export function parsePairingUri(uri) {
     throw new Error(`pairing URI exceeds ${MAX_URI_LEN}-char cap`);
   }
   const trimmed = uri.trim();
-  if (!trimmed.startsWith(PAIRING_PREFIX)) {
-    throw new Error("not a tyde-pair://v1 pairing URI");
-  }
-  const encoded = trimmed.slice(PAIRING_PREFIX.length);
+  const prefix = pairingPrefix(trimmed);
+  const encoded = trimmed.slice(prefix.length);
   if (encoded.length === 0) {
     throw new Error("pairing payload is empty");
   }
 
   const bytes = base64urlToBytes(encoded);
-  const map = decodeFirst(bytes, { maxBytes: MAX_CBOR_BYTES });
-  if (map === null || typeof map !== "object" || Array.isArray(map)) {
-    throw new Error("pairing payload is not a CBOR map");
-  }
-
-  const v = typeof map.v === "number" ? map.v : null;
-  const protocolVersion =
-    typeof map.protocol_version === "number" ? map.protocol_version : null;
-  const releaseVersionRaw =
-    typeof map.release_version === "string" ? map.release_version : null;
+  const { v, protocolVersion, releaseVersionRaw } = decodePairingLoaderFields(bytes);
   const releaseVersion = validateReleaseVersion(releaseVersionRaw);
 
   return { v, protocolVersion, releaseVersion, releaseVersionRaw };

@@ -1,9 +1,10 @@
 // Test fixtures for the loader.
 //
-// The three REAL_* URIs below were produced by the authoritative Rust type
-// (`MobilePairingQrPayload::to_uri`) via `cargo run -p mqtt-transport
-// --example print_qr`. They are genuine host output, so the JS CBOR reader is
-// tested against real ciborium encoding — not a JS re-implementation of it.
+// The REAL_* URIs below were produced by the authoritative Rust types
+// (`MobilePairingQrPayload::to_uri` and
+// `ManagedMobilePairingQrPayload::to_uri`). They are genuine host output, so
+// the JS CBOR reader is tested against real ciborium encoding — not a JS
+// re-implementation of it.
 //
 // `makePairingUri` builds synthetic payloads for injection/abuse cases that a
 // real (validating) host would never emit, so we can prove the loader rejects
@@ -17,6 +18,9 @@ export const REAL_STABLE =
 
 export const REAL_NO_RELEASE =
   "tyde-pair://v1?qGF2AnBwcm90b2NvbF92ZXJzaW9uDWx0eWRlX3ZlcnNpb26jZW1ham9yAGVtaW5vcghlcGF0Y2gOZmJyb2tlcqJjdXJseB53c3M6Ly9icm9rZXIuZW1xeC5pbzo4MDg0L21xdHRkYXV0aKFka2luZGlhbm9ueW1vdXNmcG9saWN5pGxtcXR0X3ZlcnNpb24FY3FvcwFmcmV0YWlu9GtjbGVhbl9zdGFydPVkcm9vbXZCd2NIQndjSEJ3Y0hCd2NIQndjSEJ3Y3Bza1ggCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQlqaG9zdF9sYWJlbGpub19yZWxlYXNl";
+
+export const REAL_MANAGED_V2 =
+  "tyde-pair://v2?rGF2A3Bwcm90b2NvbF92ZXJzaW9uGCV4GnRyYW5zcG9ydF9wcm90b2NvbF92ZXJzaW9uA2x0eWRlX3ZlcnNpb26jZW1ham9yAGVtaW5vcghlcGF0Y2gOb3JlbGVhc2VfdmVyc2lvbmYwLjguMTlob2ZmZXJfaWRpb2ZmZXJfMDFKbG9mZmVyX3NlY3JldHRvZmZlcl9zZWNyZXRfZnJvbV9xcmZicm9rZXKkaGVuZHBvaW50eDZ3c3M6Ly9hMTIzNDU2Nzg5MC1hdHMuaW90LnVzLXdlc3QtMi5hbWF6b25hd3MuY29tL21xdHRocHJvdmlkZXJsYXdzX2lvdF9jb3JlZnJlZ2lvbml1cy13ZXN0LTJvYXV0aG9yaXplcl9uYW1lcHR5Y29kZS1tb2JpbGUtdjFkcm9vbXZNek16TXpNek16TXpNek16TXpNek13Y3Bza1ggNTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTVqaG9zdF9sYWJlbGlUeWRlIEhvc3RtZXhwaXJlc19hdF9tcxsAAAGZyDFT4A";
 
 // --- synthetic CBOR map builder (text keys; uint or text values) -----------
 
@@ -46,9 +50,9 @@ function encodeValue(value) {
   throw new Error("fixture builder supports only uint/text values");
 }
 
-// Builds a `tyde-pair://v1?` URI from a flat object of string/number entries.
-// Insertion order is preserved, mirroring how a CBOR map is laid out.
-export function makePairingUri(entries) {
+// Builds a pairing URI from a flat object of string/number entries. Insertion
+// order is preserved, mirroring how a CBOR map is laid out.
+export function makePairingUri(entries, { uriVersion = 1 } = {}) {
   const keys = Object.keys(entries);
   const bytes = [...encodeTextHeader(5, keys.length)]; // major 5 = map
   for (const key of keys) {
@@ -60,7 +64,7 @@ export function makePairingUri(entries) {
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
-  return "tyde-pair://v1?" + b64;
+  return `tyde-pair://v${uriVersion}?${b64}`;
 }
 
 // --- QR scan fixture --------------------------------------------------------
