@@ -544,17 +544,19 @@ pub(crate) async fn probe_session_settings_schema(
         )
         .await
     {
-        rpc.terminate().await;
-        return Err(format!("Codex model discovery initialize failed: {err}"));
+        return codex_probe_result_with_cleanup(
+            Err(format!("Codex model discovery initialize failed: {err}")),
+            rpc.terminate().await,
+        );
     }
 
     let response = rpc
         .request("model/list", json!({ "includeHidden": false }))
         .await;
-    rpc.terminate().await;
-
-    let response =
-        response.map_err(|err| format!("Codex model discovery model/list RPC failed: {err}"))?;
+    let response = codex_probe_result_with_cleanup(
+        response.map_err(|err| format!("Codex model discovery model/list RPC failed: {err}")),
+        rpc.terminate().await,
+    )?;
 
     let raw_models = response
         .get("data")
@@ -570,6 +572,22 @@ pub(crate) async fn probe_session_settings_schema(
     }
 
     Ok(codex_session_settings_schema(models))
+}
+
+fn codex_probe_result_with_cleanup<T>(
+    operation: Result<T, String>,
+    cleanup: Result<(), String>,
+) -> Result<T, String> {
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(format!(
+            "Codex model discovery app-server cleanup failed: {cleanup_error}"
+        )),
+        (Err(error), Err(cleanup_error)) => Err(format!(
+            "{error}; Codex app-server cleanup also failed: {cleanup_error}"
+        )),
+    }
 }
 
 fn codex_model_options_from_raw(raw_models: &[Value]) -> Vec<protocol::SelectOption> {
@@ -5569,14 +5587,15 @@ impl CodexRpc {
         self.stderr_task.abort();
     }
 
-    async fn terminate(&self) {
+    async fn terminate(&self) -> Result<(), String> {
         let child = self.child.lock().await.take();
-        if let Some(mut child) = child {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
+        let result = match child {
+            Some(mut child) => terminate_codex_child(&mut child).await,
+            None => Ok(()),
+        };
         self.stdout_task.abort();
         self.stderr_task.abort();
+        result
     }
 
     /// Reap the app-server after it exited on its own (stdout EOF → `Closed`).
@@ -5596,6 +5615,39 @@ impl CodexRpc {
             let _ = child.wait().await;
         }
     }
+}
+
+async fn terminate_codex_child(child: &mut AsyncGroupChild) -> Result<(), String> {
+    let kill_error = child
+        .start_kill()
+        .err()
+        .map(|err| format!("failed to kill Codex app-server process group: {err}"));
+    let wait_error = wait_for_codex_child_exit(child.wait(), CODEX_SHUTDOWN_TIMEOUT)
+        .await
+        .err();
+
+    match (kill_error, wait_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) | (None, Some(error)) => Err(error),
+        (Some(kill_error), Some(wait_error)) => Err(format!("{kill_error}; {wait_error}")),
+    }
+}
+
+async fn wait_for_codex_child_exit(
+    wait: impl std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+    timeout: Duration,
+) -> Result<(), String> {
+    match tokio::time::timeout(timeout, wait).await {
+        Ok(Ok(_)) => None,
+        Ok(Err(err)) => Some(format!(
+            "failed to reap Codex app-server process group: {err}"
+        )),
+        Err(_) => Some(format!(
+            "timed out after {}s reaping Codex app-server process group",
+            timeout.as_secs_f64()
+        )),
+    }
+    .map_or(Ok(()), Err)
 }
 
 impl Drop for CodexRpc {
@@ -8555,6 +8607,47 @@ for line in sys.stdin:
             !resolved.0.contains_key("model"),
             "Auto must omit the model override so Codex selects its effective model"
         );
+    }
+
+    #[test]
+    fn codex_model_probe_surfaces_cleanup_failure_after_success() {
+        let error = codex_probe_result_with_cleanup(
+            Ok::<_, String>(()),
+            Err("timed out reaping test app-server".to_string()),
+        )
+        .expect_err("cleanup failure must fail model discovery");
+
+        assert!(error.contains("Codex model discovery app-server cleanup failed"));
+        assert!(error.contains("timed out reaping test app-server"));
+    }
+
+    #[test]
+    fn codex_model_probe_preserves_operation_and_cleanup_failures() {
+        let error = codex_probe_result_with_cleanup::<()>(
+            Err("model/list failed".to_string()),
+            Err("kill failed".to_string()),
+        )
+        .expect_err("both failures must remain visible");
+
+        assert!(error.contains("model/list failed"));
+        assert!(error.contains("Codex app-server cleanup also failed: kill failed"));
+    }
+
+    #[tokio::test]
+    async fn codex_child_wait_timeout_is_bounded_and_explicit() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_codex_child_exit(
+                std::future::pending::<std::io::Result<std::process::ExitStatus>>(),
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("bounded child wait must return")
+        .expect_err("pending child wait must time out");
+
+        assert!(result.contains("timed out after 0.01s"));
+        assert!(result.contains("reaping Codex app-server process group"));
     }
 
     #[tokio::test]
