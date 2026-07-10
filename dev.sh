@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 cd "$(dirname "$0")"
 
@@ -44,8 +45,12 @@ case "${1:-}" in
     check)
         check
         ;;
+    release)
+        shift
+        exec tools/release.sh "$@"
+        ;;
     *)
-        printf 'Usage: %s check\n' "$0" >&2
+        printf 'Usage: %s check\n       %s release <command> [args]\n' "$0" "$0" >&2
         exit 2
         ;;
 esac

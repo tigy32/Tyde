@@ -94,6 +94,12 @@ with the tag. Install it once per clone with `tools/install-git-hooks.sh`
 Only push a release after the user explicitly approves the release action and
 the exact target version, e.g. `vX.Y.Z`. Never force-push a release.
 
+Use `./dev.sh release prepare vX.Y.Z --commit` and then
+`./dev.sh release cut vX.Y.Z` for the normal human release path. Use the
+`status`, `wait`, `verify`, and beta-only `publish` subcommands for bounded
+monitoring and controlled publication instead of an ad hoc polling loop. The
+checklist below remains the hard-rule contract enforced by that tooling.
+
 After approval:
 
 1. Confirm the working tree is clean and you are on `main`:

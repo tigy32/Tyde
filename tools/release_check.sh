@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -73,6 +74,27 @@ fi
 VERSION="${VERSION#v}"
 log "Release version: $VERSION"
 
+log "Checking release tooling shell syntax"
+bash -n dev.sh tools/release.sh tools/release_check.sh
+
+log "Checking release tooling Python syntax"
+python3 -B - \
+    tools/check_release_version.py \
+    tools/set_release_version.py \
+    tools/release_tool.py <<'PY'
+import pathlib
+import sys
+
+for raw_path in sys.argv[1:]:
+    path = pathlib.Path(raw_path)
+    compile(path.read_text(encoding="utf-8"), str(path), "exec")
+PY
+
+log "Running release tooling Python tests"
+python3 -B -m unittest \
+    tools/test_release_tooling.py \
+    tools/test_check_mobile_web_manifest.py
+
 log "Running cargo fmt --all --check"
 cargo fmt --all --check
 
@@ -96,9 +118,6 @@ log "Running web loader tests"
 
 log "Running web deploy manifest tests"
 node --test web/deploy/*.test.mjs
-
-log "Running mobile web manifest Python tests"
-python3 -m unittest tools/test_check_mobile_web_manifest.py
 
 log "Checking web deploy shell syntax"
 bash -n web/deploy/deploy.sh

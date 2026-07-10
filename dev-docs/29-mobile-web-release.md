@@ -77,6 +77,28 @@ asserts every S3 destination stays under `s3://tycode-static/tyde/`.
 
 ## Local checks
 
+The deterministic human release entry points are:
+
+```sh
+./dev.sh release prepare v<release> [--commit]
+./dev.sh release cut v<release> [--no-wait]
+./dev.sh release status v<release>
+./dev.sh release wait v<release> [--timeout 90m] [--interval 30]
+./dev.sh release verify v<release>
+./dev.sh release publish v<beta-release>
+```
+
+`cut` requires an exact TTY confirmation, pushes `main` before the annotated
+tag, and waits by polling GitHub unless `--no-wait` is given. Beta workflows
+leave a verified draft; `publish` is the separate beta-only publication step
+and also requires exact TTY confirmation. None of these commands bypasses the
+release checks, hook, clean-tree, or `main` requirements in `AGENTS.md`.
+The `wait --timeout` deadline bounds the complete wait subprocess, including
+GitHub, network, and helper calls; timeout exits remain `3` when no matching run
+was seen and `4` after a matching run reached a nonterminal state. A deadline
+hit while normalizing status or verifying a completed run exits `5` as a
+network/tool error.
+
 Use the canonical local guard before release builds:
 
 ```sh

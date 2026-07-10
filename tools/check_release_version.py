@@ -12,6 +12,23 @@ except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
 
+JSON_VERSION_PATHS = (
+    pathlib.Path("package.json"),
+    pathlib.Path("frontend/tauri-shell/tauri.conf.json"),
+    pathlib.Path("mobile/src-tauri/tauri.conf.json"),
+)
+PACKAGE_LOCK_PATH = pathlib.Path("package-lock.json")
+CARGO_PACKAGE_PATHS = (
+    pathlib.Path("frontend/tauri-shell/Cargo.toml"),
+    pathlib.Path("tyde-server/Cargo.toml"),
+    pathlib.Path("mobile/src-tauri/Cargo.toml"),
+)
+CARGO_LOCK_PATH = pathlib.Path("Cargo.lock")
+CARGO_LOCK_PACKAGE_NAMES = frozenset(
+    {"tauri-shell", "tyde-server", "tyde-mobile-shell"}
+)
+
+
 def normalize_expected(raw: str) -> str:
     raw = raw.strip()
     if raw.startswith("v"):
@@ -113,31 +130,42 @@ def read_cargo_lock_versions(
     return versions
 
 
+def release_version_paths(repo_root: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    return tuple(
+        repo_root / path
+        for path in (
+            *JSON_VERSION_PATHS,
+            PACKAGE_LOCK_PATH,
+            *CARGO_PACKAGE_PATHS,
+            CARGO_LOCK_PATH,
+        )
+    )
+
+
+def collect_versions(repo_root: pathlib.Path) -> dict[str, str]:
+    versions = {
+        str(path): read_json_version(repo_root / path)
+        for path in JSON_VERSION_PATHS
+    }
+    versions.update(read_package_lock_versions(repo_root / PACKAGE_LOCK_PATH))
+    versions.update(
+        {
+            str(path): read_cargo_package_version(repo_root / path)
+            for path in CARGO_PACKAGE_PATHS
+        }
+    )
+    versions.update(
+        read_cargo_lock_versions(
+            repo_root / CARGO_LOCK_PATH,
+            set(CARGO_LOCK_PACKAGE_NAMES),
+        )
+    )
+    return versions
+
+
 def main() -> int:
     repo_root = pathlib.Path(__file__).resolve().parent.parent
-    versions = {
-        "package.json": read_json_version(repo_root / "package.json"),
-        **read_package_lock_versions(repo_root / "package-lock.json"),
-        "frontend/tauri-shell/Cargo.toml": read_cargo_package_version(
-            repo_root / "frontend/tauri-shell/Cargo.toml"
-        ),
-        "tyde-server/Cargo.toml": read_cargo_package_version(
-            repo_root / "tyde-server/Cargo.toml"
-        ),
-        "frontend/tauri-shell/tauri.conf.json": read_json_version(
-            repo_root / "frontend/tauri-shell/tauri.conf.json"
-        ),
-        "mobile/src-tauri/Cargo.toml": read_cargo_package_version(
-            repo_root / "mobile/src-tauri/Cargo.toml"
-        ),
-        "mobile/src-tauri/tauri.conf.json": read_json_version(
-            repo_root / "mobile/src-tauri/tauri.conf.json"
-        ),
-        **read_cargo_lock_versions(
-            repo_root / "Cargo.lock",
-            {"tauri-shell", "tyde-server", "tyde-mobile-shell"},
-        ),
-    }
+    versions = collect_versions(repo_root)
 
     unique_versions = sorted(set(versions.values()))
     if len(unique_versions) != 1:
