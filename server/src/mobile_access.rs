@@ -40,8 +40,9 @@ use crate::error::{AppError, AppResult};
 use crate::host::HostHandle;
 use crate::store::mobile_pairings::{
     ActiveManagedMobilePairingCredential, ActiveMobilePairingCredential,
-    ManagedMobilePairingCredential, ManagedMobilePairingHandoff, MobilePairingRecord,
-    MobilePairings, MobilePairingsStore, key_fingerprint,
+    ManagedMobilePairingCredential, ManagedMobilePairingHandoff, ManagedMobilePairingRecordInsert,
+    MobilePairingRecord, MobilePairings, MobilePairingsStore, PendingManagedMobileHandoffAck,
+    key_fingerprint,
 };
 use crate::stream::{Stream, StreamClosed};
 
@@ -53,6 +54,8 @@ const MANAGED_SERVICE_BASE_URL_ENV: &str = "TYDE_MOBILE_SERVICE_BASE_URL";
 const DEFAULT_MANAGED_SERVICE_BASE_URL: &str = "https://tycode.dev/api/tyde/mobile/v1";
 const PAIRING_HMAC_PREFIX: &str = "TYCODE-PAIRING-HMAC-V1";
 const OFFER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const HANDOFF_ACK_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const HANDOFF_ACK_RETRY_MAX: Duration = Duration::from_secs(30);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -234,6 +237,11 @@ pub(crate) enum MobileAccessCommand {
         offer_id: MobilePairingOfferId,
         handoff: Box<ManagedMobilePairingHandoff>,
     },
+    PairingHandoffAckRetry {
+        offer_id: MobilePairingOfferId,
+        pairing_id: String,
+        attempt: u32,
+    },
     PairingOfferTerminal {
         offer_id: MobilePairingOfferId,
         state: ManagedOfferTerminalState,
@@ -340,6 +348,7 @@ pub(crate) struct MobileAccessActor {
     connected_tasks: HashMap<MobileDeviceId, ConnectedMobileTask>,
     pairing_ttl_task: Option<JoinHandle<()>>,
     offer_poll_task: Option<JoinHandle<()>>,
+    handoff_ack_retry_task: Option<JoinHandle<()>>,
     next_connection_instance_id: u64,
     mobile_pairings_lease: Option<MobilePairingsLease>,
 }
@@ -514,6 +523,38 @@ impl ManagedMobileServiceClient {
         Ok(())
     }
 
+    async fn acknowledge_host_handoff(
+        &self,
+        offer_id: &MobilePairingOfferId,
+        host_offer_token: &str,
+        pairing_id: &str,
+    ) -> Result<(), ManagedServiceError> {
+        let response = self
+            .http
+            .post(
+                self.base
+                    .url_for(&format!("/host/offers/{offer_id}/handoff/ack")),
+            )
+            .bearer_auth(host_offer_token)
+            .json(&AcknowledgeHostHandoffRequest {
+                pairing_id: pairing_id.to_owned(),
+            })
+            .send()
+            .await
+            .map_err(ManagedServiceError::transport)?;
+        let response: AcknowledgeHostHandoffResponse = parse_managed_response(response).await?;
+        if response.offer_id != offer_id.as_str()
+            || response.pairing_id != pairing_id
+            || response.status != HostHandoffStatus::Acknowledged
+        {
+            return Err(ManagedServiceError::new(
+                MobileAccessErrorCode::ServiceUnavailable,
+                "managed mobile service returned an invalid handoff acknowledgement",
+            ));
+        }
+        Ok(())
+    }
+
     async fn mint_host_broker_credentials(
         &self,
         record: &MobilePairingRecord,
@@ -678,6 +719,7 @@ struct PollHostOfferResponse {
     device: Option<ContractDeviceSummary>,
     broker: Option<ContractBrokerEndpoint>,
     host_broker_credentials: Option<ContractBrokerCredentials>,
+    host_handoff: Option<ContractHostHandoffState>,
 }
 
 impl std::fmt::Debug for PollHostOfferResponse {
@@ -698,6 +740,7 @@ impl std::fmt::Debug for PollHostOfferResponse {
                 "host_broker_credentials",
                 &self.host_broker_credentials.as_ref().map(|_| "<redacted>"),
             )
+            .field("host_handoff", &self.host_handoff)
             .finish()
     }
 }
@@ -706,6 +749,32 @@ impl std::fmt::Debug for PollHostOfferResponse {
 struct CancelHostOfferResponse {
     offer_id: String,
     status: HostOfferStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct AcknowledgeHostHandoffRequest {
+    pairing_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcknowledgeHostHandoffResponse {
+    offer_id: String,
+    pairing_id: String,
+    status: HostHandoffStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContractHostHandoffState {
+    status: HostHandoffStatus,
+    expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HostHandoffStatus {
+    Available,
+    Acknowledged,
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -813,6 +882,7 @@ struct ContractBrokerCredentials {
     connect: ContractBrokerConnect,
     scope: ContractBrokerCredentialScope,
     issued_at_ms: u64,
+    connect_valid_until_ms: u64,
     expires_at_ms: u64,
 }
 
@@ -825,6 +895,7 @@ impl std::fmt::Debug for ContractBrokerCredentials {
             .field("connect", &"<redacted>")
             .field("scope", &self.scope)
             .field("issued_at_ms", &self.issued_at_ms)
+            .field("connect_valid_until_ms", &self.connect_valid_until_ms)
             .field("expires_at_ms", &self.expires_at_ms)
             .finish()
     }
@@ -888,6 +959,7 @@ enum ManagedErrorCode {
     OfferAlreadyRedeemed,
     DuplicateDevice,
     OfferExpired,
+    HostHandoffExpired,
     RepairRequired,
     PairingRevoked,
     VersionMismatch,
@@ -937,6 +1009,7 @@ impl ManagedErrorBody {
             ManagedErrorCode::OfferAlreadyRedeemed => MobileAccessErrorCode::PairingRejected,
             ManagedErrorCode::DuplicateDevice => MobileAccessErrorCode::DuplicateDevice,
             ManagedErrorCode::OfferExpired => MobileAccessErrorCode::PairingExpired,
+            ManagedErrorCode::HostHandoffExpired => MobileAccessErrorCode::PairingExpired,
             ManagedErrorCode::RepairRequired => MobileAccessErrorCode::RepairRequired,
             ManagedErrorCode::PairingRevoked => MobileAccessErrorCode::RevokedDevice,
             ManagedErrorCode::VersionMismatch => MobileAccessErrorCode::VersionMismatch,
@@ -1138,14 +1211,29 @@ impl MobileAccessActor {
         } else {
             MobileBrokerStatus::Disabled
         };
-        let pairing = match &pairings.active_pairing {
-            Some(active) => MobilePairingState::Active {
-                offer_id: active.offer_id.clone(),
-                expires_at_ms: active
-                    .created_at_ms
-                    .saturating_add(init.pairing_ttl.as_millis() as u64),
+        let pairing = match (&pairings.pending_handoff_ack, &pairings.active_pairing) {
+            (Some(pending), None) => MobilePairingState::Active {
+                offer_id: pending.offer_id.clone(),
+                expires_at_ms: pending.expires_at_ms,
             },
-            None => MobilePairingState::Idle,
+            (None, Some(active)) => MobilePairingState::Active {
+                offer_id: active.offer_id.clone(),
+                expires_at_ms: active.managed.as_ref().map_or_else(
+                    || {
+                        active
+                            .created_at_ms
+                            .saturating_add(init.pairing_ttl.as_millis() as u64)
+                    },
+                    |managed| managed.expires_at_ms,
+                ),
+            },
+            (None, None) => MobilePairingState::Idle,
+            (Some(_), Some(_)) => {
+                return Err(
+                    "mobile pairings contain conflicting active offer and pending acknowledgement"
+                        .to_owned(),
+                );
+            }
         };
 
         Ok(Self {
@@ -1166,6 +1254,7 @@ impl MobileAccessActor {
             connected_tasks: HashMap::new(),
             pairing_ttl_task: None,
             offer_poll_task: None,
+            handoff_ack_retry_task: None,
             next_connection_instance_id: 0,
             mobile_pairings_lease: None,
         })
@@ -1221,6 +1310,15 @@ impl MobileAccessActor {
                 }
                 MobileAccessCommand::PairingOfferRedeemed { offer_id, handoff } => {
                     self.pairing_offer_redeemed(&offer_id, *handoff).await;
+                }
+                MobileAccessCommand::PairingHandoffAckRetry {
+                    offer_id,
+                    pairing_id,
+                    attempt,
+                } => {
+                    self.handoff_ack_retry_task.take();
+                    self.acknowledge_persisted_handoff(&offer_id, &pairing_id, attempt)
+                        .await;
                 }
                 MobileAccessCommand::PairingOfferTerminal { offer_id, state } => {
                     self.pairing_offer_terminal(&offer_id, state).await;
@@ -1392,6 +1490,7 @@ impl MobileAccessActor {
             self.spawn_device_accepts_if_needed();
         } else {
             self.spawn_managed_device_accepts_if_needed();
+            self.resume_managed_pairing_handoff_if_needed();
         }
     }
 
@@ -1426,6 +1525,36 @@ impl MobileAccessActor {
                 offer_id,
                 code: MobileAccessErrorCode::InvalidConfig,
                 message: "mobile connections are disabled".to_owned(),
+            };
+            self.fan_out_state().await;
+            return;
+        }
+        if let Some(pending) = self.pairings.pending_handoff_ack.clone()
+            && now_ms().is_ok_and(|now| now >= pending.expires_at_ms)
+            && let Some(broker_url) = self
+                .pairings
+                .devices
+                .iter()
+                .find(|record| record.device_id == pending.device_id)
+                .map(|record| record.broker.url.clone())
+        {
+            self.expire_pending_handoff(
+                &pending.offer_id,
+                &pending.pairing_id,
+                broker_url,
+                "Managed mobile handoff acknowledgement expired".to_owned(),
+                0,
+            )
+            .await;
+            if self.pairings.pending_handoff_ack.is_some() {
+                return;
+            }
+        }
+        if self.pairings.pending_handoff_ack.is_some() {
+            self.pairing = MobilePairingState::Failed {
+                offer_id,
+                code: MobileAccessErrorCode::PairingRejected,
+                message: "A managed mobile handoff is still being acknowledged".to_owned(),
             };
             self.fan_out_state().await;
             return;
@@ -1946,46 +2075,299 @@ impl MobileAccessActor {
         offer_id: &MobilePairingOfferId,
         handoff: ManagedMobilePairingHandoff,
     ) {
-        let Some(active) = self.pairings.active_pairing.as_mut() else {
+        let Some(active) = self.pairings.active_pairing.as_ref() else {
             return;
         };
         if &active.offer_id != offer_id {
             return;
         }
-        let Some(managed) = active.managed.as_mut() else {
+        let Some(managed) = active.managed.as_ref() else {
             return;
         };
-        managed.handoff = Some(handoff);
-        managed.host_broker_credentials = managed
-            .handoff
-            .as_ref()
-            .map(|handoff| handoff.host_broker_credentials.clone())
-            .unwrap_or_else(|| managed.host_broker_credentials.clone());
-        managed.broker = managed
-            .handoff
-            .as_ref()
-            .map(|handoff| handoff.broker.clone())
-            .unwrap_or_else(|| managed.broker.clone());
-        active.broker = BrokerEndpoint {
-            url: managed.broker.endpoint.clone(),
-            auth: BrokerAuth::Anonymous,
-        };
-        let broker_url = managed.broker.endpoint.clone();
-        if let Err(message) = self.pairings_store.save(&self.pairings) {
+        if handoff.host_broker_credentials.scope.role != ManagedBrokerRole::Host
+            || handoff.host_broker_credentials.issued_at_ms
+                >= handoff.host_broker_credentials.expires_at_ms
+        {
+            let message =
+                "managed mobile handoff contained invalid host broker credentials".to_owned();
             self.pairing = MobilePairingState::Failed {
                 offer_id: offer_id.clone(),
-                code: MobileAccessErrorCode::StoreLoadFailed,
+                code: MobileAccessErrorCode::ServiceUnavailable,
+                message: message.clone(),
+            };
+            self.broker_status = MobileBrokerStatus::Error {
+                broker_url: Some(handoff.broker.endpoint),
+                code: MobileAccessErrorCode::ServiceUnavailable,
                 message,
             };
             self.fan_out_state().await;
             return;
         }
+        if let Some(task) = self.pairing_ttl_task.take() {
+            task.abort();
+        }
+        let active = active.clone();
+        let pairing_id = handoff.pairing_id.clone();
+        let handoff_expires_at_ms = handoff.handoff_expires_at_ms;
+        let device_id = handoff.device_id.clone();
+        let broker_url = handoff.broker.endpoint.clone();
+        let record = MobilePairingRecord {
+            device_id: device_id.clone(),
+            broker: BrokerEndpoint {
+                url: broker_url.clone(),
+                auth: BrokerAuth::Anonymous,
+            },
+            room: active.room,
+            psk: active.psk.clone(),
+            label: handoff.device_label,
+            created_at_ms: handoff.device_created_at_ms,
+            last_seen_at_ms: handoff.device_last_seen_at_ms,
+            state: MobileDeviceState::Paired,
+            key_fingerprint: active.key_fingerprint.clone(),
+            managed: Some(ManagedMobilePairingCredential {
+                pairing_id: pairing_id.clone(),
+                host_pairing_secret: handoff.host_pairing_secret,
+                broker: handoff.broker,
+            }),
+        };
+        let pending_ack = PendingManagedMobileHandoffAck {
+            offer_id: offer_id.clone(),
+            host_offer_token: managed.host_offer_token.clone(),
+            pairing_id: pairing_id.clone(),
+            device_id: device_id.clone(),
+            expires_at_ms: handoff_expires_at_ms,
+        };
+        let mut persisted_pairings = self.pairings.clone();
+        let insert = match persisted_pairings.insert_managed_record(record) {
+            Ok(insert) => insert,
+            Err(message) => {
+                self.pairing = MobilePairingState::Failed {
+                    offer_id: offer_id.clone(),
+                    code: MobileAccessErrorCode::DuplicateDevice,
+                    message: message.clone(),
+                };
+                self.broker_status = MobileBrokerStatus::Error {
+                    broker_url: Some(broker_url),
+                    code: MobileAccessErrorCode::DuplicateDevice,
+                    message,
+                };
+                self.fan_out_state().await;
+                return;
+            }
+        };
+        persisted_pairings.active_pairing = None;
+        persisted_pairings.pending_handoff_ack = Some(pending_ack);
+        if let Err(message) = self.pairings_store.save(&persisted_pairings) {
+            self.pairing = MobilePairingState::Failed {
+                offer_id: offer_id.clone(),
+                code: MobileAccessErrorCode::StoreLoadFailed,
+                message: message.clone(),
+            };
+            self.broker_status = MobileBrokerStatus::Error {
+                broker_url: Some(broker_url),
+                code: MobileAccessErrorCode::StoreLoadFailed,
+                message,
+            };
+            self.spawn_offer_poll_after(active, OFFER_POLL_INTERVAL);
+            self.fan_out_state().await;
+            return;
+        }
+        self.pairings = persisted_pairings;
         if let Some(task) = self.offer_poll_task.take() {
             task.abort();
         }
-        self.broker_status = MobileBrokerStatus::Connecting { broker_url };
-        self.spawn_active_pairing_accept_if_needed();
+        self.active_requester = None;
+        self.pairing = MobilePairingState::Active {
+            offer_id: offer_id.clone(),
+            expires_at_ms: handoff_expires_at_ms,
+        };
+        self.broker_status = MobileBrokerStatus::Connecting {
+            broker_url: broker_url.clone(),
+        };
+        self.spawn_device_accept(device_id);
+        if insert == ManagedMobilePairingRecordInsert::Inserted {
+            self.fan_out_state().await;
+        }
+
+        self.acknowledge_persisted_handoff(offer_id, &pairing_id, 0)
+            .await;
+    }
+
+    async fn acknowledge_persisted_handoff(
+        &mut self,
+        offer_id: &MobilePairingOfferId,
+        pairing_id: &str,
+        attempt: u32,
+    ) {
+        let Some(pending) = self.pairings.pending_handoff_ack.clone() else {
+            return;
+        };
+        if &pending.offer_id != offer_id || pending.pairing_id != pairing_id {
+            return;
+        }
+        let Some(record) = self
+            .pairings
+            .devices
+            .iter()
+            .find(|record| record.device_id == pending.device_id)
+            .cloned()
+        else {
+            let message = format!(
+                "managed mobile handoff {pairing_id} was not durably persisted before acknowledgement"
+            );
+            self.pairing = MobilePairingState::Failed {
+                offer_id: offer_id.clone(),
+                code: MobileAccessErrorCode::RepairRequired,
+                message: message.clone(),
+            };
+            self.broker_status = MobileBrokerStatus::Error {
+                broker_url: None,
+                code: MobileAccessErrorCode::RepairRequired,
+                message,
+            };
+            self.fan_out_state().await;
+            return;
+        };
+        let device_id = record.device_id;
+        let broker_url = record.broker.url;
+        if now_ms().is_ok_and(|now| now >= pending.expires_at_ms) {
+            self.expire_pending_handoff(
+                offer_id,
+                pairing_id,
+                broker_url,
+                "Managed mobile handoff acknowledgement expired".to_owned(),
+                attempt,
+            )
+            .await;
+            return;
+        }
+        if let Err(error) = self
+            .managed_service
+            .acknowledge_host_handoff(offer_id, &pending.host_offer_token, pairing_id)
+            .await
+        {
+            if error.code == MobileAccessErrorCode::PairingExpired {
+                self.expire_pending_handoff(
+                    offer_id,
+                    pairing_id,
+                    broker_url,
+                    error.message,
+                    attempt,
+                )
+                .await;
+                return;
+            }
+            let pairing = MobilePairingState::Failed {
+                offer_id: offer_id.clone(),
+                code: error.code,
+                message: error.message.clone(),
+            };
+            let broker_status = MobileBrokerStatus::Error {
+                broker_url: Some(broker_url),
+                code: error.code,
+                message: error.message,
+            };
+            let changed = self.pairing != pairing || self.broker_status != broker_status;
+            self.pairing = pairing;
+            self.broker_status = broker_status;
+            if error.code == MobileAccessErrorCode::ServiceUnavailable {
+                self.schedule_handoff_ack_retry(
+                    offer_id.clone(),
+                    pairing_id.to_owned(),
+                    attempt.saturating_add(1),
+                    handoff_ack_retry_delay(attempt),
+                );
+            }
+            if changed {
+                self.fan_out_state().await;
+            }
+            return;
+        }
+
+        let mut persisted_pairings = self.pairings.clone();
+        persisted_pairings.pending_handoff_ack = None;
+        if let Err(message) = self.pairings_store.save(&persisted_pairings) {
+            let pairing = MobilePairingState::Failed {
+                offer_id: offer_id.clone(),
+                code: MobileAccessErrorCode::StoreLoadFailed,
+                message: message.clone(),
+            };
+            let broker_status = MobileBrokerStatus::Error {
+                broker_url: Some(broker_url),
+                code: MobileAccessErrorCode::StoreLoadFailed,
+                message,
+            };
+            let changed = self.pairing != pairing || self.broker_status != broker_status;
+            self.pairing = pairing;
+            self.broker_status = broker_status;
+            self.schedule_handoff_ack_retry(
+                offer_id.clone(),
+                pairing_id.to_owned(),
+                attempt.saturating_add(1),
+                handoff_ack_retry_delay(attempt),
+            );
+            if changed {
+                self.fan_out_state().await;
+            }
+            return;
+        }
+        self.pairings = persisted_pairings;
+        self.pairing = MobilePairingState::Consumed {
+            offer_id: offer_id.clone(),
+        };
+        if !self.connected_tasks.contains_key(&device_id) {
+            self.broker_status = MobileBrokerStatus::Connecting { broker_url };
+        }
         self.fan_out_state().await;
+        self.schedule_pairing_grace(offer_id.clone());
+    }
+
+    async fn expire_pending_handoff(
+        &mut self,
+        offer_id: &MobilePairingOfferId,
+        pairing_id: &str,
+        broker_url: BrokerUrl,
+        expiry_message: String,
+        attempt: u32,
+    ) {
+        let mut persisted_pairings = self.pairings.clone();
+        persisted_pairings.pending_handoff_ack = None;
+        if let Err(message) = self.pairings_store.save(&persisted_pairings) {
+            let pairing = MobilePairingState::Failed {
+                offer_id: offer_id.clone(),
+                code: MobileAccessErrorCode::StoreLoadFailed,
+                message: message.clone(),
+            };
+            let broker_status = MobileBrokerStatus::Error {
+                broker_url: Some(broker_url),
+                code: MobileAccessErrorCode::StoreLoadFailed,
+                message,
+            };
+            let changed = self.pairing != pairing || self.broker_status != broker_status;
+            self.pairing = pairing;
+            self.broker_status = broker_status;
+            self.schedule_handoff_ack_retry(
+                offer_id.clone(),
+                pairing_id.to_owned(),
+                attempt.saturating_add(1),
+                handoff_ack_retry_delay(attempt),
+            );
+            if changed {
+                self.fan_out_state().await;
+            }
+            return;
+        }
+        self.pairings = persisted_pairings;
+        let pairing = MobilePairingState::Failed {
+            offer_id: offer_id.clone(),
+            code: MobileAccessErrorCode::PairingExpired,
+            message: expiry_message,
+        };
+        let changed = self.pairing != pairing;
+        self.pairing = pairing;
+        if changed {
+            self.fan_out_state().await;
+        }
     }
 
     async fn pairing_offer_terminal(
@@ -2224,6 +2606,23 @@ impl MobileAccessActor {
         }
     }
 
+    fn resume_managed_pairing_handoff_if_needed(&mut self) {
+        if let Some(pending) = self.pairings.pending_handoff_ack.clone() {
+            self.schedule_handoff_ack_retry(
+                pending.offer_id,
+                pending.pairing_id,
+                0,
+                Duration::ZERO,
+            );
+            return;
+        }
+        if let Some(active) = self.pairings.active_pairing.clone()
+            && active.managed.is_some()
+        {
+            self.spawn_offer_poll(active);
+        }
+    }
+
     fn spawn_pairing_accept(&mut self, credential: ActiveMobilePairingCredential) {
         let key = AcceptTaskKey::Pairing(credential.offer_id.clone());
         if self.accept_tasks.contains_key(&key) {
@@ -2280,6 +2679,14 @@ impl MobileAccessActor {
     }
 
     fn spawn_offer_poll(&mut self, credential: ActiveMobilePairingCredential) {
+        self.spawn_offer_poll_after(credential, Duration::ZERO);
+    }
+
+    fn spawn_offer_poll_after(
+        &mut self,
+        credential: ActiveMobilePairingCredential,
+        initial_delay: Duration,
+    ) {
         if let Some(task) = self.offer_poll_task.take() {
             task.abort();
         }
@@ -2291,6 +2698,7 @@ impl MobileAccessActor {
             self.managed_service.clone(),
             credential.offer_id,
             managed.host_offer_token,
+            initial_delay,
         ));
     }
 
@@ -2321,6 +2729,27 @@ impl MobileAccessActor {
         }));
     }
 
+    fn schedule_handoff_ack_retry(
+        &mut self,
+        offer_id: MobilePairingOfferId,
+        pairing_id: String,
+        attempt: u32,
+        delay: Duration,
+    ) {
+        if let Some(task) = self.handoff_ack_retry_task.take() {
+            task.abort();
+        }
+        let tx = self.tx.clone();
+        self.handoff_ack_retry_task = Some(tokio::spawn(async move {
+            sleep(delay).await;
+            let _ = tx.send(MobileAccessCommand::PairingHandoffAckRetry {
+                offer_id,
+                pairing_id,
+                attempt,
+            });
+        }));
+    }
+
     fn schedule_pairing_grace(&self, offer_id: MobilePairingOfferId) {
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -2343,6 +2772,9 @@ impl MobileAccessActor {
         if let Some(task) = self.offer_poll_task.take() {
             task.abort();
         }
+        if let Some(task) = self.handoff_ack_retry_task.take() {
+            task.abort();
+        }
         self.active_requester = None;
         if let Err(message) = self.pairings_store.save(&self.pairings) {
             tracing::warn!(error = %message, "failed to persist active mobile pairing cancellation");
@@ -2360,6 +2792,9 @@ impl MobileAccessActor {
             task.abort();
         }
         if let Some(task) = self.offer_poll_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.handoff_ack_retry_task.take() {
             task.abort();
         }
     }
@@ -2472,14 +2907,16 @@ fn spawn_offer_poll_task(
     managed_service: ManagedMobileServiceClient,
     offer_id: MobilePairingOfferId,
     host_offer_token: String,
+    initial_delay: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        sleep(initial_delay).await;
         loop {
             let result = managed_service
                 .poll_host_offer(&offer_id, &host_offer_token)
                 .await;
             match result {
-                Ok(response) => match managed_handoff_from_poll_response(response) {
+                Ok(response) => match managed_handoff_from_poll_response(&offer_id, response) {
                     Ok(ManagedPollOutcome::Pending) => {
                         sleep(OFFER_POLL_INTERVAL).await;
                     }
@@ -2515,6 +2952,7 @@ fn spawn_offer_poll_task(
     })
 }
 
+#[derive(Debug)]
 enum ManagedPollOutcome {
     Pending,
     Redeemed(Box<ManagedMobilePairingHandoff>),
@@ -2522,9 +2960,23 @@ enum ManagedPollOutcome {
 }
 
 fn managed_handoff_from_poll_response(
+    expected_offer_id: &MobilePairingOfferId,
     response: PollHostOfferResponse,
 ) -> Result<ManagedPollOutcome, ManagedServiceError> {
-    let offer_id = response.offer_id;
+    let offer_id = MobilePairingOfferId::new(response.offer_id).map_err(|err| {
+        ManagedServiceError::new(
+            MobileAccessErrorCode::ServiceUnavailable,
+            format!("managed mobile service returned invalid polled offer id: {err}"),
+        )
+    })?;
+    if &offer_id != expected_offer_id {
+        return Err(ManagedServiceError::new(
+            MobileAccessErrorCode::ServiceUnavailable,
+            format!(
+                "managed mobile service returned offer {offer_id} while polling {expected_offer_id}"
+            ),
+        ));
+    }
     match response.status {
         HostOfferStatus::Pending => {
             if response.expires_at_ms.is_none() {
@@ -2536,24 +2988,75 @@ fn managed_handoff_from_poll_response(
             Ok(ManagedPollOutcome::Pending)
         }
         HostOfferStatus::Redeemed => {
+            let host_handoff = response.host_handoff.ok_or_else(|| {
+                ManagedServiceError::new(
+                    MobileAccessErrorCode::ServiceUnavailable,
+                    format!("managed mobile offer {offer_id} omitted host_handoff state"),
+                )
+            })?;
+            if host_handoff.expires_at_ms == 0 {
+                return Err(ManagedServiceError::new(
+                    MobileAccessErrorCode::ServiceUnavailable,
+                    format!("managed mobile offer {offer_id} returned invalid handoff expiry"),
+                ));
+            }
+            match host_handoff.status {
+                HostHandoffStatus::Available => {}
+                HostHandoffStatus::Expired => {
+                    return Ok(ManagedPollOutcome::Terminal(
+                        ManagedOfferTerminalState::Expired,
+                    ));
+                }
+                HostHandoffStatus::Acknowledged => {
+                    return Err(ManagedServiceError::new(
+                        MobileAccessErrorCode::RepairRequired,
+                        format!(
+                            "managed mobile offer {offer_id} handoff was acknowledged before durable receipt"
+                        ),
+                    ));
+                }
+            }
             let pairing_id = response.pairing_id.ok_or_else(|| {
                 ManagedServiceError::new(
                     MobileAccessErrorCode::RepairRequired,
                     format!("managed mobile offer {offer_id} was redeemed without pairing id"),
                 )
             })?;
+            if pairing_id.trim().is_empty() {
+                return Err(ManagedServiceError::new(
+                    MobileAccessErrorCode::RepairRequired,
+                    format!("managed mobile offer {offer_id} returned an empty pairing id"),
+                ));
+            }
             let host_pairing_secret = response.host_pairing_secret.ok_or_else(|| {
                 ManagedServiceError::new(
                     MobileAccessErrorCode::RepairRequired,
                     format!("managed mobile offer {offer_id} handoff was already consumed"),
                 )
             })?;
+            if host_pairing_secret.trim().is_empty() {
+                return Err(ManagedServiceError::new(
+                    MobileAccessErrorCode::RepairRequired,
+                    format!(
+                        "managed mobile offer {offer_id} returned an empty host pairing secret"
+                    ),
+                ));
+            }
             let device = response.device.ok_or_else(|| {
                 ManagedServiceError::new(
                     MobileAccessErrorCode::RepairRequired,
                     format!("managed mobile offer {offer_id} was redeemed without device summary"),
                 )
             })?;
+            if device.device_id.trim().is_empty()
+                || device.label.trim().is_empty()
+                || device.created_at_ms == 0
+            {
+                return Err(ManagedServiceError::new(
+                    MobileAccessErrorCode::RepairRequired,
+                    format!("managed mobile offer {offer_id} returned an invalid device summary"),
+                ));
+            }
             let broker = response
                 .broker
                 .ok_or_else(|| {
@@ -2574,10 +3077,21 @@ fn managed_handoff_from_poll_response(
                     )
                 })?
                 .into_protocol()?;
+            if host_broker_credentials.scope.role != ManagedBrokerRole::Host
+                || host_broker_credentials.issued_at_ms >= host_broker_credentials.expires_at_ms
+            {
+                return Err(ManagedServiceError::new(
+                    MobileAccessErrorCode::ServiceUnavailable,
+                    format!(
+                        "managed mobile offer {offer_id} returned invalid host broker credentials"
+                    ),
+                ));
+            }
             Ok(ManagedPollOutcome::Redeemed(Box::new(
                 ManagedMobilePairingHandoff {
                     pairing_id,
                     host_pairing_secret,
+                    handoff_expires_at_ms: host_handoff.expires_at_ms,
                     device_id: MobileDeviceId(device.device_id),
                     device_label: device.label,
                     device_created_at_ms: device.created_at_ms,
@@ -2744,6 +3258,14 @@ fn managed_broker_status_for_pairings(pairings: &MobilePairings) -> MobileBroker
     if let Some(broker_url) = first_managed_broker_url(pairings) {
         return MobileBrokerStatus::Connecting { broker_url };
     }
+    if let Some(broker_url) = pairings
+        .active_pairing
+        .as_ref()
+        .and_then(|active| active.managed.as_ref())
+        .map(|managed| managed.broker.endpoint.clone())
+    {
+        return MobileBrokerStatus::Connecting { broker_url };
+    }
     if pairings
         .devices
         .iter()
@@ -2873,6 +3395,12 @@ fn jittered_backoff(base: Duration) -> Duration {
     }
     let jitter_ms = (jitter.as_millis() as u64).saturating_mul(nanos) / 1_000;
     (base + Duration::from_millis(jitter_ms)).min(ACCEPT_RECONNECT_MAX)
+}
+
+fn handoff_ack_retry_delay(attempt: u32) -> Duration {
+    HANDOFF_ACK_RETRY_INITIAL
+        .saturating_mul(2_u32.saturating_pow(attempt.min(31)))
+        .min(HANDOFF_ACK_RETRY_MAX)
 }
 
 async fn send_mobile_access_state(
@@ -3112,6 +3640,7 @@ mod tests {
         MobilePairings {
             version: crate::store::mobile_pairings::MOBILE_PAIRINGS_VERSION,
             active_pairing: Some(active_pairing()),
+            pending_handoff_ack: None,
             devices: Vec::new(),
         }
     }
@@ -3120,6 +3649,7 @@ mod tests {
         MobilePairings {
             version: crate::store::mobile_pairings::MOBILE_PAIRINGS_VERSION,
             active_pairing: None,
+            pending_handoff_ack: None,
             devices: vec![paired_device(device_id)],
         }
     }
@@ -3128,6 +3658,7 @@ mod tests {
         MobilePairings {
             version: crate::store::mobile_pairings::MOBILE_PAIRINGS_VERSION,
             active_pairing: None,
+            pending_handoff_ack: None,
             devices: vec![public_paired_device(device_id)],
         }
     }
@@ -3151,7 +3682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_discards_persisted_active_pairing() {
+    async fn startup_discards_persisted_dev_active_pairing() {
         let test = test_actor_with(Some(pairings_with_active()), test_settings(true));
 
         assert_eq!(test.actor.pairing, MobilePairingState::Idle);
@@ -3161,7 +3692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_discards_persisted_active_pairing_when_disabled() {
+    async fn startup_discards_persisted_dev_active_pairing_when_disabled() {
         let test = test_actor_with(Some(pairings_with_active()), test_settings(false));
 
         assert_eq!(test.actor.broker_status, MobileBrokerStatus::Disabled);
@@ -3295,6 +3826,26 @@ mod tests {
     }
 
     #[test]
+    fn host_handoff_expired_error_maps_to_pairing_expired() {
+        let envelope: ManagedErrorEnvelope = serde_json::from_value(serde_json::json!({
+            "error": {
+                "code": "host_handoff_expired",
+                "message": "host handoff expired",
+                "retryable": false,
+                "state": "host_handoff_expired",
+                "paywall_url": null
+            }
+        }))
+        .expect("parse host_handoff_expired error");
+
+        let error = envelope.error.into_error();
+
+        assert_eq!(error.code, MobileAccessErrorCode::PairingExpired);
+        assert!(error.message.contains("host_handoff_expired"));
+        assert!(!error.message.contains("Retryable."));
+    }
+
+    #[test]
     fn managed_service_dto_debug_redacts_broker_secrets() {
         let credentials: ContractBrokerCredentials = serde_json::from_value(serde_json::json!({
             "grant_id": "grant_01JSECRET",
@@ -3314,9 +3865,11 @@ mod tests {
                 "subscribe": ["tyde/prod/pair_01J/rooms/+/client-to-host"]
             },
             "issued_at_ms": 1760000000000_u64,
+            "connect_valid_until_ms": 1760000150000_u64,
             "expires_at_ms": 1760000300000_u64
         }))
         .expect("credentials");
+        assert_eq!(credentials.connect_valid_until_ms, 1760000150000_u64);
         let debug = format!("{credentials:?}");
 
         assert!(!debug.contains("signed-grant-secret"));
@@ -3479,6 +4032,521 @@ mod tests {
         assert!(request.get("tyggs_pass_proof").is_none());
     }
 
+    fn managed_test_broker() -> ManagedBrokerEndpoint {
+        ManagedBrokerEndpoint {
+            endpoint: BrokerUrl::new("wss://127.0.0.1:9/mqtt").expect("managed broker URL"),
+            provider: ManagedBrokerProvider::AwsIotCore,
+            region: ManagedBrokerRegion::new("us-west-2").expect("managed broker region"),
+            authorizer_name: ManagedBrokerAuthorizerName::new("tycode-mobile-v1")
+                .expect("managed broker authorizer"),
+        }
+    }
+
+    fn managed_test_credentials(grant_id: &str) -> ManagedBrokerCredentials {
+        let namespace = "tyde/prod/pair_01JHANDOFF";
+        ManagedBrokerCredentials {
+            grant_id: ManagedBrokerGrantId::new(grant_id).expect("managed grant id"),
+            client_id: ManagedBrokerClientId::new(format!("{namespace}/host/{grant_id}"))
+                .expect("managed client id"),
+            connect: ManagedBrokerConnectAuth {
+                username: Some(
+                    "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant"
+                        .to_owned(),
+                ),
+                password: Some(format!("signed-{grant_id}")),
+                websocket_url: None,
+                headers: BTreeMap::from([(
+                    "x-tycode-grant".to_owned(),
+                    format!("signed-{grant_id}"),
+                )]),
+            },
+            scope: ManagedBrokerCredentialScope {
+                namespace: ManagedBrokerTopicNamespace::new(namespace)
+                    .expect("managed topic namespace"),
+                role: ManagedBrokerRole::Host,
+                publish: vec![format!("{namespace}/rooms/+/host-to-client")],
+                subscribe: vec![format!("{namespace}/rooms/+/client-to-host")],
+            },
+            issued_at_ms: 1,
+            expires_at_ms: u64::MAX,
+        }
+    }
+
+    fn active_managed_pairing_for_handoff() -> ActiveMobilePairingCredential {
+        let psk = test_psk();
+        let broker = managed_test_broker();
+        ActiveMobilePairingCredential {
+            offer_id: MobilePairingOfferId::new("offer_01JHANDOFF").expect("offer id"),
+            broker: BrokerEndpoint {
+                url: broker.endpoint.clone(),
+                auth: BrokerAuth::Anonymous,
+            },
+            room: RoomId([7_u8; 16]),
+            psk: psk.clone(),
+            created_at_ms: 1,
+            key_fingerprint: key_fingerprint(&psk),
+            managed: Some(ActiveManagedMobilePairingCredential {
+                host_offer_token: "host_offer_01JHANDOFF".to_owned(),
+                pairing_url: "https://tycode.dev/tyde/#handoff-test".to_owned(),
+                broker,
+                host_broker_credentials: managed_test_credentials("grant_offer"),
+                expires_at_ms: u64::MAX,
+                handoff: None,
+            }),
+        }
+    }
+
+    fn managed_test_handoff(grant_id: &str) -> ManagedMobilePairingHandoff {
+        ManagedMobilePairingHandoff {
+            pairing_id: "pair_01JHANDOFF".to_owned(),
+            host_pairing_secret: "host_pairing_secret_01JHANDOFF".to_owned(),
+            handoff_expires_at_ms: u64::MAX - 100,
+            device_id: MobileDeviceId("device-01JHANDOFF".to_owned()),
+            device_label: "Mike's iPhone".to_owned(),
+            device_created_at_ms: 1,
+            device_last_seen_at_ms: Some(2),
+            broker: managed_test_broker(),
+            host_broker_credentials: managed_test_credentials(grant_id),
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_handoff_is_durable_before_ack_and_broker_retry() {
+        let mock = MockHandoffService::start().await;
+        let mut test = test_actor_with_service(None, test_settings(true), Some(mock.base_url()));
+        let active = active_managed_pairing_for_handoff();
+        let offer_id = active.offer_id.clone();
+        test.actor.pairings.active_pairing = Some(active);
+        test.actor.pairing = MobilePairingState::Active {
+            offer_id: offer_id.clone(),
+            expires_at_ms: u64::MAX,
+        };
+        mock.set_pairings_path(test.actor.pairings_store.path().to_owned())
+            .await;
+
+        test.actor
+            .pairing_offer_redeemed(&offer_id, managed_test_handoff("grant_handoff_1"))
+            .await;
+
+        assert_eq!(mock.ack_count(), 1);
+        assert_eq!(mock.persisted_before_ack().await, vec![true]);
+        assert_eq!(test.actor.pairings.devices.len(), 1);
+        assert!(test.actor.pairings.active_pairing.is_none());
+        assert!(test.actor.pairings.pending_handoff_ack.is_some());
+        assert!(
+            test.actor
+                .accept_tasks
+                .contains_key(&AcceptTaskKey::Device(MobileDeviceId(
+                    "device-01JHANDOFF".to_owned()
+                )))
+        );
+        assert!(matches!(
+            &test.actor.pairing,
+            MobilePairingState::Failed {
+                code: MobileAccessErrorCode::ServiceUnavailable,
+                ..
+            }
+        ));
+        let after_failed_ack = test
+            .actor
+            .pairings_store
+            .get()
+            .expect("load pairing after failed ack");
+        assert_eq!(after_failed_ack.devices.len(), 1);
+        assert_eq!(
+            after_failed_ack
+                .pending_handoff_ack
+                .as_ref()
+                .expect("pending handoff ack")
+                .expires_at_ms,
+            u64::MAX - 100
+        );
+
+        let retry_pairing_id = loop {
+            let command = tokio::time::timeout(Duration::from_secs(5), test.actor.rx.recv())
+                .await
+                .expect("timed out waiting for handoff ack retry")
+                .expect("mobile access command channel closed");
+            if let MobileAccessCommand::PairingHandoffAckRetry {
+                offer_id: retry_offer_id,
+                pairing_id,
+                attempt,
+            } = command
+            {
+                assert_eq!(retry_offer_id, offer_id);
+                test.actor.handoff_ack_retry_task.take();
+                break (pairing_id, attempt);
+            }
+        };
+        test.actor
+            .acknowledge_persisted_handoff(&offer_id, &retry_pairing_id.0, retry_pairing_id.1)
+            .await;
+
+        assert_eq!(mock.ack_count(), 2);
+        assert_eq!(mock.persisted_before_ack().await, vec![true, true]);
+        assert_eq!(test.actor.pairings.devices.len(), 1);
+        assert!(test.actor.pairings.active_pairing.is_none());
+        assert!(test.actor.pairings.pending_handoff_ack.is_none());
+        assert!(matches!(
+            &test.actor.pairing,
+            MobilePairingState::Consumed { offer_id: consumed } if consumed == &offer_id
+        ));
+
+        let (device_id, code, message) = loop {
+            let command = tokio::time::timeout(Duration::from_secs(5), test.actor.rx.recv())
+                .await
+                .expect("timed out waiting for broker failure")
+                .expect("mobile access command channel closed");
+            if let MobileAccessCommand::DeviceAcceptFailed {
+                device_id,
+                code,
+                message,
+            } = command
+            {
+                break (device_id, code, message);
+            }
+        };
+        assert_eq!(code, MobileAccessErrorCode::TransportFailed);
+        test.actor
+            .device_accept_failed(&device_id, code, message)
+            .await;
+        assert!(matches!(
+            &test.actor.broker_status,
+            MobileBrokerStatus::Error {
+                code: MobileAccessErrorCode::TransportFailed,
+                ..
+            }
+        ));
+        assert_eq!(test.actor.pairings.devices.len(), 1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while mock.mint_count() < 2 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("broker retry did not mint fresh credentials");
+
+        test.actor.abort_all_tasks();
+        let persisted = test
+            .actor
+            .pairings_store
+            .get()
+            .expect("load durable pairing for restart");
+        assert_eq!(persisted.devices.len(), 1);
+        assert!(persisted.active_pairing.is_none());
+        assert!(persisted.pending_handoff_ack.is_none());
+        let previous_mint_count = mock.mint_count();
+        let mut restarted =
+            test_actor_with_service(Some(persisted), test_settings(true), Some(mock.base_url()));
+        restarted.actor.enable_mobile_access().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while mock.mint_count() == previous_mint_count {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("restart did not reconnect from durable pairing");
+        assert!(restarted.actor.pairings.active_pairing.is_none());
+        assert_eq!(restarted.actor.pairings.devices.len(), 1);
+        restarted.actor.abort_all_tasks();
+    }
+
+    #[tokio::test]
+    async fn crash_before_ack_resumes_ack_and_broker_from_durable_state() {
+        let mock = MockHandoffService::start().await;
+        mock.set_failed_ack_attempts(0);
+        mock.set_ack_delay(Duration::from_secs(5));
+        let mut test = test_actor_with_service(None, test_settings(true), Some(mock.base_url()));
+        let active = active_managed_pairing_for_handoff();
+        let offer_id = active.offer_id.clone();
+        test.actor.pairings.active_pairing = Some(active);
+        test.actor.pairing = MobilePairingState::Active {
+            offer_id: offer_id.clone(),
+            expires_at_ms: u64::MAX,
+        };
+        mock.set_pairings_path(test.actor.pairings_store.path().to_owned())
+            .await;
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            test.actor
+                .pairing_offer_redeemed(&offer_id, managed_test_handoff("grant_crash")),
+        )
+        .await
+        .expect_err("simulate crash while acknowledgement is in flight");
+        test.actor.abort_all_tasks();
+
+        let persisted = test
+            .actor
+            .pairings_store
+            .get()
+            .expect("load crash-safe handoff state");
+        assert!(persisted.active_pairing.is_none());
+        assert!(persisted.pending_handoff_ack.is_some());
+        assert_eq!(persisted.devices.len(), 1);
+
+        mock.set_ack_delay(Duration::ZERO);
+        let mut restarted =
+            test_actor_with_service(Some(persisted), test_settings(true), Some(mock.base_url()));
+        mock.set_pairings_path(restarted.actor.pairings_store.path().to_owned())
+            .await;
+        restarted.actor.enable_mobile_access().await;
+        assert!(
+            restarted
+                .actor
+                .accept_tasks
+                .contains_key(&AcceptTaskKey::Device(MobileDeviceId(
+                    "device-01JHANDOFF".to_owned()
+                )))
+        );
+
+        loop {
+            let command = tokio::time::timeout(Duration::from_secs(5), restarted.actor.rx.recv())
+                .await
+                .expect("timed out waiting for startup handoff recovery")
+                .expect("mobile access command channel closed");
+            if let MobileAccessCommand::PairingHandoffAckRetry {
+                offer_id,
+                pairing_id,
+                attempt,
+            } = command
+            {
+                restarted.actor.handoff_ack_retry_task.take();
+                restarted
+                    .actor
+                    .acknowledge_persisted_handoff(&offer_id, &pairing_id, attempt)
+                    .await;
+                break;
+            }
+        }
+
+        assert!(restarted.actor.pairings.pending_handoff_ack.is_none());
+        assert_eq!(restarted.actor.pairings.devices.len(), 1);
+        assert!(mock.mint_count() >= 1);
+        assert!(matches!(
+            restarted.actor.pairing,
+            MobilePairingState::Consumed { .. }
+        ));
+        restarted.actor.abort_all_tasks();
+    }
+
+    #[tokio::test]
+    async fn expired_handoff_after_crash_keeps_pairing_and_allows_new_offer() {
+        let mock = MockHandoffService::start().await;
+        mock.set_failed_ack_attempts(0);
+        mock.set_ack_delay(Duration::from_secs(5));
+        let mut test = test_actor_with_service(None, test_settings(true), Some(mock.base_url()));
+        let active = active_managed_pairing_for_handoff();
+        let offer_id = active.offer_id.clone();
+        test.actor.pairings.active_pairing = Some(active);
+        test.actor.pairing = MobilePairingState::Active {
+            offer_id: offer_id.clone(),
+            expires_at_ms: u64::MAX,
+        };
+        mock.set_pairings_path(test.actor.pairings_store.path().to_owned())
+            .await;
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            test.actor
+                .pairing_offer_redeemed(&offer_id, managed_test_handoff("grant_expiry_crash")),
+        )
+        .await
+        .expect_err("simulate crash before handoff acknowledgement");
+        test.actor.abort_all_tasks();
+        let persisted = test
+            .actor
+            .pairings_store
+            .get()
+            .expect("load pending handoff after crash");
+
+        mock.set_ack_delay(Duration::ZERO);
+        mock.set_expire_ack(true);
+        let mut restarted =
+            test_actor_with_service(Some(persisted), test_settings(true), Some(mock.base_url()));
+        mock.set_pairings_path(restarted.actor.pairings_store.path().to_owned())
+            .await;
+        restarted.actor.enable_mobile_access().await;
+        loop {
+            let command = tokio::time::timeout(Duration::from_secs(5), restarted.actor.rx.recv())
+                .await
+                .expect("timed out waiting for expired handoff recovery")
+                .expect("mobile access command channel closed");
+            if let MobileAccessCommand::PairingHandoffAckRetry {
+                offer_id,
+                pairing_id,
+                attempt,
+            } = command
+            {
+                restarted.actor.handoff_ack_retry_task.take();
+                restarted
+                    .actor
+                    .acknowledge_persisted_handoff(&offer_id, &pairing_id, attempt)
+                    .await;
+                break;
+            }
+        }
+
+        assert!(restarted.actor.pairings.pending_handoff_ack.is_none());
+        assert_eq!(restarted.actor.pairings.devices.len(), 1);
+        assert!(
+            restarted
+                .actor
+                .accept_tasks
+                .contains_key(&AcceptTaskKey::Device(MobileDeviceId(
+                    "device-01JHANDOFF".to_owned()
+                )))
+        );
+        assert!(matches!(
+            &restarted.actor.pairing,
+            MobilePairingState::Failed {
+                code: MobileAccessErrorCode::PairingExpired,
+                ..
+            }
+        ));
+        assert!(restarted.actor.handoff_ack_retry_task.is_none());
+
+        let new_offer_id = MobilePairingOfferId::new("offer-after-expiry").expect("offer id");
+        restarted
+            .actor
+            .start_dev_pairing(
+                StreamPath("/host/new-pairing".to_owned()),
+                new_offer_id.clone(),
+                endpoint(),
+            )
+            .await;
+        assert!(matches!(
+            restarted.actor.pairings.active_pairing.as_ref(),
+            Some(active) if active.offer_id == new_offer_id
+        ));
+        assert_eq!(restarted.actor.pairings.devices.len(), 1);
+        restarted.actor.abort_all_tasks();
+    }
+
+    #[tokio::test]
+    async fn startup_resumes_managed_offer_poll_without_durable_record() {
+        let mock = MockHandoffService::start().await;
+        let pairings = MobilePairings {
+            version: crate::store::mobile_pairings::MOBILE_PAIRINGS_VERSION,
+            active_pairing: Some(active_managed_pairing_for_handoff()),
+            pending_handoff_ack: None,
+            devices: Vec::new(),
+        };
+        let mut test =
+            test_actor_with_service(Some(pairings), test_settings(true), Some(mock.base_url()));
+
+        test.actor.enable_mobile_access().await;
+
+        let command = tokio::time::timeout(Duration::from_secs(5), test.actor.rx.recv())
+            .await
+            .expect("timed out waiting for resumed offer poll")
+            .expect("mobile access command channel closed");
+        let MobileAccessCommand::PairingOfferRedeemed { offer_id, handoff } = command else {
+            panic!("expected resumed managed handoff");
+        };
+        assert_eq!(offer_id.as_str(), "offer_01JHANDOFF");
+        assert_eq!(handoff.pairing_id, "pair_01JHANDOFF");
+        assert!(test.actor.pairings.devices.is_empty());
+        test.actor.abort_all_tasks();
+    }
+
+    #[test]
+    fn handoff_ack_retry_backoff_is_exponential_and_capped() {
+        assert_eq!(handoff_ack_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(handoff_ack_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(handoff_ack_retry_delay(2), Duration::from_secs(4));
+        assert_eq!(handoff_ack_retry_delay(5), Duration::from_secs(30));
+        assert_eq!(handoff_ack_retry_delay(31), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn repeated_ack_failure_does_not_emit_duplicate_failed_state() {
+        let mock = MockHandoffService::start().await;
+        mock.set_failed_ack_attempts(2);
+        let mut test = test_actor_with_service(None, test_settings(true), Some(mock.base_url()));
+        let active = active_managed_pairing_for_handoff();
+        let offer_id = active.offer_id.clone();
+        test.actor.pairings.active_pairing = Some(active);
+        test.actor.pairing = MobilePairingState::Active {
+            offer_id: offer_id.clone(),
+            expires_at_ms: u64::MAX,
+        };
+        mock.set_pairings_path(test.actor.pairings_store.path().to_owned())
+            .await;
+        let (subscriber, mut subscriber_rx) = stream("/host/ack-retry");
+        let subscriber_path = subscriber.path().clone();
+        test.actor
+            .register_bootstrap_subscriber(subscriber)
+            .await
+            .expect("register subscriber");
+        test.actor
+            .activate_bootstrap_subscriber(subscriber_path)
+            .await;
+
+        test.actor
+            .pairing_offer_redeemed(&offer_id, managed_test_handoff("grant_churn"))
+            .await;
+        while subscriber_rx.try_recv().is_ok() {}
+
+        test.actor
+            .acknowledge_persisted_handoff(&offer_id, "pair_01JHANDOFF", 1)
+            .await;
+
+        assert!(subscriber_rx.try_recv().is_err());
+        assert_eq!(mock.ack_count(), 2);
+        test.actor.abort_all_tasks();
+    }
+
+    #[test]
+    fn managed_poll_rejects_an_offer_identity_mismatch() {
+        let response: PollHostOfferResponse =
+            serde_json::from_value(MockHandoffService::redeemed_poll_json("grant_handoff"))
+                .expect("poll response");
+        let expected = MobilePairingOfferId::new("offer_expected").expect("offer id");
+
+        let error = managed_handoff_from_poll_response(&expected, response)
+            .expect_err("mismatched offer must fail");
+
+        assert_eq!(error.code, MobileAccessErrorCode::ServiceUnavailable);
+        assert!(error.message.contains("while polling offer_expected"));
+    }
+
+    #[test]
+    fn redeemed_managed_poll_requires_typed_handoff_state() {
+        let mut json = MockHandoffService::redeemed_poll_json("grant_handoff");
+        json.as_object_mut()
+            .expect("poll response object")
+            .remove("host_handoff");
+        let response: PollHostOfferResponse =
+            serde_json::from_value(json).expect("poll response without handoff state");
+        let expected = MobilePairingOfferId::new("offer_01JHANDOFF").expect("offer id");
+
+        let error = managed_handoff_from_poll_response(&expected, response)
+            .expect_err("redeemed poll without host_handoff must fail");
+
+        assert_eq!(error.code, MobileAccessErrorCode::ServiceUnavailable);
+        assert!(error.message.contains("omitted host_handoff state"));
+    }
+
+    #[test]
+    fn redeemed_managed_poll_accepts_expired_handoff_without_secrets() {
+        let mut json = MockHandoffService::redeemed_poll_json("grant_handoff");
+        let object = json.as_object_mut().expect("poll response object");
+        object.remove("host_pairing_secret");
+        object.remove("host_broker_credentials");
+        object["host_handoff"]["status"] = serde_json::json!("expired");
+        let response: PollHostOfferResponse = serde_json::from_value(json).expect("poll response");
+        let expected = MobilePairingOfferId::new("offer_01JHANDOFF").expect("offer id");
+
+        let outcome = managed_handoff_from_poll_response(&expected, response)
+            .expect("expired handoff is a terminal offer outcome");
+
+        assert!(matches!(
+            outcome,
+            ManagedPollOutcome::Terminal(ManagedOfferTerminalState::Expired)
+        ));
+    }
+
     #[tokio::test]
     async fn pairing_offer_is_sent_only_to_requesting_stream() {
         let mut test = test_actor();
@@ -3518,6 +4586,274 @@ mod tests {
         );
         assert_eq!(recv_kind(&mut other_rx).await, FrameKind::MobileAccessState);
         assert!(other_rx.try_recv().is_err());
+    }
+
+    #[derive(Clone)]
+    struct MockHandoffService {
+        addr: std::net::SocketAddr,
+        pairings_path: std::sync::Arc<tokio::sync::Mutex<Option<std::path::PathBuf>>>,
+        persisted_before_ack: std::sync::Arc<tokio::sync::Mutex<Vec<bool>>>,
+        ack_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ack_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        failed_ack_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        expire_ack: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        mint_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl MockHandoffService {
+        async fn start() -> Self {
+            use axum::extract::State;
+            use axum::http::{HeaderMap, StatusCode};
+            use axum::routing::{get, post};
+            use axum::{Json, Router};
+            use std::sync::atomic::Ordering;
+
+            #[derive(Clone)]
+            struct StateValue {
+                pairings_path: std::sync::Arc<tokio::sync::Mutex<Option<std::path::PathBuf>>>,
+                persisted_before_ack: std::sync::Arc<tokio::sync::Mutex<Vec<bool>>>,
+                ack_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                ack_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+                failed_ack_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                expire_ack: std::sync::Arc<std::sync::atomic::AtomicBool>,
+                mint_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            }
+
+            async fn poll_offer() -> Json<serde_json::Value> {
+                Json(MockHandoffService::redeemed_poll_json("grant_poll"))
+            }
+
+            async fn acknowledge(
+                State(state): State<StateValue>,
+                headers: HeaderMap,
+                Json(request): Json<serde_json::Value>,
+            ) -> (StatusCode, Json<serde_json::Value>) {
+                let persisted = match state.pairings_path.lock().await.clone() {
+                    Some(path) => std::fs::read_to_string(path)
+                        .ok()
+                        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                        .is_some_and(|json| {
+                            json["devices"].as_array().is_some_and(|devices| {
+                                devices.len() == 1
+                                    && devices[0]["managed"]["pairing_id"] == "pair_01JHANDOFF"
+                                    && devices[0]["managed"]["host_pairing_secret"]
+                                        == "host_pairing_secret_01JHANDOFF"
+                                    && json["pending_handoff_ack"]["offer_id"] == "offer_01JHANDOFF"
+                                    && json["pending_handoff_ack"]["host_offer_token"]
+                                        == "host_offer_01JHANDOFF"
+                                    && json["pending_handoff_ack"]["pairing_id"]
+                                        == "pair_01JHANDOFF"
+                                    && json["pending_handoff_ack"]["device_id"]
+                                        == "device-01JHANDOFF"
+                            })
+                        }),
+                    None => false,
+                };
+                let authorized = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    == Some("Bearer host_offer_01JHANDOFF");
+                let bound = request["pairing_id"] == "pair_01JHANDOFF";
+                state
+                    .persisted_before_ack
+                    .lock()
+                    .await
+                    .push(persisted && authorized && bound);
+                let delay_ms = state.ack_delay_ms.load(Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                let attempt = state.ack_count.fetch_add(1, Ordering::SeqCst);
+                if state.expire_ack.load(Ordering::SeqCst) {
+                    return (
+                        StatusCode::GONE,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "host_handoff_expired",
+                                "message": "host handoff expired",
+                                "retryable": false,
+                                "state": "host_handoff_expired",
+                                "paywall_url": null
+                            }
+                        })),
+                    );
+                }
+                if attempt < state.failed_ack_attempts.load(Ordering::SeqCst) {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "error": {
+                                "code": "service_unavailable",
+                                "message": "temporary ack failure",
+                                "retryable": true,
+                                "state": "retry",
+                                "paywall_url": null
+                            }
+                        })),
+                    );
+                }
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "offer_id": "offer_01JHANDOFF",
+                        "pairing_id": "pair_01JHANDOFF",
+                        "status": "acknowledged"
+                    })),
+                )
+            }
+
+            async fn mint_credentials(State(state): State<StateValue>) -> Json<serde_json::Value> {
+                let attempt = state.mint_count.fetch_add(1, Ordering::SeqCst) + 1;
+                Json(serde_json::json!({
+                    "pairing_id": "pair_01JHANDOFF",
+                    "status": "active",
+                    "broker": MockHandoffService::broker_json(),
+                    "broker_credentials": MockHandoffService::credentials_json(&format!(
+                        "grant_mint_{attempt}"
+                    ))
+                }))
+            }
+
+            let pairings_path = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+            let persisted_before_ack = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let ack_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let ack_delay_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let failed_ack_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+            let expire_ack = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mint_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let state = StateValue {
+                pairings_path: pairings_path.clone(),
+                persisted_before_ack: persisted_before_ack.clone(),
+                ack_count: ack_count.clone(),
+                ack_delay_ms: ack_delay_ms.clone(),
+                failed_ack_attempts: failed_ack_attempts.clone(),
+                expire_ack: expire_ack.clone(),
+                mint_count: mint_count.clone(),
+            };
+            let app = Router::new()
+                .route(
+                    "/api/tyde/mobile/v1/host/offers/{offer_id}",
+                    get(poll_offer),
+                )
+                .route(
+                    "/api/tyde/mobile/v1/host/offers/{offer_id}/handoff/ack",
+                    post(acknowledge),
+                )
+                .route(
+                    "/api/tyde/mobile/v1/pairings/{pairing_id}/broker-credentials",
+                    post(mint_credentials),
+                )
+                .with_state(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock handoff service");
+            let addr = listener.local_addr().expect("mock handoff service addr");
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("mock handoff service");
+            });
+            Self {
+                addr,
+                pairings_path,
+                persisted_before_ack,
+                ack_count,
+                ack_delay_ms,
+                failed_ack_attempts,
+                expire_ack,
+                mint_count,
+            }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}/api/tyde/mobile/v1", self.addr)
+        }
+
+        async fn set_pairings_path(&self, path: std::path::PathBuf) {
+            *self.pairings_path.lock().await = Some(path);
+        }
+
+        async fn persisted_before_ack(&self) -> Vec<bool> {
+            self.persisted_before_ack.lock().await.clone()
+        }
+
+        fn ack_count(&self) -> usize {
+            self.ack_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn set_ack_delay(&self, delay: Duration) {
+            self.ack_delay_ms.store(
+                u64::try_from(delay.as_millis()).expect("ack delay fits in u64"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+
+        fn set_failed_ack_attempts(&self, attempts: usize) {
+            self.failed_ack_attempts
+                .store(attempts, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn set_expire_ack(&self, expired: bool) {
+            self.expire_ack
+                .store(expired, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn mint_count(&self) -> usize {
+            self.mint_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn broker_json() -> serde_json::Value {
+            serde_json::json!({
+                "endpoint": "wss://127.0.0.1:9/mqtt",
+                "provider": "aws_iot_core",
+                "region": "us-west-2",
+                "authorizer_name": "tycode-mobile-v1"
+            })
+        }
+
+        fn credentials_json(grant_id: &str) -> serde_json::Value {
+            let namespace = "tyde/prod/pair_01JHANDOFF";
+            serde_json::json!({
+                "grant_id": grant_id,
+                "client_id": format!("{namespace}/host/{grant_id}"),
+                "connect": {
+                    "username": "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant",
+                    "password": format!("signed-{grant_id}"),
+                    "headers": {
+                        "x-tycode-grant": format!("signed-{grant_id}")
+                    }
+                },
+                "scope": {
+                    "namespace": namespace,
+                    "role": "host",
+                    "publish": [format!("{namespace}/rooms/+/host-to-client")],
+                    "subscribe": [format!("{namespace}/rooms/+/client-to-host")]
+                },
+                "issued_at_ms": 1,
+                "connect_valid_until_ms": u64::MAX - 1,
+                "expires_at_ms": u64::MAX
+            })
+        }
+
+        fn redeemed_poll_json(grant_id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "offer_id": "offer_01JHANDOFF",
+                "status": "redeemed",
+                "expires_at_ms": null,
+                "pairing_id": "pair_01JHANDOFF",
+                "host_pairing_secret": "host_pairing_secret_01JHANDOFF",
+                "device": {
+                    "device_id": "device-01JHANDOFF",
+                    "label": "Mike's iPhone",
+                    "created_at_ms": 1,
+                    "last_seen_at_ms": 2
+                },
+                "broker": Self::broker_json(),
+                "host_broker_credentials": Self::credentials_json(grant_id),
+                "host_handoff": {
+                    "status": "available",
+                    "expires_at_ms": u64::MAX - 100
+                }
+            })
+        }
     }
 
     #[derive(Clone)]
@@ -3582,6 +4918,7 @@ mod tests {
                         "subscribe": [format!("{namespace}/rooms/+/client-to-host")]
                     },
                     "issued_at_ms": 1760000000000_u64,
+                    "connect_valid_until_ms": 1760000150000_u64,
                     "expires_at_ms": 1760000300000_u64
                 })
             }

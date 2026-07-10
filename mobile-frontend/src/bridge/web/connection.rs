@@ -51,6 +51,45 @@ use wasmtimer::tokio::{sleep, timeout};
 
 const CONNECTION_CHANNEL_CAPACITY: usize = 256;
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+/// After this many consecutive retryable failures with the same typed error
+/// code the actor keeps retrying with backoff but pins a persistent `Failed`
+/// status, so the UI shows an actionable card instead of an ambiguous eternal
+/// `Connecting` spinner.
+const PERSISTENT_FAILURE_THRESHOLD: u32 = 3;
+
+/// Tracks consecutive retryable failures sharing the same typed
+/// [`MobileAccessErrorCode`]. Keyed on the code — NOT the rendered message —
+/// because message details vary between attempts (broker disconnect reasons,
+/// service error text) and must not keep resetting the count; the latest
+/// error's message is still what the persistent card displays. A different
+/// code restarts the count (a new situation gets the transient treatment
+/// again); a successful connect resets it.
+#[derive(Default)]
+struct RepeatedFailures {
+    code: Option<MobileAccessErrorCode>,
+    count: u32,
+}
+
+impl RepeatedFailures {
+    fn record(&mut self, code: MobileAccessErrorCode) -> u32 {
+        if self.code == Some(code) {
+            self.count += 1;
+        } else {
+            self.code = Some(code);
+            self.count = 1;
+        }
+        self.count
+    }
+
+    fn reset(&mut self) {
+        self.code = None;
+        self.count = 0;
+    }
+
+    fn is_persistent(&self) -> bool {
+        self.count >= PERSISTENT_FAILURE_THRESHOLD
+    }
+}
 
 #[derive(Clone)]
 struct StoredConnectionStatus {
@@ -393,6 +432,33 @@ impl ConnectionManager {
             None,
         );
     }
+
+    /// Repeated same-code retryable failures: the reconnect loop keeps running,
+    /// but the surfaced status becomes a persistent `Failed` card (instead of
+    /// `Connecting`) that names the latest failure and the attempt count.
+    fn emit_persistent_failure(
+        &self,
+        local_host_id: &LocalHostId,
+        actor_instance_id: u64,
+        error: &ConnectErr,
+        attempts: u32,
+    ) {
+        if !self.is_current_actor(local_host_id, actor_instance_id) {
+            return;
+        }
+        let message = format!(
+            "{error} ({attempts} consecutive attempts failed; still retrying in background)"
+        );
+        self.emit_host_error(local_host_id, actor_instance_id, message.clone());
+        self.set_status_and_emit(
+            local_host_id.clone(),
+            PairedHostConnectionStatus::Failed {
+                code: error.error_code(),
+                message,
+            },
+            None,
+        );
+    }
 }
 
 // ── Connection actor ──────────────────────────────────────────────────────
@@ -414,7 +480,9 @@ impl std::fmt::Display for ConnectErr {
             Self::Io(error) => write!(f, "I/O error on MQTT Tyde byte stream: {error}"),
             Self::Timeout => write!(
                 f,
-                "MQTT connection attempt timed out after {CONNECT_ATTEMPT_TIMEOUT:?}"
+                "MQTT connection attempt timed out after {CONNECT_ATTEMPT_TIMEOUT:?}: no broker \
+                 failure was reported, but the host never completed the rendezvous — it may be \
+                 offline, asleep, or not running Tyde"
             ),
             Self::NeedsRepair(message) => write!(f, "{message}"),
             Self::ManagedCredentials(error) => write!(f, "{}", error.message),
@@ -439,7 +507,11 @@ impl ConnectErr {
             Self::Io(error) => transport_error_from_io(error)
                 .map(transport_error_code)
                 .unwrap_or(MobileAccessErrorCode::TransportFailed),
-            Self::Timeout => MobileAccessErrorCode::BrokerConnectionFailed,
+            // Not `BrokerConnectionFailed`: broker-level failures are reported
+            // as typed `Transport` errors. Hitting this timeout means no broker
+            // failure was reported within the window and the rendezvous with
+            // the host never completed.
+            Self::Timeout => MobileAccessErrorCode::TransportFailed,
             Self::NeedsRepair(_) => MobileAccessErrorCode::RepairRequired,
             Self::ManagedCredentials(error) => error.code,
         }
@@ -460,8 +532,14 @@ async fn run_connection_actor(
 ) {
     let local_host_id = record.local_host_id.clone();
     let mut backoff = MqttReconnectBackoff::default();
+    let mut failures = RepeatedFailures::default();
     loop {
-        manager.emit_connecting(&local_host_id, actor_instance_id);
+        // Once the failure has repeated into a persistent `Failed` card, the
+        // retry loop keeps running silently behind it: re-emitting `Connecting`
+        // here would resurrect the ambiguous spinner the card replaced.
+        if !failures.is_persistent() {
+            manager.emit_connecting(&local_host_id, actor_instance_id);
+        }
 
         let connect_result = tokio::select! {
             result = connect_once(&record, &psk) => result,
@@ -481,11 +559,21 @@ async fn run_connection_actor(
                     manager.emit_final_failure(&local_host_id, actor_instance_id, &error);
                     return;
                 }
-                manager.emit_host_error(
-                    &local_host_id,
-                    actor_instance_id,
-                    format!("MQTT connection failed; retrying: {error}"),
-                );
+                let attempts = failures.record(error.error_code());
+                if failures.is_persistent() {
+                    manager.emit_persistent_failure(
+                        &local_host_id,
+                        actor_instance_id,
+                        &error,
+                        attempts,
+                    );
+                } else {
+                    manager.emit_host_error(
+                        &local_host_id,
+                        actor_instance_id,
+                        format!("MQTT connection failed; retrying: {error}"),
+                    );
+                }
                 if wait_backoff_or_stop(&mut rx, &mut backoff).await {
                     manager.emit_disconnected(
                         &local_host_id,
@@ -499,6 +587,7 @@ async fn run_connection_actor(
         };
 
         backoff.reset();
+        failures.reset();
         let Some(connection_instance_id) = manager
             .on_connected(&local_host_id, actor_instance_id)
             .await
@@ -529,12 +618,22 @@ async fn run_connection_actor(
                     manager.emit_final_failure(&local_host_id, actor_instance_id, &error);
                     return;
                 }
-                manager.emit_connecting(&local_host_id, actor_instance_id);
-                manager.emit_host_error(
-                    &local_host_id,
-                    actor_instance_id,
-                    format!("MQTT connection dropped; reconnecting: {error}"),
-                );
+                let attempts = failures.record(error.error_code());
+                if failures.is_persistent() {
+                    manager.emit_persistent_failure(
+                        &local_host_id,
+                        actor_instance_id,
+                        &error,
+                        attempts,
+                    );
+                } else {
+                    manager.emit_connecting(&local_host_id, actor_instance_id);
+                    manager.emit_host_error(
+                        &local_host_id,
+                        actor_instance_id,
+                        format!("MQTT connection dropped; reconnecting: {error}"),
+                    );
+                }
                 if wait_backoff_or_stop(&mut rx, &mut backoff).await {
                     manager.emit_disconnected(
                         &local_host_id,
@@ -776,13 +875,144 @@ mod tests {
         assert_eq!(error.error_code(), MobileAccessErrorCode::RepairRequired);
     }
 
+    /// The attempt timeout is the "broker never failed, host never answered"
+    /// outcome: it must stay retryable but must NOT be coded as a broker
+    /// connection failure (typed `Transport` errors own that), and its message
+    /// must surface the rendezvous-wait distinction to the user.
     #[test]
-    fn connect_timeout_is_retryable_broker_failure() {
+    fn connect_timeout_is_retryable_rendezvous_wait_not_broker_failure() {
         let error = ConnectErr::Timeout;
         assert!(error.is_retryable());
+        assert_eq!(error.error_code(), MobileAccessErrorCode::TransportFailed);
+        let message = error.to_string();
+        assert!(
+            message.contains("no broker failure was reported"),
+            "{message}"
+        );
+        assert!(
+            message.contains("host never completed the rendezvous"),
+            "{message}"
+        );
+    }
+
+    /// Repeated retryable failures with the same typed code cross the
+    /// persistence threshold (pinning the actionable `Failed` card); a
+    /// different code or a successful connect restarts the transient treatment.
+    #[test]
+    fn repeated_same_code_failures_become_persistent_and_reset_on_change() {
+        let mut failures = RepeatedFailures::default();
+        assert_eq!(failures.record(MobileAccessErrorCode::TransportFailed), 1);
+        assert!(!failures.is_persistent());
+        assert_eq!(failures.record(MobileAccessErrorCode::TransportFailed), 2);
+        assert!(!failures.is_persistent());
+        assert_eq!(failures.record(MobileAccessErrorCode::TransportFailed), 3);
+        assert!(failures.is_persistent());
+
         assert_eq!(
-            error.error_code(),
-            MobileAccessErrorCode::BrokerConnectionFailed
+            failures.record(MobileAccessErrorCode::BrokerConnectionFailed),
+            1,
+            "a different failure code is a new situation"
+        );
+        assert!(!failures.is_persistent());
+        failures.record(MobileAccessErrorCode::BrokerConnectionFailed);
+        failures.record(MobileAccessErrorCode::BrokerConnectionFailed);
+        assert!(failures.is_persistent());
+
+        failures.reset();
+        assert!(!failures.is_persistent());
+        assert_eq!(failures.record(MobileAccessErrorCode::TransportFailed), 1);
+    }
+
+    /// Broker failures render attempt-specific detail (disconnect reasons,
+    /// service messages); repetition is keyed on the typed code so that
+    /// varying detail cannot keep resetting the count and trap the UI in the
+    /// eternal `Connecting` spinner the persistent card exists to replace.
+    #[test]
+    fn variable_error_detail_does_not_reset_persistence_counting() {
+        let attempts = [
+            "broker closed the socket (epoch 1)",
+            "connection reset by peer",
+            "keep-alive timeout at 17s",
+        ];
+        let mut failures = RepeatedFailures::default();
+        let mut rendered = Vec::new();
+        for (index, reason) in attempts.iter().enumerate() {
+            let error = ConnectErr::Transport(MqttTransportError::BrokerDisconnected {
+                reason: (*reason).to_owned(),
+            });
+            rendered.push(error.to_string());
+            assert_eq!(failures.record(error.error_code()), index as u32 + 1);
+        }
+        assert_eq!(
+            rendered
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            attempts.len(),
+            "the rendered messages must actually differ for this test to prove anything"
+        );
+        assert!(
+            failures.is_persistent(),
+            "same-code failures with different detail must still accumulate"
+        );
+    }
+
+    /// Emission path: with the actor registered as current, a persistent
+    /// failure must pin a `Failed` status (with the typed code and the latest
+    /// error's message plus the retrying notice) that `connection_statuses`
+    /// then reports — this is what replaces the spinner in the UI.
+    #[test]
+    fn emit_persistent_failure_pins_failed_status_with_latest_message() {
+        let manager = ConnectionManager {
+            inner: Rc::new(RefCell::new(ManagerInner::default())),
+        };
+        let host = LocalHostId("h-persistent".to_owned());
+        let (tx, _rx) = mpsc::channel(1);
+        manager.inner.borrow_mut().active.insert(
+            host.clone(),
+            ActiveConnection {
+                tx,
+                actor_instance_id: 7,
+                connection_instance_id: None,
+            },
+        );
+
+        let error = ConnectErr::Timeout;
+        manager.emit_persistent_failure(&host, 7, &error, PERSISTENT_FAILURE_THRESHOLD);
+
+        let statuses = manager.connection_statuses();
+        let event = statuses
+            .iter()
+            .find(|event| event.local_host_id == host)
+            .expect("a status must be stored for the failing host");
+        match &event.status {
+            PairedHostConnectionStatus::Failed { code, message } => {
+                assert_eq!(*code, MobileAccessErrorCode::TransportFailed);
+                assert!(
+                    message.contains("host never completed the rendezvous"),
+                    "the latest error's own message must be displayed: {message}"
+                );
+                assert!(
+                    message.contains("still retrying"),
+                    "the card must say retries continue: {message}"
+                );
+                assert!(
+                    message.contains(&PERSISTENT_FAILURE_THRESHOLD.to_string()),
+                    "the attempt count must be visible: {message}"
+                );
+            }
+            other => panic!("expected a persistent Failed status, got {other:?}"),
+        }
+
+        // A stale actor must not be able to pin anything.
+        let other_host = LocalHostId("h-stale".to_owned());
+        manager.emit_persistent_failure(&other_host, 99, &error, PERSISTENT_FAILURE_THRESHOLD);
+        assert!(
+            !manager
+                .connection_statuses()
+                .iter()
+                .any(|event| event.local_host_id == other_host),
+            "a non-current actor must not store a status"
         );
     }
 

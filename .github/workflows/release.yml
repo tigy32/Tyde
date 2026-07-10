@@ -77,6 +77,17 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -86,20 +97,21 @@ jobs:
         with:
           workspaces: . -> target
 
-      # Run the native (logic) test suite BEFORE any expensive matrix build or
-      # code signing. beta 20 shipped a startup panic that these very tests
-      # (server::mobile_access) catch immediately — the release had no test gate
-      # at all. The CI nextest profile owns retry behavior and the five-minute
-      # suite limit.
-      #
-      # tauri-shell and tyde-mobile-shell are excluded: their `generate_context!`
-      # macro needs the frontend `dist/` to exist at compile time, which only the
-      # `build` job produces (via trunk). They are thin GUI shells with no logic
-      # tests; every logic crate (server, client, protocol, tests, …) still runs.
-      - name: Run workspace tests
-        run: >-
-          cargo nextest run --profile ci --workspace
-          --exclude tauri-shell --exclude tyde-mobile-shell
+      - name: Install trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@0.21.14
+
+      - name: Build frontend prerequisites
+        run: |
+          (cd frontend && trunk build --release)
+          (cd mobile-frontend && trunk build --release)
+
+      # Run the complete fresh check before any expensive matrix build or code
+      # signing. --force makes release CI authoritative even if the runner's
+      # restored target directory contains a local dev-check success record.
+      - name: Run authoritative checks
+        run: ./dev.sh check --force
 
   build:
     needs: [create-release, test]

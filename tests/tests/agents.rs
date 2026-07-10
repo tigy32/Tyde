@@ -722,7 +722,7 @@ async fn await_dev_driver_agent_ready(
 ) -> tyde_dev_driver::agent_control::AwaitAgentsResult {
     let awaited = tokio::time::timeout(
         Duration::from_secs(15),
-        control.await_agents(Some(vec![protocol::AgentId(agent_id.to_owned())]), None),
+        control.await_agents(Some(vec![protocol::AgentId(agent_id.to_owned())])),
     )
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {context}"))

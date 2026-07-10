@@ -27,8 +27,7 @@ use web_sys::{BinaryType, CloseEvent, Event, MessageEvent, WebSocket};
 
 use crate::chunking::MAX_PLAINTEXT_CHUNK_LEN;
 use crate::config::{
-    BrowserConnectPacketOptions, LinkBrokerConfig, browser_link_broker_url,
-    encode_browser_connect_packet,
+    BrowserConnectPacketOptions, LinkBrokerConfig, encode_browser_connect_packet, link_broker_url,
 };
 use crate::error::MqttTransportError;
 use crate::link::{
@@ -105,7 +104,7 @@ impl WasmMqttLink {
     /// Open the WebSocket, perform the MQTT5 CONNECT/CONNACK handshake, and return
     /// a link ready for `subscribe`/`publish`/`poll`.
     pub(crate) async fn connect(broker: &LinkBrokerConfig) -> Result<Self, MqttTransportError> {
-        let websocket_url = browser_link_broker_url(broker)?;
+        let websocket_url = link_broker_url(broker);
         let url = websocket_url.as_str();
         if !url.starts_with("wss://") {
             // The wasm backend can only reach the broker over wss (mixed-content

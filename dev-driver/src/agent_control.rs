@@ -20,7 +20,7 @@ use tokio::io::{
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use uuid::Uuid;
 
 const DEFAULT_READ_LIMIT: usize = 100;
@@ -344,15 +344,12 @@ impl AgentControlHandle {
     pub async fn await_agents(
         &self,
         requested_ids: Option<Vec<AgentId>>,
-        timeout_ms: Option<u64>,
     ) -> Result<AwaitAgentsResult, String> {
         if requested_ids.as_ref().is_some_and(|ids| ids.is_empty()) {
             return Err("agent_ids must contain at least one agent_id".to_string());
         }
 
         let mut snapshot_rx = self.snapshot_rx.clone();
-        let timeout_sleep = timeout_ms.map(|ms| sleep(Duration::from_millis(ms)));
-        tokio::pin!(timeout_sleep);
 
         loop {
             let snapshot = snapshot_rx.borrow().clone();
@@ -367,31 +364,7 @@ impl AgentControlHandle {
                 });
             }
 
-            if let Some(timeout_sleep) = timeout_sleep.as_mut().as_pin_mut() {
-                tokio::select! {
-                    changed = snapshot_rx.changed() => {
-                        if changed.is_err() {
-                            let error = snapshot_rx
-                                .borrow()
-                                .connection_error
-                                .clone()
-                                .unwrap_or_else(|| "agent-control runtime stopped".to_string());
-                            return Err(error);
-                        }
-                    }
-                    _ = timeout_sleep => {
-                        let snapshot = snapshot_rx.borrow().clone();
-                        let watched_ids = resolve_watched_ids(&snapshot, requested_ids.as_deref())?;
-                        return Ok(AwaitAgentsResult {
-                            ready: ready_agents_from_snapshot(&snapshot, &watched_ids),
-                            still_thinking: still_thinking_agents_from_snapshot(
-                                &snapshot,
-                                &watched_ids,
-                            ),
-                        });
-                    }
-                }
-            } else if snapshot_rx.changed().await.is_err() {
+            if snapshot_rx.changed().await.is_err() {
                 let error = snapshot_rx
                     .borrow()
                     .connection_error
@@ -1515,7 +1488,7 @@ async fn dispatch_tool(control: &AgentControlHandle, params: CallToolParams) -> 
                     Err(err) => return ToolCallResult::text_error(err),
                 }
             }
-            match control.await_agents(Some(agent_ids), None).await {
+            match control.await_agents(Some(agent_ids)).await {
                 Ok(result) => ToolCallResult::json(result),
                 Err(err) => ToolCallResult::text_error(err),
             }
@@ -1990,6 +1963,37 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn await_tool_schema_rejects_timeout_fields() {
+        let schema = await_agent_schema();
+        assert_eq!(
+            schema.get("additionalProperties"),
+            Some(&Value::Bool(false))
+        );
+        for field in ["timeout", "timeout_ms"] {
+            assert!(
+                schema.pointer(&format!("/properties/{field}")).is_none(),
+                "await schema must not advertise {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn await_tool_input_rejects_timeout_fields() {
+        for field in ["timeout", "timeout_ms"] {
+            let mut args = Map::new();
+            args.insert("agent_ids".to_string(), json!(["agent-id"]));
+            args.insert(field.to_string(), json!(5_000));
+
+            let err = parse_tool_input::<AwaitAgentsToolInput>(Some(args))
+                .expect_err("timeout tool argument should be rejected");
+            assert!(
+                err.contains("unknown field") && err.contains(field),
+                "unexpected error for {field}: {err}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn await_agents_then_read_returns_completed_turn() {
         let (host, _tempdir) = test_host();
@@ -2011,10 +2015,13 @@ mod tests {
             .spawn_agent(request)
             .await
             .expect("spawn should succeed");
-        let awaited = control
-            .await_agents(Some(vec![AgentId(spawned.agent_id.clone())]), Some(5_000))
-            .await
-            .expect("await should succeed");
+        let awaited = timeout(
+            Duration::from_secs(5),
+            control.await_agents(Some(vec![AgentId(spawned.agent_id.clone())])),
+        )
+        .await
+        .expect("timed out waiting for agent")
+        .expect("await should succeed");
 
         let result = awaited.ready.first().expect("agent should be ready");
         assert_eq!(result.status, AgentControlStatus::Idle);
@@ -2067,10 +2074,13 @@ mod tests {
             .await
             .expect("late replayed agent output should be readable");
         assert_replayed_completed_message_without_stream_end(&replay, expected_text);
-        let awaited = control
-            .await_agents(Some(vec![agent_id.clone()]), Some(5_000))
-            .await
-            .expect("await should succeed for late replayed completed turn");
+        let awaited = timeout(
+            Duration::from_secs(5),
+            control.await_agents(Some(vec![agent_id.clone()])),
+        )
+        .await
+        .expect("timed out waiting for late replayed agent")
+        .expect("await should succeed for late replayed completed turn");
 
         assert!(
             awaited.still_thinking.is_empty(),
@@ -2162,10 +2172,13 @@ mod tests {
             .await
             .expect("spawn should succeed");
         let agent_id = AgentId(spawned.agent_id.clone());
-        let _ = control
-            .await_agents(Some(vec![agent_id.clone()]), Some(5_000))
-            .await
-            .expect("initial await should succeed");
+        let _ = timeout(
+            Duration::from_secs(5),
+            control.await_agents(Some(vec![agent_id.clone()])),
+        )
+        .await
+        .expect("timed out waiting for initial agent turn")
+        .expect("initial await should succeed");
         let cursor = read_agent_contains(
             &control,
             agent_id.clone(),
@@ -2178,10 +2191,13 @@ mod tests {
             .send_message(agent_id.clone(), "follow up".to_string())
             .await
             .expect("send_message should succeed");
-        let awaited = control
-            .await_agents(Some(vec![agent_id.clone()]), Some(5_000))
-            .await
-            .expect("follow-up await should succeed");
+        let awaited = timeout(
+            Duration::from_secs(5),
+            control.await_agents(Some(vec![agent_id.clone()])),
+        )
+        .await
+        .expect("timed out waiting for follow-up agent turn")
+        .expect("follow-up await should succeed");
 
         let result = awaited.ready.first().expect("agent should be ready");
         assert_eq!(result.status, AgentControlStatus::Idle);

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -17,8 +18,10 @@ pub const MOBILE_PAIRINGS_STORE_PATH_ENV: &str = "TYDE_MOBILE_PAIRINGS_STORE_PAT
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobilePairings {
     pub version: u32,
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_pairing: Option<ActiveMobilePairingCredential>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_handoff_ack: Option<PendingManagedMobileHandoffAck>,
     #[serde(default)]
     pub devices: Vec<MobilePairingRecord>,
 }
@@ -31,7 +34,7 @@ pub struct ActiveMobilePairingCredential {
     pub psk: PreSharedKey,
     pub created_at_ms: u64,
     pub key_fingerprint: String,
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed: Option<ActiveManagedMobilePairingCredential>,
 }
 
@@ -83,14 +86,14 @@ impl fmt::Debug for MobilePairingRecord {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveManagedMobilePairingCredential {
     pub host_offer_token: String,
     pub pairing_url: String,
     pub broker: ManagedBrokerEndpoint,
     pub host_broker_credentials: ManagedBrokerCredentials,
     pub expires_at_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub handoff: Option<ManagedMobilePairingHandoff>,
 }
 
@@ -112,6 +115,7 @@ impl fmt::Debug for ActiveManagedMobilePairingCredential {
 pub struct ManagedMobilePairingHandoff {
     pub pairing_id: String,
     pub host_pairing_secret: String,
+    pub handoff_expires_at_ms: u64,
     pub device_id: MobileDeviceId,
     pub device_label: String,
     pub device_created_at_ms: u64,
@@ -126,6 +130,7 @@ impl fmt::Debug for ManagedMobilePairingHandoff {
             .debug_struct("ManagedMobilePairingHandoff")
             .field("pairing_id", &self.pairing_id)
             .field("host_pairing_secret", &"<redacted>")
+            .field("handoff_expires_at_ms", &self.handoff_expires_at_ms)
             .field("device_id", &self.device_id)
             .field("device_label", &self.device_label)
             .field("device_created_at_ms", &self.device_created_at_ms)
@@ -141,6 +146,34 @@ pub struct ManagedMobilePairingCredential {
     pub pairing_id: String,
     pub host_pairing_secret: String,
     pub broker: ManagedBrokerEndpoint,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingManagedMobileHandoffAck {
+    pub offer_id: MobilePairingOfferId,
+    pub host_offer_token: String,
+    pub pairing_id: String,
+    pub device_id: MobileDeviceId,
+    pub expires_at_ms: u64,
+}
+
+impl fmt::Debug for PendingManagedMobileHandoffAck {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingManagedMobileHandoffAck")
+            .field("offer_id", &self.offer_id)
+            .field("host_offer_token", &"<redacted>")
+            .field("pairing_id", &self.pairing_id)
+            .field("device_id", &self.device_id)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedMobilePairingRecordInsert {
+    Inserted,
+    Existing,
 }
 
 impl fmt::Debug for ManagedMobilePairingCredential {
@@ -171,6 +204,7 @@ impl MobilePairings {
         Self {
             version: MOBILE_PAIRINGS_VERSION,
             active_pairing: None,
+            pending_handoff_ack: None,
             devices: Vec::new(),
         }
     }
@@ -190,7 +224,15 @@ impl MobilePairings {
     }
 
     pub fn normalize_startup_runtime_state(&mut self) -> bool {
-        let mut changed = self.active_pairing.take().is_some();
+        let mut changed = false;
+        if self
+            .active_pairing
+            .as_ref()
+            .is_some_and(|active| active.managed.is_none())
+        {
+            self.active_pairing = None;
+            changed = true;
+        }
         for device in &mut self.devices {
             if device.state == MobileDeviceState::Connected {
                 device.state = MobileDeviceState::Paired;
@@ -199,6 +241,63 @@ impl MobilePairings {
         }
         changed
     }
+
+    pub fn insert_managed_record(
+        &mut self,
+        record: MobilePairingRecord,
+    ) -> Result<ManagedMobilePairingRecordInsert, String> {
+        let managed = record.managed.as_ref().ok_or_else(|| {
+            "managed mobile pairing record must include managed credentials".to_owned()
+        })?;
+        let device_match = self
+            .devices
+            .iter()
+            .position(|existing| existing.device_id == record.device_id);
+        let pairing_match = self.devices.iter().position(|existing| {
+            existing
+                .managed
+                .as_ref()
+                .is_some_and(|existing| existing.pairing_id == managed.pairing_id)
+        });
+
+        match (device_match, pairing_match) {
+            (None, None) => {
+                self.devices.push(record);
+                Ok(ManagedMobilePairingRecordInsert::Inserted)
+            }
+            (Some(device_index), Some(pairing_index))
+                if device_index == pairing_index
+                    && same_managed_pairing_record(&self.devices[device_index], &record) =>
+            {
+                Ok(ManagedMobilePairingRecordInsert::Existing)
+            }
+            (Some(device_index), Some(pairing_index)) if device_index == pairing_index => {
+                Err(format!(
+                    "managed pairing {} replay conflicts with durable device {}",
+                    managed.pairing_id, record.device_id
+                ))
+            }
+            (Some(_), _) => Err(format!(
+                "managed pairing {} conflicts with existing device {}",
+                managed.pairing_id, record.device_id
+            )),
+            (_, Some(_)) => Err(format!(
+                "managed pairing {} is already bound to another device",
+                managed.pairing_id
+            )),
+        }
+    }
+}
+
+fn same_managed_pairing_record(left: &MobilePairingRecord, right: &MobilePairingRecord) -> bool {
+    left.device_id == right.device_id
+        && left.broker == right.broker
+        && left.room == right.room
+        && left.psk == right.psk
+        && left.label == right.label
+        && left.created_at_ms == right.created_at_ms
+        && left.key_fingerprint == right.key_fingerprint
+        && left.managed == right.managed
 }
 
 #[derive(Debug)]
@@ -295,6 +394,7 @@ impl MobilePairingsStore {
         let mut pairings = Self::read_unvalidated_from_disk(path).ok()?;
         pairings.version = MOBILE_PAIRINGS_VERSION;
         pairings.active_pairing = None;
+        pairings.pending_handoff_ack = None;
         for record in &mut pairings.devices {
             record.state = MobileDeviceState::RepairRequired;
             record.managed = None;
@@ -335,8 +435,69 @@ fn validate_pairings(pairings: &MobilePairings) -> Result<(), String> {
     if let Some(active) = &pairings.active_pairing {
         validate_active(active)?;
     }
+    if pairings.active_pairing.is_some() && pairings.pending_handoff_ack.is_some() {
+        return Err("mobile pairings cannot contain both an active offer and pending handoff acknowledgement".to_owned());
+    }
+    let mut device_ids = HashSet::new();
+    let mut managed_pairing_ids = HashSet::new();
     for record in &pairings.devices {
         validate_device(record)?;
+        if !device_ids.insert(&record.device_id) {
+            return Err(format!(
+                "duplicate mobile pairing device_id {}",
+                record.device_id
+            ));
+        }
+        if let Some(managed) = &record.managed
+            && !managed_pairing_ids.insert(managed.pairing_id.as_str())
+        {
+            return Err(format!(
+                "duplicate managed mobile pairing_id {}",
+                managed.pairing_id
+            ));
+        }
+    }
+    if let Some(pending) = &pairings.pending_handoff_ack {
+        validate_pending_handoff_ack(pending, &pairings.devices)?;
+    }
+    Ok(())
+}
+
+fn validate_pending_handoff_ack(
+    pending: &PendingManagedMobileHandoffAck,
+    devices: &[MobilePairingRecord],
+) -> Result<(), String> {
+    if pending.offer_id.0.is_empty() {
+        return Err("pending mobile handoff ack offer_id must not be empty".to_owned());
+    }
+    validate_non_empty(
+        "pending mobile handoff ack host_offer_token",
+        &pending.host_offer_token,
+    )?;
+    validate_non_empty("pending mobile handoff ack pairing_id", &pending.pairing_id)?;
+    if pending.device_id.0.is_empty() {
+        return Err("pending mobile handoff ack device_id must not be empty".to_owned());
+    }
+    let record = devices
+        .iter()
+        .find(|record| record.device_id == pending.device_id)
+        .ok_or_else(|| {
+            format!(
+                "pending mobile handoff ack references unknown device {}",
+                pending.device_id
+            )
+        })?;
+    let managed = record.managed.as_ref().ok_or_else(|| {
+        format!(
+            "pending mobile handoff ack device {} is not managed",
+            pending.device_id
+        )
+    })?;
+    if managed.pairing_id != pending.pairing_id {
+        return Err(format!(
+            "pending mobile handoff ack pairing {} does not match device {}",
+            pending.pairing_id, pending.device_id
+        ));
     }
     Ok(())
 }
@@ -404,6 +565,9 @@ fn validate_managed_handoff(handoff: &ManagedMobilePairingHandoff) -> Result<(),
     )?;
     if handoff.device_id.0.is_empty() {
         return Err("managed mobile handoff device_id must not be empty".to_owned());
+    }
+    if handoff.handoff_expires_at_ms == 0 {
+        return Err("managed mobile handoff expires_at_ms must not be zero".to_owned());
     }
     validate_non_empty("managed mobile handoff device_label", &handoff.device_label)?;
     if handoff.device_created_at_ms == 0 {
@@ -544,6 +708,7 @@ mod tests {
                 handoff: Some(ManagedMobilePairingHandoff {
                     pairing_id: "pair_01J".to_owned(),
                     host_pairing_secret: "handoff_host_pairing_secret".to_owned(),
+                    handoff_expires_at_ms: 2,
                     device_id: MobileDeviceId("device-1".to_owned()),
                     device_label: "Mike's iPhone".to_owned(),
                     device_created_at_ms: 1,
@@ -556,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn pairings_save_omits_active_pairing_and_round_trips_devices() {
+    fn pairings_save_round_trips_active_pairing_and_devices() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("mobile_pairings.json");
         let store = MobilePairingsStore::load(path).expect("load store");
@@ -572,6 +737,7 @@ mod tests {
                 key_fingerprint: key_fingerprint(&psk),
                 managed: None,
             }),
+            pending_handoff_ack: None,
             devices: vec![MobilePairingRecord {
                 device_id: MobileDeviceId("device-1".to_owned()),
                 broker: endpoint(),
@@ -588,30 +754,44 @@ mod tests {
 
         store.save(&pairings).expect("save pairings");
         let loaded = store.get().expect("load pairings");
-        assert!(loaded.active_pairing.is_none());
-        assert_eq!(loaded.devices, pairings.devices);
+        assert_eq!(loaded, pairings);
     }
 
     #[test]
-    fn active_managed_pairing_secrets_are_not_serialized() {
+    fn protected_active_managed_pairing_round_trips() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("mobile_pairings.json");
         let store = MobilePairingsStore::load(path.clone()).expect("load store");
         let pairings = MobilePairings {
             version: MOBILE_PAIRINGS_VERSION,
             active_pairing: Some(active_managed_pairing()),
+            pending_handoff_ack: None,
             devices: Vec::new(),
         };
 
         store.save(&pairings).expect("save pairings");
         let json = std::fs::read_to_string(&path).expect("read pairings file");
 
-        assert!(!json.contains("active_pairing"));
-        assert!(!json.contains("host_offer_token_secret"));
-        assert!(!json.contains("secret-payload"));
-        assert!(!json.contains("signed-grant-secret"));
+        assert!(json.contains("active_pairing"));
+        assert!(json.contains("host_offer_token_secret"));
         assert!(!json.contains("handoff_host_pairing_secret"));
-        assert!(store.get().expect("load pairings").active_pairing.is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("active pairing metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let mut expected = pairings;
+        expected
+            .active_pairing
+            .as_mut()
+            .and_then(|active| active.managed.as_mut())
+            .expect("active managed pairing")
+            .handoff = None;
+        assert_eq!(store.get().expect("load pairings"), expected);
     }
 
     #[test]
@@ -623,6 +803,7 @@ mod tests {
         let pairings = MobilePairings {
             version: MOBILE_PAIRINGS_VERSION,
             active_pairing: None,
+            pending_handoff_ack: None,
             devices: vec![MobilePairingRecord {
                 device_id: MobileDeviceId("device-1".to_owned()),
                 broker: BrokerEndpoint {
@@ -654,6 +835,85 @@ mod tests {
     }
 
     #[test]
+    fn managed_pairing_record_replay_is_idempotent() {
+        let psk = PreSharedKey::from_slice(&[9_u8; 32]).expect("psk");
+        let record = MobilePairingRecord {
+            device_id: MobileDeviceId("device-1".to_owned()),
+            broker: BrokerEndpoint {
+                url: managed_broker().endpoint,
+                auth: BrokerAuth::Anonymous,
+            },
+            room: RoomId([8_u8; 16]),
+            psk: psk.clone(),
+            label: "Mike's iPhone".to_owned(),
+            created_at_ms: 1,
+            last_seen_at_ms: Some(1),
+            state: MobileDeviceState::Paired,
+            key_fingerprint: key_fingerprint(&psk),
+            managed: Some(ManagedMobilePairingCredential {
+                pairing_id: "pair_01J".to_owned(),
+                host_pairing_secret: "durable_host_pairing_secret".to_owned(),
+                broker: managed_broker(),
+            }),
+        };
+        let mut pairings = MobilePairings::empty();
+
+        assert_eq!(
+            pairings
+                .insert_managed_record(record.clone())
+                .expect("insert managed pairing"),
+            ManagedMobilePairingRecordInsert::Inserted
+        );
+        assert_eq!(
+            pairings
+                .insert_managed_record(record)
+                .expect("replay managed pairing"),
+            ManagedMobilePairingRecordInsert::Existing
+        );
+        assert_eq!(pairings.devices.len(), 1);
+    }
+
+    #[test]
+    fn managed_pairing_record_replay_rejects_conflicting_secret() {
+        let mut pairings = MobilePairings::empty();
+        let psk = PreSharedKey::from_slice(&[9_u8; 32]).expect("psk");
+        let mut record = MobilePairingRecord {
+            device_id: MobileDeviceId("device-1".to_owned()),
+            broker: BrokerEndpoint {
+                url: managed_broker().endpoint,
+                auth: BrokerAuth::Anonymous,
+            },
+            room: RoomId([8_u8; 16]),
+            psk: psk.clone(),
+            label: "Mike's iPhone".to_owned(),
+            created_at_ms: 1,
+            last_seen_at_ms: Some(1),
+            state: MobileDeviceState::Paired,
+            key_fingerprint: key_fingerprint(&psk),
+            managed: Some(ManagedMobilePairingCredential {
+                pairing_id: "pair_01J".to_owned(),
+                host_pairing_secret: "durable_host_pairing_secret".to_owned(),
+                broker: managed_broker(),
+            }),
+        };
+        pairings
+            .insert_managed_record(record.clone())
+            .expect("insert managed pairing");
+        record
+            .managed
+            .as_mut()
+            .expect("managed pairing")
+            .host_pairing_secret = "conflicting_host_pairing_secret".to_owned();
+
+        let error = pairings
+            .insert_managed_record(record)
+            .expect_err("conflicting replay must fail");
+
+        assert!(error.contains("conflicts with durable device"));
+        assert_eq!(pairings.devices.len(), 1);
+    }
+
+    #[test]
     fn unknown_store_version_loads_as_repair_required() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("mobile_pairings.json");
@@ -669,6 +929,7 @@ mod tests {
                 key_fingerprint: key_fingerprint(&psk),
                 managed: None,
             }),
+            pending_handoff_ack: None,
             devices: vec![MobilePairingRecord {
                 device_id: MobileDeviceId("device-1".to_owned()),
                 broker: endpoint(),

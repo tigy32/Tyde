@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use protocol::{
@@ -50,7 +53,54 @@ pub(crate) struct LinkBrokerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LinkBrokerAuth {
     Legacy(BrokerAuth),
-    Managed(protocol::ManagedBrokerConnectAuth),
+    Managed(ManagedWssConnectStrategy),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ManagedWssConnectStrategy {
+    websocket_url: BrokerUrl,
+    mqtt_credentials: Option<ManagedMqttCredentials>,
+    headers: BTreeMap<String, String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum ManagedMqttCredentials {
+    UsernamePassword { username: String, password: String },
+}
+
+impl fmt::Debug for ManagedWssConnectStrategy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedWssConnectStrategy")
+            .field("websocket_url", &"<redacted>")
+            .field(
+                "mqtt_credentials",
+                &self.mqtt_credentials.as_ref().map(|_| "<redacted>"),
+            )
+            .field("header_count", &self.headers.len())
+            .finish()
+    }
+}
+
+impl ManagedWssConnectStrategy {
+    pub(crate) fn websocket_url(&self) -> &BrokerUrl {
+        &self.websocket_url
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn mqtt_credentials(&self) -> Option<(&str, &str)> {
+        match &self.mqtt_credentials {
+            Some(ManagedMqttCredentials::UsernamePassword { username, password }) => {
+                Some((username, password))
+            }
+            None => None,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn headers(&self) -> &BTreeMap<String, String> {
+        &self.headers
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +150,7 @@ impl ConnectionPlan {
         config: ManagedMqttConnectConfig,
         mode: ManagedConnectionMode,
     ) -> Result<Self, MqttTransportError> {
-        validate_managed_config(&config, mode)?;
+        let connect = validate_managed_config(&config, mode)?;
         let endpoint = BrokerEndpoint {
             url: config.broker.endpoint.clone(),
             auth: BrokerAuth::Anonymous,
@@ -114,7 +164,7 @@ impl ConnectionPlan {
             },
             broker: LinkBrokerConfig {
                 url: config.broker.endpoint,
-                auth: LinkBrokerAuth::Managed(config.credentials.connect),
+                auth: LinkBrokerAuth::Managed(connect),
                 client_id: LinkClientId::Exact(config.credentials.client_id),
             },
             topics: TopicScheme::Managed {
@@ -222,7 +272,7 @@ impl ParticipantRole {
 fn validate_managed_config(
     config: &ManagedMqttConnectConfig,
     mode: ManagedConnectionMode,
-) -> Result<(), MqttTransportError> {
+) -> Result<ManagedWssConnectStrategy, MqttTransportError> {
     validate_managed_broker_endpoint(&config.broker)?;
     validate_managed_topic_namespace(&config.credentials.scope.namespace)?;
     if config.credentials.scope.role != config.role.managed_broker_role() {
@@ -240,11 +290,7 @@ fn validate_managed_config(
     }
     validate_managed_client_id(config)?;
     validate_expected_managed_filters(config, mode)?;
-    validate_managed_connect_auth(&config.credentials.connect)?;
-    if let Some(websocket_url) = &config.credentials.connect.websocket_url {
-        validate_managed_websocket_url_for_broker(websocket_url, &config.broker)?;
-    }
-    Ok(())
+    validate_managed_connect_auth(&config.credentials.connect, &config.broker)
 }
 
 fn validate_expected_managed_filters(
@@ -383,66 +429,38 @@ fn validate_managed_client_id(config: &ManagedMqttConnectConfig) -> Result<(), M
 
 fn validate_managed_connect_auth(
     auth: &protocol::ManagedBrokerConnectAuth,
-) -> Result<(), MqttTransportError> {
-    if auth.username.is_none()
-        && auth.password.is_none()
-        && auth.websocket_url.is_none()
-        && auth.headers.is_empty()
-    {
-        return Err(MqttTransportError::Configuration {
+    broker: &ManagedBrokerEndpoint,
+) -> Result<ManagedWssConnectStrategy, MqttTransportError> {
+    let websocket_url = auth.websocket_url.as_ref().ok_or_else(|| {
+        MqttTransportError::Configuration {
             message:
-                "managed broker connect auth must include username/password, connect.websocket_url, or WebSocket headers"
+                "managed WSS MQTT requires service-issued connect.websocket_url; refusing to use the base broker endpoint"
                     .to_owned(),
-        });
-    }
-    if auth.password.is_some() && auth.username.is_none() {
-        return Err(MqttTransportError::Configuration {
-            message: "managed broker MQTT password cannot be sent without a username".to_owned(),
-        });
-    }
-    if let Some(websocket_url) = &auth.websocket_url {
-        validate_managed_websocket_url_shape(websocket_url)?;
-    }
+        }
+    })?;
+    validate_managed_websocket_url_for_broker(websocket_url, broker)?;
+    let mqtt_credentials = match (&auth.username, &auth.password) {
+        (Some(username), Some(password)) => Some(ManagedMqttCredentials::UsernamePassword {
+            username: username.clone(),
+            password: password.clone(),
+        }),
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(MqttTransportError::Configuration {
+                message:
+                    "managed broker MQTT username and password must either both be present or both be absent"
+                        .to_owned(),
+            });
+        }
+    };
     for (name, value) in &auth.headers {
         validate_websocket_header(name, value)?;
     }
-    Ok(())
-}
-
-#[cfg(any(target_arch = "wasm32", test))]
-pub(crate) fn validate_browser_managed_connect_auth(
-    auth: &protocol::ManagedBrokerConnectAuth,
-) -> Result<(), MqttTransportError> {
-    let websocket_url = auth.websocket_url.as_ref().ok_or_else(|| {
-        MqttTransportError::Configuration {
-            message:
-                "browser WebSocket MQTT requires managed broker connect.websocket_url; refusing to use the base broker endpoint"
-                    .to_owned(),
-        }
-    })?;
-    validate_managed_websocket_url_shape(websocket_url)?;
-    if auth.password.is_some() && auth.username.is_none() {
-        return Err(MqttTransportError::Configuration {
-            message: "managed broker MQTT password cannot be sent without a username".to_owned(),
-        });
-    }
-    Ok(())
-}
-
-#[cfg(any(target_arch = "wasm32", test))]
-pub(crate) fn validate_browser_managed_connect_auth_for_broker(
-    auth: &protocol::ManagedBrokerConnectAuth,
-    endpoint: &BrokerUrl,
-) -> Result<(), MqttTransportError> {
-    validate_browser_managed_connect_auth(auth)?;
-    let websocket_url = auth.websocket_url.as_ref().ok_or_else(|| {
-        MqttTransportError::Configuration {
-            message:
-                "browser WebSocket MQTT requires managed broker connect.websocket_url; refusing to use the base broker endpoint"
-                    .to_owned(),
-        }
-    })?;
-    validate_managed_websocket_url_matches_endpoint(websocket_url, endpoint)
+    Ok(ManagedWssConnectStrategy {
+        websocket_url: websocket_url.clone(),
+        mqtt_credentials,
+        headers: auth.headers.clone(),
+    })
 }
 
 fn validate_managed_websocket_url_shape(
@@ -548,6 +566,7 @@ fn validate_managed_websocket_url_for_broker(
     websocket_url: &BrokerUrl,
     broker: &ManagedBrokerEndpoint,
 ) -> Result<(), MqttTransportError> {
+    validate_managed_websocket_url_shape(websocket_url)?;
     validate_managed_websocket_url_matches_endpoint(websocket_url, &broker.endpoint)?;
     let websocket = parse_managed_url(websocket_url, "managed broker connect.websocket_url")?;
     validate_managed_websocket_query(&websocket, Some(broker.authorizer_name.as_str()))
@@ -662,22 +681,10 @@ fn single_managed_query_value(
     }
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
-pub(crate) fn browser_link_broker_url(
-    broker: &LinkBrokerConfig,
-) -> Result<&BrokerUrl, MqttTransportError> {
+pub(crate) fn link_broker_url(broker: &LinkBrokerConfig) -> &BrokerUrl {
     match &broker.auth {
-        LinkBrokerAuth::Managed(auth) => {
-            validate_browser_managed_connect_auth_for_broker(auth, &broker.url)?;
-            auth.websocket_url
-                .as_ref()
-                .ok_or_else(|| MqttTransportError::Configuration {
-                    message:
-                        "browser WebSocket MQTT requires managed broker connect.websocket_url; refusing to use the base broker endpoint"
-                            .to_owned(),
-                })
-        }
-        LinkBrokerAuth::Legacy(_) => Ok(&broker.url),
+        LinkBrokerAuth::Managed(auth) => auth.websocket_url(),
+        LinkBrokerAuth::Legacy(_) => &broker.url,
     }
 }
 
@@ -731,9 +738,7 @@ pub(crate) fn encode_browser_connect_packet(
         LinkBrokerAuth::Legacy(BrokerAuth::UsernamePassword { username, password }) => {
             connect.set_login(username.clone(), password.clone());
         }
-        LinkBrokerAuth::Managed(auth) => {
-            validate_browser_managed_connect_auth_for_broker(auth, &broker.url)?;
-        }
+        LinkBrokerAuth::Managed(_) => {}
     }
 
     let mut buffer = bytes::BytesMut::new();
@@ -1019,7 +1024,9 @@ mod tests {
             headers: BTreeMap::new(),
         };
         let err = ConnectionPlan::managed(config).expect_err("missing auth must fail");
-        assert!(err.to_string().contains("connect auth"));
+        assert!(matches!(err, MqttTransportError::Configuration { .. }));
+        assert!(!err.is_retryable(), "invalid managed auth must be terminal");
+        assert!(err.to_string().contains("connect.websocket_url"));
     }
 
     #[test]
@@ -1081,6 +1088,8 @@ mod tests {
         ] {
             let err = ConnectionPlan::managed_ephemeral(config)
                 .expect_err("invalid websocket_url semantics must fail closed");
+            assert!(matches!(err, MqttTransportError::Configuration { .. }));
+            assert!(!err.is_retryable(), "invalid managed URL must be terminal");
             assert!(
                 err.to_string().contains(expected),
                 "expected {expected:?} in {err}"
@@ -1119,47 +1128,44 @@ mod tests {
     }
 
     #[test]
-    fn managed_connection_plan_rejects_invalid_header_values() {
-        let mut config = managed_config(ParticipantRole::Host);
-        config
-            .credentials
-            .connect
-            .headers
-            .insert("x-tycode-grant".to_owned(), "line\r\nbreak".to_owned());
-        let err = ConnectionPlan::managed(config).expect_err("invalid header must fail");
-        assert!(err.to_string().contains("invalid value"));
+    fn managed_connection_plan_rejects_invalid_headers_terminally() {
+        for (name, value) in [
+            ("invalid header", "signed-grant"),
+            ("x-tycode-grant", "line\r\nbreak"),
+        ] {
+            let mut config = managed_config(ParticipantRole::Host);
+            config
+                .credentials
+                .connect
+                .headers
+                .insert(name.to_owned(), value.to_owned());
+            let err = ConnectionPlan::managed(config).expect_err("invalid header must fail");
+            assert!(matches!(err, MqttTransportError::Configuration { .. }));
+            assert!(!err.is_retryable(), "invalid header must be terminal");
+            assert!(!err.to_string().contains(value));
+        }
     }
 
     #[test]
-    fn browser_managed_auth_accepts_websocket_url_with_optional_username_password() {
-        let config = managed_config(ParticipantRole::Client);
-        validate_browser_managed_connect_auth(&config.credentials.connect)
-            .expect("browser can use the service-issued WebSocket URL");
-    }
-
-    #[test]
-    fn browser_managed_auth_rejects_missing_websocket_url() {
-        let mut config = managed_config(ParticipantRole::Client);
-        config.credentials.connect.websocket_url = None;
-        let err = validate_browser_managed_connect_auth(&config.credentials.connect)
-            .expect_err("missing browser websocket_url must fail closed");
-        assert!(err.to_string().contains("websocket_url"));
-    }
-
-    #[test]
-    fn browser_managed_auth_rejects_password_without_username() {
+    fn managed_auth_rejects_unpaired_mqtt_username_or_password() {
         let mut config = managed_config(ParticipantRole::Client);
         config.credentials.connect.username = None;
-        let err = validate_browser_managed_connect_auth(&config.credentials.connect)
+        let err = ConnectionPlan::managed_ephemeral(config)
             .expect_err("password without username must fail closed");
-        assert!(err.to_string().contains("password"));
+        assert!(err.to_string().contains("both be present"));
+
+        let mut config = managed_config(ParticipantRole::Client);
+        config.credentials.connect.password = None;
+        let err = ConnectionPlan::managed_ephemeral(config)
+            .expect_err("username without password must fail closed");
+        assert!(err.to_string().contains("both be present"));
     }
 
-    #[test]
-    fn browser_link_uses_managed_websocket_url_not_base_endpoint() {
+    #[tokio::test]
+    async fn native_and_wasm_select_exact_managed_websocket_url() {
         let plan = ConnectionPlan::managed_ephemeral(managed_config(ParticipantRole::Client))
             .expect("managed plan");
-        let url = browser_link_broker_url(&plan.broker).expect("browser URL");
+        let url = link_broker_url(&plan.broker);
         assert_eq!(
             url.as_str(),
             "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=signed-grant"
@@ -1167,34 +1173,35 @@ mod tests {
         assert_ne!(
             url.as_str(),
             plan.config.endpoint.url.as_str(),
-            "browser managed transport must not fall back to the base broker endpoint"
+            "managed WSS transport must not fall back to the base broker endpoint"
         );
-    }
+        let options = crate::link_native::mqtt_options_for_link(&plan.broker, None)
+            .expect("native managed MQTT options");
+        assert_eq!(options.broker_address(), (url.as_str().to_owned(), 443));
+        assert_eq!(
+            options.client_id(),
+            "tyde/prod/pair_01J/mobile/dev_01J/grant_01J"
+        );
+        assert!(
+            options.request_modifier().is_some(),
+            "native managed WebSocket headers must be wired into rumqttc"
+        );
+        let modifier = options.request_modifier().expect("request modifier");
+        for _ in 0..2 {
+            let request = modifier(Default::default()).await;
+            assert_eq!(
+                request
+                    .headers()
+                    .get("x-tycode-grant")
+                    .and_then(|value| value.to_str().ok()),
+                Some("signed-grant")
+            );
+        }
 
-    #[test]
-    fn browser_link_rejects_websocket_url_base_mismatch_without_token_leak() {
-        let config = managed_config(ParticipantRole::Client);
-        let broker = LinkBrokerConfig {
-            url: BrokerUrl::new("wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt")
-                .expect("base endpoint"),
-            auth: LinkBrokerAuth::Managed(ManagedBrokerConnectAuth {
-                websocket_url: Some(
-                    BrokerUrl::new(
-                        "wss://other-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant-secret",
-                    )
-                    .expect("websocket url"),
-                ),
-                ..config.credentials.connect
-            }),
-            client_id: LinkClientId::Exact(config.credentials.client_id),
-        };
-
-        let err = browser_link_broker_url(&broker)
-            .expect_err("browser link must validate websocket_url against the base endpoint");
-
-        assert!(err.to_string().contains("must match broker endpoint"));
-        assert!(!err.to_string().contains("signed-grant-secret"));
-        assert!(!err.to_string().contains("tycode-grant=signed"));
+        let debug = format!("{:?}", plan.broker);
+        assert!(!debug.contains("signed-grant"));
+        assert!(!debug.contains("tycode-grant"));
+        assert!(!debug.contains("x-tycode-grant"));
     }
 
     #[test]

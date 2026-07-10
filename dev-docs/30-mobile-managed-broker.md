@@ -245,12 +245,14 @@ surface through server-owned state. It must not substitute any default broker.
 }
 ```
 
-The browser mobile website must use `connect.websocket_url` for AWS IoT Core
-custom-authorizer WebSocket connections; if it is missing or invalid the managed
-path fails closed rather than falling back to the base broker endpoint. Native
-MQTT clients may place the grant token in the password, username authorizer
-token field, or WebSocket headers as required by AWS IoT. The semantic contract
-is the signed grant, exact `client_id`, role, and scoped topic namespace.
+Both native and browser managed WSS transports must use the exact validated
+service-issued `connect.websocket_url` for AWS IoT Core custom-authorizer
+connections. The base broker endpoint is validation context only and is never a
+connect fallback. A missing, malformed, or endpoint-mismatched
+`connect.websocket_url` is a terminal typed transport-configuration error.
+Optional MQTT username/password credentials must be supplied together, and
+native may also forward validated WebSocket headers. Both transports preserve
+the exact service-issued `client_id`, role, and scoped topic namespace.
 
 The `rooms/+` filter is intentional for Tyde's managed **ephemeral** MQTT path.
 The stored Tyde room is a rendezvous channel only; during

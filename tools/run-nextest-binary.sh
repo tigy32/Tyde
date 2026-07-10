@@ -28,7 +28,11 @@ if [[ ! -x "$cached_binary" ]]; then
         }
         trap cleanup EXIT
 
-        find "$cache_dir" -maxdepth 1 -type f -name "$binary_name.*" -delete
+        for stale_binary in "$cache_dir/$binary_name".*; do
+            if [[ -f "$stale_binary" ]]; then
+                rm -f "$stale_binary"
+            fi
+        done
         cp -c "$binary" "$temporary_binary"
         xattr -c "$temporary_binary"
         mv "$temporary_binary" "$cached_binary"

@@ -131,9 +131,13 @@ enum AuthCallbackExchangeAction {
     Ready(Option<MobileServiceAuthState>),
 }
 
-/// Refresh managed broker credentials this long before they expire so a
-/// reconnect never hands the transport an already-dead grant.
-const CREDENTIAL_REFRESH_MARGIN_MS: u64 = 30_000;
+/// Client clock-skew plus mint/connect latency margin applied against the
+/// service-owned `connect_valid_until_ms` boundary, so a grant that looks
+/// connectable on the phone's clock is still inside the boundary when the
+/// CONNECT reaches AWS. The authorizer's own minimum-lifetime policy lives in
+/// tycode-mobile-service and arrives already folded into
+/// `connect_valid_until_ms` — it is deliberately not mirrored here.
+const CREDENTIAL_CLOCK_SKEW_ALLOWANCE_MS: u64 = 60_000;
 
 /// Terminal or re-renderable outcome of a redeem attempt. `Auth` re-drives the
 /// [`MobileServiceAuthState`] card (e.g. the session lapsed into `pass_required`
@@ -168,9 +172,23 @@ thread_local! {
 
     /// Fresh mobile broker grants, held **only in memory** (never persisted —
     /// finding #5 / dev-docs/30). Populated by redeem and mint; reused for a
-    /// reconnect that happens before they expire; dropped on forget or reload.
-    static CREDENTIAL_CACHE: RefCell<HashMap<LocalHostId, ManagedBrokerCredentials>> =
+    /// reconnect that happens while still connectable; dropped on forget or
+    /// reload.
+    static CREDENTIAL_CACHE: RefCell<HashMap<LocalHostId, CachedBrokerGrant>> =
         RefCell::new(HashMap::new());
+}
+
+/// A cached broker grant paired with the service-owned connect-validity
+/// boundary from the mint/redeem contract. The boundary is not part of the
+/// protocol [`ManagedBrokerCredentials`], so it rides alongside them in this
+/// in-memory cache only. No `Debug`: the credentials carry secrets.
+#[derive(Clone)]
+struct CachedBrokerGrant {
+    credentials: ManagedBrokerCredentials,
+    /// Absolute epoch-ms deadline after which the AWS authorizer will refuse a
+    /// CONNECT with this grant, computed service-side (token expiry minus the
+    /// authorizer's minimum-lifetime policy).
+    connect_valid_until_ms: u64,
 }
 
 fn mark_authenticated(value: bool) {
@@ -181,15 +199,13 @@ fn is_authenticated() -> bool {
     AUTHENTICATED.with(Cell::get)
 }
 
-fn cache_credentials(local_host_id: &LocalHostId, credentials: ManagedBrokerCredentials) {
+fn cache_credentials(local_host_id: &LocalHostId, grant: CachedBrokerGrant) {
     CREDENTIAL_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .insert(local_host_id.clone(), credentials);
+        cache.borrow_mut().insert(local_host_id.clone(), grant);
     });
 }
 
-fn cached_fresh_credentials(
+fn cached_connectable_credentials(
     local_host_id: &LocalHostId,
     now_ms: u64,
 ) -> Option<ManagedBrokerCredentials> {
@@ -197,8 +213,8 @@ fn cached_fresh_credentials(
         cache
             .borrow()
             .get(local_host_id)
-            .filter(|credentials| credentials_are_fresh(credentials, now_ms))
-            .cloned()
+            .filter(|grant| cached_grant_is_connectable(grant, now_ms))
+            .map(|grant| grant.credentials.clone())
     })
 }
 
@@ -585,7 +601,8 @@ pub async fn redeem_and_connect(qr_uri: &str) -> Result<(), RedeemOutcome> {
 }
 
 /// Obtains managed broker credentials for a (re)connect: reuses the in-memory
-/// cached grant while it is still fresh, otherwise mints new ones via
+/// cached grant while its service-owned `connect_valid_until_ms` boundary
+/// (minus a clock-skew allowance) has not passed, otherwise mints new ones via
 /// `POST /pairings/{id}/broker-credentials` (cookie + HMAC). Used by the
 /// connection manager to build the `ManagedMqttConnectConfig`.
 pub async fn obtain_managed_credentials(
@@ -600,7 +617,7 @@ pub async fn obtain_managed_credentials(
             message: "paired host has no managed tycode.dev identity".to_owned(),
             retryable: false,
         })?;
-    if let Some(credentials) = cached_fresh_credentials(&record.local_host_id, now_ms) {
+    if let Some(credentials) = cached_connectable_credentials(&record.local_host_id, now_ms) {
         return Ok((managed.broker.clone(), credentials));
     }
     mint_managed_credentials(record, managed).await
@@ -929,8 +946,8 @@ async fn finish_redeem(
     }
 
     // Reuse the redeem-issued grant for the first connect (in memory only).
-    if let Some(credentials) = result.mobile_broker_credentials {
-        cache_credentials(&local_host_id, credentials);
+    if let Some(grant) = result.mobile_broker_credentials {
+        cache_credentials(&local_host_id, grant);
     }
 
     if let Err(message) = super::connection::manager()
@@ -1011,13 +1028,20 @@ async fn mint_managed_credentials(
                     retryable: true,
                 })?;
             let broker = response.broker.into_protocol().map_err(mint_conv_err)?;
+            let connect_valid_until_ms = response.broker_credentials.connect_valid_until_ms;
             let credentials = response
                 .broker_credentials
                 .into_protocol(&broker)
                 .map_err(mint_conv_err)?;
-            // Cache in memory for the next reconnect within its lifetime; never
-            // persisted (finding #5).
-            cache_credentials(&record.local_host_id, credentials.clone());
+            // Cache in memory for the next reconnect within its service-owned
+            // connect boundary; never persisted (finding #5).
+            cache_credentials(
+                &record.local_host_id,
+                CachedBrokerGrant {
+                    credentials: credentials.clone(),
+                    connect_valid_until_ms,
+                },
+            );
             Ok((broker, credentials))
         }
         Ok(HttpJson { body, .. }) => Err(mint_error_from_body(&body)),
@@ -1192,8 +1216,8 @@ fn url_path_prefix(base_url: &str) -> String {
     }
 }
 
-fn credentials_are_fresh(credentials: &ManagedBrokerCredentials, now_ms: u64) -> bool {
-    credentials.expires_at_ms > now_ms.saturating_add(CREDENTIAL_REFRESH_MARGIN_MS)
+fn cached_grant_is_connectable(grant: &CachedBrokerGrant, now_ms: u64) -> bool {
+    grant.connect_valid_until_ms > now_ms.saturating_add(CREDENTIAL_CLOCK_SKEW_ALLOWANCE_MS)
 }
 
 // ── Error mapping ─────────────────────────────────────────────────────────────
@@ -1466,7 +1490,7 @@ struct RedeemResult {
     device_id: String,
     device_pairing_secret: String,
     broker: ManagedBrokerEndpoint,
-    mobile_broker_credentials: Option<ManagedBrokerCredentials>,
+    mobile_broker_credentials: Option<CachedBrokerGrant>,
 }
 
 #[derive(Deserialize)]
@@ -1481,13 +1505,17 @@ struct RedeemResponse {
 impl RedeemResponse {
     fn into_result(self) -> Result<RedeemResult, String> {
         let broker = self.broker.into_protocol()?;
+        let connect_valid_until_ms = self.mobile_broker_credentials.connect_valid_until_ms;
         let credentials = self.mobile_broker_credentials.into_protocol(&broker)?;
         Ok(RedeemResult {
             pairing_id: self.pairing_id,
             device_id: self.device_id,
             device_pairing_secret: self.device_pairing_secret,
             broker,
-            mobile_broker_credentials: Some(credentials),
+            mobile_broker_credentials: Some(CachedBrokerGrant {
+                credentials,
+                connect_valid_until_ms,
+            }),
         })
     }
 }
@@ -1531,6 +1559,10 @@ struct ContractCredentials {
     connect: ContractConnect,
     scope: ContractScope,
     issued_at_ms: u64,
+    /// Service-owned absolute connect-validity boundary: token expiry minus
+    /// the authorizer's minimum-lifetime policy, computed by
+    /// tycode-mobile-service. Required — a response without it is unreadable.
+    connect_valid_until_ms: u64,
     expires_at_ms: u64,
 }
 
@@ -1968,17 +2000,62 @@ mod tests {
         );
     }
 
+    /// Freshness is the service-owned `connect_valid_until_ms` boundary minus
+    /// only a client clock-skew allowance — no authorizer policy is mirrored
+    /// client-side. A grant whose token has not expired but whose connect
+    /// boundary is inside the skew window must not be reused.
     #[test]
-    fn credentials_are_fresh_respects_margin() {
-        let creds = sample_credentials(10_000);
+    fn cached_grant_connectable_respects_service_boundary_and_skew() {
+        let now = 1_000_000;
+        let grant = |connect_valid_until_ms| CachedBrokerGrant {
+            // Token expiry far in the future: connectability must come from
+            // the service boundary, never from `expires_at_ms`.
+            credentials: sample_credentials(now + 900_000),
+            connect_valid_until_ms,
+        };
+        for boundary_ms in [0, now, now + CREDENTIAL_CLOCK_SKEW_ALLOWANCE_MS] {
+            assert!(
+                !cached_grant_is_connectable(&grant(boundary_ms), now),
+                "boundary at {boundary_ms}ms is at or inside the skew window and must be stale"
+            );
+        }
         assert!(
-            !credentials_are_fresh(&creds, 0),
-            "expiry within margin is stale"
+            cached_grant_is_connectable(&grant(now + CREDENTIAL_CLOCK_SKEW_ALLOWANCE_MS + 1), now),
+            "a boundary strictly beyond the skew window is connectable"
         );
-        let creds = sample_credentials(1_000_000);
+    }
+
+    /// The mint/redeem contract requires `connect_valid_until_ms`; a response
+    /// without it must fail to parse (surfaced as an unreadable response),
+    /// never default to a client-guessed boundary.
+    #[test]
+    fn contract_credentials_require_connect_valid_until_ms() {
+        let with_field = serde_json::json!({
+            "grant_id": "grant_1",
+            "client_id": "tyde/prod/pair_1/mobile/dev_1/grant_1",
+            "connect": {},
+            "scope": {
+                "namespace": "tyde/prod/pair_1",
+                "role": "mobile",
+                "publish": [],
+                "subscribe": []
+            },
+            "issued_at_ms": 0,
+            "connect_valid_until_ms": 600_000,
+            "expires_at_ms": 900_000
+        });
+        let parsed: ContractCredentials =
+            serde_json::from_value(with_field.clone()).expect("full contract parses");
+        assert_eq!(parsed.connect_valid_until_ms, 600_000);
+
+        let mut without_field = with_field;
+        without_field
+            .as_object_mut()
+            .expect("object")
+            .remove("connect_valid_until_ms");
         assert!(
-            credentials_are_fresh(&creds, 100),
-            "distant expiry is fresh"
+            serde_json::from_value::<ContractCredentials>(without_field).is_err(),
+            "a credential response without connect_valid_until_ms must be unreadable"
         );
     }
 
@@ -2098,6 +2175,7 @@ mod tests {
                 publish: vec!["tyde/prod/pair_1/rooms/+/client-to-host".to_owned()],
                 subscribe: vec!["tyde/prod/pair_1/rooms/+/host-to-client".to_owned()],
             },
+            connect_valid_until_ms: 0,
             issued_at_ms: 0,
             expires_at_ms: 1,
         }
@@ -2362,6 +2440,7 @@ mod wasm_tests {
                 "subscribe":["tyde/prod/pair_01J/rooms/+/host-to-client"]
             },
             "issued_at_ms":1,
+            "connect_valid_until_ms":4102444500000,
             "expires_at_ms":4102444800000
         }
     }"#;
@@ -3515,6 +3594,7 @@ mod wasm_tests {
                         "subscribe":["tyde/prod/pair_01J/rooms/+/host-to-client"]
                     },
                     "issued_at_ms":1,
+                    "connect_valid_until_ms":4102444500000,
                     "expires_at_ms":4102444800000
                 }
             }"#,
@@ -3539,6 +3619,128 @@ mod wasm_tests {
 
         clear_cached_credentials(&record.local_host_id);
         let _ = super::super::store::delete_device_secret(&device_secret_key_id).await;
+        drop(fetch);
+        set_config("");
+    }
+
+    fn cached_test_grant(
+        grant_id: &str,
+        connect_valid_until_ms: u64,
+        expires_at_ms: u64,
+    ) -> CachedBrokerGrant {
+        CachedBrokerGrant {
+            credentials: cached_test_credentials(grant_id, expires_at_ms),
+            connect_valid_until_ms,
+        }
+    }
+
+    fn cached_test_credentials(grant_id: &str, expires_at_ms: u64) -> ManagedBrokerCredentials {
+        ManagedBrokerCredentials {
+            grant_id: ManagedBrokerGrantId::new(grant_id).expect("grant id"),
+            client_id: ManagedBrokerClientId::new("tyde/prod/pair_01J/mobile/dev_01J/grant_cached")
+                .expect("client id"),
+            connect: ManagedBrokerConnectAuth {
+                username: None,
+                password: None,
+                websocket_url: Some(
+                    protocol::BrokerUrl::new(
+                        "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=cached-grant",
+                    )
+                    .expect("websocket url"),
+                ),
+                headers: Default::default(),
+            },
+            scope: ManagedBrokerCredentialScope {
+                namespace: ManagedBrokerTopicNamespace::new("tyde/prod/pair_01J")
+                    .expect("namespace"),
+                role: ManagedBrokerRole::Mobile,
+                publish: vec!["tyde/prod/pair_01J/rooms/+/client-to-host".to_owned()],
+                subscribe: vec!["tyde/prod/pair_01J/rooms/+/host-to-client".to_owned()],
+            },
+            issued_at_ms: 0,
+            expires_at_ms,
+        }
+    }
+
+    /// The latent credential bug: a cached grant whose token has not expired
+    /// but whose service-owned connect boundary has passed must be re-minted,
+    /// never reused — the authorizer would refuse the connect.
+    #[wasm_bindgen_test]
+    async fn cached_grant_past_service_connect_boundary_is_reminted_not_reused() {
+        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
+        let fetch = install_fetch_mock(vec![(200, VALID_MINT_RESPONSE)]);
+        let device_secret_key_id =
+            super::super::store::store_device_secret("device_pairing_secret_stale_grant")
+                .await
+                .expect("store device secret");
+        let record = reconnect_record("reconnect-stale-grant", device_secret_key_id.clone());
+        let now = 1_000_000_000_u64;
+        // Token still valid for 299s, but the service says CONNECT stopped
+        // being acceptable 1s ago — connectability must follow the boundary,
+        // not the token expiry.
+        cache_credentials(
+            &record.local_host_id,
+            cached_test_grant("grant_stale", now - 1_000, now + 299_000),
+        );
+
+        let (_broker, credentials) = obtain_managed_credentials(&record, now)
+            .await
+            .expect("a sub-minimum cached grant must trigger a fresh mint");
+
+        assert_eq!(
+            credentials.grant_id.as_str(),
+            "grant_01J",
+            "the freshly minted grant must be returned, not the dead cached one"
+        );
+        let calls = fetch.calls();
+        assert_eq!(calls.len(), 1, "exactly one mint request must be issued");
+        assert!(
+            calls[0]
+                .url
+                .ends_with("/pairings/pair_01J/broker-credentials"),
+            "the call must be a broker credential mint: {calls:?}"
+        );
+
+        clear_cached_credentials(&record.local_host_id);
+        let _ = super::super::store::delete_device_secret(&device_secret_key_id).await;
+        drop(fetch);
+        set_config("");
+    }
+
+    /// The in-memory grant cache still works: a cached grant whose service
+    /// connect boundary is safely beyond the clock-skew allowance is reused
+    /// without any service call.
+    #[wasm_bindgen_test]
+    async fn cached_grant_within_service_connect_boundary_is_reused() {
+        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
+        let fetch = install_fetch_mock(Vec::new());
+        // The device secret is intentionally absent: a cache hit must never
+        // touch the keystore or the service.
+        let record = reconnect_record(
+            "reconnect-fresh-grant",
+            mobile_shell_types::KeychainSecretId("unused-device-secret".to_owned()),
+        );
+        let now = 1_000_000_000_u64;
+        cache_credentials(
+            &record.local_host_id,
+            cached_test_grant(
+                "grant_cached_fresh",
+                now + CREDENTIAL_CLOCK_SKEW_ALLOWANCE_MS + 60_000,
+                now + 900_000,
+            ),
+        );
+
+        let (_broker, credentials) = obtain_managed_credentials(&record, now)
+            .await
+            .expect("a still-valid cached grant must be reused");
+
+        assert_eq!(credentials.grant_id.as_str(), "grant_cached_fresh");
+        assert!(
+            fetch.calls().is_empty(),
+            "no service request may be issued for a still-valid cached grant"
+        );
+
+        clear_cached_credentials(&record.local_host_id);
         drop(fetch);
         set_config("");
     }
@@ -3576,6 +3778,7 @@ mod wasm_tests {
                         "subscribe":["tyde/prod/pair_01J/rooms/+/host-to-client"]
                     },
                     "issued_at_ms":1,
+                    "connect_valid_until_ms":4102444500000,
                     "expires_at_ms":4102444800000
                 }
             }"#,

@@ -267,9 +267,10 @@ It must not include latest messages, errors, summaries, or output snippets.
 #### `tyde_await_agents`
 
 Waits like `select(2)` over the supplied agent ids. It returns when any watched
-agent becomes non-`thinking`. If every watched agent is still `thinking` near
-the MCP transport's per-call deadline, it returns a status snapshot so callers
-can call it again instead of losing the tool call to a client-side timeout.
+agent becomes non-`thinking`. It has no tool-level timeout and accepts neither
+`timeout` nor `timeout_ms`. While every watched agent is still `thinking`, the
+call remains pending unless the request is cancelled or the status channel
+fails. Callers may impose their own transport-level deadline.
 
 Input:
 

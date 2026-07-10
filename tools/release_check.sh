@@ -92,29 +92,12 @@ PY
 
 log "Running release tooling Python tests"
 python3 -B -m unittest \
+    tools/test_dev_check.py \
     tools/test_release_tooling.py \
     tools/test_check_mobile_web_manifest.py
 
-log "Running cargo fmt --all --check"
-cargo fmt --all --check
-
-log "Running cargo check --all-targets"
-cargo check --all-targets
-
-log "Running cargo clippy --all-targets -- -D warnings"
-cargo clippy --all-targets -- -D warnings
-
-log "Running cargo nextest run"
-cargo nextest run
-
-log "Running tools/run-wasm-tests.sh"
-tools/run-wasm-tests.sh
-
-log "Running web loader tests"
-(
-    cd web/loader
-    node --test
-)
+log "Running fresh authoritative dev checks"
+./dev.sh check --force
 
 log "Running web deploy manifest tests"
 node --test web/deploy/*.test.mjs

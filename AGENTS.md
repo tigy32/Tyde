@@ -32,6 +32,15 @@ Before creating any commit, you must verify the following are clean:
 - `cargo nextest run` — native tests pass
 - `tools/run-wasm-tests.sh` — wasm UI tests pass
 
+Run the canonical sequence with `./dev.sh check`. Its default mode fingerprints
+the complete Git worktree and tool/test environment. A cache miss runs the
+compile/lint stages once and each native, wasm, and web-loader test stage three
+times; a cache hit prints the prior successful stage summary and does no work.
+Use `./dev.sh check --force` for a cache-bypassing authoritative three-run
+check that may refresh the success record, and `./dev.sh check --no-cache` only
+for a one-run local diagnostic that neither reads nor writes the cache. Release
+and CI checks must use `--force`.
+
 The native suite has a hard five-minute limit, enforced by
 `.config/nextest.toml`. Treat exceeding that limit as a test failure: find and
 fix the root cause. Do not fall back to serial `cargo test`, increase the
@@ -187,6 +196,7 @@ logs you added until the user has signed off on the fix.
 
 ## Running the app and tests locally
 
+- Canonical full check: `./dev.sh check`
 - Native tests: `cargo nextest run` (no `--target` flag; must finish in under
   five minutes)
 - Wasm tests: `tools/run-wasm-tests.sh` (filter with
