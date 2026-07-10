@@ -24,6 +24,42 @@ use rmcp::model::{CallToolRequestParams, RawContent};
 use rmcp::transport::StreamableHttpClientTransport;
 use serde_json::{Value, json};
 
+fn write_fake_codex_model_probe_program(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let binary = dir.path().join("fake-codex-model-probe.py");
+    let script = r#"#!/usr/bin/env python3
+import json
+import sys
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    method = request.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "model/list":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"data": [{"model": "gpt-5.4-mini"}]}
+        })
+"#;
+    std::fs::write(&binary, script).expect("write fake Codex model probe");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&binary)
+            .expect("fake Codex model probe metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).expect("chmod fake Codex model probe");
+    }
+    binary
+}
+
 async fn next_env(client: &mut client::Connection, context: &str) -> Envelope {
     match tokio::time::timeout(Duration::from_secs(10), client.next_event()).await {
         Ok(Ok(Some(env))) => env,
@@ -1010,7 +1046,13 @@ async fn team_member_create_rejects_unknown_custom_agent() {
 
 #[tokio::test]
 async fn team_create_allows_default_agent_with_backend_and_cost() {
-    let mut fixture = Fixture::new().await;
+    let probe_dir = tempfile::tempdir().expect("Codex probe tempdir");
+    let fake_codex = write_fake_codex_model_probe_program(&probe_dir);
+    let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+        codex_probe_program: Some(fake_codex.to_string_lossy().into_owned()),
+        ..Default::default()
+    })
+    .await;
     let project = create_project(&mut fixture.client, "default-agent-project").await;
     fixture
         .client

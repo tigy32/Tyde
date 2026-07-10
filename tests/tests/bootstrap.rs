@@ -269,6 +269,68 @@ fn hermes_claude_launch_profile() -> HostLaunchProfileConfig {
     }
 }
 
+fn write_fake_codex_model_probe_program(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let binary = dir.path().join("fake-codex-model-probe.py");
+    let counter = dir.path().join("model-list-count");
+    let script = format!(
+        r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+COUNTER = {}
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    method = request.get("method")
+    if method == "initialize":
+        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
+    elif method == "model/list":
+        count = 0
+        if os.path.exists(COUNTER):
+            with open(COUNTER, "r", encoding="utf-8") as counter_file:
+                count = int(counter_file.read())
+        with open(COUNTER, "w", encoding="utf-8") as counter_file:
+            counter_file.write(str(count + 1))
+        if count == 0:
+            send({{
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {{"data": [{{"model": "gpt-5.5"}}]}}
+            }})
+        elif count == 1:
+            send({{
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {{"data": [{{"model": "gpt-5.6"}}]}}
+            }})
+        else:
+            send({{
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {{"code": -32000, "message": "model metadata unavailable"}}
+            }})
+"#,
+        serde_json::to_string(&counter.to_string_lossy()).expect("counter path JSON")
+    );
+    std::fs::write(&binary, script).expect("write fake Codex model probe");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&binary)
+            .expect("fake Codex model probe metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).expect("chmod fake Codex model probe");
+    }
+    binary
+}
+
 #[tokio::test]
 async fn connection_emits_one_host_bootstrap_without_old_initial_spam() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -851,6 +913,192 @@ async fn stable_reconnect_does_not_emit_unchanged_session_schemas_after_bootstra
         "stable reconnect duplicate schema replay",
     )
     .await;
+}
+
+#[tokio::test]
+async fn codex_session_schema_refresh_replaces_models_and_surfaces_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let settings_path = dir.path().join("settings.json");
+    let mut profile_settings = SessionSettingsValues::default();
+    profile_settings.0.insert(
+        "model".to_owned(),
+        SessionSettingValue::String("gpt-5.6".to_owned()),
+    );
+    write_host_settings_with_launch_profiles(
+        &settings_path,
+        &[BackendKind::Codex],
+        Some(BackendKind::Codex),
+        vec![HostLaunchProfileConfig {
+            id: LaunchProfileId("codex:gpt-5.6".to_owned()),
+            label: "Codex GPT-5.6".to_owned(),
+            description: None,
+            backend_kind: BackendKind::Codex,
+            session_settings: profile_settings,
+        }],
+    );
+    let fake_codex = write_fake_codex_model_probe_program(&dir);
+    let host = server::spawn_host_with_mock_backend_and_runtime_config(
+        dir.path().join("sessions.json"),
+        dir.path().join("projects.json"),
+        settings_path,
+        server::HostRuntimeConfig {
+            codex_probe_program: Some(fake_codex.to_string_lossy().into_owned()),
+            skip_real_backend_probe: true,
+            ..Default::default()
+        },
+    )
+    .expect("spawn host");
+    let mut client = connect_raw(host).await;
+
+    let bootstrap_env = next_env(&mut client, "Codex host bootstrap").await;
+    let bootstrap: HostBootstrapPayload = bootstrap_env
+        .parse_payload()
+        .expect("Codex HostBootstrap payload");
+    assert!(matches!(
+        bootstrap.session_schemas.as_slice(),
+        [protocol::SessionSchemaEntry::Pending {
+            backend_kind: BackendKind::Codex
+        }]
+    ));
+    assert!(matches!(
+        launch_profile_entry(&bootstrap.launch_profile_catalog, "codex:gpt-5.6"),
+        LaunchProfileEntry::Unavailable { message, .. } if message.contains("still loading")
+    ));
+
+    let first_schemas_env = next_kind(
+        &mut client,
+        FrameKind::SessionSchemas,
+        "initial Codex model schema",
+    )
+    .await;
+    let first_schemas: SessionSchemasPayload = first_schemas_env
+        .parse_payload()
+        .expect("initial Codex SessionSchemas");
+    let protocol::SessionSchemaEntry::Ready {
+        schema: first_schema,
+    } = &first_schemas.schemas[0]
+    else {
+        panic!("initial Codex schema should be ready: {first_schemas:?}");
+    };
+    let first_model_field = first_schema
+        .fields
+        .iter()
+        .find(|field| field.key == "model")
+        .expect("initial Codex model field");
+    let protocol::SessionSettingFieldType::Select {
+        options,
+        default,
+        nullable,
+    } = &first_model_field.field_type
+    else {
+        panic!("Codex model field should be a select");
+    };
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gpt-5.5"]
+    );
+    assert_eq!(default, &None, "Auto must remain the model default");
+    assert!(*nullable, "Auto must remain representable as null");
+
+    let first_catalog_env = next_kind(
+        &mut client,
+        FrameKind::LaunchProfileCatalogNotify,
+        "initial Codex launch profile catalog",
+    )
+    .await;
+    let first_catalog: LaunchProfileCatalogPayload = first_catalog_env
+        .parse_payload()
+        .expect("initial Codex LaunchProfileCatalog");
+    assert!(matches!(
+        launch_profile_entry(&first_catalog.catalog, "codex:gpt-5.6"),
+        LaunchProfileEntry::Unavailable { message, .. } if message.contains("invalid session setting 'model' value 'gpt-5.6'")
+    ));
+
+    client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Codex],
+            },
+        })
+        .await
+        .expect("refresh Codex session schema");
+
+    let refreshed_schemas_env = next_kind(
+        &mut client,
+        FrameKind::SessionSchemas,
+        "refreshed Codex model schema",
+    )
+    .await;
+    let refreshed_schemas: SessionSchemasPayload = refreshed_schemas_env
+        .parse_payload()
+        .expect("refreshed Codex SessionSchemas");
+    let protocol::SessionSchemaEntry::Ready {
+        schema: refreshed_schema,
+    } = &refreshed_schemas.schemas[0]
+    else {
+        panic!("refreshed Codex schema should be ready: {refreshed_schemas:?}");
+    };
+    let refreshed_model_field = refreshed_schema
+        .fields
+        .iter()
+        .find(|field| field.key == "model")
+        .expect("refreshed Codex model field");
+    let protocol::SessionSettingFieldType::Select { options, .. } =
+        &refreshed_model_field.field_type
+    else {
+        panic!("refreshed Codex model field should be a select");
+    };
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gpt-5.6"],
+        "refreshed metadata must replace the old process-lifetime model list"
+    );
+
+    let refreshed_catalog_env = next_kind(
+        &mut client,
+        FrameKind::LaunchProfileCatalogNotify,
+        "refreshed Codex launch profile catalog",
+    )
+    .await;
+    let refreshed_catalog: LaunchProfileCatalogPayload = refreshed_catalog_env
+        .parse_payload()
+        .expect("refreshed Codex LaunchProfileCatalog");
+    assert!(matches!(
+        launch_profile_entry(&refreshed_catalog.catalog, "codex:gpt-5.6"),
+        LaunchProfileEntry::Ready { .. }
+    ));
+
+    client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::EnabledBackends {
+                enabled_backends: vec![BackendKind::Codex],
+            },
+        })
+        .await
+        .expect("refresh failing Codex session schema");
+
+    let unavailable_schemas_env = next_kind(
+        &mut client,
+        FrameKind::SessionSchemas,
+        "unavailable Codex model schema",
+    )
+    .await;
+    let unavailable_schemas: SessionSchemasPayload = unavailable_schemas_env
+        .parse_payload()
+        .expect("unavailable Codex SessionSchemas");
+    assert!(matches!(
+        unavailable_schemas.schemas.as_slice(),
+        [protocol::SessionSchemaEntry::Unavailable {
+            backend_kind: BackendKind::Codex,
+            message,
+        }] if message.contains("model/list RPC failed") && message.contains("model metadata unavailable")
+    ));
 }
 
 #[tokio::test]

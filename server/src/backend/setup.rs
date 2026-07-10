@@ -11,7 +11,6 @@ use protocol::{
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
-use crate::backend::codex::discover_models;
 use crate::browse_stream::host_platform;
 use crate::process_env;
 
@@ -34,11 +33,9 @@ const HERMES_PYTHON_MODULE: &str = "tui_gateway.entry";
 
 pub(crate) async fn collect_backend_setup() -> BackendSetupPayload {
     let platform = host_platform();
-    // Probe every backend concurrently. Each probe spawns a real
-    // `<cli> --version` subprocess (capped at a 2s timeout) and the codex
-    // probe additionally runs model discovery, so running them sequentially
-    // made host startup wait for the *sum* of all probes. Joining them means
-    // we only wait for the slowest one.
+    // Probe every backend concurrently. Each probe spawns a real `<cli>
+    // --version` subprocess capped at a 2s timeout, so running them
+    // sequentially made host startup wait for the sum of all probes.
     let backends = futures_util::future::join_all(
         [
             BackendKind::Tycode,
@@ -153,10 +150,6 @@ async fn probe_backend(kind: BackendKind, platform: HostPlatform) -> BackendSetu
         BackendKind::Antigravity => probe_candidates(&antigravity_command_candidates()).await,
         BackendKind::Hermes => probe_hermes_gateway().await,
     };
-
-    if kind == BackendKind::Codex && probe.status == BackendSetupStatus::Installed {
-        discover_models().await;
-    }
 
     backend_setup_info_from_probe(kind, platform, probe)
 }

@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -51,11 +50,11 @@ const CODEX_UNRESTRICTED_SANDBOX: &str = "danger-full-access";
 const CODEX_READ_ONLY_SANDBOX: &str = "workspace-write";
 const CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS: bool = true;
 const CODEX_REASONING_SUMMARY_LEVEL: &str = "detailed";
-static DISCOVERED_MODELS: OnceLock<Vec<protocol::SelectOption>> = OnceLock::new();
 
 #[cfg(test)]
-static CODEX_TEST_APP_SERVER_BINARY: OnceLock<std::sync::Mutex<Option<std::path::PathBuf>>> =
-    OnceLock::new();
+static CODEX_TEST_APP_SERVER_BINARY: std::sync::OnceLock<
+    std::sync::Mutex<Option<std::path::PathBuf>>,
+> = std::sync::OnceLock::new();
 
 #[cfg(test)]
 fn codex_test_app_server_binary_override() -> &'static std::sync::Mutex<Option<std::path::PathBuf>>
@@ -522,23 +521,20 @@ pub async fn query_account_rate_limits(ssh_host: Option<&str>) -> Result<Value, 
     limits
 }
 
-pub async fn discover_models() {
-    if DISCOVERED_MODELS.get().is_some() {
-        return;
-    }
+pub(crate) async fn probe_session_settings_schema(
+    program: Option<&str>,
+) -> Result<SessionSettingsSchema, String> {
+    let (rpc, _inbound_rx) = CodexRpc::spawn_with_local_program(
+        None,
+        &[],
+        None,
+        BackendAccessMode::Unrestricted,
+        program,
+    )
+    .await
+    .map_err(|err| format!("Codex model discovery failed to spawn app-server: {err}"))?;
 
-    // `model/list` is a JSON-RPC method, not a CLI subcommand. Spawn a short-lived
-    // app-server session to call it, the same way query_account_rate_limits does.
-    let (rpc, _inbound_rx) =
-        match CodexRpc::spawn(None, &[], None, BackendAccessMode::Unrestricted).await {
-            Ok(pair) => pair,
-            Err(err) => {
-                tracing::warn!("Codex model discovery: failed to spawn app-server: {err}");
-                return;
-            }
-        };
-
-    let init_result = rpc
+    if let Err(err) = rpc
         .request(
             "initialize",
             json!({
@@ -546,40 +542,34 @@ pub async fn discover_models() {
                 "capabilities": { "experimentalApi": true }
             }),
         )
-        .await;
-    if let Err(err) = init_result {
-        tracing::warn!("Codex model discovery: initialize failed: {err}");
-        rpc.shutdown().await;
-        return;
+        .await
+    {
+        rpc.terminate().await;
+        return Err(format!("Codex model discovery initialize failed: {err}"));
     }
 
     let response = rpc
         .request("model/list", json!({ "includeHidden": false }))
         .await;
-    rpc.shutdown().await;
+    rpc.terminate().await;
 
-    let response = match response {
-        Ok(r) => r,
-        Err(err) => {
-            tracing::warn!("Codex model discovery: model/list RPC failed: {err}");
-            return;
-        }
-    };
+    let response =
+        response.map_err(|err| format!("Codex model discovery model/list RPC failed: {err}"))?;
 
     let raw_models = response
         .get("data")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            format!("Codex model discovery model/list response missing data array: {response}")
+        })?;
 
-    let models = codex_model_options_from_raw(&raw_models);
+    let models = codex_model_options_from_raw(raw_models);
 
     if models.is_empty() {
-        tracing::warn!("Codex model discovery: model/list returned no models");
-        return;
+        return Err("Codex model discovery model/list returned no usable models".to_string());
     }
 
-    let _ = DISCOVERED_MODELS.set(models);
+    Ok(codex_session_settings_schema(models))
 }
 
 fn codex_model_options_from_raw(raw_models: &[Value]) -> Vec<protocol::SelectOption> {
@@ -5363,6 +5353,23 @@ impl CodexRpc {
         steering_tempfile: Option<&std::path::Path>,
         access_mode: BackendAccessMode,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
+        Self::spawn_with_local_program(
+            ssh_host,
+            startup_mcp_servers,
+            steering_tempfile,
+            access_mode,
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_with_local_program(
+        ssh_host: Option<&str>,
+        startup_mcp_servers: &[StartupMcpServer],
+        steering_tempfile: Option<&std::path::Path>,
+        access_mode: BackendAccessMode,
+        local_program: Option<&str>,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
         let mut config_overrides = codex_mcp_config_overrides(startup_mcp_servers);
         if let Some(path) = steering_tempfile {
             config_overrides.push(format!(
@@ -5374,7 +5381,10 @@ impl CodexRpc {
             let remote_args = codex_app_server_args(access_mode, &config_overrides);
             crate::remote::spawn_remote_process(host, "codex", &remote_args, None).await?
         } else {
-            let mut cmd = codex_command();
+            let mut cmd = match local_program {
+                Some(program) => Command::new(program),
+                None => codex_command(),
+            };
             for arg in codex_app_server_args(access_mode, &config_overrides) {
                 cmd.arg(arg);
             }
@@ -5559,6 +5569,16 @@ impl CodexRpc {
         self.stderr_task.abort();
     }
 
+    async fn terminate(&self) {
+        let child = self.child.lock().await.take();
+        if let Some(mut child) = child {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        self.stdout_task.abort();
+        self.stderr_task.abort();
+    }
+
     /// Reap the app-server after it exited on its own (stdout EOF → `Closed`).
     ///
     /// Unlike claude (whose stdout reader calls `mark_process_exited`, which
@@ -5623,6 +5643,53 @@ pub struct CodexBackend {
 impl CodexBackend {
     pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
         let _ = self.subagent_emitter_tx.send(Some(emitter));
+    }
+}
+
+fn codex_session_settings_schema(model_options: Vec<SelectOption>) -> SessionSettingsSchema {
+    SessionSettingsSchema {
+        backend_kind: protocol::BackendKind::Codex,
+        fields: vec![
+            SessionSettingField {
+                key: "model".to_string(),
+                label: "Model".to_string(),
+                description: None,
+                use_slider: false,
+                field_type: SessionSettingFieldType::Select {
+                    options: model_options,
+                    default: None,
+                    nullable: true,
+                },
+            },
+            SessionSettingField {
+                key: "reasoning_effort".to_string(),
+                label: "Reasoning Effort".to_string(),
+                description: None,
+                use_slider: true,
+                field_type: SessionSettingFieldType::Select {
+                    options: vec![
+                        SelectOption {
+                            value: "low".to_string(),
+                            label: "Low".to_string(),
+                        },
+                        SelectOption {
+                            value: "medium".to_string(),
+                            label: "Medium".to_string(),
+                        },
+                        SelectOption {
+                            value: "high".to_string(),
+                            label: "High".to_string(),
+                        },
+                        SelectOption {
+                            value: "xhigh".to_string(),
+                            label: "XHigh".to_string(),
+                        },
+                    ],
+                    default: Some("xhigh".to_string()),
+                    nullable: true,
+                },
+            },
+        ],
     }
 }
 
@@ -6139,58 +6206,7 @@ fn codex_raw_event_message(value: &Value, default_message: &str) -> String {
 
 impl Backend for CodexBackend {
     fn session_settings_schema() -> SessionSettingsSchema {
-        SessionSettingsSchema {
-            backend_kind: protocol::BackendKind::Codex,
-            fields: vec![
-                SessionSettingField {
-                    key: "model".to_string(),
-                    label: "Model".to_string(),
-                    description: None,
-                    use_slider: false,
-                    field_type: SessionSettingFieldType::Select {
-                        options: match DISCOVERED_MODELS.get() {
-                            Some(models) => models.clone(),
-                            None => {
-                                tracing::warn!(
-                                    "Codex session settings schema requested before model discovery completed"
-                                );
-                                Vec::new()
-                            }
-                        },
-                        default: None,
-                        nullable: true,
-                    },
-                },
-                SessionSettingField {
-                    key: "reasoning_effort".to_string(),
-                    label: "Reasoning Effort".to_string(),
-                    description: None,
-                    use_slider: true,
-                    field_type: SessionSettingFieldType::Select {
-                        options: vec![
-                            SelectOption {
-                                value: "low".to_string(),
-                                label: "Low".to_string(),
-                            },
-                            SelectOption {
-                                value: "medium".to_string(),
-                                label: "Medium".to_string(),
-                            },
-                            SelectOption {
-                                value: "high".to_string(),
-                                label: "High".to_string(),
-                            },
-                            SelectOption {
-                                value: "xhigh".to_string(),
-                                label: "XHigh".to_string(),
-                            },
-                        ],
-                        default: Some("xhigh".to_string()),
-                        nullable: true,
-                    },
-                },
-            ],
-        }
+        codex_session_settings_schema(Vec::new())
     }
 
     async fn spawn(
@@ -8511,6 +8527,33 @@ for line in sys.stdin:
         assert_eq!(
             values,
             vec!["gpt-5.10", "gpt-5.10-mini", "gpt-5.9", "gpt-5"]
+        );
+    }
+
+    #[test]
+    fn codex_auto_model_remains_unset_in_dynamic_schema_and_spawn_settings() {
+        let schema = codex_session_settings_schema(vec![protocol::SelectOption {
+            value: "gpt-5.6".to_string(),
+            label: "gpt-5.6".to_string(),
+        }]);
+        let model_field = schema
+            .fields
+            .iter()
+            .find(|field| field.key == "model")
+            .expect("Codex model field");
+        let SessionSettingFieldType::Select {
+            default, nullable, ..
+        } = &model_field.field_type
+        else {
+            panic!("Codex model field should be a select");
+        };
+        assert_eq!(default, &None);
+        assert!(*nullable);
+
+        let resolved = resolve_session_settings(&BackendSpawnConfig::default());
+        assert!(
+            !resolved.0.contains_key("model"),
+            "Auto must omit the model override so Codex selects its effective model"
         );
     }
 

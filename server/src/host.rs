@@ -222,17 +222,15 @@ pub struct HostRuntimeConfig {
     pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub workflow_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub antigravity_conversations_dir: Option<PathBuf>,
+    pub codex_probe_program: Option<String>,
     pub kiro_probe_program: Option<String>,
     pub kiro_probe_workspace_root: Option<PathBuf>,
     pub mobile_pairing_ttl: Option<std::time::Duration>,
     pub mobile_managed_service_base_url: Option<String>,
-    /// Skip probing the real backend CLIs (`<cli> --version`, codex model
-    /// discovery, etc.) when collecting backend setup. Each probe spawns a
-    /// real subprocess and codex discovery makes a network RPC, costing
-    /// several seconds per host spawn — fine once at app startup, but ruinous
-    /// in the test suite where every fixture spawns a host. Tests set this so
-    /// `collect_backend_setup` returns an empty stub instantly. Defaults to
-    /// `false` so production startup is unaffected.
+    /// Skip probing real backend CLIs and Codex model metadata. Tests set this
+    /// so backend setup returns an empty stub and Codex's dynamic session
+    /// schema becomes explicitly unavailable unless `codex_probe_program` is
+    /// supplied. Defaults to `false` so production startup is unaffected.
     pub skip_real_backend_probe: bool,
     pub agents_view_preferences_primary: bool,
 }
@@ -245,6 +243,7 @@ impl Default for HostRuntimeConfig {
             review_mcp_bind_addr: None,
             workflow_mcp_bind_addr: None,
             antigravity_conversations_dir: None,
+            codex_probe_program: None,
             kiro_probe_program: None,
             kiro_probe_workspace_root: None,
             mobile_pairing_ttl: None,
@@ -373,6 +372,13 @@ enum KiroSessionSchemaState {
 }
 
 #[derive(Clone, Debug)]
+enum CodexSessionSchemaState {
+    Pending,
+    Ready(SessionSettingsSchema),
+    Unavailable(String),
+}
+
+#[derive(Clone, Debug)]
 enum HermesSessionSchemaState {
     Pending,
     Ready(SessionSettingsSchema),
@@ -408,11 +414,13 @@ pub(crate) struct HostState {
     pub workflow_locations: Vec<WorkflowCatalogLocation>,
     pub workflow_run_store: WorkflowRunStore,
     pub mobile_access: MobileAccessHandle,
+    codex_session_schema: CodexSessionSchemaState,
     kiro_session_schema: KiroSessionSchemaState,
     hermes_session_schema: HermesSessionSchemaState,
     backend_config_snapshots: Vec<BackendConfigSnapshot>,
     backend_native_settings_snapshots: Vec<BackendNativeSettingsSnapshot>,
     antigravity_conversations_dir: PathBuf,
+    codex_probe_program: Option<String>,
     kiro_probe_program: Option<String>,
     kiro_probe_workspace_root: Option<PathBuf>,
     skip_real_backend_probe: bool,
@@ -5320,6 +5328,7 @@ impl HostHandle {
     pub(crate) async fn refresh_session_schemas(&self) {
         let (
             settings_store,
+            codex_probe_program,
             kiro_probe_program,
             configured_kiro_probe_workspace_root,
             skip_real_backend_probe,
@@ -5336,10 +5345,12 @@ impl HostHandle {
                     None
                 }
             };
+            state.codex_session_schema = CodexSessionSchemaState::Pending;
             state.kiro_session_schema = KiroSessionSchemaState::Pending;
             state.hermes_session_schema = HermesSessionSchemaState::Pending;
             (
                 Arc::clone(&state.settings_store),
+                state.codex_probe_program.clone(),
                 state.kiro_probe_program.clone(),
                 state.kiro_probe_workspace_root.clone(),
                 state.skip_real_backend_probe,
@@ -5352,6 +5363,29 @@ impl HostHandle {
             .get()
             .unwrap_or_else(|err| panic!("failed to load host settings for session schemas: {err}"))
             .enabled_backends;
+
+        let codex_session_schema = if enabled_backends.contains(&protocol::BackendKind::Codex) {
+            if skip_real_backend_probe && codex_probe_program.is_none() {
+                CodexSessionSchemaState::Unavailable(
+                    "Codex model discovery is unavailable because backend probing is disabled"
+                        .to_string(),
+                )
+            } else {
+                match crate::backend::codex::probe_session_settings_schema(
+                    codex_probe_program.as_deref(),
+                )
+                .await
+                {
+                    Ok(schema) => CodexSessionSchemaState::Ready(schema),
+                    Err(err) => {
+                        tracing::error!("failed to refresh Codex session schema: {err}");
+                        CodexSessionSchemaState::Unavailable(err)
+                    }
+                }
+            }
+        } else {
+            CodexSessionSchemaState::Pending
+        };
 
         let kiro_session_schema = if enabled_backends.contains(&protocol::BackendKind::Kiro) {
             match kiro_probe_workspace_root(configured_kiro_probe_workspace_root.as_deref()) {
@@ -5416,6 +5450,7 @@ impl HostHandle {
         };
 
         let mut state = self.state.lock().await;
+        state.codex_session_schema = codex_session_schema;
         state.kiro_session_schema = kiro_session_schema;
         state.hermes_session_schema = hermes_session_schema;
         fan_out_session_schemas(&mut state).await;
@@ -9752,11 +9787,13 @@ fn spawn_host_inner(
             workflow_locations,
             workflow_run_store,
             mobile_access: mobile_access.clone(),
+            codex_session_schema: CodexSessionSchemaState::Pending,
             kiro_session_schema: KiroSessionSchemaState::Pending,
             hermes_session_schema: HermesSessionSchemaState::Pending,
             backend_config_snapshots: Vec::new(),
             backend_native_settings_snapshots: Vec::new(),
             antigravity_conversations_dir,
+            codex_probe_program: runtime_config.codex_probe_program.clone(),
             kiro_probe_program: runtime_config.kiro_probe_program.clone(),
             kiro_probe_workspace_root: runtime_config.kiro_probe_workspace_root.clone(),
             skip_real_backend_probe: runtime_config.skip_real_backend_probe,
@@ -13181,6 +13218,10 @@ fn session_schema_for_backend(
     backend_kind: protocol::BackendKind,
 ) -> Option<SessionSettingsSchema> {
     match backend_kind {
+        protocol::BackendKind::Codex => match &state.codex_session_schema {
+            CodexSessionSchemaState::Ready(schema) => Some(schema.clone()),
+            CodexSessionSchemaState::Pending | CodexSessionSchemaState::Unavailable(_) => None,
+        },
         protocol::BackendKind::Kiro => match &state.kiro_session_schema {
             KiroSessionSchemaState::Ready(schema) => Some(schema.clone()),
             KiroSessionSchemaState::Pending | KiroSessionSchemaState::Unavailable(_) => None,
@@ -13266,7 +13307,7 @@ fn sanitize_stored_session_settings(
 fn backend_has_dynamic_session_schema(backend_kind: protocol::BackendKind) -> bool {
     matches!(
         backend_kind,
-        protocol::BackendKind::Kiro | protocol::BackendKind::Hermes
+        protocol::BackendKind::Kiro | protocol::BackendKind::Codex | protocol::BackendKind::Hermes
     )
 }
 
@@ -13275,6 +13316,16 @@ fn session_schema_entry_for_backend(
     backend_kind: protocol::BackendKind,
 ) -> SessionSchemaEntry {
     match backend_kind {
+        protocol::BackendKind::Codex => match &state.codex_session_schema {
+            CodexSessionSchemaState::Ready(schema) => SessionSchemaEntry::Ready {
+                schema: schema.clone(),
+            },
+            CodexSessionSchemaState::Pending => SessionSchemaEntry::Pending { backend_kind },
+            CodexSessionSchemaState::Unavailable(message) => SessionSchemaEntry::Unavailable {
+                backend_kind,
+                message: message.clone(),
+            },
+        },
         protocol::BackendKind::Kiro => match &state.kiro_session_schema {
             KiroSessionSchemaState::Ready(schema) => SessionSchemaEntry::Ready {
                 schema: schema.clone(),
