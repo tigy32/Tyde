@@ -30,6 +30,10 @@ pub fn PairingFlow(screen: PairingScreen) -> impl IntoView {
             <ServiceAuthScreen qr_uri=qr_uri host_label=host_label initial_auth=auth />
         }
         .into_any(),
+        PairingScreen::ServiceAuthStatus { auth } => view! {
+            <ServiceAuthStatusScreen initial_auth=auth />
+        }
+        .into_any(),
         PairingScreen::RepairRequired { message } => view! {
             <RepairRequiredScreen message=message />
         }
@@ -349,8 +353,14 @@ fn ServiceAuthScreen(
         let qr_uri = qr_for_run.clone();
         let state = state_for_run.clone();
         spawn_local(async move {
-            let authenticated = bridge::authenticate_managed(&qr_uri).await;
-            auth.set(authenticated.clone());
+            let authenticated = match auth.get_untracked() {
+                authenticated @ MobileServiceAuthState::Authenticated { .. } => authenticated,
+                _ => {
+                    let authenticated = bridge::authenticate_managed(&qr_uri).await;
+                    auth.set(authenticated.clone());
+                    authenticated
+                }
+            };
             if !matches!(authenticated, MobileServiceAuthState::Authenticated { .. }) {
                 busy.set(false);
                 return;
@@ -385,7 +395,14 @@ fn ServiceAuthScreen(
             return;
         }
         started.set(true);
-        run.run(());
+        if matches!(
+            auth.get_untracked(),
+            MobileServiceAuthState::Idle
+                | MobileServiceAuthState::Authenticating
+                | MobileServiceAuthState::Authenticated { .. }
+        ) {
+            run.run(());
+        }
     });
 
     // Not-signed-in state: navigate to the tycode.dev-hosted Tyggs OAuth start,
@@ -416,6 +433,61 @@ fn ServiceAuthScreen(
                         auth=auth.get()
                         busy=busy.get()
                         on_retry=run
+                        on_sign_in=on_sign_in
+                    />
+                }}
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn ServiceAuthStatusScreen(initial_auth: MobileServiceAuthState) -> impl IntoView {
+    let state = use_context::<AppState>().expect("AppState context");
+    let auth = RwSignal::new(initial_auth);
+    let busy = RwSignal::new(false);
+
+    let state_for_retry = state.clone();
+    let on_retry = Callback::new(move |_: ()| {
+        if busy.get_untracked() {
+            return;
+        }
+        busy.set(true);
+        let state = state_for_retry.clone();
+        spawn_local(async move {
+            let next = bridge::probe_managed_auth().await;
+            if matches!(next, MobileServiceAuthState::Authenticated { .. }) {
+                state.app_mode.set(AppMode::Workspace);
+            } else {
+                auth.set(next);
+                busy.set(false);
+            }
+        });
+    });
+
+    let on_sign_in = Callback::new(move |provider: AuthProvider| {
+        if let Err(error) = bridge::begin_tyggs_sign_in(provider, None) {
+            log::error!("failed to restart Tyggs sign-in: {error}");
+        }
+    });
+    let state_for_cancel = state.clone();
+
+    view! {
+        <div class="view pairing-view">
+            <div class="view-header">
+                <h1 class="view-title">"Tyggs mobile access"</h1>
+                <button
+                    class="header-action"
+                    data-mobile-test="boot-service-auth-cancel"
+                    on:click=move |_| state_for_cancel.app_mode.set(AppMode::Workspace)
+                >"Cancel"</button>
+            </div>
+            <div class="view-body">
+                {move || view! {
+                    <ServiceAuthCard
+                        auth=auth.get()
+                        busy=busy.get()
+                        on_retry=on_retry
                         on_sign_in=on_sign_in
                     />
                 }}
@@ -903,6 +975,81 @@ mod wasm_tests {
                 .is_none(),
             "a non-retryable service_unavailable must not offer a futile retry"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn boot_auth_status_preserves_paywall_and_retry_actions_without_qr() {
+        let paywall = make_container();
+        let _paywall_handle = mount_to(paywall.clone(), move || {
+            let state = AppState::new();
+            provide_context(state);
+            view! {
+                <PairingFlow screen=PairingScreen::ServiceAuthStatus {
+                    auth: MobileServiceAuthState::PassRequired {
+                        message: "A Tyggs Pass is required.".to_owned(),
+                        paywall_url: "https://tyggs.com/pass/checkout".to_owned(),
+                    },
+                } />
+            }
+        });
+        next_tick().await;
+
+        let link = paywall
+            .query_selector("[data-mobile-test='pairing-paywall-link']")
+            .unwrap()
+            .expect("boot pass_required must keep its paywall action");
+        assert_eq!(
+            link.get_attribute("href").as_deref(),
+            Some("https://tyggs.com/pass/checkout")
+        );
+
+        set_service_config(r#"{"stubAuth":"authenticated"}"#);
+        let unavailable = make_container();
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let state_for_mount = state_handle.clone();
+        let _unavailable_handle = mount_to(unavailable.clone(), move || {
+            let state = AppState::new();
+            *state_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <PairingFlow screen=PairingScreen::ServiceAuthStatus {
+                    auth: MobileServiceAuthState::ServiceUnavailable {
+                        message: "Try again shortly.".to_owned(),
+                        retryable: true,
+                    },
+                } />
+            }
+        });
+        next_tick().await;
+
+        assert!(
+            unavailable
+                .query_selector("[data-mobile-test='pairing-service-retry']")
+                .unwrap()
+                .is_some(),
+            "retryable boot service failure must keep its retry action"
+        );
+        let retry: HtmlElement = unavailable
+            .query_selector("[data-mobile-test='pairing-service-retry']")
+            .unwrap()
+            .expect("retry action")
+            .dyn_into()
+            .unwrap();
+        retry.click();
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(
+            state_handle
+                .borrow()
+                .as_ref()
+                .expect("captured state")
+                .app_mode
+                .get_untracked(),
+            AppMode::Workspace,
+            "successful no-QR retry should leave auth status without redeeming"
+        );
+        set_service_config("");
     }
 
     /// The repair-required screen explains the failure and offers a re-scan —

@@ -27,7 +27,11 @@ use super::UnlistenHandle;
 use store::{IndexedDbHostStore, IndexedDbPskStore, PskStore, WebPairedHostRecord};
 
 pub use qr::{ensure_camera_permission, scan_qr};
-pub use service::{AuthProvider, RedeemOutcome, authenticate as authenticate_managed};
+pub use service::{
+    AuthProvider, RedeemOutcome, authenticate as authenticate_managed,
+    complete_boot_auth_callback as complete_boot_managed_auth_callback,
+    probe_auth as probe_managed_auth,
+};
 
 // ── Paired-host queries ───────────────────────────────────────────────────
 

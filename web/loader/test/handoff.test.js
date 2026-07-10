@@ -60,6 +60,8 @@ const {
   takeRepairVersion,
   REPAIR_VERSION_KEY,
   resolvePairingFragment,
+  isPairingUrlFragment,
+  capturePairingFragmentFromUrl,
 } = await import("../loader.js");
 const { REAL_WITH_PRERELEASE, REAL_MANAGED_V2, EXAMPLE_MANIFEST, makePairingUri } =
   await import("./fixtures.js");
@@ -363,4 +365,134 @@ test("handlePairingUri consumes the pending fragment on commit", async () => {
     undefined,
     "committing a URI clears the pending recovery copy (no stale replay)",
   );
+});
+
+// --- OAuth auth-loop fix: scrub ONLY pairing fragments -----------------------
+//
+// Tyggs redirects mobile web OAuth back to
+// `…/tyde/?oauth=success&provider=…&code=oauth_handoff#handoffCode=<64-hex>`.
+// The booted wasm app consumes/strips both the query params and the hash; the
+// loader must not destroy them first. Only fragments carrying a `tyde-pair://`
+// pairing URI hold the PSK no-leak invariant and get scrubbed.
+
+const HANDOFF_HASH = "#handoffCode=" + "ab12".repeat(16); // 64-hex handoff code
+const OAUTH_SEARCH = "?oauth=success&provider=google&code=oauth_handoff";
+
+function fakeLocation(hash, search = "") {
+  return { hash, pathname: "/tyde/", search };
+}
+
+function fakeHistory(calls) {
+  return {
+    replaceState: (...args) => {
+      calls.push(args);
+    },
+  };
+}
+
+test("isPairingUrlFragment: pairing fragments are scrub candidates", () => {
+  assert.equal(isPairingUrlFragment(`#${REAL_WITH_PRERELEASE}`), true);
+  assert.equal(isPairingUrlFragment(`#${REAL_MANAGED_V2}`), true);
+  // Percent-encoded pairing fragments (some cameras/links encode them).
+  assert.equal(
+    isPairingUrlFragment(`#${encodeURIComponent(REAL_WITH_PRERELEASE)}`),
+    true,
+  );
+  // Malformed-but-embedded pairing URIs may still carry secrets → scrub.
+  assert.equal(isPairingUrlFragment("#x=1&tyde-pair://v1?truncated"), true);
+});
+
+test("isPairingUrlFragment: OAuth handoff and unrelated fragments are preserved", () => {
+  assert.equal(isPairingUrlFragment(HANDOFF_HASH), false);
+  assert.equal(isPairingUrlFragment("#section-2"), false);
+  assert.equal(isPairingUrlFragment(""), false);
+  assert.equal(isPairingUrlFragment(undefined), false);
+  assert.equal(isPairingUrlFragment(null), false);
+});
+
+test("capturePairingFragmentFromUrl scrubs a pairing hash, preserving path + query", () => {
+  delete sessionStore[PENDING_FRAGMENT_KEY];
+  const calls = [];
+  const fragment = capturePairingFragmentFromUrl(
+    fakeLocation(`#${REAL_WITH_PRERELEASE}`, "?utm=x"),
+    fakeHistory(calls),
+  );
+  assert.equal(fragment, REAL_WITH_PRERELEASE, "pairing fragment captured");
+  assert.equal(calls.length, 1, "pairing hash is scrubbed exactly once");
+  assert.deepEqual(calls[0], [null, "", "/tyde/?utm=x"], "path and query survive");
+  assert.equal(
+    sessionStore[PENDING_FRAGMENT_KEY],
+    REAL_WITH_PRERELEASE,
+    "captured fragment mirrored for retry recovery, as before",
+  );
+  delete sessionStore[PENDING_FRAGMENT_KEY];
+});
+
+test("capturePairingFragmentFromUrl leaves the OAuth handoff hash for the wasm app", () => {
+  delete sessionStore[PENDING_FRAGMENT_KEY];
+  const calls = [];
+  const fragment = capturePairingFragmentFromUrl(
+    fakeLocation(HANDOFF_HASH, OAUTH_SEARCH),
+    fakeHistory(calls),
+  );
+  assert.equal(fragment, null, "handoff fragment is not a pairing capture");
+  assert.equal(
+    calls.length,
+    0,
+    "URL untouched: #handoffCode AND the oauth query params stay for the app",
+  );
+  assert.equal(sessionStore[PENDING_FRAGMENT_KEY], undefined, "nothing stashed");
+});
+
+test("pending pairing recovery never strips an OAuth hash", () => {
+  // A stale pending pairing fragment exists (earlier pre-commit failure) when
+  // the OAuth redirect lands. Recovery may still return the stash, but the
+  // scrub decision reads only the LIVE hash — the handoff fragment survives.
+  sessionStore[PENDING_FRAGMENT_KEY] = REAL_WITH_PRERELEASE;
+  const calls = [];
+  const fragment = capturePairingFragmentFromUrl(
+    fakeLocation(HANDOFF_HASH, OAUTH_SEARCH),
+    fakeHistory(calls),
+  );
+  assert.equal(fragment, REAL_WITH_PRERELEASE, "recovery still works");
+  assert.equal(calls.length, 0, "OAuth hash is NOT stripped by recovery");
+  delete sessionStore[PENDING_FRAGMENT_KEY];
+});
+
+test("capturePairingFragmentFromUrl leaves unrelated anchors alone", () => {
+  delete sessionStore[PENDING_FRAGMENT_KEY];
+  const calls = [];
+  const fragment = capturePairingFragmentFromUrl(
+    fakeLocation("#section-2"),
+    fakeHistory(calls),
+  );
+  assert.equal(fragment, null);
+  assert.equal(calls.length, 0, "non-pairing fragments are not destroyed");
+});
+
+test("capturePairingFragmentFromUrl does nothing on a clean load", () => {
+  delete sessionStore[PENDING_FRAGMENT_KEY];
+  const calls = [];
+  const fragment = capturePairingFragmentFromUrl(
+    fakeLocation(""),
+    fakeHistory(calls),
+  );
+  assert.equal(fragment, null);
+  assert.equal(calls.length, 0, "no history rewrite on a clean load");
+});
+
+test("resolvePairingFragment normalizes a percent-encoded pairing fragment", () => {
+  delete sessionStore[PENDING_FRAGMENT_KEY];
+  const result = resolvePairingFragment(
+    `#${encodeURIComponent(REAL_WITH_PRERELEASE)}`,
+  );
+  assert.equal(result, REAL_WITH_PRERELEASE, "decoded to the inner tyde-pair URI");
+  assert.equal(sessionStore[PENDING_FRAGMENT_KEY], REAL_WITH_PRERELEASE);
+  delete sessionStore[PENDING_FRAGMENT_KEY];
+});
+
+test("resolvePairingFragment does not capture or stash an OAuth handoff hash", () => {
+  delete sessionStore[PENDING_FRAGMENT_KEY];
+  assert.equal(resolvePairingFragment(HANDOFF_HASH), null);
+  assert.equal(sessionStore[PENDING_FRAGMENT_KEY], undefined);
 });

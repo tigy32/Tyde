@@ -56,6 +56,7 @@ esac
 
 require_command python3 "Install Python 3 and rerun release-check."
 require_command cargo "Install Rust/Cargo and rerun release-check."
+require_command cargo-nextest "Install it with: cargo install cargo-nextest --locked"
 require_command rustup "Install rustup or add the wasm32-unknown-unknown target in this Rust toolchain."
 require_command node "Install Node.js and rerun release-check."
 require_command trunk "Install it with: cargo install trunk"
@@ -81,8 +82,8 @@ cargo check --all-targets
 log "Running cargo clippy --all-targets -- -D warnings"
 cargo clippy --all-targets -- -D warnings
 
-log "Running cargo test"
-cargo test
+log "Running cargo nextest run"
+cargo nextest run
 
 log "Running tools/run-wasm-tests.sh"
 tools/run-wasm-tests.sh

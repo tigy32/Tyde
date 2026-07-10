@@ -124,42 +124,86 @@ fn install_app_mode_effect(state: AppState) {
     });
 }
 
-/// Completes a first-time pairing initiated from the PWA loader. The loader
-/// scans/pastes the QR, stashes the raw `tyde-pair://…` URI in sessionStorage,
-/// and boots this bundle; here we consume that URI, run the AUTHORITATIVE parse
-/// (`preview_pairing_uri`), and drop the user on the pairing Confirm screen so
-/// one tap finishes the handshake. The loader never makes pairing decisions —
-/// it only routes us here — so a forged/invalid stash is rejected by the parse
-/// and the app simply falls back to its normal onboarding flow. No-op on native
-/// shells (the bridge returns `None`).
+/// Completes PWA loader pairing/auth handoffs at boot. A stashed QR is consumed
+/// and authoritatively classified here; when OAuth returns with a callback, its
+/// one-time handoff is completed before the pairing screen mounts. A failed
+/// callback only short-circuits to the `Failed` screen when there is NO pending
+/// QR: with a still-valid pending managed QR the `AuthFailed` state rides into
+/// the `ServiceAuth` screen instead, where `ServiceAuthCard` renders the
+/// sign-in buttons so the user can retry with one tap rather than re-scanning.
+/// If Safari lost the sessionStorage QR, the callback is still completed and
+/// the signed-in app stays on its normal onboarding/host-picker screen for a
+/// fresh scan. Invalid stashed QRs are rejected rather than trusted as loader
+/// decisions.
 fn spawn_boot_pairing_handoff(state: AppState) {
-    let Some(qr_uri) = bridge::take_pending_pairing_uri() else {
-        return;
-    };
+    let pending_qr_uri = bridge::take_pending_pairing_uri();
     spawn_local(async move {
-        match bridge::classify_pairing_offer(&qr_uri).await {
-            Ok(offer) => {
-                let screen = match offer {
-                    PairingOffer::ManagedService { host_label } => PairingScreen::ServiceAuth {
-                        qr_uri,
-                        host_label,
-                        auth: MobileServiceAuthState::Idle,
-                    },
-                    PairingOffer::RepairRequired { message } => {
-                        PairingScreen::RepairRequired { message }
+        let callback_auth = bridge::complete_boot_managed_auth_callback().await;
+        match pending_qr_uri {
+            Some(qr_uri) => match bridge::classify_pairing_offer(&qr_uri).await {
+                Ok(offer) => {
+                    let screen = boot_pairing_screen(qr_uri, offer, callback_auth);
+                    state.app_mode.set(AppMode::Pairing(screen));
+                }
+                Err(error) => {
+                    // Forged or stale handoff: drop the QR, but still surface the
+                    // auth callback outcome exactly as if no QR were pending.
+                    log::warn!("ignoring loader pairing handoff: {error}");
+                    if let Some(auth) = callback_auth {
+                        apply_boot_auth_without_pending(&state, auth);
                     }
-                    PairingOffer::DirectPairing { preview } => {
-                        PairingScreen::Confirm { qr_uri, preview }
-                    }
-                };
-                state.app_mode.set(AppMode::Pairing(screen));
-            }
-            Err(error) => {
-                // Forged or stale handoff: ignore and stay in the normal flow.
-                log::warn!("ignoring loader pairing handoff: {error}");
+                }
+            },
+            None => {
+                if let Some(auth) = callback_auth {
+                    apply_boot_auth_without_pending(&state, auth);
+                }
             }
         }
     });
+}
+
+/// Routes a boot-time pending QR onto its pairing screen. The managed arm keeps
+/// whatever terminal auth state the OAuth callback produced — including
+/// `AuthFailed` — so the QR is not discarded and `ServiceAuthCard` can offer
+/// sign-in/retry for it directly. Direct-pairing and repair offers don't involve
+/// Tyggs auth, so the callback state is irrelevant to their screens.
+fn boot_pairing_screen(
+    qr_uri: String,
+    offer: PairingOffer,
+    callback_auth: Option<MobileServiceAuthState>,
+) -> PairingScreen {
+    match offer {
+        PairingOffer::ManagedService { host_label } => PairingScreen::ServiceAuth {
+            qr_uri,
+            host_label,
+            auth: callback_auth.unwrap_or(MobileServiceAuthState::Idle),
+        },
+        PairingOffer::RepairRequired { message } => PairingScreen::RepairRequired { message },
+        PairingOffer::DirectPairing { preview } => PairingScreen::Confirm { qr_uri, preview },
+    }
+}
+
+fn apply_boot_auth_without_pending(state: &AppState, auth: MobileServiceAuthState) {
+    match auth {
+        MobileServiceAuthState::Authenticated { .. } => {
+            log::info!("completed Tyggs sign-in; scan a pairing QR to continue");
+        }
+        MobileServiceAuthState::AuthFailed { message } => {
+            state
+                .app_mode
+                .set(AppMode::Pairing(PairingScreen::Failed { message }));
+        }
+        auth @ (MobileServiceAuthState::PassRequired { .. }
+        | MobileServiceAuthState::ServiceUnavailable { .. }) => {
+            state
+                .app_mode
+                .set(AppMode::Pairing(PairingScreen::ServiceAuthStatus { auth }));
+        }
+        MobileServiceAuthState::Idle | MobileServiceAuthState::Authenticating => {
+            log::warn!("Tyggs OAuth callback did not produce a terminal auth state");
+        }
+    }
 }
 
 fn spawn_initial_paired_hosts_load(state: AppState) {
@@ -1644,6 +1688,111 @@ mod wasm_tests {
             state.mobile_shell_error.get_untracked().is_none(),
             "stale line must be dropped before parse/protocol validation"
         );
+    }
+
+    /// A boot `AuthFailed` callback must not discard a still-valid pending
+    /// managed QR: it rides into the `ServiceAuth` screen so `ServiceAuthCard`
+    /// renders the sign-in buttons and one tap retries — no re-scan.
+    #[wasm_bindgen_test]
+    fn boot_auth_failed_with_pending_managed_qr_keeps_service_auth_screen() {
+        let screen = boot_pairing_screen(
+            "tyde-pair://v2?offer".to_owned(),
+            PairingOffer::ManagedService {
+                host_label: "Mike's MacBook Pro".to_owned(),
+            },
+            Some(MobileServiceAuthState::AuthFailed {
+                message: "Tyggs sign-in failed: oauth_no_linked_account".to_owned(),
+            }),
+        );
+        match screen {
+            PairingScreen::ServiceAuth {
+                qr_uri,
+                host_label,
+                auth: MobileServiceAuthState::AuthFailed { message },
+            } => {
+                assert_eq!(
+                    qr_uri, "tyde-pair://v2?offer",
+                    "the pending QR must be kept"
+                );
+                assert_eq!(host_label, "Mike's MacBook Pro");
+                assert!(message.contains("oauth_no_linked_account"), "{message}");
+            }
+            other => panic!("expected ServiceAuth carrying AuthFailed, got {other:?}"),
+        }
+
+        // Without a callback the managed arm starts from Idle, as before.
+        let screen = boot_pairing_screen(
+            "tyde-pair://v2?offer".to_owned(),
+            PairingOffer::ManagedService {
+                host_label: "Mike's MacBook Pro".to_owned(),
+            },
+            None,
+        );
+        assert!(matches!(
+            screen,
+            PairingScreen::ServiceAuth {
+                auth: MobileServiceAuthState::Idle,
+                ..
+            }
+        ));
+    }
+
+    #[wasm_bindgen_test]
+    fn boot_handoff_without_pending_qr_keeps_success_out_of_sign_in_flow() {
+        let state = AppState::new();
+        apply_boot_auth_without_pending(
+            &state,
+            MobileServiceAuthState::Authenticated { expires_at_ms: 42 },
+        );
+
+        assert_eq!(
+            state.app_mode.get_untracked(),
+            AppMode::Onboarding,
+            "successful boot auth must return to onboarding rather than another sign-in screen"
+        );
+
+        apply_boot_auth_without_pending(
+            &state,
+            MobileServiceAuthState::AuthFailed {
+                message: "Tyggs sign-in failed: oauth_no_linked_account".to_owned(),
+            },
+        );
+        assert!(matches!(
+            state.app_mode.get_untracked(),
+            AppMode::Pairing(PairingScreen::Failed { message })
+                if message.contains("oauth_no_linked_account")
+        ));
+
+        apply_boot_auth_without_pending(
+            &state,
+            MobileServiceAuthState::PassRequired {
+                message: "A Tyggs Pass is required.".to_owned(),
+                paywall_url: "https://tyggs.com/pass/checkout".to_owned(),
+            },
+        );
+        assert!(matches!(
+            state.app_mode.get_untracked(),
+            AppMode::Pairing(PairingScreen::ServiceAuthStatus {
+                auth: MobileServiceAuthState::PassRequired { paywall_url, .. },
+            }) if paywall_url == "https://tyggs.com/pass/checkout"
+        ));
+
+        apply_boot_auth_without_pending(
+            &state,
+            MobileServiceAuthState::ServiceUnavailable {
+                message: "Try again shortly.".to_owned(),
+                retryable: true,
+            },
+        );
+        assert!(matches!(
+            state.app_mode.get_untracked(),
+            AppMode::Pairing(PairingScreen::ServiceAuthStatus {
+                auth: MobileServiceAuthState::ServiceUnavailable {
+                    retryable: true,
+                    ..
+                },
+            })
+        ));
     }
 
     /// Empty `paired_hosts` → onboarding screen. Adding a host while

@@ -354,44 +354,23 @@ fn backend_label(backend_kind: BackendKind) -> &'static str {
 struct AntigravityConversationDbGuard {
     path: PathBuf,
     remove_file: bool,
-    created_dirs: Vec<PathBuf>,
 }
 
 impl AntigravityConversationDbGuard {
-    fn create(session_id: &SessionId) -> Self {
-        let home = PathBuf::from(std::env::var("HOME").expect("HOME must be set"));
-        let dirs = [
-            home.join(".gemini"),
-            home.join(".gemini").join("antigravity-cli"),
-            home.join(".gemini")
-                .join("antigravity-cli")
-                .join("conversations"),
-        ];
-        let mut created_dirs = Vec::new();
-        for dir in dirs {
-            if !dir.exists() {
-                std::fs::create_dir(&dir).unwrap_or_else(|err| {
-                    panic!("failed to create fake Antigravity db dir {dir:?}: {err}")
-                });
-                created_dirs.push(dir);
-            }
-        }
-        let path = home
-            .join(".gemini")
-            .join("antigravity-cli")
-            .join("conversations")
-            .join(format!("{}.db", session_id.0));
+    fn create(conversations_dir: &Path, session_id: &SessionId) -> Self {
+        std::fs::create_dir_all(conversations_dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to create fake Antigravity conversations dir {conversations_dir:?}: {err}"
+            )
+        });
+        let path = conversations_dir.join(format!("{}.db", session_id.0));
         let remove_file = !path.exists();
         if remove_file {
             std::fs::write(&path, b"test conversation db").unwrap_or_else(|err| {
                 panic!("failed to create fake Antigravity conversation db {path:?}: {err}")
             });
         }
-        Self {
-            path,
-            remove_file,
-            created_dirs,
-        }
+        Self { path, remove_file }
     }
 }
 
@@ -399,9 +378,6 @@ impl Drop for AntigravityConversationDbGuard {
     fn drop(&mut self) {
         if self.remove_file {
             let _ = std::fs::remove_file(&self.path);
-        }
-        for dir in self.created_dirs.iter().rev() {
-            let _ = std::fs::remove_dir(dir);
         }
     }
 }
@@ -529,6 +505,7 @@ fn write_fake_kiro_probe_program(dir: &tempfile::TempDir) -> PathBuf {
         &path,
         r#"#!/bin/sh
 set -eu
+printf '%s\n' "$PWD" > "$(dirname "$0")/probe-cwd"
 IFS= read -r _ || exit 1
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
 IFS= read -r _ || exit 1
@@ -1200,7 +1177,10 @@ async fn antigravity_native_uuid_session_remains_resumable_after_close() {
     );
 
     set_stored_session_resumable(fixture.store_dir(), &session_id, false);
-    let _db_guard = AntigravityConversationDbGuard::create(&session_id);
+    let _db_guard = AntigravityConversationDbGuard::create(
+        fixture.antigravity_conversations_dir(),
+        &session_id,
+    );
     let mut session = None;
     for _ in 0..3 {
         fixture
@@ -1315,6 +1295,17 @@ async fn antigravity_native_uuid_session_remains_resumable_after_close() {
         session.resumable,
         "Antigravity native UUID sessions with a backing AGY db should remain resumable after close"
     );
+
+    let (_fresh_client, fresh_bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let restarted_session = fresh_bootstrap
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .expect("persisted Antigravity session after fresh host restart");
+    assert!(
+        restarted_session.resumable,
+        "fresh fixture hosts must reuse the isolated Antigravity conversations directory"
+    );
 }
 
 #[tokio::test]
@@ -1369,7 +1360,10 @@ async fn antigravity_direct_resume_missing_native_db_reports_startup_failure() {
         }
     }
 
-    let db_guard = AntigravityConversationDbGuard::create(&session_id);
+    let db_guard = AntigravityConversationDbGuard::create(
+        fixture.antigravity_conversations_dir(),
+        &session_id,
+    );
     fixture
         .client
         .list_sessions(ListSessionsPayload::default())
@@ -1675,9 +1669,11 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
     init_tracing();
 
     let probe_dir = tempfile::tempdir().expect("create Kiro probe tempdir");
+    let probe_workspace_dir = tempfile::tempdir().expect("create Kiro probe workspace tempdir");
     let probe_program = write_fake_kiro_probe_program(&probe_dir);
     let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
         kiro_probe_program: Some(probe_program.to_string_lossy().to_string()),
+        kiro_probe_workspace_root: Some(probe_workspace_dir.path().to_path_buf()),
         ..server::HostRuntimeConfig::default()
     })
     .await;
@@ -1692,37 +1688,46 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
         .await
         .expect("enable Kiro backend");
 
-    let schemas = loop {
-        let env = expect_fixture_event(&mut fixture.client, "Kiro SessionSchemas").await;
-        if !matches!(
-            env.kind,
-            FrameKind::SessionSchemas | FrameKind::LaunchProfileCatalogNotify
-        ) {
-            continue;
+    let kiro_schema = tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            let env = fixture
+                .client
+                .next_event()
+                .await
+                .expect("read event while waiting for Kiro SessionSchemas")
+                .expect("connection closed while waiting for Kiro SessionSchemas");
+            if env.kind != FrameKind::SessionSchemas {
+                continue;
+            }
+            let payload: SessionSchemasPayload =
+                env.parse_payload().expect("parse Kiro SessionSchemas");
+            let Some(kiro_schema) = payload
+                .schemas
+                .into_iter()
+                .find(|schema| schema.backend_kind() == BackendKind::Kiro)
+            else {
+                continue;
+            };
+            if !matches!(kiro_schema, SessionSchemaEntry::Pending { .. }) {
+                break kiro_schema;
+            }
         }
-        if env.kind == FrameKind::LaunchProfileCatalogNotify {
-            continue;
-        }
-        let payload: SessionSchemasPayload = env.parse_payload().expect("parse SessionSchemas");
-        if payload
-            .schemas
-            .iter()
-            .any(|schema| schema.backend_kind() == BackendKind::Kiro)
-        {
-            break payload;
-        }
-    };
+    })
+    .await
+    .expect("timed out waiting for Kiro schema probe result");
 
-    let kiro_schema = schemas
-        .schemas
-        .into_iter()
-        .find(|schema| schema.backend_kind() == BackendKind::Kiro)
-        .expect("Kiro schema should be present");
-    let SessionSchemaEntry::Ready {
-        schema: kiro_schema,
-    } = kiro_schema
-    else {
-        panic!("expected Kiro schema to be ready");
+    let kiro_schema = match kiro_schema {
+        SessionSchemaEntry::Ready { schema } => schema,
+        SessionSchemaEntry::Unavailable { message, .. } => {
+            assert!(
+                message.contains("Kiro schema probe stage '"),
+                "Kiro schema probe failure should identify its stage: {message}"
+            );
+            panic!("expected Kiro schema to be ready; probe became unavailable: {message}");
+        }
+        SessionSchemaEntry::Pending { .. } => {
+            panic!("expected Kiro schema to be ready; probe remained pending")
+        }
     };
     assert_eq!(kiro_schema.fields.len(), 1);
     assert_eq!(kiro_schema.fields[0].key, "model");
@@ -1751,6 +1756,16 @@ async fn kiro_dynamic_schema_discovery_uses_probe_models() {
         }
         other => panic!("expected Kiro model field to be a Select, got {other:?}"),
     }
+    let probe_cwd = std::fs::read_to_string(probe_dir.path().join("probe-cwd"))
+        .expect("read fake Kiro probe cwd");
+    let expected_probe_cwd =
+        std::fs::canonicalize(probe_workspace_dir.path().join(".tyde/kiro-admin"))
+            .expect("canonicalize isolated Kiro admin cwd");
+    assert_eq!(
+        PathBuf::from(probe_cwd.trim()),
+        expected_probe_cwd,
+        "fake Kiro probe should run from the isolated admin cwd"
+    );
 
     let mut session_settings = SessionSettingsValues::default();
     session_settings.0.insert(

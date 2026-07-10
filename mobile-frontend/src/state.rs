@@ -160,6 +160,12 @@ pub enum PairingScreen {
         host_label: String,
         auth: MobileServiceAuthState,
     },
+    /// A boot OAuth callback completed after Safari lost the pending QR. The
+    /// typed auth result remains renderable (paywall/retry/sign-in) without
+    /// inventing pairing data or attempting redemption.
+    ServiceAuthStatus {
+        auth: MobileServiceAuthState,
+    },
     /// A legacy public-broker QR or stored record that fails closed: the user
     /// must re-pair from the host's current QR. Never a spinner, never a silent
     /// public-broker connect.

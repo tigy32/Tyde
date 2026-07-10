@@ -711,24 +711,59 @@ function clearPendingFragment() {
   }
 }
 
+// The loader's fragment-scrub decision. True when a URL hash (`location.hash`,
+// with or without the leading `#`) carries a `tyde-pair://` pairing URI — the
+// ONLY kind of fragment the loader may clear from the URL. The PSK no-leak
+// invariant applies just to pairing fragments; every other fragment — most
+// importantly the `#handoffCode=…` the Tyggs OAuth redirect appends for the
+// booted wasm app, and plain anchors — must survive in the URL until the app
+// consumes and strips it itself. Pure; exported for unit testing.
+export function isPairingUrlFragment(urlHash) {
+  if (typeof urlHash !== "string" || urlHash.length === 0) return false;
+  const withHash = urlHash.startsWith("#") ? urlHash : "#" + urlHash;
+  if (extractPairingUri(withHash) !== null) return true;
+  // A fragment that merely EMBEDS the scheme (malformed, truncated, over-long)
+  // may still carry pairing secrets — keep scrubbing those rather than leaving
+  // them in the URL.
+  return withHash.includes("tyde-pair://");
+}
+
 // Resolves the pairing fragment for this init from the URL hash the caller has
 // ALREADY captured and cleared (no-leak invariant). A `tyde-pair://…` fragment
 // in the URL is the source of truth: it is returned AND mirrored to
 // sessionStorage so a retry after a pre-commit failure can recover it. When the
-// URL has no pairing fragment (e.g. a retry reload after we cleared it), we
-// recover the previously-stashed one. Returns the fragment string or null.
-// Exported for unit testing; only reads/writes sessionStorage (no DOM).
+// URL has no pairing fragment (e.g. a retry reload after we cleared it, or an
+// OAuth `#handoffCode=…` return), we recover the previously-stashed one.
+// Returns the fragment string or null. Exported for unit testing; only
+// reads/writes sessionStorage (no DOM).
 export function resolvePairingFragment(urlHash) {
-  let fragment = null;
-  if (typeof urlHash === "string" && urlHash.length > 0) {
+  if (isPairingUrlFragment(urlHash)) {
     const f = urlHash.startsWith("#") ? urlHash.slice(1) : urlHash;
-    if (f.includes("tyde-pair://")) fragment = f;
-  }
-  if (fragment) {
+    // Normalize a decodable fragment down to the inner `tyde-pair://…` URI
+    // (covers percent-encoding cameras/links apply); an embedded-but-
+    // unextractable fragment passes through raw, as before.
+    const fragment = extractPairingUri("#" + f) ?? f;
     stashPendingFragment(fragment);
     return fragment;
   }
   return readPendingFragment();
+}
+
+// Captures this load's pairing fragment and scrubs it — and ONLY it — from the
+// URL. The scrub decision is `isPairingUrlFragment` on the LIVE hash alone: a
+// pairing fragment is cleared via history.replaceState (path + query preserved)
+// before anything else can leak it, while a non-pairing fragment and the query
+// string (`?oauth=…` plus `#handoffCode=…` from the Tyggs OAuth redirect) stay
+// in the URL for the booted wasm app to consume and clean up. Pending-fragment
+// RECOVERY (a stashed pairing URI from an earlier pre-commit failure) can still
+// return a URI here, but never triggers a scrub. Exported for unit testing;
+// `loc`/`hist` are injectable so tests don't navigate.
+export function capturePairingFragmentFromUrl(loc, hist) {
+  const hash = loc && typeof loc.hash === "string" ? loc.hash : "";
+  if (isPairingUrlFragment(hash) && hist && typeof hist.replaceState === "function") {
+    hist.replaceState(null, "", loc.pathname + loc.search);
+  }
+  return resolvePairingFragment(hash);
 }
 
 // Handles a raw pairing URI (from scan or paste): parse -> validate -> resolve
@@ -1075,23 +1110,23 @@ async function init() {
     onRepairVersion(detail);
   });
 
-  // Capture + IMMEDIATELY clear any URL fragment BEFORE the first await or early
-  // return below, so the PSK-bearing `tyde-pair://…` fragment can never leak
-  // into a later navigation/referrer regardless of which path init() takes
+  // Capture + IMMEDIATELY clear a PAIRING URL fragment BEFORE the first await or
+  // early return below, so the PSK-bearing `tyde-pair://…` fragment can never
+  // leak into a later navigation/referrer regardless of which path init() takes
   // (manifest fetch, self-heal repair, startup boot). The host's QR is a generic
   // HTTPS link (`https://tycode.dev/tyde/#tyde-pair://v1?<payload>`); the secret
-  // rides in the FRAGMENT, which browsers never send to the origin.
-  // `resolvePairingFragment` mirrors the captured fragment into sessionStorage
+  // rides in the FRAGMENT, which browsers never send to the origin. ONLY pairing
+  // fragments are scrubbed: the Tyggs OAuth redirect returns to
+  // `?oauth=success&…#handoffCode=<hex>` and the booted wasm app is what
+  // consumes and strips that hash (plus the oauth query params) — scrubbing it
+  // here would break the mobile web OAuth loop. `resolvePairingFragment`
+  // (inside the capture) mirrors a captured pairing fragment into sessionStorage
   // (never the URL) so a retry after a pre-commit failure — e.g. a failed
   // manifest fetch, whose retry button reloads the page — can recover it without
-  // a rescan, and recovers a previously-stashed one when this load has no hash.
-  // `history.replaceState` runs only when a hash was present, preserving the
-  // no-rewrite-on-clean-load behavior.
-  const hash = window.location.hash;
-  if (hash) {
-    history.replaceState(null, "", window.location.pathname + window.location.search);
-  }
-  const pairingFragment = resolvePairingFragment(hash);
+  // a rescan, and recovers a previously-stashed one when this load has no
+  // pairing hash. `history.replaceState` runs only for a pairing hash,
+  // preserving the no-rewrite-on-clean-load behavior.
+  const pairingFragment = capturePairingFragmentFromUrl(window.location, history);
 
   show("loading");
 

@@ -71,6 +71,7 @@ use protocol::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
@@ -111,6 +112,25 @@ const RETURN_TO_SECRET_PARAM_KEYS: &[&str] = &[
     "room",
     "psk",
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthCallback {
+    HandoffCode(String),
+    Failed { message: String },
+}
+
+enum AuthCallbackExchange {
+    Unchecked,
+    InFlight(Vec<oneshot::Sender<MobileServiceAuthState>>),
+    Complete(Option<MobileServiceAuthState>),
+}
+
+enum AuthCallbackExchangeAction {
+    Complete(AuthCallback),
+    Wait(oneshot::Receiver<MobileServiceAuthState>),
+    Ready(Option<MobileServiceAuthState>),
+}
+
 /// Refresh managed broker credentials this long before they expire so a
 /// reconnect never hands the transport an already-dead grant.
 const CREDENTIAL_REFRESH_MARGIN_MS: u64 = 30_000;
@@ -142,6 +162,9 @@ thread_local! {
     /// is "authenticated". The authoritative session is the `HttpOnly` cookie the
     /// browser holds — this is not a secret and is never sent anywhere.
     static AUTHENTICATED: Cell<bool> = const { Cell::new(false) };
+
+    static AUTH_CALLBACK_EXCHANGE: RefCell<AuthCallbackExchange> =
+        const { RefCell::new(AuthCallbackExchange::Unchecked) };
 
     /// Fresh mobile broker grants, held **only in memory** (never persisted —
     /// finding #5 / dev-docs/30). Populated by redeem and mint; reused for a
@@ -343,23 +366,101 @@ fn not_configured() -> MobileServiceAuthState {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
-/// Resolves the `tycode.dev` session and returns the typed
-/// [`MobileServiceAuthState`]. If the browser just returned from the OAuth
-/// redirect it first completes the one-time `handoffCode` exchange
-/// ([`complete_handoff`]); otherwise it probes the existing session cookie
-/// (`GET /auth/session`). An `AuthFailed` result means "not signed in" — the UI
-/// drives [`tyggs_sign_in_url`] to start the redirect.
+/// Validates the managed offer, probes the cookie-backed `tycode.dev` session,
+/// and returns the typed [`MobileServiceAuthState`]. Boot callback completion is
+/// deliberately separate so pairing auth cannot race reconnect credential mint.
 pub async fn authenticate(qr_uri: &str) -> MobileServiceAuthState {
     if let Err(message) = parse_managed_offer(qr_uri) {
         return MobileServiceAuthState::AuthFailed { message };
     }
+    probe_auth().await
+}
+
+/// Completes or joins the page's one OAuth callback exchange. Reconnect minting
+/// uses the same single-flight state, so the session cookie always exists before
+/// either path continues and the handoff marker has only one consumer.
+pub async fn complete_boot_auth_callback() -> Option<MobileServiceAuthState> {
+    resolve_auth_callback().await
+}
+
+/// Re-probes the current cookie-backed auth state without requiring a QR.
+pub async fn probe_auth() -> MobileServiceAuthState {
     let config = load_config();
-    if let Some(base_url) = config.base_url.clone() {
-        return authenticate_live(&base_url, &config).await;
-    }
-    match config.stub_auth.as_deref() {
-        Some(kind) => stub_auth_state(kind, &config),
-        None => not_configured(),
+    let state = match config.base_url.as_deref() {
+        Some(base_url) => authenticate_live(base_url, &config).await,
+        None => match config.stub_auth.as_deref() {
+            Some(kind) => stub_auth_state(kind, &config),
+            None => not_configured(),
+        },
+    };
+    AUTH_CALLBACK_EXCHANGE.with(|exchange| {
+        let mut exchange = exchange.borrow_mut();
+        // Refresh only an ALREADY-COMPLETED exchange so later reconnect mints
+        // see the newest probe outcome (e.g. a retried sign-in clearing a stale
+        // AuthFailed). An `Unchecked` exchange must stay unchecked: the URL may
+        // still carry an unconsumed OAuth callback (`handoffCode`), and caching
+        // a probe result over it would mask the source of truth (dev-docs/01).
+        // `InFlight` is left for the in-flight exchange to complete.
+        if matches!(*exchange, AuthCallbackExchange::Complete(_)) {
+            *exchange = AuthCallbackExchange::Complete(Some(state.clone()));
+        }
+    });
+    state
+}
+
+async fn resolve_auth_callback() -> Option<MobileServiceAuthState> {
+    let action = AUTH_CALLBACK_EXCHANGE.with(|exchange| {
+        let mut exchange = exchange.borrow_mut();
+        match &mut *exchange {
+            AuthCallbackExchange::Unchecked => match take_auth_callback() {
+                Some(callback) => {
+                    *exchange = AuthCallbackExchange::InFlight(Vec::new());
+                    AuthCallbackExchangeAction::Complete(callback)
+                }
+                None => {
+                    *exchange = AuthCallbackExchange::Complete(None);
+                    AuthCallbackExchangeAction::Ready(None)
+                }
+            },
+            AuthCallbackExchange::InFlight(waiters) => {
+                let (sender, receiver) = oneshot::channel();
+                waiters.push(sender);
+                AuthCallbackExchangeAction::Wait(receiver)
+            }
+            AuthCallbackExchange::Complete(state) => {
+                AuthCallbackExchangeAction::Ready(state.clone())
+            }
+        }
+    });
+
+    match action {
+        AuthCallbackExchangeAction::Ready(state) => state,
+        AuthCallbackExchangeAction::Wait(receiver) => match receiver.await {
+            Ok(state) => Some(state),
+            Err(_) => Some(MobileServiceAuthState::ServiceUnavailable {
+                message: "Tyggs sign-in callback exchange ended unexpectedly.".to_owned(),
+                retryable: true,
+            }),
+        },
+        AuthCallbackExchangeAction::Complete(callback) => {
+            let config = load_config();
+            let state = complete_auth_callback(&config, callback).await;
+            let waiters = AUTH_CALLBACK_EXCHANGE.with(|exchange| {
+                match std::mem::replace(
+                    &mut *exchange.borrow_mut(),
+                    AuthCallbackExchange::Complete(Some(state.clone())),
+                ) {
+                    AuthCallbackExchange::InFlight(waiters) => waiters,
+                    AuthCallbackExchange::Unchecked | AuthCallbackExchange::Complete(_) => {
+                        Vec::new()
+                    }
+                }
+            });
+            for waiter in waiters {
+                let _ = waiter.send(state.clone());
+            }
+            Some(state)
+        }
     }
 }
 
@@ -448,24 +549,6 @@ fn strip_fragment_params(url: &web_sys::Url, keys: &[&str]) {
     }
 }
 
-fn cleanup_current_auth_callback_url() {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let location = window.location();
-    let Ok(href) = location.href() else {
-        return;
-    };
-    let Ok(url) = web_sys::Url::new(&href) else {
-        return;
-    };
-    let before = url.href();
-    strip_auth_callback_params(&url);
-    if url.href() != before {
-        replace_url(&window, &url);
-    }
-}
-
 /// Redeems the scanned offer against `tycode.dev` (`POST /pairings/redeem`,
 /// cookie-authenticated), persists the durable managed pairing, and connects to
 /// the managed broker. Returns a [`RedeemOutcome`] on failure — never a fallback
@@ -526,13 +609,6 @@ pub async fn obtain_managed_credentials(
 // ── Live HTTP: auth ──────────────────────────────────────────────────────────
 
 async fn authenticate_live(base_url: &str, config: &ServiceConfig) -> MobileServiceAuthState {
-    // Fresh back from the `tycode.dev` OAuth redirect: a one-time `handoffCode`
-    // is in the URL. Strip it immediately and exchange it for the session cookie
-    // before falling back to the cookie-only probe below.
-    if let Some(handoff_code) = take_handoff_code() {
-        return complete_handoff(base_url, config, &handoff_code).await;
-    }
-    cleanup_current_auth_callback_url();
     let url = format!("{base_url}/auth/session");
     match send(HttpMethod::Get, &url, None, &[]).await {
         Ok(HttpJson { status, body }) if status < 300 => {
@@ -562,6 +638,22 @@ async fn authenticate_live(base_url: &str, config: &ServiceConfig) -> MobileServ
             message,
             retryable: true,
         },
+    }
+}
+
+async fn complete_auth_callback(
+    config: &ServiceConfig,
+    callback: AuthCallback,
+) -> MobileServiceAuthState {
+    match callback {
+        AuthCallback::HandoffCode(handoff_code) => match config.base_url.as_deref() {
+            Some(base_url) => complete_handoff(base_url, config, &handoff_code).await,
+            None => not_configured(),
+        },
+        AuthCallback::Failed { message } => {
+            mark_authenticated(false);
+            MobileServiceAuthState::AuthFailed { message }
+        }
     }
 }
 
@@ -622,7 +714,7 @@ async fn complete_handoff(
         }
         Ok(HttpJson { body, .. }) => {
             mark_authenticated(false);
-            auth_state_from_error(&body, config)
+            handoff_auth_state_from_error(&body, config)
         }
         Err(message) => MobileServiceAuthState::ServiceUnavailable {
             message,
@@ -631,50 +723,90 @@ async fn complete_handoff(
     }
 }
 
-/// Reads the one-time `handoffCode` marker from the current URL (query string or
-/// fragment) and **removes it immediately** via `history.replaceState`, before
-/// any network call, so a reload or back-button can never replay it. Returns
-/// `None` when no handoff is present (the normal cookie-probe / reconnect path).
-fn take_handoff_code() -> Option<String> {
+/// Captures a Tyggs OAuth callback from the current URL and removes its markers
+/// via `history.replaceState` before any network call. Both successful handoff
+/// markers and OAuth failures are one-shot: neither can replay on reload/back.
+fn take_auth_callback() -> Option<AuthCallback> {
     let window = web_sys::window()?;
     let location = window.location();
     let href = location.href().ok()?;
     let url = web_sys::Url::new(&href).ok()?;
 
-    // Query string form: `…/tyde/?handoffCode=…`. Mutating the associated
-    // `URLSearchParams` updates `url.href` in place.
-    if let Some(code) = url
-        .search_params()
-        .get(HANDOFF_CODE_KEY)
-        .filter(|value| !value.is_empty())
-    {
-        url.search_params().delete(HANDOFF_CODE_KEY);
-        strip_return_to_search_params(&url);
-        url.set_hash("");
-        replace_url(&window, &url);
-        return Some(code);
-    }
-
-    // Fragment form: `…/tyde/#handoffCode=…` (or `…#other&handoffCode=…`).
-    let hash = url.hash();
-    let fragment = hash.strip_prefix('#').unwrap_or(&hash);
-    if fragment.is_empty() {
-        return None;
-    }
-    let mut found: Option<String> = None;
-    for part in fragment.split('&') {
-        if let Some((key, value)) = part.split_once('=')
-            && key == HANDOFF_CODE_KEY
-            && !value.is_empty()
-        {
-            found = Some(decode_uri_component(value));
+    let callback = capture_auth_callback(&url)?;
+    strip_return_to_search_params(&url);
+    match callback {
+        AuthCallback::HandoffCode(_) => url.set_hash(""),
+        AuthCallback::Failed { .. } => {
+            strip_auth_callback_params(&url);
+            strip_fragment_params(&url, RETURN_TO_SECRET_PARAM_KEYS);
+            if url.hash().contains("tyde-pair://") {
+                url.set_hash("");
+            }
         }
     }
-    let code = found?;
-    strip_return_to_search_params(&url);
-    url.set_hash("");
     replace_url(&window, &url);
-    Some(code)
+    Some(callback)
+}
+
+fn capture_auth_callback(url: &web_sys::Url) -> Option<AuthCallback> {
+    // Presence means a NON-EMPTY value: a bare `?code=` or `#oauth` must never
+    // read as an OAuth callback.
+    let param = |key: &str| auth_callback_param(url, key).filter(|value| !value.is_empty());
+    // The Tyggs OAuth redirect always carries an explicit `oauth=…` marker
+    // (`?oauth=success&provider=…`). Generic keys like `error` and `code` occur
+    // in plenty of non-OAuth URLs, so without that marker they must not hijack
+    // a normal boot into a Tyggs failure. Explicitly auth-named keys
+    // (`auth_error`, `oauth_error`) are unambiguous and stand on their own.
+    let oauth_marker = param("oauth").is_some();
+
+    let error_code = ["auth_error", "oauth_error"]
+        .into_iter()
+        .find_map(&param)
+        .or_else(|| {
+            if !oauth_marker {
+                return None;
+            }
+            ["error_code", "error"].into_iter().find_map(&param)
+        });
+    if let Some(error_code) = error_code {
+        let detail = ["error_description", "message"]
+            .into_iter()
+            .find_map(&param);
+        let message = match detail {
+            Some(detail) if detail != error_code => {
+                format!("Tyggs sign-in failed ({error_code}): {detail}")
+            }
+            _ => format!("Tyggs sign-in failed: {error_code}"),
+        };
+        return Some(AuthCallback::Failed { message });
+    }
+
+    if let Some(handoff_code) = param(HANDOFF_CODE_KEY) {
+        return Some(AuthCallback::HandoffCode(handoff_code));
+    }
+
+    if oauth_marker {
+        return Some(AuthCallback::Failed {
+            message: "Tyggs sign-in failed: the OAuth callback did not include a handoff code."
+                .to_owned(),
+        });
+    }
+
+    None
+}
+
+fn auth_callback_param(url: &web_sys::Url, name: &str) -> Option<String> {
+    let search_value = url.search_params().get(name);
+    if search_value.as_ref().is_some_and(|value| !value.is_empty()) {
+        return search_value;
+    }
+    let hash = url.hash();
+    let fragment = hash.strip_prefix('#').unwrap_or(&hash);
+    let fragment_value = fragment.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        (decode_uri_component(key) == name).then(|| decode_uri_component(value))
+    });
+    fragment_value.or(search_value)
 }
 
 /// Rewrites the address bar to `url` without navigating (so the stripped
@@ -828,13 +960,10 @@ async fn mint_managed_credentials(
             retryable: false,
         });
     };
-    // A reconnect that follows a "Sign in with Tyggs again" redirect returns
-    // here with a one-time `handoffCode` still in the URL (the pairing
-    // `authenticate` path never ran). Exchange it for the session cookie first
-    // so the cookie-authenticated mint below can succeed instead of looping on
-    // `mobile_session_required`.
-    if let Some(handoff_code) = take_handoff_code() {
-        let state = complete_handoff(&base_url, &config, &handoff_code).await;
+    // Join any boot callback exchange before minting. Terminal auth/pass states
+    // stop reconnect, while a retryable service failure falls through so this
+    // real mint request can recover after a transient outage without a reload.
+    if let Some(state) = resolve_auth_callback().await {
         handoff_auth_state_to_credential_result(state)?;
     }
     let device_secret = super::store::load_device_secret(&managed.device_secret_key_id)
@@ -1105,13 +1234,17 @@ fn handoff_auth_state_to_credential_result(
             message,
             retryable: false,
         }),
-        MobileServiceAuthState::ServiceUnavailable { message, retryable } => {
-            Err(ManagedCredentialError {
-                code: MobileAccessErrorCode::ServiceUnavailable,
-                message,
-                retryable,
-            })
-        }
+        MobileServiceAuthState::ServiceUnavailable {
+            retryable: true, ..
+        } => Ok(()),
+        MobileServiceAuthState::ServiceUnavailable {
+            message,
+            retryable: false,
+        } => Err(ManagedCredentialError {
+            code: MobileAccessErrorCode::ServiceUnavailable,
+            message,
+            retryable: false,
+        }),
         MobileServiceAuthState::Idle | MobileServiceAuthState::Authenticating => {
             Err(ManagedCredentialError {
                 code: MobileAccessErrorCode::Internal,
@@ -1129,6 +1262,25 @@ fn auth_state_from_error(body: &str, config: &ServiceConfig) -> MobileServiceAut
             retryable: true,
         };
     };
+    auth_state_from_error_body(error, config)
+}
+
+fn handoff_auth_state_from_error(body: &str, config: &ServiceConfig) -> MobileServiceAuthState {
+    let Some(error) = parse_error(body) else {
+        return MobileServiceAuthState::ServiceUnavailable {
+            message: "tycode.dev returned an unexpected error.".to_owned(),
+            retryable: true,
+        };
+    };
+    match error.code.as_str() {
+        "invalid_tyggs_auth" | "mobile_session_required" => MobileServiceAuthState::AuthFailed {
+            message: error.message,
+        },
+        _ => auth_state_from_error_body(error, config),
+    }
+}
+
+fn auth_state_from_error_body(error: ErrorBody, config: &ServiceConfig) -> MobileServiceAuthState {
     // Error `code` strings are exactly the documented set in
     // dev-docs/30 "Common error codes" (no undocumented codes like
     // `unauthenticated`). Unknown codes fall through and are surfaced, never
@@ -1996,6 +2148,9 @@ mod wasm_tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     fn set_config(json: &str) {
+        AUTH_CALLBACK_EXCHANGE.with(|exchange| {
+            *exchange.borrow_mut() = AuthCallbackExchange::Unchecked;
+        });
         let window = web_sys::window().expect("window");
         if json.is_empty() {
             let _ = js_sys::Reflect::delete_property(&window, &JsValue::from_str(CONFIG_GLOBAL));
@@ -2016,12 +2171,28 @@ mod wasm_tests {
     struct FetchMock {
         calls: Rc<RefCell<Vec<FetchCall>>>,
         original_fetch: JsValue,
+        delayed_resolve: Option<Rc<RefCell<Option<js_sys::Function>>>>,
+        delayed_response: Option<(u16, &'static str)>,
         _closure: Closure<dyn FnMut(JsValue) -> js_sys::Promise>,
     }
 
     impl FetchMock {
         fn calls(&self) -> Vec<FetchCall> {
             self.calls.borrow().clone()
+        }
+
+        fn release_delayed_response(&self) {
+            let resolve = self
+                .delayed_resolve
+                .as_ref()
+                .expect("delayed fetch mock")
+                .borrow_mut()
+                .take()
+                .expect("delayed request must be pending");
+            let (status, body) = self.delayed_response.expect("delayed response");
+            resolve
+                .call1(&JsValue::NULL, &response_value(status, body))
+                .expect("resolve delayed response");
         }
     }
 
@@ -2062,22 +2233,82 @@ mod wasm_tests {
         FetchMock {
             calls,
             original_fetch,
+            delayed_resolve: None,
+            delayed_response: None,
+            _closure: closure,
+        }
+    }
+
+    fn install_delayed_first_fetch_mock(
+        first_response: (u16, &'static str),
+        remaining_responses: Vec<(u16, &'static str)>,
+    ) -> FetchMock {
+        let window = web_sys::window().expect("window");
+        let original_fetch = js_sys::Reflect::get(&window, &JsValue::from_str("fetch"))
+            .expect("read original fetch");
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let calls_for_fetch = calls.clone();
+        let delayed_resolve = Rc::new(RefCell::new(None));
+        let delayed_resolve_for_fetch = delayed_resolve.clone();
+        let response_queue = Rc::new(RefCell::new(VecDeque::from(remaining_responses)));
+        let responses_for_fetch = response_queue.clone();
+        let mut first = true;
+        let closure = Closure::<dyn FnMut(JsValue) -> js_sys::Promise>::new(
+            move |request_value: JsValue| {
+                let request: web_sys::Request = request_value
+                    .dyn_into()
+                    .expect("managed-service client must call fetch with Request");
+                calls_for_fetch.borrow_mut().push(FetchCall {
+                    method: request.method(),
+                    url: request.url(),
+                });
+                if first {
+                    first = false;
+                    let delayed_resolve = delayed_resolve_for_fetch.clone();
+                    return js_sys::Promise::new(&mut |resolve, _reject| {
+                        *delayed_resolve.borrow_mut() = Some(resolve);
+                    });
+                }
+                let (status, body) = responses_for_fetch.borrow_mut().pop_front().unwrap_or((
+                    500,
+                    r#"{"error":{"code":"internal","message":"unexpected extra request","retryable":true}}"#,
+                ));
+                response_promise(status, body)
+            },
+        );
+        js_sys::Reflect::set(&window, &JsValue::from_str("fetch"), closure.as_ref())
+            .expect("install fetch mock");
+        FetchMock {
+            calls,
+            original_fetch,
+            delayed_resolve: Some(delayed_resolve),
+            delayed_response: Some(first_response),
             _closure: closure,
         }
     }
 
     fn response_promise(status: u16, body: &str) -> js_sys::Promise {
-        let response = js_sys::Function::new_with_args(
-            "body,status",
-            "return new Response(body, { status });",
-        )
-        .call2(
-            &JsValue::NULL,
-            &JsValue::from_str(body),
-            &JsValue::from_f64(f64::from(status)),
-        )
-        .expect("create Response");
-        js_sys::Promise::resolve(&response)
+        js_sys::Promise::resolve(&response_value(status, body))
+    }
+
+    fn response_value(status: u16, body: &str) -> JsValue {
+        js_sys::Function::new_with_args("body,status", "return new Response(body, { status });")
+            .call2(
+                &JsValue::NULL,
+                &JsValue::from_str(body),
+                &JsValue::from_f64(f64::from(status)),
+            )
+            .expect("create Response")
+    }
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .expect("window")
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .expect("schedule tick");
+        });
+        JsFuture::from(promise).await.expect("event-loop tick");
     }
 
     fn reconnect_record(
@@ -2105,6 +2336,35 @@ mod wasm_tests {
             }),
         }
     }
+
+    const VALID_MINT_RESPONSE: &str = r#"{
+        "pairing_id":"pair_01J",
+        "status":"active",
+        "broker":{
+            "endpoint":"wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt",
+            "provider":"aws_iot_core",
+            "region":"us-west-2",
+            "authorizer_name":"tycode-mobile-v1"
+        },
+        "broker_credentials":{
+            "grant_id":"grant_01J",
+            "client_id":"tyde/prod/pair_01J/mobile/dev_01J/grant_01J",
+            "connect":{
+                "username":"x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant",
+                "password":"signed-grant",
+                "websocket_url":"wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=signed-grant",
+                "headers":{"x-tycode-grant":"signed-grant"}
+            },
+            "scope":{
+                "namespace":"tyde/prod/pair_01J",
+                "role":"mobile",
+                "publish":["tyde/prod/pair_01J/rooms/+/client-to-host"],
+                "subscribe":["tyde/prod/pair_01J/rooms/+/host-to-client"]
+            },
+            "issued_at_ms":1,
+            "expires_at_ms":4102444800000
+        }
+    }"#;
 
     #[wasm_bindgen_test]
     async fn authenticate_without_config_fails_closed_non_retryable() {
@@ -2491,14 +2751,17 @@ mod wasm_tests {
             .replace_state_with_url(&JsValue::NULL, "", Some("/?handoffCode=abc123"))
             .expect("seed handoff query");
 
-        assert_eq!(take_handoff_code().as_deref(), Some("abc123"));
+        assert_eq!(
+            take_auth_callback(),
+            Some(AuthCallback::HandoffCode("abc123".to_owned()))
+        );
         let after = window.location().href().expect("href");
         assert!(
             !after.contains("handoffCode"),
             "the handoff marker must be stripped from the URL: {after}"
         );
         assert!(
-            take_handoff_code().is_none(),
+            take_auth_callback().is_none(),
             "the one-time handoff must not be readable a second time"
         );
 
@@ -2518,7 +2781,10 @@ mod wasm_tests {
             .replace_state_with_url(&JsValue::NULL, "", Some("/#handoffCode=frag-xyz"))
             .expect("seed handoff fragment");
 
-        assert_eq!(take_handoff_code().as_deref(), Some("frag-xyz"));
+        assert_eq!(
+            take_auth_callback(),
+            Some(AuthCallback::HandoffCode("frag-xyz".to_owned()))
+        );
         let after = window.location().href().expect("href");
         assert!(
             !after.contains("handoffCode"),
@@ -2540,18 +2806,161 @@ mod wasm_tests {
             .replace_state_with_url(&JsValue::NULL, "", Some("/"))
             .expect("clear url");
 
-        assert!(take_handoff_code().is_none());
+        assert!(take_auth_callback().is_none());
 
         history
             .replace_state_with_url(&JsValue::NULL, "", Some(&original))
             .expect("restore url");
     }
 
-    /// If Account redirects back without a `handoffCode`, auth processing still
-    /// must scrub stale OAuth callback params so a later login builds a clean
-    /// `return_to`.
+    /// Generic `code`/`error` params (and bare/empty markers) without the Tyggs
+    /// OAuth `oauth=…` marker must not hijack a normal boot into a Tyggs
+    /// failure — and must be left in the URL for whatever owns them.
     #[wasm_bindgen_test]
-    async fn auth_probe_without_handoff_strips_oauth_callback_params() {
+    fn non_oauth_urls_are_not_captured_as_auth_callbacks() {
+        let window = web_sys::window().expect("window");
+        let history = window.history().expect("history");
+        let original = window.location().href().expect("href");
+
+        for (seed, survivor) in [
+            ("/tyde/?code=abc", Some("code=abc")),
+            ("/tyde/?error=1", Some("error=1")),
+            ("/tyde/?error_code=boom", Some("error_code=boom")),
+            ("/tyde/?code=", None),
+            ("/tyde/?oauth=", None),
+            ("/tyde/#oauth", None),
+            ("/tyde/?auth=1", Some("auth=1")),
+        ] {
+            history
+                .replace_state_with_url(&JsValue::NULL, "", Some(seed))
+                .expect("seed non-oauth url");
+            assert!(
+                take_auth_callback().is_none(),
+                "{seed} must not read as an OAuth callback"
+            );
+            if let Some(survivor) = survivor {
+                let after = window.location().href().expect("href");
+                assert!(
+                    after.contains(survivor),
+                    "non-OAuth param {survivor:?} must survive untouched: {after}"
+                );
+            }
+        }
+
+        history
+            .replace_state_with_url(&JsValue::NULL, "", Some(&original))
+            .expect("restore url");
+    }
+
+    /// With the `oauth=…` marker present the intended callback handling is
+    /// preserved: generic `error` maps to a failure, a marked callback missing
+    /// its handoff code fails explicitly, and explicitly auth-named error keys
+    /// still stand on their own.
+    #[wasm_bindgen_test]
+    fn oauth_marker_preserves_intended_callback_handling() {
+        let window = web_sys::window().expect("window");
+        let history = window.history().expect("history");
+        let original = window.location().href().expect("href");
+
+        history
+            .replace_state_with_url(
+                &JsValue::NULL,
+                "",
+                Some("/tyde/?oauth=success&provider=google&error=denied"),
+            )
+            .expect("seed marked error callback");
+        match take_auth_callback() {
+            Some(AuthCallback::Failed { message }) => {
+                assert!(message.contains("denied"), "{message}")
+            }
+            other => panic!("expected marked OAuth error to be captured, got {other:?}"),
+        }
+
+        history
+            .replace_state_with_url(
+                &JsValue::NULL,
+                "",
+                Some("/tyde/?oauth=success&provider=google&code=oauth_handoff"),
+            )
+            .expect("seed marked callback without handoff");
+        match take_auth_callback() {
+            Some(AuthCallback::Failed { message }) => {
+                assert!(
+                    message.contains("did not include a handoff code"),
+                    "{message}"
+                )
+            }
+            other => panic!("expected missing-handoff failure, got {other:?}"),
+        }
+
+        history
+            .replace_state_with_url(&JsValue::NULL, "", Some("/tyde/?auth_error=denied"))
+            .expect("seed explicit auth_error");
+        match take_auth_callback() {
+            Some(AuthCallback::Failed { message }) => {
+                assert!(message.contains("denied"), "{message}")
+            }
+            other => panic!("expected standalone auth_error capture, got {other:?}"),
+        }
+
+        history
+            .replace_state_with_url(&JsValue::NULL, "", Some(&original))
+            .expect("restore url");
+    }
+
+    /// A cookie probe that runs before the boot callback exchange must not cache
+    /// its outcome over the `Unchecked` exchange — the URL may still carry the
+    /// unconsumed one-time `handoffCode`, which stays authoritative.
+    #[wasm_bindgen_test]
+    async fn probe_auth_does_not_mask_unconsumed_url_callback() {
+        let window = web_sys::window().expect("window");
+        let history = window.history().expect("history");
+        let original = window.location().href().expect("href");
+        history
+            .replace_state_with_url(&JsValue::NULL, "", Some("/tyde/?handoffCode=late"))
+            .expect("seed unconsumed handoff");
+        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
+        let fetch = install_fetch_mock(vec![
+            (200, r#"{"authenticated":false}"#),
+            (200, r#"{"authenticated":true,"expires_at_ms":7}"#),
+        ]);
+
+        // Probe first (signed-out cookie): must NOT complete the exchange.
+        assert!(matches!(
+            probe_auth().await,
+            MobileServiceAuthState::AuthFailed { .. }
+        ));
+
+        // The boot callback still finds and exchanges the URL handoff.
+        match complete_boot_auth_callback().await {
+            Some(MobileServiceAuthState::Authenticated { expires_at_ms }) => {
+                assert_eq!(expires_at_ms, 7);
+            }
+            other => panic!("expected the URL handoff to win over the cached probe, got {other:?}"),
+        }
+        let methods: Vec<String> = fetch.calls().into_iter().map(|call| call.method).collect();
+        assert_eq!(
+            methods,
+            vec!["GET".to_owned(), "POST".to_owned()],
+            "probe must GET, then the handoff must still POST /auth/session"
+        );
+        let after = window.location().href().expect("href");
+        assert!(
+            !after.contains("handoffCode"),
+            "the consumed handoff must be stripped: {after}"
+        );
+
+        drop(fetch);
+        set_config("");
+        history
+            .replace_state_with_url(&JsValue::NULL, "", Some(&original))
+            .expect("restore url");
+    }
+
+    /// An OAuth error callback is captured into an explicit failure before its
+    /// params are stripped. It must not degrade into a signed-out cookie probe.
+    #[wasm_bindgen_test]
+    async fn oauth_error_callback_is_surfaced_then_stripped() {
         let window = web_sys::window().expect("window");
         let history = window.history().expect("history");
         let original = window.location().href().expect("href");
@@ -2559,24 +2968,22 @@ mod wasm_tests {
             .replace_state_with_url(
                 &JsValue::NULL,
                 "",
-                Some("/tyde/?theme=dark&oauth=1&provider=google&code=abc&error=bad&error_code=e&error_description=desc&message=msg&auth=1&auth_error=auth&oauth_error=oauth#oauth=frag&provider=google&code=frag-code&keep=1"),
+                Some("/tyde/?theme=dark&oauth=1&provider=google&error=oauth_no_linked_account&error_description=No%20linked%20account#oauth=frag&keep=1"),
             )
-            .expect("seed stale callback params");
+            .expect("seed OAuth error callback");
         set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
-        let fetch = install_fetch_mock(vec![(200, r#"{"authenticated":false}"#)]);
+        let fetch = install_fetch_mock(Vec::new());
 
-        let uri = super::super::tests_support::sample_managed_uri();
-        assert!(matches!(
-            authenticate(&uri).await,
-            MobileServiceAuthState::AuthFailed { .. }
-        ));
-        assert_eq!(
-            fetch.calls(),
-            vec![FetchCall {
-                method: "GET".to_owned(),
-                url: "https://tycode.dev/api/tyde/mobile/v1/auth/session".to_owned(),
-            }],
-            "no handoff should use the cookie-only auth probe"
+        match complete_boot_auth_callback().await {
+            Some(MobileServiceAuthState::AuthFailed { message }) => {
+                assert!(message.contains("oauth_no_linked_account"), "{message}");
+                assert!(message.contains("No linked account"), "{message}");
+            }
+            other => panic!("expected explicit OAuth failure, got {other:?}"),
+        }
+        assert!(
+            fetch.calls().is_empty(),
+            "OAuth errors must not probe signed-out state"
         );
 
         let after = window.location().href().expect("href");
@@ -2601,6 +3008,17 @@ mod wasm_tests {
                 "visible URL leaked fragment callback param {key:?}: {after}"
             );
         }
+        assert!(
+            matches!(
+                complete_boot_auth_callback().await,
+                Some(MobileServiceAuthState::AuthFailed { .. })
+            ),
+            "a captured OAuth error callback must not replay"
+        );
+        assert!(
+            fetch.calls().is_empty(),
+            "replay check must not issue a request"
+        );
 
         drop(fetch);
         set_config("");
@@ -2613,7 +3031,7 @@ mod wasm_tests {
     /// HttpOnly cookie-only session and strip all QR-secret-bearing URL parts
     /// before the network call completes.
     #[wasm_bindgen_test]
-    async fn handoff_success_posts_cookie_only_session_and_strips_qr_url() {
+    async fn boot_handoff_without_pending_qr_posts_session_once() {
         let window = web_sys::window().expect("window");
         let history = window.history().expect("history");
         let original = window.location().href().expect("href");
@@ -2627,9 +3045,8 @@ mod wasm_tests {
         set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
         let fetch = install_fetch_mock(vec![(200, r#"{"authenticated":true,"expires_at_ms":42}"#)]);
 
-        let uri = super::super::tests_support::sample_managed_uri();
-        match authenticate(&uri).await {
-            MobileServiceAuthState::Authenticated { expires_at_ms } => {
+        match complete_boot_auth_callback().await {
+            Some(MobileServiceAuthState::Authenticated { expires_at_ms }) => {
                 assert_eq!(expires_at_ms, 42);
             }
             other => panic!("expected authenticated handoff, got {other:?}"),
@@ -2656,6 +3073,66 @@ mod wasm_tests {
                 "handoff cleanup leaked callback param {key:?}: {after}"
             );
         }
+        assert!(
+            matches!(
+                complete_boot_auth_callback().await,
+                Some(MobileServiceAuthState::Authenticated { .. })
+            ),
+            "a successful boot handoff must not replay after URL cleanup"
+        );
+        assert_eq!(fetch.calls().len(), 1, "handoff POST must remain one-shot");
+
+        drop(fetch);
+        set_config("");
+        history
+            .replace_state_with_url(&JsValue::NULL, "", Some(&original))
+            .expect("restore url");
+    }
+
+    /// When the pending QR survives the OAuth redirect, the callback exchange
+    /// still runs once and the existing managed path redeems the offer once.
+    #[wasm_bindgen_test]
+    async fn handoff_with_pending_qr_exchanges_once_then_redeems_once() {
+        let window = web_sys::window().expect("window");
+        let history = window.history().expect("history");
+        let original = window.location().href().expect("href");
+        history
+            .replace_state_with_url(&JsValue::NULL, "", Some("/tyde/?handoffCode=pending"))
+            .expect("seed pending-QR handoff");
+        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
+        let fetch = install_fetch_mock(vec![
+            (200, r#"{"authenticated":true,"expires_at_ms":42}"#),
+            (
+                402,
+                r#"{"error":{"code":"pass_required","message":"Pass required after redeem","retryable":false,"paywall_url":"https://tyggs.com/pass"}}"#,
+            ),
+        ]);
+
+        let uri = super::super::tests_support::sample_managed_uri();
+        assert!(matches!(
+            complete_boot_auth_callback().await,
+            Some(MobileServiceAuthState::Authenticated { .. })
+        ));
+        assert!(matches!(
+            redeem_and_connect(&uri).await,
+            Err(RedeemOutcome::Auth(
+                MobileServiceAuthState::PassRequired { .. }
+            ))
+        ));
+        assert_eq!(
+            fetch.calls(),
+            vec![
+                FetchCall {
+                    method: "POST".to_owned(),
+                    url: "https://tycode.dev/api/tyde/mobile/v1/auth/session".to_owned(),
+                },
+                FetchCall {
+                    method: "POST".to_owned(),
+                    url: "https://tycode.dev/api/tyde/mobile/v1/pairings/redeem".to_owned(),
+                },
+            ],
+            "pending-QR resume must exchange once, then redeem once"
+        );
 
         drop(fetch);
         set_config("");
@@ -2680,11 +3157,12 @@ mod wasm_tests {
             r#"{"error":{"code":"invalid_tyggs_auth","message":"handoff expired","retryable":false}}"#,
         )]);
 
-        let uri = super::super::tests_support::sample_managed_uri();
-        assert!(matches!(
-            authenticate(&uri).await,
-            MobileServiceAuthState::AuthFailed { .. }
-        ));
+        match complete_boot_auth_callback().await {
+            Some(MobileServiceAuthState::AuthFailed { message }) => {
+                assert_eq!(message, "handoff expired");
+            }
+            other => panic!("expected explicit handoff failure, got {other:?}"),
+        }
         assert_eq!(fetch.calls().len(), 1);
         let after = window.location().href().expect("href");
         assert!(
@@ -2692,9 +3170,17 @@ mod wasm_tests {
             "failed handoff must still strip the marker: {after}"
         );
         assert!(
-            take_handoff_code().is_none(),
+            take_auth_callback().is_none(),
             "failed handoff must not be replayable"
         );
+        assert!(
+            matches!(
+                complete_boot_auth_callback().await,
+                Some(MobileServiceAuthState::AuthFailed { .. })
+            ),
+            "failed boot handoff must not replay through authenticate"
+        );
+        assert_eq!(fetch.calls().len(), 1, "failed handoff POST must run once");
 
         drop(fetch);
         set_config("");
@@ -2721,8 +3207,8 @@ mod wasm_tests {
 
         let uri = super::super::tests_support::sample_managed_uri();
         assert!(matches!(
-            authenticate(&uri).await,
-            MobileServiceAuthState::Authenticated { .. }
+            complete_boot_auth_callback().await,
+            Some(MobileServiceAuthState::Authenticated { .. })
         ));
         assert!(matches!(
             authenticate(&uri).await,
@@ -2768,10 +3254,9 @@ mod wasm_tests {
 
         assert_eq!(error.code, MobileAccessErrorCode::ServiceAuthRequired);
         assert!(!error.retryable);
-        assert!(
-            error.message.contains("Sign in"),
-            "auth failure should remain user-actionable: {}",
-            error.message
+        assert_eq!(
+            error.message, "handoff expired",
+            "callback failure must preserve the explicit service error"
         );
         assert_eq!(
             fetch.calls(),
@@ -2840,6 +3325,157 @@ mod wasm_tests {
         history
             .replace_state_with_url(&JsValue::NULL, "", Some(&original))
             .expect("restore url");
+    }
+
+    /// Boot callback completion and auto-connect share one in-flight exchange.
+    /// Boot starts first and the auth response is held pending; auto-connect must
+    /// join it without issuing a credential mint until that response is released.
+    #[wasm_bindgen_test]
+    async fn boot_callback_and_auto_connect_share_one_exchange_before_mint() {
+        let window = web_sys::window().expect("window");
+        let history = window.history().expect("history");
+        let original = window.location().href().expect("href");
+        history
+            .replace_state_with_url(&JsValue::NULL, "", Some("/tyde/?handoffCode=shared"))
+            .expect("seed shared callback");
+        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
+        let fetch = install_delayed_first_fetch_mock(
+            (200, r#"{"authenticated":true,"expires_at_ms":99}"#),
+            vec![(
+                503,
+                r#"{"error":{"code":"service_unavailable","message":"mint outage","retryable":true}}"#,
+            )],
+        );
+        let device_secret_key_id =
+            super::super::store::store_device_secret("device_pairing_secret_concurrent")
+                .await
+                .expect("store device secret");
+        let record = reconnect_record("reconnect-concurrent-handoff", device_secret_key_id.clone());
+
+        let boot_result = Rc::new(RefCell::new(None));
+        let boot_result_for_task = boot_result.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            *boot_result_for_task.borrow_mut() = Some(complete_boot_auth_callback().await);
+        });
+        next_tick().await;
+        assert_eq!(
+            fetch.calls(),
+            vec![FetchCall {
+                method: "POST".to_owned(),
+                url: "https://tycode.dev/api/tyde/mobile/v1/auth/session".to_owned(),
+            }],
+            "boot must start exactly one delayed session exchange"
+        );
+
+        let credential_result = Rc::new(RefCell::new(None));
+        let credential_result_for_task = credential_result.clone();
+        let record_for_task = record.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            *credential_result_for_task.borrow_mut() =
+                Some(obtain_managed_credentials(&record_for_task, 0).await);
+        });
+        next_tick().await;
+        assert_eq!(
+            fetch.calls().len(),
+            1,
+            "auto-connect must not mint while the session exchange is pending"
+        );
+        assert!(credential_result.borrow().is_none());
+
+        fetch.release_delayed_response();
+        for _ in 0..5 {
+            next_tick().await;
+        }
+        let boot_auth = boot_result
+            .borrow_mut()
+            .take()
+            .expect("boot callback task completed");
+        let credential_result = credential_result
+            .borrow_mut()
+            .take()
+            .expect("credential task completed");
+        assert!(matches!(
+            boot_auth,
+            Some(MobileServiceAuthState::Authenticated { .. })
+        ));
+        assert_eq!(
+            credential_result.expect_err("mocked mint must fail").code,
+            MobileAccessErrorCode::ServiceUnavailable
+        );
+        assert_eq!(
+            fetch.calls(),
+            vec![
+                FetchCall {
+                    method: "POST".to_owned(),
+                    url: "https://tycode.dev/api/tyde/mobile/v1/auth/session".to_owned(),
+                },
+                FetchCall {
+                    method: "POST".to_owned(),
+                    url:
+                        "https://tycode.dev/api/tyde/mobile/v1/pairings/pair_01J/broker-credentials"
+                            .to_owned(),
+                },
+            ],
+            "one auth exchange must finish before the single credential mint"
+        );
+
+        let _ = super::super::store::delete_device_secret(&device_secret_key_id).await;
+        drop(fetch);
+        set_config("");
+        history
+            .replace_state_with_url(&JsValue::NULL, "", Some(&original))
+            .expect("restore url");
+    }
+
+    #[wasm_bindgen_test]
+    async fn transient_auth_probe_does_not_veto_recovered_credential_mint() {
+        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
+        let fetch = install_fetch_mock(vec![
+            (
+                503,
+                r#"{"error":{"code":"service_unavailable","message":"auth outage","retryable":true}}"#,
+            ),
+            (200, VALID_MINT_RESPONSE),
+        ]);
+
+        assert!(matches!(
+            probe_auth().await,
+            MobileServiceAuthState::ServiceUnavailable {
+                retryable: true,
+                ..
+            }
+        ));
+
+        let device_secret_key_id =
+            super::super::store::store_device_secret("device_pairing_secret_after_auth_outage")
+                .await
+                .expect("store device secret");
+        let record = reconnect_record("reconnect-after-auth-outage", device_secret_key_id.clone());
+        obtain_managed_credentials(&record, 0)
+            .await
+            .expect("recovered service must receive a real credential mint");
+
+        assert_eq!(
+            fetch.calls(),
+            vec![
+                FetchCall {
+                    method: "GET".to_owned(),
+                    url: "https://tycode.dev/api/tyde/mobile/v1/auth/session".to_owned(),
+                },
+                FetchCall {
+                    method: "POST".to_owned(),
+                    url:
+                        "https://tycode.dev/api/tyde/mobile/v1/pairings/pair_01J/broker-credentials"
+                            .to_owned(),
+                },
+            ],
+            "a cached transient probe failure must not suppress the recovered mint"
+        );
+
+        clear_cached_credentials(&record.local_host_id);
+        let _ = super::super::store::delete_device_secret(&device_secret_key_id).await;
+        drop(fetch);
+        set_config("");
     }
 
     /// A successful reconnect mint must preserve the browser-safe AWS IoT

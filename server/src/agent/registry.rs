@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,7 +13,9 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::agent::customization::ResolvedSpawnConfig;
-use crate::agent::{AgentHandle, now_ms, spawn_agent_actor, spawn_relay_agent_actor};
+use crate::agent::{
+    AgentActorRuntimeContext, AgentHandle, now_ms, spawn_agent_actor, spawn_relay_agent_actor,
+};
 use crate::backend::StartupMcpServer;
 use crate::backend::StartupMcpTransport;
 use crate::host::mcp_url_for_agent;
@@ -229,6 +232,7 @@ impl AgentRegistry {
         session_store: Arc<Mutex<SessionStore>>,
         host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
         review_registry: ReviewRegistryHandle,
+        antigravity_conversations_dir: PathBuf,
     ) -> SpawnedAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
         for server in &mut request.startup_mcp_servers {
@@ -266,10 +270,13 @@ impl AgentRegistry {
             agent_id.clone(),
             start.clone(),
             request,
-            session_store,
-            host_sub_agent_spawn_tx,
-            review_registry,
-            status_handle.clone(),
+            AgentActorRuntimeContext {
+                session_store,
+                host_sub_agent_spawn_tx,
+                review_registry,
+                status_handle: status_handle.clone(),
+                antigravity_conversations_dir,
+            },
         );
 
         let previous = self.agents.insert(

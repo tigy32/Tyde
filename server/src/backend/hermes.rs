@@ -24,8 +24,9 @@ use uuid::Uuid;
 use crate::agent::customization::ResolvedSpawnConfig;
 use crate::backend::{
     Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
-    backend_config_text, backend_fork_unsupported_message, render_combined_spawn_instructions,
-    resolve_settings as resolve_backend_settings, tyde_owned_no_root_cwd,
+    StartupMcpServer, StartupMcpTransport, backend_config_text, backend_fork_unsupported_message,
+    render_combined_spawn_instructions, resolve_settings as resolve_backend_settings,
+    tyde_owned_no_root_cwd,
 };
 use crate::process_env;
 
@@ -40,6 +41,105 @@ const HERMES_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const HERMES_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const HERMES_USAGE_TIMEOUT: Duration = Duration::from_secs(2);
 const HERMES_MODEL_PROVIDER_FLAG: &str = " --provider ";
+const HERMES_MCP_BOOTSTRAP: &str = r#"
+import copy
+import json
+import runpy
+import sys
+import threading
+
+try:
+    import hermes_bootstrap
+    hermes_bootstrap.harden_import_path()
+    from hermes_cli import config as _tyde_config
+
+    _tyde_payload = json.loads(sys.stdin.readline())
+    _tyde_injected = _tyde_payload.get("mcp_servers")
+    if not isinstance(_tyde_injected, dict):
+        raise ValueError("mcp_servers must be an object")
+
+    _tyde_real_read_raw_config = _tyde_config.read_raw_config
+    _tyde_real_load_config = _tyde_config.load_config
+    _tyde_real_load_config_readonly = _tyde_config.load_config_readonly
+    _tyde_real_save_config = _tyde_config.save_config
+    _tyde_state = threading.local()
+
+    def _tyde_merge(config):
+        merged = copy.deepcopy(config) if isinstance(config, dict) else {}
+        native_servers = merged.get("mcp_servers")
+        if not isinstance(native_servers, dict):
+            native_servers = {}
+        else:
+            native_servers = copy.deepcopy(native_servers)
+        native_servers.update(copy.deepcopy(_tyde_injected))
+        merged["mcp_servers"] = native_servers
+        return merged
+
+    def _tyde_read_raw_config():
+        config = _tyde_real_read_raw_config()
+        if getattr(_tyde_state, "saving", False):
+            return config
+        return _tyde_merge(config)
+
+    def _tyde_load_config():
+        config = _tyde_real_load_config()
+        if getattr(_tyde_state, "saving", False):
+            return config
+        return _tyde_merge(config)
+
+    def _tyde_load_config_readonly():
+        config = _tyde_real_load_config_readonly()
+        if getattr(_tyde_state, "saving", False):
+            return config
+        return _tyde_merge(config)
+
+    def _tyde_save_config(config, *args, **kwargs):
+        clean = copy.deepcopy(config) if isinstance(config, dict) else {}
+        native = _tyde_real_read_raw_config()
+        native_servers = native.get("mcp_servers") if isinstance(native, dict) else None
+        native_servers = native_servers if isinstance(native_servers, dict) else {}
+        clean_servers = clean.get("mcp_servers")
+        clean_servers = copy.deepcopy(clean_servers) if isinstance(clean_servers, dict) else {}
+        for name in _tyde_injected:
+            if name in native_servers:
+                clean_servers[name] = copy.deepcopy(native_servers[name])
+            else:
+                clean_servers.pop(name, None)
+        if clean_servers:
+            clean["mcp_servers"] = clean_servers
+        else:
+            clean.pop("mcp_servers", None)
+        _tyde_state.saving = True
+        try:
+            return _tyde_real_save_config(clean, *args, **kwargs)
+        finally:
+            _tyde_state.saving = False
+
+    _tyde_config.read_raw_config = _tyde_read_raw_config
+    _tyde_config.load_config = _tyde_load_config
+    _tyde_config.load_config_readonly = _tyde_load_config_readonly
+    _tyde_config.save_config = _tyde_save_config
+
+    from tui_gateway import server as _tyde_gateway_server
+    _tyde_real_load_enabled_toolsets = _tyde_gateway_server._load_enabled_toolsets
+
+    def _tyde_load_enabled_toolsets():
+        selected = _tyde_real_load_enabled_toolsets()
+        if selected is None:
+            return None
+        selected = list(selected)
+        for name in _tyde_injected:
+            if name not in selected:
+                selected.append(name)
+        return selected
+
+    _tyde_gateway_server._load_enabled_toolsets = _tyde_load_enabled_toolsets
+except Exception as exc:
+    print(f"Tyde Hermes MCP bootstrap failed: {exc}", file=sys.stderr, flush=True)
+    raise SystemExit(2)
+
+runpy.run_module("tui_gateway.entry", run_name="__main__")
+"#;
 
 #[cfg(test)]
 static TEST_HERMES_PYTHON: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -310,7 +410,8 @@ impl Backend for HermesBackend {
     ) -> Result<(Self, EventStream), String> {
         reject_unverified_capabilities(&config, &initial_input)?;
         let resolved_settings = resolve_session_settings(&config);
-        let (gateway, gateway_events_rx) = HermesGatewayHandle::spawn(&workspace_roots).await?;
+        let (gateway, gateway_events_rx) =
+            HermesGatewayHandle::spawn(&workspace_roots, &config.startup_mcp_servers).await?;
         let create_params = build_session_create_params(
             &workspace_roots,
             &config.resolved_spawn_config,
@@ -346,7 +447,8 @@ impl Backend for HermesBackend {
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
         reject_unverified_resume_capabilities(&config)?;
-        let (gateway, gateway_events_rx) = HermesGatewayHandle::spawn(&workspace_roots).await?;
+        let (gateway, gateway_events_rx) =
+            HermesGatewayHandle::spawn(&workspace_roots, &config.startup_mcp_servers).await?;
         let resume = gateway
             .request(
                 "session.resume",
@@ -404,7 +506,7 @@ impl Backend for HermesBackend {
     }
 
     async fn list_sessions() -> Result<Vec<BackendSession>, String> {
-        let (gateway, _gateway_events_rx) = HermesGatewayHandle::spawn(&[]).await?;
+        let (gateway, _gateway_events_rx) = HermesGatewayHandle::spawn(&[], &[]).await?;
         let result = gateway
             .request("session.list", json!({ "limit": 200 }))
             .await;
@@ -454,7 +556,7 @@ impl Backend for HermesBackend {
 pub(crate) async fn probe_session_settings_schema(
     workspace_roots: &[String],
 ) -> Result<SessionSettingsSchema, String> {
-    let (gateway, _events) = HermesGatewayHandle::spawn(workspace_roots).await?;
+    let (gateway, _events) = HermesGatewayHandle::spawn(workspace_roots, &[]).await?;
     let options = gateway.request("model.options", json!({})).await;
     gateway.shutdown().await;
     session_settings_schema_from_model_options(&options?)
@@ -463,7 +565,7 @@ pub(crate) async fn probe_session_settings_schema(
 pub(crate) async fn probe_backend_config_snapshot(
     workspace_roots: &[String],
 ) -> Result<BackendConfigValues, String> {
-    let (gateway, _events) = HermesGatewayHandle::spawn(workspace_roots).await?;
+    let (gateway, _events) = HermesGatewayHandle::spawn(workspace_roots, &[]).await?;
     let options = gateway.request("model.options", json!({})).await;
     gateway.shutdown().await;
     hermes_backend_config_snapshot_from_model_options(&options?)
@@ -889,18 +991,44 @@ impl HermesSessionActor {
 impl HermesGatewayHandle {
     async fn spawn(
         workspace_roots: &[String],
+        startup_mcp_servers: &[StartupMcpServer],
     ) -> Result<(Self, mpsc::UnboundedReceiver<HermesGatewayEvent>), String> {
-        let target = resolve_gateway_spawn_target(workspace_roots).await?;
+        let mut target = resolve_gateway_spawn_target(workspace_roots).await?;
+        let mcp_bootstrap = hermes_mcp_bootstrap_payload(startup_mcp_servers)?;
+        if mcp_bootstrap.is_some() {
+            target.args = vec!["-c".to_string(), HERMES_MCP_BOOTSTRAP.to_string()];
+            target.display_program = format!("{} with Tyde MCP bootstrap", target.display_program);
+            tracing::info!(
+                mcp_servers = ?startup_mcp_servers
+                    .iter()
+                    .map(|server| server.name.as_str())
+                    .collect::<Vec<_>>(),
+                "Starting Hermes gateway with process-local MCP config overlay"
+            );
+        }
         let startup_timeout =
             duration_from_env_ms(HERMES_STARTUP_TIMEOUT_ENV, HERMES_STARTUP_TIMEOUT);
         let request_timeout = duration_from_env_ms(HERMES_RPC_TIMEOUT_ENV, HERMES_REQUEST_TIMEOUT);
 
         let mut child = spawn_gateway_child(&target).await?;
-        let stdin = child
+        let mut stdin = child
             .inner()
             .stdin
             .take()
             .ok_or_else(|| "Failed to capture Hermes gateway stdin".to_string())?;
+        if let Some(payload) = mcp_bootstrap
+            && let Err(err) = async {
+                stdin.write_all(payload.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                stdin.flush().await
+            }
+            .await
+        {
+            let _ = child.kill().await;
+            return Err(format!(
+                "Failed to inject Tyde MCP configuration into Hermes gateway: {err}"
+            ));
+        }
         let stdout = child
             .inner()
             .stdout
@@ -1790,16 +1918,78 @@ fn reject_unverified_capabilities(
 }
 
 fn reject_unverified_resume_capabilities(config: &BackendSpawnConfig) -> Result<(), String> {
-    if !config.startup_mcp_servers.is_empty() {
-        return Err("Hermes MCP injection is not enabled because tui_gateway MCP startup parameters have not been verified".to_string());
-    }
-    if !config.resolved_spawn_config.mcp_servers.is_empty() {
-        return Err("Hermes custom MCP servers are not enabled because tui_gateway MCP startup parameters have not been verified".to_string());
-    }
     if config.resolved_spawn_config.tool_policy != protocol::ToolPolicy::Unrestricted {
         return Err("Hermes custom tool policies are not enabled because the native gateway policy mapping has not been verified".to_string());
     }
     Ok(())
+}
+
+fn hermes_mcp_bootstrap_payload(
+    startup_mcp_servers: &[StartupMcpServer],
+) -> Result<Option<String>, String> {
+    if startup_mcp_servers.is_empty() {
+        return Ok(None);
+    }
+
+    let mut servers = serde_json::Map::new();
+    for server in startup_mcp_servers {
+        let name = server.name.trim();
+        if name.is_empty() {
+            return Err("Hermes MCP server name must not be blank".to_string());
+        }
+        if servers.contains_key(name) {
+            return Err(format!("Hermes MCP server name '{name}' is duplicated"));
+        }
+
+        let config = match &server.transport {
+            StartupMcpTransport::Stdio { command, args, env } => {
+                let command = command.trim();
+                if command.is_empty() {
+                    return Err(format!(
+                        "Hermes MCP server '{name}' stdio command must not be blank"
+                    ));
+                }
+                json!({
+                    "command": command,
+                    "args": args,
+                    "env": env,
+                })
+            }
+            StartupMcpTransport::Http {
+                url,
+                headers,
+                bearer_token_env_var,
+            } => {
+                let url = url.trim();
+                if url.is_empty() {
+                    return Err(format!(
+                        "Hermes MCP server '{name}' HTTP URL must not be blank"
+                    ));
+                }
+                let mut headers = headers.clone();
+                if let Some(env_var) = bearer_token_env_var
+                    .as_ref()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                {
+                    headers.retain(|header, _| !header.eq_ignore_ascii_case("authorization"));
+                    headers.insert(
+                        "Authorization".to_string(),
+                        format!("Bearer ${{{env_var}}}"),
+                    );
+                }
+                json!({
+                    "url": url,
+                    "headers": headers,
+                })
+            }
+        };
+        servers.insert(name.to_string(), config);
+    }
+
+    serde_json::to_string(&json!({ "mcp_servers": servers }))
+        .map(Some)
+        .map_err(|err| format!("Failed to serialize Hermes MCP configuration: {err}"))
 }
 
 fn build_session_create_params(
@@ -3245,6 +3435,106 @@ mod tests {
         launcher.to_string_lossy().to_string()
     }
 
+    fn write_fake_mcp_bootstrap_gateway(
+        dir: &TempDir,
+    ) -> (String, std::path::PathBuf, std::path::PathBuf) {
+        let hermes_cli = dir.path().join("hermes_cli");
+        let tui_gateway = dir.path().join("tui_gateway");
+        fs::create_dir_all(&hermes_cli).expect("create fake hermes_cli package");
+        fs::create_dir_all(&tui_gateway).expect("create fake tui_gateway package");
+        fs::write(hermes_cli.join("__init__.py"), "").expect("write hermes_cli package");
+        fs::write(tui_gateway.join("__init__.py"), "").expect("write tui_gateway package");
+        fs::write(
+            tui_gateway.join("server.py"),
+            "def _load_enabled_toolsets():\n    return ['file']\n",
+        )
+        .expect("write fake gateway server module");
+        fs::write(
+            dir.path().join("hermes_bootstrap.py"),
+            "def harden_import_path():\n    pass\n",
+        )
+        .expect("write fake Hermes bootstrap module");
+
+        let observed = dir.path().join("observed.json");
+        let saved = dir.path().join("saved.json");
+        let saved_json = serde_json::to_string(&saved.to_string_lossy()).expect("serialize path");
+        fs::write(
+            hermes_cli.join("config.py"),
+            format!(
+                r#"
+import copy, json
+_native = {{
+    "model": {{"default": "native-model"}},
+    "mcp_servers": {{
+        "native": {{"command": "native-command", "args": []}},
+        "shared": {{"url": "https://native.invalid/mcp"}}
+    }}
+}}
+
+def read_raw_config():
+    return copy.deepcopy(_native)
+
+def load_config():
+    return copy.deepcopy(_native)
+
+def load_config_readonly():
+    return copy.deepcopy(_native)
+
+def save_config(config, *args, **kwargs):
+    with open({saved_json}, "w", encoding="utf-8") as output:
+        json.dump(config, output, sort_keys=True)
+"#
+            ),
+        )
+        .expect("write fake Hermes config module");
+
+        let observed_json =
+            serde_json::to_string(&observed.to_string_lossy()).expect("serialize path");
+        fs::write(
+            tui_gateway.join("entry.py"),
+            format!(
+                r#"
+import json, sys
+from hermes_cli.config import load_config, load_config_readonly, read_raw_config, save_config
+from tui_gateway.server import _load_enabled_toolsets
+
+with open({observed_json}, "w", encoding="utf-8") as output:
+    json.dump({{
+        "raw": read_raw_config(),
+        "loaded": load_config(),
+        "readonly": load_config_readonly(),
+        "toolsets": _load_enabled_toolsets()
+    }}, output, sort_keys=True)
+changed = load_config()
+changed["mcp_servers"]["native"]["enabled"] = False
+save_config(changed)
+print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"gateway.ready","payload":{{"skin":"default"}}}}}}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request["id"]
+    method = request["method"]
+    params = request.get("params") or {{}}
+    if method == "session.create":
+        result = {{"session_id":"live-mcp","stored_session_id":"stored-mcp","messages":[],"info":{{}}}}
+    elif method == "prompt.submit":
+        result = {{"status":"streaming"}}
+    elif method == "session.usage":
+        result = {{"input":0,"output":0,"total":0}}
+    else:
+        result = {{}}
+    print(json.dumps({{"jsonrpc":"2.0","id":request_id,"result":result}}), flush=True)
+    if method == "prompt.submit":
+        session_id = params["session_id"]
+        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.start","session_id":session_id}}}}), flush=True)
+        print(json.dumps({{"jsonrpc":"2.0","method":"event","params":{{"type":"message.complete","session_id":session_id,"payload":{{"text":"mcp ready","status":"complete"}}}}}}), flush=True)
+"#
+            ),
+        )
+        .expect("write fake gateway entry module");
+
+        ("python3".to_string(), observed, saved)
+    }
+
     fn write_fake_hermes_cli_install(dir: &TempDir) -> (String, String) {
         let project = dir.path().join("hermes-agent");
         fs::create_dir_all(&project).expect("create fake Hermes project");
@@ -3475,7 +3765,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn hermes_rejects_images_and_mcp_until_verified() {
+    async fn hermes_rejects_images_until_verified() {
         let mut with_image = payload("hello");
         with_image.images = Some(vec![protocol::ImageData {
             media_type: "image/png".to_string(),
@@ -3488,23 +3778,88 @@ for line in sys.stdin:
             Err(err) => err,
         };
         assert!(err.contains("image input is disabled"));
+    }
+
+    #[tokio::test]
+    async fn hermes_gateway_injects_mcp_config_without_persisting_it() {
+        let _test_lock = TEST_HERMES_OVERRIDE_LOCK.lock().await;
+        let dir = TempDir::new().expect("tempdir");
+        let (fake, observed_path, saved_path) = write_fake_mcp_bootstrap_gateway(&dir);
+        let _guard = TestHermesPythonGuard::set(&fake);
+
+        let startup_mcp_servers = vec![
+            StartupMcpServer {
+                name: "local".to_string(),
+                transport: StartupMcpTransport::Stdio {
+                    command: "node".to_string(),
+                    args: vec!["server.js".to_string()],
+                    env: HashMap::from([("LOCAL_KEY".to_string(), "value".to_string())]),
+                },
+            },
+            StartupMcpServer {
+                name: "shared".to_string(),
+                transport: StartupMcpTransport::Http {
+                    url: "https://tyde.invalid/mcp".to_string(),
+                    headers: HashMap::from([("X-Tyde".to_string(), "yes".to_string())]),
+                    bearer_token_env_var: Some("TYDE_MCP_TOKEN".to_string()),
+                },
+            },
+        ];
 
         let config = BackendSpawnConfig {
-            startup_mcp_servers: vec![crate::backend::StartupMcpServer {
-                name: "server".to_string(),
-                transport: crate::backend::StartupMcpTransport::Http {
-                    url: "http://localhost".to_string(),
-                    headers: HashMap::new(),
-                    bearer_token_env_var: None,
-                },
-            }],
+            startup_mcp_servers,
             ..BackendSpawnConfig::default()
         };
-        let err = match HermesBackend::spawn(Vec::new(), config, payload("hello")).await {
-            Ok(_) => panic!("MCP injection should be disabled"),
-            Err(err) => err,
-        };
-        assert!(err.contains("MCP injection"));
+        let (backend, mut events) = HermesBackend::spawn(
+            vec![dir.path().to_string_lossy().to_string()],
+            config,
+            payload("verify MCP startup"),
+        )
+        .await
+        .expect("spawn bootstrapped fake Hermes backend");
+
+        timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, ChatEvent::StreamEnd(_)) {
+                    return;
+                }
+            }
+            panic!("Hermes event stream closed before the MCP test turn completed");
+        })
+        .await
+        .expect("MCP test turn should finish");
+
+        let observed: Value = serde_json::from_slice(
+            &fs::read(&observed_path).expect("read observed process config"),
+        )
+        .expect("parse observed process config");
+        for view in ["raw", "loaded", "readonly"] {
+            let servers = &observed[view]["mcp_servers"];
+            assert_eq!(servers["native"]["command"], "native-command");
+            assert_eq!(servers["local"]["command"], "node");
+            assert_eq!(servers["local"]["args"], json!(["server.js"]));
+            assert_eq!(servers["local"]["env"]["LOCAL_KEY"], "value");
+            assert_eq!(servers["shared"]["url"], "https://tyde.invalid/mcp");
+            assert_eq!(servers["shared"]["headers"]["X-Tyde"], "yes");
+            assert_eq!(
+                servers["shared"]["headers"]["Authorization"],
+                "Bearer ${TYDE_MCP_TOKEN}"
+            );
+        }
+        assert_eq!(observed["toolsets"], json!(["file", "local", "shared"]));
+
+        let saved: Value =
+            serde_json::from_slice(&fs::read(&saved_path).expect("read persisted config"))
+                .expect("parse persisted config");
+        assert_eq!(saved["mcp_servers"]["native"]["command"], "native-command");
+        assert_eq!(saved["mcp_servers"]["native"]["enabled"], false);
+        assert_eq!(
+            saved["mcp_servers"]["shared"]["url"],
+            "https://native.invalid/mcp"
+        );
+        assert!(saved["mcp_servers"].get("local").is_none());
+
+        backend.shutdown().await;
     }
 
     #[tokio::test]

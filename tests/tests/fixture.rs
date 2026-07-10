@@ -49,6 +49,7 @@ pub struct Fixture {
     host: server::HostHandle,
     #[allow(dead_code)]
     session_store_dir: tempfile::TempDir,
+    antigravity_conversations_dir: tempfile::TempDir,
 }
 
 impl Fixture {
@@ -85,6 +86,10 @@ impl Fixture {
         // output opt back in via `new_with_real_backend_probe`.
         runtime_config.skip_real_backend_probe = skip_real_backend_probe;
 
+        let antigravity_conversations_dir =
+            tempfile::tempdir().expect("create Antigravity conversations tempdir");
+        runtime_config.antigravity_conversations_dir =
+            Some(antigravity_conversations_dir.path().to_path_buf());
         let session_store_dir = tempfile::tempdir().expect("create session tempdir");
         let session_path = session_store_dir.path().join("sessions.json");
         let project_path = session_store_dir.path().join("projects.json");
@@ -103,6 +108,7 @@ impl Fixture {
             bootstrap,
             host,
             session_store_dir,
+            antigravity_conversations_dir,
         }
     }
 
@@ -126,10 +132,11 @@ impl Fixture {
 
     #[allow(dead_code)]
     pub async fn connect_fresh_host(&self) -> client::Connection {
-        let host = server::spawn_host_with_mock_backend(
+        let host = server::spawn_host_with_mock_backend_and_runtime_config(
             self.session_store_path(),
             self.project_store_path(),
             self.settings_store_path(),
+            self.fresh_host_runtime_config(),
         )
         .expect("initialize fresh host with existing stores");
         connect_client(host).await
@@ -139,10 +146,11 @@ impl Fixture {
     pub async fn connect_fresh_host_with_bootstrap(
         &self,
     ) -> (client::Connection, HostBootstrapPayload) {
-        let host = server::spawn_host_with_mock_backend(
+        let host = server::spawn_host_with_mock_backend_and_runtime_config(
             self.session_store_path(),
             self.project_store_path(),
             self.settings_store_path(),
+            self.fresh_host_runtime_config(),
         )
         .expect("initialize fresh host with existing stores");
         connect_client_with_bootstrap(host).await
@@ -180,9 +188,24 @@ impl Fixture {
         self.session_store_dir.path().join("settings.json")
     }
 
+    fn fresh_host_runtime_config(&self) -> server::HostRuntimeConfig {
+        server::HostRuntimeConfig {
+            antigravity_conversations_dir: Some(
+                self.antigravity_conversations_dir.path().to_path_buf(),
+            ),
+            skip_real_backend_probe: true,
+            ..server::HostRuntimeConfig::default()
+        }
+    }
+
     #[allow(dead_code)]
     pub fn store_dir(&self) -> &Path {
         self.session_store_dir.path()
+    }
+
+    #[allow(dead_code)]
+    pub fn antigravity_conversations_dir(&self) -> &Path {
+        self.antigravity_conversations_dir.path()
     }
 }
 

@@ -791,12 +791,14 @@ async fn stable_reconnect_does_not_emit_unchanged_session_schemas_after_bootstra
     let settings_path = dir.path().join("settings.json");
     write_enabled_backends_settings(&settings_path, &[BackendKind::Kiro]);
     let missing_kiro = dir.path().join("missing-kiro-cli-chat");
+    let kiro_workspace = tempfile::tempdir().expect("Kiro probe workspace tempdir");
     let host = server::spawn_host_with_mock_backend_and_runtime_config(
         dir.path().join("sessions.json"),
         dir.path().join("projects.json"),
         settings_path,
         server::HostRuntimeConfig {
             kiro_probe_program: Some(missing_kiro.to_string_lossy().into_owned()),
+            kiro_probe_workspace_root: Some(kiro_workspace.path().to_path_buf()),
             skip_real_backend_probe: true,
             ..Default::default()
         },
@@ -814,12 +816,25 @@ async fn stable_reconnect_does_not_emit_unchanged_session_schemas_after_bootstra
     .await;
     let first_schemas: SessionSchemasPayload =
         first_live.parse_payload().expect("first SessionSchemas");
+    let kiro_schema = first_schemas
+        .schemas
+        .iter()
+        .find(|schema| schema.backend_kind() == BackendKind::Kiro)
+        .expect("Kiro schema should be present");
+    let protocol::SessionSchemaEntry::Unavailable { message, .. } = kiro_schema else {
+        panic!("missing Kiro executable should make its schema unavailable: {kiro_schema:?}");
+    };
     assert!(
-        matches!(
-            first_schemas.schemas.first(),
-            Some(protocol::SessionSchemaEntry::Unavailable { .. })
-        ),
-        "test expects the fake Kiro probe to settle to an unavailable schema"
+        message.contains("Kiro schema probe stage 'acp_spawn'"),
+        "missing Kiro executable should fail during acp_spawn: {message}"
+    );
+    assert!(
+        message.contains(missing_kiro.to_string_lossy().as_ref()),
+        "Kiro schema failure should identify the missing executable: {message}"
+    );
+    assert!(
+        kiro_workspace.path().join(".tyde/kiro-admin").is_dir(),
+        "Kiro probe should create its admin cwd under the isolated workspace"
     );
 
     let mut second = connect_raw(host).await;

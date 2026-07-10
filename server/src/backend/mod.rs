@@ -16,9 +16,9 @@ use std::collections::HashMap;
 use protocol::{
     AgentErrorCode, AgentInput, BackendAccessMode, BackendConfigFieldType, BackendConfigSchema,
     BackendConfigSnapshot, BackendConfigSnapshotStatus, BackendConfigValues, BackendKind,
-    BackendTierConfig, ChatEvent, CustomAgentId, ImageData, SendMessagePayload, SessionId,
-    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
-    SpawnCostHint,
+    BackendTierConfig, ChatEvent, CustomAgentId, ImageData, ModelRequestTokenUsage,
+    SendMessagePayload, SessionId, SessionSettingFieldType, SessionSettingValue,
+    SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -151,18 +151,36 @@ pub struct BackendSpawnConfig {
     pub resolved_spawn_config: ResolvedSpawnConfig,
 }
 
-/// Output stream of ChatEvents from a backend session.
-/// The agent actor reads from this while independently sending AgentInput
-/// through the Backend handle — true duplex.
+/// Output stream from a backend session. The agent actor receives both chat
+/// events and backend-only accounting events while independently sending
+/// AgentInput through the Backend handle.
+#[derive(Debug, Clone)]
+pub(crate) enum BackendEvent {
+    Chat(ChatEvent),
+    ModelRequestTokenUsage(ModelRequestTokenUsage),
+}
+
+enum EventStreamReceiver {
+    Chat(mpsc::UnboundedReceiver<ChatEvent>),
+    Backend(mpsc::UnboundedReceiver<BackendEvent>),
+}
+
 pub struct EventStream {
-    rx: mpsc::UnboundedReceiver<ChatEvent>,
+    rx: EventStreamReceiver,
     resume_replay_complete: Option<oneshot::Receiver<()>>,
 }
 
 impl EventStream {
     pub fn new(rx: mpsc::UnboundedReceiver<ChatEvent>) -> Self {
         Self {
-            rx,
+            rx: EventStreamReceiver::Chat(rx),
+            resume_replay_complete: None,
+        }
+    }
+
+    pub(crate) fn new_backend(rx: mpsc::UnboundedReceiver<BackendEvent>) -> Self {
+        Self {
+            rx: EventStreamReceiver::Backend(rx),
             resume_replay_complete: None,
         }
     }
@@ -172,7 +190,17 @@ impl EventStream {
         resume_replay_complete: oneshot::Receiver<()>,
     ) -> Self {
         Self {
-            rx,
+            rx: EventStreamReceiver::Chat(rx),
+            resume_replay_complete: Some(resume_replay_complete),
+        }
+    }
+
+    pub(crate) fn new_backend_with_resume_replay_barrier(
+        rx: mpsc::UnboundedReceiver<BackendEvent>,
+        resume_replay_complete: oneshot::Receiver<()>,
+    ) -> Self {
+        Self {
+            rx: EventStreamReceiver::Backend(rx),
             resume_replay_complete: Some(resume_replay_complete),
         }
     }
@@ -180,13 +208,37 @@ impl EventStream {
     /// Receive the next ChatEvent from the backend.
     /// Returns None when the backend has terminated.
     pub async fn recv(&mut self) -> Option<ChatEvent> {
-        self.rx.recv().await
+        loop {
+            match self.recv_backend().await? {
+                BackendEvent::Chat(event) => return Some(event),
+                BackendEvent::ModelRequestTokenUsage(_) => {}
+            }
+        }
     }
 
     /// Non-blocking receive used to drain already-buffered backend events
     /// (e.g. queued resume-replay events) without awaiting new ones.
     pub fn try_recv(&mut self) -> Result<ChatEvent, mpsc::error::TryRecvError> {
-        self.rx.try_recv()
+        loop {
+            match self.try_recv_backend()? {
+                BackendEvent::Chat(event) => return Ok(event),
+                BackendEvent::ModelRequestTokenUsage(_) => {}
+            }
+        }
+    }
+
+    pub(crate) async fn recv_backend(&mut self) -> Option<BackendEvent> {
+        match &mut self.rx {
+            EventStreamReceiver::Chat(rx) => rx.recv().await.map(BackendEvent::Chat),
+            EventStreamReceiver::Backend(rx) => rx.recv().await,
+        }
+    }
+
+    pub(crate) fn try_recv_backend(&mut self) -> Result<BackendEvent, mpsc::error::TryRecvError> {
+        match &mut self.rx {
+            EventStreamReceiver::Chat(rx) => rx.try_recv().map(BackendEvent::Chat),
+            EventStreamReceiver::Backend(rx) => rx.try_recv(),
+        }
     }
 
     pub fn take_resume_replay_complete(&mut self) -> Option<oneshot::Receiver<()>> {

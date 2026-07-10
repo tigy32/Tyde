@@ -176,6 +176,30 @@ pub async fn authenticate_managed(qr_uri: &str) -> MobileServiceAuthState {
     }
 }
 
+/// Web-only: resolve the OAuth callback that returned to this app at boot. The
+/// web service coordinates this with reconnect credential minting so both paths
+/// observe one exchange result instead of racing for the one-time marker.
+pub async fn complete_boot_managed_auth_callback() -> Option<MobileServiceAuthState> {
+    if use_web_backend() {
+        web::complete_boot_managed_auth_callback().await
+    } else {
+        None
+    }
+}
+
+/// Web-only: re-probe the current cookie-backed managed session without a QR.
+/// Used by the no-pending-QR pass/paywall and retryable-service screens.
+pub async fn probe_managed_auth() -> MobileServiceAuthState {
+    if use_web_backend() {
+        web::probe_managed_auth().await
+    } else {
+        MobileServiceAuthState::ServiceUnavailable {
+            message: "Managed authentication is handled by the native app shell.".to_owned(),
+            retryable: false,
+        }
+    }
+}
+
 /// Web-only: redeem a managed offer (`POST /pairings/redeem`) and connect to the
 /// managed broker. Native shells never reach this path (they produce a
 /// `DirectPairing` offer), so it returns a terminal outcome there.

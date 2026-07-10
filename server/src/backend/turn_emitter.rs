@@ -26,8 +26,8 @@
 //!
 //! Non-`ChatEvent` wire kinds (`Settings`, `SessionStarted`,
 //! `SessionsList`, `ProfilesList`, `ModuleSchemas`, `ModelsList`,
-//! `ConversationCleared`, backend `Error`) also have typed methods so
-//! no backend needs to reach past the emitter.
+//! `ConversationCleared`, `ModelRequestTokenUsage`, backend `Error`) also
+//! have typed methods so no backend needs to reach past the emitter.
 
 use std::collections::HashSet;
 
@@ -35,7 +35,7 @@ use indexmap::IndexMap;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use protocol::{TaskList, TokenUsageUnavailableReason};
+use protocol::{ModelRequestTokenUsage, TaskList, TokenUsageUnavailableReason};
 
 /// Sender half of the wire channel. Kept private to this module; every
 /// emission must go through the typed methods below.
@@ -300,6 +300,14 @@ impl TurnEmitter {
 
     pub fn message_metadata_updated(&self, payload: MessageMetadataUpdatePayload) {
         self.lock().message_metadata_updated(payload);
+    }
+
+    pub fn model_request_token_usage(&self, usage: &ModelRequestTokenUsage) {
+        let data = serde_json::to_value(usage).expect("model request token usage must serialize");
+        self.lock().send(json!({
+            "kind": "ModelRequestTokenUsage",
+            "data": data,
+        }));
     }
 
     // ---------- Misc chat events ----------

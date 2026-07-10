@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,11 +10,12 @@ use protocol::{
     AgentBootstrapPayload, AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, AgentOrigin,
     AgentRenamedPayload, AgentStartPayload, BackendAccessMode, BackendKind, ChatEvent, ChatMessage,
     ChatMessageId, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin, MessageSender,
-    MessageTokenUsage, QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload,
-    ReviewErrorContext, SendMessagePayload, SessionId, SessionSettingsPayload,
-    SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
-    TaskTokenUsageAmount, TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage,
-    TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult,
+    MessageTokenUsage, ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry, QueuedMessageId,
+    QueuedMessagesPayload, ReviewErrorContext, SendMessagePayload, SessionId,
+    SessionSettingsPayload, SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData,
+    StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
+    TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    ToolExecutionCompletedData, ToolExecutionResult,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -27,7 +29,7 @@ use crate::backend::kiro::KiroBackend;
 use crate::backend::mock::MockBackend;
 use crate::backend::tycode::TycodeBackend;
 use crate::backend::{
-    Backend, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
+    Backend, BackendEvent, BackendSession, BackendSpawnConfig, BackendStartupError, EventStream,
     StartupMcpServer, apply_session_settings_update, resolve_backend_session_settings,
     validate_runtime_session_settings_update, validate_session_settings_values,
 };
@@ -103,6 +105,14 @@ struct AgentNameChangeContext<'a> {
     start_tx: &'a watch::Sender<AgentStartPayload>,
     event_log: &'a mut [Envelope],
     subscribers: &'a mut Vec<Stream>,
+}
+
+pub(crate) struct AgentActorRuntimeContext {
+    pub(crate) session_store: Arc<Mutex<SessionStore>>,
+    pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    pub(crate) review_registry: ReviewRegistryHandle,
+    pub(crate) status_handle: registry::AgentStatusHandle,
+    pub(crate) antigravity_conversations_dir: PathBuf,
 }
 
 enum AgentCommand {
@@ -413,6 +423,14 @@ pub(crate) struct AgentHandle {
 enum TokenUsageSource {
     Message(ChatMessageId),
     EventSeq(u64),
+    ModelRequest(ModelRequestId),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TokenUsageTrackingMode {
+    #[default]
+    Messages,
+    ModelRequests,
 }
 
 #[derive(Debug, Default)]
@@ -422,9 +440,21 @@ struct AgentActivityStatsTracker {
     token_usage_by_source: HashMap<TokenUsageSource, TaskTokenUsageScope>,
     active_reasoning: String,
     latest_model: Option<String>,
+    token_usage_tracking_mode: TokenUsageTrackingMode,
 }
 
 impl AgentActivityStatsTracker {
+    fn for_backend(backend_kind: BackendKind) -> Self {
+        Self {
+            token_usage_tracking_mode: if backend_kind == BackendKind::Codex {
+                TokenUsageTrackingMode::ModelRequests
+            } else {
+                TokenUsageTrackingMode::Messages
+            },
+            ..Self::default()
+        }
+    }
+
     fn snapshot(&self) -> AgentActivityStats {
         self.stats.clone()
     }
@@ -557,6 +587,26 @@ impl AgentActivityStatsTracker {
         self.stats != previous
     }
 
+    fn observe_model_request_token_usage(
+        &mut self,
+        usage: ModelRequestTokenUsage,
+        source_seq: u64,
+    ) -> bool {
+        if self.token_usage_tracking_mode != TokenUsageTrackingMode::ModelRequests {
+            return false;
+        }
+        let previous = self.stats.clone();
+        self.token_usage_by_source.insert(
+            TokenUsageSource::ModelRequest(usage.request_id),
+            TaskTokenUsageScope::Known {
+                usage: Box::new(TaskTokenUsageAmount::from_token_usage(&usage.request)),
+            },
+        );
+        self.stats.token_usage = usage.cumulative;
+        self.stats.source_through_seq = Some(source_seq);
+        self.stats != previous
+    }
+
     fn observe_model(&mut self, model_info: Option<&protocol::ModelInfo>) {
         let Some(model) = model_info
             .map(|info| info.model.trim())
@@ -578,6 +628,11 @@ impl AgentActivityStatsTracker {
     }
 
     fn stamp_message_turn_token_usage(&mut self, message: &mut ChatMessage, source_seq: u64) {
+        if self.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests
+            && message.token_usage.is_none()
+        {
+            return;
+        }
         let source = token_usage_source_for_message(message, source_seq);
         message.token_usage = Some(self.scoped_token_usage_for_source(
             source,
@@ -610,6 +665,9 @@ impl AgentActivityStatsTracker {
         let mut token_usage = token_usage.unwrap_or_else(|| {
             MessageTokenUsage::unavailable(TokenUsageUnavailableReason::BackendDidNotReport)
         });
+        if self.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests {
+            return token_usage;
+        }
         let Some(turn_usage) = token_usage.turn.known_usage().cloned() else {
             let reason = match token_usage.turn {
                 TokenUsageScope::Known { .. } => TaskTokenUsageUnavailableReason::AgentUnavailable,
@@ -1041,6 +1099,7 @@ pub(crate) async fn generate_agent_name(
         spawn_config,
         initial_input,
         host_sub_agent_spawn_tx,
+        None,
     )
     .await
     {
@@ -1164,6 +1223,7 @@ pub(crate) async fn generate_agent_activity_summary(
         spawn_config,
         initial_input,
         host_sub_agent_spawn_tx,
+        None,
     )
     .await
     {
@@ -1388,6 +1448,7 @@ async fn spawn_backend(
     config: BackendSpawnConfig,
     initial_input: SendMessagePayload,
     host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    antigravity_conversations_dir: Option<PathBuf>,
 ) -> BackendSpawnResult {
     match backend_kind {
         BackendKind::Tycode => {
@@ -1429,8 +1490,17 @@ async fn spawn_backend(
             Ok((Box::new(b), events, session_id))
         }
         BackendKind::Antigravity => {
-            let (b, events) =
-                AntigravityBackend::spawn(workspace_roots, config, initial_input).await?;
+            let conversations_dir =
+                crate::backend::antigravity::resolve_antigravity_conversations_dir(
+                    antigravity_conversations_dir.as_deref(),
+                )?;
+            let (b, events) = AntigravityBackend::spawn_with_conversations_dir(
+                workspace_roots,
+                config,
+                initial_input,
+                conversations_dir,
+            )
+            .await?;
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
@@ -1449,6 +1519,7 @@ async fn resume_backend(
     config: BackendSpawnConfig,
     session_id: SessionId,
     host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
+    antigravity_conversations_dir: Option<PathBuf>,
 ) -> BackendResumeResult {
     let (backend, events): (BackendHandle, EventStream) = match backend_kind {
         BackendKind::Tycode => {
@@ -1482,8 +1553,17 @@ async fn resume_backend(
             (Box::new(b), events)
         }
         BackendKind::Antigravity => {
-            let (b, events) =
-                AntigravityBackend::resume(workspace_roots, config, session_id).await?;
+            let conversations_dir =
+                crate::backend::antigravity::resolve_antigravity_conversations_dir(
+                    antigravity_conversations_dir.as_deref(),
+                )?;
+            let (b, events) = AntigravityBackend::resume_with_conversations_dir(
+                workspace_roots,
+                config,
+                session_id,
+                conversations_dir,
+            )
+            .await?;
             (Box::new(b), events)
         }
         BackendKind::Hermes => {
@@ -1643,11 +1723,15 @@ pub(crate) fn spawn_agent_actor(
     agent_id: AgentId,
     start: AgentStartPayload,
     request: ResolvedSpawnRequest,
-    session_store: Arc<Mutex<SessionStore>>,
-    host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
-    review_registry: ReviewRegistryHandle,
-    status_handle: registry::AgentStatusHandle,
+    runtime: AgentActorRuntimeContext,
 ) -> (AgentHandle, oneshot::Receiver<Result<SessionId, String>>) {
+    let AgentActorRuntimeContext {
+        session_store,
+        host_sub_agent_spawn_tx,
+        review_registry,
+        status_handle,
+        antigravity_conversations_dir,
+    } = runtime;
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
     let accepting_input = Arc::new(AtomicBool::new(false));
     let accepting_input_task = Arc::clone(&accepting_input);
@@ -1692,7 +1776,7 @@ pub(crate) fn spawn_agent_actor(
         let mut replay_state = AgentReplayState::default();
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
-        let mut activity_stats = AgentActivityStatsTracker::default();
+        let mut activity_stats = AgentActivityStatsTracker::for_backend(backend_kind);
         let mut activity_event_seq = 0_u64;
         let mut current_session_id = resume_session_id.clone();
         let mut pending_alias = initial_alias;
@@ -1745,6 +1829,7 @@ pub(crate) fn spawn_agent_actor(
                             spawn_config.clone(),
                             session_id.clone(),
                             host_sub_agent_spawn_tx.clone(),
+                            Some(antigravity_conversations_dir.clone()),
                         )
                         .await
                     };
@@ -1801,6 +1886,7 @@ pub(crate) fn spawn_agent_actor(
                                 spawn_config,
                                 first_input,
                                 host_sub_agent_spawn_tx.clone(),
+                                Some(antigravity_conversations_dir),
                             )
                             .await
                         };
@@ -2002,8 +2088,8 @@ pub(crate) fn spawn_agent_actor(
 
         loop {
             tokio::select! {
-                maybe_event = events.recv() => {
-                    let Some(mut event) = maybe_event else {
+                maybe_event = events.recv_backend() => {
+                    let Some(event) = maybe_event else {
                         if let Some(compaction) = active_compaction.take() {
                             let _ = compaction
                                 .reply
@@ -2096,6 +2182,24 @@ pub(crate) fn spawn_agent_actor(
                         )
                         .await;
                         return;
+                    };
+                    let mut event = match event {
+                        BackendEvent::Chat(event) => event,
+                        BackendEvent::ModelRequestTokenUsage(usage) => {
+                            let source_seq = activity_event_seq;
+                            activity_event_seq = activity_event_seq.saturating_add(1);
+                            if activity_stats.observe_model_request_token_usage(usage, source_seq) {
+                                upsert_activity_stats_snapshot(
+                                    &canonical_stream,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    &current_start.agent_id,
+                                    activity_stats.snapshot(),
+                                )
+                                .await;
+                            }
+                            continue;
+                        }
                     };
                     if resume_replay_gate_pending {
                         ingest_gated_replay_event(
@@ -2493,19 +2597,39 @@ pub(crate) fn spawn_agent_actor(
                             // ingesting them here (rather than leaving them for a
                             // now-ungated `events.recv()`) keeps the full resume
                             // transcript off the live broadcast path.
-                            while let Ok(mut event) = events.try_recv() {
-                                ingest_gated_replay_event(
-                                    &mut event,
-                                    &canonical_stream,
-                                    &current_start.agent_id,
-                                    &mut event_log,
-                                    &mut subscribers,
-                                    &mut replay_state,
-                                    &mut activity_stats,
-                                    &mut active_stream_text,
-                                    &mut activity_event_seq,
-                                )
-                                .await;
+                            while let Ok(event) = events.try_recv_backend() {
+                                match event {
+                                    BackendEvent::Chat(mut event) => {
+                                        ingest_gated_replay_event(
+                                            &mut event,
+                                            &canonical_stream,
+                                            &current_start.agent_id,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            &mut replay_state,
+                                            &mut activity_stats,
+                                            &mut active_stream_text,
+                                            &mut activity_event_seq,
+                                        )
+                                        .await;
+                                    }
+                                    BackendEvent::ModelRequestTokenUsage(usage) => {
+                                        let source_seq = activity_event_seq;
+                                        activity_event_seq = activity_event_seq.saturating_add(1);
+                                        if activity_stats
+                                            .observe_model_request_token_usage(usage, source_seq)
+                                        {
+                                            upsert_activity_stats_snapshot(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &current_start.agent_id,
+                                                activity_stats.snapshot(),
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                }
                             }
                             resume_replay_gate_pending = false;
                             match result {
@@ -4843,7 +4967,7 @@ fn agent_usage_snapshot_from_log(
     start: &AgentStartPayload,
     event_log: &[Envelope],
 ) -> AgentUsageSnapshot {
-    let mut tracker = AgentActivityStatsTracker::default();
+    let mut tracker = AgentActivityStatsTracker::for_backend(start.backend_kind);
     let mut active_stream_text = String::new();
     let mut saw_replayable_usage_event = false;
     let mut latest_stats = None;
@@ -4877,6 +5001,18 @@ fn agent_usage_snapshot_from_log(
             }
             _ => {}
         }
+    }
+    if start.backend_kind == BackendKind::Codex
+        && let Some(stats) = latest_stats.as_ref()
+        && stats.token_usage.total_tokens > 0
+    {
+        return AgentUsageSnapshot {
+            start: start.clone(),
+            usage: TaskTokenUsageScope::Known {
+                usage: Box::new(TaskTokenUsageAmount::from_token_usage(&stats.token_usage)),
+            },
+            model: tracker.latest_model,
+        };
     }
     if saw_replayable_usage_event {
         let reported_usage_floor = latest_stats.as_ref().map(|stats| &stats.token_usage);
@@ -5568,11 +5704,11 @@ mod tests {
     use protocol::{
         AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
         AgentId, AgentInput, AgentStartPayload, ChatEvent, ChatMessage, ChatMessageId, FrameKind,
-        MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, ReasoningData,
-        SessionId, StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData, TaskList,
-        TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope,
-        TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult, ToolRequest,
-        ToolRequestType,
+        MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId,
+        ModelRequestTokenUsage, ModelTurnId, ReasoningData, SessionId, StreamEndData, StreamPath,
+        StreamStartData, StreamTextDeltaData, TaskList, TaskTokenUsageScope,
+        TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+        ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -6108,6 +6244,52 @@ mod tests {
         ));
         assert_eq!(stats.snapshot().token_usage.total_tokens, 22);
         assert_eq!(stats.snapshot().source_through_seq, Some(1));
+    }
+
+    #[test]
+    fn codex_activity_stats_use_model_requests_not_chat_records() {
+        let mut stats = AgentActivityStatsTracker::for_backend(protocol::BackendKind::Codex);
+        for sequence in 0..180 {
+            let mut message = assistant_message("intermediate Codex record");
+            message.message_id = Some(ChatMessageId(format!("message-{sequence}")));
+            let mut event = ChatEvent::MessageAdded(message);
+            stats.observe_chat_event(&mut event, sequence, "");
+            let ChatEvent::MessageAdded(message) = event else {
+                unreachable!();
+            };
+            assert!(message.token_usage.is_none());
+        }
+
+        let first = ModelRequestTokenUsage {
+            request_id: ModelRequestId {
+                turn_id: ModelTurnId("turn-1".to_owned()),
+                sequence: 0,
+            },
+            request: token_usage(40),
+            turn: token_usage(40),
+            cumulative: token_usage(1_000),
+            model_context_window: Some(400_000),
+        };
+        assert!(stats.observe_model_request_token_usage(first, 180));
+
+        let second = ModelRequestTokenUsage {
+            request_id: ModelRequestId {
+                turn_id: ModelTurnId("turn-1".to_owned()),
+                sequence: 1,
+            },
+            request: token_usage(25),
+            turn: token_usage(65),
+            cumulative: token_usage(1_025),
+            model_context_window: Some(400_000),
+        };
+        assert!(stats.observe_model_request_token_usage(second, 181));
+
+        let (usage, _) = stats.usage_snapshot();
+        let TaskTokenUsageScope::Known { usage } = usage else {
+            panic!("Codex request usage should be fully known");
+        };
+        assert_eq!(usage.total_tokens, 1_025);
+        assert_eq!(stats.token_usage_by_source.len(), 2);
     }
 
     #[test]

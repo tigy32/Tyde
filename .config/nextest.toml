@@ -7,6 +7,12 @@
 # Run with:  cargo nextest run
 #        or:  cargo nextest run --profile ci
 
+nextest-version = "0.9.100"
+experimental = ["wrapper-scripts"]
+
+[scripts.wrapper.macos-test-binary]
+command = { command-line = "tools/run-nextest-binary.sh", relative-to = "workspace-root" }
+
 # Several backend tests stand up a *fake* CLI/app-server (a real subprocess:
 # `python3`, a shell script, etc.) and serialize themselves with an in-process
 # mutex — CODEX_FAKE_APP_SERVER_SERIAL, FAKE_CLAUDE_ENV_LOCK,
@@ -24,11 +30,25 @@ serial-backend-fakes = { max-threads = 1 }
 filter = 'test(/backend::codex::tests::codex_backend_fork/) | test(/backend::claude::tests::(fake_|resume_session_missing)/) | test(/backend::antigravity::tests::(install_antigravity_mcp_config|mcp_guard)/)'
 test-group = 'serial-backend-fakes'
 
+# These tests intentionally run real CLI probes with a two-second child-process
+# timeout. Reserve the runner while they probe so unrelated process-heavy tests
+# cannot make healthy fake executables time out during startup.
+[[profile.default.overrides]]
+filter = 'binary_id(tests::settings) & test(/backend_(setup_payload_(uses_sign_in_command_and_versioned_tycode_probe|reports_found_unusable_hermes_cli)|config_snapshots_report_tycode_settings_schema_release_blocker)/)'
+threads-required = "num-test-threads"
+
 [[profile.ci.overrides]]
 filter = 'test(/backend::codex::tests::codex_backend_fork/) | test(/backend::claude::tests::(fake_|resume_session_missing)/) | test(/backend::antigravity::tests::(install_antigravity_mcp_config|mcp_guard)/)'
 test-group = 'serial-backend-fakes'
 
+[[profile.ci.overrides]]
+filter = 'binary_id(tests::settings) & test(/backend_(setup_payload_(uses_sign_in_command_and_versioned_tycode_probe|reports_found_unusable_hermes_cli)|config_snapshots_report_tycode_settings_schema_release_blocker)/)'
+threads-required = "num-test-threads"
+
 [profile.default]
+# The native suite is a fast local gate, not a background job. Crossing five
+# minutes is a test failure that must be fixed rather than normalized.
+global-timeout = "5m"
 # A healthy integration test finishes well under 30s; anything slower is
 # flagged in the run output so a creeping regression (e.g. a fixture that
 # started spawning real subprocesses) is visible instead of silently bloating
@@ -38,7 +58,14 @@ retries = 0
 # Print failure output as soon as a test fails, and again in the final summary.
 failure-output = "immediate-final"
 
+[[profile.default.scripts]]
+filter = "all()"
+platform = 'cfg(target_os = "macos")'
+list-wrapper = "macos-test-binary"
+run-wrapper = "macos-test-binary"
+
 [profile.ci]
+global-timeout = "5m"
 slow-timeout = "60s"
 # Retry flaky tests a couple of times before declaring failure, and keep going
 # after the first failure so one bad test doesn't mask others.
@@ -46,3 +73,9 @@ retries = 2
 fail-fast = false
 failure-output = "immediate-final"
 final-status-level = "slow"
+
+[[profile.ci.scripts]]
+filter = "all()"
+platform = 'cfg(target_os = "macos")'
+list-wrapper = "macos-test-binary"
+run-wrapper = "macos-test-binary"

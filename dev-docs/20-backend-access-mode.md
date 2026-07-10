@@ -155,10 +155,13 @@ for read-only is the advisory, not an Antigravity sandbox.
 ### Hermes
 
 Hermes read-only uses the shared advisory seeded into `session.create` as a
-system history message. Tyde does not claim a hard Hermes sandbox or MCP/tool
-policy mapping for read-only mode yet. If a custom agent requires startup MCP
-servers, custom MCP servers, or a non-default tool policy, the Hermes backend
-fails visibly instead of pretending those policies were applied.
+system history message. Startup and custom MCP servers are loaded through the
+Hermes process-local native-config overlay described in
+`hermes-integration.md`; loading those servers is not a hard read-only sandbox
+or a Hermes-side mutating-tool filter. Tyde-owned MCP endpoints still enforce
+the calling agent's access mode at the server boundary. A non-default custom
+tool policy remains unsupported and fails visibly instead of pretending the
+policy was applied.
 
 ### Mock
 

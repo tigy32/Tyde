@@ -13,7 +13,10 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use protocol::{BackendAccessMode, TokenUsageUnavailableReason};
+use protocol::{
+    BackendAccessMode, ModelRequestId, ModelRequestTokenUsage, ModelTurnId, TokenUsage,
+    TokenUsageUnavailableReason,
+};
 
 use crate::backend::agent_control_progress::{
     await_progress_data_for_tool, is_tyde_agent_control_spawn_tool_name,
@@ -389,6 +392,7 @@ impl CodexSession {
                 pending_message_metadata: None,
                 completed_message_metadata_by_turn: HashMap::new(),
                 token_usage_by_turn: HashMap::new(),
+                model_token_usage_by_turn: HashMap::new(),
                 turn_context_by_turn: HashMap::new(),
                 file_change_call_ids: HashMap::new(),
                 pending_request: None,
@@ -713,6 +717,15 @@ struct PendingCodexMessageMetadata {
     turn_context: TurnContextEstimate,
 }
 
+#[derive(Clone, Default)]
+struct CodexTurnTokenUsage {
+    request_count: u32,
+    latest_request: Option<TokenUsage>,
+    turn: TokenUsage,
+    cumulative: Option<TokenUsage>,
+    model_context_window: Option<u64>,
+}
+
 struct CodexSubAgentStream {
     emitter: Arc<TurnEmitter>,
     receiver_thread_id: Option<String>,
@@ -767,6 +780,7 @@ struct CodexState {
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
     completed_message_metadata_by_turn: HashMap<String, PendingCodexMessageMetadata>,
     token_usage_by_turn: HashMap<String, Value>,
+    model_token_usage_by_turn: HashMap<String, CodexTurnTokenUsage>,
     turn_context_by_turn: HashMap<String, TurnContextEstimate>,
     file_change_call_ids: HashMap<String, Vec<String>>,
     pending_request: Option<PendingRequest>,
@@ -1086,6 +1100,7 @@ impl CodexInner {
             state.active_stream = None;
             state.pending_message_metadata = None;
             state.token_usage_by_turn.clear();
+            state.model_token_usage_by_turn.clear();
             state.turn_context_by_turn.clear();
             state.file_change_call_ids.clear();
             state.pending_request = None;
@@ -1473,43 +1488,62 @@ impl CodexInner {
     }
 
     async fn handle_root_token_usage_updated(&self, params: &Value) {
-        let metadata_update = {
+        let (metadata_update, model_usage) = {
             let mut state = self.state.lock().await;
-            let Some((turn_id, token_usage)) =
-                extract_turn_token_usage(params, state.model.as_deref())
+            let model = state.model.clone();
+            let model_usage = extract_model_request_token_usage(params, model.as_deref()).and_then(
+                |(turn_id, request, cumulative, context_window)| {
+                    record_model_request_token_usage(
+                        &mut state.model_token_usage_by_turn,
+                        turn_id,
+                        request,
+                        cumulative,
+                        context_window,
+                    )
+                },
+            );
+            let Some((turn_id, token_usage)) = extract_turn_token_usage(params, model.as_deref())
             else {
                 return;
             };
 
-            if let Some(pending) = state.completed_message_metadata_by_turn.remove(&turn_id) {
-                let context_breakdown = estimate_context_breakdown(
-                    Some(&token_usage),
-                    &pending.turn_context,
-                    Some(&pending.model),
-                );
-                Some((pending, token_usage, context_breakdown))
-            } else if state.active_turn_id.as_deref() == Some(turn_id.as_str())
-                || state
-                    .active_stream
-                    .as_ref()
-                    .is_some_and(|stream| stream.turn_id == turn_id)
-                || state
-                    .pending_message_metadata
-                    .as_ref()
-                    .is_some_and(|pending| pending.turn_id == turn_id)
-            {
-                state.token_usage_by_turn.insert(turn_id, token_usage);
-                None
-            } else {
-                None
-            }
+            let metadata_update =
+                if let Some(pending) = state.completed_message_metadata_by_turn.remove(&turn_id) {
+                    let context_breakdown = estimate_context_breakdown(
+                        Some(&token_usage),
+                        &pending.turn_context,
+                        Some(&pending.model),
+                    );
+                    let model_token_usage = state.model_token_usage_by_turn.get(&turn_id).cloned();
+                    Some((pending, token_usage, model_token_usage, context_breakdown))
+                } else if state.active_turn_id.as_deref() == Some(turn_id.as_str())
+                    || state
+                        .active_stream
+                        .as_ref()
+                        .is_some_and(|stream| stream.turn_id == turn_id)
+                    || state
+                        .pending_message_metadata
+                        .as_ref()
+                        .is_some_and(|pending| pending.turn_id == turn_id)
+                {
+                    state.token_usage_by_turn.insert(turn_id, token_usage);
+                    None
+                } else {
+                    None
+                };
+            (metadata_update, model_usage)
         };
 
-        if let Some((pending, token_usage, context_breakdown)) = metadata_update {
+        if let Some(usage) = model_usage {
+            self.emitter.model_request_token_usage(&usage);
+        }
+        if let Some((pending, token_usage, model_token_usage, context_breakdown)) = metadata_update
+        {
             emit_codex_message_metadata_update(
                 &self.emitter,
                 pending,
                 Some(token_usage),
+                model_token_usage.as_ref(),
                 context_breakdown,
             );
         }
@@ -1988,6 +2022,7 @@ impl CodexInner {
                 emitter.as_ref(),
                 pending,
                 Some(token_usage),
+                None,
                 context_breakdown,
             );
         }
@@ -2043,6 +2078,7 @@ impl CodexInner {
                 emitter.as_ref(),
                 pending,
                 Some(token_usage),
+                None,
                 context_breakdown,
             );
         }
@@ -2093,6 +2129,7 @@ impl CodexInner {
                 emitter.as_ref(),
                 pending,
                 Some(token_usage),
+                None,
                 context_breakdown,
             );
         }
@@ -3087,12 +3124,23 @@ impl CodexInner {
             state.model.clone()
         };
         let turn_usage = extract_turn_token_usage(params, model_hint.as_deref());
+        let model_usage = extract_model_request_token_usage(params, model_hint.as_deref());
 
-        let (stream_to_close, metadata_update) = {
+        let (stream_to_close, metadata_update, model_usage) = {
             let mut state = self.state.lock().await;
             if let Some((turn_id, token_usage)) = turn_usage {
                 state.token_usage_by_turn.insert(turn_id, token_usage);
             }
+            let model_usage =
+                model_usage.and_then(|(turn_id, request, cumulative, context_window)| {
+                    record_model_request_token_usage(
+                        &mut state.model_token_usage_by_turn,
+                        turn_id,
+                        request,
+                        cumulative,
+                        context_window,
+                    )
+                });
 
             let completed_turn_id =
                 extract_turn_id(params).or_else(|| state.active_turn_id.clone());
@@ -3146,7 +3194,10 @@ impl CodexInner {
                                 .completed_message_metadata_by_turn
                                 .insert(turn_id.clone(), pending.clone());
                         }
-                        metadata_update = Some((pending, token_usage, context_breakdown));
+                        let model_token_usage =
+                            state.model_token_usage_by_turn.get(&turn_id).cloned();
+                        metadata_update =
+                            Some((pending, token_usage, model_token_usage, context_breakdown));
                     }
                 } else if state
                     .pending_message_metadata
@@ -3158,15 +3209,19 @@ impl CodexInner {
                 }
                 state.turn_context_by_turn.remove(&turn_id);
                 state.token_usage_by_turn.remove(&turn_id);
+                state.model_token_usage_by_turn.remove(&turn_id);
             }
             state.pending_request = None;
             state.file_change_call_ids.clear();
             state.pending_tool_call_ids.clear();
             state.close_active_stream_when_tools_idle = false;
             state.pending_user_input_bytes = 0;
-            (stream_to_close, metadata_update)
+            (stream_to_close, metadata_update, model_usage)
         };
 
+        if let Some(usage) = model_usage {
+            self.emitter.model_request_token_usage(&usage);
+        }
         if let Some(segment) = stream_to_close {
             self.emitter.stream_end(StreamEndPayload {
                 content: segment.content,
@@ -3181,11 +3236,13 @@ impl CodexInner {
                 context_breakdown: None,
             });
         }
-        if let Some((pending, token_usage, context_breakdown)) = metadata_update {
+        if let Some((pending, token_usage, model_token_usage, context_breakdown)) = metadata_update
+        {
             emit_codex_message_metadata_update(
                 &self.emitter,
                 pending,
                 token_usage,
+                model_token_usage.as_ref(),
                 context_breakdown,
             );
         }
@@ -4095,16 +4152,37 @@ fn emit_codex_message_metadata_update(
     emitter: &TurnEmitter,
     pending: PendingCodexMessageMetadata,
     token_usage: Option<Value>,
+    model_token_usage: Option<&CodexTurnTokenUsage>,
     context_breakdown: Value,
 ) {
+    let (request_usage, turn_usage, cumulative_usage) =
+        codex_message_usage_values(token_usage, model_token_usage);
     emitter.message_metadata_updated(MessageMetadataUpdatePayload {
         message_id: pending.message_id,
         model_info: Some(json!({ "model": pending.model })),
-        request_usage: token_usage.clone(),
-        turn_usage: token_usage,
-        cumulative_usage: None,
+        request_usage,
+        turn_usage,
+        cumulative_usage,
         context_breakdown: Some(context_breakdown),
     });
+}
+
+fn codex_message_usage_values(
+    token_usage: Option<Value>,
+    model_token_usage: Option<&CodexTurnTokenUsage>,
+) -> (Option<Value>, Option<Value>, Option<Value>) {
+    match model_token_usage {
+        Some(usage) => (
+            usage.latest_request.as_ref().map(codex_token_usage_value),
+            Some(codex_token_usage_value(&usage.turn)),
+            usage.cumulative.as_ref().map(codex_token_usage_value),
+        ),
+        None => (token_usage.clone(), token_usage, None),
+    }
+}
+
+fn codex_token_usage_value(usage: &TokenUsage) -> Value {
+    serde_json::to_value(usage).expect("Codex token usage must serialize")
 }
 
 fn apply_reasoning_delta_to_state(
@@ -4567,6 +4645,81 @@ fn extract_turn_token_usage(params: &Value, model_hint: Option<&str>) -> Option<
     Some((turn_id, normalized))
 }
 
+fn extract_model_request_token_usage(
+    params: &Value,
+    model_hint: Option<&str>,
+) -> Option<(String, TokenUsage, TokenUsage, Option<u64>)> {
+    let turn_id = extract_turn_id(params)?;
+    let raw = extract_turn_token_usage_value(params)?;
+    let request_value = normalize_token_usage_with_envelope(raw, Some(params), model_hint)?;
+    let cumulative_raw = raw
+        .get("total")
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| {
+            raw.get("last")
+                .filter(|value| value.is_object())
+                .unwrap_or(raw)
+        });
+    let cumulative_value =
+        normalize_token_usage_with_envelope(cumulative_raw, Some(params), model_hint)?;
+    let model_context_window = request_value.get("context_window").and_then(Value::as_u64);
+    let request = serde_json::from_value(request_value).ok()?;
+    let cumulative = serde_json::from_value(cumulative_value).ok()?;
+    Some((turn_id, request, cumulative, model_context_window))
+}
+
+fn record_model_request_token_usage(
+    usage_by_turn: &mut HashMap<String, CodexTurnTokenUsage>,
+    turn_id: String,
+    request: TokenUsage,
+    cumulative: TokenUsage,
+    model_context_window: Option<u64>,
+) -> Option<ModelRequestTokenUsage> {
+    let state = usage_by_turn.entry(turn_id.clone()).or_default();
+    if state.cumulative.as_ref() == Some(&cumulative) {
+        return None;
+    }
+
+    let sequence = state.request_count;
+    state.request_count = state.request_count.saturating_add(1);
+    add_token_usage(&mut state.turn, &request);
+    state.latest_request = Some(request.clone());
+    state.cumulative = Some(cumulative.clone());
+    state.model_context_window = model_context_window.or(state.model_context_window);
+
+    Some(ModelRequestTokenUsage {
+        request_id: ModelRequestId {
+            turn_id: ModelTurnId(turn_id),
+            sequence,
+        },
+        request,
+        turn: state.turn.clone(),
+        cumulative,
+        model_context_window: state.model_context_window,
+    })
+}
+
+fn add_token_usage(total: &mut TokenUsage, usage: &TokenUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+    total.cached_prompt_tokens =
+        add_optional_token_usage(total.cached_prompt_tokens, usage.cached_prompt_tokens);
+    total.cache_creation_input_tokens = add_optional_token_usage(
+        total.cache_creation_input_tokens,
+        usage.cache_creation_input_tokens,
+    );
+    total.reasoning_tokens =
+        add_optional_token_usage(total.reasoning_tokens, usage.reasoning_tokens);
+}
+
+fn add_optional_token_usage(total: Option<u64>, usage: Option<u64>) -> Option<u64> {
+    match (total, usage) {
+        (None, None) => None,
+        (total, usage) => Some(total.unwrap_or(0).saturating_add(usage.unwrap_or(0))),
+    }
+}
+
 fn normalize_token_usage_with_envelope(
     raw: &Value,
     envelope: Option<&Value>,
@@ -4645,6 +4798,8 @@ fn context_window_from_token_usage(
     envelope: Option<&Value>,
 ) -> Option<u64> {
     const WINDOW_KEYS: &[&str] = &[
+        "modelContextWindow",
+        "model_context_window",
         "contextWindow",
         "context_window",
         "maxInputTokens",
@@ -5453,8 +5608,9 @@ use protocol::{
 };
 
 use super::{
-    Backend, BackendSession, BackendSpawnConfig, EventStream, protocol_images_to_attachments,
-    resolve_settings as resolve_backend_settings, session_settings_to_json,
+    Backend, BackendEvent, BackendSession, BackendSpawnConfig, EventStream,
+    protocol_images_to_attachments, resolve_settings as resolve_backend_settings,
+    session_settings_to_json,
 };
 
 pub struct CodexBackend {
@@ -5824,7 +5980,44 @@ fn spawn_codex_subagent_event_bridge(
     });
 }
 
+fn spawn_codex_backend_event_bridge(
+    mut raw_rx: mpsc::UnboundedReceiver<Value>,
+    event_tx: mpsc::UnboundedSender<BackendEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(raw) = raw_rx.recv().await {
+            if !forward_codex_backend_stream_event(raw, &event_tx) {
+                break;
+            }
+        }
+    });
+}
+
+fn forward_codex_backend_stream_event(
+    raw: Value,
+    events_tx: &mpsc::UnboundedSender<BackendEvent>,
+) -> bool {
+    if let Some(usage) = model_request_token_usage_from_raw(&raw) {
+        return events_tx
+            .send(BackendEvent::ModelRequestTokenUsage(usage))
+            .is_ok();
+    }
+    let Some(event) = codex_backend_event_from_raw(&raw) else {
+        return true;
+    };
+    if events_tx
+        .send(BackendEvent::Chat(event.chat_event))
+        .is_err()
+    {
+        return false;
+    }
+    !event.terminal
+}
+
 fn forward_codex_backend_event(raw: Value, events_tx: &mpsc::UnboundedSender<ChatEvent>) -> bool {
+    if model_request_token_usage_from_raw(&raw).is_some() {
+        return true;
+    }
     let Some(event) = codex_backend_event_from_raw(&raw) else {
         return true;
     };
@@ -5832,6 +6025,13 @@ fn forward_codex_backend_event(raw: Value, events_tx: &mpsc::UnboundedSender<Cha
         return false;
     }
     !event.terminal
+}
+
+fn model_request_token_usage_from_raw(value: &Value) -> Option<ModelRequestTokenUsage> {
+    if value.get("kind").and_then(Value::as_str) != Some("ModelRequestTokenUsage") {
+        return None;
+    }
+    serde_json::from_value(value.get("data")?.clone()).ok()
 }
 
 struct CodexForwardedBackendEvent {
@@ -5852,6 +6052,7 @@ fn codex_backend_event_from_raw(value: &Value) -> Option<CodexForwardedBackendEv
             };
 
             match kind {
+                "ModelRequestTokenUsage" => None,
                 "Error" => Some(CodexForwardedBackendEvent {
                     chat_event: backend_error_message(codex_raw_event_message(
                         value,
@@ -6002,9 +6203,9 @@ impl Backend for CodexBackend {
         let cwd = pick_workspace_root(&workspace_roots)?;
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
-        spawn_codex_subagent_event_bridge(raw_event_rx, events_tx);
+        spawn_codex_backend_event_bridge(raw_event_rx, events_tx);
         let emitter = Arc::new(TurnEmitter::new_for_agent(
             raw_event_tx,
             AgentName(CODEX_AGENT_NAME),
@@ -6247,6 +6448,8 @@ impl Backend for CodexBackend {
                 CodexLoopPendingMessageMetadata,
             > = HashMap::new();
             let mut token_usage_by_turn: HashMap<String, Value> = HashMap::new();
+            let mut model_token_usage_by_turn: HashMap<String, CodexTurnTokenUsage> =
+                HashMap::new();
             let mut turn_context_by_turn: HashMap<String, TurnContextEstimate> = HashMap::new();
             let mut pending_user_input_bytes = initial_message.len() as u64;
             let mut conversation_bytes_total = 0u64;
@@ -6464,6 +6667,18 @@ impl Backend for CodexBackend {
                                 emitter.stream_reasoning_delta(&message_id, &delta);
                             }
                             "thread/tokenUsage/updated" => {
+                                if let Some((turn_id, request, cumulative, context_window)) =
+                                    extract_model_request_token_usage(&params, Some(&model_name))
+                                    && let Some(usage) = record_model_request_token_usage(
+                                        &mut model_token_usage_by_turn,
+                                        turn_id,
+                                        request,
+                                        cumulative,
+                                        context_window,
+                                    )
+                                {
+                                    emitter.model_request_token_usage(&usage);
+                                }
                                 if let Some((turn_id, token_usage)) =
                                     extract_turn_token_usage(&params, Some(&model_name))
                                 {
@@ -6475,15 +6690,20 @@ impl Backend for CodexBackend {
                                             &pending.turn_context,
                                             Some(&model_name),
                                         );
+                                        let (request_usage, turn_usage, cumulative_usage) =
+                                            codex_message_usage_values(
+                                                Some(token_usage),
+                                                model_token_usage_by_turn.get(&turn_id),
+                                            );
                                         emitter.message_metadata_updated(
                                             MessageMetadataUpdatePayload {
                                                 message_id: pending.message_id,
                                                 model_info: Some(json!({
                                                     "model": model_name.clone()
                                                 })),
-                                                request_usage: Some(token_usage.clone()),
-                                                turn_usage: Some(token_usage),
-                                                cumulative_usage: None,
+                                                request_usage,
+                                                turn_usage,
+                                                cumulative_usage,
                                                 context_breakdown: Some(context_breakdown),
                                             },
                                         );
@@ -6923,6 +7143,18 @@ impl Backend for CodexBackend {
                                     .and_then(Value::as_str)
                                     .unwrap_or("completed");
                                 let turn_id_for_log = active_turn_id.clone();
+                                if let Some((turn_id, request, cumulative, context_window)) =
+                                    extract_model_request_token_usage(&params, Some(&model_name))
+                                    && let Some(usage) = record_model_request_token_usage(
+                                        &mut model_token_usage_by_turn,
+                                        turn_id,
+                                        request,
+                                        cumulative,
+                                        context_window,
+                                    )
+                                {
+                                    emitter.model_request_token_usage(&usage);
+                                }
                                 if let Some((turn_id, token_usage)) =
                                     extract_turn_token_usage(&params, Some(&model_name))
                                 {
@@ -7016,12 +7248,17 @@ impl Backend for CodexBackend {
                                         completed_message_metadata_by_turn
                                             .insert(turn_id.clone(), pending.clone());
                                     }
+                                    let (request_usage, turn_usage, cumulative_usage) =
+                                        codex_message_usage_values(
+                                            usage,
+                                            model_token_usage_by_turn.get(turn_id),
+                                        );
                                     emitter.message_metadata_updated(MessageMetadataUpdatePayload {
                                         message_id: pending.message_id,
                                         model_info: Some(json!({ "model": model_name.clone() })),
-                                        request_usage: usage.clone(),
-                                        turn_usage: usage,
-                                        cumulative_usage: None,
+                                        request_usage,
+                                        turn_usage,
+                                        cumulative_usage,
                                         context_breakdown: Some(context_breakdown),
                                     });
                                 }
@@ -7044,6 +7281,7 @@ impl Backend for CodexBackend {
                                 close_stream_when_tools_idle = false;
                                 if let Some(turn_id) = turn_id_for_log.as_ref() {
                                     token_usage_by_turn.remove(turn_id);
+                                    model_token_usage_by_turn.remove(turn_id);
                                     turn_context_by_turn.remove(turn_id);
                                 }
                             }
@@ -7166,7 +7404,7 @@ impl Backend for CodexBackend {
                 session_id,
                 subagent_emitter_tx,
             },
-            EventStream::new(events_rx),
+            EventStream::new_backend(events_rx),
         ))
     }
 
@@ -7177,7 +7415,7 @@ impl Backend for CodexBackend {
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (resume_replay_complete_tx, resume_replay_complete_rx) =
             tokio::sync::oneshot::channel();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
@@ -7249,7 +7487,7 @@ impl Backend for CodexBackend {
             }
 
             while let Ok(raw) = raw_events.try_recv() {
-                if !forward_codex_backend_event(raw, &events_tx) {
+                if !forward_codex_backend_stream_event(raw, &events_tx) {
                     session.shutdown().await;
                     return;
                 }
@@ -7262,7 +7500,7 @@ impl Backend for CodexBackend {
                         let Some(raw) = incoming else {
                             break;
                         };
-                        if !forward_codex_backend_event(raw, &events_tx) {
+                        if !forward_codex_backend_stream_event(raw, &events_tx) {
                             break;
                         }
                     }
@@ -7334,7 +7572,10 @@ impl Backend for CodexBackend {
                 session_id: backend_session_id,
                 subagent_emitter_tx,
             },
-            EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
+            EventStream::new_backend_with_resume_replay_barrier(
+                events_rx,
+                resume_replay_complete_rx,
+            ),
         ))
     }
 
@@ -7350,7 +7591,7 @@ impl Backend for CodexBackend {
 
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
             watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
 
@@ -7452,7 +7693,7 @@ impl Backend for CodexBackend {
                         let Some(raw) = incoming else {
                             break;
                         };
-                        if !forward_codex_backend_event(raw, &events_tx) {
+                        if !forward_codex_backend_stream_event(raw, &events_tx) {
                             break;
                         }
                     }
@@ -7537,7 +7778,7 @@ impl Backend for CodexBackend {
                 session_id: backend_session_id,
                 subagent_emitter_tx,
             },
-            EventStream::new(events_rx),
+            EventStream::new_backend(events_rx),
         ))
     }
 
@@ -8640,6 +8881,7 @@ for line in sys.stdin:
             pending_message_metadata: None,
             completed_message_metadata_by_turn: HashMap::new(),
             token_usage_by_turn: HashMap::new(),
+            model_token_usage_by_turn: HashMap::new(),
             turn_context_by_turn: HashMap::new(),
             file_change_call_ids: HashMap::new(),
             pending_request: None,
@@ -8695,7 +8937,9 @@ for line in sys.stdin:
     fn drain_events(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
         let mut out = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            out.push(event);
+            if event.get("kind").and_then(Value::as_str) != Some("ModelRequestTokenUsage") {
+                out.push(event);
+            }
         }
         out
     }
@@ -8760,6 +9004,46 @@ for line in sys.stdin:
             serde_json::to_value(event).expect("serialize forwarded event"),
             raw
         );
+    }
+
+    #[test]
+    fn model_request_usage_uses_backend_only_event_path() {
+        let usage = ModelRequestTokenUsage {
+            request_id: ModelRequestId {
+                turn_id: ModelTurnId("turn-1".to_owned()),
+                sequence: 3,
+            },
+            request: TokenUsage {
+                total_tokens: 12,
+                ..TokenUsage::default()
+            },
+            turn: TokenUsage {
+                total_tokens: 42,
+                ..TokenUsage::default()
+            },
+            cumulative: TokenUsage {
+                total_tokens: 142,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(400_000),
+        };
+        let raw = json!({
+            "kind": "ModelRequestTokenUsage",
+            "data": serde_json::to_value(&usage).expect("serialize usage"),
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        assert!(forward_codex_backend_stream_event(raw.clone(), &tx));
+        let BackendEvent::ModelRequestTokenUsage(forwarded) =
+            rx.try_recv().expect("backend usage event")
+        else {
+            panic!("usage should not be forwarded as chat");
+        };
+        assert_eq!(forwarded, usage);
+
+        let (chat_tx, mut chat_rx) = mpsc::unbounded_channel();
+        assert!(forward_codex_backend_event(raw, &chat_tx));
+        assert!(chat_rx.try_recv().is_err());
     }
 
     #[test]
@@ -11795,6 +12079,105 @@ Do not describe the tool, and do not skip the tool call."#;
         let (_, usage) =
             extract_turn_token_usage(&payload, Some("gpt-5.3-codex")).expect("turn usage");
         assert_eq!(usage["context_window"], json!(400_000));
+    }
+
+    #[test]
+    fn model_request_usage_keeps_last_turn_and_thread_scopes() {
+        let first_payload = json!({
+            "turnId": "turn_123",
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 100,
+                    "cachedInputTokens": 80,
+                    "outputTokens": 10,
+                    "reasoningOutputTokens": 4,
+                    "totalTokens": 110
+                },
+                "total": {
+                    "inputTokens": 1_000,
+                    "cachedInputTokens": 900,
+                    "outputTokens": 100,
+                    "reasoningOutputTokens": 40,
+                    "totalTokens": 1_100
+                },
+                "modelContextWindow": 400_000
+            }
+        });
+        let second = json!({
+            "turnId": "turn_123",
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 120,
+                    "cachedInputTokens": 90,
+                    "outputTokens": 20,
+                    "reasoningOutputTokens": 5,
+                    "totalTokens": 140
+                },
+                "total": {
+                    "inputTokens": 1_120,
+                    "cachedInputTokens": 990,
+                    "outputTokens": 120,
+                    "reasoningOutputTokens": 45,
+                    "totalTokens": 1_240
+                },
+                "modelContextWindow": 400_000
+            }
+        });
+        let mut by_turn = HashMap::new();
+
+        let (turn_id, request, cumulative, context_window) =
+            extract_model_request_token_usage(&first_payload, Some("gpt-5.5"))
+                .expect("first usage");
+        let first = record_model_request_token_usage(
+            &mut by_turn,
+            turn_id,
+            request,
+            cumulative,
+            context_window,
+        )
+        .expect("first request");
+        assert_eq!(first.request_id.sequence, 0);
+        assert_eq!(first.request.total_tokens, 110);
+        assert_eq!(first.turn.total_tokens, 110);
+        assert_eq!(first.cumulative.total_tokens, 1_100);
+        let (turn_id, request, cumulative, context_window) =
+            extract_model_request_token_usage(&first_payload, Some("gpt-5.5"))
+                .expect("duplicate usage");
+        assert!(
+            record_model_request_token_usage(
+                &mut by_turn,
+                turn_id,
+                request,
+                cumulative,
+                context_window,
+            )
+            .is_none(),
+            "duplicate cumulative snapshots must not invent requests"
+        );
+
+        let (turn_id, request, cumulative, context_window) =
+            extract_model_request_token_usage(&second, Some("gpt-5.5")).expect("second usage");
+        let second = record_model_request_token_usage(
+            &mut by_turn,
+            turn_id,
+            request,
+            cumulative,
+            context_window,
+        )
+        .expect("second request");
+        assert_eq!(second.request_id.sequence, 1);
+        assert_eq!(second.request.total_tokens, 140);
+        assert_eq!(second.turn.total_tokens, 250);
+        assert_eq!(second.cumulative.total_tokens, 1_240);
+        assert_eq!(second.model_context_window, Some(400_000));
+
+        let (request, turn, cumulative) = codex_message_usage_values(None, by_turn.get("turn_123"));
+        assert_eq!(request.expect("request usage")["total_tokens"], json!(140));
+        assert_eq!(turn.expect("turn usage")["total_tokens"], json!(250));
+        assert_eq!(
+            cumulative.expect("cumulative usage")["total_tokens"],
+            json!(1_240)
+        );
     }
 
     #[test]

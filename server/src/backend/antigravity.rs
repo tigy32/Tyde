@@ -57,6 +57,7 @@ struct AntigravityInner {
 
 struct AntigravityState {
     session_id: Option<SessionId>,
+    conversations_dir: PathBuf,
     primary_root: String,
     extra_roots: Vec<String>,
     startup_mcp_servers: Vec<StartupMcpServer>,
@@ -156,6 +157,65 @@ impl Backend for AntigravityBackend {
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
+        let conversations_dir = resolve_antigravity_conversations_dir(None)?;
+        Self::spawn_with_conversations_dir(
+            workspace_roots,
+            config,
+            initial_input,
+            conversations_dir,
+        )
+        .await
+    }
+
+    async fn resume(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        session_id: SessionId,
+    ) -> Result<(Self, EventStream), String> {
+        let conversations_dir = resolve_antigravity_conversations_dir(None)?;
+        Self::resume_with_conversations_dir(workspace_roots, config, session_id, conversations_dir)
+            .await
+    }
+
+    async fn fork(
+        _workspace_roots: Vec<String>,
+        _config: BackendSpawnConfig,
+        _from_session_id: SessionId,
+        _initial_input: protocol::SendMessagePayload,
+    ) -> Result<(Self, EventStream), BackendStartupError> {
+        Err(BackendStartupError::unsupported(
+            backend_fork_unsupported_message(BackendKind::Antigravity),
+        ))
+    }
+
+    async fn list_sessions() -> Result<Vec<BackendSession>, String> {
+        Ok(Vec::new())
+    }
+
+    fn session_id(&self) -> SessionId {
+        self.session_id.clone()
+    }
+
+    async fn send(&self, input: AgentInput) -> bool {
+        self.input_tx.send(input).is_ok()
+    }
+
+    async fn interrupt(&self) -> bool {
+        self.interrupt_tx.send(()).is_ok()
+    }
+
+    async fn shutdown(self) {
+        let _ = self.interrupt_tx.send(());
+    }
+}
+
+impl AntigravityBackend {
+    pub(crate) async fn spawn_with_conversations_dir(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        initial_input: protocol::SendMessagePayload,
+        conversations_dir: PathBuf,
+    ) -> Result<(Self, EventStream), String> {
         let (primary_root, extra_roots) = resolve_workspace_roots(&workspace_roots)?;
         let resolved_settings = resolve_session_settings(&config);
         let _ = selected_model(&resolved_settings)?;
@@ -168,6 +228,7 @@ impl Backend for AntigravityBackend {
             events_tx,
             state: Mutex::new(AntigravityState {
                 session_id: None,
+                conversations_dir,
                 primary_root,
                 extra_roots,
                 startup_mcp_servers: config.startup_mcp_servers,
@@ -222,17 +283,18 @@ impl Backend for AntigravityBackend {
         ))
     }
 
-    async fn resume(
+    pub(crate) async fn resume_with_conversations_dir(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         session_id: SessionId,
+        conversations_dir: PathBuf,
     ) -> Result<(Self, EventStream), String> {
         if !is_antigravity_native_session_id(&session_id) {
             return Err(format!(
                 "Antigravity resume requires a native agy conversation UUID, got {session_id}"
             ));
         }
-        ensure_antigravity_conversation_exists(&session_id)?;
+        ensure_antigravity_conversation_exists(&session_id, &conversations_dir)?;
 
         let (primary_root, extra_roots) = resolve_workspace_roots(&workspace_roots)?;
         let resolved_settings = resolve_session_settings(&config);
@@ -246,6 +308,7 @@ impl Backend for AntigravityBackend {
             events_tx,
             state: Mutex::new(AntigravityState {
                 session_id: Some(session_id.clone()),
+                conversations_dir,
                 primary_root,
                 extra_roots,
                 startup_mcp_servers: config.startup_mcp_servers,
@@ -268,37 +331,6 @@ impl Backend for AntigravityBackend {
             },
             EventStream::new(events_rx),
         ))
-    }
-
-    async fn fork(
-        _workspace_roots: Vec<String>,
-        _config: BackendSpawnConfig,
-        _from_session_id: SessionId,
-        _initial_input: protocol::SendMessagePayload,
-    ) -> Result<(Self, EventStream), BackendStartupError> {
-        Err(BackendStartupError::unsupported(
-            backend_fork_unsupported_message(BackendKind::Antigravity),
-        ))
-    }
-
-    async fn list_sessions() -> Result<Vec<BackendSession>, String> {
-        Ok(Vec::new())
-    }
-
-    fn session_id(&self) -> SessionId {
-        self.session_id.clone()
-    }
-
-    async fn send(&self, input: AgentInput) -> bool {
-        self.input_tx.send(input).is_ok()
-    }
-
-    async fn interrupt(&self) -> bool {
-        self.interrupt_tx.send(()).is_ok()
-    }
-
-    async fn shutdown(self) {
-        let _ = self.interrupt_tx.send(());
     }
 }
 
@@ -416,7 +448,8 @@ impl AntigravityInner {
         let message_id = format!("antigravity-msg-{turn_id}");
         let conversation_id = state.session_id.clone();
         if let Some(session_id) = conversation_id.as_ref()
-            && let Err(err) = ensure_antigravity_conversation_exists(session_id)
+            && let Err(err) =
+                ensure_antigravity_conversation_exists(session_id, &state.conversations_dir)
         {
             fail_session_capture(&mut session_capture, &err);
             return Err(err);
@@ -1176,13 +1209,19 @@ pub(crate) fn is_antigravity_native_session_id(session_id: &SessionId) -> bool {
     session_id.0.len() == 36 && Uuid::parse_str(&session_id.0).is_ok()
 }
 
-pub(crate) fn is_antigravity_session_resumable(session_id: &SessionId) -> bool {
+pub(crate) fn is_antigravity_session_resumable(
+    session_id: &SessionId,
+    conversations_dir: &Path,
+) -> bool {
     is_antigravity_native_session_id(session_id)
-        && antigravity_conversation_db_path(session_id).is_ok_and(|path| path.is_file())
+        && antigravity_conversation_db_path(session_id, conversations_dir).is_file()
 }
 
-fn ensure_antigravity_conversation_exists(session_id: &SessionId) -> Result<(), String> {
-    let path = antigravity_conversation_db_path(session_id)?;
+fn ensure_antigravity_conversation_exists(
+    session_id: &SessionId,
+    conversations_dir: &Path,
+) -> Result<(), String> {
+    let path = antigravity_conversation_db_path(session_id, conversations_dir);
     if path.is_file() {
         Ok(())
     } else {
@@ -1193,12 +1232,20 @@ fn ensure_antigravity_conversation_exists(session_id: &SessionId) -> Result<(), 
     }
 }
 
-fn antigravity_conversation_db_path(session_id: &SessionId) -> Result<PathBuf, String> {
-    Ok(crate::paths::home_dir()?
-        .join(".gemini")
-        .join("antigravity-cli")
-        .join("conversations")
-        .join(format!("{}.db", session_id.0)))
+fn antigravity_conversation_db_path(session_id: &SessionId, conversations_dir: &Path) -> PathBuf {
+    conversations_dir.join(format!("{}.db", session_id.0))
+}
+
+pub(crate) fn resolve_antigravity_conversations_dir(
+    configured_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    match configured_dir {
+        Some(path) => Ok(path.to_path_buf()),
+        None => Ok(crate::paths::home_dir()?
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("conversations")),
+    }
 }
 
 pub(crate) fn antigravity_known_models() -> Vec<SelectOption> {
@@ -2126,6 +2173,7 @@ mod tests {
             events_tx,
             state: Mutex::new(AntigravityState {
                 session_id: None,
+                conversations_dir: std::env::temp_dir(),
                 primary_root,
                 extra_roots: Vec::new(),
                 startup_mcp_servers: Vec::new(),
@@ -2144,6 +2192,7 @@ mod tests {
             events_tx,
             state: Mutex::new(AntigravityState {
                 session_id: None,
+                conversations_dir: std::env::temp_dir(),
                 primary_root: "/tmp".to_string(),
                 extra_roots: Vec::new(),
                 startup_mcp_servers: Vec::new(),

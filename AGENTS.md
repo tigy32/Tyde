@@ -29,8 +29,15 @@ Before creating any commit, you must verify the following are clean:
 - `cargo fmt --all` — formatting
 - `cargo check --all-targets` — compiles
 - `cargo clippy --all-targets -- -D warnings` — no lint violations
-- `cargo test` — native tests pass
+- `cargo nextest run` — native tests pass
 - `tools/run-wasm-tests.sh` — wasm UI tests pass
+
+The native suite has a hard five-minute limit, enforced by
+`.config/nextest.toml`. Treat exceeding that limit as a test failure: find and
+fix the root cause. Do not fall back to serial `cargo test`, increase the
+timeout, split the canonical suite, reduce coverage, or skip, weaken, or delete
+tests to get under the limit. Install the runner with
+`cargo install cargo-nextest --locked` if `cargo nextest` is unavailable.
 
 For clippy: **fix the underlying issue**. Do not paper over violations with
 `_`-prefixed unused names, `#[allow(...)]` attributes, or other suppressions
@@ -127,7 +134,7 @@ in. When pre-commit checks surface that kind of collateral:
 - If `cargo fmt` rewrites whitespace in files another agent forgot to
   format, include those fmt-only hunks in your commit rather than
   reverting them.
-- If `cargo test` or clippy fails on code you didn't touch because of a
+- If `cargo nextest run` or clippy fails on code you didn't touch because of a
   previous agent's mistake, debug and fix it as part of your commit. Do
   not skip the check or stash the failure for someone else.
 
@@ -174,7 +181,8 @@ logs you added until the user has signed off on the fix.
 
 ## Running the app and tests locally
 
-- Native tests: `cargo test` (no `--target` flag)
+- Native tests: `cargo nextest run` (no `--target` flag; must finish in under
+  five minutes)
 - Wasm tests: `tools/run-wasm-tests.sh` (filter with
   `tools/run-wasm-tests.sh wasm_tests::`)
 - Build: `./build.sh` or per-crate `cargo build`

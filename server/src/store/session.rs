@@ -363,12 +363,25 @@ impl SessionStore {
         &self,
         scope: SessionListScope,
     ) -> Result<Vec<SessionSummary>, String> {
+        let antigravity_conversations_dir =
+            crate::backend::antigravity::resolve_antigravity_conversations_dir(None)?;
+        self.summaries_for_scope_with_antigravity_conversations_dir(
+            scope,
+            &antigravity_conversations_dir,
+        )
+    }
+
+    pub(crate) fn summaries_for_scope_with_antigravity_conversations_dir(
+        &self,
+        scope: SessionListScope,
+        antigravity_conversations_dir: &Path,
+    ) -> Result<Vec<SessionSummary>, String> {
         let records = self.list()?;
         Ok(records
             .into_iter()
             .filter(|record| session_record_matches_scope(record, scope))
             .map(|record| {
-                let resumable = session_record_is_resumable(&record);
+                let resumable = session_record_is_resumable(&record, antigravity_conversations_dir);
                 SessionSummary {
                     id: record.id,
                     backend_kind: record.backend_kind,
@@ -585,9 +598,15 @@ fn is_native_antigravity_session_id(session_id: &str) -> bool {
     session_id.len() == 36 && Uuid::parse_str(session_id).is_ok()
 }
 
-pub(crate) fn session_record_is_resumable(record: &SessionRecord) -> bool {
+pub(crate) fn session_record_is_resumable(
+    record: &SessionRecord,
+    antigravity_conversations_dir: &Path,
+) -> bool {
     session_record_is_resumable_with(record, |session_id| {
-        crate::backend::antigravity::is_antigravity_session_resumable(session_id)
+        crate::backend::antigravity::is_antigravity_session_resumable(
+            session_id,
+            antigravity_conversations_dir,
+        )
     })
 }
 

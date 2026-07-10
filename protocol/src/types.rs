@@ -5871,6 +5871,24 @@ pub struct TokenUsage {
     pub reasoning_tokens: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModelTurnId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModelRequestId {
+    pub turn_id: ModelTurnId,
+    pub sequence: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRequestTokenUsage {
+    pub request_id: ModelRequestId,
+    pub request: TokenUsage,
+    pub turn: TokenUsage,
+    pub cumulative: TokenUsage,
+    pub model_context_window: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageTokenUsage {
     pub request: TokenUsageScope,

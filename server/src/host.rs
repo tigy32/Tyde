@@ -221,7 +221,9 @@ pub struct HostRuntimeConfig {
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub workflow_mcp_bind_addr: Option<std::net::SocketAddr>,
+    pub antigravity_conversations_dir: Option<PathBuf>,
     pub kiro_probe_program: Option<String>,
+    pub kiro_probe_workspace_root: Option<PathBuf>,
     pub mobile_pairing_ttl: Option<std::time::Duration>,
     pub mobile_managed_service_base_url: Option<String>,
     /// Skip probing the real backend CLIs (`<cli> --version`, codex model
@@ -242,7 +244,9 @@ impl Default for HostRuntimeConfig {
             agent_control_mcp_bind_addr: None,
             review_mcp_bind_addr: None,
             workflow_mcp_bind_addr: None,
+            antigravity_conversations_dir: None,
             kiro_probe_program: None,
+            kiro_probe_workspace_root: None,
             mobile_pairing_ttl: None,
             mobile_managed_service_base_url: None,
             skip_real_backend_probe: false,
@@ -408,7 +412,9 @@ pub(crate) struct HostState {
     hermes_session_schema: HermesSessionSchemaState,
     backend_config_snapshots: Vec<BackendConfigSnapshot>,
     backend_native_settings_snapshots: Vec<BackendNativeSettingsSnapshot>,
+    antigravity_conversations_dir: PathBuf,
     kiro_probe_program: Option<String>,
+    kiro_probe_workspace_root: Option<PathBuf>,
     skip_real_backend_probe: bool,
     host_streams: HashMap<StreamPath, HostSubscriber>,
     project_streams: HashMap<ProjectId, ProjectStreamSubscription>,
@@ -762,13 +768,15 @@ impl HostHandle {
             });
             subscriber.session_list_replay.default_scope()
         };
-        let mut session_summaries = state
+        let session_summaries = state
             .session_store
             .lock()
             .await
-            .summaries_for_scope(session_list_scope)
+            .summaries_for_scope_with_antigravity_conversations_dir(
+                session_list_scope,
+                &state.antigravity_conversations_dir,
+            )
             .unwrap_or_else(|err| panic!("failed to list sessions for host registration: {err}"));
-        normalize_antigravity_session_resumability(&mut session_summaries);
         let (sessions, session_list) = {
             let subscriber = state.host_streams.get_mut(&host_path).unwrap_or_else(|| {
                 panic!("host stream {host_path} disappeared before session bootstrap paging")
@@ -1960,6 +1968,7 @@ impl HostHandle {
             config_mcp,
             removing_projects,
             parent_session_id,
+            antigravity_conversations_dir,
         ) = {
             let state = self.state.lock().await;
             (
@@ -1992,6 +2001,7 @@ impl HostHandle {
                         )))
                     }
                 }),
+                state.antigravity_conversations_dir.clone(),
             )
         };
         let (parent_session_id, parent_session_lookup_failure) = match parent_session_id {
@@ -2243,7 +2253,7 @@ impl HostHandle {
                         })
                         .await);
                 };
-                if !session_record_is_resumable(&record) {
+                if !session_record_is_resumable(&record, &antigravity_conversations_dir) {
                     let resolved_name = payload
                         .name
                         .clone()
@@ -2740,12 +2750,15 @@ impl HostHandle {
                         crate::backend::backend_fork_unsupported_message(backend_kind),
                     )
                 });
-                let non_resumable_failure = (!session_record_is_resumable(&record)).then(|| {
-                    AgentStartupFailure::unsupported(format!(
-                        "cannot fork non-resumable session {}",
-                        from_session_id
-                    ))
-                });
+                let non_resumable_failure =
+                    (!session_record_is_resumable(&record, &antigravity_conversations_dir)).then(
+                        || {
+                            AgentStartupFailure::unsupported(format!(
+                                "cannot fork non-resumable session {}",
+                                from_session_id
+                            ))
+                        },
+                    );
                 let parent_agent_mismatch_failure = match parent_session_id.as_ref() {
                     Some(session_id) if session_id != &from_session_id => {
                         Some(AgentStartupFailure::internal(format!(
@@ -2838,11 +2851,13 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let review_registry = state.review_registry.clone();
+            let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
             let spawned = state.registry.spawn(
                 request,
                 Arc::clone(&session_store),
                 sub_agent_spawn_tx,
                 review_registry,
+                antigravity_conversations_dir,
             );
             let activity_summary =
                 initial_agent_activity_summary_state(&mut state, &spawned.start.agent_id);
@@ -3083,10 +3098,14 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let review_registry = state.review_registry.clone();
-            let spawned =
-                state
-                    .registry
-                    .spawn(request, session_store, sub_agent_spawn_tx, review_registry);
+            let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
+            let spawned = state.registry.spawn(
+                request,
+                session_store,
+                sub_agent_spawn_tx,
+                review_registry,
+                antigravity_conversations_dir,
+            );
             let activity_summary =
                 initial_agent_activity_summary_state(&mut state, &spawned.start.agent_id);
             let host_streams = state
@@ -4529,7 +4548,13 @@ impl HostHandle {
     }
 
     async fn ensure_team_resume_session(&self, session_id: &SessionId) -> Result<(), String> {
-        let session_store = { Arc::clone(&self.state.lock().await.session_store) };
+        let (session_store, antigravity_conversations_dir) = {
+            let state = self.state.lock().await;
+            (
+                Arc::clone(&state.session_store),
+                state.antigravity_conversations_dir.clone(),
+            )
+        };
         let record = session_store
             .lock()
             .await
@@ -4538,7 +4563,7 @@ impl HostHandle {
             .into_iter()
             .find(|record| record.id == *session_id)
             .ok_or_else(|| format!("cannot resume missing session {session_id}"))?;
-        if !session_record_is_resumable(&record) {
+        if !session_record_is_resumable(&record, &antigravity_conversations_dir) {
             return Err(format!("cannot resume non-resumable session {session_id}"));
         }
         Ok(())
@@ -4815,7 +4840,7 @@ impl HostHandle {
                 OPERATION,
             )?
         } else {
-            let (session_store, scope) = {
+            let (session_store, scope, antigravity_conversations_dir) = {
                 let state = self.state.lock().await;
                 let subscriber = state
                     .host_streams
@@ -4831,14 +4856,17 @@ impl HostHandle {
                     payload
                         .scope
                         .unwrap_or_else(|| subscriber.session_list_replay.default_scope()),
+                    state.antigravity_conversations_dir.clone(),
                 )
             };
-            let mut sessions = session_store
+            let sessions = session_store
                 .lock()
                 .await
-                .summaries_for_scope(scope)
+                .summaries_for_scope_with_antigravity_conversations_dir(
+                    scope,
+                    &antigravity_conversations_dir,
+                )
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-            normalize_antigravity_session_resumability(&mut sessions);
             let mut state = self.state.lock().await;
             let subscriber = state
                 .host_streams
@@ -5290,7 +5318,13 @@ impl HostHandle {
     }
 
     pub(crate) async fn refresh_session_schemas(&self) {
-        let (settings_store, kiro_probe_program, skip_real_backend_probe, prev_hermes_ready) = {
+        let (
+            settings_store,
+            kiro_probe_program,
+            configured_kiro_probe_workspace_root,
+            skip_real_backend_probe,
+            prev_hermes_ready,
+        ) = {
             let mut state = self.state.lock().await;
             // Capture the last-known-good Hermes schema before resetting to
             // Pending, so a transient probe failure below can fall back to it
@@ -5307,6 +5341,7 @@ impl HostHandle {
             (
                 Arc::clone(&state.settings_store),
                 state.kiro_probe_program.clone(),
+                state.kiro_probe_workspace_root.clone(),
                 state.skip_real_backend_probe,
                 prev_hermes_ready,
             )
@@ -5319,7 +5354,7 @@ impl HostHandle {
             .enabled_backends;
 
         let kiro_session_schema = if enabled_backends.contains(&protocol::BackendKind::Kiro) {
-            match kiro_probe_workspace_root() {
+            match kiro_probe_workspace_root(configured_kiro_probe_workspace_root.as_deref()) {
                 Ok(workspace_root) => match crate::backend::kiro::probe_session_settings_schema(
                     &[workspace_root],
                     kiro_probe_program,
@@ -9598,6 +9633,10 @@ fn spawn_host_inner(
     use_mock_backend: bool,
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
+    let antigravity_conversations_dir =
+        crate::backend::antigravity::resolve_antigravity_conversations_dir(
+            runtime_config.antigravity_conversations_dir.as_deref(),
+        )?;
     let (session_store, purged_gemini_session_ids) =
         SessionStore::load_with_migration(paths.session)?;
     let project_store = ProjectStore::load(paths.project)?;
@@ -9717,7 +9756,9 @@ fn spawn_host_inner(
             hermes_session_schema: HermesSessionSchemaState::Pending,
             backend_config_snapshots: Vec::new(),
             backend_native_settings_snapshots: Vec::new(),
+            antigravity_conversations_dir,
             kiro_probe_program: runtime_config.kiro_probe_program.clone(),
+            kiro_probe_workspace_root: runtime_config.kiro_probe_workspace_root.clone(),
             skip_real_backend_probe: runtime_config.skip_real_backend_probe,
             host_streams: HashMap::new(),
             project_streams: HashMap::new(),
@@ -11734,13 +11775,15 @@ fn page_session_summaries(
 }
 
 async fn fan_out_session_lists(state: &mut HostState) {
-    let mut sessions = state
+    let sessions = state
         .session_store
         .lock()
         .await
-        .summaries()
+        .summaries_for_scope_with_antigravity_conversations_dir(
+            SessionListScope::AllSessions,
+            &state.antigravity_conversations_dir,
+        )
         .unwrap_or_else(|err| panic!("failed to list sessions for fanout: {err}"));
-    normalize_antigravity_session_resumability(&mut sessions);
 
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
     let mut dead_paths = Vec::new();
@@ -12106,13 +12149,7 @@ fn extend_task_token_usage_reasons(
     }
 }
 
-fn normalize_antigravity_session_resumability(sessions: &mut [SessionSummary]) {
-    normalize_antigravity_session_resumability_with(
-        sessions,
-        crate::backend::antigravity::is_antigravity_session_resumable,
-    );
-}
-
+#[cfg(test)]
 fn normalize_antigravity_session_resumability_with<F>(
     sessions: &mut [SessionSummary],
     is_antigravity_resumable: F,
@@ -12127,6 +12164,7 @@ fn normalize_antigravity_session_resumability_with<F>(
     }
 }
 
+#[cfg(test)]
 fn antigravity_summary_is_permanently_non_resumable(session: &SessionSummary) -> bool {
     session.compacted_to_session_id.is_some() || (!session.resumable && session.parent_id.is_some())
 }
@@ -13416,8 +13454,11 @@ fn resolve_launch_profile_from_catalog(
     }
 }
 
-fn kiro_probe_workspace_root() -> Result<String, String> {
-    Ok(crate::paths::home_dir()?.to_string_lossy().into_owned())
+fn kiro_probe_workspace_root(configured_root: Option<&Path>) -> Result<String, String> {
+    match configured_root {
+        Some(root) => Ok(root.to_string_lossy().into_owned()),
+        None => Ok(crate::paths::home_dir()?.to_string_lossy().into_owned()),
+    }
 }
 
 fn hermes_probe_workspace_root() -> Result<String, String> {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +28,31 @@ use crate::subprocess::ImageAttachment;
 const KIRO_AGENT_NAME: &str = "kiro";
 const KIRO_ADMIN_SESSION_SUBDIR: &str = ".tyde/kiro-admin";
 const KIRO_EPHEMERAL_SESSION_SUBDIR: &str = ".tyde/kiro-ephemeral";
+const KIRO_SCHEMA_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const KIRO_SCHEMA_PROBE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug)]
+enum KiroSchemaProbeStage {
+    WorkspaceSetup,
+    AcpSpawn,
+    Initialize,
+    SessionNew,
+    ModelsList,
+    Shutdown,
+}
+
+impl KiroSchemaProbeStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WorkspaceSetup => "workspace_setup",
+            Self::AcpSpawn => "acp_spawn",
+            Self::Initialize => "initialize",
+            Self::SessionNew => "session_new",
+            Self::ModelsList => "models_list",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
 
 struct KiroSpawnMode<'a> {
     ephemeral: bool,
@@ -36,6 +62,27 @@ struct KiroSpawnMode<'a> {
     startup_mcp_servers: &'a [StartupMcpServer],
     steering_content: Option<&'a str>,
     program_override: Option<String>,
+    probe_deadline: Option<tokio::time::Instant>,
+}
+
+async fn await_kiro_stage<T>(
+    deadline: Option<tokio::time::Instant>,
+    stage: KiroSchemaProbeStage,
+    future: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    if let Some(deadline) = deadline {
+        tracing::debug!(stage = stage.label(), "Kiro schema probe stage started");
+        let result = tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| format!("Kiro schema probe stage '{}' timed out", stage.label()))?
+            .map_err(|err| format!("Kiro schema probe stage '{}' failed: {err}", stage.label()))?;
+        tracing::debug!(stage = stage.label(), "Kiro schema probe stage completed");
+        Ok(result)
+    } else {
+        future
+            .await
+            .map_err(|err| format!("Kiro {} failed: {err}", stage.label()))
+    }
 }
 
 fn kiro_initialize_params() -> Value {
@@ -89,6 +136,7 @@ impl KiroSession {
                 startup_mcp_servers,
                 steering_content,
                 program_override: None,
+                probe_deadline: None,
             },
         )
         .await
@@ -111,6 +159,7 @@ impl KiroSession {
                 startup_mcp_servers,
                 steering_content,
                 program_override: None,
+                probe_deadline: None,
             },
         )
         .await
@@ -152,6 +201,28 @@ impl KiroSession {
                 startup_mcp_servers,
                 steering_content,
                 program_override,
+                probe_deadline: None,
+            },
+        )
+        .await
+    }
+
+    async fn spawn_schema_probe(
+        workspace_roots: &[String],
+        program_override: Option<String>,
+        probe_deadline: tokio::time::Instant,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
+        Self::spawn_with_mode(
+            workspace_roots,
+            KiroSpawnMode {
+                ephemeral: true,
+                admin_session: true,
+                initial_model: None,
+                ssh_host: None,
+                startup_mcp_servers: &[],
+                steering_content: None,
+                program_override,
+                probe_deadline: Some(probe_deadline),
             },
         )
         .await
@@ -161,11 +232,15 @@ impl KiroSession {
         workspace_roots: &[String],
         mode: KiroSpawnMode<'_>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Value>), String> {
-        let roots = resolve_kiro_session_roots(
-            workspace_roots,
-            mode.ssh_host.as_deref(),
-            mode.admin_session,
-            mode.ephemeral,
+        let roots = await_kiro_stage(
+            mode.probe_deadline,
+            KiroSchemaProbeStage::WorkspaceSetup,
+            resolve_kiro_session_roots(
+                workspace_roots,
+                mode.ssh_host.as_deref(),
+                mode.admin_session,
+                mode.ephemeral,
+            ),
         )
         .await?;
         let acp_args: Vec<&str> = vec!["acp"];
@@ -189,11 +264,23 @@ impl KiroSession {
             spawn_spec = spawn_spec.with_remote_cwd(roots.session_cwd.clone());
         }
 
-        let (bridge, inbound_rx) = AcpBridge::spawn(spawn_spec, mode.ssh_host.as_deref()).await?;
-
-        bridge
-            .request("initialize", kiro_initialize_params())
+        let acp_program = spawn_spec.local_program.clone();
+        let (bridge, inbound_rx) =
+            await_kiro_stage(mode.probe_deadline, KiroSchemaProbeStage::AcpSpawn, async {
+                AcpBridge::spawn(spawn_spec, mode.ssh_host.as_deref())
+                    .await
+                    .map_err(|err| {
+                        format!("Failed to start Kiro executable '{acp_program}': {err}")
+                    })
+            })
             .await?;
+
+        await_kiro_stage(
+            mode.probe_deadline,
+            KiroSchemaProbeStage::Initialize,
+            bridge.request("initialize", kiro_initialize_params()),
+        )
+        .await?;
 
         let session_result: Result<(String, Value), String> = async {
             let mut session_params = json!({
@@ -205,7 +292,12 @@ impl KiroSession {
             {
                 session_params["systemPrompt"] = Value::String(content.to_string());
             }
-            let session_started = bridge.request("session/new", session_params).await?;
+            let session_started = await_kiro_stage(
+                mode.probe_deadline,
+                KiroSchemaProbeStage::SessionNew,
+                bridge.request("session/new", session_params),
+            )
+            .await?;
 
             let session_id = session_started
                 .get("sessionId")
@@ -2730,23 +2822,17 @@ pub(crate) async fn probe_session_settings_schema(
     workspace_roots: &[String],
     program_override: Option<String>,
 ) -> Result<protocol::SessionSettingsSchema, String> {
-    let (session, mut raw_events) = KiroSession::spawn_admin_with_program_override(
-        workspace_roots,
-        None,
-        None,
-        &[],
-        None,
-        program_override,
-    )
-    .await?;
+    let deadline = tokio::time::Instant::now() + KIRO_SCHEMA_PROBE_TIMEOUT;
+    let (session, mut raw_events) =
+        KiroSession::spawn_schema_probe(workspace_roots, program_override, deadline).await?;
     let handle = session.command_handle();
 
-    let probe_result = async {
+    let probe_result = await_kiro_stage(Some(deadline), KiroSchemaProbeStage::ModelsList, async {
         handle.execute(SessionCommand::ListModels).await?;
         loop {
-            let raw = tokio::time::timeout(Duration::from_secs(5), raw_events.recv())
+            let raw = raw_events
+                .recv()
                 .await
-                .map_err(|_| "Timed out waiting for Kiro ModelsList event".to_string())?
                 .ok_or_else(|| "Kiro admin probe ended before ModelsList".to_string())?;
             if raw.get("kind").and_then(Value::as_str) != Some("ModelsList") {
                 continue;
@@ -2758,11 +2844,41 @@ pub(crate) async fn probe_session_settings_schema(
                 .ok_or_else(|| format!("Kiro ModelsList missing data.models array: {raw}"))?;
             return session_settings_schema_from_known_models(known_models);
         }
-    }
+    })
     .await;
 
-    session.shutdown().await;
-    probe_result
+    tracing::debug!(
+        stage = KiroSchemaProbeStage::Shutdown.label(),
+        "Kiro schema probe stage started"
+    );
+    let shutdown_result =
+        tokio::time::timeout(KIRO_SCHEMA_PROBE_SHUTDOWN_TIMEOUT, session.shutdown())
+            .await
+            .map_err(|_| {
+                format!(
+                    "Kiro schema probe stage '{}' timed out",
+                    KiroSchemaProbeStage::Shutdown.label()
+                )
+            });
+    if shutdown_result.is_ok() {
+        tracing::debug!(
+            stage = KiroSchemaProbeStage::Shutdown.label(),
+            "Kiro schema probe stage completed"
+        );
+    }
+
+    match (probe_result, shutdown_result) {
+        (Ok(schema), Ok(())) => Ok(schema),
+        (Ok(_), Err(shutdown_error)) => Err(shutdown_error),
+        (Err(probe_error), Ok(())) => Err(probe_error),
+        (Err(probe_error), Err(shutdown_error)) => {
+            tracing::warn!(
+                error = %shutdown_error,
+                "Kiro schema probe cleanup failed after an earlier probe failure"
+            );
+            Err(probe_error)
+        }
+    }
 }
 
 fn normalize_optional_string(value: &Value) -> Option<String> {
@@ -3758,6 +3874,21 @@ mod tests {
             Value::Bool(true)
         );
         assert_eq!(params["clientCapabilities"]["terminal"], Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn schema_probe_workspace_setup_timeout_is_stage_specific() {
+        let result = await_kiro_stage(
+            Some(tokio::time::Instant::now()),
+            KiroSchemaProbeStage::WorkspaceSetup,
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("expired workspace setup deadline should time out"),
+            "Kiro schema probe stage 'workspace_setup' timed out"
+        );
     }
 
     #[test]

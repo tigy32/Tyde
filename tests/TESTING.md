@@ -73,11 +73,11 @@ async fn feature_name() {
 
 ```bash
 # Run all tests
-cargo test -p tests
+cargo nextest run -p tests
 
 # Run specific test
-cargo test -p tests test_name
+cargo nextest run -p tests test_name
 
 # Run with output
-cargo test -p tests -- --nocapture
+cargo nextest run -p tests test_name --no-capture
 ```

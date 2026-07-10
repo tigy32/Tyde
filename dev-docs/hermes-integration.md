@@ -70,6 +70,36 @@ timeout is 15 seconds and can be overridden with
 `HERMES_TUI_STARTUP_TIMEOUT_MS`. Individual JSON-RPC requests use
 `HERMES_TUI_RPC_TIMEOUT_MS` and default to 120 seconds.
 
+## MCP startup injection
+
+Hermes discovers MCP servers from `mcp_servers` in its native configuration,
+not from `session.create`. For a session with Tyde-provided MCP servers, Tyde
+therefore starts the same verified Hermes Python with a process-local bootstrap
+instead of `-m tui_gateway.entry`. The bootstrap reads one private JSON line
+from the gateway's stdin, overlays those servers onto the configuration returned
+by `hermes_cli.config`, and then runs `tui_gateway.entry` in the same process.
+The rest of stdin remains the normal newline-delimited gateway JSON-RPC stream.
+
+This keeps Hermes as the MCP client and preserves its native configuration
+validation, environment interpolation, server discovery, tool registration,
+and reload. The bootstrap also adds the session-provided server names to the
+gateway's process-local enabled toolset selection, so a user's native
+`no_mcp` preference continues to apply to native servers without hiding the MCP
+servers explicitly selected for the Tyde session. Stdio servers map to Hermes
+`command`/`args`/`env` entries. HTTP servers map to `url`/`headers`; a Tyde
+`bearer_token_env_var` becomes an `Authorization: Bearer ${ENV_VAR}` template so
+Hermes resolves the token from its own environment or secret scope.
+
+The overlay deliberately keeps the real `HERMES_HOME`. Hermes credentials,
+profiles, state database, memories, and user-configured MCP servers therefore
+remain available. Tyde-provided entries win a same-name collision inside that
+gateway process. Wrapped Hermes save operations restore the native MCP section
+before writing, so session-only entries never leak into `~/.hermes/config.yaml`.
+Tyde does not mutate the global config, create an alternate Hermes home, write a
+temporary config file, or put the injected configuration or header values in
+process arguments or environment variables. The same stdin bootstrap works
+through the remote SSH transport.
+
 ## JSON-RPC methods used
 
 The MVP uses these native gateway methods:
@@ -183,8 +213,6 @@ absorbs it after the local cancellation sequence has already closed the stream.
 ## Explicitly deferred
 
 - Image input is disabled until Hermes's native image contract is verified.
-- MCP startup injection and custom MCP server configuration are rejected until
-  Hermes gateway startup/tool policy parameters are verified.
 - Custom Tyde tool policies are rejected unless they are representable by the
   verified Hermes gateway contract.
 - Hermes delegation/subagent events currently surface as warnings. They are not
