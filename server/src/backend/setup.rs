@@ -294,6 +294,7 @@ async fn run_version_command(command: &str) -> Option<Option<(String, String)>> 
     let mut command = Command::new(command);
     command
         .arg("--version")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(path) = process_env::resolved_child_process_path() {
@@ -303,23 +304,24 @@ async fn run_version_command(command: &str) -> Option<Option<(String, String)>> 
     let mut stdout_pipe = child.inner().stdout.take()?;
     let mut stderr_pipe = child.inner().stderr.take()?;
 
-    let status = match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(_)) => return Some(None),
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let probe = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            child.wait(),
+            stdout_pipe.read_to_end(&mut stdout_bytes),
+            stderr_pipe.read_to_end(&mut stderr_bytes),
+        )
+    })
+    .await;
+    let status = match probe {
+        Ok((Ok(status), Ok(_), Ok(_))) => status,
+        Ok(_) => return Some(None),
         Err(_) => {
             let _ = child.kill().await;
             return Some(None);
         }
     };
-
-    let mut stdout_bytes = Vec::new();
-    if stdout_pipe.read_to_end(&mut stdout_bytes).await.is_err() {
-        return Some(None);
-    }
-    let mut stderr_bytes = Vec::new();
-    if stderr_pipe.read_to_end(&mut stderr_bytes).await.is_err() {
-        return Some(None);
-    }
 
     let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
@@ -1029,6 +1031,26 @@ mod tests {
             "diagnostic should name reported and required versions: {}",
             diagnostic.message
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn version_probe_bounds_descendant_pipe_drain() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let command = dir.path().join("version-probe");
+        write_executable(
+            &command,
+            "#!/bin/sh\n(sleep 30) &\nprintf 'version 1.0\\n'\nexit 0\n",
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_version_command(&command.to_string_lossy()),
+        )
+        .await
+        .expect("version probe must bound pipe draining held open by descendants");
+
+        assert!(result.is_some_and(|output| output.is_none()));
     }
 
     #[test]
