@@ -1757,7 +1757,6 @@ pub(crate) fn spawn_agent_actor(
             startup_failure,
             initial_alias,
             use_mock_backend,
-            workflow: _,
             ..
         } = request;
         let mut current_start = start.clone();
