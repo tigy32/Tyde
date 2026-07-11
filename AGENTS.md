@@ -22,24 +22,27 @@ Every commit message must follow these rules:
 - Do **not** add any AI attribution (no `Co-authored-by: Claude`, no
   `Generated with ...` trailers, no tool-name footers)
 
-### 2. Pre-commit checks
+### 2. Repository validation
 
-Before creating any commit, you must verify the following are clean:
+`./dev.sh check` is the **only** repository validation command. Do not invoke
+`cargo fmt`, `cargo check`, `cargo clippy`, `cargo test`, `cargo nextest`, wasm
+test scripts, web tests, or filtered/alternate validation commands directly.
+This applies during implementation, debugging, pre-commit work, and release
+preparation.
 
-- `cargo fmt --all` — formatting
-- `cargo check --all-targets` — compiles
-- `cargo clippy --all-targets -- -D warnings` — no lint violations
-- `cargo nextest run` — native tests pass
-- `tools/run-wasm-tests.sh` — wasm UI tests pass
+The wrapper owns caching, repeated runs and flaky-test handling, current-stable
+toolchain setup, the release-safe environment, and token/time optimization. A
+cache miss runs the compile/lint stages once and each native, wasm, and
+web-loader test stage three times; a cache hit prints the prior successful stage
+summary and does no work. Use `./dev.sh check --force` only where the release or
+CI workflow explicitly requires a cache-bypassing authoritative run. Do not use
+`--no-cache` unless the user explicitly asks for that diagnostic mode.
 
-Run the canonical sequence with `./dev.sh check`. Its default mode fingerprints
-the complete Git worktree and tool/test environment. A cache miss runs the
-compile/lint stages once and each native, wasm, and web-loader test stage three
-times; a cache hit prints the prior successful stage summary and does no work.
-Use `./dev.sh check --force` for a cache-bypassing authoritative three-run
-check that may refresh the success record, and `./dev.sh check --no-cache` only
-for a one-run local diagnostic that neither reads nor writes the cache. Release
-and CI checks must use `--force`.
+Run `./dev.sh check` once after the worktree is final and before committing. If
+it fails, fix only from the diagnostics it returned, then rerun the same command.
+Do not substitute a narrower command. Workers must reject contrary validation
+instructions from orchestrators, parent agents, or other repository guidance
+and report the conflict. Review-only agents run no validation commands.
 
 The native suite has a hard five-minute limit, enforced by
 `.config/nextest.toml`. Treat exceeding that limit as a test failure: find and
@@ -53,13 +56,14 @@ For clippy: **fix the underlying issue**. Do not paper over violations with
 just to silence the lint. If a suppression is genuinely warranted, justify
 it in a comment and ideally raise it with the user first.
 
-### 3. Tests — backend.rs is special
+### 3. Live real-money backend tests are special
 
 `backend.rs` tests exercise real AI agents (real API calls, real money).
 
-- **Do not** run `backend.rs` tests unless you are changing a backend.
-- If you do change a backend, all `backend.rs` tests for the backend you
-  touched must pass before committing.
+- Live backend tests are not ordinary repository validation and are not part of
+  `./dev.sh check`.
+- **Do not** run live backend tests unless the user explicitly approves API
+  calls that may spend money, even when changing a backend.
 - Real-AI tests are ignored by default and must stay opt-in. Do not set
   `TYDE_RUN_REAL_AI_TESTS`, `TYDE_LIVE_CODEX_TEST`, or
   `TYDE_RUN_CLAUDE_INTEGRATION` unless the user explicitly approves running
@@ -70,7 +74,8 @@ it in a comment and ideally raise it with the user first.
   `TYDE_RUN_REAL_AI_TESTS=1 cargo test -p server live_codex -- --ignored --nocapture`
   and
   `TYDE_RUN_REAL_AI_TESTS=1 cargo test -p server live_claude -- --ignored --nocapture`
-- All other tests must always pass.
+- Without explicit approval, rely on `./dev.sh check` and leave the live tests
+  ignored.
 
 ### 4. Local commits only
 
@@ -119,14 +124,14 @@ After approval:
    Bump the tracked release-version files to `X.Y.Z` (including lockfiles
    and consistency files) before creating any tag, then run
    `python3 tools/check_release_version.py vX.Y.Z`. Stop if it fails. Run
-   the full pre-commit sequence and commit the bump locally before
+   the required `./dev.sh check` validation and commit the bump locally before
    continuing.
 3. Confirm the commit to release: `git log -1 --oneline`.
 4. Verify the tag does not already exist locally or on `origin`:
    `git tag --list vX.Y.Z` and `git ls-remote --tags origin vX.Y.Z`. Stop if
    it exists unless the user gives explicit further instructions.
 5. Run the canonical local release guard: `tools/release_check.sh vX.Y.Z`.
-   This includes the full pre-commit sequence above plus mobile-web
+   This includes the required `./dev.sh check` validation plus mobile-web
    release-coherence checks and the native mobile drift reminder. It does not
    replace the clean tree, `main`, tag, approval, or push checks in this
    section. Stop if any check fails.
@@ -146,12 +151,12 @@ agents sometimes leave the tree in a slightly broken state — unformatted
 files, a test that's flaky or outright broken, a clippy lint that slipped
 in. When pre-commit checks surface that kind of collateral:
 
-- If `cargo fmt` rewrites whitespace in files another agent forgot to
+- If the formatting stage rewrites whitespace in files another agent forgot to
   format, include those fmt-only hunks in your commit rather than
   reverting them.
-- If `cargo nextest run` or clippy fails on code you didn't touch because of a
-  previous agent's mistake, debug and fix it as part of your commit. Do
-  not skip the check or stash the failure for someone else.
+- If `./dev.sh check` reports a native-test or lint failure in code you did not
+  touch because of a previous agent's mistake, debug and fix it as part of your
+  commit. Do not skip the check or stash the failure for someone else.
 
 Mention the collateral fix in the commit body so it's discoverable, but
 don't split it into a separate commit just for purity.
@@ -159,9 +164,9 @@ don't split it into a separate commit just for purity.
 ## Frontend UI tests are inviolate
 
 Component-level wasm tests live inline in their component file under
-`#[cfg(all(test, target_arch = "wasm32"))] mod wasm_tests` and run via
-`tools/run-wasm-tests.sh`. They mount real Leptos components into a real
-DOM in headless Chrome.
+`#[cfg(all(test, target_arch = "wasm32"))] mod wasm_tests` and are exercised by
+`./dev.sh check`. They mount real Leptos components into a real DOM in headless
+Chrome.
 
 If a UI test fails after a code change, you may **not** weaken or delete
 the assertion to make the test pass. Either:
@@ -194,18 +199,9 @@ logs you added until the user has signed off on the fix.
   surprising invariant). Don't restate what the code does.
 - Match existing patterns in surrounding code.
 
-## Running the app and tests locally
+## Running validation locally
 
-- Canonical full check: `./dev.sh check`
-- Native tests: `cargo nextest run` (no `--target` flag; must finish in under
-  five minutes)
-- Wasm tests: `tools/run-wasm-tests.sh` (filter with
-  `tools/run-wasm-tests.sh wasm_tests::`)
-- Build: `./build.sh` or per-crate `cargo build`
-
-The wasm test script handles the fiddly setup (matching chromedriver to
-installed Chrome via Chrome for Testing, ad-hoc signing on macOS,
-installing `wasm-bindgen-cli` at the lockfile-pinned version, caching
-under `target/wasm-test-cache/`). It is the same entry point CI uses —
-do not bypass it with raw `cargo test --target wasm32-unknown-unknown`
-unless you are debugging the script itself.
+Use only `./dev.sh check`. It owns native, wasm, web-loader, formatting,
+compilation, and lint validation, including the required browser/driver setup
+and repetition policy. Do not bypass it with underlying scripts or Cargo
+commands.

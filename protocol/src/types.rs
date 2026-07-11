@@ -775,6 +775,20 @@ pub enum AgentControlStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentControlOutput {
+    Empty,
+    Message { text: String },
+    Error { error: AgentErrorPayload },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlReadResult {
+    pub agent_id: AgentId,
+    pub output: AgentControlOutput,
+}
+
 /// Backend-agnostic hint for picking a cheaper or more capable spawned agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -5468,7 +5482,7 @@ pub struct CommandErrorPayload {
     pub fatal: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentErrorPayload {
     pub agent_id: AgentId,
     pub code: AgentErrorCode,
@@ -7457,5 +7471,66 @@ mod release_version_back_compat_tests {
         };
         let encoded_none = serde_json::to_value(&none).expect("serialize none");
         assert!(encoded_none.get("release_version").is_none());
+    }
+}
+
+#[cfg(test)]
+mod agent_control_output_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn latest_output_result_round_trips_typed_variants() {
+        let cases = [
+            AgentControlReadResult {
+                agent_id: AgentId("agent-1".to_owned()),
+                output: AgentControlOutput::Empty,
+            },
+            AgentControlReadResult {
+                agent_id: AgentId("agent-1".to_owned()),
+                output: AgentControlOutput::Message {
+                    text: "visible answer".to_owned(),
+                },
+            },
+            AgentControlReadResult {
+                agent_id: AgentId("agent-1".to_owned()),
+                output: AgentControlOutput::Error {
+                    error: AgentErrorPayload {
+                        agent_id: AgentId("agent-1".to_owned()),
+                        code: AgentErrorCode::Internal,
+                        message: "backend failed".to_owned(),
+                        fatal: true,
+                    },
+                },
+            },
+        ];
+
+        for expected in cases {
+            let encoded = serde_json::to_value(&expected).expect("serialize read result");
+            let decoded: AgentControlReadResult =
+                serde_json::from_value(encoded).expect("deserialize read result");
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn message_output_contains_only_visible_text() {
+        let result = AgentControlReadResult {
+            agent_id: AgentId("agent-1".to_owned()),
+            output: AgentControlOutput::Message {
+                text: "visible answer".to_owned(),
+            },
+        };
+
+        assert_eq!(
+            serde_json::to_value(result).expect("serialize read result"),
+            json!({
+                "agent_id": "agent-1",
+                "output": {
+                    "kind": "message",
+                    "text": "visible answer"
+                }
+            })
+        );
     }
 }

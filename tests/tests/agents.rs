@@ -825,7 +825,12 @@ async fn assert_read_agent_contains(
     expected_text: &str,
 ) -> Option<u64> {
     let read = control
-        .read_agent(protocol::AgentId(agent_id.to_string()), after_seq, None)
+        .read_agent_debug(
+            protocol::AgentId(agent_id.to_string()),
+            after_seq,
+            None,
+            None,
+        )
         .await
         .expect("agent control read should succeed");
     assert!(
@@ -3690,14 +3695,6 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
         .await
         .expect("send stream-end-first ExitPlanMode approval");
 
-    wait_for_agent_control_status(
-        &base_url,
-        &new_agent.agent_id,
-        "thinking",
-        Duration::from_millis(500),
-    )
-    .await;
-
     let mut saw_completion = false;
     while !saw_completion {
         let env = expect_chat_event_on_stream(
@@ -3714,14 +3711,6 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
             saw_completion = true;
         }
     }
-
-    wait_for_agent_control_status(
-        &base_url,
-        &new_agent.agent_id,
-        "thinking",
-        Duration::from_millis(500),
-    )
-    .await;
 
     let await_while_resuming = tokio::time::timeout(
         Duration::from_millis(150),
@@ -4122,8 +4111,9 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     .await;
 
     let base_url = fixture.agent_control_http_url().await;
+    let caller_url = format!("{base_url}?agent_id={}", parent_new.agent_id.0);
     wait_for_agent_control_status(
-        &base_url,
+        &caller_url,
         &child_new.agent_id,
         "thinking",
         Duration::from_secs(1),
@@ -4178,7 +4168,7 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     .await;
 
     wait_for_agent_control_status(
-        &base_url,
+        &caller_url,
         &child_new.agent_id,
         "idle",
         Duration::from_secs(2),
@@ -4543,7 +4533,7 @@ async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() 
     )
     .await;
 
-    let listed = mcp_list_agents(&base_url).await;
+    let listed = mcp_list_agents(&caller_url).await;
     assert_eq!(
         mcp_listed_agent(&listed, &inherited_child_id)
             .get("project_id")
@@ -4643,19 +4633,17 @@ async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
         "backend-native child AgentStart must point to its live parent",
     );
 
-    let control = fixture.connect_agent_control().await;
-    let listed = control.list_agents().await;
+    let base_url = fixture.agent_control_http_url().await;
+    let caller_url = format!("{base_url}?agent_id={}", parent_new.agent_id.0);
+    let listed = mcp_list_agents(&caller_url).await;
     assert_eq!(
-        listed.len(),
-        2,
-        "agent-control list should include native child"
+        listed.as_array().map(Vec::len),
+        Some(1),
+        "caller-scoped agent-control list should contain only the native child"
     );
-    let listed_child = listed
-        .iter()
-        .find(|agent| agent.agent_id == child_new.agent_id.0)
-        .expect("native child missing from agent-control list");
+    let listed_child = mcp_listed_agent(&listed, &child_new.agent_id);
     assert_eq!(
-        listed_child.parent_agent_id.as_deref(),
+        listed_child.get("parent_agent_id").and_then(Value::as_str),
         Some(parent_new.agent_id.0.as_str())
     );
 

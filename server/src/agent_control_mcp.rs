@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use axum::{Json, Router, response::IntoResponse, routing::get};
 use protocol::{
-    AgentControlStatus, AgentId, AgentInput, AgentOrigin, BackendAccessMode, BackendKind,
-    CustomAgentId, Envelope, ImageData, LaunchProfileCatalog, LaunchProfileId, ProjectId,
+    AgentControlOutput, AgentControlReadResult, AgentControlStatus, AgentErrorPayload, AgentId,
+    AgentInput, AgentOrigin, BackendAccessMode, BackendKind, ChatEvent, CustomAgentId, Envelope,
+    FrameKind, ImageData, LaunchProfileCatalog, LaunchProfileId, MessageSender, ProjectId,
     SendMessagePayload, SessionSchemaEntry, SessionSettingsValues, SpawnAgentParams,
     SpawnAgentPayload, SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload, TeamMemberId,
     WorkflowSaveRequest, WorkflowSaveResponse, WorkflowTargetsResponse,
@@ -154,6 +155,12 @@ struct AwaitAgentsToolInput {
 #[serde(deny_unknown_fields)]
 struct ReadAgentToolInput {
     agent_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadAgentDebugToolInput {
+    agent_id: String,
     after_seq: Option<u64>,
     limit: Option<u32>,
     max_bytes: Option<u32>,
@@ -245,7 +252,7 @@ impl AwaitProgressReporter {
 }
 
 #[derive(Debug, Serialize)]
-struct ReadAgentResult {
+struct ReadAgentDebugResult {
     agent_id: String,
     events: Vec<Envelope>,
     next_after_seq: Option<u64>,
@@ -401,7 +408,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Read output events from a Tyde agent. Results are capped by limit and max_bytes; use next_after_seq for incremental reads."
+        description = "Read only the latest assistant-visible message or agent error. Returns empty when the agent has no output record or its latest message has no visible text."
     )]
     async fn tyde_read_agent(
         &self,
@@ -411,7 +418,24 @@ impl TydeAgentControlMcpServer {
             Ok(id) => id,
             Err(err) => return Ok(err_text(err)),
         };
-        match do_read_agent(
+        match do_read_agent(&self.host, &agent_id).await {
+            Ok(result) => ok_json(result),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Debug-only detailed incremental agent output events. Results are capped by limit and max_bytes; use next_after_seq for incremental reads."
+    )]
+    async fn tyde_read_agent_debug(
+        &self,
+        Parameters(input): Parameters<ReadAgentDebugToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let agent_id = match parse_agent_id(&input.agent_id) {
+            Ok(id) => id,
+            Err(err) => return Ok(err_text(err)),
+        };
+        match do_read_agent_debug(
             &self.host,
             &agent_id,
             input.after_seq,
@@ -554,12 +578,22 @@ impl TydeAgentControlMcpServer {
         }
     }
 
-    #[tool(description = "List all agents currently known to this Tyde host.")]
+    #[tool(description = "List only agents directly created by the calling Tyde agent.")]
     async fn tyde_list_agents(
         &self,
         Parameters(_input): Parameters<EmptyToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
-        match do_list_agents(&self.host).await {
+        let request_agent_id = match request_agent_id_from_parts(&parts) {
+            Ok(Some(agent_id)) => agent_id,
+            Ok(None) => {
+                return Ok(err_text(
+                    "tyde_list_agents requires an injected caller agent_id",
+                ));
+            }
+            Err(err) => return Ok(err_text(err)),
+        };
+        match do_list_agents(&self.host, &request_agent_id).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
         }
@@ -570,7 +604,7 @@ impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Tools for orchestrating Tyde2 coding agents. Discover server-owned Launch Profiles with tyde_list_launch_options, spawn agents with tyde_spawn_agent, wait for them with tyde_await_agents, send follow-ups with tyde_send_agent_message, read output only with tyde_read_agent, use tyde_workflow_targets/tyde_workflow_save to author Tyde workflow files, and use tyde_team_describe/tyde_team_message_member when running as an agent-team member."
+                "Tools for orchestrating Tyde2 coding agents. Discover server-owned Launch Profiles with tyde_list_launch_options, spawn agents with tyde_spawn_agent, wait for them with tyde_await_agents, send follow-ups with tyde_send_agent_message, read the latest visible output with tyde_read_agent, inspect incremental output events with tyde_read_agent_debug, use tyde_workflow_targets/tyde_workflow_save to author Tyde workflow files, and use tyde_team_describe/tyde_team_message_member when running as an agent-team member."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -752,7 +786,13 @@ async fn do_spawn_agent(
         .map(parse_agent_id)
         .transpose()?;
     let caller_agent_id = request_agent_id.clone();
-    let parent_agent_id = explicit_parent.or(request_agent_id);
+    let parent_agent_id = match (request_agent_id, explicit_parent) {
+        (Some(caller), Some(explicit)) if caller != explicit => {
+            return Err("parent_agent_id must match the injected caller agent_id".to_string());
+        }
+        (Some(caller), _) => Some(caller),
+        (None, explicit) => explicit,
+    };
     let requested_name = input.name.filter(|value| !value.trim().is_empty());
 
     let payload = SpawnAgentPayload {
@@ -1018,8 +1058,19 @@ async fn do_workflow_save(
     host.workflow_save_from_agent(input).await
 }
 
-async fn do_list_agents(host: &HostHandle) -> Result<Vec<AgentOverview>, String> {
-    let agents = host.list_agents().await;
+async fn do_list_agents(
+    host: &HostHandle,
+    caller_agent_id: &AgentId,
+) -> Result<Vec<AgentOverview>, String> {
+    if host.agent_handle(caller_agent_id).await.is_none() {
+        return Err(format!("unknown caller agent_id {}", caller_agent_id.0));
+    }
+    let agents = host
+        .list_agents()
+        .await
+        .into_iter()
+        .filter(|start| start.parent_agent_id.as_ref() == Some(caller_agent_id))
+        .collect::<Vec<_>>();
     let mut overviews = Vec::with_capacity(agents.len());
     for start in agents {
         let status = host
@@ -1158,10 +1209,60 @@ async fn await_result_from_snapshot(
 async fn do_read_agent(
     host: &HostHandle,
     agent_id: &AgentId,
+) -> Result<AgentControlReadResult, String> {
+    let handle = host
+        .agent_handle(agent_id)
+        .await
+        .ok_or_else(|| format!("unknown agent_id {}", agent_id.0))?;
+    let latest = handle
+        .read_latest_output()
+        .await
+        .ok_or_else(|| format!("agent {} is not available", agent_id.0))?;
+
+    Ok(AgentControlReadResult {
+        agent_id: agent_id.clone(),
+        output: latest_agent_output(latest)?,
+    })
+}
+
+fn latest_agent_output(latest: Option<Envelope>) -> Result<AgentControlOutput, String> {
+    let Some(latest) = latest else {
+        return Ok(AgentControlOutput::Empty);
+    };
+    match latest.kind {
+        FrameKind::AgentError => {
+            let error = latest
+                .parse_payload::<AgentErrorPayload>()
+                .map_err(|err| format!("invalid latest agent error: {err}"))?;
+            Ok(AgentControlOutput::Error { error })
+        }
+        FrameKind::ChatEvent => {
+            let event = latest
+                .parse_payload::<ChatEvent>()
+                .map_err(|err| format!("invalid latest agent output event: {err}"))?;
+            let ChatEvent::MessageAdded(message) = event else {
+                return Ok(AgentControlOutput::Empty);
+            };
+            if !matches!(message.sender, MessageSender::Assistant { .. })
+                || message.content.trim().is_empty()
+            {
+                return Ok(AgentControlOutput::Empty);
+            }
+            Ok(AgentControlOutput::Message {
+                text: message.content,
+            })
+        }
+        _ => Ok(AgentControlOutput::Empty),
+    }
+}
+
+async fn do_read_agent_debug(
+    host: &HostHandle,
+    agent_id: &AgentId,
     after_seq: Option<u64>,
     limit: Option<u32>,
     max_bytes: Option<u32>,
-) -> Result<ReadAgentResult, String> {
+) -> Result<ReadAgentDebugResult, String> {
     let limit = limit
         .map(|value| value as usize)
         .unwrap_or(DEFAULT_READ_LIMIT);
@@ -1191,7 +1292,7 @@ async fn do_read_agent(
         .ok_or_else(|| format!("agent {} is not available", agent_id.0))?;
     let capped = cap_read_events(events, max_bytes, after_seq);
 
-    Ok(ReadAgentResult {
+    Ok(ReadAgentDebugResult {
         agent_id: agent_id.0.clone(),
         events: capped.events,
         next_after_seq: capped.next_after_seq,
@@ -1364,7 +1465,8 @@ async fn healthz_handler() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::StreamPath;
+    use protocol::{AgentErrorCode, ChatMessage, ReasoningData, StreamPath, ToolUseData};
+    use serde_json::Value;
     use tokio::time::{sleep, timeout};
 
     #[test]
@@ -1443,6 +1545,164 @@ mod tests {
         assert!(capped.omitted_event_bytes > 512);
     }
 
+    fn assistant_message(content: &str) -> ChatMessage {
+        ChatMessage {
+            message_id: None,
+            timestamp: 1,
+            sender: MessageSender::Assistant {
+                agent: "worker".to_owned(),
+            },
+            content: content.to_owned(),
+            reasoning: Some(ReasoningData {
+                text: "private reasoning".to_owned(),
+                tokens: None,
+                signature: None,
+                blob: None,
+            }),
+            tool_calls: vec![ToolUseData {
+                id: "tool-1".to_owned(),
+                name: "private_tool".to_owned(),
+                arguments: json!({"private": true}),
+            }],
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        }
+    }
+
+    fn output_envelope(seq: u64, event: &ChatEvent) -> Envelope {
+        Envelope::from_payload(
+            StreamPath("/agent/worker".to_owned()),
+            FrameKind::ChatEvent,
+            seq,
+            event,
+        )
+        .expect("output envelope")
+    }
+
+    #[test]
+    fn latest_agent_output_returns_only_visible_message_text() {
+        let output = latest_agent_output(Some(output_envelope(
+            1,
+            &ChatEvent::MessageAdded(assistant_message("visible answer")),
+        )))
+        .expect("project latest output");
+
+        assert_eq!(
+            output,
+            AgentControlOutput::Message {
+                text: "visible answer".to_owned()
+            }
+        );
+        let encoded = serde_json::to_value(output).expect("serialize output");
+        assert!(encoded.get("reasoning").is_none());
+        assert!(encoded.get("tool_calls").is_none());
+        assert!(encoded.get("metadata").is_none());
+    }
+
+    #[test]
+    fn latest_agent_output_preserves_empty_and_error_records() {
+        assert_eq!(
+            latest_agent_output(None).expect("empty output"),
+            AgentControlOutput::Empty
+        );
+        assert_eq!(
+            latest_agent_output(Some(output_envelope(
+                2,
+                &ChatEvent::MessageAdded(assistant_message("")),
+            )))
+            .expect("empty latest message"),
+            AgentControlOutput::Empty
+        );
+
+        let error = AgentErrorPayload {
+            agent_id: AgentId("550e8400-e29b-41d4-a716-446655440000".to_owned()),
+            code: AgentErrorCode::BackendFailed,
+            message: "backend failed".to_owned(),
+            fatal: true,
+        };
+        let envelope = Envelope::from_payload(
+            StreamPath("/agent/worker".to_owned()),
+            FrameKind::AgentError,
+            3,
+            &error,
+        )
+        .expect("error envelope");
+        assert_eq!(
+            latest_agent_output(Some(envelope)).expect("error output"),
+            AgentControlOutput::Error { error }
+        );
+    }
+
+    fn input_schema<T: schemars::JsonSchema>() -> Value {
+        serde_json::to_value(schemars::schema_for!(T)).expect("serialize input schema")
+    }
+
+    #[test]
+    fn read_tool_schemas_separate_latest_and_debug_inputs() {
+        let tools = TydeAgentControlMcpServer::tool_router().list_all();
+        assert!(tools.iter().any(|tool| tool.name == "tyde_read_agent"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "tyde_read_agent_debug")
+        );
+
+        let latest = input_schema::<ReadAgentToolInput>();
+        assert_eq!(
+            latest.get("additionalProperties"),
+            Some(&Value::Bool(false))
+        );
+        assert!(latest.pointer("/properties/agent_id").is_some());
+        for field in ["after_seq", "limit", "max_bytes"] {
+            assert!(latest.pointer(&format!("/properties/{field}")).is_none());
+        }
+
+        let debug = input_schema::<ReadAgentDebugToolInput>();
+        for field in ["agent_id", "after_seq", "limit", "max_bytes"] {
+            assert!(debug.pointer(&format!("/properties/{field}")).is_some());
+        }
+    }
+
+    #[test]
+    fn latest_and_await_inputs_reject_legacy_fields() {
+        for field in ["after_seq", "limit", "max_bytes"] {
+            let mut input = serde_json::Map::from_iter([(
+                "agent_id".to_owned(),
+                json!("550e8400-e29b-41d4-a716-446655440000"),
+            )]);
+            input.insert(field.to_owned(), json!(1));
+            let err = serde_json::from_value::<ReadAgentToolInput>(Value::Object(input))
+                .expect_err("latest read must reject debug fields");
+            assert!(err.to_string().contains("unknown field") && err.to_string().contains(field));
+        }
+        for field in ["timeout", "timeout_ms"] {
+            let mut input = serde_json::Map::from_iter([(
+                "agent_ids".to_owned(),
+                json!(["550e8400-e29b-41d4-a716-446655440000"]),
+            )]);
+            input.insert(field.to_owned(), json!(1));
+            let err = serde_json::from_value::<AwaitAgentsToolInput>(Value::Object(input))
+                .expect_err("await must reject timeout fields");
+            assert!(err.to_string().contains("unknown field") && err.to_string().contains(field));
+        }
+    }
+
+    #[test]
+    fn debug_input_accepts_incremental_controls() {
+        let input = serde_json::from_value::<ReadAgentDebugToolInput>(json!({
+            "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+            "after_seq": 7,
+            "limit": 8,
+            "max_bytes": 4096,
+        }))
+        .expect("debug input");
+        assert_eq!(input.after_seq, Some(7));
+        assert_eq!(input.limit, Some(8));
+        assert_eq!(input.max_bytes, Some(4096));
+    }
+
     fn hermes_claude_session_settings() -> protocol::SessionSettingsValues {
         let mut settings = protocol::SessionSettingsValues::default();
         settings.0.insert(
@@ -1463,6 +1723,88 @@ mod tests {
             backend_kind: BackendKind::Hermes,
             session_settings: hermes_claude_session_settings(),
         }
+    }
+
+    fn mock_spawn_input(name: &str, parent_agent_id: Option<String>) -> SpawnRequestInput {
+        SpawnAgentToolInput {
+            workspace_roots: vec!["/tmp/test".to_owned()],
+            prompt: format!("work for {name}"),
+            launch_profile_id: None,
+            backend_kind: Some(BackendKindInput::Claude),
+            session_settings: None,
+            parent_agent_id,
+            project_id: None,
+            name: Some(name.to_owned()),
+            cost_hint: None,
+            access_mode: None,
+        }
+        .into()
+    }
+
+    #[tokio::test]
+    async fn list_agents_returns_only_callers_direct_children() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("mock host");
+        let caller = do_spawn_agent(&host, mock_spawn_input("caller", None), None)
+            .await
+            .expect("spawn caller");
+        let caller_id = AgentId(caller.agent_id);
+        let child = do_spawn_agent(
+            &host,
+            mock_spawn_input("direct-child", None),
+            Some(caller_id.clone()),
+        )
+        .await
+        .expect("spawn direct child");
+        let child_id = AgentId(child.agent_id.clone());
+        let _grandchild =
+            do_spawn_agent(&host, mock_spawn_input("grandchild", None), Some(child_id))
+                .await
+                .expect("spawn grandchild");
+        let _unrelated = do_spawn_agent(&host, mock_spawn_input("unrelated", None), None)
+            .await
+            .expect("spawn unrelated agent");
+
+        let listed = do_list_agents(&host, &caller_id)
+            .await
+            .expect("list caller children");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].agent_id, child.agent_id);
+        assert_eq!(
+            listed[0].parent_agent_id.as_deref(),
+            Some(caller_id.0.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_cannot_assign_a_different_parent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("mock host");
+        let caller = do_spawn_agent(&host, mock_spawn_input("caller", None), None)
+            .await
+            .expect("spawn caller");
+        let other = do_spawn_agent(&host, mock_spawn_input("other", None), None)
+            .await
+            .expect("spawn other");
+
+        let err = do_spawn_agent(
+            &host,
+            mock_spawn_input("spoofed", Some(other.agent_id)),
+            Some(AgentId(caller.agent_id)),
+        )
+        .await
+        .expect_err("injected caller must own parent assignment");
+        assert!(err.contains("must match the injected caller"));
     }
 
     #[tokio::test]
@@ -1592,6 +1934,57 @@ mod tests {
             result.still_thinking[0].status,
             AgentControlStatus::Thinking
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_agents_remains_pending_beyond_prior_300_second_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = crate::host::spawn_host_with_mock_backend(
+            dir.path().join("sessions.json"),
+            dir.path().join("projects.json"),
+            dir.path().join("settings.json"),
+        )
+        .expect("mock host");
+        let spawned = do_spawn_agent(
+            &host,
+            SpawnAgentToolInput {
+                workspace_roots: vec!["/tmp/test".to_string()],
+                prompt: "__mock_hold_until_interrupt__ boundary".to_string(),
+                launch_profile_id: None,
+                backend_kind: Some(BackendKindInput::Claude),
+                session_settings: None,
+                parent_agent_id: None,
+                project_id: None,
+                name: Some("boundary-agent".to_string()),
+                cost_hint: None,
+                access_mode: None,
+            }
+            .into(),
+            None,
+        )
+        .await
+        .expect("spawn held agent");
+        let cancellation_token = CancellationToken::new();
+        let await_future = do_await_agents_with_progress(
+            &host,
+            vec![AgentId(spawned.agent_id)],
+            Some(cancellation_token.clone()),
+            None,
+        );
+        tokio::pin!(await_future);
+
+        tokio::time::advance(Duration::from_secs(301)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            timeout(Duration::ZERO, &mut await_future).await.is_err(),
+            "await must remain pending beyond the former client boundary"
+        );
+
+        cancellation_token.cancel();
+        let result = await_future
+            .await
+            .expect("cancellation should return a status snapshot");
+        assert_eq!(result.still_thinking.len(), 1);
     }
 
     #[tokio::test]

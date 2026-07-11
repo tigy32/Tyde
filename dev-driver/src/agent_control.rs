@@ -1,17 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use client::ClientConfig;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentControlStatus, AgentErrorPayload, AgentId,
-    AgentRenamedPayload, AgentStartPayload, BackendAccessMode, BackendConfigSchemasPayload,
-    BackendKind, ChatEvent, Envelope, FrameKind, HostBootstrapPayload, HostSettings,
-    HostSettingsPayload, LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry,
-    LaunchProfileId, MessageSender, NewAgentPayload, ProjectId, SendMessagePayload,
-    SessionSchemaEntry, SessionSchemasPayload, SessionSettingsValues, SpawnAgentParams,
-    SpawnAgentPayload, SpawnCostHint, StreamPath,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentControlOutput, AgentControlReadResult,
+    AgentControlStatus, AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
+    BackendAccessMode, BackendConfigSchemasPayload, BackendKind, ChatEvent, Envelope, FrameKind,
+    HostBootstrapPayload, HostSettings, HostSettingsPayload, LaunchProfileCatalog,
+    LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId, MessageSender,
+    NewAgentPayload, ProjectId, SendMessagePayload, SessionSchemaEntry, SessionSchemasPayload,
+    SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -25,6 +25,8 @@ use uuid::Uuid;
 
 const DEFAULT_READ_LIMIT: usize = 100;
 const MAX_READ_LIMIT: usize = 1_000;
+const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
+const MAX_READ_MAX_BYTES: usize = 1024 * 1024;
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 const BOOTSTRAP_QUIET_PERIOD: Duration = Duration::from_millis(50);
 const COMMAND_BUFFER: usize = 32;
@@ -51,6 +53,7 @@ struct AgentState {
     last_error: Option<String>,
     activity_counter: u64,
     event_log: Vec<Envelope>,
+    latest_output: AgentControlOutput,
 }
 
 impl AgentState {
@@ -72,12 +75,26 @@ impl AgentState {
     }
 }
 
+fn latest_output_from_message(message: &protocol::ChatMessage) -> Option<AgentControlOutput> {
+    if !matches!(message.sender, MessageSender::Assistant { .. }) {
+        return None;
+    }
+    if message.content.trim().is_empty() {
+        Some(AgentControlOutput::Empty)
+    } else {
+        Some(AgentControlOutput::Message {
+            text: message.content.clone(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct SnapshotState {
     host_settings: Option<HostSettings>,
     launch_profile_catalog: LaunchProfileCatalog,
     session_schemas: Vec<SessionSchemaEntry>,
     agents: HashMap<AgentId, AgentState>,
+    direct_agent_ids: HashSet<AgentId>,
     connection_error: Option<String>,
     version: u64,
 }
@@ -282,14 +299,8 @@ impl AgentControlHandle {
     }
 
     pub async fn list_agents(&self) -> Vec<AgentOverview> {
-        let mut agents = self
-            .snapshot()
-            .agents
-            .values()
-            .map(agent_overview_from_state)
-            .collect::<Vec<_>>();
-        agents.sort_by_key(|agent| agent.created_at_ms);
-        agents
+        let snapshot = self.snapshot();
+        direct_agent_overviews(&snapshot)
     }
 
     pub fn list_launch_options(&self) -> ListLaunchOptionsResult {
@@ -304,12 +315,25 @@ impl AgentControlHandle {
         }
     }
 
-    pub async fn read_agent(
+    pub async fn read_agent(&self, agent_id: AgentId) -> Result<AgentControlReadResult, String> {
+        let snapshot = self.snapshot();
+        let agent = snapshot
+            .agents
+            .get(&agent_id)
+            .ok_or_else(|| format!("unknown agent_id {}", agent_id.0))?;
+        Ok(AgentControlReadResult {
+            agent_id,
+            output: agent.latest_output.clone(),
+        })
+    }
+
+    pub async fn read_agent_debug(
         &self,
         agent_id: AgentId,
         after_seq: Option<u64>,
         limit: Option<u32>,
-    ) -> Result<ReadAgentResult, String> {
+        max_bytes: Option<u32>,
+    ) -> Result<ReadAgentDebugResult, String> {
         let limit = limit
             .map(|value| value as usize)
             .unwrap_or(DEFAULT_READ_LIMIT);
@@ -318,6 +342,15 @@ impl AgentControlHandle {
         }
         if limit > MAX_READ_LIMIT {
             return Err(format!("limit must be <= {MAX_READ_LIMIT}"));
+        }
+        let max_bytes = max_bytes
+            .map(|value| value as usize)
+            .unwrap_or(DEFAULT_READ_MAX_BYTES);
+        if max_bytes == 0 {
+            return Err("max_bytes must be greater than zero".to_string());
+        }
+        if max_bytes > MAX_READ_MAX_BYTES {
+            return Err(format!("max_bytes must be <= {MAX_READ_MAX_BYTES}"));
         }
 
         let snapshot = self.snapshot();
@@ -332,12 +365,15 @@ impl AgentControlHandle {
             .take(limit)
             .cloned()
             .collect::<Vec<_>>();
-        let next_after_seq = events.last().map(|event| event.seq).or(after_seq);
+        let capped = cap_read_events(events, max_bytes, after_seq);
 
-        Ok(ReadAgentResult {
+        Ok(ReadAgentDebugResult {
             agent_id: agent_id.0,
-            events,
-            next_after_seq,
+            events: capped.events,
+            next_after_seq: capped.next_after_seq,
+            max_bytes,
+            omitted_events: capped.omitted_events,
+            omitted_event_bytes: capped.omitted_event_bytes,
         })
     }
 
@@ -417,10 +453,53 @@ pub struct ListLaunchOptionsResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ReadAgentResult {
+pub struct ReadAgentDebugResult {
     pub agent_id: String,
     pub events: Vec<Envelope>,
     pub next_after_seq: Option<u64>,
+    pub max_bytes: usize,
+    pub omitted_events: usize,
+    pub omitted_event_bytes: usize,
+}
+
+struct CappedReadEvents {
+    events: Vec<Envelope>,
+    next_after_seq: Option<u64>,
+    omitted_events: usize,
+    omitted_event_bytes: usize,
+}
+
+fn cap_read_events(
+    events: Vec<Envelope>,
+    max_bytes: usize,
+    after_seq: Option<u64>,
+) -> CappedReadEvents {
+    let mut kept = Vec::new();
+    let mut used_bytes = 0usize;
+    let mut omitted_events = 0usize;
+    let mut omitted_event_bytes = 0usize;
+    let mut next_after_seq = after_seq;
+
+    for event in events {
+        let event_bytes = serde_json::to_vec(&event)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        next_after_seq = Some(event.seq);
+        if used_bytes.saturating_add(event_bytes) <= max_bytes {
+            used_bytes = used_bytes.saturating_add(event_bytes);
+            kept.push(event);
+        } else {
+            omitted_events = omitted_events.saturating_add(1);
+            omitted_event_bytes = omitted_event_bytes.saturating_add(event_bytes);
+        }
+    }
+
+    CappedReadEvents {
+        events: kept,
+        next_after_seq,
+        omitted_events,
+        omitted_event_bytes,
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -453,6 +532,17 @@ fn agent_overview_from_state(state: &AgentState) -> AgentOverview {
         project_id: state.project_id.as_ref().map(|value| value.0.clone()),
         created_at_ms: state.created_at_ms,
     }
+}
+
+fn direct_agent_overviews(snapshot: &SnapshotState) -> Vec<AgentOverview> {
+    let mut agents = snapshot
+        .agents
+        .values()
+        .filter(|agent| snapshot.direct_agent_ids.contains(&agent.agent_id))
+        .map(agent_overview_from_state)
+        .collect::<Vec<_>>();
+    agents.sort_by_key(|agent| agent.created_at_ms);
+    agents
 }
 
 fn resolve_watched_ids(
@@ -619,6 +709,10 @@ async fn run_runtime(
                                 .expect("validated NewAgent payload should parse");
                             if let Some(pending) = state.pending_spawn.take() {
                                 if pending.matches(&payload) {
+                                    state
+                                        .snapshot
+                                        .direct_agent_ids
+                                        .insert(payload.agent_id.clone());
                                     let agent_status = state
                                         .snapshot
                                         .agents
@@ -730,6 +824,7 @@ fn apply_new_agent_payload(snapshot: &mut SnapshotState, payload: NewAgentPayloa
             last_error: None,
             activity_counter: activity,
             event_log: Vec::new(),
+            latest_output: AgentControlOutput::Empty,
         },
     );
 }
@@ -839,6 +934,14 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
             });
             agent.activity_counter = agent.activity_counter.saturating_add(1);
             agent.event_log.push(envelope.clone());
+            let latest_output = match &payload {
+                ChatEvent::MessageAdded(message) => latest_output_from_message(message),
+                ChatEvent::StreamEnd(data) => latest_output_from_message(&data.message),
+                _ => None,
+            };
+            if let Some(latest_output) = latest_output {
+                agent.latest_output = latest_output;
+            }
             match payload {
                 ChatEvent::TypingStatusChanged(typing) => {
                     agent.is_thinking = typing;
@@ -914,6 +1017,9 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 });
             agent.activity_counter = agent.activity_counter.saturating_add(1);
             agent.event_log.push(envelope.clone());
+            agent.latest_output = AgentControlOutput::Error {
+                error: payload.clone(),
+            };
             agent.last_error = Some(payload.message.clone());
             if payload.fatal || payload.message == "agent not running" {
                 agent.is_thinking = false;
@@ -1080,8 +1186,15 @@ struct SendAgentMessageToolInput {
 #[serde(deny_unknown_fields)]
 struct ReadAgentToolInput {
     agent_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadAgentDebugToolInput {
+    agent_id: String,
     after_seq: Option<u64>,
     limit: Option<u32>,
+    max_bytes: Option<u32>,
 }
 
 fn parse_agent_id(input: &str) -> Result<AgentId, String> {
@@ -1325,8 +1438,13 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "tyde_read_agent",
-            description: "Read output events from an existing Tyde agent.",
+            description: "Read only the latest assistant-visible message or agent error from an existing Tyde agent.",
             input_schema: read_agent_schema(),
+        },
+        ToolDefinition {
+            name: "tyde_read_agent_debug",
+            description: "Debug-only detailed incremental output events from an existing Tyde agent.",
+            input_schema: read_agent_debug_schema(),
         },
         ToolDefinition {
             name: "tyde_send_agent_message",
@@ -1335,7 +1453,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "tyde_list_agents",
-            description: "List all agents currently known to this Tyde host connection.",
+            description: "List only agents directly created through this agent-control connection.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -1439,9 +1557,21 @@ fn read_agent_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "agent_id": { "type": "string" }
+        },
+        "required": ["agent_id"],
+        "additionalProperties": false
+    })
+}
+
+fn read_agent_debug_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
             "agent_id": { "type": "string" },
             "after_seq": { "type": "integer", "minimum": 0 },
-            "limit": { "type": "integer", "minimum": 1 }
+            "limit": { "type": "integer", "minimum": 1 },
+            "max_bytes": { "type": "integer", "minimum": 1 }
         },
         "required": ["agent_id"],
         "additionalProperties": false
@@ -1502,8 +1632,22 @@ async fn dispatch_tool(control: &AgentControlHandle, params: CallToolParams) -> 
                 Ok(agent_id) => agent_id,
                 Err(err) => return ToolCallResult::text_error(err),
             };
+            match control.read_agent(agent_id).await {
+                Ok(result) => ToolCallResult::json(result),
+                Err(err) => ToolCallResult::text_error(err),
+            }
+        }
+        "tyde_read_agent_debug" => {
+            let input = match parse_tool_input::<ReadAgentDebugToolInput>(params.arguments) {
+                Ok(input) => input,
+                Err(err) => return ToolCallResult::text_error(err),
+            };
+            let agent_id = match parse_agent_id(&input.agent_id) {
+                Ok(agent_id) => agent_id,
+                Err(err) => return ToolCallResult::text_error(err),
+            };
             match control
-                .read_agent(agent_id, input.after_seq, input.limit)
+                .read_agent_debug(agent_id, input.after_seq, input.limit, input.max_bytes)
                 .await
             {
                 Ok(result) => ToolCallResult::json(result),
@@ -1788,7 +1932,7 @@ mod tests {
         expected_text: &str,
     ) -> Option<u64> {
         let read = control
-            .read_agent(agent_id, after_seq, None)
+            .read_agent_debug(agent_id, after_seq, None, None)
             .await
             .expect("read_agent should succeed");
         assert!(
@@ -1879,7 +2023,7 @@ mod tests {
     }
 
     fn assert_replayed_completed_message_without_stream_end(
-        read: &ReadAgentResult,
+        read: &ReadAgentDebugResult,
         expected_text: &str,
     ) {
         let mut saw_message_added = false;
@@ -1994,6 +2138,188 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_tool_schemas_separate_latest_and_debug_controls() {
+        let tools = tool_definitions();
+        assert!(tools.iter().any(|tool| tool.name == "tyde_read_agent"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.name == "tyde_read_agent_debug")
+        );
+
+        let latest = read_agent_schema();
+        for field in ["after_seq", "limit", "max_bytes"] {
+            assert!(latest.pointer(&format!("/properties/{field}")).is_none());
+        }
+        let debug = read_agent_debug_schema();
+        for field in ["agent_id", "after_seq", "limit", "max_bytes"] {
+            assert!(debug.pointer(&format!("/properties/{field}")).is_some());
+        }
+    }
+
+    #[test]
+    fn latest_read_input_rejects_debug_controls() {
+        for field in ["after_seq", "limit", "max_bytes"] {
+            let mut args = Map::new();
+            args.insert("agent_id".to_owned(), json!("agent-id"));
+            args.insert(field.to_owned(), json!(1));
+            let err = parse_tool_input::<ReadAgentToolInput>(Some(args))
+                .expect_err("latest read must reject debug controls");
+            assert!(err.contains("unknown field") && err.contains(field));
+        }
+    }
+
+    fn test_agent_state(agent_id: AgentId) -> AgentState {
+        AgentState {
+            agent_id,
+            name: "worker".to_owned(),
+            backend_kind: BackendKind::Claude,
+            workspace_roots: vec!["/tmp/test".to_owned()],
+            project_id: None,
+            parent_agent_id: None,
+            created_at_ms: 1,
+            instance_stream: StreamPath(
+                "/agent/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440001"
+                    .to_owned(),
+            ),
+            is_thinking: false,
+            turn_completed: false,
+            terminated: false,
+            last_error: None,
+            activity_counter: 0,
+            event_log: Vec::new(),
+            latest_output: AgentControlOutput::Empty,
+        }
+    }
+
+    fn assistant_output_envelope(agent_id: &AgentId, seq: u64, content: &str) -> Envelope {
+        Envelope::from_payload(
+            StreamPath(format!(
+                "/agent/{}/550e8400-e29b-41d4-a716-446655440001",
+                agent_id.0
+            )),
+            FrameKind::ChatEvent,
+            seq,
+            &ChatEvent::MessageAdded(protocol::ChatMessage {
+                message_id: None,
+                timestamp: 1,
+                sender: MessageSender::Assistant {
+                    agent: "worker".to_owned(),
+                },
+                content: content.to_owned(),
+                reasoning: Some(protocol::ReasoningData {
+                    text: "private reasoning".to_owned(),
+                    tokens: None,
+                    signature: None,
+                    blob: None,
+                }),
+                tool_calls: vec![protocol::ToolUseData {
+                    id: "tool-1".to_owned(),
+                    name: "private_tool".to_owned(),
+                    arguments: json!({"private": true}),
+                }],
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            }),
+        )
+        .expect("assistant output envelope")
+    }
+
+    #[test]
+    fn latest_output_cache_does_not_look_back_past_empty_or_error() {
+        let agent_id = AgentId("550e8400-e29b-41d4-a716-446655440000".to_owned());
+        let mut snapshot = SnapshotState::default();
+        snapshot
+            .agents
+            .insert(agent_id.clone(), test_agent_state(agent_id.clone()));
+
+        apply_envelope(
+            &mut snapshot,
+            &assistant_output_envelope(&agent_id, 1, "visible answer"),
+        );
+        assert_eq!(
+            snapshot.agents[&agent_id].latest_output,
+            AgentControlOutput::Message {
+                text: "visible answer".to_owned()
+            }
+        );
+
+        apply_envelope(&mut snapshot, &assistant_output_envelope(&agent_id, 2, ""));
+        assert_eq!(
+            snapshot.agents[&agent_id].latest_output,
+            AgentControlOutput::Empty
+        );
+
+        let error = AgentErrorPayload {
+            agent_id: agent_id.clone(),
+            code: protocol::AgentErrorCode::Internal,
+            message: "failed".to_owned(),
+            fatal: true,
+        };
+        let error_envelope = Envelope::from_payload(
+            StreamPath(format!(
+                "/agent/{}/550e8400-e29b-41d4-a716-446655440001",
+                agent_id.0
+            )),
+            FrameKind::AgentError,
+            3,
+            &error,
+        )
+        .expect("agent error envelope");
+        apply_envelope(&mut snapshot, &error_envelope);
+        assert_eq!(
+            snapshot.agents[&agent_id].latest_output,
+            AgentControlOutput::Error { error }
+        );
+    }
+
+    #[test]
+    fn debug_read_byte_cap_advances_incremental_cursor() {
+        let events = vec![
+            Envelope::from_payload(
+                StreamPath("/agent/a".to_owned()),
+                FrameKind::ChatEvent,
+                1,
+                &json!({"text": "small"}),
+            )
+            .expect("small event"),
+            Envelope::from_payload(
+                StreamPath("/agent/a".to_owned()),
+                FrameKind::ChatEvent,
+                2,
+                &json!({"text": "x".repeat(4096)}),
+            )
+            .expect("large event"),
+        ];
+
+        let capped = cap_read_events(events, 512, None);
+        assert_eq!(capped.events.len(), 1);
+        assert_eq!(capped.next_after_seq, Some(2));
+        assert_eq!(capped.omitted_events, 1);
+        assert!(capped.omitted_event_bytes > 512);
+    }
+
+    #[test]
+    fn list_agents_excludes_agents_not_created_by_driver() {
+        let direct_id = AgentId("550e8400-e29b-41d4-a716-446655440000".to_owned());
+        let unrelated_id = AgentId("550e8400-e29b-41d4-a716-446655440002".to_owned());
+        let mut snapshot = SnapshotState::default();
+        snapshot
+            .agents
+            .insert(direct_id.clone(), test_agent_state(direct_id.clone()));
+        snapshot
+            .agents
+            .insert(unrelated_id.clone(), test_agent_state(unrelated_id));
+        snapshot.direct_agent_ids.insert(direct_id.clone());
+
+        let listed = direct_agent_overviews(&snapshot);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].agent_id, direct_id.0);
+    }
+
     #[tokio::test]
     async fn await_agents_then_read_returns_completed_turn() {
         let (host, _tempdir) = test_host();
@@ -2025,6 +2351,17 @@ mod tests {
 
         let result = awaited.ready.first().expect("agent should be ready");
         assert_eq!(result.status, AgentControlStatus::Idle);
+        assert_eq!(
+            control
+                .read_agent(AgentId(spawned.agent_id.clone()))
+                .await
+                .expect("latest output should be readable")
+                .output,
+            AgentControlOutput::Message {
+                text: "[startup_mcp_servers: tyde-agent-control(http)] mock backend response to: hello"
+                    .to_owned()
+            }
+        );
         read_agent_contains(
             &control,
             AgentId(spawned.agent_id.clone()),
@@ -2070,7 +2407,7 @@ mod tests {
 
         let control = connect_runtime(host).await;
         let replay = control
-            .read_agent(agent_id.clone(), None, None)
+            .read_agent_debug(agent_id.clone(), None, None, None)
             .await
             .expect("late replayed agent output should be readable");
         assert_replayed_completed_message_without_stream_end(&replay, expected_text);

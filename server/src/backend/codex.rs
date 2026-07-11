@@ -5276,6 +5276,8 @@ fn toml_quoted(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
 }
 
+const CODEX_AGENT_CONTROL_TOOL_TIMEOUT_SECS: u64 = 315_576_000;
+
 fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<String> {
     let mut overrides = Vec::new();
 
@@ -5285,6 +5287,13 @@ fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<S
             continue;
         }
         let base = format!("mcp_servers.{name}");
+        if name == "tyde-agent-control" {
+            // Codex otherwise applies its 300-second default to a tool whose
+            // contract is to wait until an agent changes state.
+            overrides.push(format!(
+                "{base}.tool_timeout_sec={CODEX_AGENT_CONTROL_TOOL_TIMEOUT_SECS}"
+            ));
+        }
         match &server.transport {
             StartupMcpTransport::Http {
                 url,
@@ -12682,6 +12691,25 @@ Do not describe the tool, and do not skip the tool call."#;
                 .any(|entry| entry == "mcp_servers.tyde-debug.http_headers.x-ignored=\"value\""),
             "expected Codex MCP config to emit HTTP header overrides: {overrides:?}"
         );
+    }
+
+    #[test]
+    fn codex_agent_control_mcp_has_no_session_scale_tool_deadline() {
+        let overrides = codex_mcp_config_overrides(&[StartupMcpServer {
+            name: "tyde-agent-control".to_string(),
+            transport: StartupMcpTransport::Http {
+                url: "http://127.0.0.1:4012/mcp".to_string(),
+                headers: HashMap::new(),
+                bearer_token_env_var: None,
+            },
+        }]);
+
+        assert!(overrides.iter().any(|entry| {
+            entry
+                == &format!(
+                    "mcp_servers.tyde-agent-control.tool_timeout_sec={CODEX_AGENT_CONTROL_TOOL_TIMEOUT_SECS}"
+                )
+        }));
     }
 
     /// Regression: a Codex agent calling Tyde's `tyde_spawn_agent` MCP tool must

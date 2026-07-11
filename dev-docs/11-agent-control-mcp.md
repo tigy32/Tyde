@@ -197,8 +197,9 @@ TydeAgentControlMcpEnabled { enabled: bool }
 ## MCP Surface
 
 The MCP surface is deliberately small. Output is never coupled to user-message
-queues, list responses, spawn responses, or await responses. The only way to
-read agent output is `tyde_read_agent`.
+queues, list responses, spawn responses, or await responses. Normal callers
+read the latest result with `tyde_read_agent`; diagnostics use the separate
+incremental `tyde_read_agent_debug` event API.
 
 Tools:
 
@@ -207,6 +208,7 @@ Tools:
 - `tyde_await_agents`
 - `tyde_send_agent_message`
 - `tyde_read_agent`
+- `tyde_read_agent_debug`
 
 There is no `run` convenience tool and no MCP `cancel` tool in this surface.
 Clients compose the primitives explicitly: spawn, await status, then read output.
@@ -250,7 +252,10 @@ server can infer the parent agent id from the request URL/header; an explicit
 
 #### `tyde_list_agents`
 
-Lists spawned agents and their current status. It returns metadata only:
+Lists only agents whose server-owned `parent_agent_id` is the injected calling
+agent id. It excludes grandchildren, unrelated host agents, and children owned
+by other callers. Requests without an injected caller agent id are rejected.
+It returns metadata only:
 
 - `agent_id`
 - `name`
@@ -270,7 +275,9 @@ Waits like `select(2)` over the supplied agent ids. It returns when any watched
 agent becomes non-`thinking`. It has no tool-level timeout and accepts neither
 `timeout` nor `timeout_ms`. While every watched agent is still `thinking`, the
 call remains pending unless the request is cancelled or the status channel
-fails. Callers may impose their own transport-level deadline.
+fails. Codex otherwise applies a 300-second default MCP deadline, so Tyde's
+injected `tyde-agent-control` configuration overrides that default with a
+session-scale horizon; the Tyde tool itself has no timer or retry loop.
 
 Input:
 
@@ -295,19 +302,44 @@ Input:
 
 #### `tyde_read_agent`
 
-Reads output events from one agent. This is the sole output-reading primitive.
+Reads exactly one latest output record from one agent. The result is one of:
+
+- `message`, containing only assistant-visible text
+- `error`, containing the typed `AgentErrorPayload`
+- `empty`, when there is no output record or the latest assistant message has
+  no visible text
+
+The read never falls back to an earlier message. Reasoning, tool calls,
+metadata, and prior output are not returned.
+
+Input:
+
+- `agent_id`
+
+Output:
+
+- `agent_id`
+- `output`
+
+#### `tyde_read_agent_debug`
+
+Preserves the detailed incremental event API for diagnostics.
 
 Input:
 
 - `agent_id`
 - `after_seq?`
 - `limit?`
+- `max_bytes?`
 
 Output:
 
 - `agent_id`
 - `events`
 - `next_after_seq`
+- `max_bytes`
+- `omitted_events`
+- `omitted_event_bytes`
 
 The event stream uses protocol `Envelope` values directly. Readable output is
 limited to agent output events, currently `ChatEvent` and `AgentError` frames.
@@ -362,8 +394,10 @@ if settings.tyde_agent_control_mcp_enabled {
 ### Agent Output Storage
 
 Agent actors already own their event logs. `tyde_read_agent` asks the relevant
-actor for output envelopes after an optional sequence number and with an explicit
-limit. This keeps output reads actor-owned and avoids hidden host/UI caches.
+actor for its single latest output record. `tyde_read_agent_debug` asks for
+output envelopes after an optional sequence number with explicit count and byte
+limits. This keeps production output reads actor-owned and avoids hidden host/UI
+caches.
 
 ### Advantage Over External Driver
 

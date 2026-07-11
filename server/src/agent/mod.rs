@@ -135,6 +135,9 @@ enum AgentCommand {
         limit: usize,
         reply: oneshot::Sender<Vec<Envelope>>,
     },
+    ReadLatestOutput {
+        reply: oneshot::Sender<Option<Envelope>>,
+    },
     FetchSessionHistory {
         before_seq: Option<u64>,
         limit: usize,
@@ -931,6 +934,18 @@ impl AgentHandle {
                 limit,
                 reply: reply_tx,
             })
+            .is_err()
+        {
+            return None;
+        }
+        reply_rx.await.ok()
+    }
+
+    pub async fn read_latest_output(&self) -> Option<Option<Envelope>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .tx
+            .send(AgentCommand::ReadLatestOutput { reply: reply_tx })
             .is_err()
         {
             return None;
@@ -3321,6 +3336,9 @@ pub(crate) fn spawn_agent_actor(
                         } => {
                             let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                         }
+                        AgentCommand::ReadLatestOutput { reply } => {
+                            let _ = reply.send(latest_output_record(&event_log));
+                        }
                         AgentCommand::FetchSessionHistory {
                             before_seq,
                             limit,
@@ -3736,6 +3754,9 @@ pub(crate) fn spawn_relay_agent_actor(
                         } => {
                             let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                         }
+                        AgentCommand::ReadLatestOutput { reply } => {
+                            let _ = reply.send(latest_output_record(&event_log));
+                        }
                         AgentCommand::FetchSessionHistory {
                             before_seq,
                             limit,
@@ -3985,6 +4006,9 @@ async fn park_terminal_agent(
             } => {
                 let _ = reply.send(output_events_since(event_log, after_seq, limit));
             }
+            AgentCommand::ReadLatestOutput { reply } => {
+                let _ = reply.send(latest_output_record(event_log));
+            }
             AgentCommand::FetchSessionHistory {
                 before_seq,
                 limit,
@@ -4074,6 +4098,9 @@ async fn park_relay_terminal_agent(
                 reply,
             } => {
                 let _ = reply.send(output_events_since(event_log, after_seq, limit));
+            }
+            AgentCommand::ReadLatestOutput { reply } => {
+                let _ = reply.send(latest_output_record(event_log));
             }
             AgentCommand::FetchSessionHistory {
                 before_seq,
@@ -4876,6 +4903,24 @@ fn output_events_since(
         .take(limit)
         .cloned()
         .collect()
+}
+
+fn latest_output_record(event_log: &[Envelope]) -> Option<Envelope> {
+    event_log
+        .iter()
+        .rev()
+        .find(|event| match event.kind {
+            FrameKind::AgentError => true,
+            FrameKind::ChatEvent => matches!(
+                event.parse_payload::<ChatEvent>(),
+                Ok(ChatEvent::MessageAdded(ChatMessage {
+                    sender: MessageSender::Assistant { .. },
+                    ..
+                }))
+            ),
+            _ => false,
+        })
+        .cloned()
 }
 
 fn activity_history_snapshot(
@@ -5717,8 +5762,9 @@ mod tests {
         GenerateAgentActivitySummaryRequest, InterruptOutcome, activity_history_snapshot,
         agent_usage_snapshot_from_log, append_chat_event, append_event, attach_subscriber,
         collect_agent_activity_summary_events, generate_mock_name, known_turn_usage,
-        name_generation_fallback, output_events_since, sanitize_generated_agent_name,
-        session_history_window, spawn_relay_agent_actor, upsert_activity_stats_snapshot,
+        latest_output_record, name_generation_fallback, output_events_since, replay_envelope,
+        sanitize_generated_agent_name, session_history_window, spawn_relay_agent_actor,
+        upsert_activity_stats_snapshot,
     };
     use crate::agent::registry::AgentStatusHandle;
     use crate::backend::EventStream;
@@ -5771,6 +5817,9 @@ mod tests {
                         reply,
                     } => {
                         let _ = reply.send(output_events_since(&event_log, after_seq, limit));
+                    }
+                    AgentCommand::ReadLatestOutput { reply } => {
+                        let _ = reply.send(latest_output_record(&event_log));
                     }
                     AgentCommand::FetchSessionHistory {
                         before_seq,
@@ -7674,6 +7723,33 @@ mod tests {
             }
             other => panic!("expected MessageMetadataUpdated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn latest_output_record_does_not_fall_back_past_empty_message() {
+        let canonical_stream = "/agent/replay-agent";
+        let prior = replay_envelope(
+            canonical_stream,
+            1,
+            FrameKind::ChatEvent,
+            &ChatEvent::MessageAdded(assistant_message("prior visible answer")),
+        );
+        let latest = replay_envelope(
+            canonical_stream,
+            2,
+            FrameKind::ChatEvent,
+            &ChatEvent::MessageAdded(assistant_message("")),
+        );
+        let metadata = replay_envelope(
+            canonical_stream,
+            3,
+            FrameKind::ChatEvent,
+            &metadata_update("message-2", 42),
+        );
+
+        let selected = latest_output_record(&[prior, latest, metadata])
+            .expect("empty assistant message remains the latest output record");
+        assert_eq!(selected.seq, 2);
     }
 
     #[tokio::test]
