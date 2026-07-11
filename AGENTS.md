@@ -35,9 +35,21 @@ The wrapper owns caching, repeated runs and flaky-test handling, current-stable
 toolchain setup, the release-safe environment, and token/time optimization. A
 cache miss runs the compile/lint stages once and each native, wasm, and
 web-loader test stage three times; a cache hit prints the prior successful stage
-summary and does no work. Use `./dev.sh check --force` only where the release or
-CI workflow explicitly requires a cache-bypassing authoritative run. Do not use
-`--no-cache` unless the user explicitly asks for that diagnostic mode.
+summary and does no validation work. Successful stages print only START/PASS,
+wall time, repetitions, and peak RSS. Complete stage output and metadata are
+retained in bounded `target/dev-check-logs/` runs; failures print the complete
+captured diagnostics and their log path without truncation. Use
+`./dev.sh check --force` only where the release or CI workflow explicitly
+requires a cache-bypassing authoritative run. Do not use `--no-cache` unless the
+user explicitly asks for that diagnostic mode.
+
+Checks are single-instance per repository and fail immediately if the local
+check lock is held. The wrapper pins repository-local sccache configuration,
+disables Cargo incremental compilation for the check, records cache metrics,
+and never falls back when sccache setup is invalid. It may clean only bounded
+check logs, obsolete check cache records, and regenerable nextest test-binary
+clones for the same repository. It must never recursively scan or automatically
+clean shared Cargo targets.
 
 Run `./dev.sh check` once after the worktree is final and before committing. If
 it fails, fix only from the diagnostics it returned, then rerun the same

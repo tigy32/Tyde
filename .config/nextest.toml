@@ -4,14 +4,18 @@
 # binaries at once (plain `cargo test` runs binaries one after another), which
 # is the main reason the integration suite is much faster under nextest.
 #
-# Run with:  cargo nextest run
-#        or:  cargo nextest run --profile ci
+# The canonical wrapper invokes nextest. Do not run this stage directly; use
+# `./dev.sh check` so repetition, time limits, compact logs, and cleanup apply.
 
 nextest-version = "0.9.100"
 experimental = ["wrapper-scripts"]
 
 [scripts.wrapper.macos-test-binary]
 command = { command-line = "tools/run-nextest-binary.sh", relative-to = "workspace-root" }
+
+# macOS test binaries are cloned outside the enormous shared target directory
+# to avoid dyld paging stalls. The wrapper keys clones by logical test target,
+# removes superseded identities, and safely recovers locks left by dead copiers.
 
 # Several backend tests stand up a *fake* CLI/app-server (a real subprocess:
 # `python3`, a shell script, etc.) and serialize themselves with an in-process
@@ -30,11 +34,11 @@ serial-backend-fakes = { max-threads = 1 }
 filter = 'test(/backend::codex::tests::codex_backend_fork/) | test(/backend::claude::tests::(fake_|resume_session_missing)/) | test(/backend::antigravity::tests::(install_antigravity_mcp_config|mcp_guard)/)'
 test-group = 'serial-backend-fakes'
 
-# These tests intentionally run real CLI probes with a two-second child-process
-# timeout. Reserve the runner while they probe so unrelated process-heavy tests
-# cannot make healthy fake executables time out during startup.
+# These tests intentionally exercise real CLI probes at tight process timeout
+# boundaries. Reserve the runner while they probe so unrelated process-heavy
+# tests cannot consume the deadline of healthy fake executables.
 [[profile.default.overrides]]
-filter = 'binary_id(tests::settings) & test(/backend_(setup_payload_(uses_sign_in_command_and_versioned_tycode_probe|reports_found_unusable_hermes_cli)|config_snapshots_report_tycode_settings_schema_release_blocker)/)'
+filter = '(binary_id(tests::settings) & test(/backend_(setup_payload_(uses_sign_in_command_and_versioned_tycode_probe|reports_found_unusable_hermes_cli)|config_snapshots_report_tycode_settings_schema_release_blocker)/)) | test(/backend::setup::tests::version_probe_bounds_descendant_pipe_drain/)'
 threads-required = "num-test-threads"
 
 [[profile.ci.overrides]]
@@ -42,7 +46,7 @@ filter = 'test(/backend::codex::tests::codex_backend_fork/) | test(/backend::cla
 test-group = 'serial-backend-fakes'
 
 [[profile.ci.overrides]]
-filter = 'binary_id(tests::settings) & test(/backend_(setup_payload_(uses_sign_in_command_and_versioned_tycode_probe|reports_found_unusable_hermes_cli)|config_snapshots_report_tycode_settings_schema_release_blocker)/)'
+filter = '(binary_id(tests::settings) & test(/backend_(setup_payload_(uses_sign_in_command_and_versioned_tycode_probe|reports_found_unusable_hermes_cli)|config_snapshots_report_tycode_settings_schema_release_blocker)/)) | test(/backend::setup::tests::version_probe_bounds_descendant_pipe_drain/)'
 threads-required = "num-test-threads"
 
 [profile.default]
