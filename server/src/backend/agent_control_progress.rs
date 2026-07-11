@@ -14,6 +14,7 @@ pub(crate) fn is_tyde_agent_control_spawn_tool_name(tool_name: &str) -> bool {
 
 pub(crate) fn is_tyde_agent_control_await_tool_name(tool_name: &str) -> bool {
     is_tyde_agent_control_tool_name(tool_name, "tydeawaitagents")
+        || normalize_tool_name(tool_name).ends_with("tydeagentawaittydeawaitagents")
 }
 
 pub(crate) fn await_progress_data_for_tool(
@@ -291,6 +292,9 @@ mod tests {
         assert!(is_tyde_agent_control_await_tool_name(
             "mcp__tyde_agent_control__tyde_await_agents"
         ));
+        assert!(is_tyde_agent_control_await_tool_name(
+            "mcp__tyde-agent-await__tyde_await_agents"
+        ));
 
         assert!(!is_tyde_agent_control_spawn_tool_name("spawn_agent"));
         assert!(!is_tyde_agent_control_await_tool_name("wait_agent"));
@@ -327,11 +331,11 @@ mod tests {
     fn parses_await_agent_ids_from_codex_mcp_item_wrapper() {
         let progress = await_progress_data_for_tool(
             "call-await",
-            "mcp__tyde-agent-control__tyde_await_agents",
+            "mcp__tyde-agent-await__tyde_await_agents",
             &json!({
                 "id": "call-await",
                 "type": "mcpToolCall",
-                "tool": "mcp__tyde-agent-control__tyde_await_agents",
+                "tool": "mcp__tyde-agent-await__tyde_await_agents",
                 "arguments": {
                     "agent_ids": [
                         "agent-a",

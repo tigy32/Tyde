@@ -752,6 +752,7 @@ fn bootstrap_payloads_round_trip() {
         events: vec![AgentBootstrapEvent::ChatEvent(
             ChatEvent::TypingStatusChanged(true),
         )],
+        latest_output: Default::default(),
     });
     round_trip_json(&ProjectBootstrapPayload {
         project: Project {

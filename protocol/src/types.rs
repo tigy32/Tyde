@@ -775,18 +775,180 @@ pub enum AgentControlStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentControlOutput {
+    #[default]
     Empty,
-    Message { text: String },
-    Error { error: AgentErrorPayload },
+    Message {
+        text: String,
+    },
+    Error {
+        error: AgentErrorPayload,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentControlOutputProjectionError {
+    InvalidAgentError(String),
+    InvalidChatEvent(String),
+    EventLogRewound { observed: usize, actual: usize },
+}
+
+impl fmt::Display for AgentControlOutputProjectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidAgentError(error) => write!(f, "invalid agent error output: {error}"),
+            Self::InvalidChatEvent(error) => write!(f, "invalid chat output event: {error}"),
+            Self::EventLogRewound { observed, actual } => write!(
+                f,
+                "agent output event log rewound from {observed} observed records to {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AgentControlOutputProjectionError {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentControlLatestOutput {
+    output: AgentControlOutput,
+    observed_records: usize,
+}
+
+impl AgentControlLatestOutput {
+    pub fn output(&self) -> &AgentControlOutput {
+        &self.output
+    }
+
+    pub fn replace_from_bootstrap(&mut self, output: AgentControlOutput) {
+        self.output = output;
+    }
+
+    pub fn observe_envelope(
+        &mut self,
+        envelope: &Envelope,
+    ) -> Result<(), AgentControlOutputProjectionError> {
+        if let Some(output) = agent_control_output_from_envelope(envelope)? {
+            self.output = output;
+        }
+        Ok(())
+    }
+
+    pub fn observe_event_log(
+        &mut self,
+        event_log: &[Envelope],
+    ) -> Result<(), AgentControlOutputProjectionError> {
+        if event_log.len() < self.observed_records {
+            return Err(AgentControlOutputProjectionError::EventLogRewound {
+                observed: self.observed_records,
+                actual: event_log.len(),
+            });
+        }
+        for envelope in &event_log[self.observed_records..] {
+            self.observe_envelope(envelope)?;
+        }
+        self.observed_records = event_log.len();
+        Ok(())
+    }
+}
+
+pub fn agent_control_output_from_envelope(
+    envelope: &Envelope,
+) -> Result<Option<AgentControlOutput>, AgentControlOutputProjectionError> {
+    match envelope.kind {
+        FrameKind::AgentError => envelope
+            .parse_payload::<AgentErrorPayload>()
+            .map(|error| Some(AgentControlOutput::Error { error }))
+            .map_err(|error| {
+                AgentControlOutputProjectionError::InvalidAgentError(error.to_string())
+            }),
+        FrameKind::ChatEvent => envelope
+            .parse_payload::<ChatEvent>()
+            .map(|event| agent_control_output_from_chat_event(&event))
+            .map_err(|error| {
+                AgentControlOutputProjectionError::InvalidChatEvent(error.to_string())
+            }),
+        _ => Ok(None),
+    }
+}
+
+pub fn agent_control_output_from_chat_event(event: &ChatEvent) -> Option<AgentControlOutput> {
+    let message = match event {
+        ChatEvent::MessageAdded(message) => message,
+        ChatEvent::StreamEnd(data) => &data.message,
+        _ => return None,
+    };
+    if !matches!(message.sender, MessageSender::Assistant { .. }) {
+        return None;
+    }
+    if message.content.trim().is_empty() {
+        Some(AgentControlOutput::Empty)
+    } else {
+        Some(AgentControlOutput::Message {
+            text: message.content.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentControlReadResult {
     pub agent_id: AgentId,
     pub output: AgentControlOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentControlReadDebugResult {
+    pub agent_id: AgentId,
+    pub events: Vec<Envelope>,
+    pub next_after_seq: Option<u64>,
+    pub max_bytes: usize,
+    pub omitted_events: usize,
+    pub omitted_event_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentControlCappedEvents {
+    pub events: Vec<Envelope>,
+    pub next_after_seq: Option<u64>,
+    pub omitted_events: usize,
+    pub omitted_event_bytes: usize,
+}
+
+pub const AGENT_CONTROL_DEFAULT_READ_LIMIT: usize = 50;
+pub const AGENT_CONTROL_MAX_READ_LIMIT: usize = 200;
+pub const AGENT_CONTROL_DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
+pub const AGENT_CONTROL_MAX_READ_MAX_BYTES: usize = 1024 * 1024;
+
+pub fn cap_agent_control_events(
+    events: Vec<Envelope>,
+    max_bytes: usize,
+    after_seq: Option<u64>,
+) -> Result<AgentControlCappedEvents, serde_json::Error> {
+    let mut kept = Vec::new();
+    let mut used_bytes = 0usize;
+    let mut omitted_events = 0usize;
+    let mut omitted_event_bytes = 0usize;
+    let mut next_after_seq = after_seq;
+
+    for event in events {
+        let event_bytes = serde_json::to_vec(&event)?.len();
+        next_after_seq = Some(event.seq);
+        if used_bytes.saturating_add(event_bytes) <= max_bytes {
+            used_bytes = used_bytes.saturating_add(event_bytes);
+            kept.push(event);
+        } else {
+            omitted_events = omitted_events.saturating_add(1);
+            omitted_event_bytes = omitted_event_bytes.saturating_add(event_bytes);
+        }
+    }
+
+    Ok(AgentControlCappedEvents {
+        events: kept,
+        next_after_seq,
+        omitted_events,
+        omitted_event_bytes,
+    })
 }
 
 /// Backend-agnostic hint for picking a cheaper or more capable spawned agent.
@@ -1963,6 +2125,8 @@ pub struct AgentsViewPreferencesNotifyPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentBootstrapPayload {
     pub events: Vec<AgentBootstrapEvent>,
+    #[serde(default)]
+    pub latest_output: AgentControlOutput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6665,6 +6829,7 @@ mod search_serde_tests {
 
         let bootstrap = AgentBootstrapPayload {
             events: vec![AgentBootstrapEvent::AgentActivityStats(payload.clone())],
+            latest_output: AgentControlOutput::Empty,
         };
         assert!(matches!(
             round_trip(&bootstrap).events.as_slice(),
@@ -7532,5 +7697,94 @@ mod agent_control_output_tests {
                 }
             })
         );
+    }
+
+    fn assistant_message(content: &str) -> ChatMessage {
+        ChatMessage {
+            message_id: None,
+            timestamp: 1,
+            sender: MessageSender::Assistant {
+                agent: "worker".to_owned(),
+            },
+            content: content.to_owned(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        }
+    }
+
+    #[test]
+    fn latest_output_state_observes_records_in_source_order_without_lookback() {
+        let stream = StreamPath("/agent/agent-1".to_owned());
+        let message = Envelope::from_payload(
+            stream.clone(),
+            FrameKind::ChatEvent,
+            1,
+            &ChatEvent::MessageAdded(assistant_message("visible")),
+        )
+        .expect("message envelope");
+        let empty = Envelope::from_payload(
+            stream.clone(),
+            FrameKind::ChatEvent,
+            2,
+            &ChatEvent::MessageAdded(assistant_message("")),
+        )
+        .expect("empty envelope");
+        let unrelated = Envelope::from_payload(
+            stream.clone(),
+            FrameKind::ChatEvent,
+            3,
+            &ChatEvent::TypingStatusChanged(false),
+        )
+        .expect("typing envelope");
+        let error = AgentErrorPayload {
+            agent_id: AgentId("agent-1".to_owned()),
+            code: AgentErrorCode::BackendFailed,
+            message: "failed".to_owned(),
+            fatal: true,
+        };
+        let error_envelope = Envelope::from_payload(stream, FrameKind::AgentError, 4, &error)
+            .expect("error envelope");
+
+        let mut state = AgentControlLatestOutput::default();
+        state
+            .observe_event_log(&[message, empty, unrelated, error_envelope])
+            .expect("project source-ordered output");
+        assert_eq!(state.output(), &AgentControlOutput::Error { error });
+    }
+
+    #[test]
+    fn debug_result_and_byte_cap_share_one_serialized_shape() {
+        let event = Envelope::from_payload(
+            StreamPath("/agent/agent-1".to_owned()),
+            FrameKind::ChatEvent,
+            7,
+            &ChatEvent::MessageAdded(assistant_message("visible")),
+        )
+        .expect("message envelope");
+        let capped = cap_agent_control_events(vec![event], 1024 * 1024, Some(6))
+            .expect("typed envelope sizing");
+        let result = AgentControlReadDebugResult {
+            agent_id: AgentId("agent-1".to_owned()),
+            events: capped.events,
+            next_after_seq: capped.next_after_seq,
+            max_bytes: 1024 * 1024,
+            omitted_events: capped.omitted_events,
+            omitted_event_bytes: capped.omitted_event_bytes,
+        };
+        let decoded: AgentControlReadDebugResult =
+            serde_json::from_value(serde_json::to_value(&result).expect("serialize debug result"))
+                .expect("deserialize debug result");
+        assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn legacy_bootstrap_without_latest_output_defaults_to_empty() {
+        let bootstrap: AgentBootstrapPayload =
+            serde_json::from_value(json!({ "events": [] })).expect("legacy bootstrap payload");
+        assert_eq!(bootstrap.latest_output, AgentControlOutput::Empty);
     }
 }

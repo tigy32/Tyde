@@ -6,6 +6,13 @@ pub mod validator;
 #[cfg(feature = "framing")]
 pub use framing::{FrameError, read_envelope, write_envelope};
 pub use types::{
+    AGENT_CONTROL_DEFAULT_READ_LIMIT, AGENT_CONTROL_DEFAULT_READ_MAX_BYTES,
+    AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentControlCappedEvents,
+    AgentControlLatestOutput, AgentControlOutputProjectionError, AgentControlReadDebugResult,
+    agent_control_output_from_chat_event, agent_control_output_from_envelope,
+    cap_agent_control_events,
+};
+pub use types::{
     AgentActivityStats, AgentActivityStatsPayload, AgentActivitySummary,
     AgentActivitySummaryPayload, AgentActivitySummaryStaleReason, AgentActivitySummaryState,
     AgentAnnotationTarget, AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload,

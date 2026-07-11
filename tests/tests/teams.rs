@@ -22,6 +22,7 @@ use protocol::{
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde_json::{Value, json};
 
 fn write_fake_codex_model_probe_program(dir: &tempfile::TempDir) -> std::path::PathBuf {
@@ -312,10 +313,15 @@ async fn call_agent_control_tool_json(
     name: &str,
     arguments: Value,
 ) -> Value {
-    let base_url = fixture.agent_control_http_url().await;
-    let separator = if base_url.contains('?') { '&' } else { '?' };
-    let url = format!("{base_url}{separator}agent_id={}", agent_id.0);
-    let transport = StreamableHttpClientTransport::from_uri(url);
+    let caller = fixture.agent_control_caller(agent_id).await;
+    let bearer = caller
+        .authorization
+        .strip_prefix("Bearer ")
+        .expect("fixture caller authorization must be bearer")
+        .to_owned();
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(caller.url).auth_header(bearer),
+    );
     let service = ().serve(transport).await.expect("connect to agent MCP");
     let result = service
         .call_tool(CallToolRequestParams {

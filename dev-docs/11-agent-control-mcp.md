@@ -246,15 +246,17 @@ Input:
 - `cost_hint?`
 
 `backend_kind` is optional only if the host has an explicit `default_backend` in
-`HostSettings`. If the request arrives from an injected child-agent MCP URL, the
-server can infer the parent agent id from the request URL/header; an explicit
-`parent_agent_id` may still be supplied by trusted host-side callers.
+`HostSettings`. Each injected agent receives a server-signed bearer credential
+bound to its `AgentId`; that authenticated identity becomes the parent. Header
+and query identities are claims only and must match the credential. Root/admin
+spawns use the separate typed host protocol/dev-driver surface, not bare MCP.
 
 #### `tyde_list_agents`
 
-Lists only agents whose server-owned `parent_agent_id` is the injected calling
-agent id. It excludes grandchildren, unrelated host agents, and children owned
-by other callers. Requests without an injected caller agent id are rejected.
+Lists only agents whose server-owned `parent_agent_id` is the authenticated
+calling agent id. It excludes grandchildren, unrelated host agents, and
+children owned by other callers. Missing, invalid, or mismatched credentials
+are rejected.
 It returns metadata only:
 
 - `agent_id`
@@ -275,9 +277,12 @@ Waits like `select(2)` over the supplied agent ids. It returns when any watched
 agent becomes non-`thinking`. It has no tool-level timeout and accepts neither
 `timeout` nor `timeout_ms`. While every watched agent is still `thinking`, the
 call remains pending unless the request is cancelled or the status channel
-fails. Codex otherwise applies a 300-second default MCP deadline, so Tyde's
-injected `tyde-agent-control` configuration overrides that default with a
-session-scale horizon; the Tyde tool itself has no timer or retry loop.
+fails. Codex otherwise applies a 300-second default per-server MCP deadline.
+Tyde therefore exposes only this tool on the separate `tyde-agent-await`
+endpoint and gives only that MCP server a session-scale client horizon. The
+normal `tyde-agent-control` tools retain Codex's ordinary deadline. The await
+tool itself has no timer or retry loop; the long client horizon is necessary
+because current Codex config has no representation for an unlimited timeout.
 
 Input:
 
@@ -299,6 +304,9 @@ Input:
 
 - `agent_id`
 - `message`
+
+Await, read, debug-read, send, and list centrally authorize targets against the
+server-owned direct-child relation. Knowing another agent id is insufficient.
 
 #### `tyde_read_agent`
 
@@ -368,7 +376,8 @@ converts child output into hidden parent input.
 `server/src/agent_control_mcp.rs` follows the same embedded-loopback pattern as
 `server/src/debug_mcp.rs`:
 
-- `start_server()` returns an `AgentControlMcpHandle` with the HTTP URL
+- `start_server()` returns normal-control and await-only HTTP URLs plus a
+  private credential authority
 - loopback-only bind, reject non-loopback peers
 - MCP tool dispatch routes to `HostHandle` / agent actor operations
 - tool responses use protocol types directly where protocol events are returned
@@ -388,16 +397,29 @@ if settings.tyde_agent_control_mcp_enabled {
             bearer_token_env_var: None,
         },
     });
+    servers.push(StartupMcpServer {
+        name: "tyde-agent-await".to_string(),
+        transport: StartupMcpTransport::Http {
+            url: agent_control_mcp.await_url.clone(),
+            headers: HashMap::new(),
+            bearer_token_env_var: None,
+        },
+    });
 }
 ```
 
+When the registry assigns the new `AgentId`, it injects the corresponding
+signed bearer credential into both HTTP transports. The credential is not
+derived from or replaceable by an `agent_id` query/header value.
+
 ### Agent Output Storage
 
-Agent actors already own their event logs. `tyde_read_agent` asks the relevant
-actor for its single latest output record. `tyde_read_agent_debug` asks for
-output envelopes after an optional sequence number with explicit count and byte
-limits. This keeps production output reads actor-owned and avoids hidden host/UI
-caches.
+Agent actors own a typed `AgentControlLatestOutput` record and update it by
+observing output events in original source order. They never reverse-scan or
+fall back through replay history. `AgentBootstrapPayload` carries this typed
+record explicitly, so reconnect history cannot overwrite a newer error with an
+older message. Production and dev-driver projection, debug result shape, and
+byte-capping logic all come from protocol shared code.
 
 ### Advantage Over External Driver
 
@@ -409,6 +431,11 @@ simple:
 - no bootstrap quiescence window
 - direct access to agent records, status, and actor-owned event history
 - no synthetic parent queued-message path for child output
+
+The dev-driver connection is the explicit host/admin surface: it uses Tyde's
+typed host protocol rather than the caller-authenticated MCP endpoint. Its
+stdio tool server scopes targets it creates; in-process test handles may opt
+into the host/admin view explicitly.
 
 ## Non-Goals For This Slice
 

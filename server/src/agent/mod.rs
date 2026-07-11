@@ -7,15 +7,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use protocol::{
     AgentActivityStats, AgentActivityStatsPayload, AgentActivitySummary, AgentBootstrapEvent,
-    AgentBootstrapPayload, AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, AgentOrigin,
-    AgentRenamedPayload, AgentStartPayload, BackendAccessMode, BackendKind, ChatEvent, ChatMessage,
-    ChatMessageId, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin, MessageSender,
-    MessageTokenUsage, ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry, QueuedMessageId,
-    QueuedMessagesPayload, ReviewErrorContext, SendMessagePayload, SessionId,
-    SessionSettingsPayload, SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData,
-    StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
-    TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
-    ToolExecutionCompletedData, ToolExecutionResult,
+    AgentBootstrapPayload, AgentControlLatestOutput, AgentControlOutput, AgentErrorCode,
+    AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
+    BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId, Envelope, FrameKind,
+    MessageMetadataUpdateData, MessageOrigin, MessageSender, MessageTokenUsage, ModelRequestId,
+    ModelRequestTokenUsage, QueuedMessageEntry, QueuedMessageId, QueuedMessagesPayload,
+    ReviewErrorContext, SendMessagePayload, SessionId, SessionSettingsPayload,
+    SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
+    TaskTokenUsageAmount, TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage,
+    TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionResult,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -91,6 +91,7 @@ struct InitialFollowUpContext<'a> {
     status_handle: &'a registry::AgentStatusHandle,
     canonical_stream: &'a str,
     event_log: &'a mut Vec<Envelope>,
+    latest_output: &'a mut AgentControlLatestOutput,
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     queue: &'a mut VecDeque<QueuedMessageEntry>,
@@ -136,7 +137,7 @@ enum AgentCommand {
         reply: oneshot::Sender<Vec<Envelope>>,
     },
     ReadLatestOutput {
-        reply: oneshot::Sender<Option<Envelope>>,
+        reply: oneshot::Sender<Result<AgentControlOutput, String>>,
     },
     FetchSessionHistory {
         before_seq: Option<u64>,
@@ -941,7 +942,7 @@ impl AgentHandle {
         reply_rx.await.ok()
     }
 
-    pub async fn read_latest_output(&self) -> Option<Option<Envelope>> {
+    pub async fn read_latest_output(&self) -> Option<Result<AgentControlOutput, String>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
@@ -1787,6 +1788,7 @@ pub(crate) fn spawn_agent_actor(
         let initial_session_settings = spawn_config.session_settings.clone();
         let canonical_stream = format!("/agent/{}", agent_id);
         let mut event_log: Vec<Envelope> = Vec::new();
+        let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState::default();
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
@@ -1960,6 +1962,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut current_start,
                     &start_tx,
                     &mut event_log,
+                    &mut latest_output,
                     &mut subscribers,
                     &mut rx,
                 )
@@ -2088,6 +2091,7 @@ pub(crate) fn spawn_agent_actor(
                     status_handle: &status_handle,
                     canonical_stream: &canonical_stream,
                     event_log: &mut event_log,
+                    latest_output: &mut latest_output,
                     replay_state: &mut replay_state,
                     subscribers: &mut subscribers,
                     queue: &mut queue,
@@ -2101,6 +2105,9 @@ pub(crate) fn spawn_agent_actor(
         }
 
         loop {
+            latest_output
+                .observe_event_log(&event_log)
+                .expect("typed agent replay log must project latest output");
             tokio::select! {
                 maybe_event = events.recv_backend() => {
                     let Some(event) = maybe_event else {
@@ -2133,6 +2140,7 @@ pub(crate) fn spawn_agent_actor(
                             flush_pending_resume_attaches(
                                 &event_log,
                                 None,
+                                &mut latest_output,
                                 &mut subscribers,
                                 &mut pending_resume_attaches,
                             );
@@ -2148,6 +2156,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut current_start,
                                 &start_tx,
                                 &mut event_log,
+                                &mut latest_output,
                                 &mut subscribers,
                                 &mut rx,
                             )
@@ -2191,6 +2200,7 @@ pub(crate) fn spawn_agent_actor(
                             &mut current_start,
                             &start_tx,
                             &mut event_log,
+                            &mut latest_output,
                             &mut subscribers,
                             &mut rx,
                         )
@@ -2565,6 +2575,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut current_start,
                                 &start_tx,
                                 &mut event_log,
+                                &mut latest_output,
                                 &mut subscribers,
                                 &mut rx,
                             )
@@ -2652,6 +2663,7 @@ pub(crate) fn spawn_agent_actor(
                                     flush_pending_resume_attaches(
                                         &event_log,
                                         Some(&replay_state),
+                                        &mut latest_output,
                                         &mut subscribers,
                                         &mut pending_resume_attaches,
                                     );
@@ -2671,6 +2683,7 @@ pub(crate) fn spawn_agent_actor(
                                                 status_handle: &status_handle,
                                                 canonical_stream: &canonical_stream,
                                                 event_log: &mut event_log,
+                                                latest_output: &mut latest_output,
                                                 replay_state: &mut replay_state,
                                                 subscribers: &mut subscribers,
                                                 queue: &mut queue,
@@ -2711,6 +2724,7 @@ pub(crate) fn spawn_agent_actor(
                                     flush_pending_resume_attaches(
                                         &event_log,
                                         None,
+                                        &mut latest_output,
                                         &mut subscribers,
                                         &mut pending_resume_attaches,
                                     );
@@ -2728,6 +2742,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut current_start,
                                         &start_tx,
                                         &mut event_log,
+                                        &mut latest_output,
                                         &mut subscribers,
                                         &mut rx,
                                     )
@@ -2870,6 +2885,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut current_start,
                                                 &start_tx,
                                                 &mut event_log,
+                                                &mut latest_output,
                                                 &mut subscribers,
                                                 &mut rx,
                                             )
@@ -3099,6 +3115,7 @@ pub(crate) fn spawn_agent_actor(
                                             &mut current_start,
                                             &start_tx,
                                             &mut event_log,
+                                            &mut latest_output,
                                             &mut subscribers,
                                             &mut rx,
                                         )
@@ -3337,7 +3354,7 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                         }
                         AgentCommand::ReadLatestOutput { reply } => {
-                            let _ = reply.send(latest_output_record(&event_log));
+                            let _ = reply.send(Ok(latest_output.output().clone()));
                         }
                         AgentCommand::FetchSessionHistory {
                             before_seq,
@@ -3454,9 +3471,10 @@ pub(crate) fn spawn_agent_actor(
                                 pending_resume_attaches.push((stream, reply));
                                 continue;
                             }
-                            let attached = attach_subscriber(
+                            let attached = attach_subscriber_with_latest_output(
                                 &event_log,
                                 Some(&replay_state),
+                                latest_output.output(),
                                 &mut subscribers,
                                 stream,
                             );
@@ -3494,6 +3512,7 @@ pub(crate) fn spawn_relay_agent_actor(
     tokio::spawn(async move {
         let canonical_stream = format!("/agent/{}", agent_id);
         let mut event_log: Vec<Envelope> = Vec::new();
+        let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState::default();
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
@@ -3531,6 +3550,9 @@ pub(crate) fn spawn_relay_agent_actor(
         .await;
 
         loop {
+            latest_output
+                .observe_event_log(&event_log)
+                .expect("typed relay replay log must project latest output");
             tokio::select! {
                 maybe_event = events.recv() => {
                     let Some(mut event) = maybe_event else {
@@ -3562,6 +3584,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             &mut current_start,
                             &start_tx,
                             &mut event_log,
+                            &mut latest_output,
                             &mut subscribers,
                             &mut rx,
                             &accepting_input_task,
@@ -3755,7 +3778,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                         }
                         AgentCommand::ReadLatestOutput { reply } => {
-                            let _ = reply.send(latest_output_record(&event_log));
+                            let _ = reply.send(Ok(latest_output.output().clone()));
                         }
                         AgentCommand::FetchSessionHistory {
                             before_seq,
@@ -3806,9 +3829,10 @@ pub(crate) fn spawn_relay_agent_actor(
                             }
                         }
                         AgentCommand::Attach { stream, reply } => {
-                            let attached = attach_subscriber(
+                            let attached = attach_subscriber_with_latest_output(
                                 &event_log,
                                 Some(&replay_state),
+                                latest_output.output(),
                                 &mut subscribers,
                                 stream,
                             );
@@ -3969,10 +3993,14 @@ async fn park_terminal_agent(
     current_start: &mut AgentStartPayload,
     start_tx: &watch::Sender<AgentStartPayload>,
     event_log: &mut [Envelope],
+    latest_output: &mut AgentControlLatestOutput,
     subscribers: &mut Vec<Stream>,
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
 ) {
     loop {
+        latest_output
+            .observe_event_log(event_log)
+            .expect("typed terminal replay log must project latest output");
         let Some(command) = rx.recv().await else {
             break;
         };
@@ -4007,7 +4035,7 @@ async fn park_terminal_agent(
                 let _ = reply.send(output_events_since(event_log, after_seq, limit));
             }
             AgentCommand::ReadLatestOutput { reply } => {
-                let _ = reply.send(latest_output_record(event_log));
+                let _ = reply.send(Ok(latest_output.output().clone()));
             }
             AgentCommand::FetchSessionHistory {
                 before_seq,
@@ -4030,7 +4058,13 @@ async fn park_terminal_agent(
                 let _ = reply.send(agent_usage_snapshot_from_log(current_start, event_log));
             }
             AgentCommand::Attach { stream, reply } => {
-                let attached = attach_subscriber(event_log, None, subscribers, stream);
+                let attached = attach_subscriber_with_latest_output(
+                    event_log,
+                    None,
+                    latest_output.output(),
+                    subscribers,
+                    stream,
+                );
                 let _ = reply.send(attached);
             }
             AgentCommand::Close { reply } => {
@@ -4059,6 +4093,7 @@ async fn park_relay_terminal_agent(
     current_start: &mut AgentStartPayload,
     start_tx: &watch::Sender<AgentStartPayload>,
     event_log: &mut Vec<Envelope>,
+    latest_output: &mut AgentControlLatestOutput,
     subscribers: &mut Vec<Stream>,
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
     accepting_input: &Arc<AtomicBool>,
@@ -4066,6 +4101,9 @@ async fn park_relay_terminal_agent(
     canonical_stream: &str,
 ) {
     loop {
+        latest_output
+            .observe_event_log(event_log)
+            .expect("typed relay terminal replay log must project latest output");
         let Some(command) = rx.recv().await else {
             break;
         };
@@ -4100,7 +4138,7 @@ async fn park_relay_terminal_agent(
                 let _ = reply.send(output_events_since(event_log, after_seq, limit));
             }
             AgentCommand::ReadLatestOutput { reply } => {
-                let _ = reply.send(latest_output_record(event_log));
+                let _ = reply.send(Ok(latest_output.output().clone()));
             }
             AgentCommand::FetchSessionHistory {
                 before_seq,
@@ -4123,7 +4161,13 @@ async fn park_relay_terminal_agent(
                 let _ = reply.send(agent_usage_snapshot_from_log(current_start, event_log));
             }
             AgentCommand::Attach { stream, reply } => {
-                let attached = attach_subscriber(event_log, None, subscribers, stream);
+                let attached = attach_subscriber_with_latest_output(
+                    event_log,
+                    None,
+                    latest_output.output(),
+                    subscribers,
+                    stream,
+                );
                 let _ = reply.send(attached);
             }
             AgentCommand::Close { reply } => {
@@ -4514,11 +4558,20 @@ fn abort_resume_replay_barrier_task(task: &mut Option<tokio::task::JoinHandle<()
 fn flush_pending_resume_attaches(
     event_log: &[Envelope],
     replay_state: Option<&AgentReplayState>,
+    latest_output: &mut AgentControlLatestOutput,
     subscribers: &mut Vec<Stream>,
     pending_attaches: &mut Vec<(Stream, oneshot::Sender<bool>)>,
 ) {
+    let output = current_latest_output(latest_output, event_log)
+        .expect("typed resume replay log must project latest output");
     for (stream, reply) in std::mem::take(pending_attaches) {
-        let attached = attach_subscriber(event_log, replay_state, subscribers, stream);
+        let attached = attach_subscriber_with_latest_output(
+            event_log,
+            replay_state,
+            &output,
+            subscribers,
+            stream,
+        );
         let _ = reply.send(attached);
     }
 }
@@ -4565,6 +4618,7 @@ async fn send_initial_follow_up_or_park(
         context.current_start,
         context.start_tx,
         context.event_log,
+        context.latest_output,
         context.subscribers,
         context.rx,
     )
@@ -4905,22 +4959,14 @@ fn output_events_since(
         .collect()
 }
 
-fn latest_output_record(event_log: &[Envelope]) -> Option<Envelope> {
-    event_log
-        .iter()
-        .rev()
-        .find(|event| match event.kind {
-            FrameKind::AgentError => true,
-            FrameKind::ChatEvent => matches!(
-                event.parse_payload::<ChatEvent>(),
-                Ok(ChatEvent::MessageAdded(ChatMessage {
-                    sender: MessageSender::Assistant { .. },
-                    ..
-                }))
-            ),
-            _ => false,
-        })
-        .cloned()
+fn current_latest_output(
+    latest_output: &mut AgentControlLatestOutput,
+    event_log: &[Envelope],
+) -> Result<AgentControlOutput, String> {
+    latest_output
+        .observe_event_log(event_log)
+        .map_err(|error| error.to_string())?;
+    Ok(latest_output.output().clone())
 }
 
 fn activity_history_snapshot(
@@ -5285,9 +5331,30 @@ fn broadcast_event(subscribers: &mut Vec<Stream>, event: &Envelope) {
     }
 }
 
+#[cfg(test)]
 fn attach_subscriber(
     event_log: &[Envelope],
     replay_state: Option<&AgentReplayState>,
+    subscribers: &mut Vec<Stream>,
+    stream: Stream,
+) -> bool {
+    let mut latest_output = AgentControlLatestOutput::default();
+    latest_output
+        .observe_event_log(event_log)
+        .expect("typed agent replay log must project latest output");
+    attach_subscriber_with_latest_output(
+        event_log,
+        replay_state,
+        latest_output.output(),
+        subscribers,
+        stream,
+    )
+}
+
+fn attach_subscriber_with_latest_output(
+    event_log: &[Envelope],
+    replay_state: Option<&AgentReplayState>,
+    latest_output: &AgentControlOutput,
     subscribers: &mut Vec<Stream>,
     stream: Stream,
 ) -> bool {
@@ -5317,8 +5384,11 @@ fn attach_subscriber(
         );
     }
 
-    let payload = serde_json::to_value(AgentBootstrapPayload { events })
-        .expect("failed to serialize AgentBootstrap payload");
+    let payload = serde_json::to_value(AgentBootstrapPayload {
+        events,
+        latest_output: latest_output.clone(),
+    })
+    .expect("failed to serialize AgentBootstrap payload");
     if stream
         .send_value(FrameKind::AgentBootstrap, payload)
         .is_err()
@@ -5747,12 +5817,13 @@ mod tests {
 
     use protocol::{
         AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
-        AgentId, AgentInput, AgentStartPayload, ChatEvent, ChatMessage, ChatMessageId, FrameKind,
-        MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId,
-        ModelRequestTokenUsage, ModelTurnId, ReasoningData, SessionId, StreamEndData, StreamPath,
-        StreamStartData, StreamTextDeltaData, TaskList, TaskTokenUsageScope,
-        TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
-        ToolExecutionCompletedData, ToolExecutionResult, ToolRequest, ToolRequestType,
+        AgentControlLatestOutput, AgentControlOutput, AgentId, AgentInput, AgentStartPayload,
+        ChatEvent, ChatMessage, ChatMessageId, FrameKind, MessageMetadataUpdateData, MessageSender,
+        MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
+        ReasoningData, SessionId, StreamEndData, StreamPath, StreamStartData, StreamTextDeltaData,
+        TaskList, TaskTokenUsageScope, TaskTokenUsageUnavailableReason, TokenUsage,
+        TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionCompletedData,
+        ToolExecutionResult, ToolRequest, ToolRequestType,
     };
     use tokio::sync::{Mutex, mpsc, watch};
     use tokio::time::timeout;
@@ -5761,10 +5832,10 @@ mod tests {
         AgentActivityStatsTracker, AgentCommand, AgentHandle, AgentReplayState,
         GenerateAgentActivitySummaryRequest, InterruptOutcome, activity_history_snapshot,
         agent_usage_snapshot_from_log, append_chat_event, append_event, attach_subscriber,
-        collect_agent_activity_summary_events, generate_mock_name, known_turn_usage,
-        latest_output_record, name_generation_fallback, output_events_since, replay_envelope,
-        sanitize_generated_agent_name, session_history_window, spawn_relay_agent_actor,
-        upsert_activity_stats_snapshot,
+        attach_subscriber_with_latest_output, collect_agent_activity_summary_events,
+        current_latest_output, generate_mock_name, known_turn_usage, name_generation_fallback,
+        output_events_since, replay_envelope, sanitize_generated_agent_name,
+        session_history_window, spawn_relay_agent_actor, upsert_activity_stats_snapshot,
     };
     use crate::agent::registry::AgentStatusHandle;
     use crate::backend::EventStream;
@@ -5798,6 +5869,7 @@ mod tests {
                 .await;
 
             let mut event_log = Vec::new();
+            let mut latest_output = AgentControlLatestOutput::default();
             let mut subscribers = Vec::new();
             append_event(
                 &format!("/agent/{}", start.agent_id),
@@ -5807,8 +5879,13 @@ mod tests {
                 &payload,
             )
             .await;
-
-            while let Some(command) = rx.recv().await {
+            loop {
+                latest_output
+                    .observe_event_log(&event_log)
+                    .expect("typed failed-agent replay log must project latest output");
+                let Some(command) = rx.recv().await else {
+                    break;
+                };
                 match command {
                     AgentCommand::ResumeReplayBarrier { .. } => {}
                     AgentCommand::ReadOutput {
@@ -5819,7 +5896,7 @@ mod tests {
                         let _ = reply.send(output_events_since(&event_log, after_seq, limit));
                     }
                     AgentCommand::ReadLatestOutput { reply } => {
-                        let _ = reply.send(latest_output_record(&event_log));
+                        let _ = reply.send(Ok(latest_output.output().clone()));
                     }
                     AgentCommand::FetchSessionHistory {
                         before_seq,
@@ -5843,8 +5920,13 @@ mod tests {
                         let _ = reply.send(agent_usage_snapshot_from_log(&start, &event_log));
                     }
                     AgentCommand::Attach { stream, reply } => {
-                        let attached =
-                            attach_subscriber(&event_log, None, &mut subscribers, stream);
+                        let attached = attach_subscriber_with_latest_output(
+                            &event_log,
+                            None,
+                            latest_output.output(),
+                            &mut subscribers,
+                            stream,
+                        );
                         let _ = reply.send(attached);
                     }
                     AgentCommand::SetName { reply, .. } => {
@@ -7726,7 +7808,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_output_record_does_not_fall_back_past_empty_message() {
+    fn latest_output_state_does_not_fall_back_past_empty_message() {
         let canonical_stream = "/agent/replay-agent";
         let prior = replay_envelope(
             canonical_stream,
@@ -7747,9 +7829,10 @@ mod tests {
             &metadata_update("message-2", 42),
         );
 
-        let selected = latest_output_record(&[prior, latest, metadata])
-            .expect("empty assistant message remains the latest output record");
-        assert_eq!(selected.seq, 2);
+        let mut state = AgentControlLatestOutput::default();
+        let output = current_latest_output(&mut state, &[prior, latest, metadata])
+            .expect("typed output records should project");
+        assert_eq!(output, AgentControlOutput::Empty);
     }
 
     #[tokio::test]

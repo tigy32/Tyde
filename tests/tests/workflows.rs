@@ -19,6 +19,7 @@ use protocol::{
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde_json::{Value, json};
 
 static GLOBAL_WORKFLOWS_ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -266,15 +267,17 @@ async fn trigger_workflow_and_wait_for_coordinator(
 }
 
 async fn call_mcp_tool(
+    fixture: &Fixture,
     base_url: &str,
     caller_agent_id: &AgentId,
     name: &str,
     arguments: Value,
 ) -> (bool, String) {
-    call_mcp_tool_optional_caller(base_url, Some(caller_agent_id), name, arguments).await
+    call_mcp_tool_optional_caller(fixture, base_url, Some(caller_agent_id), name, arguments).await
 }
 
 async fn call_mcp_tool_optional_caller(
+    fixture: &Fixture,
     base_url: &str,
     caller_agent_id: Option<&AgentId>,
     name: &str,
@@ -286,7 +289,21 @@ async fn call_mcp_tool_optional_caller(
     } else {
         base_url.to_owned()
     };
-    let transport = StreamableHttpClientTransport::from_uri(url);
+    let agent_control_url = fixture.agent_control_http_url().await;
+    let transport = if let Some(caller_agent_id) = caller_agent_id
+        && base_url == agent_control_url
+    {
+        let caller = fixture.agent_control_caller(caller_agent_id).await;
+        let bearer = caller
+            .authorization
+            .strip_prefix("Bearer ")
+            .expect("fixture caller authorization must be bearer");
+        StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(url).auth_header(bearer),
+        )
+    } else {
+        StreamableHttpClientTransport::from_uri(url)
+    };
     let service = ().serve(transport).await.expect("connect to MCP");
     let arguments = arguments
         .as_object()
@@ -318,23 +335,25 @@ async fn call_mcp_tool_optional_caller(
 }
 
 async fn call_mcp_json_tool(
+    fixture: &Fixture,
     base_url: &str,
     caller_agent_id: &AgentId,
     name: &str,
     arguments: Value,
 ) -> WorkflowRunSnapshot {
-    let (is_error, body) = call_mcp_tool(base_url, caller_agent_id, name, arguments).await;
+    let (is_error, body) = call_mcp_tool(fixture, base_url, caller_agent_id, name, arguments).await;
     assert!(!is_error, "MCP tool {name} returned error: {body}");
     serde_json::from_str(&body).unwrap_or_else(|err| panic!("parse {name} JSON result: {err}"))
 }
 
 async fn call_agent_control_json<T: serde::de::DeserializeOwned>(
+    fixture: &Fixture,
     base_url: &str,
     caller_agent_id: &AgentId,
     name: &str,
     arguments: Value,
 ) -> T {
-    let (is_error, body) = call_mcp_tool(base_url, caller_agent_id, name, arguments).await;
+    let (is_error, body) = call_mcp_tool(fixture, base_url, caller_agent_id, name, arguments).await;
     assert!(!is_error, "MCP tool {name} returned error: {body}");
     serde_json::from_str(&body)
         .unwrap_or_else(|err| panic!("parse {name} JSON result: {err}: {body}"))
@@ -651,6 +670,7 @@ async fn workflow_progress_finish_and_reconnect_replay_run() {
 
     let workflow_url = fixture.workflow_mcp_http_url().await;
     let step_snapshot = call_mcp_json_tool(
+        &fixture,
         &workflow_url,
         &coordinator.agent_id,
         "tyde_workflow_report_step",
@@ -682,6 +702,7 @@ async fn workflow_progress_finish_and_reconnect_replay_run() {
     }
 
     let finished = call_mcp_json_tool(
+        &fixture,
         &workflow_url,
         &coordinator.agent_id,
         "tyde_workflow_finish",
@@ -787,6 +808,7 @@ async fn late_workflow_finish_after_cancel_cannot_resurrect_run() {
 
     let workflow_url = fixture.workflow_mcp_http_url().await;
     let (is_error, body) = call_mcp_tool(
+        &fixture,
         &workflow_url,
         &coordinator.agent_id,
         "tyde_workflow_finish",
@@ -831,6 +853,7 @@ async fn workflow_child_agents_inherit_context_and_backend_allowlist() {
 
     let agent_control_url = fixture.agent_control_http_url().await;
     let (is_error, error_body) = call_mcp_tool(
+        &fixture,
         &agent_control_url,
         &coordinator.agent_id,
         "tyde_spawn_agent",
@@ -852,6 +875,7 @@ async fn workflow_child_agents_inherit_context_and_backend_allowlist() {
     );
 
     let (is_error, body) = call_mcp_tool(
+        &fixture,
         &agent_control_url,
         &coordinator.agent_id,
         "tyde_spawn_agent",
@@ -947,6 +971,7 @@ async fn workflow_save_mcp_notifies_and_triggers_without_refresh() {
     let agent_control_url = fixture.agent_control_http_url().await;
 
     let targets: WorkflowTargetsResponse = call_agent_control_json(
+        &fixture,
         &agent_control_url,
         &author.agent_id,
         "tyde_workflow_targets",
@@ -966,6 +991,7 @@ async fn workflow_save_mcp_notifies_and_triggers_without_refresh() {
     }));
 
     let save: WorkflowSaveResponse = call_agent_control_json(
+        &fixture,
         &agent_control_url,
         &author.agent_id,
         "tyde_workflow_save",
@@ -1047,6 +1073,7 @@ async fn workflow_save_rejects_read_only_without_catalog_change() {
     let target_file = _global.path().join("readonly.md");
 
     let (is_error, body) = call_mcp_tool(
+        &fixture,
         &agent_control_url,
         &readonly.agent_id,
         "tyde_workflow_save",
@@ -1096,6 +1123,7 @@ async fn workflow_save_create_replace_collision_semantics() {
     let agent_control_url = fixture.agent_control_http_url().await;
 
     let global_save: WorkflowSaveResponse = call_agent_control_json(
+        &fixture,
         &agent_control_url,
         &author.agent_id,
         "tyde_workflow_save",
@@ -1110,6 +1138,7 @@ async fn workflow_save_create_replace_collision_semantics() {
     assert!(global_save.created);
 
     let (is_error, body) = call_mcp_tool(
+        &fixture,
         &agent_control_url,
         &author.agent_id,
         "tyde_workflow_save",
@@ -1127,6 +1156,7 @@ async fn workflow_save_create_replace_collision_semantics() {
     );
 
     let (is_error, body) = call_mcp_tool(
+        &fixture,
         &agent_control_url,
         &author.agent_id,
         "tyde_workflow_save",
@@ -1144,6 +1174,7 @@ async fn workflow_save_create_replace_collision_semantics() {
     );
 
     let project_shadow: WorkflowSaveResponse = call_agent_control_json(
+        &fixture,
         &agent_control_url,
         &author.agent_id,
         "tyde_workflow_save",
@@ -1169,6 +1200,7 @@ async fn workflow_save_create_replace_collision_semantics() {
     );
 
     let (is_error, body) = call_mcp_tool(
+        &fixture,
         &agent_control_url,
         &author.agent_id,
         "tyde_workflow_save",
@@ -1190,6 +1222,7 @@ async fn workflow_save_create_replace_collision_semantics() {
     );
 
     let (is_error, body) = call_mcp_tool(
+        &fixture,
         &agent_control_url,
         &author.agent_id,
         "tyde_workflow_save",
@@ -1211,6 +1244,7 @@ async fn workflow_save_create_replace_collision_semantics() {
     );
 
     let (is_error, body) = call_mcp_tool(
+        &fixture,
         &agent_control_url,
         &author.agent_id,
         "tyde_workflow_save",
@@ -1232,6 +1266,7 @@ async fn workflow_save_create_replace_collision_semantics() {
     );
 
     let replaced: WorkflowSaveResponse = call_agent_control_json(
+        &fixture,
         &agent_control_url,
         &author.agent_id,
         "tyde_workflow_save",
@@ -1453,6 +1488,7 @@ async fn workflow_strict_validator_and_legacy_diagnostics_are_visible() {
 
     for (filename, markdown, expected) in invalid_cases {
         let (is_error, body) = call_mcp_tool(
+            &fixture,
             &agent_control_url,
             &author.agent_id,
             "tyde_workflow_save",
@@ -1658,6 +1694,7 @@ async fn workflow_save_rejects_stale_disk_duplicate_id_before_reload() {
 
     let agent_control_url = fixture.agent_control_http_url().await;
     let (is_error, body) = call_mcp_tool(
+        &fixture,
         &agent_control_url,
         &author.agent_id,
         "tyde_workflow_save",

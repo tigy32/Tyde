@@ -28,6 +28,7 @@ pub(crate) mod workflows;
 pub use backend::{acp, antigravity, claude, codex, kiro, subprocess};
 
 pub use acceptor::{HandshakeError, accept, listen_uds};
+pub use agent_control_mcp::AgentControlMcpCaller;
 pub use connection::{run_connection, run_mobile_connection};
 pub use host::{
     HostHandle, HostRuntimeConfig, spawn_host, spawn_host_with_mock_backend,

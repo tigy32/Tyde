@@ -4252,6 +4252,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"kiro-restored-sess
                         created_at_ms: 0,
                     },
                 )],
+                latest_output: Default::default(),
             },
         )
         .expect("serialize AgentBootstrap");

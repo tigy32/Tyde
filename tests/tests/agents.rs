@@ -27,7 +27,9 @@ use rmcp::{
         ProgressNotificationParam, ProgressToken, RawContent, ServerResult,
     },
     service::{NotificationContext, PeerRequestOptions, RoleClient},
-    transport::StreamableHttpClientTransport,
+    transport::{
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -423,13 +425,21 @@ fn parse_http_url(url: &str) -> (&str, &str) {
 }
 
 async fn post_json(url: &str, body: &Value) -> Value {
+    post_json_with_headers(url, &[], body).await
+}
+
+async fn post_json_with_headers(url: &str, headers: &[(&str, &str)], body: &Value) -> Value {
     let (addr, target) = parse_http_url(url);
     let mut stream = TcpStream::connect(addr)
         .await
         .unwrap_or_else(|err| panic!("connect {addr} failed: {err}"));
     let body_bytes = serde_json::to_vec(body).expect("serialize HTTP JSON body");
+    let extra_headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
     let request = format!(
-        "POST {target} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {target} HTTP/1.1\r\nHost: {addr}\r\n{extra_headers}Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body_bytes.len()
     );
     stream
@@ -465,22 +475,43 @@ async fn post_json(url: &str, body: &Value) -> Value {
     serde_json::from_str(json_str).expect("parse SSE JSON response")
 }
 
-async fn mcp_spawn_agent(url: &str, prompt: &str, name: &str) -> protocol::AgentId {
-    mcp_spawn_agent_with_arguments(
-        url,
-        json!({
-            "workspace_roots": ["/tmp/agent-control-mcp-parent-url"],
-            "prompt": prompt,
-            "backend_kind": "claude",
-            "name": name
-        }),
-    )
-    .await
+fn mcp_result_is_error(response: &Value) -> bool {
+    response
+        .get("result")
+        .and_then(|result| result.get("isError").or_else(|| result.get("is_error")))
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| panic!("MCP result missing isError: {response}"))
 }
 
-async fn mcp_spawn_agent_with_arguments(url: &str, arguments: Value) -> protocol::AgentId {
-    let response = post_json(
+fn mcp_result_text(response: &Value) -> &str {
+    response
+        .get("result")
+        .and_then(|result| result.get("content"))
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|entry| entry.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("MCP response missing content text: {response}"))
+}
+
+async fn mcp_spawn_agent_as(
+    caller: &server::AgentControlMcpCaller,
+    arguments: Value,
+) -> protocol::AgentId {
+    mcp_spawn_agent_with_request(&caller.url, Some(&caller.authorization), arguments).await
+}
+
+async fn mcp_spawn_agent_with_request(
+    url: &str,
+    authorization: Option<&str>,
+    arguments: Value,
+) -> protocol::AgentId {
+    let headers = authorization
+        .map(|value| vec![("Authorization", value)])
+        .unwrap_or_default();
+    let response = post_json_with_headers(
         url,
+        &headers,
         &json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -516,9 +547,13 @@ async fn mcp_spawn_agent_with_arguments(url: &str, arguments: Value) -> protocol
     protocol::AgentId(agent_id.to_string())
 }
 
-async fn mcp_await_agent(url: &str, agent_id: &protocol::AgentId) -> Value {
-    let response = post_json(
-        url,
+async fn mcp_await_agent(
+    caller: &server::AgentControlMcpCaller,
+    agent_id: &protocol::AgentId,
+) -> Value {
+    let response = post_json_with_headers(
+        &caller.await_url,
+        &[("Authorization", &caller.authorization)],
         &json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -551,9 +586,10 @@ async fn mcp_await_agent(url: &str, agent_id: &protocol::AgentId) -> Value {
     serde_json::from_str(text).expect("parse MCP tool payload JSON")
 }
 
-async fn mcp_list_agents(url: &str) -> Value {
-    let response = post_json(
-        url,
+async fn mcp_list_agents(caller: &server::AgentControlMcpCaller) -> Value {
+    let response = post_json_with_headers(
+        &caller.url,
+        &[("Authorization", &caller.authorization)],
         &json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -582,6 +618,41 @@ async fn mcp_list_agents(url: &str) -> Value {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("MCP response missing content text: {response}"));
     serde_json::from_str(text).expect("parse MCP tool payload JSON")
+}
+
+async fn mcp_tool_call_as(
+    caller: &server::AgentControlMcpCaller,
+    await_surface: bool,
+    tool_name: &str,
+    arguments: Value,
+) -> Value {
+    let url = if await_surface {
+        &caller.await_url
+    } else {
+        &caller.url
+    };
+    post_json_with_headers(
+        url,
+        &[("Authorization", &caller.authorization)],
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments
+            }
+        }),
+    )
+    .await
+}
+
+fn mcp_success_json(response: &Value) -> Value {
+    assert!(
+        !mcp_result_is_error(response),
+        "MCP tool call failed: {response}"
+    );
+    serde_json::from_str(mcp_result_text(response)).expect("parse MCP success payload JSON")
 }
 
 async fn mcp_list_launch_options(url: &str) -> Value {
@@ -762,14 +833,14 @@ fn assert_await_result_ready(body: &Value, agent_id: &protocol::AgentId) {
 }
 
 async fn wait_for_agent_control_status(
-    url: &str,
+    caller: &server::AgentControlMcpCaller,
     agent_id: &protocol::AgentId,
     expected_status: &str,
     timeout: Duration,
 ) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let agents = mcp_list_agents(url).await;
+        let agents = mcp_list_agents(caller).await;
         let matching = agents
             .as_array()
             .unwrap_or_else(|| panic!("list agents result was not an array: {agents}"))
@@ -867,8 +938,52 @@ const MOCK_AGENT_CONTROL_AWAIT_SENTINEL: &str = "__mock_agent_control_await__";
 const MOCK_LATE_USAGE_SENTINEL: &str = "__mock_late_usage__";
 const MOCK_NO_USAGE_SENTINEL: &str = "__mock_no_usage__";
 const MOCK_ORCHESTRATION_SENTINEL: &str = "__mock_orchestration__";
+const MOCK_EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL: &str = "__mock_empty_agent_control_output__";
 const MOCK_TURN_TOKEN_TOTAL: u64 = 1590;
 const MOCK_NATIVE_CHILD_TOKEN_TOTAL: u64 = 330;
+
+async fn spawn_agent_control_parent(fixture: &mut Fixture, name: &str) -> NewAgentPayload {
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![format!("/tmp/{name}")],
+                prompt: format!("initialize {name}"),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent-control parent");
+    let env = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "agent-control parent NewAgent",
+    )
+    .await;
+    let parent: NewAgentPayload = env.parse_payload().expect("parse parent NewAgent");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &parent.instance_stream,
+        "agent-control parent AgentStart",
+    )
+    .await;
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &parent.instance_stream,
+        &format!("mock backend response to: initialize {name}"),
+    )
+    .await;
+    parent
+}
 
 fn assert_known_turn_usage(
     usage: &Option<MessageTokenUsage>,
@@ -3405,6 +3520,8 @@ async fn agent_control_http_discovers_and_spawns_launch_profiles() {
         .await
         .expect("enable Claude");
 
+    let parent = spawn_agent_control_parent(&mut fixture, "launch-profile-parent").await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
     let base_url = fixture.agent_control_http_url().await;
     let options = mcp_list_launch_options(&base_url).await;
     let entries = options["catalog"]["entries"]
@@ -3417,8 +3534,8 @@ async fn agent_control_http_discovers_and_spawns_launch_profiles() {
         "expected claude:default in {options}"
     );
 
-    let agent_id = mcp_spawn_agent_with_arguments(
-        &base_url,
+    let agent_id = mcp_spawn_agent_as(
+        &caller,
         json!({
             "workspace_roots": ["/tmp/agent-control-launch-profile"],
             "prompt": "agent control launch profile",
@@ -3430,7 +3547,7 @@ async fn agent_control_http_discovers_and_spawns_launch_profiles() {
         }),
     )
     .await;
-    let awaited = mcp_await_agent(&base_url, &agent_id).await;
+    let awaited = mcp_await_agent(&caller, &agent_id).await;
     assert_await_result_ready(&awaited, &agent_id);
 }
 
@@ -3471,6 +3588,8 @@ async fn agent_control_http_spawns_explicit_hermes_launch_profile_after_schema_r
         "expected ready hermes:claude in {catalog:?}"
     );
 
+    let parent = spawn_agent_control_parent(&mut fixture, "hermes-profile-parent").await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
     let base_url = fixture.agent_control_http_url().await;
     let options = mcp_list_launch_options(&base_url).await;
     let entries = options["catalog"]["entries"]
@@ -3485,8 +3604,8 @@ async fn agent_control_http_spawns_explicit_hermes_launch_profile_after_schema_r
         "expected ready hermes:claude in {options}"
     );
 
-    let agent_id = mcp_spawn_agent_with_arguments(
-        &base_url,
+    let agent_id = mcp_spawn_agent_as(
+        &caller,
         json!({
             "workspace_roots": ["/tmp/agent-control-hermes-launch-profile"],
             "prompt": "agent control explicit Hermes launch profile",
@@ -3495,20 +3614,22 @@ async fn agent_control_http_spawns_explicit_hermes_launch_profile_after_schema_r
         }),
     )
     .await;
-    let awaited = mcp_await_agent(&base_url, &agent_id).await;
+    let awaited = mcp_await_agent(&caller, &agent_id).await;
     assert_await_result_ready(&awaited, &agent_id);
 }
 
 #[tokio::test]
 async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
     let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_control_parent(&mut fixture, "plan-await-parent").await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
 
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
             name: Some("await-exit-plan-mode".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: None,
+            parent_agent_id: Some(parent.agent_id.clone()),
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/await-exit-plan-mode".to_owned()],
@@ -3540,10 +3661,9 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
         wait_for_exit_plan_mode_pause_on_stream(&mut fixture.client, &new_agent.instance_stream)
             .await;
 
-    let base_url = fixture.agent_control_http_url().await;
     let pending_await = tokio::time::timeout(
         Duration::from_secs(2),
-        mcp_await_agent(&base_url, &new_agent.agent_id),
+        mcp_await_agent(&caller, &new_agent.agent_id),
     )
     .await
     .expect("tyde_await_agents must return while plan approval is pending");
@@ -3569,7 +3689,7 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
 
     let resumed_await = tokio::time::timeout(
         Duration::from_secs(5),
-        mcp_await_agent(&base_url, &new_agent.agent_id),
+        mcp_await_agent(&caller, &new_agent.agent_id),
     )
     .await
     .expect("tyde_await_agents must return after plan approval resumes the turn");
@@ -3624,13 +3744,15 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
 #[tokio::test]
 async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
     let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_control_parent(&mut fixture, "resuming-await-parent").await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
 
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
             name: Some("await-exit-plan-mode-resume".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: None,
+            parent_agent_id: Some(parent.agent_id.clone()),
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/await-exit-plan-mode-resume".to_owned()],
@@ -3668,10 +3790,9 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
         wait_for_exit_plan_mode_pause_on_stream(&mut fixture.client, &new_agent.instance_stream)
             .await;
 
-    let base_url = fixture.agent_control_http_url().await;
     let pending_await = tokio::time::timeout(
         Duration::from_secs(2),
-        mcp_await_agent(&base_url, &new_agent.agent_id),
+        mcp_await_agent(&caller, &new_agent.agent_id),
     )
     .await
     .expect("tyde_await_agents must return while stream-end-first plan approval is pending");
@@ -3695,6 +3816,14 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
         .await
         .expect("send stream-end-first ExitPlanMode approval");
 
+    wait_for_agent_control_status(
+        &caller,
+        &new_agent.agent_id,
+        "thinking",
+        Duration::from_millis(500),
+    )
+    .await;
+
     let mut saw_completion = false;
     while !saw_completion {
         let env = expect_chat_event_on_stream(
@@ -3712,9 +3841,17 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
         }
     }
 
+    wait_for_agent_control_status(
+        &caller,
+        &new_agent.agent_id,
+        "thinking",
+        Duration::from_millis(500),
+    )
+    .await;
+
     let await_while_resuming = tokio::time::timeout(
         Duration::from_millis(150),
-        mcp_await_agent(&base_url, &new_agent.agent_id),
+        mcp_await_agent(&caller, &new_agent.agent_id),
     )
     .await;
     assert!(
@@ -3750,7 +3887,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
 
     let finished_await = tokio::time::timeout(
         Duration::from_secs(2),
-        mcp_await_agent(&base_url, &new_agent.agent_id),
+        mcp_await_agent(&caller, &new_agent.agent_id),
     )
     .await
     .expect("tyde_await_agents must return after stream-end-first resumed turn finishes");
@@ -3787,7 +3924,7 @@ async fn agent_control_spawn_without_name_returns_generated_name() {
 }
 
 #[tokio::test]
-async fn agent_control_http_infers_parent_agent_id_from_request_url() {
+async fn agent_control_http_binds_parent_to_authenticated_caller() {
     let mut fixture = Fixture::new().await;
 
     fixture
@@ -3820,11 +3957,15 @@ async fn agent_control_http_infers_parent_agent_id_from_request_url() {
     let parent_start: AgentStartPayload = env.parse_payload().expect("parse mcp parent AgentStart");
     assert_eq!(parent_start.parent_agent_id, None);
 
-    let base_url = fixture.agent_control_http_url().await;
-    let child_agent_id = mcp_spawn_agent(
-        &format!("{base_url}?agent_id={}", parent_new.agent_id.0),
-        "child from inferred MCP parent",
-        "mcp-child",
+    let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
+    let child_agent_id = mcp_spawn_agent_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/agent-control-mcp-parent-url"],
+            "prompt": "child from authenticated MCP parent",
+            "backend_kind": "claude",
+            "name": "mcp-child"
+        }),
     )
     .await;
 
@@ -3900,15 +4041,311 @@ async fn agent_control_http_rejects_unknown_tool_arguments() {
 }
 
 #[tokio::test]
+async fn agent_control_http_latest_empty_error_reconnect_and_debug_are_typed() {
+    let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_control_parent(&mut fixture, "typed-read-parent").await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
+
+    let empty_child = mcp_spawn_agent_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/typed-empty-child"],
+            "prompt": "visible before empty output",
+            "backend_kind": "claude",
+            "name": "typed-empty-child"
+        }),
+    )
+    .await;
+    let empty_ready = mcp_await_agent(&caller, &empty_child).await;
+    assert_await_result_ready(&empty_ready, &empty_child);
+    let send_empty = mcp_tool_call_as(
+        &caller,
+        false,
+        "tyde_send_agent_message",
+        json!({
+            "agent_id": empty_child.0,
+            "message": MOCK_EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL
+        }),
+    )
+    .await;
+    assert!(!mcp_result_is_error(&send_empty));
+    let empty_ready = mcp_await_agent(&caller, &empty_child).await;
+    assert_await_result_ready(&empty_ready, &empty_child);
+
+    let empty_read = mcp_tool_call_as(
+        &caller,
+        false,
+        "tyde_read_agent",
+        json!({ "agent_id": empty_child.0 }),
+    )
+    .await;
+    let empty_payload = mcp_success_json(&empty_read);
+    assert_eq!(empty_payload["output"]["kind"], "empty");
+    assert!(empty_payload["output"].get("text").is_none());
+
+    let debug_read = mcp_tool_call_as(
+        &caller,
+        false,
+        "tyde_read_agent_debug",
+        json!({
+            "agent_id": empty_child.0,
+            "after_seq": 0,
+            "limit": 50,
+            "max_bytes": 262144
+        }),
+    )
+    .await;
+    let debug_payload = mcp_success_json(&debug_read);
+    assert_eq!(debug_payload["agent_id"], empty_child.0);
+    assert!(
+        debug_payload["events"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty())
+    );
+    assert!(debug_payload["next_after_seq"].as_u64().is_some());
+
+    let failed_child = mcp_spawn_agent_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/typed-failed-child"],
+            "prompt": "visible before terminal error",
+            "backend_kind": "claude",
+            "name": "typed-failed-child"
+        }),
+    )
+    .await;
+    let initially_ready = mcp_await_agent(&caller, &failed_child).await;
+    assert_await_result_ready(&initially_ready, &failed_child);
+    let terminate = mcp_tool_call_as(
+        &caller,
+        false,
+        "tyde_send_agent_message",
+        json!({
+            "agent_id": failed_child.0,
+            "message": "__mock_die_after_busy__"
+        }),
+    )
+    .await;
+    assert!(!mcp_result_is_error(&terminate));
+    let failed_ready = mcp_await_agent(&caller, &failed_child).await;
+    assert_eq!(failed_ready["ready"][0]["status"], "failed");
+
+    for reconnect in 0..2 {
+        let error_read = mcp_tool_call_as(
+            &caller,
+            false,
+            "tyde_read_agent",
+            json!({ "agent_id": failed_child.0 }),
+        )
+        .await;
+        let error_payload = mcp_success_json(&error_read);
+        assert_eq!(error_payload["output"]["kind"], "error");
+        assert_eq!(
+            error_payload["output"]["error"]["agent_id"], failed_child.0,
+            "reconnect {reconnect} must retain the newer typed error"
+        );
+    }
+}
+
+#[tokio::test]
+async fn agent_control_http_credentials_scope_every_child_tool() {
+    let mut fixture = Fixture::new().await;
+    let parent_a = spawn_agent_control_parent(&mut fixture, "credential-parent-a").await;
+    let parent_b = spawn_agent_control_parent(&mut fixture, "credential-parent-b").await;
+    let caller_a = fixture.agent_control_caller(&parent_a.agent_id).await;
+    let caller_b = fixture.agent_control_caller(&parent_b.agent_id).await;
+
+    let child_a = mcp_spawn_agent_as(
+        &caller_a,
+        json!({
+            "workspace_roots": ["/tmp/credential-child-a"],
+            "prompt": MOCK_EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL,
+            "backend_kind": "claude",
+            "name": "credential-child-a"
+        }),
+    )
+    .await;
+    let child_b = mcp_spawn_agent_as(
+        &caller_b,
+        json!({
+            "workspace_roots": ["/tmp/credential-child-b"],
+            "prompt": MOCK_EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL,
+            "backend_kind": "claude",
+            "name": "credential-child-b"
+        }),
+    )
+    .await;
+    let _ = mcp_await_agent(&caller_a, &child_a).await;
+    let _ = mcp_await_agent(&caller_b, &child_b).await;
+
+    let listed = mcp_list_agents(&caller_a).await;
+    let listed_ids = listed
+        .as_array()
+        .expect("list agents array")
+        .iter()
+        .filter_map(|agent| agent["agent_id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(listed_ids, vec![child_a.0.as_str()]);
+
+    for (tool, await_surface, arguments) in [
+        ("tyde_read_agent", false, json!({ "agent_id": child_b.0 })),
+        (
+            "tyde_read_agent_debug",
+            false,
+            json!({ "agent_id": child_b.0 }),
+        ),
+        (
+            "tyde_send_agent_message",
+            false,
+            json!({ "agent_id": child_b.0, "message": "spoofed" }),
+        ),
+        (
+            "tyde_await_agents",
+            true,
+            json!({ "agent_ids": [child_b.0] }),
+        ),
+    ] {
+        let response = mcp_tool_call_as(&caller_a, await_surface, tool, arguments).await;
+        assert!(
+            mcp_result_is_error(&response),
+            "{tool} must deny cross-parent target"
+        );
+        assert!(mcp_result_text(&response).contains("not a direct child"));
+    }
+
+    let base_url = fixture.agent_control_http_url().await;
+    let list_request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "tyde_list_agents", "arguments": {} }
+    });
+    let query_spoof = post_json(
+        &format!("{base_url}?agent_id={}", parent_a.agent_id.0),
+        &list_request,
+    )
+    .await;
+    assert!(mcp_result_is_error(&query_spoof));
+    assert!(mcp_result_text(&query_spoof).contains("bearer credential"));
+
+    let header_spoof = post_json_with_headers(
+        &base_url,
+        &[("x-tyde-agent-id", parent_a.agent_id.0.as_str())],
+        &list_request,
+    )
+    .await;
+    assert!(mcp_result_is_error(&header_spoof));
+    assert!(mcp_result_text(&header_spoof).contains("bearer credential"));
+
+    let mismatched_query = post_json_with_headers(
+        &format!("{base_url}?agent_id={}", parent_b.agent_id.0),
+        &[("Authorization", &caller_a.authorization)],
+        &list_request,
+    )
+    .await;
+    assert!(mcp_result_is_error(&mismatched_query));
+    assert!(mcp_result_text(&mismatched_query).contains("does not match"));
+
+    let mismatched_header = post_json_with_headers(
+        &base_url,
+        &[
+            ("Authorization", &caller_a.authorization),
+            ("x-tyde-agent-id", parent_b.agent_id.0.as_str()),
+        ],
+        &list_request,
+    )
+    .await;
+    assert!(mcp_result_is_error(&mismatched_header));
+    assert!(mcp_result_text(&mismatched_header).contains("does not match"));
+
+    let forged = post_json_with_headers(
+        &base_url,
+        &[(
+            "Authorization",
+            "Bearer v1.00000000-0000-0000-0000-000000000000.forged",
+        )],
+        &list_request,
+    )
+    .await;
+    assert!(mcp_result_is_error(&forged));
+    assert!(mcp_result_text(&forged).contains("invalid agent-control bearer"));
+}
+
+#[tokio::test]
+async fn agent_control_await_endpoint_isolated_and_remains_pending() {
+    let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_control_parent(&mut fixture, "isolated-await-parent").await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
+    let held_child = mcp_spawn_agent_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/isolated-await-child"],
+            "prompt": "__mock_hold_until_interrupt__ isolated await",
+            "backend_kind": "claude",
+            "name": "isolated-await-child"
+        }),
+    )
+    .await;
+    let held_new = expect_replayed_new_agent(
+        &mut fixture.client,
+        &held_child,
+        "isolated await child NewAgent",
+    )
+    .await;
+
+    for (url, expected, absent) in [
+        (&caller.url, "tyde_read_agent", "tyde_await_agents"),
+        (&caller.await_url, "tyde_await_agents", "tyde_read_agent"),
+    ] {
+        let response = post_json_with_headers(
+            url,
+            &[("Authorization", &caller.authorization)],
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }),
+        )
+        .await;
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools/list result");
+        assert!(tools.iter().any(|tool| tool["name"] == expected));
+        assert!(!tools.iter().any(|tool| tool["name"] == absent));
+    }
+
+    let pending = mcp_tool_call_as(
+        &caller,
+        true,
+        "tyde_await_agents",
+        json!({ "agent_ids": [held_child.0] }),
+    );
+    tokio::pin!(pending);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(350), &mut pending)
+            .await
+            .is_err(),
+        "dedicated await call must remain pending beyond the scaled prior boundary"
+    );
+    fixture
+        .client
+        .interrupt(&held_new.instance_stream)
+        .await
+        .expect("interrupt held await child");
+    let response = tokio::time::timeout(Duration::from_secs(5), &mut pending)
+        .await
+        .expect("await should finish after child becomes idle");
+    assert!(!mcp_result_is_error(&response));
+}
+
+#[tokio::test]
 async fn agent_control_http_await_emits_progress_notifications() {
     let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_control_parent(&mut fixture, "await-progress-parent").await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
 
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
             name: Some("await-progress".to_owned()),
             custom_agent_id: None,
-            parent_agent_id: None,
+            parent_agent_id: Some(parent.agent_id.clone()),
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/await-progress".to_owned()],
@@ -3928,9 +4365,14 @@ async fn agent_control_http_await_emits_progress_notifications() {
     assert_eq!(env.kind, FrameKind::NewAgent);
     let new_agent: NewAgentPayload = env.parse_payload().expect("parse await progress NewAgent");
 
-    let base_url = fixture.agent_control_http_url().await;
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-    let transport = StreamableHttpClientTransport::from_uri(base_url);
+    let bearer = caller
+        .authorization
+        .strip_prefix("Bearer ")
+        .expect("fixture caller authorization must be bearer");
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(caller.await_url.clone()).auth_header(bearer),
+    );
     let service = ProgressRecorder { tx: progress_tx }
         .serve(transport)
         .await
@@ -4110,10 +4552,9 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     )
     .await;
 
-    let base_url = fixture.agent_control_http_url().await;
-    let caller_url = format!("{base_url}?agent_id={}", parent_new.agent_id.0);
+    let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
     wait_for_agent_control_status(
-        &caller_url,
+        &caller,
         &child_new.agent_id,
         "thinking",
         Duration::from_secs(1),
@@ -4167,13 +4608,8 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     )
     .await;
 
-    wait_for_agent_control_status(
-        &caller_url,
-        &child_new.agent_id,
-        "idle",
-        Duration::from_secs(2),
-    )
-    .await;
+    wait_for_agent_control_status(&caller, &child_new.agent_id, "idle", Duration::from_secs(2))
+        .await;
 
     let completion = expect_tool_completion_on_stream(
         &mut fixture.client,
@@ -4251,46 +4687,18 @@ async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments(
     )
     .await;
 
-    let base_url = fixture.agent_control_http_url().await;
-    let response = post_json(
-        &base_url,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "tyde_spawn_agent",
-                "arguments": {
-                    "workspace_roots": ["/tmp/explicit-parent-child"],
-                    "prompt": "child with explicit parent",
-                    "backend_kind": "claude",
-                    "name": "explicit-child",
-                    "parent_agent_id": parent_new.agent_id.0
-                }
-            }
+    let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
+    let child_agent_id = mcp_spawn_agent_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/explicit-parent-child"],
+            "prompt": "child with explicit parent",
+            "backend_kind": "claude",
+            "name": "explicit-child",
+            "parent_agent_id": parent_new.agent_id.0
         }),
     )
     .await;
-
-    let result = response
-        .get("result")
-        .unwrap_or_else(|| panic!("MCP response missing result: {response}"));
-    let is_error = result
-        .get("isError")
-        .or_else(|| result.get("is_error"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    assert!(!is_error, "MCP tool call failed: {response}");
-    let text = result["content"][0]["text"]
-        .as_str()
-        .expect("missing content text");
-    let payload: Value = serde_json::from_str(text).expect("parse spawn result JSON");
-    let child_agent_id = protocol::AgentId(
-        payload["agent_id"]
-            .as_str()
-            .expect("missing agent_id")
-            .to_owned(),
-    );
 
     let child_new = expect_replayed_new_agent(
         &mut fixture.client,
@@ -4306,7 +4714,7 @@ async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments(
     assert_eq!(
         child_new.project_id.as_ref(),
         Some(&parent_project.id),
-        "child spawned with explicit parent_agent_id and no caller must inherit parent project_id"
+        "child spawned by its authenticated parent must inherit the parent project_id"
     );
 
     let child_start = expect_agent_start_on_stream(
@@ -4334,48 +4742,31 @@ async fn agent_control_http_respects_explicit_parent_agent_id_in_tool_arguments(
 }
 
 #[tokio::test]
-async fn agent_control_http_unknown_parent_does_not_fabricate_project_id() {
-    let mut fixture = Fixture::new().await;
+async fn agent_control_http_rejects_unauthenticated_explicit_parent() {
+    let fixture = Fixture::new().await;
     let base_url = fixture.agent_control_http_url().await;
     let unknown_parent_id = protocol::AgentId("11111111-1111-1111-1111-111111111111".to_owned());
-    let child_agent_id = mcp_spawn_agent_with_arguments(
+    let response = post_json(
         &base_url,
-        json!({
-            "workspace_roots": ["/tmp/unknown-parent-child"],
-            "prompt": "child with unknown parent",
-            "backend_kind": "claude",
-            "name": "unknown-parent-child",
-            "parent_agent_id": unknown_parent_id.0.clone()
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "tyde_spawn_agent",
+                "arguments": {
+                    "workspace_roots": ["/tmp/unknown-parent-child"],
+                    "prompt": "child with unknown parent",
+                    "backend_kind": "claude",
+                    "name": "unknown-parent-child",
+                    "parent_agent_id": unknown_parent_id.0
+                }
+            }
         }),
     )
     .await;
-
-    let child_new = expect_replayed_new_agent(
-        &mut fixture.client,
-        &child_agent_id,
-        "unknown parent child NewAgent",
-    )
-    .await;
-    assert_eq!(child_new.parent_agent_id.as_ref(), Some(&unknown_parent_id));
-    assert_eq!(child_new.project_id, None);
-
-    let child_start = expect_agent_start_on_stream(
-        &mut fixture.client,
-        &child_new.instance_stream,
-        "unknown parent child AgentStart",
-    )
-    .await;
-    assert_eq!(
-        child_start.parent_agent_id.as_ref(),
-        Some(&unknown_parent_id)
-    );
-    assert_eq!(child_start.project_id, None);
-    expect_agent_control_child_initial_turn_on_stream(
-        &mut fixture.client,
-        &child_new.instance_stream,
-        "mock backend response to: child with unknown parent",
-    )
-    .await;
+    assert!(mcp_result_is_error(&response));
+    assert!(mcp_result_text(&response).contains("requires an agent-control bearer credential"));
 }
 
 #[tokio::test]
@@ -4434,11 +4825,10 @@ async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() 
     )
     .await;
 
-    let base_url = fixture.agent_control_http_url().await;
-    let caller_url = format!("{base_url}?agent_id={}", parent_new.agent_id.0);
+    let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
     let inherited_child_root = "/tmp/agent-control-inherited-child";
-    let inherited_child_id = mcp_spawn_agent_with_arguments(
-        &caller_url,
+    let inherited_child_id = mcp_spawn_agent_as(
+        &caller,
         json!({
             "workspace_roots": [inherited_child_root],
             "prompt": "child inherits project",
@@ -4485,8 +4875,8 @@ async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() 
     .await;
 
     let override_child_root = "/tmp/agent-control-override-child";
-    let override_child_id = mcp_spawn_agent_with_arguments(
-        &caller_url,
+    let override_child_id = mcp_spawn_agent_as(
+        &caller,
         json!({
             "workspace_roots": [override_child_root],
             "prompt": "child overrides project",
@@ -4533,7 +4923,7 @@ async fn agent_control_http_inherits_project_id_from_parent_unless_overridden() 
     )
     .await;
 
-    let listed = mcp_list_agents(&caller_url).await;
+    let listed = mcp_list_agents(&caller).await;
     assert_eq!(
         mcp_listed_agent(&listed, &inherited_child_id)
             .get("project_id")
@@ -4633,9 +5023,8 @@ async fn backend_native_child_is_first_class_and_replays_to_late_subscribers() {
         "backend-native child AgentStart must point to its live parent",
     );
 
-    let base_url = fixture.agent_control_http_url().await;
-    let caller_url = format!("{base_url}?agent_id={}", parent_new.agent_id.0);
-    let listed = mcp_list_agents(&caller_url).await;
+    let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
+    let listed = mcp_list_agents(&caller).await;
     assert_eq!(
         listed.as_array().map(Vec::len),
         Some(1),
@@ -5010,11 +5399,15 @@ async fn interrupting_parent_keeps_agent_control_children_running() {
     let event: ChatEvent = env.parse_payload().expect("parse parent typing true");
     assert!(matches!(event, ChatEvent::TypingStatusChanged(true)));
 
-    let base_url = fixture.agent_control_http_url().await;
-    let child_agent_id = mcp_spawn_agent(
-        &format!("{base_url}?agent_id={}", parent_new.agent_id.0),
-        "__mock_slow__ agent-control child first",
-        "agent-control-child",
+    let caller = fixture.agent_control_caller(&parent_new.agent_id).await;
+    let child_agent_id = mcp_spawn_agent_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/agent-control-mcp-parent-url"],
+            "prompt": "__mock_slow__ agent-control child first",
+            "backend_kind": "claude",
+            "name": "agent-control-child"
+        }),
     )
     .await;
 

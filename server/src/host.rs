@@ -2859,9 +2859,11 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let review_registry = state.review_registry.clone();
+            let agent_control_mcp = state.agent_control_mcp.clone();
             let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
             let spawned = state.registry.spawn(
                 request,
+                &agent_control_mcp,
                 Arc::clone(&session_store),
                 sub_agent_spawn_tx,
                 review_registry,
@@ -3106,9 +3108,11 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let sub_agent_spawn_tx = state.sub_agent_spawn_tx.clone();
             let review_registry = state.review_registry.clone();
+            let agent_control_mcp = state.agent_control_mcp.clone();
             let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
             let spawned = state.registry.spawn(
                 request,
+                &agent_control_mcp,
                 session_store,
                 sub_agent_spawn_tx,
                 review_registry,
@@ -6241,6 +6245,17 @@ impl HostHandle {
 
     pub async fn agent_control_mcp_url(&self) -> String {
         self.state.lock().await.agent_control_mcp.url.clone()
+    }
+
+    pub async fn agent_control_mcp_caller(
+        &self,
+        agent_id: &AgentId,
+    ) -> Result<crate::agent_control_mcp::AgentControlMcpCaller, String> {
+        let state = self.state.lock().await;
+        if state.registry.agent_handle(agent_id).is_none() {
+            return Err(format!("unknown agent_id {}", agent_id.0));
+        }
+        Ok(state.agent_control_mcp.caller(agent_id))
     }
 
     pub async fn review_mcp_url(&self) -> String {
@@ -9748,7 +9763,7 @@ fn spawn_host_inner(
     // Create the host handle first so we can pass it to the agent-control MCP
     // server. The MCP server runs on its own thread and accesses the host
     // through the cloned handle.
-    let agent_control_mcp_placeholder = AgentControlMcpHandle { url: String::new() };
+    let agent_control_mcp_placeholder = AgentControlMcpHandle::disabled();
     let config_mcp_placeholder = ConfigMcpHandle { url: String::new() };
     let review_mcp_placeholder = ReviewMcpHandle { url: String::new() };
     let workflow_mcp_placeholder = WorkflowMcpHandle { url: String::new() };
@@ -9833,7 +9848,7 @@ fn spawn_host_inner(
                 "agent-control MCP server unavailable; continuing without it: {}",
                 err
             );
-            AgentControlMcpHandle { url: String::new() }
+            AgentControlMcpHandle::disabled()
         }
         Err(err) => return Err(err),
     };
@@ -10701,9 +10716,17 @@ pub(crate) fn startup_mcp_servers_for_settings(
 
     if settings.tyde_agent_control_mcp_enabled && !agent_control_mcp.url.is_empty() {
         servers.push(StartupMcpServer {
-            name: "tyde-agent-control".to_string(),
+            name: crate::agent_control_mcp::AGENT_CONTROL_MCP_SERVER_NAME.to_string(),
             transport: StartupMcpTransport::Http {
                 url: agent_control_mcp.url.clone(),
+                headers: HashMap::new(),
+                bearer_token_env_var: None,
+            },
+        });
+        servers.push(StartupMcpServer {
+            name: crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME.to_string(),
+            transport: StartupMcpTransport::Http {
+                url: agent_control_mcp.await_url.clone(),
                 headers: HashMap::new(),
                 bearer_token_env_var: None,
             },
@@ -13791,7 +13814,7 @@ mod tests {
             launch_profiles: Vec::new(),
         };
         let debug_mcp = DebugMcpHandle { url: String::new() };
-        let agent_control = AgentControlMcpHandle { url: String::new() };
+        let agent_control = AgentControlMcpHandle::disabled();
         let config_mcp = ConfigMcpHandle {
             url: "http://127.0.0.1:9/mcp".to_owned(),
         };

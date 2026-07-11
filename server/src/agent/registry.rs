@@ -16,6 +16,9 @@ use crate::agent::customization::ResolvedSpawnConfig;
 use crate::agent::{
     AgentActorRuntimeContext, AgentHandle, now_ms, spawn_agent_actor, spawn_relay_agent_actor,
 };
+use crate::agent_control_mcp::{
+    AGENT_CONTROL_AWAIT_MCP_SERVER_NAME, AGENT_CONTROL_MCP_SERVER_NAME, AgentControlMcpHandle,
+};
 use crate::backend::StartupMcpServer;
 use crate::backend::StartupMcpTransport;
 use crate::host::mcp_url_for_agent;
@@ -229,6 +232,7 @@ impl AgentRegistry {
     pub fn spawn(
         &mut self,
         mut request: ResolvedSpawnRequest,
+        agent_control_mcp: &AgentControlMcpHandle,
         session_store: Arc<Mutex<SessionStore>>,
         host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
         review_registry: ReviewRegistryHandle,
@@ -236,16 +240,32 @@ impl AgentRegistry {
     ) -> SpawnedAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
         for server in &mut request.startup_mcp_servers {
-            if server.name != "tyde-agent-control"
-                && server.name != REVIEW_FEEDBACK_MCP_SERVER_NAME
-                && server.name != WORKFLOW_PROGRESS_MCP_SERVER_NAME
-            {
+            if !matches!(
+                server.name.as_str(),
+                AGENT_CONTROL_MCP_SERVER_NAME
+                    | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
+                    | REVIEW_FEEDBACK_MCP_SERVER_NAME
+                    | WORKFLOW_PROGRESS_MCP_SERVER_NAME
+            ) {
                 continue;
             }
-            let StartupMcpTransport::Http { url, .. } = &mut server.transport else {
+            let StartupMcpTransport::Http { url, headers, .. } = &mut server.transport else {
                 panic!("Tyde injected MCP servers must use HTTP transport");
             };
-            *url = mcp_url_for_agent(url, &agent_id);
+            if matches!(
+                server.name.as_str(),
+                AGENT_CONTROL_MCP_SERVER_NAME | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
+            ) {
+                headers.insert(
+                    axum::http::header::AUTHORIZATION.as_str().to_owned(),
+                    agent_control_mcp.caller(&agent_id).authorization,
+                );
+            } else if matches!(
+                server.name.as_str(),
+                REVIEW_FEEDBACK_MCP_SERVER_NAME | WORKFLOW_PROGRESS_MCP_SERVER_NAME
+            ) {
+                *url = mcp_url_for_agent(url, &agent_id);
+            }
         }
         let start = AgentStartPayload {
             agent_id: agent_id.clone(),

@@ -55,7 +55,7 @@ Your value is coordination, clarity, sequencing, and quality control.
 
 Use whichever delegation tools are available to you:
 
-- Agent tools (tyde-agent-control MCP): `tyde_spawn_agent` starts a new agent
+- Agent tools (tyde-agent-control and tyde-agent-await MCPs): `tyde_spawn_agent` starts a new agent
   (choose `backend_kind`, `access_mode` of `read_only` or `unrestricted`, the
   workspace roots, and a scoped prompt), `tyde_await_agents` blocks until
   agents become idle, `tyde_read_agent` reads their output,
@@ -267,8 +267,8 @@ projects at once.
 - **MCP servers.** External tool servers agents can call. Users add their
   own in Settings → MCP Servers. The Default agent loads all configured MCP
   servers automatically. Tyde also has built-in ones: `tyde-debug` (drive a
-  dev instance), `tyde-agent-control` (spawn/await agents — what the
-  Orchestrator uses), and `tyde-config` (yours).
+  dev instance), `tyde-agent-control` (spawn/read agents), `tyde-agent-await`
+  (long-running agent waits), and `tyde-config` (yours).
 - **Task complexity tiers.** Optional Low/High spawn configurations per
   backend (model + reasoning effort) under Settings → Backends.
 - **Review.** Workspace-level code review of pending changes from the

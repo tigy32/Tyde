@@ -26,6 +26,7 @@ use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
 
 const MOCK_MODEL: &str = "mock";
 const FORCE_SPAWN_FAILURE_SENTINEL: &str = "__mock_fail_spawn__";
+const EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL: &str = "__mock_empty_agent_control_output__";
 const SPAWN_NATIVE_CHILD_SENTINEL: &str = "__mock_spawn_native_child__";
 /// Like `__mock_spawn_native_child__` but drops the emitter handle immediately
 /// after the turn completes, which closes the child's backend event stream.
@@ -114,12 +115,25 @@ fn mock_turn_token_usage() -> TokenUsage {
     }
 }
 
-fn agent_control_mcp_url(startup_mcp_servers: &[StartupMcpServer]) -> Option<String> {
+#[derive(Clone)]
+struct MockAgentControlAwaitMcp {
+    url: String,
+    authorization: Option<String>,
+}
+
+fn agent_control_await_mcp(
+    startup_mcp_servers: &[StartupMcpServer],
+) -> Option<MockAgentControlAwaitMcp> {
     startup_mcp_servers
         .iter()
-        .find(|server| server.name == "tyde-agent-control")
+        .find(|server| server.name == crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME)
         .and_then(|server| match &server.transport {
-            StartupMcpTransport::Http { url, .. } => Some(url.clone()),
+            StartupMcpTransport::Http { url, headers, .. } => Some(MockAgentControlAwaitMcp {
+                url: url.clone(),
+                authorization: headers
+                    .get(axum::http::header::AUTHORIZATION.as_str())
+                    .cloned(),
+            }),
             StartupMcpTransport::Stdio { .. } => None,
         })
 }
@@ -139,7 +153,7 @@ struct MockLoopConfig {
     initial_message: Option<String>,
     slow_initial_turn: bool,
     hold_initial_turn: bool,
-    agent_control_mcp_url: Option<String>,
+    agent_control_await_mcp: Option<MockAgentControlAwaitMcp>,
 }
 
 impl MockBackend {
@@ -162,7 +176,7 @@ impl Backend for MockBackend {
         if initial_message.contains(FORCE_SPAWN_FAILURE_SENTINEL) {
             return Err("mock backend forced spawn failure".to_string());
         }
-        let agent_control_mcp_url = agent_control_mcp_url(&config.startup_mcp_servers);
+        let agent_control_await_mcp = agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = config
             .startup_mcp_servers
             .iter()
@@ -223,7 +237,7 @@ impl Backend for MockBackend {
                 initial_message: Some(initial_message),
                 slow_initial_turn,
                 hold_initial_turn,
-                agent_control_mcp_url,
+                agent_control_await_mcp,
             },
         );
 
@@ -242,7 +256,7 @@ impl Backend for MockBackend {
         config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
-        let agent_control_mcp_url = agent_control_mcp_url(&config.startup_mcp_servers);
+        let agent_control_await_mcp = agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = config
             .startup_mcp_servers
             .iter()
@@ -312,7 +326,7 @@ impl Backend for MockBackend {
                 initial_message: None,
                 slow_initial_turn: false,
                 hold_initial_turn: false,
-                agent_control_mcp_url,
+                agent_control_await_mcp,
             },
         );
 
@@ -340,7 +354,7 @@ impl Backend for MockBackend {
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), BackendStartupError> {
         let initial_message = initial_input.message;
-        let agent_control_mcp_url = agent_control_mcp_url(&config.startup_mcp_servers);
+        let agent_control_await_mcp = agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = config
             .startup_mcp_servers
             .iter()
@@ -398,7 +412,7 @@ impl Backend for MockBackend {
                 initial_message: Some(initial_message),
                 slow_initial_turn: false,
                 hold_initial_turn: false,
-                agent_control_mcp_url,
+                agent_control_await_mcp,
             },
         );
 
@@ -461,7 +475,7 @@ fn start_mock_command_loop(
         initial_message,
         slow_initial_turn,
         hold_initial_turn,
-        agent_control_mcp_url,
+        agent_control_await_mcp,
     } = config;
     tokio::spawn(async move {
         let mut active_subagents = Vec::new();
@@ -485,7 +499,7 @@ fn start_mock_command_loop(
             } else if let Some(agent_ids) = parse_mock_agent_control_await(&initial_message) {
                 if !emit_mock_agent_control_await(
                     &events_tx,
-                    agent_control_mcp_url.as_deref(),
+                    agent_control_await_mcp.as_ref(),
                     agent_ids,
                 )
                 .await
@@ -573,7 +587,7 @@ fn start_mock_command_loop(
                     if let Some(agent_ids) = parse_mock_agent_control_await(&payload.message) {
                         if !emit_mock_agent_control_await(
                             &events_tx,
-                            agent_control_mcp_url.as_deref(),
+                            agent_control_await_mcp.as_ref(),
                             agent_ids,
                         )
                         .await
@@ -607,6 +621,10 @@ fn start_mock_command_loop(
                                 Duration::ZERO
                             },
                         });
+                    } else if payload.message.contains(MOCK_DIE_AFTER_BUSY_SENTINEL) {
+                        let _ = events_tx.send(ChatEvent::TypingStatusChanged(true));
+                        sleep(Duration::from_millis(MOCK_DIE_SLEEP_MS)).await;
+                        return;
                     } else if payload.message.contains(MOCK_ERROR_WITHOUT_IDLE_SENTINEL) {
                         emit_mock_error(&events_tx, "mock backend emitted error without idle");
                     } else if payload
@@ -794,6 +812,57 @@ async fn emit_turn(
             .is_ok();
     }
 
+    if user_message.contains(EMPTY_AGENT_CONTROL_OUTPUT_SENTINEL) {
+        if events_tx
+            .send(ChatEvent::MessageAdded(ChatMessage {
+                message_id: Some(protocol::ChatMessageId(Uuid::new_v4().to_string())),
+                timestamp: now_ms(),
+                sender: MessageSender::Assistant {
+                    agent: "mock".to_owned(),
+                },
+                content: String::new(),
+                reasoning: Some(protocol::ReasoningData {
+                    text: "hidden reasoning".to_owned(),
+                    tokens: None,
+                    signature: None,
+                    blob: None,
+                }),
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            }))
+            .is_err()
+        {
+            return false;
+        }
+        if events_tx
+            .send(ChatEvent::StreamEnd(StreamEndData {
+                message: ChatMessage {
+                    message_id: Some(protocol::ChatMessageId(Uuid::new_v4().to_string())),
+                    timestamp: now_ms(),
+                    sender: MessageSender::Assistant {
+                        agent: "mock".to_owned(),
+                    },
+                    content: String::new(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+            }))
+            .is_err()
+        {
+            return false;
+        }
+        return events_tx
+            .send(ChatEvent::TypingStatusChanged(false))
+            .is_ok();
+    }
+
     if user_message.trim() == MOCK_COMPACT_SENTINEL {
         if events_tx
             .send(ChatEvent::MessageAdded(ChatMessage {
@@ -949,7 +1018,7 @@ fn parse_mock_agent_control_await(message: &str) -> Option<Vec<String>> {
 
 async fn emit_mock_agent_control_await(
     events_tx: &mpsc::UnboundedSender<ChatEvent>,
-    agent_control_mcp_url: Option<&str>,
+    agent_control_await_mcp: Option<&MockAgentControlAwaitMcp>,
     agent_ids: Vec<String>,
 ) -> bool {
     let message_id = Some(Uuid::new_v4().to_string());
@@ -987,9 +1056,9 @@ async fn emit_mock_agent_control_await(
         return false;
     }
 
-    let result = match agent_control_mcp_url {
-        Some(url) => call_agent_control_await_mcp(url, &agent_ids).await,
-        None => Err("mock backend has no tyde-agent-control MCP server".to_owned()),
+    let result = match agent_control_await_mcp {
+        Some(config) => call_agent_control_await_mcp(config, &agent_ids).await,
+        None => Err("mock backend has no tyde-agent-await MCP server".to_owned()),
     };
     let (success, tool_result, error, response_text) = match result {
         Ok(body) => (
@@ -1062,9 +1131,12 @@ async fn emit_mock_agent_control_await(
         .is_ok()
 }
 
-async fn call_agent_control_await_mcp(url: &str, agent_ids: &[String]) -> Result<Value, String> {
+async fn call_agent_control_await_mcp(
+    config: &MockAgentControlAwaitMcp,
+    agent_ids: &[String],
+) -> Result<Value, String> {
     let response = post_mcp_json(
-        url,
+        config,
         &json!({
             "jsonrpc": "2.0",
             "id": "mock-agent-control-await",
@@ -1099,15 +1171,20 @@ async fn call_agent_control_await_mcp(url: &str, agent_ids: &[String]) -> Result
     serde_json::from_str(text).map_err(|err| format!("failed to parse MCP result JSON: {err}"))
 }
 
-async fn post_mcp_json(url: &str, body: &Value) -> Result<Value, String> {
-    let (addr, target) = parse_http_url(url)?;
+async fn post_mcp_json(config: &MockAgentControlAwaitMcp, body: &Value) -> Result<Value, String> {
+    let (addr, target) = parse_http_url(&config.url)?;
     let mut stream = TcpStream::connect(addr)
         .await
         .map_err(|err| format!("connect {addr} failed: {err}"))?;
     let body_bytes =
         serde_json::to_vec(body).map_err(|err| format!("serialize MCP request failed: {err}"))?;
+    let authorization = config
+        .authorization
+        .as_ref()
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "POST {target} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {target} HTTP/1.1\r\nHost: {addr}\r\n{authorization}Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body_bytes.len()
     );
     stream

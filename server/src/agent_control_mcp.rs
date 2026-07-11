@@ -1,14 +1,19 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{Json, Router, response::IntoResponse, routing::get};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use protocol::{
-    AgentControlOutput, AgentControlReadResult, AgentControlStatus, AgentErrorPayload, AgentId,
-    AgentInput, AgentOrigin, BackendAccessMode, BackendKind, ChatEvent, CustomAgentId, Envelope,
-    FrameKind, ImageData, LaunchProfileCatalog, LaunchProfileId, MessageSender, ProjectId,
-    SendMessagePayload, SessionSchemaEntry, SessionSettingsValues, SpawnAgentParams,
-    SpawnAgentPayload, SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload, TeamMemberId,
-    WorkflowSaveRequest, WorkflowSaveResponse, WorkflowTargetsResponse,
+    AGENT_CONTROL_DEFAULT_READ_LIMIT, AGENT_CONTROL_DEFAULT_READ_MAX_BYTES,
+    AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentControlReadDebugResult,
+    AgentControlReadResult, AgentControlStatus, AgentId, AgentInput, AgentOrigin,
+    BackendAccessMode, BackendKind, CustomAgentId, ImageData, LaunchProfileCatalog,
+    LaunchProfileId, ProjectId, SendMessagePayload, SessionSchemaEntry, SessionSettingsValues,
+    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload,
+    TeamMemberId, WorkflowSaveRequest, WorkflowSaveResponse, WorkflowTargetsResponse,
+    cap_agent_control_events,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -33,6 +38,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::Sha256;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -41,29 +47,133 @@ use crate::host::HostHandle;
 use crate::team_registry::team_preset_catalog;
 
 pub const AGENT_CONTROL_AGENT_ID_HEADER: &str = "x-tyde-agent-id";
+pub const AGENT_CONTROL_MCP_SERVER_NAME: &str = "tyde-agent-control";
+pub const AGENT_CONTROL_AWAIT_MCP_SERVER_NAME: &str = "tyde-agent-await";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
 const AWAIT_TOOL_PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
-const AGENT_CONTROL_SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
-const DEFAULT_READ_LIMIT: usize = 50;
-const MAX_READ_LIMIT: usize = 200;
-const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
-const MAX_READ_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AgentControlMcpHandle {
     pub url: String,
+    pub await_url: String,
+    credentials: AgentControlCredentialAuthority,
+}
+
+#[derive(Clone)]
+pub struct AgentControlMcpCaller {
+    pub url: String,
+    pub await_url: String,
+    pub authorization: String,
+}
+
+impl std::fmt::Debug for AgentControlMcpCaller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentControlMcpCaller")
+            .field("url", &self.url)
+            .field("await_url", &self.await_url)
+            .field("authorization", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+struct AgentControlCredentialAuthority {
+    secret: Arc<[u8; 32]>,
+}
+
+impl std::fmt::Debug for AgentControlCredentialAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentControlCredentialAuthority")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentControlCredentialAuthority {
+    fn new() -> Self {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut secret = [0_u8; 32];
+        secret[..16].copy_from_slice(first.as_bytes());
+        secret[16..].copy_from_slice(second.as_bytes());
+        Self {
+            secret: Arc::new(secret),
+        }
+    }
+
+    fn issue(&self, agent_id: &AgentId) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.as_ref())
+            .expect("HMAC-SHA256 accepts a 32-byte key");
+        mac.update(agent_id.0.as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("v1.{}.{signature}", agent_id.0)
+    }
+
+    fn verify(&self, token: &str) -> Result<AgentId, String> {
+        let mut parts = token.split('.');
+        let version = parts.next();
+        let agent_id = parts.next();
+        let signature = parts.next();
+        if version != Some("v1") || parts.next().is_some() {
+            return Err("invalid agent-control bearer credential".to_owned());
+        }
+        let agent_id =
+            agent_id.ok_or_else(|| "invalid agent-control bearer credential".to_owned())?;
+        let signature = signature
+            .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+            .ok_or_else(|| "invalid agent-control bearer credential".to_owned())?;
+        let agent_id = parse_agent_id(agent_id)
+            .map_err(|_| "invalid agent-control bearer credential".to_owned())?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.as_ref())
+            .expect("HMAC-SHA256 accepts a 32-byte key");
+        mac.update(agent_id.0.as_bytes());
+        mac.verify_slice(&signature)
+            .map_err(|_| "invalid agent-control bearer credential".to_owned())?;
+        Ok(agent_id)
+    }
+}
+
+impl AgentControlMcpHandle {
+    pub(crate) fn disabled() -> Self {
+        Self {
+            url: String::new(),
+            await_url: String::new(),
+            credentials: AgentControlCredentialAuthority::new(),
+        }
+    }
+
+    pub(crate) fn caller(&self, agent_id: &AgentId) -> AgentControlMcpCaller {
+        AgentControlMcpCaller {
+            url: self.url.clone(),
+            await_url: self.await_url.clone(),
+            authorization: format!("Bearer {}", self.credentials.issue(agent_id)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentControlMcpSurface {
+    Control,
+    Await,
 }
 
 #[derive(Clone)]
 struct TydeAgentControlMcpServer {
     host: HostHandle,
+    credentials: AgentControlCredentialAuthority,
+    surface: AgentControlMcpSurface,
     tool_router: ToolRouter<Self>,
 }
 
 impl TydeAgentControlMcpServer {
-    fn new(host: HostHandle) -> Self {
+    fn new(
+        host: HostHandle,
+        credentials: AgentControlCredentialAuthority,
+        surface: AgentControlMcpSurface,
+    ) -> Self {
         Self {
             host,
+            credentials,
+            surface,
             tool_router: Self::tool_router(),
         }
     }
@@ -252,16 +362,6 @@ impl AwaitProgressReporter {
 }
 
 #[derive(Debug, Serialize)]
-struct ReadAgentDebugResult {
-    agent_id: String,
-    events: Vec<Envelope>,
-    next_after_seq: Option<u64>,
-    max_bytes: usize,
-    omitted_events: usize,
-    omitted_event_bytes: usize,
-}
-
-#[derive(Debug, Serialize)]
 struct AgentOverview {
     agent_id: String,
     name: String,
@@ -339,40 +439,112 @@ fn err_json<T: Serialize>(value: T) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::error(vec![Content::json(value)?]))
 }
 
-fn request_agent_id_from_parts(
+fn claimed_agent_id_from_parts(
     parts: &axum::http::request::Parts,
 ) -> Result<Option<AgentId>, String> {
-    if let Some(agent_id) = parts
+    let header_agent_id = parts
         .headers
         .get(AGENT_CONTROL_AGENT_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return parse_agent_id(agent_id).map(Some);
-    }
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| "x-tyde-agent-id header must be UTF-8".to_owned())
+                .and_then(|value| parse_agent_id(value.trim()))
+        })
+        .transpose()?;
 
     let target = parts
         .uri
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or_else(|| parts.uri.path());
-    split_request_target(target).map(|(_, agent_id)| agent_id)
+    let (_, query_agent_id) = split_request_target(target)?;
+    match (header_agent_id, query_agent_id) {
+        (Some(header), Some(query)) if header != query => {
+            Err("x-tyde-agent-id header does not match agent_id query parameter".to_owned())
+        }
+        (Some(agent_id), _) | (_, Some(agent_id)) => Ok(Some(agent_id)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn authenticated_caller_from_parts(
+    credentials: &AgentControlCredentialAuthority,
+    parts: &axum::http::request::Parts,
+) -> Result<Option<AgentId>, String> {
+    let claimed_agent_id = claimed_agent_id_from_parts(parts)?;
+    let authorization = parts.headers.get(axum::http::header::AUTHORIZATION);
+    let Some(authorization) = authorization else {
+        if claimed_agent_id.is_some() {
+            return Err("agent identity requires an agent-control bearer credential".to_owned());
+        }
+        return Ok(None);
+    };
+    let authorization = authorization
+        .to_str()
+        .map_err(|_| "authorization header must be UTF-8".to_owned())?;
+    let token = authorization
+        .strip_prefix("Bearer ")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "authorization header must contain a Bearer credential".to_owned())?;
+    let authenticated_agent_id = credentials.verify(token.trim())?;
+    if claimed_agent_id
+        .as_ref()
+        .is_some_and(|claimed| claimed != &authenticated_agent_id)
+    {
+        return Err("agent identity header/query does not match bearer credential".to_owned());
+    }
+    Ok(Some(authenticated_agent_id))
+}
+
+async fn require_authenticated_caller(
+    server: &TydeAgentControlMcpServer,
+    parts: &axum::http::request::Parts,
+    tool_name: &'static str,
+) -> Result<AgentId, String> {
+    let caller = authenticated_caller_from_parts(&server.credentials, parts)?
+        .ok_or_else(|| format!("{tool_name} requires an agent-control bearer credential"))?;
+    if server.host.agent_handle(&caller).await.is_none() {
+        return Err("authenticated agent-control caller is not active".to_owned());
+    }
+    Ok(caller)
+}
+
+async fn authorize_direct_children(
+    host: &HostHandle,
+    caller: &AgentId,
+    targets: &[AgentId],
+) -> Result<(), String> {
+    let agents = host.list_agents().await;
+    for target in targets {
+        let authorized = agents.iter().any(|agent| {
+            agent.agent_id == *target && agent.parent_agent_id.as_ref() == Some(caller)
+        });
+        if !authorized {
+            return Err(format!(
+                "authorization: agent_id {} is not a direct child of caller {}",
+                target.0, caller.0
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[tool_router]
 impl TydeAgentControlMcpServer {
-    #[tool(description = "Spawn a Tyde agent and return immediately with its agent_id.")]
+    #[tool(
+        description = "Spawn a direct child of the authenticated caller and return immediately with its agent_id."
+    )]
     async fn tyde_spawn_agent(
         &self,
         Parameters(input): Parameters<SpawnAgentToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let request_agent_id = match request_agent_id_from_parts(&parts) {
-            Ok(agent_id) => agent_id,
-            Err(err) => return Ok(err_text(err)),
+        let caller = match require_authenticated_caller(self, &parts, "tyde_spawn_agent").await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
         };
-        match do_spawn_agent(&self.host, input.into(), request_agent_id).await {
+        match do_spawn_agent(&self.host, input.into(), Some(caller)).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
         }
@@ -390,17 +562,25 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Wait until any supplied Tyde agent becomes idle or failed. Returns statuses only; use tyde_read_agent to read output."
+        description = "Wait without a Tyde tool timer until any supplied direct child becomes idle or failed. Requires the calling agent's bearer credential and returns statuses only."
     )]
     async fn tyde_await_agents(
         &self,
         Parameters(input): Parameters<AwaitAgentsToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_await_agents").await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
         let agent_ids = match parse_agent_ids(input.agent_ids) {
             Ok(ids) => ids,
             Err(err) => return Ok(err_text(err)),
         };
+        if let Err(error) = authorize_direct_children(&self.host, &caller, &agent_ids).await {
+            return Ok(err_text(error));
+        }
         match do_await_agents(&self.host, agent_ids, context).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
@@ -408,16 +588,26 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Read only the latest assistant-visible message or agent error. Returns empty when the agent has no output record or its latest message has no visible text."
+        description = "Read only a direct child's server-owned latest assistant-visible message, error, or empty record. Never scans backward."
     )]
     async fn tyde_read_agent(
         &self,
         Parameters(input): Parameters<ReadAgentToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_read_agent").await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
         let agent_id = match parse_agent_id(&input.agent_id) {
             Ok(id) => id,
             Err(err) => return Ok(err_text(err)),
         };
+        if let Err(error) =
+            authorize_direct_children(&self.host, &caller, std::slice::from_ref(&agent_id)).await
+        {
+            return Ok(err_text(error));
+        }
         match do_read_agent(&self.host, &agent_id).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
@@ -425,16 +615,27 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Debug-only detailed incremental agent output events. Results are capped by limit and max_bytes; use next_after_seq for incremental reads."
+        description = "Debug-only detailed incremental output events for a direct child. Results are capped by limit and max_bytes."
     )]
     async fn tyde_read_agent_debug(
         &self,
         Parameters(input): Parameters<ReadAgentDebugToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_read_agent_debug").await
+        {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
         let agent_id = match parse_agent_id(&input.agent_id) {
             Ok(id) => id,
             Err(err) => return Ok(err_text(err)),
         };
+        if let Err(error) =
+            authorize_direct_children(&self.host, &caller, std::slice::from_ref(&agent_id)).await
+        {
+            return Ok(err_text(error));
+        }
         match do_read_agent_debug(
             &self.host,
             &agent_id,
@@ -449,24 +650,34 @@ impl TydeAgentControlMcpServer {
         }
     }
 
-    #[tool(description = "Send a follow-up message to an existing Tyde agent.")]
+    #[tool(description = "Send a follow-up message to a direct child of the authenticated caller.")]
     async fn tyde_send_agent_message(
         &self,
         Parameters(input): Parameters<SendAgentMessageToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let request_agent_id = match request_agent_id_from_parts(&parts) {
-            Ok(agent_id) => agent_id,
-            Err(err) => return Ok(err_text(err)),
-        };
+        let request_agent_id =
+            match require_authenticated_caller(self, &parts, "tyde_send_agent_message").await {
+                Ok(agent_id) => agent_id,
+                Err(err) => return Ok(err_text(err)),
+            };
         let agent_id = match parse_agent_id(&input.agent_id) {
             Ok(id) => id,
             Err(err) => return Ok(err_text(err)),
         };
+        if let Err(error) = authorize_direct_children(
+            &self.host,
+            &request_agent_id,
+            std::slice::from_ref(&agent_id),
+        )
+        .await
+        {
+            return Ok(err_text(error));
+        }
         if input.message.trim().is_empty() {
             return Ok(err_text("message must not be empty"));
         }
-        match do_send_message(&self.host, &agent_id, input.message, request_agent_id).await {
+        match do_send_message(&self.host, &agent_id, input.message, Some(request_agent_id)).await {
             Ok(()) => ok_json(json!({ "ok": true })),
             Err(err) => Ok(err_text(err)),
         }
@@ -480,15 +691,11 @@ impl TydeAgentControlMcpServer {
         Parameters(_input): Parameters<EmptyToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let request_agent_id = match request_agent_id_from_parts(&parts) {
-            Ok(Some(agent_id)) => agent_id,
-            Ok(None) => {
-                return Ok(err_text(
-                    "tyde_team_describe requires an injected caller agent_id",
-                ));
-            }
-            Err(err) => return Ok(err_text(err)),
-        };
+        let request_agent_id =
+            match require_authenticated_caller(self, &parts, "tyde_team_describe").await {
+                Ok(agent_id) => agent_id,
+                Err(err) => return Ok(err_text(err)),
+            };
         match do_team_describe(&self.host, request_agent_id).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
@@ -503,15 +710,11 @@ impl TydeAgentControlMcpServer {
         Parameters(input): Parameters<TeamMessageMemberToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let request_agent_id = match request_agent_id_from_parts(&parts) {
-            Ok(Some(agent_id)) => agent_id,
-            Ok(None) => {
-                return Ok(err_text(
-                    "tyde_team_message_member requires an injected caller agent_id",
-                ));
-            }
-            Err(err) => return Ok(err_text(err)),
-        };
+        let request_agent_id =
+            match require_authenticated_caller(self, &parts, "tyde_team_message_member").await {
+                Ok(agent_id) => agent_id,
+                Err(err) => return Ok(err_text(err)),
+            };
         if let Err(err) = reject_mutating_tool_for_read_only_caller(
             &self.host,
             Some(&request_agent_id),
@@ -541,7 +744,7 @@ impl TydeAgentControlMcpServer {
         Parameters(_input): Parameters<EmptyToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let request_agent_id = match request_agent_id_from_parts(&parts) {
+        let request_agent_id = match authenticated_caller_from_parts(&self.credentials, &parts) {
             Ok(agent_id) => agent_id,
             Err(err) => return Ok(err_text(err)),
         };
@@ -559,7 +762,7 @@ impl TydeAgentControlMcpServer {
         Parameters(input): Parameters<WorkflowSaveRequest>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let request_agent_id = match request_agent_id_from_parts(&parts) {
+        let request_agent_id = match authenticated_caller_from_parts(&self.credentials, &parts) {
             Ok(agent_id) => agent_id,
             Err(err) => return Ok(err_text(err)),
         };
@@ -584,15 +787,11 @@ impl TydeAgentControlMcpServer {
         Parameters(_input): Parameters<EmptyToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
-        let request_agent_id = match request_agent_id_from_parts(&parts) {
-            Ok(Some(agent_id)) => agent_id,
-            Ok(None) => {
-                return Ok(err_text(
-                    "tyde_list_agents requires an injected caller agent_id",
-                ));
-            }
-            Err(err) => return Ok(err_text(err)),
-        };
+        let request_agent_id =
+            match require_authenticated_caller(self, &parts, "tyde_list_agents").await {
+                Ok(agent_id) => agent_id,
+                Err(err) => return Ok(err_text(err)),
+            };
         match do_list_agents(&self.host, &request_agent_id).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
@@ -602,11 +801,16 @@ impl TydeAgentControlMcpServer {
 
 impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
+        let instructions = match self.surface {
+            AgentControlMcpSurface::Control => {
+                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server."
+            }
+            AgentControlMcpSurface::Await => {
+                "The dedicated long-running tyde_await_agents tool for direct child Tyde agents."
+            }
+        };
         ServerInfo {
-            instructions: Some(
-                "Tools for orchestrating Tyde2 coding agents. Discover server-owned Launch Profiles with tyde_list_launch_options, spawn agents with tyde_spawn_agent, wait for them with tyde_await_agents, send follow-ups with tyde_send_agent_message, read the latest visible output with tyde_read_agent, inspect incremental output events with tyde_read_agent_debug, use tyde_workflow_targets/tyde_workflow_save to author Tyde workflow files, and use tyde_team_describe/tyde_team_message_member when running as an agent-team member."
-                    .into(),
-            ),
+            instructions: Some(instructions.into()),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
         }
@@ -623,6 +827,10 @@ impl ServerHandler for TydeAgentControlMcpServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut tools = self.tool_router.list_all();
+        tools.retain(|tool| match self.surface {
+            AgentControlMcpSurface::Control => tool.name != "tyde_await_agents",
+            AgentControlMcpSurface::Await => tool.name == "tyde_await_agents",
+        });
         let tiers_enabled = self
             .host
             .read_settings()
@@ -654,6 +862,16 @@ impl ServerHandler for TydeAgentControlMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let allowed = match self.surface {
+            AgentControlMcpSurface::Control => request.name != "tyde_await_agents",
+            AgentControlMcpSurface::Await => request.name == "tyde_await_agents",
+        };
+        if !allowed {
+            return Ok(err_text(format!(
+                "tool {} is not available on this agent-control MCP endpoint",
+                request.name
+            )));
+        }
         let context = ToolCallContext::new(self, request, context);
         self.tool_router.call(context).await
     }
@@ -683,6 +901,8 @@ pub fn start_server(
     let local_addr = listener
         .local_addr()
         .map_err(|err| format!("failed to read agent-control MCP listener addr: {err}"))?;
+    let credentials = AgentControlCredentialAuthority::new();
+    let server_credentials = credentials.clone();
 
     std::thread::Builder::new()
         .name("tyde-agent-control-mcp".to_string())
@@ -694,21 +914,47 @@ pub fn start_server(
             runtime.block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(listener)
                     .expect("failed to create tokio agent-control MCP listener");
-                let mcp_service: StreamableHttpService<
+                let control_host = host_handle.clone();
+                let control_credentials = server_credentials.clone();
+                let control_service: StreamableHttpService<
                     TydeAgentControlMcpServer,
                     LocalSessionManager,
                 > = StreamableHttpService::new(
-                    move || Ok(TydeAgentControlMcpServer::new(host_handle.clone())),
+                    move || {
+                        Ok(TydeAgentControlMcpServer::new(
+                            control_host.clone(),
+                            control_credentials.clone(),
+                            AgentControlMcpSurface::Control,
+                        ))
+                    },
                     Default::default(),
                     StreamableHttpServerConfig {
                         stateful_mode: false,
-                        sse_keep_alive: Some(AGENT_CONTROL_SSE_KEEP_ALIVE),
+                        ..Default::default()
+                    },
+                );
+                let await_credentials = server_credentials.clone();
+                let await_service: StreamableHttpService<
+                    TydeAgentControlMcpServer,
+                    LocalSessionManager,
+                > = StreamableHttpService::new(
+                    move || {
+                        Ok(TydeAgentControlMcpServer::new(
+                            host_handle.clone(),
+                            await_credentials.clone(),
+                            AgentControlMcpSurface::Await,
+                        ))
+                    },
+                    Default::default(),
+                    StreamableHttpServerConfig {
+                        stateful_mode: false,
                         ..Default::default()
                     },
                 );
                 let router = Router::new()
                     .route("/healthz", get(healthz_handler))
-                    .nest_service("/mcp", mcp_service);
+                    .nest_service("/mcp", control_service)
+                    .nest_service("/await", await_service);
                 if let Err(err) = axum::serve(listener, router).await {
                     tracing::warn!("agent-control MCP HTTP server stopped: {err}");
                 }
@@ -718,6 +964,8 @@ pub fn start_server(
 
     Ok(AgentControlMcpHandle {
         url: format!("http://{local_addr}/mcp"),
+        await_url: format!("http://{local_addr}/await"),
+        credentials,
     })
 }
 
@@ -788,10 +1036,15 @@ async fn do_spawn_agent(
     let caller_agent_id = request_agent_id.clone();
     let parent_agent_id = match (request_agent_id, explicit_parent) {
         (Some(caller), Some(explicit)) if caller != explicit => {
-            return Err("parent_agent_id must match the injected caller agent_id".to_string());
+            return Err("parent_agent_id must match the authenticated caller".to_string());
         }
         (Some(caller), _) => Some(caller),
-        (None, explicit) => explicit,
+        (None, Some(_)) => {
+            return Err(
+                "parent_agent_id requires an authenticated agent-control caller".to_owned(),
+            );
+        }
+        (None, None) => None,
     };
     let requested_name = input.name.filter(|value| !value.trim().is_empty());
 
@@ -818,11 +1071,11 @@ async fn do_spawn_agent(
     let agent_id = host
         .spawn_agent_from_agent_control(payload, caller_agent_id.as_ref())
         .await?;
-    let status = host.agent_status_snapshot(&agent_id).await;
-    let agent_status = status
-        .as_ref()
-        .map(|s| s.status())
-        .unwrap_or(AgentControlStatus::Thinking);
+    let agent_status = host
+        .agent_status_snapshot(&agent_id)
+        .await
+        .ok_or_else(|| format!("spawned agent {} missing status snapshot", agent_id.0))?
+        .status();
     let name = host
         .list_agents()
         .await
@@ -1217,43 +1470,12 @@ async fn do_read_agent(
     let latest = handle
         .read_latest_output()
         .await
-        .ok_or_else(|| format!("agent {} is not available", agent_id.0))?;
+        .ok_or_else(|| format!("agent {} is not available", agent_id.0))??;
 
     Ok(AgentControlReadResult {
         agent_id: agent_id.clone(),
-        output: latest_agent_output(latest)?,
+        output: latest,
     })
-}
-
-fn latest_agent_output(latest: Option<Envelope>) -> Result<AgentControlOutput, String> {
-    let Some(latest) = latest else {
-        return Ok(AgentControlOutput::Empty);
-    };
-    match latest.kind {
-        FrameKind::AgentError => {
-            let error = latest
-                .parse_payload::<AgentErrorPayload>()
-                .map_err(|err| format!("invalid latest agent error: {err}"))?;
-            Ok(AgentControlOutput::Error { error })
-        }
-        FrameKind::ChatEvent => {
-            let event = latest
-                .parse_payload::<ChatEvent>()
-                .map_err(|err| format!("invalid latest agent output event: {err}"))?;
-            let ChatEvent::MessageAdded(message) = event else {
-                return Ok(AgentControlOutput::Empty);
-            };
-            if !matches!(message.sender, MessageSender::Assistant { .. })
-                || message.content.trim().is_empty()
-            {
-                return Ok(AgentControlOutput::Empty);
-            }
-            Ok(AgentControlOutput::Message {
-                text: message.content,
-            })
-        }
-        _ => Ok(AgentControlOutput::Empty),
-    }
 }
 
 async fn do_read_agent_debug(
@@ -1262,24 +1484,26 @@ async fn do_read_agent_debug(
     after_seq: Option<u64>,
     limit: Option<u32>,
     max_bytes: Option<u32>,
-) -> Result<ReadAgentDebugResult, String> {
+) -> Result<AgentControlReadDebugResult, String> {
     let limit = limit
         .map(|value| value as usize)
-        .unwrap_or(DEFAULT_READ_LIMIT);
+        .unwrap_or(AGENT_CONTROL_DEFAULT_READ_LIMIT);
     if limit == 0 {
         return Err("limit must be greater than zero".to_string());
     }
-    if limit > MAX_READ_LIMIT {
-        return Err(format!("limit must be <= {MAX_READ_LIMIT}"));
+    if limit > AGENT_CONTROL_MAX_READ_LIMIT {
+        return Err(format!("limit must be <= {AGENT_CONTROL_MAX_READ_LIMIT}"));
     }
     let max_bytes = max_bytes
         .map(|value| value as usize)
-        .unwrap_or(DEFAULT_READ_MAX_BYTES);
+        .unwrap_or(AGENT_CONTROL_DEFAULT_READ_MAX_BYTES);
     if max_bytes == 0 {
         return Err("max_bytes must be greater than zero".to_string());
     }
-    if max_bytes > MAX_READ_MAX_BYTES {
-        return Err(format!("max_bytes must be <= {MAX_READ_MAX_BYTES}"));
+    if max_bytes > AGENT_CONTROL_MAX_READ_MAX_BYTES {
+        return Err(format!(
+            "max_bytes must be <= {AGENT_CONTROL_MAX_READ_MAX_BYTES}"
+        ));
     }
 
     let handle = host
@@ -1290,56 +1514,17 @@ async fn do_read_agent_debug(
         .read_output(after_seq, limit)
         .await
         .ok_or_else(|| format!("agent {} is not available", agent_id.0))?;
-    let capped = cap_read_events(events, max_bytes, after_seq);
+    let capped = cap_agent_control_events(events, max_bytes, after_seq)
+        .map_err(|error| format!("failed to size agent output events: {error}"))?;
 
-    Ok(ReadAgentDebugResult {
-        agent_id: agent_id.0.clone(),
+    Ok(AgentControlReadDebugResult {
+        agent_id: agent_id.clone(),
         events: capped.events,
         next_after_seq: capped.next_after_seq,
         max_bytes,
         omitted_events: capped.omitted_events,
         omitted_event_bytes: capped.omitted_event_bytes,
     })
-}
-
-struct CappedReadEvents {
-    events: Vec<Envelope>,
-    next_after_seq: Option<u64>,
-    omitted_events: usize,
-    omitted_event_bytes: usize,
-}
-
-fn cap_read_events(
-    events: Vec<Envelope>,
-    max_bytes: usize,
-    after_seq: Option<u64>,
-) -> CappedReadEvents {
-    let mut kept = Vec::new();
-    let mut used_bytes = 0usize;
-    let mut omitted_events = 0usize;
-    let mut omitted_event_bytes = 0usize;
-    let mut next_after_seq = after_seq;
-
-    for event in events {
-        let event_bytes = serde_json::to_vec(&event)
-            .map(|bytes| bytes.len())
-            .unwrap_or(0);
-        next_after_seq = Some(event.seq);
-        if used_bytes.saturating_add(event_bytes) <= max_bytes {
-            used_bytes = used_bytes.saturating_add(event_bytes);
-            kept.push(event);
-        } else {
-            omitted_events = omitted_events.saturating_add(1);
-            omitted_event_bytes = omitted_event_bytes.saturating_add(event_bytes);
-        }
-    }
-
-    CappedReadEvents {
-        events: kept,
-        next_after_seq,
-        omitted_events,
-        omitted_event_bytes,
-    }
 }
 
 #[derive(Debug)]
@@ -1416,6 +1601,7 @@ fn split_request_target(target: &str) -> Result<(&str, Option<AgentId>), String>
 }
 
 fn parse_agent_id_from_query(query: &str) -> Result<Option<AgentId>, String> {
+    let mut parsed = None;
     for pair in query.split('&') {
         let Some((key, value)) = pair.split_once('=') else {
             continue;
@@ -1423,12 +1609,14 @@ fn parse_agent_id_from_query(query: &str) -> Result<Option<AgentId>, String> {
         if key != "agent_id" {
             continue;
         }
+        if parsed.is_some() {
+            return Err("agent_id query parameter must not be repeated".to_owned());
+        }
         let decoded = percent_decode_query_component(value)
             .ok_or_else(|| format!("invalid agent_id query parameter encoding: {value}"))?;
-        let agent_id = parse_agent_id(&decoded)?;
-        return Ok(Some(agent_id));
+        parsed = Some(parse_agent_id(&decoded)?);
     }
-    Ok(None)
+    Ok(parsed)
 }
 
 fn percent_decode_query_component(value: &str) -> Option<String> {
@@ -1465,7 +1653,10 @@ async fn healthz_handler() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{AgentErrorCode, ChatMessage, ReasoningData, StreamPath, ToolUseData};
+    use protocol::{
+        AgentControlOutput, AgentErrorCode, AgentErrorPayload, ChatEvent, ChatMessage, Envelope,
+        FrameKind, MessageSender, ReasoningData, StreamPath, ToolUseData,
+    };
     use serde_json::Value;
     use tokio::time::{sleep, timeout};
 
@@ -1518,6 +1709,28 @@ mod tests {
     }
 
     #[test]
+    fn caller_credentials_bind_signature_to_agent_id() {
+        let credentials = AgentControlCredentialAuthority::new();
+        let caller = AgentId("550e8400-e29b-41d4-a716-446655440000".to_owned());
+        let other = "550e8400-e29b-41d4-a716-446655440001";
+        let token = credentials.issue(&caller);
+        assert_eq!(
+            credentials.verify(&token).expect("valid credential"),
+            caller
+        );
+
+        let (_, _, signature) = token
+            .split_once('.')
+            .and_then(|(version, rest)| {
+                rest.rsplit_once('.')
+                    .map(|(agent_id, signature)| (version, agent_id, signature))
+            })
+            .expect("credential fields");
+        let spoofed = format!("v1.{other}.{signature}");
+        assert!(credentials.verify(&spoofed).is_err());
+    }
+
+    #[test]
     fn cap_read_events_advances_past_omitted_events() {
         let events = vec![
             Envelope::from_payload(
@@ -1536,7 +1749,8 @@ mod tests {
             .expect("large event"),
         ];
 
-        let capped = cap_read_events(events, 512, None);
+        let capped = cap_agent_control_events(events, 512, None)
+            .expect("typed envelopes should serialize for byte capping");
 
         assert_eq!(capped.events.len(), 1);
         assert_eq!(capped.events[0].seq, 1);
@@ -1583,11 +1797,12 @@ mod tests {
 
     #[test]
     fn latest_agent_output_returns_only_visible_message_text() {
-        let output = latest_agent_output(Some(output_envelope(
+        let output = protocol::agent_control_output_from_envelope(&output_envelope(
             1,
             &ChatEvent::MessageAdded(assistant_message("visible answer")),
-        )))
-        .expect("project latest output");
+        ))
+        .expect("project latest output")
+        .expect("assistant message is an output record");
 
         assert_eq!(
             output,
@@ -1603,16 +1818,14 @@ mod tests {
 
     #[test]
     fn latest_agent_output_preserves_empty_and_error_records() {
+        assert_eq!(AgentControlOutput::default(), AgentControlOutput::Empty);
         assert_eq!(
-            latest_agent_output(None).expect("empty output"),
-            AgentControlOutput::Empty
-        );
-        assert_eq!(
-            latest_agent_output(Some(output_envelope(
+            protocol::agent_control_output_from_envelope(&output_envelope(
                 2,
                 &ChatEvent::MessageAdded(assistant_message("")),
-            )))
-            .expect("empty latest message"),
+            ))
+            .expect("empty latest message")
+            .expect("empty assistant message is an output record"),
             AgentControlOutput::Empty
         );
 
@@ -1630,7 +1843,9 @@ mod tests {
         )
         .expect("error envelope");
         assert_eq!(
-            latest_agent_output(Some(envelope)).expect("error output"),
+            protocol::agent_control_output_from_envelope(&envelope)
+                .expect("error output")
+                .expect("agent error is an output record"),
             AgentControlOutput::Error { error }
         );
     }
@@ -1803,8 +2018,8 @@ mod tests {
             Some(AgentId(caller.agent_id)),
         )
         .await
-        .expect_err("injected caller must own parent assignment");
-        assert!(err.contains("must match the injected caller"));
+        .expect_err("authenticated caller must own parent assignment");
+        assert!(err.contains("must match the authenticated caller"));
     }
 
     #[tokio::test]

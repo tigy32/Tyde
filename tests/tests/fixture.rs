@@ -167,6 +167,14 @@ impl Fixture {
     }
 
     #[allow(dead_code)]
+    pub async fn agent_control_caller(&self, agent_id: &AgentId) -> server::AgentControlMcpCaller {
+        self.host
+            .agent_control_mcp_caller(agent_id)
+            .await
+            .expect("active agent should receive agent-control credentials")
+    }
+
+    #[allow(dead_code)]
     pub async fn review_mcp_http_url(&self) -> String {
         self.host.review_mcp_url().await
     }

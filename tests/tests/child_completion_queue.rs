@@ -217,7 +217,9 @@ async fn assert_no_parent_reentry(
 }
 
 fn mock_turn_text(prompt: &str) -> String {
-    format!("[startup_mcp_servers: tyde-agent-control(http)] mock backend response to: {prompt}")
+    format!(
+        "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] mock backend response to: {prompt}"
+    )
 }
 
 #[tokio::test]

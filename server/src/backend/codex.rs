@@ -17,6 +17,7 @@ use protocol::{
     TokenUsageUnavailableReason,
 };
 
+use crate::agent_control_mcp::AGENT_CONTROL_AWAIT_MCP_SERVER_NAME;
 use crate::backend::agent_control_progress::{
     await_progress_data_for_tool, is_tyde_agent_control_spawn_tool_name,
     spawn_progress_data_for_tool_result,
@@ -5006,7 +5007,10 @@ fn codex_mcp_elicitation_result(params: &Value) -> Value {
     if approval_kind == Some("mcp_tool_call")
         && matches!(
             server_name,
-            "tyde-debug" | "tyde-agent-control" | REVIEW_FEEDBACK_MCP_SERVER_NAME
+            "tyde-debug"
+                | "tyde-agent-control"
+                | AGENT_CONTROL_AWAIT_MCP_SERVER_NAME
+                | REVIEW_FEEDBACK_MCP_SERVER_NAME
         )
     {
         return json!({
@@ -5276,7 +5280,7 @@ fn toml_quoted(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
 }
 
-const CODEX_AGENT_CONTROL_TOOL_TIMEOUT_SECS: u64 = 315_576_000;
+const CODEX_AGENT_AWAIT_TOOL_TIMEOUT_SECS: u64 = 315_576_000;
 
 fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<String> {
     let mut overrides = Vec::new();
@@ -5287,11 +5291,11 @@ fn codex_mcp_config_overrides(startup_mcp_servers: &[StartupMcpServer]) -> Vec<S
             continue;
         }
         let base = format!("mcp_servers.{name}");
-        if name == "tyde-agent-control" {
+        if name == AGENT_CONTROL_AWAIT_MCP_SERVER_NAME {
             // Codex otherwise applies its 300-second default to a tool whose
             // contract is to wait until an agent changes state.
             overrides.push(format!(
-                "{base}.tool_timeout_sec={CODEX_AGENT_CONTROL_TOOL_TIMEOUT_SECS}"
+                "{base}.tool_timeout_sec={CODEX_AGENT_AWAIT_TOOL_TIMEOUT_SECS}"
             ));
         }
         match &server.transport {
@@ -8098,7 +8102,7 @@ for line in sys.stdin:
                     "item": {
                         "id": "await-call-1",
                         "type": "mcpToolCall",
-                        "tool": "mcp__tyde-agent-control__tyde_await_agents",
+                        "tool": "mcp__tyde-agent-await__tyde_await_agents",
                         "arguments": {
                             "agent_ids": ["agent-a", "agent-b"]
                         }
@@ -8112,7 +8116,7 @@ for line in sys.stdin:
                     "item": {
                         "id": "await-call-1",
                         "type": "mcpToolCall",
-                        "tool": "mcp__tyde-agent-control__tyde_await_agents",
+                        "tool": "mcp__tyde-agent-await__tyde_await_agents",
                         "status": "completed"
                     }
                 }
@@ -9523,6 +9527,7 @@ for line in sys.stdin:
                     workflow: None,
                     created_at_ms: new_agent.created_at_ms,
                 })],
+                latest_output: Default::default(),
             },
         )
         .expect("serialize AgentBootstrap");
@@ -12694,20 +12699,36 @@ Do not describe the tool, and do not skip the tool call."#;
     }
 
     #[test]
-    fn codex_agent_control_mcp_has_no_session_scale_tool_deadline() {
-        let overrides = codex_mcp_config_overrides(&[StartupMcpServer {
-            name: "tyde-agent-control".to_string(),
-            transport: StartupMcpTransport::Http {
-                url: "http://127.0.0.1:4012/mcp".to_string(),
-                headers: HashMap::new(),
-                bearer_token_env_var: None,
+    fn codex_only_await_mcp_has_session_scale_deadline() {
+        let servers = [
+            StartupMcpServer {
+                name: "tyde-agent-control".to_string(),
+                transport: StartupMcpTransport::Http {
+                    url: "http://127.0.0.1:4012/mcp".to_string(),
+                    headers: HashMap::new(),
+                    bearer_token_env_var: None,
+                },
             },
-        }]);
+            StartupMcpServer {
+                name: AGENT_CONTROL_AWAIT_MCP_SERVER_NAME.to_string(),
+                transport: StartupMcpTransport::Http {
+                    url: "http://127.0.0.1:4012/await".to_string(),
+                    headers: HashMap::new(),
+                    bearer_token_env_var: None,
+                },
+            },
+        ];
+        let overrides = codex_mcp_config_overrides(&servers);
 
+        assert!(
+            !overrides
+                .iter()
+                .any(|entry| entry.starts_with("mcp_servers.tyde-agent-control.tool_timeout_sec="))
+        );
         assert!(overrides.iter().any(|entry| {
             entry
                 == &format!(
-                    "mcp_servers.tyde-agent-control.tool_timeout_sec={CODEX_AGENT_CONTROL_TOOL_TIMEOUT_SECS}"
+                    "mcp_servers.{AGENT_CONTROL_AWAIT_MCP_SERVER_NAME}.tool_timeout_sec={CODEX_AGENT_AWAIT_TOOL_TIMEOUT_SECS}"
                 )
         }));
     }

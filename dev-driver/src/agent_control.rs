@@ -5,13 +5,16 @@ use std::time::Duration;
 
 use client::ClientConfig;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentControlOutput, AgentControlReadResult,
-    AgentControlStatus, AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
-    BackendAccessMode, BackendConfigSchemasPayload, BackendKind, ChatEvent, Envelope, FrameKind,
-    HostBootstrapPayload, HostSettings, HostSettingsPayload, LaunchProfileCatalog,
-    LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId, MessageSender,
-    NewAgentPayload, ProjectId, SendMessagePayload, SessionSchemaEntry, SessionSchemasPayload,
-    SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath,
+    AGENT_CONTROL_DEFAULT_READ_LIMIT, AGENT_CONTROL_DEFAULT_READ_MAX_BYTES,
+    AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentBootstrapEvent,
+    AgentBootstrapPayload, AgentControlLatestOutput, AgentControlReadDebugResult,
+    AgentControlReadResult, AgentControlStatus, AgentErrorPayload, AgentId, AgentRenamedPayload,
+    AgentStartPayload, BackendAccessMode, BackendConfigSchemasPayload, BackendKind, ChatEvent,
+    Envelope, FrameKind, HostBootstrapPayload, HostSettings, HostSettingsPayload,
+    LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId,
+    MessageSender, NewAgentPayload, ProjectId, SendMessagePayload, SessionSchemaEntry,
+    SessionSchemasPayload, SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload,
+    SpawnCostHint, StreamPath, cap_agent_control_events,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -23,10 +26,6 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-const DEFAULT_READ_LIMIT: usize = 100;
-const MAX_READ_LIMIT: usize = 1_000;
-const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
-const MAX_READ_MAX_BYTES: usize = 1024 * 1024;
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 const BOOTSTRAP_QUIET_PERIOD: Duration = Duration::from_millis(50);
 const COMMAND_BUFFER: usize = 32;
@@ -53,7 +52,7 @@ struct AgentState {
     last_error: Option<String>,
     activity_counter: u64,
     event_log: Vec<Envelope>,
-    latest_output: AgentControlOutput,
+    latest_output: AgentControlLatestOutput,
 }
 
 impl AgentState {
@@ -72,19 +71,6 @@ impl AgentState {
         } else {
             AgentControlStatus::Idle
         }
-    }
-}
-
-fn latest_output_from_message(message: &protocol::ChatMessage) -> Option<AgentControlOutput> {
-    if !matches!(message.sender, MessageSender::Assistant { .. }) {
-        return None;
-    }
-    if message.content.trim().is_empty() {
-        Some(AgentControlOutput::Empty)
-    } else {
-        Some(AgentControlOutput::Message {
-            text: message.content.clone(),
-        })
     }
 }
 
@@ -205,6 +191,7 @@ impl AgentControlTarget {
 pub struct AgentControlHandle {
     command_tx: mpsc::Sender<Command>,
     snapshot_rx: watch::Receiver<SnapshotState>,
+    enforce_direct_targets: bool,
 }
 
 impl AgentControlHandle {
@@ -225,10 +212,17 @@ impl AgentControlHandle {
                 })?,
         };
 
-        Self::from_connection(connection).await
+        Self::from_connection_with_scope(connection, true).await
     }
 
     pub async fn from_connection(connection: client::Connection) -> Result<Self, String> {
+        Self::from_connection_with_scope(connection, false).await
+    }
+
+    async fn from_connection_with_scope(
+        connection: client::Connection,
+        enforce_direct_targets: bool,
+    ) -> Result<Self, String> {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_BUFFER);
         let (snapshot_tx, snapshot_rx) = watch::channel(SnapshotState::default());
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -244,6 +238,7 @@ impl AgentControlHandle {
         Ok(Self {
             command_tx,
             snapshot_rx,
+            enforce_direct_targets,
         })
     }
 
@@ -264,6 +259,7 @@ impl AgentControlHandle {
     }
 
     pub async fn send_message(&self, agent_id: AgentId, message: String) -> Result<(), String> {
+        self.authorize_target(&agent_id)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(Command::SendMessage {
@@ -280,6 +276,7 @@ impl AgentControlHandle {
     }
 
     pub async fn interrupt(&self, agent_id: AgentId) -> Result<(), String> {
+        self.authorize_target(&agent_id)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(Command::Interrupt {
@@ -296,6 +293,14 @@ impl AgentControlHandle {
 
     fn snapshot(&self) -> SnapshotState {
         self.snapshot_rx.borrow().clone()
+    }
+
+    fn authorize_target(&self, agent_id: &AgentId) -> Result<(), String> {
+        if self.enforce_direct_targets {
+            ensure_direct_agent(&self.snapshot(), agent_id)
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn list_agents(&self) -> Vec<AgentOverview> {
@@ -317,13 +322,16 @@ impl AgentControlHandle {
 
     pub async fn read_agent(&self, agent_id: AgentId) -> Result<AgentControlReadResult, String> {
         let snapshot = self.snapshot();
+        if self.enforce_direct_targets {
+            ensure_direct_agent(&snapshot, &agent_id)?;
+        }
         let agent = snapshot
             .agents
             .get(&agent_id)
             .ok_or_else(|| format!("unknown agent_id {}", agent_id.0))?;
         Ok(AgentControlReadResult {
             agent_id,
-            output: agent.latest_output.clone(),
+            output: agent.latest_output.output().clone(),
         })
     }
 
@@ -333,27 +341,32 @@ impl AgentControlHandle {
         after_seq: Option<u64>,
         limit: Option<u32>,
         max_bytes: Option<u32>,
-    ) -> Result<ReadAgentDebugResult, String> {
+    ) -> Result<AgentControlReadDebugResult, String> {
         let limit = limit
             .map(|value| value as usize)
-            .unwrap_or(DEFAULT_READ_LIMIT);
+            .unwrap_or(AGENT_CONTROL_DEFAULT_READ_LIMIT);
         if limit == 0 {
             return Err("limit must be greater than zero".to_string());
         }
-        if limit > MAX_READ_LIMIT {
-            return Err(format!("limit must be <= {MAX_READ_LIMIT}"));
+        if limit > AGENT_CONTROL_MAX_READ_LIMIT {
+            return Err(format!("limit must be <= {AGENT_CONTROL_MAX_READ_LIMIT}"));
         }
         let max_bytes = max_bytes
             .map(|value| value as usize)
-            .unwrap_or(DEFAULT_READ_MAX_BYTES);
+            .unwrap_or(AGENT_CONTROL_DEFAULT_READ_MAX_BYTES);
         if max_bytes == 0 {
             return Err("max_bytes must be greater than zero".to_string());
         }
-        if max_bytes > MAX_READ_MAX_BYTES {
-            return Err(format!("max_bytes must be <= {MAX_READ_MAX_BYTES}"));
+        if max_bytes > AGENT_CONTROL_MAX_READ_MAX_BYTES {
+            return Err(format!(
+                "max_bytes must be <= {AGENT_CONTROL_MAX_READ_MAX_BYTES}"
+            ));
         }
 
         let snapshot = self.snapshot();
+        if self.enforce_direct_targets {
+            ensure_direct_agent(&snapshot, &agent_id)?;
+        }
         let agent = snapshot
             .agents
             .get(&agent_id)
@@ -365,10 +378,11 @@ impl AgentControlHandle {
             .take(limit)
             .cloned()
             .collect::<Vec<_>>();
-        let capped = cap_read_events(events, max_bytes, after_seq);
+        let capped = cap_agent_control_events(events, max_bytes, after_seq)
+            .map_err(|error| format!("failed to size agent output events: {error}"))?;
 
-        Ok(ReadAgentDebugResult {
-            agent_id: agent_id.0,
+        Ok(AgentControlReadDebugResult {
+            agent_id,
             events: capped.events,
             next_after_seq: capped.next_after_seq,
             max_bytes,
@@ -390,6 +404,11 @@ impl AgentControlHandle {
         loop {
             let snapshot = snapshot_rx.borrow().clone();
             let watched_ids = resolve_watched_ids(&snapshot, requested_ids.as_deref())?;
+            if self.enforce_direct_targets {
+                for agent_id in &watched_ids {
+                    ensure_direct_agent(&snapshot, agent_id)?;
+                }
+            }
             let ready = ready_agents_from_snapshot(&snapshot, &watched_ids);
             let still_thinking = still_thinking_agents_from_snapshot(&snapshot, &watched_ids);
 
@@ -453,56 +472,6 @@ pub struct ListLaunchOptionsResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ReadAgentDebugResult {
-    pub agent_id: String,
-    pub events: Vec<Envelope>,
-    pub next_after_seq: Option<u64>,
-    pub max_bytes: usize,
-    pub omitted_events: usize,
-    pub omitted_event_bytes: usize,
-}
-
-struct CappedReadEvents {
-    events: Vec<Envelope>,
-    next_after_seq: Option<u64>,
-    omitted_events: usize,
-    omitted_event_bytes: usize,
-}
-
-fn cap_read_events(
-    events: Vec<Envelope>,
-    max_bytes: usize,
-    after_seq: Option<u64>,
-) -> CappedReadEvents {
-    let mut kept = Vec::new();
-    let mut used_bytes = 0usize;
-    let mut omitted_events = 0usize;
-    let mut omitted_event_bytes = 0usize;
-    let mut next_after_seq = after_seq;
-
-    for event in events {
-        let event_bytes = serde_json::to_vec(&event)
-            .map(|bytes| bytes.len())
-            .unwrap_or(0);
-        next_after_seq = Some(event.seq);
-        if used_bytes.saturating_add(event_bytes) <= max_bytes {
-            used_bytes = used_bytes.saturating_add(event_bytes);
-            kept.push(event);
-        } else {
-            omitted_events = omitted_events.saturating_add(1);
-            omitted_event_bytes = omitted_event_bytes.saturating_add(event_bytes);
-        }
-    }
-
-    CappedReadEvents {
-        events: kept,
-        next_after_seq,
-        omitted_events,
-        omitted_event_bytes,
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct AgentOverview {
     pub agent_id: String,
     pub name: String,
@@ -545,6 +514,17 @@ fn direct_agent_overviews(snapshot: &SnapshotState) -> Vec<AgentOverview> {
     agents
 }
 
+fn ensure_direct_agent(snapshot: &SnapshotState, agent_id: &AgentId) -> Result<(), String> {
+    if snapshot.direct_agent_ids.contains(agent_id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "authorization: agent_id {} was not created by this agent-control runtime",
+            agent_id.0
+        ))
+    }
+}
+
 fn resolve_watched_ids(
     snapshot: &SnapshotState,
     requested_ids: Option<&[AgentId]>,
@@ -561,7 +541,9 @@ fn resolve_watched_ids(
         None => Ok(snapshot
             .agents
             .values()
-            .filter(|agent| agent.is_active())
+            .filter(|agent| {
+                agent.is_active() && snapshot.direct_agent_ids.contains(&agent.agent_id)
+            })
             .map(|agent| agent.agent_id.clone())
             .collect()),
     }
@@ -713,12 +695,18 @@ async fn run_runtime(
                                         .snapshot
                                         .direct_agent_ids
                                         .insert(payload.agent_id.clone());
-                                    let agent_status = state
+                                    let Some(agent_status) = state
                                         .snapshot
                                         .agents
                                         .get(&payload.agent_id)
-                                        .map(|agent| agent.status())
-                                        .unwrap_or(AgentControlStatus::Thinking);
+                                        .map(AgentState::status)
+                                    else {
+                                        let _ = pending.reply.send(Err(format!(
+                                            "announced agent {} missing from runtime snapshot",
+                                            payload.agent_id.0
+                                        )));
+                                        continue;
+                                    };
                                     let _ = pending.reply.send(Ok(SpawnAgentResult {
                                         agent_id: payload.agent_id.0.clone(),
                                         name: payload.name,
@@ -824,7 +812,7 @@ fn apply_new_agent_payload(snapshot: &mut SnapshotState, payload: NewAgentPayloa
             last_error: None,
             activity_counter: activity,
             event_log: Vec::new(),
-            latest_output: AgentControlOutput::Empty,
+            latest_output: AgentControlLatestOutput::default(),
         },
     );
 }
@@ -903,9 +891,22 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
             let payload: AgentBootstrapPayload = envelope
                 .parse_payload()
                 .expect("validated AgentBootstrap payload should parse");
+            let latest_output = payload.latest_output;
             for event in payload.events {
                 apply_agent_bootstrap_event(snapshot, &envelope.stream, event);
             }
+            let agent_id = parse_agent_id_from_stream(&envelope.stream);
+            snapshot
+                .agents
+                .get_mut(&agent_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "agent bootstrap arrived for unknown agent stream {}",
+                        envelope.stream.0
+                    )
+                })
+                .latest_output
+                .replace_from_bootstrap(latest_output);
         }
         FrameKind::AgentStart => {
             let payload: AgentStartPayload = envelope
@@ -934,14 +935,10 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
             });
             agent.activity_counter = agent.activity_counter.saturating_add(1);
             agent.event_log.push(envelope.clone());
-            let latest_output = match &payload {
-                ChatEvent::MessageAdded(message) => latest_output_from_message(message),
-                ChatEvent::StreamEnd(data) => latest_output_from_message(&data.message),
-                _ => None,
-            };
-            if let Some(latest_output) = latest_output {
-                agent.latest_output = latest_output;
-            }
+            agent
+                .latest_output
+                .observe_envelope(envelope)
+                .expect("validated chat event must project latest output");
             match payload {
                 ChatEvent::TypingStatusChanged(typing) => {
                     agent.is_thinking = typing;
@@ -1017,9 +1014,10 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 });
             agent.activity_counter = agent.activity_counter.saturating_add(1);
             agent.event_log.push(envelope.clone());
-            agent.latest_output = AgentControlOutput::Error {
-                error: payload.clone(),
-            };
+            agent
+                .latest_output
+                .observe_envelope(envelope)
+                .expect("validated agent error must project latest output");
             agent.last_error = Some(payload.message.clone());
             if payload.fatal || payload.message == "agent not running" {
                 agent.is_thinking = false;
@@ -1872,6 +1870,8 @@ pub async fn run_stdio_server(target: AgentControlTarget) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
+    use protocol::AgentControlOutput;
+
     use super::*;
 
     async fn connect_runtime(host: server::HostHandle) -> AgentControlHandle {
@@ -2023,7 +2023,7 @@ mod tests {
     }
 
     fn assert_replayed_completed_message_without_stream_end(
-        read: &ReadAgentDebugResult,
+        read: &AgentControlReadDebugResult,
         expected_text: &str,
     ) {
         let mut saw_message_added = false;
@@ -2189,7 +2189,7 @@ mod tests {
             last_error: None,
             activity_counter: 0,
             event_log: Vec::new(),
-            latest_output: AgentControlOutput::Empty,
+            latest_output: AgentControlLatestOutput::default(),
         }
     }
 
@@ -2241,16 +2241,16 @@ mod tests {
             &assistant_output_envelope(&agent_id, 1, "visible answer"),
         );
         assert_eq!(
-            snapshot.agents[&agent_id].latest_output,
-            AgentControlOutput::Message {
+            snapshot.agents[&agent_id].latest_output.output(),
+            &AgentControlOutput::Message {
                 text: "visible answer".to_owned()
             }
         );
 
         apply_envelope(&mut snapshot, &assistant_output_envelope(&agent_id, 2, ""));
         assert_eq!(
-            snapshot.agents[&agent_id].latest_output,
-            AgentControlOutput::Empty
+            snapshot.agents[&agent_id].latest_output.output(),
+            &AgentControlOutput::Empty
         );
 
         let error = AgentErrorPayload {
@@ -2271,8 +2271,62 @@ mod tests {
         .expect("agent error envelope");
         apply_envelope(&mut snapshot, &error_envelope);
         assert_eq!(
-            snapshot.agents[&agent_id].latest_output,
-            AgentControlOutput::Error { error }
+            snapshot.agents[&agent_id].latest_output.output(),
+            &AgentControlOutput::Error { error }
+        );
+    }
+
+    #[test]
+    fn bootstrap_latest_error_wins_over_older_replayed_message() {
+        let agent_id = AgentId("550e8400-e29b-41d4-a716-446655440000".to_owned());
+        let mut snapshot = SnapshotState::default();
+        snapshot
+            .agents
+            .insert(agent_id.clone(), test_agent_state(agent_id.clone()));
+        let error = AgentErrorPayload {
+            agent_id: agent_id.clone(),
+            code: protocol::AgentErrorCode::BackendFailed,
+            message: "newer failure".to_owned(),
+            fatal: true,
+        };
+        let payload = AgentBootstrapPayload {
+            events: vec![
+                AgentBootstrapEvent::AgentError(error.clone()),
+                AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(protocol::ChatMessage {
+                    message_id: None,
+                    timestamp: 1,
+                    sender: MessageSender::Assistant {
+                        agent: "worker".to_owned(),
+                    },
+                    content: "older answer".to_owned(),
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                })),
+            ],
+            latest_output: AgentControlOutput::Error {
+                error: error.clone(),
+            },
+        };
+        let envelope = Envelope::from_payload(
+            StreamPath(format!(
+                "/agent/{}/550e8400-e29b-41d4-a716-446655440001",
+                agent_id.0
+            )),
+            FrameKind::AgentBootstrap,
+            0,
+            &payload,
+        )
+        .expect("agent bootstrap envelope");
+
+        apply_envelope(&mut snapshot, &envelope);
+
+        assert_eq!(
+            snapshot.agents[&agent_id].latest_output.output(),
+            &AgentControlOutput::Error { error }
         );
     }
 
@@ -2295,7 +2349,8 @@ mod tests {
             .expect("large event"),
         ];
 
-        let capped = cap_read_events(events, 512, None);
+        let capped = cap_agent_control_events(events, 512, None)
+            .expect("typed envelopes should serialize for byte capping");
         assert_eq!(capped.events.len(), 1);
         assert_eq!(capped.next_after_seq, Some(2));
         assert_eq!(capped.omitted_events, 1);
@@ -2358,7 +2413,7 @@ mod tests {
                 .expect("latest output should be readable")
                 .output,
             AgentControlOutput::Message {
-                text: "[startup_mcp_servers: tyde-agent-control(http)] mock backend response to: hello"
+                text: "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] mock backend response to: hello"
                     .to_owned()
             }
         );

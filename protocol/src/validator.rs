@@ -1958,6 +1958,7 @@ mod tests {
             0,
             &AgentBootstrapPayload {
                 events: vec![AgentBootstrapEvent::AgentStart(agent_start_payload())],
+                latest_output: Default::default(),
             },
         )
         .expect("serialize AgentBootstrap")

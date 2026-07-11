@@ -2561,7 +2561,15 @@ mod tests {
                 },
             )));
 
-            apply_agent_bootstrap(&state, &host, &stream, AgentBootstrapPayload { events });
+            apply_agent_bootstrap(
+                &state,
+                &host,
+                &stream,
+                AgentBootstrapPayload {
+                    events,
+                    latest_output: Default::default(),
+                },
+            );
 
             assert!(
                 state
@@ -2647,7 +2655,10 @@ mod wasm_tests {
     /// then rewind the per-stream seq counter so the test's first
     /// envelope on that stream can use seq 0.
     fn prime_agent_stream(state: &AppState, host: &LocalHostId, stream: &StreamPath) {
-        let bootstrap = protocol::AgentBootstrapPayload { events: Vec::new() };
+        let bootstrap = protocol::AgentBootstrapPayload {
+            events: Vec::new(),
+            latest_output: Default::default(),
+        };
         let env = Envelope::from_payload(stream.clone(), FrameKind::AgentBootstrap, 0, &bootstrap)
             .expect("synthetic AgentBootstrap");
         dispatch_envelope(state, host, env);
@@ -3465,6 +3476,7 @@ mod wasm_tests {
                 protocol::AgentBootstrapEvent::AgentStart(agent_start),
                 protocol::AgentBootstrapEvent::ChatEvent(chat_event),
             ],
+            latest_output: Default::default(),
         };
         dispatch_envelope(
             &state,

@@ -266,6 +266,7 @@ pub fn prime_agent_stream_for_tests(
         0,
         &BootstrapPayload {
             events: vec![BootstrapEvent::AgentStart(agent_payload.clone())],
+            latest_output: Default::default(),
         },
     )
     .expect("synthetic AgentBootstrap");
@@ -5661,7 +5662,15 @@ mod tests {
                 },
             )));
 
-            apply_agent_bootstrap(&state, host_id, &stream, AgentBootstrapPayload { events });
+            apply_agent_bootstrap(
+                &state,
+                host_id,
+                &stream,
+                AgentBootstrapPayload {
+                    events,
+                    latest_output: Default::default(),
+                },
+            );
 
             assert!(
                 state

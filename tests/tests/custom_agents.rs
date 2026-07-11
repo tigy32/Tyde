@@ -942,7 +942,7 @@ async fn spawn_with_custom_agent_resolves_expected_configuration() {
     assert_eq!(agent_start.custom_agent_id, Some(custom_agent.id.clone()));
 
     let text = expect_turn_text(&mut fixture.client, "customized turn").await;
-    assert!(text.contains("[startup_mcp_servers: tyde-agent-control(http), docs-server(stdio)]"));
+    assert!(text.contains("[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http), docs-server(stdio)]"));
     assert!(text.contains("[instructions: reviewer instructions]"));
     assert!(text.contains("[skills: lint=Run cargo test -q before reporting completion.]"));
     assert!(text.contains("[steering: project steering body\\n\\nhost steering body]"));
@@ -1012,7 +1012,7 @@ async fn default_agent_resolves_all_current_skills_and_mcp_servers() {
     assert_eq!(agent_start.custom_agent_id, None);
 
     let text = expect_turn_text(&mut fixture.client, "default turn").await;
-    assert!(text.contains("[startup_mcp_servers: tyde-agent-control(http), docs-server(stdio)]"));
+    assert!(text.contains("[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http), docs-server(stdio)]"));
     assert!(text.contains("lint=Run cargo test -q before reporting completion."));
     assert!(text.contains("qa=Check the visible UI state before reporting completion."));
 }
