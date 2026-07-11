@@ -6,7 +6,7 @@
 #   - uses locally installed Chrome when available, otherwise downloads
 #     Chrome for Testing (cached under target/wasm-test-cache/),
 #   - downloads a chromedriver that matches Chrome,
-#   - ad-hoc re-signs it on macOS so Gatekeeper doesn't kill it,
+#   - ad-hoc re-signs a newly downloaded driver during preparation on macOS,
 #   - installs wasm-bindgen-cli at the version pinned in Cargo.lock,
 #   - sets CHROMEDRIVER and runs `cargo test --target wasm32-unknown-unknown`
 #     in `frontend/`, passing any extra args through.
@@ -57,6 +57,97 @@ die() { log "error: $*"; exit 1; }
     die "CHROMEDRIVER is not executable: $CHROMEDRIVER"
 [[ -z "${WASM_BINDGEN_TEST_RUNNER:-}" || -x "$WASM_BINDGEN_TEST_RUNNER" ]] ||
     die "WASM_BINDGEN_TEST_RUNNER is not executable: $WASM_BINDGEN_TEST_RUNNER"
+if [[ -n "${WASM_BINDGEN_TEST_RUNNER:-}" &&
+    "$(basename "$WASM_BINDGEN_TEST_RUNNER")" != "wasm-bindgen-test-runner" ]]; then
+    die "WASM_BINDGEN_TEST_RUNNER must be named wasm-bindgen-test-runner so Cargo runs the fingerprinted executable"
+fi
+
+sha256_file() {
+    python3 - "$1" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as source:
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+validate_prepared_identity() {
+    local identity="$1"
+    local stored_chrome stored_chrome_version stored_driver stored_driver_version
+    local stored_runner stored_runner_version stored_required current_version raw_version
+    local current_driver_number
+    local webdriver_source webdriver_identity required
+
+    stored_chrome="$(sed -n 's/^wasm.chrome.path=//p' "$identity")"
+    stored_chrome_version="$(sed -n 's/^wasm.chrome.version=//p' "$identity")"
+    stored_driver="$(sed -n 's/^wasm.chromedriver.path=//p' "$identity")"
+    stored_driver_version="$(sed -n 's/^wasm.chromedriver.version=//p' "$identity")"
+    stored_runner="$(sed -n 's/^wasm.bindgen.path=//p' "$identity")"
+    stored_runner_version="$(sed -n 's/^wasm.bindgen.version=//p' "$identity")"
+    stored_required="$(sed -n 's/^wasm.bindgen.required=//p' "$identity")"
+    [[ -n "$stored_chrome_version" ]] ||
+        die "prepared identity has no Chrome version: $identity"
+    [[ -n "$stored_driver_version" ]] ||
+        die "prepared identity has no chromedriver version: $identity"
+    [[ -n "$stored_runner_version" ]] ||
+        die "prepared identity has no wasm runner version: $identity"
+    [[ -n "$stored_required" ]] ||
+        die "prepared identity has no required wasm-bindgen version: $identity"
+    [[ -x "$stored_chrome" ]] ||
+        die "prepared identity Chrome is missing or not executable: $stored_chrome"
+    [[ -x "$stored_driver" ]] ||
+        die "prepared identity chromedriver is missing or not executable: $stored_driver"
+    [[ -x "$stored_runner" ]] ||
+        die "prepared identity wasm runner is missing or not executable: $stored_runner"
+    [[ "$(basename "$stored_runner")" == "wasm-bindgen-test-runner" ]] ||
+        die "prepared identity wasm runner has the wrong basename: $stored_runner"
+    [[ -z "${CHROMEDRIVER:-}" || "$CHROMEDRIVER" == "$stored_driver" ]] ||
+        die "explicit CHROMEDRIVER does not match prepared identity: $stored_driver"
+    [[ -z "${WASM_BINDGEN_TEST_RUNNER:-}" ||
+        "$WASM_BINDGEN_TEST_RUNNER" == "$stored_runner" ]] ||
+        die "explicit WASM_BINDGEN_TEST_RUNNER does not match prepared identity: $stored_runner"
+
+    raw_version="$("$stored_chrome" --version 2>/dev/null || true)"
+    current_version="$(printf '%s' "$raw_version" \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    [[ "$current_version" == "$stored_chrome_version" ]] ||
+        die "prepared identity Chrome changed from $stored_chrome_version to ${current_version:-unreadable}"
+    raw_version="$("$stored_driver" --version 2>/dev/null || true)"
+    current_version="$(printf '%s\n' "$raw_version" | head -n1)"
+    [[ "$current_version" == "$stored_driver_version" ]] ||
+        die "prepared identity chromedriver changed from $stored_driver_version to ${current_version:-unreadable}"
+    current_driver_number="$(printf '%s' "$current_version" \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    [[ -n "$current_driver_number" ]] ||
+        die "prepared identity chromedriver version is invalid: $current_version"
+    [[ "${stored_chrome_version%%.*}" == "${current_driver_number%%.*}" ]] ||
+        die "prepared identity Chrome and chromedriver have different major versions"
+    raw_version="$("$stored_runner" --version 2>/dev/null || true)"
+    current_version="$(printf '%s\n' "$raw_version" | awk '{print $NF}')"
+    [[ "$current_version" == "$stored_runner_version" ]] ||
+        die "prepared identity wasm runner changed from $stored_runner_version to ${current_version:-unreadable}"
+    required="$(awk '/^name = "wasm-bindgen"$/ { getline; sub(/version = "/, ""); sub(/"$/, ""); print; exit }' \
+        "$repo_root/Cargo.lock")"
+    [[ "$required" == "$stored_required" ]] ||
+        die "prepared identity requires wasm-bindgen $stored_required but Cargo.lock requires $required"
+
+    webdriver_source="$(sed -n 's/^wasm.webdriver.source=//p' "$identity")"
+    webdriver_identity="$(sed -n 's/^wasm.webdriver.identity=sha256://p' "$identity")"
+    [[ -n "$webdriver_source" ]] ||
+        die "prepared identity has no webdriver source: $identity"
+    if [[ -n "$webdriver_source" && "$webdriver_source" != "default" ]]; then
+        [[ -f "$webdriver_source" ]] ||
+            die "prepared identity webdriver config is missing: $webdriver_source"
+        [[ -n "$webdriver_identity" ]] ||
+            die "prepared identity webdriver config has no SHA-256 identity"
+        [[ "$(sha256_file "$webdriver_source")" == "$webdriver_identity" ]] ||
+            die "prepared identity webdriver config changed: $webdriver_source"
+    fi
+}
 
 refresh_cft_metadata() {
     mkdir -p "$cache_dir"
@@ -264,8 +355,8 @@ print_identity() {
         [[ -f "$webdriver_source_json" ]] ||
             die "WASM_BINDGEN_TEST_WEBDRIVER_JSON does not exist: $webdriver_source_json"
         printf 'wasm.webdriver.source=%s\n' "$webdriver_source_json"
-        printf 'wasm.webdriver.identity=%s\n' \
-            "$(cksum "$webdriver_source_json" | awk '{ print $1 ":" $2 }')"
+        printf 'wasm.webdriver.identity=sha256:%s\n' \
+            "$(sha256_file "$webdriver_source_json")"
     else
         printf 'wasm.webdriver.source=default\n'
     fi
@@ -306,6 +397,7 @@ fi
 if [[ ! -x "$chrome_bin" ]]; then
     if [[ "$mode" == "identity" ]]; then
         if [[ -s "$prepared_identity" ]]; then
+            validate_prepared_identity "$prepared_identity"
             cat "$prepared_identity"
             exit 0
         fi
@@ -358,6 +450,7 @@ fi
 # Cache by major version. Chrome auto-updates within a major; chromedriver is
 # only required to match the major number per Chrome for Testing's policy.
 driver_source=""
+downloaded_driver=0
 if [[ -n "${CHROMEDRIVER:-}" ]]; then
     [[ -x "$CHROMEDRIVER" ]] || die "CHROMEDRIVER is not executable: $CHROMEDRIVER"
     driver_bin="$CHROMEDRIVER"
@@ -418,10 +511,12 @@ if [[ -n "$cft_platform" && ! -x "$driver_bin" ]]; then
         mv "$found" "$driver_bin"
     fi
     rm -f "$zip_path"
+    downloaded_driver=1
 fi
 
 # macOS Gatekeeper rejects the downloaded binary; ad-hoc re-sign it once.
-if [[ "$(uname -s)" == "Darwin" ]]; then
+if [[ "$mode" == "prepare" && $downloaded_driver -eq 1 &&
+    "$(uname -s)" == "Darwin" ]]; then
     if ! "$driver_bin" --version >/dev/null 2>&1; then
         log "ad-hoc signing chromedriver for macOS…"
         codesign --remove-signature "$driver_bin" 2>/dev/null || true
@@ -429,7 +524,9 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     fi
 fi
 
-driver_version="$("$driver_bin" --version 2>/dev/null | head -n1)"
+if ! driver_version="$("$driver_bin" --version 2>/dev/null | head -n1)"; then
+    die "chromedriver is not executable by the OS: $driver_bin; run preparation to provision a check-owned driver"
+fi
 driver_version_full="$(printf '%s' "$driver_version" \
     | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
 [[ -n "$driver_version_full" ]] || die "could not parse chromedriver version: $driver_version"

@@ -58,7 +58,9 @@ lockfile-pinned wasm-bindgen runner once through `tools/run-wasm-tests.sh` and
 then uses those exact paths for all wasm repetitions. Explicit `CHROME` and
 `CHROMEDRIVER` overrides are authoritative and invalid overrides fail. Cache
 explanation mode is read-only: it performs no cleanup, network provisioning, or
-daemon startup.
+daemon startup, and it never signs or modifies browser tools. An explicit
+`WASM_BINDGEN_TEST_RUNNER` must be named `wasm-bindgen-test-runner` so Cargo
+executes the exact fingerprinted path.
 
 Run `./dev.sh check` once after the worktree is final and before committing. If
 it fails, fix only from the diagnostics it returned, then rerun the same

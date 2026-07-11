@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -242,6 +243,10 @@ esac
             "python3",
             """#!/usr/bin/env bash
 if [[ "${1:-}" == "--version" ]]; then
+  if [[ "${DEV_CHECK_FAIL_PYTHON_IDENTITY:-0}" == 1 ]]; then
+    echo "python identity detail from stderr" >&2
+    exit 7
+  fi
   echo "Python ${DEV_CHECK_FAKE_PYTHON_VERSION:-3.test}"
   exit 0
 fi
@@ -603,10 +608,21 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
 
         self.assertEqual(rejected.returncode, 1)
         self.assertIn("required sccache 0.16.0", rejected.stderr)
+        self.assertIn("cargo install sccache --version 0.16.0 --locked", rejected.stderr)
         self.assertIn("Failing repetition diagnostics:", rejected.stderr)
         self.assertFalse(
             any(line.startswith("cargo fmt ") for line in self._log_lines())
         )
+
+    def test_identity_failure_preserves_underlying_diagnostics_and_status(self) -> None:
+        env = self.env.copy()
+        env["DEV_CHECK_FAIL_PYTHON_IDENTITY"] = "1"
+
+        rejected = self._run("--explain-cache", env=env, check=False)
+
+        self.assertEqual(rejected.returncode, 7)
+        self.assertIn("could not read python3 identity (exit 7)", rejected.stderr)
+        self.assertIn("python identity detail from stderr", rejected.stderr)
 
     def test_sccache_validation_failure_has_log_and_failure_stats(self) -> None:
         env = self.env.copy()
@@ -683,6 +699,9 @@ class NextestWrapperContractTests(unittest.TestCase):
         )
         self.assertIn("LOCK_HELD=false", source)
         self.assertIn('if [[ "$owner_pid" == "$$" ]]', source)
+        self.assertIn('if mkdir "$lock_dir"', source)
+        self.assertIn('lease_dir="$(mktemp', source)
+        self.assertIn("ownerless_grace_seconds=5", source)
 
 
 @unittest.skipUnless(platform.system() == "Darwin", "macOS clone wrapper")
@@ -710,16 +729,28 @@ class NextestCloneTests(unittest.TestCase):
             workspace = next((tmpdir / "tyde-nextest").iterdir())
             lock = workspace / "sample.lock"
             lock.mkdir()
-            (lock / "owner").write_text("pid=999999999\n", encoding="utf-8")
+            old = time.time() - 10
+            os.utime(lock, (old, old))
 
             subprocess.run([str(wrapper), str(second)], env=env, check=True)
 
             clones = [path for path in workspace.glob("sample.*") if path.is_file()]
             self.assertEqual(len(clones), 1)
             self.assertFalse(lock.exists())
+            partial_lock = workspace / "partial.lock"
+            partial_lease = workspace / "sample.partial.use.ownerless"
+            recent_lock = workspace / "recent.lock"
+            recent_lease = workspace / "sample.recent.use.ownerless"
+            partial_lock.mkdir()
+            partial_lease.write_text("", encoding="utf-8")
+            recent_lock.mkdir()
+            recent_lease.write_text("", encoding="utf-8")
+            os.utime(partial_lock, (old, old))
+            os.utime(partial_lease, (old, old))
             for index in range(70):
                 extra = workspace / f"extra.{index:02d}"
                 extra.write_text("x", encoding="utf-8")
+                extra.chmod(0o755)
                 os.utime(extra, (1000 + index, 1000 + index))
             cleanup_env = env.copy()
             cleanup_env["TYDE_DEV_CHECK_LOCK_HELD"] = "1"
@@ -732,8 +763,19 @@ class NextestCloneTests(unittest.TestCase):
             )
             self.assertGreater(int(cleanup.stdout), 0)
             self.assertTrue(workspace.exists())
+            self.assertFalse(partial_lock.exists())
+            self.assertFalse(partial_lease.exists())
+            self.assertTrue(recent_lock.exists())
+            self.assertTrue(recent_lease.exists())
             self.assertLessEqual(
-                len([path for path in workspace.iterdir() if path.is_file()]), 64
+                len(
+                    [
+                        path
+                        for path in workspace.iterdir()
+                        if path.is_file() and os.access(path, os.X_OK)
+                    ]
+                ),
+                64,
             )
 
 
@@ -777,6 +819,9 @@ class WasmToolScriptTests(unittest.TestCase):
                     "WASM_BINDGEN_TEST_RUNNER": str(runner),
                 }
             )
+            webdriver = root / "webdriver.json"
+            webdriver.write_text('{"capabilities": "external"}\n', encoding="utf-8")
+            env["WASM_BINDGEN_TEST_WEBDRIVER_JSON"] = str(webdriver)
 
             identity = subprocess.run(
                 [str(script), "--identity"],
@@ -788,7 +833,18 @@ class WasmToolScriptTests(unittest.TestCase):
 
             self.assertIn(f"wasm.chrome.path={chrome}", identity.stdout)
             self.assertIn(f"wasm.chromedriver.path={driver}", identity.stdout)
+            webdriver_hash = hashlib.sha256(webdriver.read_bytes()).hexdigest()
+            self.assertIn(
+                f"wasm.webdriver.identity=sha256:{webdriver_hash}", identity.stdout
+            )
             self.assertFalse((root / "target").exists())
+            source = script.read_text(encoding="utf-8")
+            self.assertIn(
+                'if [[ "$mode" == "prepare" && $downloaded_driver -eq 1', source
+            )
+            self.assertIn("wasm.webdriver.identity=sha256:", source)
+            self.assertIn('validate_prepared_identity "$prepared_identity"', source)
+            self.assertIn('export PATH="$(dirname "$runner_bin"):$PATH"', source)
 
             prepared = root / "prepared.env"
             subprocess.run(
@@ -892,6 +948,105 @@ class WasmToolScriptTests(unittest.TestCase):
             )
             self.assertNotEqual(missing.returncode, 0)
             self.assertIn("CHROME is not executable", missing.stderr)
+
+            custom_runner = binaries / "custom-runner"
+            custom_runner.write_text(
+                runner.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            custom_runner.chmod(0o755)
+            driver.write_text(
+                "#!/usr/bin/env bash\necho 'ChromeDriver 150.0.7871.115'\n",
+                encoding="utf-8",
+            )
+            driver.chmod(0o755)
+            env["CHROME"] = str(chrome)
+            env["WASM_BINDGEN_TEST_RUNNER"] = str(custom_runner)
+            wrong_name = subprocess.run(
+                [str(script), "--identity"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(wrong_name.returncode, 0)
+            self.assertIn(
+                "must be named wasm-bindgen-test-runner", wrong_name.stderr
+            )
+
+    def test_identity_never_signs_an_unusable_explicit_driver(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = pathlib.Path(temp_name) / "repo"
+            tools = root / "tools"
+            binaries = root / "bin"
+            tools.mkdir(parents=True)
+            binaries.mkdir()
+            script = tools / "run-wasm-tests.sh"
+            shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
+            (root / "Cargo.lock").write_text(
+                'name = "wasm-bindgen"\nversion = "0.2.118"\n',
+                encoding="utf-8",
+            )
+
+            marker = root / "codesigned"
+            chrome = binaries / "chrome"
+            driver = binaries / "chromedriver"
+            runner = binaries / "wasm-bindgen-test-runner"
+            chrome.write_text(
+                "#!/usr/bin/env bash\necho 'Google Chrome 150.0.7871.102'\n",
+                encoding="utf-8",
+            )
+            driver.write_text(
+                "#!/usr/bin/env bash\n"
+                '[[ -e "$SIGN_MARKER" ]] || exit 9\n'
+                "echo 'ChromeDriver 150.0.7871.115'\n",
+                encoding="utf-8",
+            )
+            runner.write_text(
+                "#!/usr/bin/env bash\necho 'wasm-bindgen-test-runner 0.2.118'\n",
+                encoding="utf-8",
+            )
+            (binaries / "uname").write_text(
+                "#!/usr/bin/env bash\n"
+                "case \"${1:-}\" in\n"
+                "  -s) echo Darwin ;;\n"
+                "  -m) echo x86_64 ;;\n"
+                "  *) echo Darwin ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            (binaries / "codesign").write_text(
+                '#!/usr/bin/env bash\ntouch "$SIGN_MARKER"\n', encoding="utf-8"
+            )
+            for binary in (
+                chrome,
+                driver,
+                runner,
+                binaries / "uname",
+                binaries / "codesign",
+            ):
+                binary.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{binaries}:{env['PATH']}",
+                    "CHROME": str(chrome),
+                    "CHROMEDRIVER": str(driver),
+                    "WASM_BINDGEN_TEST_RUNNER": str(runner),
+                    "SIGN_MARKER": str(marker),
+                }
+            )
+            identity = subprocess.run(
+                [str(script), "--identity"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(identity.returncode, 0)
+            self.assertIn("run preparation to provision", identity.stderr)
+            self.assertFalse(marker.exists())
 
 
 class RustToolchainParityTests(unittest.TestCase):

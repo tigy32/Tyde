@@ -391,7 +391,7 @@ set_sccache_environment() {
     local executable repository_hash port name
 
     command -v sccache >/dev/null 2>&1 ||
-        die "sccache $DEV_CHECK_SCCACHE_VERSION is required in PATH"
+        die "sccache $DEV_CHECK_SCCACHE_VERSION is required in PATH. Install it with: cargo install sccache --version $DEV_CHECK_SCCACHE_VERSION --locked"
     executable="$(command -v sccache)"
     repository_hash="$(printf '%s' "$PWD" | hash_text)"
     port=$((20000 + 16#${repository_hash:0:8} % 30000))
@@ -414,7 +414,7 @@ configure_sccache() {
     mkdir -p "$SCCACHE_DIR"
 
     run_stage "Verify pinned sccache" 1 bash -c \
-        'actual="$(sccache --version 2>&1)"; [[ "$actual" == "sccache $1" ]] || { printf "required sccache %s; found %s\n" "$1" "$actual" >&2; exit 1; }' \
+        'actual="$(sccache --version 2>&1)"; [[ "$actual" == "sccache $1" ]] || { printf "required sccache %s; found %s. Install with: cargo install sccache --version %s --locked\n" "$1" "$actual" "$1" >&2; exit 1; }' \
         _ "$DEV_CHECK_SCCACHE_VERSION"
     run_stage "Connect pinned local sccache" 1 \
         sccache --show-stats --stats-format=json
@@ -457,10 +457,17 @@ SCRIPT
 hash_command() {
     local label="$1"
     shift
-    local output
+    local output status
 
-    if ! output="$("$@" 2>&1)"; then
-        die "could not read $label identity"
+    if output="$("$@" 2>&1)"; then
+        status=0
+    else
+        status=$?
+    fi
+    if ((status != 0)); then
+        printf 'ERROR: could not read %s identity (exit %s)\n' "$label" "$status" >&2
+        printf '%s\n' "$output" >&2
+        exit "$status"
     fi
     printf 'tool.%s.version=%s\n' "$label" "$(printf '%s\n' "$output" | head -n 1)"
     printf 'tool.%s.identity=%s\n' "$label" "$(printf '%s' "$output" | hash_text)"
@@ -795,7 +802,7 @@ check() {
         verify_active_rust_toolchain "$channel"
         set_sccache_environment
         [[ "$(sccache --version)" == "sccache $DEV_CHECK_SCCACHE_VERSION" ]] ||
-            die "sccache $DEV_CHECK_SCCACHE_VERSION is required for cache identity"
+            die "sccache $DEV_CHECK_SCCACHE_VERSION is required for cache identity. Install it with: cargo install sccache --version $DEV_CHECK_SCCACHE_VERSION --locked"
         WASM_CACHE_IDENTITY="$(tools/run-wasm-tests.sh --identity)"
         inputs="$(cache_inputs)"
         key="$(cache_key_for_inputs "$inputs")"
