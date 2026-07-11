@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use protocol::{AgentId, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload};
+use protocol::{
+    AgentId, BackendKind, CustomAgentNotifyPayload, Envelope, FrameKind, HostBootstrapPayload,
+    HostSettingValue,
+};
 use tyde_dev_driver::agent_control::AgentControlHandle;
 
 // `cargo` compiles each integration test file as its own binary, so a
@@ -61,21 +64,30 @@ impl Fixture {
     /// Like [`Fixture::new`] but actually probes the real backend CLIs
     /// (`<cli> --version`, codex model discovery, etc.). Spawning real
     /// subprocesses costs several seconds per fixture, so only the handful of
-    /// tests asserting on backend-setup *contents* should use this — everyone
-    /// else gets the fast stub via `new`/`new_with_runtime_config`.
+    /// tests asserting on backend-setup *contents* should use this with the
+    /// exact enabled backends they exercise — everyone else gets the fast stub
+    /// via `new`/`new_with_runtime_config`.
     #[allow(dead_code)]
-    pub async fn new_with_real_backend_probe() -> Self {
-        Self::new_with_runtime_config_inner(server::HostRuntimeConfig::default(), false).await
+    pub async fn new_with_real_backend_probe_for_enabled_backends(
+        enabled_backends: Vec<BackendKind>,
+    ) -> Self {
+        Self::new_with_runtime_config_inner(
+            server::HostRuntimeConfig::default(),
+            false,
+            Some(enabled_backends),
+        )
+        .await
     }
 
     #[allow(dead_code)]
     pub async fn new_with_runtime_config(runtime_config: server::HostRuntimeConfig) -> Self {
-        Self::new_with_runtime_config_inner(runtime_config, true).await
+        Self::new_with_runtime_config_inner(runtime_config, true, None).await
     }
 
     async fn new_with_runtime_config_inner(
         mut runtime_config: server::HostRuntimeConfig,
         skip_real_backend_probe: bool,
+        enabled_backends: Option<Vec<BackendKind>>,
     ) -> Self {
         init_tracing();
 
@@ -94,6 +106,12 @@ impl Fixture {
         let session_path = session_store_dir.path().join("sessions.json");
         let project_path = session_store_dir.path().join("projects.json");
         let settings_path = session_store_dir.path().join("settings.json");
+        if let Some(enabled_backends) = enabled_backends {
+            server::store::settings::HostSettingsStore::load(settings_path.clone())
+                .expect("load fixture settings store")
+                .apply(HostSettingValue::EnabledBackends { enabled_backends })
+                .expect("seed fixture enabled backends");
+        }
         let host = server::spawn_host_with_mock_backend_and_runtime_config(
             session_path,
             project_path,

@@ -2125,7 +2125,6 @@ pub struct AgentsViewPreferencesNotifyPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentBootstrapPayload {
     pub events: Vec<AgentBootstrapEvent>,
-    #[serde(default)]
     pub latest_output: AgentControlOutput,
 }
 
@@ -7782,9 +7781,9 @@ mod agent_control_output_tests {
     }
 
     #[test]
-    fn legacy_bootstrap_without_latest_output_defaults_to_empty() {
-        let bootstrap: AgentBootstrapPayload =
-            serde_json::from_value(json!({ "events": [] })).expect("legacy bootstrap payload");
-        assert_eq!(bootstrap.latest_output, AgentControlOutput::Empty);
+    fn bootstrap_requires_explicit_latest_output() {
+        let error = serde_json::from_value::<AgentBootstrapPayload>(json!({ "events": [] }))
+            .expect_err("bootstrap without latest_output must be rejected");
+        assert!(error.to_string().contains("latest_output"));
     }
 }

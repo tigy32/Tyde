@@ -615,7 +615,7 @@ async fn backend_setup_payload_uses_sign_in_command_and_versioned_tycode_probe()
     );
     let _hermes_python = EnvVarGuard::set("HERMES_PYTHON", "".to_string());
 
-    let mut fixture = Fixture::new_with_real_backend_probe().await;
+    let mut fixture = Fixture::new_with_real_backend_probe_for_enabled_backends(Vec::new()).await;
     let payload = fixture.bootstrap.backend_setup.clone();
     expect_no_backend_setup_replay(&mut fixture.client).await;
 
@@ -721,7 +721,7 @@ async fn backend_setup_payload_reports_found_unusable_hermes_cli() {
     );
     let _hermes_python = EnvVarGuard::set("HERMES_PYTHON", "".to_string());
 
-    let mut fixture = Fixture::new_with_real_backend_probe().await;
+    let mut fixture = Fixture::new_with_real_backend_probe_for_enabled_backends(Vec::new()).await;
     let payload = fixture.bootstrap.backend_setup.clone();
     expect_no_backend_setup_replay(&mut fixture.client).await;
 
@@ -769,7 +769,8 @@ async fn backend_config_snapshots_report_tycode_settings_schema_release_blocker(
     let _hermes_python =
         EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
 
-    let mut fixture = Fixture::new_with_real_backend_probe().await;
+    let mut fixture =
+        Fixture::new_with_real_backend_probe_for_enabled_backends(vec![BackendKind::Tycode]).await;
     let payload = loop {
         let env = fixture
             .client
