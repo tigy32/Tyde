@@ -11,6 +11,8 @@ import unittest
 
 TOOLS_DIR = pathlib.Path(__file__).resolve().parent
 REPO_ROOT = TOOLS_DIR.parent
+TOOLCHAIN_UPDATE_LOG = "rustup update stable toolchain=unset"
+TOOLCHAIN_INSTALL_LOG = "rustup toolchain install toolchain=unset"
 
 
 class DevCheckCacheTests(unittest.TestCase):
@@ -23,6 +25,9 @@ class DevCheckCacheTests(unittest.TestCase):
         self.bin.mkdir()
 
         shutil.copy2(REPO_ROOT / "dev.sh", self.root / "dev.sh")
+        shutil.copy2(
+            REPO_ROOT / "rust-toolchain.toml", self.root / "rust-toolchain.toml"
+        )
         (self.root / ".config").mkdir()
         (self.root / ".config" / "nextest.toml").write_text(
             'nextest-version = "0.9.100"\n', encoding="utf-8"
@@ -61,6 +66,7 @@ if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "wasm" ]]; then exit 9; fi
             {
                 "PATH": f"{self.bin}:{self.env['PATH']}",
                 "DEV_CHECK_TEST_LOG": str(self.log),
+                "RUSTUP_TOOLCHAIN": "nightly",
                 "TYDE_RUN_REAL_AI_TESTS": "must-be-unset",
                 "TYDE_LIVE_CODEX_TEST": "must-be-unset",
                 "TYDE_RUN_CLAUDE_INTEGRATION": "must-be-unset",
@@ -81,10 +87,10 @@ if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "wasm" ]]; then exit 9; fi
             """#!/usr/bin/env bash
 set -euo pipefail
 case "$*" in
-  "-Vv") echo "cargo 1.90.0 (test)"; echo "release: 1.90.0"; exit 0 ;;
+  "-Vv") echo "cargo stable-test (test)"; echo "release: stable-test"; exit 0 ;;
   "nextest --version") echo "cargo-nextest 0.9.100"; exit 0 ;;
 esac
-echo "cargo $* real-ai=${TYDE_RUN_REAL_AI_TESTS-unset}/${TYDE_LIVE_CODEX_TEST-unset}/${TYDE_RUN_CLAUDE_INTEGRATION-unset}" >> "$DEV_CHECK_TEST_LOG"
+echo "cargo $* toolchain=${RUSTUP_TOOLCHAIN-unset} real-ai=${TYDE_RUN_REAL_AI_TESTS-unset}/${TYDE_LIVE_CODEX_TEST-unset}/${TYDE_RUN_CLAUDE_INTEGRATION-unset}" >> "$DEV_CHECK_TEST_LOG"
 if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "cargo $*" ]]; then exit 9; fi
 """,
         )
@@ -95,7 +101,7 @@ if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "cargo $*" ]]; then exit 9; fi
         self._write(
             "rustc",
             """#!/usr/bin/env bash
-echo "rustc ${FAKE_RUSTC_VERSION:-1.90.0} (test)"
+echo "rustc stable-test (test)"
 echo "host: test-host"
 """,
         )
@@ -103,7 +109,17 @@ echo "host: test-host"
             "rustup",
             """#!/usr/bin/env bash
 case "$*" in
-  "show active-toolchain") echo "stable-test-host (default)" ;;
+  "update stable")
+    echo "rustup update stable toolchain=${RUSTUP_TOOLCHAIN-unset}" >> "$DEV_CHECK_TEST_LOG"
+    [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "rustup update stable" ]] && exit 9
+    :
+    ;;
+  "toolchain install")
+    echo "rustup toolchain install toolchain=${RUSTUP_TOOLCHAIN-unset}" >> "$DEV_CHECK_TEST_LOG"
+    [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "rustup toolchain install" ]] && exit 9
+    :
+    ;;
+  "show active-toolchain") echo "stable-test-host (environment override by RUSTUP_TOOLCHAIN)" ;;
   "target list --installed") printf 'test-host\\nwasm32-unknown-unknown\\n' ;;
   *) exit 2 ;;
 esac
@@ -163,18 +179,32 @@ if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "node" ]]; then exit 9; fi
             index = self.root / index
         return hashlib.sha256(index.read_bytes()).hexdigest()
 
-    def test_miss_runs_required_counts_then_hit_is_noop(self) -> None:
+    def test_miss_runs_required_counts_then_hit_only_updates_toolchain(self) -> None:
         first = self._run()
 
         self.assertIn("dev check cache miss", first.stdout)
         lines = self._log_lines()
+        self.assertEqual(lines[:2], [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG])
         self.assertEqual(sum(line.startswith("cargo fmt ") for line in lines), 1)
         self.assertEqual(sum(line.startswith("cargo check ") for line in lines), 1)
         self.assertEqual(sum(line.startswith("cargo clippy ") for line in lines), 1)
         self.assertEqual(sum(line.startswith("cargo nextest run ") for line in lines), 3)
         self.assertEqual(lines.count("wasm"), 3)
         self.assertEqual(sum(line.startswith("node --test ") for line in lines), 3)
-        self.assertTrue(all("real-ai=unset/unset/unset" in line for line in lines if line.startswith("cargo ")))
+        self.assertTrue(
+            all(
+                "real-ai=unset/unset/unset" in line
+                for line in lines
+                if line.startswith("cargo ")
+            )
+        )
+        self.assertTrue(
+            all(
+                "toolchain=stable" in line
+                for line in lines
+                if line.startswith("cargo ")
+            )
+        )
         records = list((self.root / "target" / "dev-check-cache").glob("*.success"))
         self.assertEqual(len(records), 1)
         self.assertIn("complete=true", records[0].read_text(encoding="utf-8"))
@@ -185,7 +215,10 @@ if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "node" ]]; then exit 9; fi
         self.assertIn("dev check cache hit", second.stdout)
         self.assertIn("Prior successful stage summary:", second.stdout)
         self.assertIn("cargo nextest run: 3/3 passed", second.stdout)
-        self.assertEqual(self._log_lines(), before)
+        self.assertEqual(
+            self._log_lines(),
+            before + [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG],
+        )
 
     def test_fingerprint_covers_git_states_without_mutating_real_index(self) -> None:
         base_key = self._explain_key()
@@ -230,7 +263,7 @@ if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "node" ]]; then exit 9; fi
 
         forced = self._run("--force")
         self.assertIn("dev check cache bypassed", forced.stdout)
-        self.assertEqual(len(self._log_lines()) - initial_log_count, 12)
+        self.assertEqual(len(self._log_lines()) - initial_log_count, 14)
         self.assertEqual(
             len(list((self.root / "target" / "dev-check-cache").glob("*.success"))),
             len(initial_records),
@@ -239,7 +272,7 @@ if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "node" ]]; then exit 9; fi
         before_no_cache = len(self._log_lines())
         no_cache = self._run("--no-cache")
         self.assertIn("dev check cache disabled", no_cache.stdout)
-        self.assertEqual(len(self._log_lines()) - before_no_cache, 6)
+        self.assertEqual(len(self._log_lines()) - before_no_cache, 8)
         self.assertEqual(
             len(list((self.root / "target" / "dev-check-cache").glob("*.success"))),
             len(initial_records),
@@ -268,6 +301,34 @@ if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "node" ]]; then exit 9; fi
         )
         self.assertEqual(list((self.root / "target" / "dev-check-cache").glob(".success.*")), [])
 
+    def test_toolchain_update_failure_precedes_cache_evaluation_and_checks(self) -> None:
+        self._run()
+        before = self._log_lines()
+        env = self.env.copy()
+        env["DEV_CHECK_FAIL_COMMAND"] = "rustup update stable"
+
+        rejected = self._run(env=env, check=False)
+
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("could not update the stable Rust toolchain", rejected.stderr)
+        self.assertNotIn("dev check cache hit", rejected.stdout)
+        self.assertEqual(self._log_lines(), before + [TOOLCHAIN_UPDATE_LOG])
+
+    def test_workflow_toolchain_entrypoint_uses_the_check_update_path(self) -> None:
+        result = subprocess.run(
+            [str(self.root / "dev.sh"), "rust-toolchain"],
+            cwd=self.root,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._log_lines(), [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG]
+        )
+
     def test_ci_requires_force_and_release_guard_uses_force(self) -> None:
         ci_env = self.env.copy()
         ci_env["CI"] = "true"
@@ -285,6 +346,47 @@ if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "node" ]]; then exit 9; fi
             REPO_ROOT / ".github" / "workflows" / "release.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("run: ./dev.sh check --force", release_workflow)
+
+
+class RustToolchainParityTests(unittest.TestCase):
+    def test_repository_pin_declares_every_required_rust_tool(self) -> None:
+        self.assertEqual(
+            (REPO_ROOT / "rust-toolchain.toml").read_text(encoding="utf-8"),
+            """[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"
+""",
+        )
+
+    def test_release_workflows_install_the_repository_pin(self) -> None:
+        release_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "release.yml"
+        ).read_text(encoding="utf-8")
+        mobile_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "mobile-web-release.yml"
+        ).read_text(encoding="utf-8")
+
+        root_install = """      - name: Install repository Rust toolchain
+        run: ./dev.sh rust-toolchain
+"""
+        nested_install = """      - name: Install repository Rust toolchain
+        working-directory: deploy-tools
+        shell: bash
+        run: |
+          ./dev.sh rust-toolchain
+"""
+
+        self.assertEqual(release_workflow.count(root_install), 3)
+        self.assertEqual(mobile_workflow.count(nested_install), 1)
+        self.assertNotIn("dtolnay/rust-toolchain@stable", release_workflow)
+        self.assertNotIn("dtolnay/rust-toolchain@stable", mobile_workflow)
+        self.assertNotIn("rustup update stable", release_workflow)
+        self.assertNotIn("rustup update stable", mobile_workflow)
+        self.assertIn(
+            "RUSTUP_TOOLCHAIN=$(rustup show active-toolchain", mobile_workflow
+        )
 
 
 if __name__ == "__main__":

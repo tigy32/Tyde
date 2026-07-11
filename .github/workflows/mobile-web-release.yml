@@ -68,10 +68,12 @@ jobs:
         with:
           node-version: lts/*
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      - name: Install repository Rust toolchain
+        working-directory: deploy-tools
+        shell: bash
+        run: |
+          ./dev.sh rust-toolchain
+          echo "RUSTUP_TOOLCHAIN=$(rustup show active-toolchain | awk '{print $1}')" >> "$GITHUB_ENV"
 
       - name: Install trunk
         uses: taiki-e/install-action@v2

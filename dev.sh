@@ -17,6 +17,29 @@ die() {
     exit 1
 }
 
+prepare_rust_toolchain() {
+    local channel active
+
+    channel="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+    [[ -n "$channel" && "$channel" != *$'\n'* ]] ||
+        die "rust-toolchain.toml must declare exactly one channel"
+    [[ "$channel" == "stable" ]] ||
+        die "rust-toolchain.toml must declare the stable channel"
+    command -v rustup >/dev/null 2>&1 ||
+        die "rustup is required to update the repository Rust toolchain"
+    if ! env -u RUSTUP_TOOLCHAIN rustup update "$channel"; then
+        die "could not update the stable Rust toolchain"
+    fi
+    if ! env -u RUSTUP_TOOLCHAIN rustup toolchain install; then
+        die "could not install the repository Rust toolchain"
+    fi
+    export RUSTUP_TOOLCHAIN="$channel"
+    active="$(rustup show active-toolchain)" ||
+        die "could not resolve the active Rust toolchain"
+    [[ "$active" == "$channel"-* ]] ||
+        die "stable Rust is required by rust-toolchain.toml; active toolchain is $active"
+}
+
 hash_text() {
     git hash-object --stdin
 }
@@ -99,6 +122,7 @@ cache_inputs() {
     local path
     local -a relevant_files=(
         dev.sh
+        rust-toolchain.toml
         .config/nextest.toml
         tools/run-nextest-binary.sh
         tools/run-wasm-tests.sh
@@ -252,6 +276,8 @@ check() {
         die "CI must invoke ./dev.sh check --force"
     fi
 
+    prepare_rust_toolchain
+
     if ! command -v cargo-nextest >/dev/null 2>&1; then
         die "cargo-nextest is required. Install it with: cargo install cargo-nextest --locked"
     fi
@@ -324,6 +350,7 @@ check() {
 
 usage() {
     printf 'Usage: %s check [--force | --no-cache | --explain-cache]\n' "$0"
+    printf '       %s rust-toolchain\n' "$0"
     printf '       %s release <command> [args]\n' "$0"
 }
 
@@ -331,6 +358,11 @@ case "${1:-}" in
     check)
         shift
         check "$@"
+        ;;
+    rust-toolchain)
+        shift
+        [[ $# -eq 0 ]] || die "rust-toolchain does not accept arguments"
+        prepare_rust_toolchain
         ;;
     release)
         shift
