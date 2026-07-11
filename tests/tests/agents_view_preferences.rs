@@ -224,10 +224,7 @@ async fn assert_no_agent_closed_for(
     context: &str,
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
-    loop {
-        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
-            break;
-        };
+    while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
         let env = match tokio::time::timeout(remaining, client.next_event()).await {
             Ok(Ok(Some(env))) => env,
             Ok(Ok(None)) => panic!("connection closed while checking {context}"),

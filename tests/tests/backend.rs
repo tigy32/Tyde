@@ -2935,10 +2935,8 @@ async fn expect_folded_token_turn_after_user_echo(
                             pending_metadata_updates.push(update);
                         }
                     }
-                    ChatEvent::TypingStatusChanged(false) => {
-                        if got_user_message_echo {
-                            saw_typing_false = true;
-                        }
+                    ChatEvent::TypingStatusChanged(false) if got_user_message_echo => {
+                        saw_typing_false = true;
                     }
                     _ => {}
                 }
