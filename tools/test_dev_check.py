@@ -6,6 +6,7 @@ import pathlib
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -42,6 +43,32 @@ class DevCheckCacheTests(unittest.TestCase):
         wasm_script.write_text(
             """#!/usr/bin/env bash
 set -euo pipefail
+identity() {
+  printf 'wasm.chrome.path=%s\\n' "${CHROME:-provisioned-chrome}"
+  printf 'wasm.chrome.version=%s\\n' "$("${CHROME:-$DEV_CHECK_FAKE_CHROME}" --version)"
+  printf 'wasm.chromedriver.path=%s\\n' "${CHROMEDRIVER:-provisioned-driver}"
+  printf 'wasm.chromedriver.version=%s\\n' "$("${CHROMEDRIVER:-$DEV_CHECK_FAKE_CHROMEDRIVER}" --version)"
+  printf 'wasm.bindgen.required=0.2.118\\n'
+  printf 'wasm.bindgen.path=%s\\n' "${WASM_BINDGEN_TEST_RUNNER:-provisioned-runner}"
+  printf 'wasm.bindgen.version=%s\\n' "$("${WASM_BINDGEN_TEST_RUNNER:-$DEV_CHECK_FAKE_RUNNER}" --version)"
+}
+if [[ "${1:-}" == "--identity" ]]; then identity; exit 0; fi
+if [[ "${1:-}" == "--prepare" ]]; then
+  output="$2"
+  identity_file="$output.identity"
+  identity > "$identity_file"
+  {
+    printf 'export TYDE_WASM_TOOLS_PREPARED=1\\n'
+    printf 'export CHROME=%q\\n' "${CHROME:-$DEV_CHECK_FAKE_CHROME}"
+    printf 'export CHROMEDRIVER=%q\\n' "${CHROMEDRIVER:-$DEV_CHECK_FAKE_CHROMEDRIVER}"
+    printf 'export WASM_BINDGEN_TEST_RUNNER=%q\\n' "${WASM_BINDGEN_TEST_RUNNER:-$DEV_CHECK_FAKE_RUNNER}"
+    printf 'export WASM_BINDGEN_TEST_WEBDRIVER_JSON=%q\\n' "$output.webdriver.json"
+    printf 'export TYDE_WASM_IDENTITY_FILE=%q\\n' "$identity_file"
+  } > "$output"
+  echo "wasm-prepare" >> "$DEV_CHECK_TEST_LOG"
+  exit 0
+fi
+[[ "${TYDE_WASM_TOOLS_PREPARED:-0}" == 1 ]]
 echo "wasm" >> "$DEV_CHECK_TEST_LOG"
 if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "wasm" ]]; then exit 9; fi
 """,
@@ -75,11 +102,17 @@ with open(os.environ["DEV_CHECK_TEST_LOG"], "a", encoding="utf-8") as log:
             {
                 "PATH": f"{self.bin}:{self.env['PATH']}",
                 "DEV_CHECK_TEST_LOG": str(self.log),
-                "DEV_CHECK_CONTRACT_CHILD": "1",
                 "RUSTUP_TOOLCHAIN": "nightly",
                 "TMPDIR": str(pathlib.Path(self.temp.name) / "tmp"),
                 "CHROME": str(self.bin / "google-chrome"),
                 "CHROMEDRIVER": str(self.bin / "chromedriver"),
+                "WASM_BINDGEN_TEST_RUNNER": str(
+                    self.bin / "wasm-bindgen-test-runner"
+                ),
+                "DEV_CHECK_FAKE_CHROME": str(self.bin / "google-chrome"),
+                "DEV_CHECK_FAKE_CHROMEDRIVER": str(self.bin / "chromedriver"),
+                "DEV_CHECK_FAKE_RUNNER": str(self.bin / "wasm-bindgen-test-runner"),
+                "DEV_CHECK_REAL_PYTHON": sys.executable,
                 "TYDE_RUN_REAL_AI_TESTS": "must-be-unset",
                 "TYDE_LIVE_CODEX_TEST": "must-be-unset",
                 "TYDE_RUN_CLAUDE_INTEGRATION": "must-be-unset",
@@ -107,6 +140,15 @@ esac
 echo "successful cargo output that must stay in the stage log"
 echo "cargo $* toolchain=${RUSTUP_TOOLCHAIN-unset} real-ai=${TYDE_RUN_REAL_AI_TESTS-unset}/${TYDE_LIVE_CODEX_TEST-unset}/${TYDE_RUN_CLAUDE_INTEGRATION-unset}" >> "$DEV_CHECK_TEST_LOG"
 if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "cargo $*" ]]; then
+  if [[ -n "${DEV_CHECK_FAIL_ON_RUN:-}" ]]; then
+    count_file="$DEV_CHECK_TEST_LOG.fail-count"
+    count=0
+    [[ -f "$count_file" ]] && count="$(cat "$count_file")"
+    count=$((count + 1))
+    printf '%s\\n' "$count" > "$count_file"
+    printf 'failure-controlled invocation=%s\\n' "$count"
+    [[ "$count" == "$DEV_CHECK_FAIL_ON_RUN" ]] || exit 0
+  fi
   echo "complete actionable failure from cargo $*" >&2
   exit 9
 fi
@@ -160,7 +202,9 @@ case "$*" in
   "--version") echo "sccache 0.16.0" ;;
   "--start-server") : ;;
   "--show-stats --stats-format=json")
-    python3 - "$SCCACHE_DIR" <<'PY'
+    cache_dir="$SCCACHE_DIR"
+    [[ "${DEV_CHECK_BAD_SCCACHE:-0}" == 1 ]] && cache_dir="/wrong-cache"
+    python3 - "$cache_dir" <<'PY'
 import json
 import sys
 
@@ -193,6 +237,16 @@ esac
         self._write(
             "wasm-bindgen-test-runner",
             "#!/usr/bin/env bash\necho 'wasm-bindgen-test-runner 0.2.118'\n",
+        )
+        self._write(
+            "python3",
+            """#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  echo "Python ${DEV_CHECK_FAKE_PYTHON_VERSION:-3.test}"
+  exit 0
+fi
+exec "$DEV_CHECK_REAL_PYTHON" "$@"
+""",
         )
 
     def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -271,7 +325,7 @@ esac
         records = list((self.root / "target" / "dev-check-cache").glob("*.success"))
         self.assertEqual(len(records), 1)
         record = records[0].read_text(encoding="utf-8")
-        self.assertIn("schema=2", record)
+        self.assertIn("schema=3", record)
         self.assertIn("complete=true", record)
         self.assertTrue(record.endswith("record.end=true\n"))
         self.assertEqual(
@@ -297,7 +351,7 @@ esac
         self.assertIn("PRIOR PASS  cargo nextest run (3/3", second.stdout)
         self.assertEqual(
             self._log_lines(),
-            before + [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG],
+            before + [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG, "wasm-prepare"],
         )
 
     def test_fingerprint_covers_git_states_without_mutating_real_index(self) -> None:
@@ -367,7 +421,13 @@ esac
         runner.chmod(0o755)
         changed_config = self.env.copy()
         changed_config["SCCACHE_RECACHE"] = "1"
-        self.assertNotEqual(self._explain_key(changed_config), base_key)
+        changed_config["SCCACHE_BUCKET"] = "must-not-be-used"
+        changed_config["SCCACHE_SERVER_PORT"] = "1"
+        self.assertEqual(self._explain_key(changed_config), base_key)
+
+        changed_python = self.env.copy()
+        changed_python["DEV_CHECK_FAKE_PYTHON_VERSION"] = "3.changed"
+        self.assertNotEqual(self._explain_key(changed_python), base_key)
 
     def test_modes_environment_and_failures_obey_cache_contract(self) -> None:
         self._run()
@@ -376,7 +436,7 @@ esac
 
         forced = self._run("--force")
         self.assertIn("CACHE BYPASS", forced.stdout)
-        self.assertEqual(len(self._log_lines()) - initial_log_count, 14)
+        self.assertEqual(len(self._log_lines()) - initial_log_count, 16)
         self.assertEqual(
             len(list((self.root / "target" / "dev-check-cache").glob("*.success"))),
             len(initial_records),
@@ -385,7 +445,7 @@ esac
         before_no_cache = len(self._log_lines())
         no_cache = self._run("--no-cache")
         self.assertIn("CACHE DISABLED", no_cache.stdout)
-        self.assertEqual(len(self._log_lines()) - before_no_cache, 8)
+        self.assertEqual(len(self._log_lines()) - before_no_cache, 10)
         self.assertEqual(
             len(list((self.root / "target" / "dev-check-cache").glob("*.success"))),
             len(initial_records),
@@ -406,13 +466,26 @@ esac
         (self.root / "failure.txt").write_text("new key\n", encoding="utf-8")
         failing_env = self.env.copy()
         failing_env["DEV_CHECK_FAIL_COMMAND"] = "cargo nextest run"
+        failing_env["DEV_CHECK_FAIL_ON_RUN"] = "2"
         failed = self._run(env=failing_env, check=False)
         self.assertEqual(failed.returncode, 9)
-        self.assertIn("FAIL  cargo nextest run (1/3", failed.stderr)
+        self.assertIn("FAIL  cargo nextest run (2/3", failed.stderr)
         self.assertIn(
             "complete actionable failure from cargo nextest run", failed.stderr
         )
-        self.assertIn("Complete diagnostics:", failed.stderr)
+        self.assertIn("Failing repetition diagnostics:", failed.stderr)
+        self.assertIn("Complete stage log:", failed.stderr)
+        self.assertIn("failure-controlled invocation=2", failed.stderr)
+        self.assertNotIn("failure-controlled invocation=1", failed.stderr)
+        failure_run = max(
+            (self.root / "target" / "dev-check-logs").glob("run-*")
+        )
+        nextest_log = next(failure_run.glob("*-cargo-nextest-run.log"))
+        full_log = nextest_log.read_text(encoding="utf-8")
+        self.assertIn("failure-controlled invocation=1", full_log)
+        self.assertIn("failure-controlled invocation=2", full_log)
+        failure_metadata = (failure_run / "metadata.txt").read_text(encoding="utf-8")
+        self.assertIn("failure_log=", failure_metadata)
         self.assertEqual(
             len(list((self.root / "target" / "dev-check-cache").glob("*.success"))),
             len(initial_records),
@@ -467,10 +540,16 @@ esac
             REPO_ROOT / ".github" / "workflows" / "release.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("run: ./dev.sh check --force", release_workflow)
+        install = "cargo install sccache --version 0.16.0 --locked --force"
+        self.assertIn(install, release_workflow)
+        self.assertLess(
+            release_workflow.index(install),
+            release_workflow.index("run: ./dev.sh check --force"),
+        )
 
     def test_contract_stage_is_reachable_without_recursive_checks(self) -> None:
         env = self.env.copy()
-        env.pop("DEV_CHECK_CONTRACT_CHILD")
+        env["DEV_CHECK_CONTRACT_CHILD"] = "1"
 
         result = self._run("--no-cache", env=env)
 
@@ -523,10 +602,87 @@ esac
         rejected = self._run(check=False)
 
         self.assertEqual(rejected.returncode, 1)
-        self.assertIn("sccache 0.16.0 is required", rejected.stderr)
+        self.assertIn("required sccache 0.16.0", rejected.stderr)
+        self.assertIn("Failing repetition diagnostics:", rejected.stderr)
         self.assertFalse(
             any(line.startswith("cargo fmt ") for line in self._log_lines())
         )
+
+    def test_sccache_validation_failure_has_log_and_failure_stats(self) -> None:
+        env = self.env.copy()
+        env["DEV_CHECK_BAD_SCCACHE"] = "1"
+
+        rejected = self._run(env=env, check=False)
+
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("sccache is not using the check-local cache", rejected.stderr)
+        self.assertIn("Failing repetition diagnostics:", rejected.stderr)
+        run_dir = max((self.root / "target" / "dev-check-logs").glob("run-*"))
+        metadata = (run_dir / "metadata.txt").read_text(encoding="utf-8")
+        self.assertIn("stage.05.log=", metadata)
+        self.assertIn("stage.05.failure_log=", metadata)
+        self.assertIn("sccache.failure_stats=", metadata)
+
+    def test_explain_cache_is_non_destructive_and_does_not_provision(self) -> None:
+        logs = self.root / "target" / "dev-check-logs"
+        logs.mkdir(parents=True)
+        sentinel = logs / "run-sentinel"
+        sentinel.mkdir()
+        orphan = self.root / "target" / "dev-check-cache" / ".success.orphan"
+        orphan.parent.mkdir(parents=True)
+        orphan.write_text("partial\n", encoding="utf-8")
+
+        result = self._run("--explain-cache")
+
+        self.assertIn("cache.key=", result.stdout)
+        self.assertTrue(sentinel.exists())
+        self.assertTrue(orphan.exists())
+        self.assertEqual(self._log_lines(), [])
+        self.assertEqual(list(logs.glob("run-20*")), [])
+
+    def test_cold_wasm_tools_provision_before_cache_identity_once(self) -> None:
+        env = self.env.copy()
+        env.pop("CHROME")
+        env.pop("CHROMEDRIVER")
+        env.pop("WASM_BINDGEN_TEST_RUNNER")
+
+        result = self._run(env=env)
+
+        self.assertIn("PASS  Provision wasm test tools", result.stdout)
+        self.assertEqual(self._log_lines().count("wasm-prepare"), 1)
+        self.assertEqual(self._log_lines().count("wasm"), 3)
+        self.assertEqual(
+            len(list((self.root / "target" / "dev-check-cache").glob("*.success"))),
+            1,
+        )
+
+    def test_success_retention_uses_mtime_and_removes_orphan_temp(self) -> None:
+        cache = self.root / "target" / "dev-check-cache"
+        cache.mkdir(parents=True)
+        records = []
+        for index in range(18):
+            record = cache / f"{index:02x}.success"
+            record.write_text("old\n", encoding="utf-8")
+            os.utime(record, (1000 + index, 1000 + index))
+            records.append(record)
+        orphan = cache / ".success.interrupted"
+        orphan.write_text("partial\n", encoding="utf-8")
+
+        self._run("--no-cache")
+
+        self.assertFalse(records[0].exists())
+        self.assertFalse(records[1].exists())
+        self.assertTrue(all(record.exists() for record in records[2:]))
+        self.assertFalse(orphan.exists())
+
+
+class NextestWrapperContractTests(unittest.TestCase):
+    def test_lock_release_requires_current_owner(self) -> None:
+        source = (REPO_ROOT / "tools" / "run-nextest-binary.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("LOCK_HELD=false", source)
+        self.assertIn('if [[ "$owner_pid" == "$$" ]]', source)
 
 
 @unittest.skipUnless(platform.system() == "Darwin", "macOS clone wrapper")
@@ -561,17 +717,181 @@ class NextestCloneTests(unittest.TestCase):
             clones = [path for path in workspace.glob("sample.*") if path.is_file()]
             self.assertEqual(len(clones), 1)
             self.assertFalse(lock.exists())
+            for index in range(70):
+                extra = workspace / f"extra.{index:02d}"
+                extra.write_text("x", encoding="utf-8")
+                os.utime(extra, (1000 + index, 1000 + index))
             cleanup_env = env.copy()
             cleanup_env["TYDE_DEV_CHECK_LOCK_HELD"] = "1"
             cleanup = subprocess.run(
-                [str(wrapper), "--cleanup-workspace"],
+                [str(wrapper), "--cleanup-stale"],
                 env=cleanup_env,
                 text=True,
                 capture_output=True,
                 check=True,
             )
             self.assertGreater(int(cleanup.stdout), 0)
-            self.assertFalse(workspace.exists())
+            self.assertTrue(workspace.exists())
+            self.assertLessEqual(
+                len([path for path in workspace.iterdir() if path.is_file()]), 64
+            )
+
+
+class WasmToolScriptTests(unittest.TestCase):
+    def test_identity_is_read_only_and_prepare_pins_exact_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = pathlib.Path(temp_name) / "repo"
+            tools = root / "tools"
+            binaries = root / "bin"
+            tools.mkdir(parents=True)
+            binaries.mkdir()
+            script = tools / "run-wasm-tests.sh"
+            shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
+            (root / "Cargo.lock").write_text(
+                'name = "wasm-bindgen"\nversion = "0.2.118"\n',
+                encoding="utf-8",
+            )
+
+            chrome = binaries / "chrome"
+            driver = binaries / "chromedriver"
+            runner = binaries / "wasm-bindgen-test-runner"
+            chrome.write_text(
+                "#!/usr/bin/env bash\necho 'Google Chrome 150.0.7871.102'\n",
+                encoding="utf-8",
+            )
+            driver.write_text(
+                "#!/usr/bin/env bash\necho 'ChromeDriver 150.0.7871.115'\n",
+                encoding="utf-8",
+            )
+            runner.write_text(
+                "#!/usr/bin/env bash\necho 'wasm-bindgen-test-runner 0.2.118'\n",
+                encoding="utf-8",
+            )
+            for binary in (chrome, driver, runner):
+                binary.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CHROME": str(chrome),
+                    "CHROMEDRIVER": str(driver),
+                    "WASM_BINDGEN_TEST_RUNNER": str(runner),
+                }
+            )
+
+            identity = subprocess.run(
+                [str(script), "--identity"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            self.assertIn(f"wasm.chrome.path={chrome}", identity.stdout)
+            self.assertIn(f"wasm.chromedriver.path={driver}", identity.stdout)
+            self.assertFalse((root / "target").exists())
+
+            prepared = root / "prepared.env"
+            subprocess.run(
+                [str(script), "--prepare", str(prepared)],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            prepared_text = prepared.read_text(encoding="utf-8")
+            self.assertIn(f"export CHROME={chrome}", prepared_text)
+            self.assertIn(f"export CHROMEDRIVER={driver}", prepared_text)
+            self.assertTrue(pathlib.Path(f"{prepared}.identity").is_file())
+
+            (root / "Cargo.lock").write_text(
+                'name = "wasm-bindgen"\nversion = "0.2.119"\n',
+                encoding="utf-8",
+            )
+            chrome.write_text(
+                "#!/usr/bin/env bash\necho 'Google Chrome 151.0.8000.1'\n",
+                encoding="utf-8",
+            )
+            driver.write_text(
+                "#!/usr/bin/env bash\necho 'ChromeDriver 151.0.8000.2'\n",
+                encoding="utf-8",
+            )
+            runner.write_text(
+                "#!/usr/bin/env bash\necho 'wasm-bindgen-test-runner 0.2.119'\n",
+                encoding="utf-8",
+            )
+            updated = root / "updated.env"
+            subprocess.run(
+                [str(script), "--prepare", str(updated)],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            updated_identity = pathlib.Path(f"{updated}.identity").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("wasm.chrome.version=151.0.8000.1", updated_identity)
+            self.assertIn("wasm.bindgen.required=0.2.119", updated_identity)
+
+    def test_invalid_or_mismatched_explicit_overrides_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = pathlib.Path(temp_name) / "repo"
+            tools = root / "tools"
+            binaries = root / "bin"
+            tools.mkdir(parents=True)
+            binaries.mkdir()
+            script = tools / "run-wasm-tests.sh"
+            shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
+            (root / "Cargo.lock").write_text(
+                'name = "wasm-bindgen"\nversion = "0.2.118"\n',
+                encoding="utf-8",
+            )
+            chrome = binaries / "chrome"
+            driver = binaries / "chromedriver"
+            runner = binaries / "wasm-bindgen-test-runner"
+            chrome.write_text(
+                "#!/usr/bin/env bash\necho 'Google Chrome 150.0.7871.102'\n",
+                encoding="utf-8",
+            )
+            driver.write_text(
+                "#!/usr/bin/env bash\necho 'ChromeDriver 149.0.7827.155'\n",
+                encoding="utf-8",
+            )
+            runner.write_text(
+                "#!/usr/bin/env bash\necho 'wasm-bindgen-test-runner 0.2.118'\n",
+                encoding="utf-8",
+            )
+            for binary in (chrome, driver, runner):
+                binary.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CHROME": str(chrome),
+                    "CHROMEDRIVER": str(driver),
+                    "WASM_BINDGEN_TEST_RUNNER": str(runner),
+                }
+            )
+
+            mismatch = subprocess.run(
+                [str(script), "--identity"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertIn("different major versions", mismatch.stderr)
+
+            env["CHROME"] = str(binaries / "missing")
+            missing = subprocess.run(
+                [str(script), "--identity"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("CHROME is not executable", missing.stderr)
 
 
 class RustToolchainParityTests(unittest.TestCase):
@@ -612,6 +932,19 @@ profile = "minimal"
         self.assertNotIn("rustup update stable", mobile_workflow)
         self.assertIn(
             "RUSTUP_TOOLCHAIN=$(rustup show active-toolchain", mobile_workflow
+        )
+
+    def test_check_source_keeps_portable_timing_and_contract_guards(self) -> None:
+        source = (REPO_ROOT / "dev.sh").read_text(encoding="utf-8")
+
+        self.assertIn("LC_ALL=C /usr/bin/time", source)
+        self.assertIn("GNU [Tt]ime", source)
+        self.assertIn("Resource timing parser failure", source)
+        self.assertIn("unset DEV_CHECK_CONTRACT_CHILD", source)
+        self.assertNotIn('if [[ "${DEV_CHECK_CONTRACT_CHILD', source)
+        self.assertIn(
+            'run_stage "dev check contract tests" 1 python3 tools/test_dev_check.py',
+            source,
         )
 
 

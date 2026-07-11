@@ -15,6 +15,8 @@
 #   tools/run-wasm-tests.sh                  # run all wasm tests
 #   tools/run-wasm-tests.sh wasm_tests::     # filter to wasm tests
 #   tools/run-wasm-tests.sh some_test_name   # filter to a single test
+#   tools/run-wasm-tests.sh --prepare FILE   # provision once for dev.sh
+#   tools/run-wasm-tests.sh --identity       # read-only current identity
 #
 # Requires: cargo; curl; unzip.
 
@@ -24,9 +26,37 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cache_dir="$repo_root/target/wasm-test-cache"
 versions_json="$cache_dir/known-good-versions.json"
 channels_json="$cache_dir/last-known-good-versions.json"
+prepared_identity="$cache_dir/prepared.identity"
+mode="run"
+prepare_output=""
+webdriver_source_json="${TYDE_WASM_WEBDRIVER_SOURCE_JSON:-${WASM_BINDGEN_TEST_WEBDRIVER_JSON:-}}"
+
+case "${1:-}" in
+    --prepare)
+        [[ $# -eq 2 ]] || {
+            printf 'Usage: %s --prepare <environment-output>\n' "$0" >&2
+            exit 2
+        }
+        mode="prepare"
+        prepare_output="$2"
+        ;;
+    --identity)
+        [[ $# -eq 1 ]] || {
+            printf 'Usage: %s --identity\n' "$0" >&2
+            exit 2
+        }
+        mode="identity"
+        ;;
+esac
 
 log() { printf '[run-wasm-tests] %s\n' "$*" >&2; }
 die() { log "error: $*"; exit 1; }
+
+[[ -z "${CHROME:-}" || -x "$CHROME" ]] || die "CHROME is not executable: $CHROME"
+[[ -z "${CHROMEDRIVER:-}" || -x "$CHROMEDRIVER" ]] ||
+    die "CHROMEDRIVER is not executable: $CHROMEDRIVER"
+[[ -z "${WASM_BINDGEN_TEST_RUNNER:-}" || -x "$WASM_BINDGEN_TEST_RUNNER" ]] ||
+    die "WASM_BINDGEN_TEST_RUNNER is not executable: $WASM_BINDGEN_TEST_RUNNER"
 
 refresh_cft_metadata() {
     mkdir -p "$cache_dir"
@@ -197,6 +227,50 @@ PY
     export WASM_BINDGEN_TEST_WEBDRIVER_JSON="$output_json"
 }
 
+write_prepared_environment() {
+    local output="$1"
+    local temporary="$output.tmp.$$"
+    local identity_output="$output.identity"
+    local identity_temporary="$identity_output.tmp.$$"
+    mkdir -p "$(dirname "$output")"
+    print_identity >"$identity_temporary"
+    mv "$identity_temporary" "$identity_output"
+    cp "$identity_output" "$prepared_identity.tmp.$$"
+    mv "$prepared_identity.tmp.$$" "$prepared_identity"
+    {
+        printf 'export TYDE_WASM_TOOLS_PREPARED=1\n'
+        printf 'export CHROME=%q\n' "$chrome_bin"
+        printf 'export CHROMEDRIVER=%q\n' "$driver_bin"
+        printf 'export WASM_BINDGEN_TEST_RUNNER=%q\n' "$runner_bin"
+        printf 'export TYDE_WASM_WEBDRIVER_SOURCE_JSON=%q\n' "$webdriver_source_json"
+        printf 'export WASM_BINDGEN_TEST_WEBDRIVER_JSON=%q\n' \
+            "$WASM_BINDGEN_TEST_WEBDRIVER_JSON"
+        printf 'export TYDE_WASM_IDENTITY_FILE=%q\n' "$identity_output"
+    } >"$temporary"
+    mv "$temporary" "$output"
+}
+
+print_identity() {
+    printf 'wasm.chrome.source=%s\n' "$chrome_source"
+    printf 'wasm.chrome.path=%s\n' "$chrome_bin"
+    printf 'wasm.chrome.version=%s\n' "$chrome_version_full"
+    printf 'wasm.chromedriver.source=%s\n' "$driver_source"
+    printf 'wasm.chromedriver.path=%s\n' "$driver_bin"
+    printf 'wasm.chromedriver.version=%s\n' "$driver_version"
+    printf 'wasm.bindgen.required=%s\n' "$wb_version"
+    printf 'wasm.bindgen.path=%s\n' "$runner_bin"
+    printf 'wasm.bindgen.version=%s\n' "$installed"
+    if [[ -n "$webdriver_source_json" ]]; then
+        [[ -f "$webdriver_source_json" ]] ||
+            die "WASM_BINDGEN_TEST_WEBDRIVER_JSON does not exist: $webdriver_source_json"
+        printf 'wasm.webdriver.source=%s\n' "$webdriver_source_json"
+        printf 'wasm.webdriver.identity=%s\n' \
+            "$(cksum "$webdriver_source_json" | awk '{ print $1 ":" $2 }')"
+    else
+        printf 'wasm.webdriver.source=default\n'
+    fi
+}
+
 # ── Platform detection ────────────────────────────────────────────────────
 case "$(uname -s)-$(uname -m)" in
     Darwin-arm64)  cft_platform="mac-arm64" ;;
@@ -209,18 +283,38 @@ esac
 # ── Locate Chrome and read its version ────────────────────────────────────
 chrome_bin=""
 downloaded_chrome=0
-if [[ "$(uname -s)" == "Darwin" ]]; then
+chrome_source=""
+if [[ -n "${CHROME:-}" ]]; then
+    [[ -x "$CHROME" ]] || die "CHROME is not executable: $CHROME"
+    chrome_bin="$CHROME"
+    chrome_source="override"
+elif [[ "${TYDE_WASM_TOOLS_PREPARED:-0}" == 1 ]]; then
+    die "prepared wasm tools require an explicit CHROME path"
+elif [[ "$(uname -s)" == "Darwin" ]]; then
     chrome_bin="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    [[ -x "$chrome_bin" ]] && chrome_source="system"
 else
     for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
         if command -v "$candidate" >/dev/null 2>&1; then
             chrome_bin="$(command -v "$candidate")"
+            chrome_source="system"
             break
         fi
     done
 fi
 
 if [[ ! -x "$chrome_bin" ]]; then
+    if [[ "$mode" == "identity" ]]; then
+        if [[ -s "$prepared_identity" ]]; then
+            cat "$prepared_identity"
+            exit 0
+        fi
+        printf 'wasm.chrome.source=unprovisioned-stable-cft\n'
+        printf 'wasm.platform=%s\n' "$cft_platform"
+        printf 'wasm.bindgen.required=%s\n' \
+            "$(awk '/^name = "wasm-bindgen"$/ { getline; sub(/version = "/, ""); sub(/"$/, ""); print; exit }' "$repo_root/Cargo.lock")"
+        exit 0
+    fi
     [[ -n "$cft_platform" ]] \
         || die "Google Chrome not found and Chrome for Testing is unavailable for $(uname -s)-$(uname -m)"
 
@@ -247,6 +341,7 @@ if [[ ! -x "$chrome_bin" ]]; then
     fi
 
     downloaded_chrome=1
+    chrome_source="chrome-for-testing"
 fi
 
 chrome_version_full="$("$chrome_bin" --version 2>/dev/null \
@@ -254,7 +349,6 @@ chrome_version_full="$("$chrome_bin" --version 2>/dev/null \
 [[ -n "$chrome_version_full" ]] || die "could not parse Chrome version"
 chrome_major="${chrome_version_full%%.*}"
 if [[ $downloaded_chrome -eq 1 ]]; then
-    write_webdriver_config "$chrome_bin"
     log "using Chrome for Testing $chrome_version_full at $chrome_bin"
 else
     log "detected Chrome $chrome_version_full (major $chrome_major)"
@@ -263,7 +357,14 @@ fi
 # ── Find or download a matching chromedriver ──────────────────────────────
 # Cache by major version. Chrome auto-updates within a major; chromedriver is
 # only required to match the major number per Chrome for Testing's policy.
-if [[ -z "$cft_platform" ]]; then
+driver_source=""
+if [[ -n "${CHROMEDRIVER:-}" ]]; then
+    [[ -x "$CHROMEDRIVER" ]] || die "CHROMEDRIVER is not executable: $CHROMEDRIVER"
+    driver_bin="$CHROMEDRIVER"
+    driver_source="override"
+elif [[ "${TYDE_WASM_TOOLS_PREPARED:-0}" == 1 ]]; then
+    die "prepared wasm tools require an explicit CHROMEDRIVER path"
+elif [[ -z "$cft_platform" ]]; then
     driver_bin=""
     for candidate in chromedriver \
         /snap/chromium/current/usr/lib/chromium-browser/chromedriver \
@@ -271,20 +372,32 @@ if [[ -z "$cft_platform" ]]; then
         if [[ "$candidate" == "chromedriver" ]]; then
             if command -v chromedriver >/dev/null 2>&1; then
                 driver_bin="$(command -v chromedriver)"
+                driver_source="system"
                 break
             fi
         elif [[ -x "$candidate" ]]; then
-            driver_bin="$candidate"
-            break
+                driver_bin="$candidate"
+                driver_source="system"
+                break
         fi
     done
     [[ -x "$driver_bin" ]] || die "chromedriver not found for $(uname -s)-$(uname -m)"
 else
     driver_dir="$cache_dir/chromedriver-$chrome_major-$cft_platform"
     driver_bin="$driver_dir/chromedriver"
+    driver_source="chrome-for-testing"
 fi
 
 if [[ -n "$cft_platform" && ! -x "$driver_bin" ]]; then
+    [[ "$mode" != "identity" ]] || {
+        printf 'wasm.chrome.source=%s\n' "$chrome_source"
+        printf 'wasm.chrome.path=%s\n' "$chrome_bin"
+        printf 'wasm.chrome.version=%s\n' "$chrome_version_full"
+        printf 'wasm.chromedriver.source=unprovisioned-for-major-%s\n' "$chrome_major"
+        printf 'wasm.bindgen.required=%s\n' \
+            "$(awk '/^name = "wasm-bindgen"$/ { getline; sub(/version = "/, ""); sub(/"$/, ""); print; exit }' "$repo_root/Cargo.lock")"
+        exit 0
+    }
     log "downloading chromedriver for Chrome major $chrome_major ($cft_platform)…"
     mkdir -p "$driver_dir"
     refresh_cft_metadata
@@ -317,6 +430,11 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 
 driver_version="$("$driver_bin" --version 2>/dev/null | head -n1)"
+driver_version_full="$(printf '%s' "$driver_version" \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+[[ -n "$driver_version_full" ]] || die "could not parse chromedriver version: $driver_version"
+[[ "${driver_version_full%%.*}" == "$chrome_major" ]] ||
+    die "Chrome $chrome_version_full and chromedriver $driver_version_full have different major versions"
 log "using $driver_version"
 
 # ── Ensure wasm-bindgen-test-runner is at the lockfile version ────────────
@@ -325,17 +443,61 @@ wb_version="$(awk '/^name = "wasm-bindgen"$/ { getline; sub(/version = "/, ""); 
 [[ -n "$wb_version" ]] || die "could not read wasm-bindgen version from Cargo.lock"
 
 needs_install=1
-if command -v wasm-bindgen-test-runner >/dev/null 2>&1; then
-    installed="$(wasm-bindgen-test-runner --version 2>/dev/null | awk '{print $NF}')"
+runner_bin=""
+if [[ -n "${WASM_BINDGEN_TEST_RUNNER:-}" ]]; then
+    [[ -x "$WASM_BINDGEN_TEST_RUNNER" ]] ||
+        die "WASM_BINDGEN_TEST_RUNNER is not executable: $WASM_BINDGEN_TEST_RUNNER"
+    runner_bin="$WASM_BINDGEN_TEST_RUNNER"
+elif command -v wasm-bindgen-test-runner >/dev/null 2>&1; then
+    runner_bin="$(command -v wasm-bindgen-test-runner)"
+fi
+if [[ -n "$runner_bin" ]]; then
+    installed="$("$runner_bin" --version 2>/dev/null | awk '{print $NF}')"
     [[ "$installed" == "$wb_version" ]] && needs_install=0
 fi
 if [[ $needs_install -eq 1 ]]; then
+    [[ "${TYDE_WASM_TOOLS_PREPARED:-0}" != 1 ]] ||
+        die "prepared wasm-bindgen-test-runner ${installed:-missing} does not match required $wb_version"
+    if [[ "$mode" == "identity" ]]; then
+        printf 'wasm.chrome.source=%s\n' "$chrome_source"
+        printf 'wasm.chrome.path=%s\n' "$chrome_bin"
+        printf 'wasm.chrome.version=%s\n' "$chrome_version_full"
+        printf 'wasm.chromedriver.source=%s\n' "$driver_source"
+        printf 'wasm.chromedriver.path=%s\n' "$driver_bin"
+        printf 'wasm.chromedriver.version=%s\n' "$driver_version"
+        printf 'wasm.bindgen.required=%s\n' "$wb_version"
+        printf 'wasm.bindgen.source=unprovisioned\n'
+        exit 0
+    fi
     log "installing wasm-bindgen-cli@$wb_version (this may take a minute)…"
     cargo install wasm-bindgen-cli --version "$wb_version" --locked
+    runner_bin="$(command -v wasm-bindgen-test-runner)"
+    installed="$("$runner_bin" --version 2>/dev/null | awk '{print $NF}')"
+    [[ "$installed" == "$wb_version" ]] ||
+        die "installed wasm-bindgen-test-runner $installed does not match required $wb_version"
+fi
+
+if [[ "$mode" == "identity" ]]; then
+    print_identity
+    exit 0
+fi
+
+if [[ "$mode" == "prepare" ]]; then
+    write_webdriver_config "$chrome_bin"
+    write_prepared_environment "$prepare_output"
+    print_identity
+    exit 0
+fi
+if [[ "${TYDE_WASM_TOOLS_PREPARED:-0}" == 1 ]]; then
+    [[ -f "${WASM_BINDGEN_TEST_WEBDRIVER_JSON:-}" ]] ||
+        die "prepared webdriver configuration is missing: ${WASM_BINDGEN_TEST_WEBDRIVER_JSON:-unset}"
+else
+    write_webdriver_config "$chrome_bin"
 fi
 
 # ── Run the tests ─────────────────────────────────────────────────────────
 export CHROMEDRIVER="$driver_bin"
+export PATH="$(dirname "$runner_bin"):$PATH"
 
 cd "$repo_root/frontend"
 log "running: cargo test --target wasm32-unknown-unknown $* (frontend)"

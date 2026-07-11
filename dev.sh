@@ -5,7 +5,7 @@ export PYTHONDONTWRITEBYTECODE=1
 
 cd "$(dirname "$0")"
 
-readonly DEV_CHECK_CACHE_SCHEMA="2"
+readonly DEV_CHECK_CACHE_SCHEMA="3"
 readonly DEV_CHECK_CACHE_DIR="target/dev-check-cache"
 readonly DEV_CHECK_LOG_DIR="target/dev-check-logs"
 readonly DEV_CHECK_LOCK_DIR="target/dev-check.lock"
@@ -24,6 +24,9 @@ CHECK_LOCK_HELD=false
 STAGE_NUMBER=0
 CLEANUP_RECLAIMED_BYTES=0
 SCCACHE_STATS_BEFORE=""
+SCCACHE_CONFIGURED=false
+WASM_CACHE_IDENTITY=""
+TIME_FLAVOR=""
 
 die() {
     printf 'ERROR: %s\n' "$1" >&2
@@ -79,12 +82,21 @@ finish_on_exit() {
         printf 'overall.duration_seconds=%s\n' \
             "$((finished_epoch - RUN_STARTED_EPOCH))" >>"$RUN_METADATA"
         record_disk_snapshot finish 2>/dev/null || true
+        if [[ "$SCCACHE_CONFIGURED" == true ]]; then
+            if sccache --show-stats --stats-format=json \
+                >"$RUN_DIR/sccache-failure.json" 2>/dev/null; then
+                printf 'sccache.failure_stats=%s\n' \
+                    "$PWD/$RUN_DIR/sccache-failure.json" >>"$RUN_METADATA"
+            fi
+        fi
     fi
     release_check_lock
 }
 
 trap finish_on_exit EXIT
-trap 'exit 130' INT TERM HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 acquire_check_lock() {
     local owner_pid=""
@@ -132,10 +144,20 @@ remove_old_entries() {
     local -a entries=()
 
     [[ -d "$directory" ]] || return 0
-    while IFS= read -r entry; do
+    while IFS=$'\t' read -r _ entry; do
         entries+=("$entry")
-    done < <(find "$directory" -mindepth 1 -maxdepth 1 -name "$pattern" \
-        -print 2>/dev/null | LC_ALL=C sort -r)
+    done < <(
+        {
+            while IFS= read -r entry; do
+                if [[ "$(uname -s)" == "Darwin" ]]; then
+                    printf '%s\t%s\n' "$(stat -f '%m' "$entry")" "$entry"
+                else
+                    printf '%s\t%s\n' "$(stat -c '%Y' "$entry")" "$entry"
+                fi
+            done < <(find "$directory" -mindepth 1 -maxdepth 1 -name "$pattern" \
+                -print 2>/dev/null)
+        } | LC_ALL=C sort -rn
+    )
 
     for entry in "${entries[@]}"; do
         count=$((count + 1))
@@ -148,12 +170,18 @@ remove_old_entries() {
 }
 
 cleanup_check_artifacts() {
-    local reclaimed
+    local reclaimed entry bytes
 
     remove_old_entries "$DEV_CHECK_LOG_DIR" 'run-*' "$((DEV_CHECK_LOG_RETENTION - 1))"
     remove_old_entries "$DEV_CHECK_CACHE_DIR" '*.success' "$DEV_CHECK_CACHE_RETENTION"
+    for entry in "$DEV_CHECK_CACHE_DIR"/.success.*; do
+        [[ -f "$entry" ]] || continue
+        bytes="$(directory_bytes "$entry")"
+        rm -f "$entry"
+        CLEANUP_RECLAIMED_BYTES=$((CLEANUP_RECLAIMED_BYTES + bytes))
+    done
     if [[ "$(uname -s)" == "Darwin" ]]; then
-        reclaimed="$(tools/run-nextest-binary.sh --cleanup-workspace)"
+        reclaimed="$(tools/run-nextest-binary.sh --cleanup-stale)"
         [[ "$reclaimed" =~ ^[0-9]+$ ]] ||
             die "nextest cleanup returned an invalid byte count: $reclaimed"
         CLEANUP_RECLAIMED_BYTES=$((CLEANUP_RECLAIMED_BYTES + reclaimed))
@@ -178,24 +206,49 @@ initialize_run_log() {
     record_disk_snapshot start
 }
 
+verify_time_tool() {
+    local probe_log="$RUN_DIR/time-probe.log"
+    if [[ ! -x /usr/bin/time ]]; then
+        printf 'GNU/BSD resource timer is required at /usr/bin/time\n' >"$probe_log"
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
+        if LC_ALL=C /usr/bin/time -l -o "$RUN_DIR/.time-probe" true \
+            >"$probe_log" 2>&1; then
+            TIME_FLAVOR="bsd"
+        fi
+    elif LC_ALL=C /usr/bin/time --version >"$probe_log" 2>&1 &&
+        grep -Eq 'GNU [Tt]ime' "$probe_log"; then
+        TIME_FLAVOR="gnu"
+    fi
+    rm -f "$RUN_DIR/.time-probe"
+    if [[ -z "$TIME_FLAVOR" ]]; then
+        printf 'FAIL  Verify portable resource timer\n' >&2
+        printf 'Complete diagnostics: %s\n' "$PWD/$probe_log" >&2
+        cat "$probe_log" >&2
+        printf 'setup.time.result=FAIL\nsetup.time.log=%s\n' \
+            "$PWD/$probe_log" >>"$RUN_METADATA"
+        exit 1
+    fi
+    printf 'setup.time.flavor=%s\n' "$TIME_FLAVOR" >>"$RUN_METADATA"
+}
+
 time_command() {
     local timing_file="$1"
     local output_file="$2"
     shift 2
 
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        /usr/bin/time -l -o "$timing_file" "$@" >>"$output_file" 2>&1
+    if [[ "$TIME_FLAVOR" == "bsd" ]]; then
+        LC_ALL=C /usr/bin/time -l -o "$timing_file" "$@" >>"$output_file" 2>&1
     else
-        /usr/bin/time -v -o "$timing_file" "$@" >>"$output_file" 2>&1
+        LC_ALL=C /usr/bin/time -v -o "$timing_file" "$@" >>"$output_file" 2>&1
     fi
 }
 
 timing_duration() {
     local timing_file="$1"
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        awk '$2 == "real" { print $1; exit }' "$timing_file"
+    if [[ "$TIME_FLAVOR" == "bsd" ]]; then
+        LC_ALL=C awk '$2 == "real" { print $1; exit }' "$timing_file"
     else
-        awk -F': ' '/Elapsed \(wall clock\) time/ {
+        LC_ALL=C awk -F': ' '/Elapsed \(wall clock\) time/ {
             split($2, parts, ":");
             if (length(parts) == 2) print parts[1] * 60 + parts[2];
             else print parts[1] * 3600 + parts[2] * 60 + parts[3];
@@ -206,10 +259,10 @@ timing_duration() {
 
 timing_peak_rss_bytes() {
     local timing_file="$1"
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        awk '/maximum resident set size/ { print $1; exit }' "$timing_file"
+    if [[ "$TIME_FLAVOR" == "bsd" ]]; then
+        LC_ALL=C awk '/maximum resident set size/ { print $1; exit }' "$timing_file"
     else
-        awk -F': ' '/Maximum resident set size/ { print $2 * 1024; exit }' "$timing_file"
+        LC_ALL=C awk -F': ' '/Maximum resident set size/ { print $2 * 1024; exit }' "$timing_file"
     fi
 }
 
@@ -217,7 +270,7 @@ run_stage() {
     local label="$1"
     local repetitions="$2"
     shift 2
-    local run status duration peak_rss timing_file
+    local run status duration peak_rss timing_file repetition_log parse_error
     local total_duration="0"
     local max_peak_rss=0
     local stage_log stage_slug
@@ -231,21 +284,41 @@ run_stage() {
 
     for ((run = 1; run <= repetitions; run++)); do
         timing_file="$RUN_DIR/.timing-$STAGE_NUMBER-$run"
-        printf '\n===== run %s/%s: ' "$run" "$repetitions" >>"$stage_log"
-        printf '%q ' "$@" >>"$stage_log"
-        printf '=====\n' >>"$stage_log"
-        if time_command "$timing_file" "$stage_log" "$@"; then
+        repetition_log="$RUN_DIR/.repetition-$STAGE_NUMBER-$run.log"
+        if ((repetitions > 1)); then
+            printf 'RUN   %s (%s/%s)\n' "$label" "$run" "$repetitions"
+        fi
+        printf '\n===== run %s/%s: ' "$run" "$repetitions" >"$repetition_log"
+        printf '%q ' "$@" >>"$repetition_log"
+        printf '=====\n' >>"$repetition_log"
+        if time_command "$timing_file" "$repetition_log" "$@"; then
             status=0
         else
             status=$?
         fi
-        duration="$(timing_duration "$timing_file")"
-        peak_rss="$(timing_peak_rss_bytes "$timing_file")"
-        rm -f "$timing_file"
+        duration="$(timing_duration "$timing_file" 2>/dev/null || true)"
+        peak_rss="$(timing_peak_rss_bytes "$timing_file" 2>/dev/null || true)"
+        parse_error=""
         [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
-            die "could not read wall timing for stage: $label"
+            parse_error="could not parse wall time"
         [[ "$peak_rss" =~ ^[0-9]+$ ]] ||
-            die "could not read peak RSS for stage: $label"
+            parse_error="${parse_error:+$parse_error; }could not parse peak RSS"
+        if [[ -n "$parse_error" ]]; then
+            {
+                printf '\nResource timing parser failure: %s\n' "$parse_error"
+                printf '%s\n' '----- raw timing output -----'
+                if [[ -f "$timing_file" ]]; then
+                    cat "$timing_file"
+                else
+                    printf 'timing output file was not created: %s\n' "$timing_file"
+                fi
+            } >>"$repetition_log"
+            status=125
+            duration="0"
+            peak_rss="0"
+        fi
+        rm -f "$timing_file"
+        cat "$repetition_log" >>"$stage_log"
         total_duration="$(awk -v total="$total_duration" -v value="$duration" \
             'BEGIN { printf "%.2f", total + value }')"
         ((peak_rss > max_peak_rss)) && max_peak_rss="$peak_rss"
@@ -253,16 +326,21 @@ run_stage() {
         if ((status != 0)); then
             printf 'FAIL  %s (%s/%s, %ss, peak RSS %s)\n' "$label" "$run" \
                 "$repetitions" "$total_duration" "$(format_bytes "$max_peak_rss")" >&2
-            printf 'Complete diagnostics: %s\n' "$PWD/$stage_log" >&2
-            cat "$stage_log" >&2
+            printf 'Failing repetition diagnostics: %s\n' "$PWD/$repetition_log" >&2
+            printf 'Complete stage log: %s\n' "$PWD/$stage_log" >&2
+            cat "$repetition_log" >&2
             printf 'stage.%02d.result=FAIL\n' "$STAGE_NUMBER" >>"$RUN_METADATA"
             printf 'stage.%02d.label=%s\n' "$STAGE_NUMBER" "$label" >>"$RUN_METADATA"
             printf 'stage.%02d.completed_runs=%s\n' "$STAGE_NUMBER" "$run" >>"$RUN_METADATA"
             printf 'stage.%02d.requested_runs=%s\n' "$STAGE_NUMBER" "$repetitions" >>"$RUN_METADATA"
             printf 'stage.%02d.duration_seconds=%s\n' "$STAGE_NUMBER" "$total_duration" >>"$RUN_METADATA"
             printf 'stage.%02d.peak_rss_bytes=%s\n' "$STAGE_NUMBER" "$max_peak_rss" >>"$RUN_METADATA"
+            printf 'stage.%02d.log=%s\n' "$STAGE_NUMBER" "$PWD/$stage_log" >>"$RUN_METADATA"
+            printf 'stage.%02d.failure_log=%s\n' "$STAGE_NUMBER" \
+                "$PWD/$repetition_log" >>"$RUN_METADATA"
             return "$status"
         fi
+        rm -f "$repetition_log"
     done
 
     printf 'PASS  %s (%s/%s, %ss, peak RSS %s)\n' "$label" "$repetitions" \
@@ -278,54 +356,74 @@ run_stage() {
     printf 'stage.%02d.log=%s\n' "$STAGE_NUMBER" "$PWD/$stage_log" >>"$RUN_METADATA"
 }
 
-prepare_rust_toolchain() {
-    local channel active
-
+rust_toolchain_channel() {
+    local channel
     channel="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
     [[ -n "$channel" && "$channel" != *$'\n'* ]] ||
         die "rust-toolchain.toml must declare exactly one channel"
     [[ "$channel" == "stable" ]] ||
         die "rust-toolchain.toml must declare the stable channel"
-    command -v rustup >/dev/null 2>&1 ||
-        die "rustup is required to update the repository Rust toolchain"
-    run_stage "Update stable Rust toolchain" 1 env -u RUSTUP_TOOLCHAIN rustup update "$channel"
-    run_stage "Install repository Rust toolchain" 1 env -u RUSTUP_TOOLCHAIN rustup toolchain install
-    export RUSTUP_TOOLCHAIN="$channel"
+    printf '%s\n' "$channel"
+}
+
+verify_active_rust_toolchain() {
+    local channel="$1"
+    local active
     active="$(rustup show active-toolchain)" ||
         die "could not resolve the active Rust toolchain"
     [[ "$active" == "$channel"-* ]] ||
         die "stable Rust is required by rust-toolchain.toml; active toolchain is $active"
 }
 
-configure_sccache() {
-    local executable repository_hash port stats
+prepare_rust_toolchain() {
+    local channel
+
+    channel="$(rust_toolchain_channel)"
+    command -v rustup >/dev/null 2>&1 ||
+        die "rustup is required to update the repository Rust toolchain"
+    run_stage "Update stable Rust toolchain" 1 env -u RUSTUP_TOOLCHAIN rustup update "$channel"
+    run_stage "Install repository Rust toolchain" 1 env -u RUSTUP_TOOLCHAIN rustup toolchain install
+    export RUSTUP_TOOLCHAIN="$channel"
+    verify_active_rust_toolchain "$channel"
+}
+
+set_sccache_environment() {
+    local executable repository_hash port name
 
     command -v sccache >/dev/null 2>&1 ||
         die "sccache $DEV_CHECK_SCCACHE_VERSION is required in PATH"
     executable="$(command -v sccache)"
-    [[ "$(sccache --version)" == "sccache $DEV_CHECK_SCCACHE_VERSION" ]] ||
-        die "sccache $DEV_CHECK_SCCACHE_VERSION is required; found $(sccache --version 2>&1)"
     repository_hash="$(printf '%s' "$PWD" | hash_text)"
-    port=$((45000 + 16#${repository_hash:0:4} % 1000))
+    port=$((20000 + 16#${repository_hash:0:8} % 30000))
 
-    unset SCCACHE_BUCKET SCCACHE_ENDPOINT SCCACHE_REDIS SCCACHE_MEMCACHED
-    unset SCCACHE_GCS_BUCKET SCCACHE_GCS_KEY_PATH SCCACHE_AZURE_CONNECTION_STRING
-    unset SCCACHE_WEBDAV_ENDPOINT SCCACHE_S3_USE_SSL SCCACHE_GHA_ENABLED
-    unset SCCACHE_OSS_BUCKET SCCACHE_COS_BUCKET
+    while IFS= read -r name; do
+        [[ "$name" == SCCACHE_* ]] && unset "$name"
+    done < <(compgen -e)
     export SCCACHE_DIR="$PWD/target/dev-check-sccache"
     export SCCACHE_CACHE_SIZE="$DEV_CHECK_SCCACHE_SIZE"
     export SCCACHE_IDLE_TIMEOUT=600
     export SCCACHE_SERVER_PORT="$port"
     export RUSTC_WRAPPER="$executable"
     export CARGO_INCREMENTAL=0
+}
+
+configure_sccache() {
+    local executable stats validation_script
+
+    executable="$RUSTC_WRAPPER"
     mkdir -p "$SCCACHE_DIR"
 
+    run_stage "Verify pinned sccache" 1 bash -c \
+        'actual="$(sccache --version 2>&1)"; [[ "$actual" == "sccache $1" ]] || { printf "required sccache %s; found %s\n" "$1" "$actual" >&2; exit 1; }' \
+        _ "$DEV_CHECK_SCCACHE_VERSION"
     run_stage "Connect pinned local sccache" 1 \
         sccache --show-stats --stats-format=json
+    SCCACHE_CONFIGURED=true
     stats="$RUN_DIR/sccache-before.json"
-    sccache --show-stats --stats-format=json >"$stats" ||
-        die "could not read sccache statistics"
-    python3 - "$stats" "$SCCACHE_DIR" "$DEV_CHECK_SCCACHE_SIZE_BYTES" <<'PY'
+    validation_script="$(cat <<'SCRIPT'
+set -euo pipefail
+sccache --show-stats --stats-format=json > "$1"
+python3 - "$1" "$2" "$3" <<'PY'
 import json
 import pathlib
 import sys
@@ -343,6 +441,10 @@ if data.get("max_cache_size") != int(expected_size):
         f"sccache cache limit is {data.get('max_cache_size')!r}, expected {expected_size}"
     )
 PY
+SCRIPT
+)"
+    run_stage "Validate pinned local sccache" 1 bash -c "$validation_script" \
+        _ "$stats" "$SCCACHE_DIR" "$DEV_CHECK_SCCACHE_SIZE_BYTES"
     SCCACHE_STATS_BEFORE="$stats"
     printf 'sccache.version=%s\n' "$DEV_CHECK_SCCACHE_VERSION" >>"$RUN_METADATA"
     printf 'sccache.executable=%s\n' "$executable" >>"$RUN_METADATA"
@@ -393,9 +495,11 @@ environment_identity() {
 
     while IFS= read -r name; do
         case "$name" in
+            TYDE_DEV_CHECK_LOCK_HELD | TYDE_WASM_*) continue ;;
+        esac
+        case "$name" in
             CI | HOME | PATH | PATHEXT | SHELL | USERPROFILE | LANG | LC_* | TZ | \
                 CLAUDE_CONFIG_DIR | HERMES_PYTHON | NO_COLOR | NODE_OPTIONS | \
-                WASM_BINDGEN_TEST_WEBDRIVER_JSON | CHROME* | CHROMEDRIVER | \
                 RUST* | CARGO* | NEXTEST* | SCCACHE* | \
                 TYDE* | CC | CXX | AR | CFLAGS | CPPFLAGS | CXXFLAGS | LDFLAGS | \
                 MACOSX_DEPLOYMENT_TARGET | SDKROOT | LD_LIBRARY_PATH | DYLD_* | \
@@ -426,54 +530,6 @@ environment_identity() {
     done
 }
 
-browser_identity() {
-    local chrome_bin=""
-    local chromedriver_bin=""
-    local chrome_version chrome_major platform
-
-    if [[ -n "${CHROME:-}" && -x "$CHROME" ]]; then
-        chrome_bin="$CHROME"
-    elif [[ "$(uname -s)" == "Darwin" && \
-        -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]]; then
-        chrome_bin="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    else
-        for chrome_bin in google-chrome google-chrome-stable chromium chromium-browser; do
-            if command -v "$chrome_bin" >/dev/null 2>&1; then
-                chrome_bin="$(command -v "$chrome_bin")"
-                break
-            fi
-        done
-    fi
-    [[ -x "$chrome_bin" ]] || die "could not resolve Chrome identity"
-    hash_command chrome "$chrome_bin" --version
-    chrome_version="$("$chrome_bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
-    [[ -n "$chrome_version" ]] || die "could not parse Chrome identity"
-    chrome_major="${chrome_version%%.*}"
-
-    if [[ -n "${CHROMEDRIVER:-}" && -x "$CHROMEDRIVER" ]]; then
-        chromedriver_bin="$CHROMEDRIVER"
-    else
-        case "$(uname -s)-$(uname -m)" in
-            Darwin-arm64) platform="mac-arm64" ;;
-            Darwin-x86_64) platform="mac-x64" ;;
-            Linux-x86_64) platform="linux64" ;;
-            *) platform="" ;;
-        esac
-        if [[ -n "$platform" && \
-            -x "target/wasm-test-cache/chromedriver-$chrome_major-$platform/chromedriver" ]]; then
-            chromedriver_bin="target/wasm-test-cache/chromedriver-$chrome_major-$platform/chromedriver"
-        elif command -v chromedriver >/dev/null 2>&1; then
-            chromedriver_bin="$(command -v chromedriver)"
-        fi
-    fi
-    if [[ -x "$chromedriver_bin" ]]; then
-        hash_command chromedriver "$chromedriver_bin" --version
-    else
-        printf 'tool.chromedriver.version=resolved-on-demand-for-chrome-%s\n' "$chrome_major"
-        printf 'tool.chromedriver.identity=resolved-by-tools-run-wasm-tests\n'
-    fi
-}
-
 cache_inputs() {
     local path
     local -a relevant_files=(
@@ -502,9 +558,9 @@ cache_inputs() {
     hash_command cargo cargo -Vv
     hash_command nextest cargo nextest --version
     hash_command node node --version
+    hash_command python3 python3 --version
     hash_command sccache sccache --version
-    hash_command wasm-bindgen-test-runner wasm-bindgen-test-runner --version
-    browser_identity
+    printf '%s\n' "$WASM_CACHE_IDENTITY"
     if command -v rustup >/dev/null 2>&1; then
         hash_command rustup rustup show active-toolchain
         hash_command rust-targets rustup target list --installed
@@ -577,10 +633,18 @@ print_cached_summary() {
 
 record_sccache_finish() {
     local after="$RUN_DIR/sccache-after.json"
-    local metrics
-    sccache --show-stats --stats-format=json >"$after" ||
-        die "could not read final sccache statistics"
-    metrics="$(python3 - "$SCCACHE_STATS_BEFORE" "$after" <<'PY'
+    local metrics metrics_file="$RUN_DIR/sccache-metrics.txt"
+    local error_log="$RUN_DIR/sccache-metrics-error.log"
+    if ! sccache --show-stats --stats-format=json >"$after" 2>"$error_log"; then
+        printf 'FAIL  Read final sccache statistics\n' >&2
+        printf 'Complete diagnostics: %s\n' "$PWD/$error_log" >&2
+        cat "$error_log" >&2
+        printf 'sccache.finish.result=FAIL\nsccache.finish.log=%s\n' \
+            "$PWD/$error_log" >>"$RUN_METADATA"
+        return 1
+    fi
+    if ! python3 - "$SCCACHE_STATS_BEFORE" "$after" >"$metrics_file" \
+        2>"$error_log" <<'PY'
 import json
 import sys
 
@@ -615,7 +679,16 @@ for name in ("requests", "hits", "misses", "errors", "writes"):
 print(f"cache_size={after.get('cache_size') or 0}")
 print(f"max_cache_size={after['max_cache_size']}")
 PY
-)"
+    then
+        printf 'FAIL  Parse final sccache statistics\n' >&2
+        printf 'Complete diagnostics: %s\n' "$PWD/$error_log" >&2
+        cat "$error_log" >&2
+        printf 'sccache.finish.result=FAIL\nsccache.finish.log=%s\n' \
+            "$PWD/$error_log" >>"$RUN_METADATA"
+        return 1
+    fi
+    rm -f "$error_log"
+    metrics="$(cat "$metrics_file")"
     while IFS= read -r line; do
         printf 'sccache.delta.%s\n' "$line" >>"$RUN_METADATA"
     done <<<"$metrics"
@@ -656,7 +729,7 @@ Usage: ./dev.sh check [--force | --no-cache | --explain-cache]
 
   --force         Ignore a cached success, run authoritative 3x tests, and cache success
   --no-cache      Run every stage once without reading or writing the cache
-  --explain-cache Print the canonical cache inputs and key without running checks
+  --explain-cache Print current canonical inputs/key without cleanup, network, or daemons
 USAGE
 }
 
@@ -667,6 +740,7 @@ check() {
     local cache_write=true
     local cache_state="miss"
     local inputs key record_path refreshed_inputs refreshed_key
+    local channel name wasm_environment
 
     if [[ $# -gt 1 ]]; then
         check_usage >&2
@@ -702,20 +776,53 @@ check() {
             ;;
     esac
 
+    unset DEV_CHECK_CONTRACT_CHILD
     unset TYDE_RUN_REAL_AI_TESTS
     unset TYDE_LIVE_CODEX_TEST
     unset TYDE_RUN_CLAUDE_INTEGRATION
+    while IFS= read -r name; do
+        [[ "$name" == TYDE_WASM_* ]] && unset "$name"
+    done < <(compgen -e)
 
     if [[ -n "${CI:-}" && "$mode" != "force" && "$mode" != "explain" ]]; then
         die "CI must invoke ./dev.sh check --force"
+    fi
+
+    if [[ "$mode" == "explain" ]]; then
+        channel="$(rust_toolchain_channel)"
+        command -v rustup >/dev/null 2>&1 || die "rustup is required"
+        export RUSTUP_TOOLCHAIN="$channel"
+        verify_active_rust_toolchain "$channel"
+        set_sccache_environment
+        [[ "$(sccache --version)" == "sccache $DEV_CHECK_SCCACHE_VERSION" ]] ||
+            die "sccache $DEV_CHECK_SCCACHE_VERSION is required for cache identity"
+        WASM_CACHE_IDENTITY="$(tools/run-wasm-tests.sh --identity)"
+        inputs="$(cache_inputs)"
+        key="$(cache_key_for_inputs "$inputs")"
+        record_path="$DEV_CHECK_CACHE_DIR/$key.success"
+        printf '%s\n' "Dev check cache inputs:" "$inputs"
+        printf 'cache.key=%s\n' "$key"
+        printf 'cache.record=%s\n' "$record_path"
+        return
     fi
 
     acquire_check_lock
     cleanup_check_artifacts
     initialize_run_log
     printf 'overall.cache_requested=%s\n' "$cache_state" >>"$RUN_METADATA"
+    verify_time_tool
     prepare_rust_toolchain
+    set_sccache_environment
     configure_sccache
+    wasm_environment="$RUN_DIR/wasm-tools.env"
+    run_stage "Provision wasm test tools" 1 \
+        tools/run-wasm-tests.sh --prepare "$wasm_environment"
+    [[ -f "$wasm_environment" ]] ||
+        die "wasm tool provisioning did not write $wasm_environment"
+    source "$wasm_environment"
+    [[ -f "$TYDE_WASM_IDENTITY_FILE" ]] ||
+        die "wasm tool provisioning did not write $TYDE_WASM_IDENTITY_FILE"
+    WASM_CACHE_IDENTITY="$(cat "$TYDE_WASM_IDENTITY_FILE")"
 
     command -v cargo-nextest >/dev/null 2>&1 ||
         die "cargo-nextest is required. Install it with: cargo install cargo-nextest --locked"
@@ -725,14 +832,6 @@ check() {
         key="$(cache_key_for_inputs "$inputs")"
         record_path="$DEV_CHECK_CACHE_DIR/$key.success"
         printf 'cache.key=%s\n' "$key" >>"$RUN_METADATA"
-    fi
-
-    if [[ "$mode" == "explain" ]]; then
-        printf '%s\n' "Dev check cache inputs:" "$inputs"
-        printf 'cache.key=%s\n' "$key"
-        printf 'cache.record=%s\n' "$record_path"
-        finish_success explain
-        return
     fi
 
     if [[ "$cache_read" == true ]] && cache_record_is_valid "$record_path" "$key"; then
@@ -760,10 +859,7 @@ check() {
     run_stage "wasm browser tests" "$repetitions" tools/run-wasm-tests.sh
     run_stage "web loader tests" "$repetitions" \
         bash -c 'cd web/loader && exec node --test test/*.test.js'
-    if [[ "${DEV_CHECK_CONTRACT_CHILD:-0}" != 1 ]]; then
-        run_stage "dev check contract tests" 1 env DEV_CHECK_CONTRACT_CHILD=1 \
-            python3 tools/test_dev_check.py
-    fi
+    run_stage "dev check contract tests" 1 python3 tools/test_dev_check.py
 
     if [[ "$cache_write" == true ]]; then
         refreshed_inputs="$(cache_inputs)"
@@ -790,10 +886,12 @@ case "${1:-}" in
     rust-toolchain)
         shift
         [[ $# -eq 0 ]] || die "rust-toolchain does not accept arguments"
-        channel="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
-        [[ "$channel" == "stable" ]] || die "rust-toolchain.toml must declare stable"
+        channel="$(rust_toolchain_channel)"
+        command -v rustup >/dev/null 2>&1 || die "rustup is required"
         env -u RUSTUP_TOOLCHAIN rustup update "$channel"
         env -u RUSTUP_TOOLCHAIN rustup toolchain install
+        export RUSTUP_TOOLCHAIN="$channel"
+        verify_active_rust_toolchain "$channel"
         ;;
     release)
         shift

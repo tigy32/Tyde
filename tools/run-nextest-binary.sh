@@ -5,7 +5,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
-    if [[ "${1:-}" == "--cleanup-workspace" ]]; then
+    if [[ "${1:-}" == "--cleanup-stale" ]]; then
         printf '0\n'
         exit 0
     fi
@@ -15,18 +15,51 @@ fi
 workspace_key="$(stat -f '%d-%i' "$repo_root")"
 cache_dir="${TMPDIR:-/tmp}/tyde-nextest/$workspace_key"
 
-if [[ "${1:-}" == "--cleanup-workspace" ]]; then
+if [[ "${1:-}" == "--cleanup-stale" ]]; then
     [[ "${TYDE_DEV_CHECK_LOCK_HELD:-0}" == 1 ]] || {
         printf '%s\n' \
             'Refusing nextest cleanup without the repository dev-check lock' >&2
         exit 1
     }
-    reclaimed_kib=0
+    before_kib=0
+    after_kib=0
+    [[ -d "$cache_dir" ]] &&
+        before_kib="$(du -sk "$cache_dir" | awk 'NR == 1 { print $1 }')"
     if [[ -d "$cache_dir" ]]; then
-        reclaimed_kib="$(du -sk "$cache_dir" | awk 'NR == 1 { print $1 }')"
-        rm -rf "$cache_dir"
+        for state_dir in "$cache_dir"/*.lock "$cache_dir"/*.use.*; do
+            [[ -d "$state_dir" ]] || continue
+            owner_pid="$(sed -n 's/^pid=//p' "$state_dir/owner" 2>/dev/null || true)"
+            if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+                rm -rf "$state_dir"
+            fi
+        done
+        count=0
+        while IFS=$'\t' read -r _ cached; do
+            [[ -f "$cached" ]] || continue
+            count=$((count + 1))
+            if ((count <= 64)); then
+                continue
+            fi
+            in_use=false
+            for lease in "$cached".use.*; do
+                [[ -d "$lease" ]] || continue
+                owner_pid="$(sed -n 's/^pid=//p' "$lease/owner" 2>/dev/null || true)"
+                if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
+                    in_use=true
+                elif [[ -z "$owner_pid" ]]; then
+                    in_use=true
+                fi
+            done
+            [[ "$in_use" == true ]] || rm -f "$cached"
+        done < <(
+            for cached in "$cache_dir"/*; do
+                [[ -f "$cached" ]] || continue
+                printf '%s\t%s\n' "$(stat -f '%m' "$cached")" "$cached"
+            done | LC_ALL=C sort -rn
+        )
+        after_kib="$(du -sk "$cache_dir" | awk 'NR == 1 { print $1 }')"
     fi
-    printf '%s\n' "$((reclaimed_kib * 1024))"
+    printf '%s\n' "$(((before_kib - after_kib) * 1024))"
     exit 0
 fi
 
@@ -48,12 +81,14 @@ cached_binary="$cache_dir/$logical_name.$binary_key"
 lock_dir="$cache_dir/$logical_name.lock"
 
 mkdir -p "$cache_dir"
+LOCK_HELD=false
 
 acquire_lock() {
     local attempt owner_pid
     for ((attempt = 1; attempt <= 200; attempt++)); do
         if mkdir "$lock_dir" 2>/dev/null; then
             printf 'pid=%s\n' "$$" >"$lock_dir/owner"
+            LOCK_HELD=true
             return
         fi
         owner_pid=""
@@ -74,8 +109,15 @@ acquire_lock() {
 }
 
 release_lock() {
-    rm -f "$lock_dir/owner"
-    rmdir "$lock_dir" 2>/dev/null || true
+    local owner_pid=""
+    if [[ "$LOCK_HELD" == true ]]; then
+        owner_pid="$(sed -n 's/^pid=//p' "$lock_dir/owner" 2>/dev/null || true)"
+        if [[ "$owner_pid" == "$$" ]]; then
+            rm -f "$lock_dir/owner"
+            rmdir "$lock_dir" 2>/dev/null || true
+        fi
+        LOCK_HELD=false
+    fi
 }
 
 stale_binary_is_in_use() {

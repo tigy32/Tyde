@@ -38,7 +38,9 @@ web-loader test stage three times; a cache hit prints the prior successful stage
 summary and does no validation work. Successful stages print only START/PASS,
 wall time, repetitions, and peak RSS. Complete stage output and metadata are
 retained in bounded `target/dev-check-logs/` runs; failures print the complete
-captured diagnostics and their log path without truncation. Use
+captured output for the failing repetition plus the complete stage-log path,
+without truncation. Repeated stages print a lightweight progress line before
+each run. Use
 `./dev.sh check --force` only where the release or CI workflow explicitly
 requires a cache-bypassing authoritative run. Do not use `--no-cache` unless the
 user explicitly asks for that diagnostic mode.
@@ -50,6 +52,13 @@ and never falls back when sccache setup is invalid. It may clean only bounded
 check logs, obsolete check cache records, and regenerable nextest test-binary
 clones for the same repository. It must never recursively scan or automatically
 clean shared Cargo targets.
+
+Before cache evaluation, the wrapper provisions Chrome, chromedriver, and the
+lockfile-pinned wasm-bindgen runner once through `tools/run-wasm-tests.sh` and
+then uses those exact paths for all wasm repetitions. Explicit `CHROME` and
+`CHROMEDRIVER` overrides are authoritative and invalid overrides fail. Cache
+explanation mode is read-only: it performs no cleanup, network provisioning, or
+daemon startup.
 
 Run `./dev.sh check` once after the worktree is final and before committing. If
 it fails, fix only from the diagnostics it returned, then rerun the same
