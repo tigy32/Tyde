@@ -59,8 +59,12 @@ global-timeout = "5m"
 # the suite.
 slow-timeout = "30s"
 retries = 0
-# Print failure output as soon as a test fails, and again in the final summary.
-failure-output = "immediate-final"
+# Keep the source runner concise; dev.sh retains the complete repetition log
+# and replays the complete failing repetition when this stage fails.
+status-level = "slow"
+final-status-level = "slow"
+success-output = "never"
+failure-output = "final"
 
 [[profile.default.scripts]]
 filter = "all()"
@@ -75,8 +79,10 @@ slow-timeout = "60s"
 # after the first failure so one bad test doesn't mask others.
 retries = 2
 fail-fast = false
-failure-output = "immediate-final"
+status-level = "slow"
 final-status-level = "slow"
+success-output = "never"
+failure-output = "final"
 
 [[profile.ci.scripts]]
 filter = "all()"

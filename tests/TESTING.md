@@ -27,6 +27,8 @@ The fixture:
 - Starts a server with a mock backend
 - Connects a client to that server
 - Provides helpers to drive conversations and collect events
+- Defaults tracing to `warn` when `RUST_LOG` is absent and preserves an
+  explicit `RUST_LOG` filter
 
 ### Mock Backend
 
@@ -69,6 +71,12 @@ async fn feature_name() {
 - **No fallbacks in test code** — if something fails, let it fail visibly
 - Tests are smoke tests — fast feedback that nothing is fundamentally broken
 
+The out-of-band worktree deletion test is the sole exception to immediate
+failure on an intervening command error. It accepts at most one fatal internal
+`project_watch` error from the deleted workbench's project stream, requires the
+message to name the exact deleted path, and still requires the matching project
+deletion notification. Every other error or event remains a failure.
+
 ## Repository Validation
 
 `./dev.sh check` is the only ordinary repository validation command. Do not
@@ -87,6 +95,11 @@ and check-local sccache metrics. Cache misses keep compile/lint stages at one
 run and native, wasm, and web-loader tests at three sequential runs. The
 dev-check contract suite itself is reached through the wrapper without
 recursively invoking the real check.
+
+Both nextest profiles report only slow test status, never emit successful test
+output, and defer failure output to nextest's final report. This keeps source
+output concise without weakening diagnostics: `dev.sh` still retains the full
+stage log and replays the complete failing repetition.
 
 Only one check may run in a repository at once; contention fails immediately.
 The wrapper uses pinned sccache 0.16.0 with a bounded local-only 10 GiB cache,

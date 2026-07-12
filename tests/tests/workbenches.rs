@@ -85,9 +85,36 @@ async fn expect_project_notify(
     context: &str,
 ) -> ProjectNotifyPayload {
     let env = expect_next_event(client, context).await;
-    assert_eq!(env.kind, FrameKind::ProjectNotify);
-    env.parse_payload()
-        .expect("failed to parse ProjectNotifyPayload")
+    match env.kind {
+        FrameKind::ProjectNotify => env.parse_payload().unwrap_or_else(|error| {
+            panic!(
+                "failed to parse ProjectNotifyPayload: context={context}, stream={}, kind={:?}, error={error}",
+                env.stream, env.kind
+            )
+        }),
+        FrameKind::CommandError => {
+            let error: CommandErrorPayload = env.parse_payload().unwrap_or_else(|parse_error| {
+                panic!(
+                    "failed to parse CommandErrorPayload while waiting for ProjectNotify: context={context}, stream={}, kind={:?}, error={parse_error}",
+                    env.stream, env.kind
+                )
+            });
+            panic!(
+                "expected ProjectNotify, got CommandError: context={context}, envelope_stream={}, stream={}, request_kind={:?}, operation={}, code={:?}, message={:?}, fatal={}",
+                env.stream,
+                error.stream,
+                error.request_kind,
+                error.operation,
+                error.code,
+                error.message,
+                error.fatal
+            );
+        }
+        kind => panic!(
+            "expected ProjectNotify: context={context}, stream={}, kind={kind:?}",
+            env.stream
+        ),
+    }
 }
 
 async fn expect_command_error(
@@ -564,9 +591,60 @@ async fn workbench_remove_succeeds_when_worktree_dir_was_deleted_out_of_band() {
         })
         .await
         .expect("workbench_remove write failed");
-    match expect_project_notify(&mut fixture.client, "missing worktree remove").await {
-        ProjectNotifyPayload::Delete { project } => assert_eq!(project.id, workbench.id),
-        other => panic!("expected workbench delete, got {other:?}"),
+    let expected_stream = protocol::StreamPath(format!("/project/{}", workbench.id));
+    let deleted_root = worktree_root.to_string_lossy();
+    let mut tolerated_watcher_error = false;
+    // The watcher can report the removed root before the host-stream delete.
+    // Accept only that source-confirmed project-stream failure and still
+    // require the matching delete notification.
+    loop {
+        let env = expect_next_event(&mut fixture.client, "missing worktree remove").await;
+        match env.kind {
+            FrameKind::ProjectNotify => {
+                let notify: ProjectNotifyPayload = env
+                    .parse_payload()
+                    .expect("parse ProjectNotifyPayload for missing worktree remove");
+                match notify {
+                    ProjectNotifyPayload::Delete { project } if project.id == workbench.id => break,
+                    other => panic!(
+                        "expected matching workbench delete: context=missing worktree remove, stream={}, kind={:?}, payload={other:?}",
+                        env.stream, env.kind
+                    ),
+                }
+            }
+            FrameKind::CommandError => {
+                let error: CommandErrorPayload = env
+                    .parse_payload()
+                    .expect("parse CommandErrorPayload for missing worktree remove");
+                assert!(
+                    !tolerated_watcher_error,
+                    "received duplicate watcher error: context=missing worktree remove, envelope_stream={}, stream={}, request_kind={:?}, operation={}, code={:?}, message={:?}, fatal={}",
+                    env.stream,
+                    error.stream,
+                    error.request_kind,
+                    error.operation,
+                    error.code,
+                    error.message,
+                    error.fatal
+                );
+                assert_eq!(env.stream, expected_stream, "unexpected envelope stream");
+                assert_eq!(error.stream, expected_stream, "unexpected payload stream");
+                assert_eq!(error.request_kind, FrameKind::ProjectFileList);
+                assert_eq!(error.operation, "project_watch");
+                assert_eq!(error.code, CommandErrorCode::Internal);
+                assert!(error.fatal, "watcher error must be fatal");
+                assert!(
+                    error.message.contains(deleted_root.as_ref()),
+                    "watcher error must name the exact deleted worktree path: path={deleted_root:?}, message={:?}",
+                    error.message
+                );
+                tolerated_watcher_error = true;
+            }
+            kind => panic!(
+                "expected workbench delete: context=missing worktree remove, stream={}, kind={kind:?}",
+                env.stream
+            ),
+        }
     }
 
     let worktrees = Command::new("git")

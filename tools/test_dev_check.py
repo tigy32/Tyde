@@ -692,6 +692,75 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         self.assertFalse(orphan.exists())
 
 
+class TestingBehaviorContractTests(unittest.TestCase):
+    def test_nextest_profiles_keep_source_output_concise(self) -> None:
+        source = (REPO_ROOT / ".config" / "nextest.toml").read_text(
+            encoding="utf-8"
+        )
+        expected = {
+            'status-level = "slow"',
+            'final-status-level = "slow"',
+            'success-output = "never"',
+            'failure-output = "final"',
+        }
+        for profile in ("default", "ci"):
+            body = source.split(f"[profile.{profile}]\n", 1)[1].split(
+                f"\n[[profile.{profile}.scripts]]", 1
+            )[0]
+            lines = [line.strip() for line in body.splitlines()]
+            for setting in expected:
+                self.assertEqual(
+                    lines.count(setting),
+                    1,
+                    f"profile {profile} must contain {setting}",
+                )
+
+    def test_fixture_tracing_defaults_to_warn_without_hiding_rust_log(self) -> None:
+        source = (REPO_ROOT / "tests" / "tests" / "fixture.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            ".with_default_directive(tracing_subscriber::filter::LevelFilter::WARN.into())",
+            source,
+        )
+        self.assertIn(".from_env_lossy()", source)
+        self.assertNotIn("EnvFilter::from_default_env()", source)
+
+    def test_workbench_watcher_exception_is_exact_and_test_local(self) -> None:
+        source = (REPO_ROOT / "tests" / "tests" / "workbenches.rs").read_text(
+            encoding="utf-8"
+        )
+        helper = source.split("async fn expect_project_notify", 1)[1].split(
+            "async fn expect_command_error", 1
+        )[0]
+        for diagnostic in (
+            "context={context}",
+            "envelope_stream={}",
+            "request_kind={:?}",
+            "operation={}",
+            "code={:?}",
+            "message={:?}",
+            "fatal={}",
+        ):
+            self.assertIn(diagnostic, helper)
+
+        test_body = source.split(
+            "async fn workbench_remove_succeeds_when_worktree_dir_was_deleted_out_of_band()",
+            1,
+        )[1].split("\n#[tokio::test]", 1)[0]
+        for exact_match in (
+            'assert_eq!(env.stream, expected_stream',
+            'assert_eq!(error.stream, expected_stream',
+            "assert_eq!(error.request_kind, FrameKind::ProjectFileList)",
+            'assert_eq!(error.operation, "project_watch")',
+            "assert_eq!(error.code, CommandErrorCode::Internal)",
+            "assert!(error.fatal",
+            "error.message.contains(deleted_root.as_ref())",
+        ):
+            self.assertIn(exact_match, test_body)
+        self.assertIn("!tolerated_watcher_error", test_body)
+
+
 class NextestWrapperContractTests(unittest.TestCase):
     def test_lock_release_requires_current_owner(self) -> None:
         source = (REPO_ROOT / "tools" / "run-nextest-binary.sh").read_text(
