@@ -11,7 +11,6 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use http::header::{HeaderName, HeaderValue};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use rumqttc::v5::mqttbytes::QoS;
@@ -26,8 +25,7 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 use crate::chunking::MAX_PLAINTEXT_CHUNK_LEN;
 use crate::config::{
-    LinkBrokerAuth, LinkBrokerConfig, LinkClientId, ManagedWssConnectStrategy, ParticipantRole,
-    link_broker_url, validate_websocket_header,
+    LinkBrokerAuth, LinkBrokerConfig, LinkClientId, ParticipantRole, link_broker_url,
 };
 use crate::error::{MqttTransportError, PublishRejection};
 use crate::link::{
@@ -355,59 +353,10 @@ fn mqtt_options_inner(
         LinkBrokerAuth::Legacy(BrokerAuth::UsernamePassword { username, password }) => {
             options.set_credentials(username.clone(), password.clone());
         }
-        LinkBrokerAuth::Managed(auth) => {
-            apply_managed_auth(&mut options, &parsed, auth)?;
-        }
+        LinkBrokerAuth::Managed(_) => {}
     }
 
     Ok(options)
-}
-
-fn apply_managed_auth(
-    options: &mut MqttOptions,
-    parsed: &url::Url,
-    auth: &ManagedWssConnectStrategy,
-) -> Result<(), MqttTransportError> {
-    if let Some((username, password)) = auth.mqtt_credentials() {
-        options.set_credentials(username.to_owned(), password.to_owned());
-    }
-
-    if auth.headers().is_empty() {
-        return Ok(());
-    }
-    if parsed.scheme() != "wss" {
-        return Err(MqttTransportError::Configuration {
-            message: "managed broker WebSocket headers require a wss:// broker endpoint".to_owned(),
-        });
-    }
-    let headers = auth
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            validate_websocket_header(name, value)?;
-            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-                MqttTransportError::Configuration {
-                    message: "managed broker WebSocket header name is invalid".to_owned(),
-                }
-            })?;
-            let value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| {
-                MqttTransportError::Configuration {
-                    message: "managed broker WebSocket header value is invalid".to_owned(),
-                }
-            })?;
-            Ok((name, value))
-        })
-        .collect::<Result<Vec<_>, MqttTransportError>>()?;
-    options.set_request_modifier(move |mut request| {
-        let headers = headers.clone();
-        async move {
-            for (name, value) in headers {
-                request.headers_mut().insert(name, value);
-            }
-            request
-        }
-    });
-    Ok(())
 }
 
 fn mqtt_plaintext_options(

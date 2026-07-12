@@ -6645,20 +6645,21 @@ mod search_serde_tests {
     #[test]
     fn managed_broker_credentials_round_trip_without_debug_secret_leak() {
         let mut headers = BTreeMap::new();
-        headers.insert("x-tycode-grant".to_owned(), "signed-grant-token".to_owned());
+        headers.insert(
+            "x-amz-customauthorizer-name".to_owned(),
+            "tycode-mobile-v1".to_owned(),
+        );
+        headers.insert("tycode-grant".to_owned(), "signed-grant-token".to_owned());
         let credentials = ManagedBrokerCredentials {
             grant_id: ManagedBrokerGrantId::new("grant_01J").expect("grant id"),
             client_id: ManagedBrokerClientId::new("tyde/prod/pair_01J/host/grant_01J")
                 .expect("client id"),
             connect: ManagedBrokerConnectAuth {
-                username: Some(
-                    "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant"
-                        .to_owned(),
-                ),
+                username: Some("tyde?x-amz-customauthorizer-name=tycode-mobile-v1".to_owned()),
                 password: Some("signed-grant-token".to_owned()),
                 websocket_url: Some(
                     BrokerUrl::new(
-                        "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=signed-grant-token"
+                        "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant-token"
                     )
                     .expect("websocket url"),
                 ),
@@ -6679,12 +6680,16 @@ mod search_serde_tests {
         assert_eq!(json["grant_id"], "grant_01J");
         assert_eq!(json["scope"]["role"], "host");
         assert_eq!(
-            json["connect"]["headers"]["x-tycode-grant"],
+            json["connect"]["headers"]["x-amz-customauthorizer-name"],
+            "tycode-mobile-v1"
+        );
+        assert_eq!(
+            json["connect"]["headers"]["tycode-grant"],
             "signed-grant-token"
         );
         assert_eq!(
             json["connect"]["websocket_url"],
-            "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=signed-grant-token"
+            "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant-token"
         );
         assert_eq!(
             serde_json::from_value::<ManagedBrokerCredentials>(json)
@@ -6702,7 +6707,7 @@ mod search_serde_tests {
             "debug output leaked managed broker websocket URL: {debug}"
         );
         assert!(
-            !debug.contains("tycode-grant") && !debug.contains("x-tycode-grant"),
+            !debug.contains("tycode-grant") && !debug.contains("x-amz-customauthorizer-name"),
             "debug output leaked managed broker grant/header details: {debug}"
         );
     }

@@ -903,10 +903,11 @@ impl std::fmt::Debug for ContractBrokerCredentials {
 
 #[derive(Clone, Deserialize)]
 struct ContractBrokerConnect {
-    username: String,
-    password: String,
+    username: Option<String>,
+    password: Option<String>,
     #[serde(default)]
     websocket_url: Option<protocol::BrokerUrl>,
+    #[serde(default)]
     headers: BTreeMap<String, String>,
 }
 
@@ -914,8 +915,8 @@ impl std::fmt::Debug for ContractBrokerConnect {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ContractBrokerConnect")
-            .field("username", &self.username)
-            .field("password", &"<redacted>")
+            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field(
                 "websocket_url",
                 &self.websocket_url.as_ref().map(|_| "<redacted>"),
@@ -1081,8 +1082,8 @@ impl ContractBrokerCredentials {
                 )
             })?,
             connect: ManagedBrokerConnectAuth {
-                username: Some(self.connect.username),
-                password: Some(self.connect.password),
+                username: self.connect.username,
+                password: self.connect.password,
                 websocket_url: self.connect.websocket_url,
                 headers: self.connect.headers,
             },
@@ -3851,11 +3852,12 @@ mod tests {
             "grant_id": "grant_01JSECRET",
             "client_id": "tyde/prod/pair_01J/host/grant_01JSECRET",
             "connect": {
-                "username": "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant",
+                "username": "tyde?x-amz-customauthorizer-name=tycode-mobile-v1",
                 "password": "signed-grant-secret",
-                "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=signed-grant-secret",
+                "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant-secret",
                 "headers": {
-                    "x-tycode-grant": "signed-grant-secret"
+                    "x-amz-customauthorizer-name": "tycode-mobile-v1",
+                    "tycode-grant": "signed-grant-secret"
                 }
             },
             "scope": {
@@ -3874,8 +3876,21 @@ mod tests {
 
         assert!(!debug.contains("signed-grant-secret"));
         assert!(!debug.contains("a1234567890-ats.iot.us-west-2.amazonaws.com"));
-        assert!(!debug.contains("x-tycode-grant"));
+        assert!(!debug.contains("x-amz-customauthorizer-name"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn managed_service_connect_dto_allows_omitted_unused_fields() {
+        let connect: ContractBrokerConnect = serde_json::from_value(serde_json::json!({
+            "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant-secret"
+        }))
+        .expect("connect DTO without unused fields");
+
+        assert!(connect.headers.is_empty());
+        assert!(connect.username.is_none());
+        assert!(connect.password.is_none());
+        assert!(connect.websocket_url.is_some());
     }
 
     #[tokio::test]
@@ -4050,15 +4065,22 @@ mod tests {
                 .expect("managed client id"),
             connect: ManagedBrokerConnectAuth {
                 username: Some(
-                    "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant"
-                        .to_owned(),
+                    "tyde?x-amz-customauthorizer-name=tycode-mobile-v1".to_owned(),
                 ),
                 password: Some(format!("signed-{grant_id}")),
-                websocket_url: None,
-                headers: BTreeMap::from([(
-                    "x-tycode-grant".to_owned(),
-                    format!("signed-{grant_id}"),
-                )]),
+                websocket_url: Some(
+                    BrokerUrl::new(format!(
+                        "wss://127.0.0.1:9/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-{grant_id}"
+                    ))
+                    .expect("managed websocket URL"),
+                ),
+                headers: BTreeMap::from([
+                    (
+                        "x-amz-customauthorizer-name".to_owned(),
+                        "tycode-mobile-v1".to_owned(),
+                    ),
+                    ("tycode-grant".to_owned(), format!("signed-{grant_id}")),
+                ]),
             },
             scope: ManagedBrokerCredentialScope {
                 namespace: ManagedBrokerTopicNamespace::new(namespace)
@@ -4815,10 +4837,12 @@ mod tests {
                 "grant_id": grant_id,
                 "client_id": format!("{namespace}/host/{grant_id}"),
                 "connect": {
-                    "username": "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant",
+                    "username": "tyde?x-amz-customauthorizer-name=tycode-mobile-v1",
                     "password": format!("signed-{grant_id}"),
+                    "websocket_url": format!("wss://127.0.0.1:9/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-{grant_id}"),
                     "headers": {
-                        "x-tycode-grant": format!("signed-{grant_id}")
+                        "x-amz-customauthorizer-name": "tycode-mobile-v1",
+                        "tycode-grant": format!("signed-{grant_id}")
                     }
                 },
                 "scope": {
@@ -4905,10 +4929,12 @@ mod tests {
                     "grant_id": "grant_01JMANAGED",
                     "client_id": format!("{namespace}/host/grant_01JMANAGED"),
                     "connect": {
-                        "username": "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant",
+                        "username": "tyde?x-amz-customauthorizer-name=tycode-mobile-v1",
                         "password": "signed-grant",
+                        "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant",
                         "headers": {
-                            "x-tycode-grant": "signed-grant"
+                            "x-amz-customauthorizer-name": "tycode-mobile-v1",
+                            "tycode-grant": "signed-grant"
                         }
                     },
                     "scope": {

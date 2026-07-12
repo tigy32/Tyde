@@ -662,17 +662,23 @@ mod tests {
     fn managed_credentials() -> ManagedBrokerCredentials {
         let mut headers = BTreeMap::new();
         headers.insert(
-            "x-tycode-grant".to_owned(),
-            "signed-grant-secret".to_owned(),
+            "x-amz-customauthorizer-name".to_owned(),
+            "tycode-mobile-v1".to_owned(),
         );
+        headers.insert("tycode-grant".to_owned(), "signed-grant-secret".to_owned());
         ManagedBrokerCredentials {
             grant_id: ManagedBrokerGrantId::new("grant_01J").expect("grant id"),
             client_id: ManagedBrokerClientId::new("tyde/prod/pair_01J/host/grant_01J")
                 .expect("client id"),
             connect: ManagedBrokerConnectAuth {
-                username: Some("x-amz-customauthorizer-name=tycode-mobile-v1".to_owned()),
+                username: Some("tyde?x-amz-customauthorizer-name=tycode-mobile-v1".to_owned()),
                 password: Some("signed-grant-secret".to_owned()),
-                websocket_url: None,
+                websocket_url: Some(
+                    BrokerUrl::new(
+                        "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant-secret",
+                    )
+                    .expect("websocket url"),
+                ),
                 headers,
             },
             scope: ManagedBrokerCredentialScope {

@@ -3756,7 +3756,6 @@ dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "hkdf",
- "http 1.4.0",
  "js-sys",
  "mqttbytes",
  "protocol",

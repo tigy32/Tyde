@@ -227,11 +227,12 @@ surface through server-owned state. It must not substitute any default broker.
   "grant_id": "grant_01J...",
   "client_id": "tyde/prod/pair_01J.../host/grant_01J...",
   "connect": {
-    "username": "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant",
+    "username": "tyde?x-amz-customauthorizer-name=tycode-mobile-v1",
     "password": "<tycode-signed-grant-jwt>",
-    "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=<tycode-signed-grant-jwt>",
+    "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=<tycode-signed-grant-jwt>",
     "headers": {
-      "x-tycode-grant": "<tycode-signed-grant-jwt>"
+      "x-amz-customauthorizer-name": "tycode-mobile-v1",
+      "tycode-grant": "<tycode-signed-grant-jwt>"
     }
   },
   "scope": {
@@ -250,9 +251,16 @@ service-issued `connect.websocket_url` for AWS IoT Core custom-authorizer
 connections. The base broker endpoint is validation context only and is never a
 connect fallback. A missing, malformed, or endpoint-mismatched
 `connect.websocket_url` is a terminal typed transport-configuration error.
-Optional MQTT username/password credentials must be supplied together, and
-native may also forward validated WebSocket headers. Both transports preserve
-the exact service-issued `client_id`, role, and scoped topic namespace.
+The current service response also includes `connect.username`,
+`connect.password`, and `connect.headers` for contract compatibility. Tyde
+retains those fields in the typed response but managed transports do not send
+them. Supplying the service username/password after a successful Upgrade causes
+AWS IoT to reject MQTT CONNECT without invoking the custom authorizer. Adding
+the `x-amz-customauthorizer-name` selector as an HTTP header alongside the query
+causes a pre-authorizer 403; `tycode-grant` is the token key/value, not another
+selector. Both native and browser therefore use the query-bearing WebSocket URL
+as the single authentication channel and preserve the exact service-issued
+`client_id`, role, and scoped topic namespace.
 
 The `rooms/+` filter is intentional for Tyde's managed **ephemeral** MQTT path.
 The stored Tyde room is a rendezvous channel only; during
@@ -351,11 +359,12 @@ Success response:
     "grant_id": "grant_01J...",
     "client_id": "tyde/prod/offer_01J.../host/grant_01J...",
     "connect": {
-      "username": "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant",
+      "username": "tyde?x-amz-customauthorizer-name=tycode-mobile-v1",
       "password": "<tycode-signed-grant-jwt>",
-      "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=<tycode-signed-grant-jwt>",
+      "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=<tycode-signed-grant-jwt>",
       "headers": {
-        "x-tycode-grant": "<tycode-signed-grant-jwt>"
+        "x-amz-customauthorizer-name": "tycode-mobile-v1",
+        "tycode-grant": "<tycode-signed-grant-jwt>"
       }
     },
     "scope": {
@@ -427,11 +436,12 @@ Redeemed response:
     "grant_id": "grant_01J...",
     "client_id": "tyde/prod/pair_01J.../host/grant_01J...",
     "connect": {
-      "username": "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant",
+      "username": "tyde?x-amz-customauthorizer-name=tycode-mobile-v1",
       "password": "<tycode-signed-grant-jwt>",
-      "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=<tycode-signed-grant-jwt>",
+      "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=<tycode-signed-grant-jwt>",
       "headers": {
-        "x-tycode-grant": "<tycode-signed-grant-jwt>"
+        "x-amz-customauthorizer-name": "tycode-mobile-v1",
+        "tycode-grant": "<tycode-signed-grant-jwt>"
       }
     },
     "scope": {
@@ -520,11 +530,12 @@ Success response:
     "grant_id": "grant_01J...",
     "client_id": "tyde/prod/pair_01J.../mobile/dev_01J.../grant_01J...",
     "connect": {
-      "username": "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant",
+      "username": "tyde?x-amz-customauthorizer-name=tycode-mobile-v1",
       "password": "<tycode-signed-grant-jwt>",
-      "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=<tycode-signed-grant-jwt>",
+      "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=<tycode-signed-grant-jwt>",
       "headers": {
-        "x-tycode-grant": "<tycode-signed-grant-jwt>"
+        "x-amz-customauthorizer-name": "tycode-mobile-v1",
+        "tycode-grant": "<tycode-signed-grant-jwt>"
       }
     },
     "scope": {
@@ -600,11 +611,12 @@ Success response:
     "grant_id": "grant_01J...",
     "client_id": "tyde/prod/pair_01J.../host/grant_01J...",
     "connect": {
-      "username": "x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant",
+      "username": "tyde?x-amz-customauthorizer-name=tycode-mobile-v1",
       "password": "<tycode-signed-grant-jwt>",
-      "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=<tycode-signed-grant-jwt>",
+      "websocket_url": "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=<tycode-signed-grant-jwt>",
       "headers": {
-        "x-tycode-grant": "<tycode-signed-grant-jwt>"
+        "x-amz-customauthorizer-name": "tycode-mobile-v1",
+        "tycode-grant": "<tycode-signed-grant-jwt>"
       }
     },
     "scope": {
@@ -758,9 +770,10 @@ rate limits before adding product counters.
 
 ## AWS IoT custom authorizer contract
 
-`tycode.dev` signs a short-lived broker grant. AWS IoT Core passes the grant to
-a custom authorizer on MQTT CONNECT. The authorizer returns an allow/deny policy
-that is scoped to the exact client id and topic namespace.
+`tycode.dev` signs a short-lived broker grant. Its selector and token are carried
+in the WebSocket Upgrade URL query. AWS IoT first returns HTTP 101, then resolves
+the named custom authorizer while processing MQTT CONNECT. The authorizer's
+allow/deny policy is scoped to the exact client id and topic namespace.
 
 ### Grant claims
 

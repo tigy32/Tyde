@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -58,48 +57,28 @@ pub(crate) enum LinkBrokerAuth {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ManagedWssConnectStrategy {
-    websocket_url: BrokerUrl,
-    mqtt_credentials: Option<ManagedMqttCredentials>,
-    headers: BTreeMap<String, String>,
+    upgrade_auth: ManagedWssUpgradeAuth,
 }
 
 #[derive(Clone, PartialEq, Eq)]
-enum ManagedMqttCredentials {
-    UsernamePassword { username: String, password: String },
+enum ManagedWssUpgradeAuth {
+    ServiceIssuedUrl(BrokerUrl),
 }
 
 impl fmt::Debug for ManagedWssConnectStrategy {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ManagedWssConnectStrategy")
-            .field("websocket_url", &"<redacted>")
-            .field(
-                "mqtt_credentials",
-                &self.mqtt_credentials.as_ref().map(|_| "<redacted>"),
-            )
-            .field("header_count", &self.headers.len())
+            .field("upgrade_auth", &"service-issued URL query")
             .finish()
     }
 }
 
 impl ManagedWssConnectStrategy {
-    pub(crate) fn websocket_url(&self) -> &BrokerUrl {
-        &self.websocket_url
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn mqtt_credentials(&self) -> Option<(&str, &str)> {
-        match &self.mqtt_credentials {
-            Some(ManagedMqttCredentials::UsernamePassword { username, password }) => {
-                Some((username, password))
-            }
-            None => None,
+    pub(crate) fn http_upgrade_url(&self) -> &BrokerUrl {
+        match &self.upgrade_auth {
+            ManagedWssUpgradeAuth::ServiceIssuedUrl(url) => url,
         }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn headers(&self) -> &BTreeMap<String, String> {
-        &self.headers
     }
 }
 
@@ -439,27 +418,8 @@ fn validate_managed_connect_auth(
         }
     })?;
     validate_managed_websocket_url_for_broker(websocket_url, broker)?;
-    let mqtt_credentials = match (&auth.username, &auth.password) {
-        (Some(username), Some(password)) => Some(ManagedMqttCredentials::UsernamePassword {
-            username: username.clone(),
-            password: password.clone(),
-        }),
-        (None, None) => None,
-        (Some(_), None) | (None, Some(_)) => {
-            return Err(MqttTransportError::Configuration {
-                message:
-                    "managed broker MQTT username and password must either both be present or both be absent"
-                        .to_owned(),
-            });
-        }
-    };
-    for (name, value) in &auth.headers {
-        validate_websocket_header(name, value)?;
-    }
     Ok(ManagedWssConnectStrategy {
-        websocket_url: websocket_url.clone(),
-        mqtt_credentials,
-        headers: auth.headers.clone(),
+        upgrade_auth: ManagedWssUpgradeAuth::ServiceIssuedUrl(websocket_url.clone()),
     })
 }
 
@@ -683,7 +643,7 @@ fn single_managed_query_value(
 
 pub(crate) fn link_broker_url(broker: &LinkBrokerConfig) -> &BrokerUrl {
     match &broker.auth {
-        LinkBrokerAuth::Managed(auth) => auth.websocket_url(),
+        LinkBrokerAuth::Managed(auth) => auth.http_upgrade_url(),
         LinkBrokerAuth::Legacy(_) => &broker.url,
     }
 }
@@ -750,44 +710,6 @@ pub(crate) fn encode_browser_connect_packet(
     Ok(buffer)
 }
 
-pub(crate) fn validate_websocket_header(name: &str, value: &str) -> Result<(), MqttTransportError> {
-    if name.is_empty() {
-        return Err(MqttTransportError::Configuration {
-            message: "managed broker WebSocket header name must not be empty".to_owned(),
-        });
-    }
-    if !name.bytes().all(is_http_header_name_byte) {
-        return Err(MqttTransportError::Configuration {
-            message: format!("managed broker WebSocket header name {name:?} is invalid"),
-        });
-    }
-    if !value
-        .bytes()
-        .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte))
-    {
-        return Err(MqttTransportError::Configuration {
-            message: format!("managed broker WebSocket header {name:?} has an invalid value"),
-        });
-    }
-    Ok(())
-}
-
-fn is_http_header_name_byte(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'!' | b'#'..=b'\''
-            | b'*'
-            | b'+'
-            | b'-'
-            | b'.'
-            | b'0'..=b'9'
-            | b'A'..=b'Z'
-            | b'^'..=b'z'
-            | b'|'
-            | b'~'
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -816,7 +738,11 @@ mod tests {
             ),
         };
         let mut headers = BTreeMap::new();
-        headers.insert("x-tycode-grant".to_owned(), "signed-grant".to_owned());
+        headers.insert(
+            "x-amz-customauthorizer-name".to_owned(),
+            "tycode-mobile-v1".to_owned(),
+        );
+        headers.insert("tycode-grant".to_owned(), "signed-grant".to_owned());
         ManagedMqttConnectConfig {
             broker: ManagedBrokerEndpoint {
                 endpoint: BrokerUrl::new("wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt")
@@ -830,11 +756,11 @@ mod tests {
                 grant_id: ManagedBrokerGrantId::new("grant_01J").expect("grant id"),
                 client_id: ManagedBrokerClientId::new(client_id).expect("client id"),
                 connect: ManagedBrokerConnectAuth {
-                    username: Some("x-amz-customauthorizer-name=tycode-mobile-v1".to_owned()),
+                    username: Some("tyde?x-amz-customauthorizer-name=tycode-mobile-v1".to_owned()),
                     password: Some("signed-grant".to_owned()),
                     websocket_url: Some(
                         BrokerUrl::new(
-                            "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=signed-grant"
+                            "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant"
                         )
                         .expect("websocket url"),
                     ),
@@ -1128,47 +1054,23 @@ mod tests {
     }
 
     #[test]
-    fn managed_connection_plan_rejects_invalid_headers_terminally() {
-        for (name, value) in [
-            ("invalid header", "signed-grant"),
-            ("x-tycode-grant", "line\r\nbreak"),
-        ] {
-            let mut config = managed_config(ParticipantRole::Host);
+    fn managed_transports_select_only_service_issued_websocket_upgrade_auth() {
+        let config = managed_config(ParticipantRole::Client);
+        assert_eq!(
             config
                 .credentials
                 .connect
                 .headers
-                .insert(name.to_owned(), value.to_owned());
-            let err = ConnectionPlan::managed(config).expect_err("invalid header must fail");
-            assert!(matches!(err, MqttTransportError::Configuration { .. }));
-            assert!(!err.is_retryable(), "invalid header must be terminal");
-            assert!(!err.to_string().contains(value));
-        }
-    }
-
-    #[test]
-    fn managed_auth_rejects_unpaired_mqtt_username_or_password() {
-        let mut config = managed_config(ParticipantRole::Client);
-        config.credentials.connect.username = None;
-        let err = ConnectionPlan::managed_ephemeral(config)
-            .expect_err("password without username must fail closed");
-        assert!(err.to_string().contains("both be present"));
-
-        let mut config = managed_config(ParticipantRole::Client);
-        config.credentials.connect.password = None;
-        let err = ConnectionPlan::managed_ephemeral(config)
-            .expect_err("username without password must fail closed");
-        assert!(err.to_string().contains("both be present"));
-    }
-
-    #[tokio::test]
-    async fn native_and_wasm_select_exact_managed_websocket_url() {
-        let plan = ConnectionPlan::managed_ephemeral(managed_config(ParticipantRole::Client))
-            .expect("managed plan");
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["tycode-grant", "x-amz-customauthorizer-name"]
+        );
+        let plan = ConnectionPlan::managed_ephemeral(config).expect("managed plan");
         let url = link_broker_url(&plan.broker);
         assert_eq!(
             url.as_str(),
-            "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&token-key-name=tycode-grant&tycode-grant=signed-grant"
+            "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant"
         );
         assert_ne!(
             url.as_str(),
@@ -1183,25 +1085,18 @@ mod tests {
             "tyde/prod/pair_01J/mobile/dev_01J/grant_01J"
         );
         assert!(
-            options.request_modifier().is_some(),
-            "native managed WebSocket headers must be wired into rumqttc"
+            options.request_modifier().is_none(),
+            "managed native WSS must not copy service connect.headers into the HTTP Upgrade"
         );
-        let modifier = options.request_modifier().expect("request modifier");
-        for _ in 0..2 {
-            let request = modifier(Default::default()).await;
-            assert_eq!(
-                request
-                    .headers()
-                    .get("x-tycode-grant")
-                    .and_then(|value| value.to_str().ok()),
-                Some("signed-grant")
-            );
-        }
+        assert!(
+            options.credentials().is_none(),
+            "managed native WSS must not copy service username/password into MQTT CONNECT"
+        );
 
         let debug = format!("{:?}", plan.broker);
         assert!(!debug.contains("signed-grant"));
         assert!(!debug.contains("tycode-grant"));
-        assert!(!debug.contains("x-tycode-grant"));
+        assert!(!debug.contains("x-amz-customauthorizer-name"));
     }
 
     #[test]
