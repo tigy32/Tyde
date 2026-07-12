@@ -1,7 +1,7 @@
 {
   "productName": "Tyde",
   "mainBinaryName": "tyde",
-  "version": "0.8.19-beta.27",
+  "version": "0.8.19-beta.28",
   "identifier": "com.tyde.app",
   "build": {
     "beforeDevCommand": "node ../tools/trunk-command.mjs serve --port 1420",
