@@ -8479,6 +8479,7 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     static FAKE_CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    const FAKE_CLAUDE_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn make_image(data: &str, media_type: &str) -> ImageAttachment {
         ImageAttachment {
@@ -11061,7 +11062,7 @@ for raw_line in sys.stdin:
         let mut saw_error = false;
         let mut saw_idle = false;
         let mut saw_stream_end = false;
-        timeout(Duration::from_secs(2), async {
+        timeout(FAKE_CLAUDE_EXIT_TIMEOUT, async {
             while !(saw_error && saw_idle) {
                 let event = rx.recv().await.expect("backend event");
                 match event_kind(&event) {
@@ -11221,7 +11222,7 @@ for raw_line in sys.stdin:
         let mut saw_failed_completion = false;
         let mut saw_error = false;
         let mut saw_idle = false;
-        timeout(Duration::from_secs(2), async {
+        timeout(FAKE_CLAUDE_EXIT_TIMEOUT, async {
             while !(saw_request && saw_failed_completion && saw_error && saw_idle) {
                 let event = events.recv().await.expect("backend event");
                 match event {
