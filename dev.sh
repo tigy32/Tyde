@@ -141,11 +141,15 @@ remove_old_entries() {
     local pattern="$2"
     local keep="$3"
     local count=0 entry bytes
-    local -a entries=()
 
     [[ -d "$directory" ]] || return 0
     while IFS=$'\t' read -r _ entry; do
-        entries+=("$entry")
+        count=$((count + 1))
+        if ((count > keep)); then
+            bytes="$(directory_bytes "$entry")"
+            rm -rf "$entry"
+            CLEANUP_RECLAIMED_BYTES=$((CLEANUP_RECLAIMED_BYTES + bytes))
+        fi
     done < <(
         {
             while IFS= read -r entry; do
@@ -158,15 +162,6 @@ remove_old_entries() {
                 -print 2>/dev/null)
         } | LC_ALL=C sort -rn
     )
-
-    for entry in "${entries[@]}"; do
-        count=$((count + 1))
-        if ((count > keep)); then
-            bytes="$(directory_bytes "$entry")"
-            rm -rf "$entry"
-            CLEANUP_RECLAIMED_BYTES=$((CLEANUP_RECLAIMED_BYTES + bytes))
-        fi
-    done
 }
 
 cleanup_check_artifacts() {

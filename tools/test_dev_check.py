@@ -691,6 +691,15 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         self.assertTrue(all(record.exists() for record in records[2:]))
         self.assertFalse(orphan.exists())
 
+    def test_empty_cleanup_directories_are_valid_under_nounset(self) -> None:
+        target = self.root / "target"
+        (target / "dev-check-logs").mkdir(parents=True)
+        (target / "dev-check-cache").mkdir()
+
+        result = self._run("--no-cache")
+
+        self.assertIn("RESULT PASS", result.stdout)
+
 
 class TestingBehaviorContractTests(unittest.TestCase):
     def test_nextest_profiles_keep_source_output_concise(self) -> None:
