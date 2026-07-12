@@ -360,11 +360,7 @@ fn read_terminal_output(
 
     loop {
         let read_start = leftover.len();
-        if read_start >= buf.len() {
-            emit_terminal_output(&event_tx, &leftover);
-            leftover.clear();
-            continue;
-        }
+        debug_assert!(read_start <= 3, "incomplete UTF-8 suffix exceeded 3 bytes");
         buf[..read_start].copy_from_slice(&leftover);
         leftover.clear();
 
@@ -379,7 +375,11 @@ fn read_terminal_output(
             Ok(n) => {
                 let total = read_start + n;
                 let data = &buf[..total];
-                let emit_end = safe_emit_end(data);
+                let emit_end = last_complete_utf8(data);
+                debug_assert!(
+                    total - emit_end <= 3,
+                    "incomplete UTF-8 suffix exceeded 3 bytes"
+                );
                 if emit_end == 0 {
                     leftover.extend_from_slice(data);
                     continue;
@@ -493,71 +493,97 @@ fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned())
 }
 
-fn safe_emit_end(data: &[u8]) -> usize {
-    let utf8_end = last_complete_utf8(data);
-    if utf8_end == 0 {
-        return 0;
-    }
-
-    let search_start = utf8_end.saturating_sub(64);
-    let window = &data[search_start..utf8_end];
-    if let Some(esc_offset) = window.iter().rposition(|&byte| byte == 0x1b) {
-        let esc_pos = search_start + esc_offset;
-        let seq = &data[esc_pos..utf8_end];
-        if !ansi_sequence_complete(seq) {
-            return esc_pos;
-        }
-    }
-
-    utf8_end
-}
-
 fn last_complete_utf8(data: &[u8]) -> usize {
-    let mut end = data.len();
-    let mut continuations = 0;
-    while end > 0 && continuations < 4 && (data[end - 1] & 0xC0) == 0x80 {
-        end -= 1;
-        continuations += 1;
+    let mut sequence_start = data.len();
+    while sequence_start > 0
+        && data.len() - sequence_start < 3
+        && (data[sequence_start - 1] & 0xC0) == 0x80
+    {
+        sequence_start -= 1;
     }
-    if end == 0 {
-        return 0;
+    if sequence_start == 0 {
+        return data.len();
     }
 
-    let lead = data[end - 1];
-    let expected_continuations = if lead < 0x80 {
-        0
-    } else if lead & 0xE0 == 0xC0 {
-        1
-    } else if lead & 0xF0 == 0xE0 {
-        2
-    } else if lead & 0xF8 == 0xF0 {
-        3
-    } else {
-        return data.len();
+    let lead_index = sequence_start - 1;
+    let sequence_width = match data[lead_index] {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return data.len(),
     };
 
-    if continuations == expected_continuations {
-        data.len()
+    if data.len() - lead_index < sequence_width {
+        lead_index
     } else {
-        end - 1
+        data.len()
     }
 }
 
-fn ansi_sequence_complete(seq: &[u8]) -> bool {
-    debug_assert_eq!(seq[0], 0x1b);
-    if seq.len() < 2 {
-        return false;
+#[cfg(test)]
+mod tests {
+    use super::last_complete_utf8;
+
+    fn emitted_chunks(reads: &[&[u8]], flush_pending: bool) -> Vec<String> {
+        let mut chunks = Vec::new();
+        let mut pending = Vec::new();
+
+        for read in reads {
+            pending.extend_from_slice(read);
+            let emit_end = last_complete_utf8(&pending);
+            assert!(pending.len() - emit_end <= 3);
+            if emit_end > 0 {
+                chunks.push(String::from_utf8_lossy(&pending[..emit_end]).into_owned());
+                pending.drain(..emit_end);
+            }
+        }
+
+        if flush_pending && !pending.is_empty() {
+            chunks.push(String::from_utf8_lossy(&pending).into_owned());
+        }
+
+        chunks
     }
 
-    match seq[1] {
-        b'[' => {
-            let last = seq[seq.len() - 1];
-            (0x40..=0x7E).contains(&last) && seq.len() > 2
+    #[test]
+    fn complete_csi_and_prompt_text_emit_immediately() {
+        let output = b"\x1b[2Kready\n$ ";
+        assert_eq!(emitted_chunks(&[output], false), vec!["\x1b[2Kready\n$ "]);
+    }
+
+    #[test]
+    fn split_ansi_is_not_aligned_by_the_server() {
+        let reads: &[&[u8]] = &[b"\x1b[", b"31mred", b"\x1b", b"[0m"];
+        let chunks = emitted_chunks(reads, false);
+        assert_eq!(chunks, vec!["\x1b[", "31mred", "\x1b", "[0m"]);
+        assert_eq!(chunks.concat(), "\x1b[31mred\x1b[0m");
+    }
+
+    #[test]
+    fn split_multibyte_utf8_reassembles_exactly() {
+        for expected in ["¢", "€", "🦀"] {
+            let bytes = expected.as_bytes();
+            let reads = bytes.iter().map(std::slice::from_ref).collect::<Vec<_>>();
+            assert_eq!(emitted_chunks(&reads, false), vec![expected]);
         }
-        b']' | b'P' | b'X' | b'^' | b'_' => {
-            seq.contains(&0x07) || seq.windows(2).any(|window| window == [0x1b, b'\\'])
-        }
-        0x40..=0x7E => true,
-        _ => true,
+    }
+
+    #[test]
+    fn complete_ascii_and_utf8_emit_immediately() {
+        assert_eq!(emitted_chunks(&[b"plain text"], false), vec!["plain text"]);
+        assert_eq!(
+            emitted_chunks(&["café 🦀".as_bytes()], false),
+            vec!["café 🦀"]
+        );
+    }
+
+    #[test]
+    fn eof_flushes_pending_partial_utf8_lossily() {
+        let partial_crab = &[0xF0, 0x9F, 0xA6];
+        assert_eq!(emitted_chunks(&[b"ok", partial_crab], false), vec!["ok"]);
+        assert_eq!(
+            emitted_chunks(&[b"ok", partial_crab], true),
+            vec!["ok", "�"]
+        );
     }
 }

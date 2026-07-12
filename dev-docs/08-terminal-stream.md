@@ -378,17 +378,17 @@ Rules:
 - `data` is an opaque terminal text chunk; the frontend writes it directly into
   the terminal emulator
 - the server must preserve chunk order
-- the server should not split a chunk in the middle of a UTF-8 code point
-- the server should not split a trailing incomplete ANSI escape sequence
-
-That last rule is worth calling out because the old implementation already hit
-this edge. We should carry that lesson forward.
+- every emitted chunk is a UTF-8-valid `String`; the server buffers only a
+  trailing incomplete UTF-8 code point, which is at most three bytes
+- ANSI escape sequences may split at any PTY read boundary
+- the terminal emulator is a stateful streaming consumer and owns ANSI parsing
+  across chunks
 
 What the frontend must not do:
 
 - parse prompts to discover cwd
 - infer command completion from output text
-- repair broken escape sequence boundaries
+- assume an ANSI escape sequence is contained in one `terminal_output` event
 
 ### 6.4 `terminal_exit`
 
@@ -617,13 +617,16 @@ Useful things to carry forward from `old/*`:
 - default shell selection by platform
 - login shell behavior on Unix
 - `TERM=xterm-256color`
-- guarding chunk boundaries so we do not split UTF-8 or incomplete ANSI escapes
+- buffering a trailing incomplete UTF-8 code point so protocol chunks remain
+  valid strings
 - explicit resize validation
 
 Things not to carry forward:
 
 - global terminal IDs echoed in every payload
 - request/response command semantics
+- server-side ANSI escape alignment or inference; stateful consumers already
+  accept ANSI sequences split across chunks
 - terminal state hidden behind ad hoc mutable maps without explicit stream
   ownership
 
