@@ -196,6 +196,7 @@ fn tycode_session_settings_schema() -> SessionSettingsSchema {
                 nullable: false,
             },
             use_slider: true,
+            select_options_by_setting: None,
         }],
     }
 }

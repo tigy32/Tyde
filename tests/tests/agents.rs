@@ -5622,6 +5622,48 @@ async fn spawn_without_name_generates_short_name_and_persists_alias() {
 }
 
 #[tokio::test]
+async fn failed_generated_name_prevents_agent_exposure() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "__mock_fail_agent_name__".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("failed generated-name spawn write");
+    let error =
+        expect_command_error(&mut fixture.client, "generated-name failure CommandError").await;
+    assert_eq!(error.operation, "spawn_agent");
+    assert_eq!(error.code, CommandErrorCode::Internal);
+    assert!(error.message.contains("mock agent name generation failure"));
+    expect_no_event(
+        &mut fixture.client,
+        Duration::from_millis(100),
+        "NewAgent after name generation failure",
+    )
+    .await;
+    let (_late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        bootstrap.agents.is_empty(),
+        "name generation failure must not appear in host bootstrap"
+    );
+}
+
+#[tokio::test]
 async fn agent_activity_summaries_default_off_stay_disabled() {
     let mut fixture = Fixture::new().await;
     assert!(

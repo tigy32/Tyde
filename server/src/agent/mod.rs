@@ -128,7 +128,6 @@ enum AgentCommand {
     },
     SetName {
         name: String,
-        persistence: AgentNamePersistence,
         reply: oneshot::Sender<bool>,
     },
     ReadOutput {
@@ -403,12 +402,6 @@ struct ReplayCompletedStream {
     stream: ReplayActiveStream,
     end: StreamEndData,
     post_end_events: Vec<ChatEvent>,
-}
-
-#[derive(Clone, Copy)]
-enum AgentNamePersistence {
-    User,
-    GeneratedIfNoUserAlias,
 }
 
 #[derive(Clone)]
@@ -896,23 +889,6 @@ impl AgentHandle {
             .tx
             .send(AgentCommand::SetName {
                 name,
-                persistence: AgentNamePersistence::User,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            return None;
-        }
-        reply_rx.await.ok()
-    }
-
-    pub async fn set_generated_name(&self, name: String) -> Option<bool> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .tx
-            .send(AgentCommand::SetName {
-                name,
-                persistence: AgentNamePersistence::GeneratedIfNoUserAlias,
                 reply: reply_tx,
             })
             .is_err()
@@ -1128,68 +1104,53 @@ pub(crate) async fn generate_agent_name(
         }
     };
 
+    let result = collect_agent_name_events(&mut events).await;
+    if let Err(err) = &result {
+        tracing::warn!(
+            backend_kind = ?request.backend_kind,
+            cost_hint = ?SpawnCostHint::Low,
+            prompt = %prompt,
+            name_prompt = %logged_name_prompt,
+            startup_mcp_servers = ?startup_mcp_server_names,
+            error = %err,
+            "agent name generator failed"
+        );
+    }
+    result
+}
+
+async fn collect_agent_name_events(events: &mut EventStream) -> Result<String, String> {
     let mut streamed_text = String::new();
-    let mut stream_delta_count = 0usize;
-    let mut chat_event_count = 0usize;
     while let Some(event) = events.recv().await {
-        chat_event_count += 1;
         match event {
             ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error) => {
-                tracing::warn!(
-                    backend_kind = ?request.backend_kind,
-                    cost_hint = ?SpawnCostHint::Low,
-                    prompt = %prompt,
-                    name_prompt = %logged_name_prompt,
-                    chat_event_count,
-                    stream_delta_count,
-                    startup_mcp_servers = ?startup_mcp_server_names,
-                    error_message = %message.content,
-                    "agent name generator received a backend error"
-                );
                 return Err(message.content);
             }
             ChatEvent::StreamDelta(delta) => {
-                stream_delta_count += 1;
                 streamed_text.push_str(&delta.text);
             }
             ChatEvent::StreamEnd(data) => {
                 let final_content = data.message.content;
-                let streamed_text_len = streamed_text.len();
                 let candidate = if final_content.trim().is_empty() {
-                    streamed_text
+                    std::mem::take(&mut streamed_text)
                 } else {
-                    final_content.clone()
+                    final_content
                 };
                 if candidate.trim().is_empty() {
-                    tracing::warn!(
-                        backend_kind = ?request.backend_kind,
-                        cost_hint = ?SpawnCostHint::Low,
-                        prompt = %prompt,
-                        name_prompt = %logged_name_prompt,
-                        chat_event_count,
-                        stream_delta_count,
-                        final_content_len = final_content.len(),
-                        streamed_text_len,
-                        startup_mcp_servers = ?startup_mcp_server_names,
-                        "agent name generator received an empty assistant response"
-                    );
+                    continue;
                 }
-                return Ok(name_generation_fallback(prompt, &candidate));
+                return sanitize_generated_agent_name(&candidate);
+            }
+            ChatEvent::TypingStatusChanged(false) => {
+                return Err(
+                    "agent name generator turn completed before producing a final response"
+                        .to_string(),
+                );
             }
             _ => {}
         }
     }
 
-    tracing::warn!(
-        backend_kind = ?request.backend_kind,
-        cost_hint = ?SpawnCostHint::Low,
-        prompt = %prompt,
-        name_prompt = %logged_name_prompt,
-        chat_event_count,
-        stream_delta_count,
-        startup_mcp_servers = ?startup_mcp_server_names,
-        "agent name generator ended before producing a final response"
-    );
     Err("agent name generator ended before producing a final response".to_string())
 }
 
@@ -1425,13 +1386,16 @@ fn activity_summary_attempted_tool_labels(
         .join(", ")
 }
 
-/// Type-erased backend handle. The actor loop only needs `send()` — this lets
-/// us dispatch to any concrete `Backend` at spawn time and forget the type.
+/// Type-erased backend handle for agent input and acknowledged settings edits.
 trait BackendSender: Send + 'static {
     fn send<'a>(
         &'a self,
         input: AgentInput,
     ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    fn update_session_settings<'a>(
+        &'a mut self,
+        payload: protocol::SetSessionSettingsPayload,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
     fn interrupt<'a>(&'a self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     fn shutdown(self: Box<Self>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 }
@@ -1442,6 +1406,13 @@ impl<B: Backend> BackendSender for B {
         input: AgentInput,
     ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
         Box::pin(Backend::send(self, input))
+    }
+
+    fn update_session_settings<'a>(
+        &'a mut self,
+        payload: protocol::SetSessionSettingsPayload,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(Backend::update_session_settings(self, payload))
     }
 
     fn interrupt<'a>(&'a self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
@@ -3164,9 +3135,16 @@ pub(crate) fn spawn_agent_actor(
                                         .await;
                                         continue;
                                     };
-                                    if let Err(err) =
-                                        validate_session_settings_values(session_schema, &update.values)
-                                    {
+                                    let mut updated_session_settings =
+                                        current_session_settings.clone();
+                                    apply_session_settings_update(
+                                        &mut updated_session_settings,
+                                        &update.values,
+                                    );
+                                    if let Err(err) = validate_session_settings_values(
+                                        session_schema,
+                                        &updated_session_settings,
+                                    ) {
                                         let payload = AgentErrorPayload {
                                             agent_id: current_start.agent_id.clone(),
                                             code: AgentErrorCode::Internal,
@@ -3203,15 +3181,31 @@ pub(crate) fn spawn_agent_actor(
                                         .await;
                                         continue;
                                     }
-                                    apply_session_settings_update(
-                                        &mut current_session_settings,
-                                        &update.values,
-                                    );
-                                    let _ = backend
-                                        .as_ref()
+                                    if let Err(err) = backend
+                                        .as_mut()
                                         .expect("backend must exist while actor is running")
-                                        .send(AgentInput::UpdateSessionSettings(update))
+                                        .update_session_settings(update)
+                                        .await
+                                    {
+                                        let payload = AgentErrorPayload {
+                                            agent_id: current_start.agent_id.clone(),
+                                            code: AgentErrorCode::BackendFailed,
+                                            message: format!(
+                                                "failed to apply session settings: {err}"
+                                            ),
+                                            fatal: false,
+                                        };
+                                        append_event(
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            FrameKind::AgentError,
+                                            &payload,
+                                        )
                                         .await;
+                                        continue;
+                                    }
+                                    current_session_settings = updated_session_settings;
                                     if let Err(err) = session_store
                                         .lock()
                                         .await
@@ -3327,7 +3321,6 @@ pub(crate) fn spawn_agent_actor(
                         }
                         AgentCommand::SetName {
                             name,
-                            persistence,
                             reply,
                         } => {
                             let applied = apply_agent_name_change(
@@ -3341,7 +3334,6 @@ pub(crate) fn spawn_agent_actor(
                                     subscribers: &mut subscribers,
                                 },
                                 name,
-                                persistence,
                             )
                             .await;
                             let _ = reply.send(applied);
@@ -3751,7 +3743,6 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         AgentCommand::SetName {
                             name,
-                            persistence,
                             reply,
                         } => {
                             let applied = apply_agent_name_change(
@@ -3765,7 +3756,6 @@ pub(crate) fn spawn_relay_agent_actor(
                                     subscribers: &mut subscribers,
                                 },
                                 name,
-                                persistence,
                             )
                             .await;
                             let _ = reply.send(applied);
@@ -4006,11 +3996,7 @@ async fn park_terminal_agent(
         };
         match command {
             AgentCommand::ResumeReplayBarrier { .. } => {}
-            AgentCommand::SetName {
-                name,
-                persistence,
-                reply,
-            } => {
+            AgentCommand::SetName { name, reply } => {
                 let applied = apply_agent_name_change(
                     AgentNameChangeContext {
                         session_store,
@@ -4022,7 +4008,6 @@ async fn park_terminal_agent(
                         subscribers,
                     },
                     name,
-                    persistence,
                 )
                 .await;
                 let _ = reply.send(applied);
@@ -4109,11 +4094,7 @@ async fn park_relay_terminal_agent(
         };
         match command {
             AgentCommand::ResumeReplayBarrier { .. } => {}
-            AgentCommand::SetName {
-                name,
-                persistence,
-                reply,
-            } => {
+            AgentCommand::SetName { name, reply } => {
                 let applied = apply_agent_name_change(
                     AgentNameChangeContext {
                         session_store,
@@ -4125,7 +4106,6 @@ async fn park_relay_terminal_agent(
                         subscribers,
                     },
                     name,
-                    persistence,
                 )
                 .await;
                 let _ = reply.send(applied);
@@ -4207,72 +4187,38 @@ async fn park_relay_terminal_agent(
     }
 }
 
-async fn apply_agent_name_change(
-    context: AgentNameChangeContext<'_>,
-    name: String,
-    persistence: AgentNamePersistence,
-) -> bool {
+async fn apply_agent_name_change(context: AgentNameChangeContext<'_>, name: String) -> bool {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return false;
     }
 
-    let persisted = if let Some(session_id) = context.session_id {
-        let persist_result = {
-            let store = context.session_store.lock().await;
-            match persistence {
-                AgentNamePersistence::User => store
-                    .set_user_alias(session_id, trimmed.to_string())
-                    .map(|_| true),
-                AgentNamePersistence::GeneratedIfNoUserAlias => {
-                    store.set_generated_alias_if_no_user_alias(session_id, trimmed.to_string())
-                }
-            }
-        };
-        match persist_result {
-            Ok(persisted) => persisted,
-            Err(err) => {
-                tracing::error!(
-                    "failed to persist renamed agent {}: {}",
-                    context.current_start.agent_id,
-                    err
-                );
-                let payload = AgentErrorPayload {
-                    agent_id: context.current_start.agent_id.clone(),
-                    code: AgentErrorCode::Internal,
-                    message: format!("failed to persist agent name: {err}"),
-                    fatal: false,
-                };
-                broadcast_live_event(context.subscribers, FrameKind::AgentError, &payload).await;
-                return false;
-            }
+    if let Some(session_id) = context.session_id {
+        if let Err(err) = context
+            .session_store
+            .lock()
+            .await
+            .set_user_alias(session_id, trimmed.to_string())
+        {
+            tracing::error!(
+                "failed to persist renamed agent {}: {}",
+                context.current_start.agent_id,
+                err
+            );
+            let payload = AgentErrorPayload {
+                agent_id: context.current_start.agent_id.clone(),
+                code: AgentErrorCode::Internal,
+                message: format!("failed to persist agent name: {err}"),
+                fatal: false,
+            };
+            broadcast_live_event(context.subscribers, FrameKind::AgentError, &payload).await;
+            return false;
         }
     } else {
-        match persistence {
-            AgentNamePersistence::User => {
-                *context.pending_alias = Some(InitialAgentAlias {
-                    name: trimmed.to_string(),
-                    persistence: InitialAgentAliasPersistence::User,
-                });
-                true
-            }
-            AgentNamePersistence::GeneratedIfNoUserAlias => {
-                if context.pending_alias.as_ref().is_some_and(|alias| {
-                    matches!(alias.persistence, InitialAgentAliasPersistence::User)
-                }) {
-                    false
-                } else {
-                    *context.pending_alias = Some(InitialAgentAlias {
-                        name: trimmed.to_string(),
-                        persistence: InitialAgentAliasPersistence::GeneratedIfNoUserAlias,
-                    });
-                    true
-                }
-            }
-        }
-    };
-    if !persisted {
-        return false;
+        *context.pending_alias = Some(InitialAgentAlias {
+            name: trimmed.to_string(),
+            persistence: InitialAgentAliasPersistence::User,
+        });
     }
 
     if context.current_start.name == trimmed {
@@ -5701,6 +5647,9 @@ pub(crate) fn derive_agent_name(prompt: &str) -> String {
 }
 
 fn generate_mock_name(prompt: &str) -> Result<String, String> {
+    if prompt.contains("__mock_fail_agent_name__") {
+        return Err("mock agent name generation failure".to_owned());
+    }
     let mut words = extract_name_words(prompt);
     if words.is_empty() {
         words = vec!["New".to_string(), "Agent".to_string(), "Task".to_string()];
@@ -5710,20 +5659,6 @@ fn generate_mock_name(prompt: &str) -> Result<String, String> {
         words.push("Task".to_string());
     }
     sanitize_generated_agent_name(&words.join(" "))
-}
-
-fn name_generation_fallback(prompt: &str, generated: &str) -> String {
-    match sanitize_generated_agent_name(generated) {
-        Ok(name) => name,
-        Err(err) => {
-            tracing::warn!(
-                "agent name generator produced invalid output {:?}: {}; falling back to prompt-derived name",
-                generated,
-                err
-            );
-            derive_agent_name(prompt)
-        }
-    }
 }
 
 fn sanitize_generated_agent_name(name: &str) -> Result<String, String> {
@@ -5833,7 +5768,7 @@ mod tests {
         GenerateAgentActivitySummaryRequest, InterruptOutcome, activity_history_snapshot,
         agent_usage_snapshot_from_log, append_chat_event, append_event, attach_subscriber,
         attach_subscriber_with_latest_output, collect_agent_activity_summary_events,
-        current_latest_output, generate_mock_name, known_turn_usage, name_generation_fallback,
+        collect_agent_name_events, current_latest_output, generate_mock_name, known_turn_usage,
         output_events_since, replay_envelope, sanitize_generated_agent_name,
         session_history_window, spawn_relay_agent_actor, upsert_activity_stats_snapshot,
     };
@@ -7005,20 +6940,84 @@ mod tests {
         );
     }
 
-    #[test]
-    fn name_generation_fallback_uses_prompt_when_generated_name_is_empty() {
+    fn generated_name_stream_end(content: &str, reasoning: Option<&str>) -> ChatEvent {
+        ChatEvent::StreamEnd(StreamEndData {
+            message: ChatMessage {
+                message_id: Some(ChatMessageId("generated-name".to_owned())),
+                timestamp: 0,
+                sender: MessageSender::Assistant {
+                    agent: "codex".to_owned(),
+                },
+                content: content.to_owned(),
+                reasoning: reasoning.map(|text| ReasoningData {
+                    text: text.to_owned(),
+                    tokens: None,
+                    signature: None,
+                    blob: None,
+                }),
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn generated_name_waits_past_reasoning_only_stream_end() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(generated_name_stream_end(
+            "",
+            Some("Choosing a concise title."),
+        ))
+        .expect("reasoning-only StreamEnd");
+        tx.send(ChatEvent::StreamDelta(StreamTextDeltaData {
+            message_id: Some("generated-name".to_owned()),
+            text: "Fix Login Flow".to_owned(),
+        }))
+        .expect("assistant name delta");
+        tx.send(generated_name_stream_end("Fix Login Flow", None))
+            .expect("assistant StreamEnd");
+        drop(tx);
+        let mut events = EventStream::new(rx);
+
         assert_eq!(
-            name_generation_fallback("please fix login flow", "   "),
+            collect_agent_name_events(&mut events).await.unwrap(),
             "Fix Login Flow"
         );
     }
 
-    #[test]
-    fn name_generation_fallback_uses_prompt_when_generated_name_has_wrong_shape() {
+    #[tokio::test]
+    async fn generated_name_empty_completion_fails_without_prompt_fallback() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(generated_name_stream_end("", Some("No final answer.")))
+            .expect("reasoning-only StreamEnd");
+        tx.send(ChatEvent::TypingStatusChanged(false))
+            .expect("turn completion");
+        let mut events = EventStream::new(rx);
+
+        let error = collect_agent_name_events(&mut events)
+            .await
+            .expect_err("empty completion must fail");
         assert_eq!(
-            name_generation_fallback("add project search filter", "project"),
-            "Add Project Search Filter"
+            error,
+            "agent name generator turn completed before producing a final response"
         );
+    }
+
+    #[tokio::test]
+    async fn generated_name_invalid_answer_fails_without_prompt_fallback() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(generated_name_stream_end("Project", None))
+            .expect("invalid assistant StreamEnd");
+        drop(tx);
+        let mut events = EventStream::new(rx);
+
+        let error = collect_agent_name_events(&mut events)
+            .await
+            .expect_err("invalid completion must fail");
+        assert!(error.contains("must contain 2-4 words"));
     }
 
     #[test]

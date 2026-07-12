@@ -2809,6 +2809,7 @@ fn session_settings_schema_from_known_models(
             label: "Model".to_string(),
             description: None,
             use_slider: false,
+            select_options_by_setting: None,
             field_type: protocol::SessionSettingFieldType::Select {
                 options,
                 default,

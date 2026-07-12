@@ -335,7 +335,7 @@ agy --model 'Gemini 3.5 Flash (Low)' --print-timeout 30s --dangerously-skip-perm
 
 fn cost_hint_for(backend_kind: BackendKind) -> Option<SpawnCostHint> {
     // Low keeps real-backend runs fast and cheap. Medium is a no-op (backend
-    // default), which for Codex means xhigh reasoning — too slow for tests.
+    // default), which may still be too slow for live probes.
     let _ = backend_kind;
     Some(SpawnCostHint::Low)
 }
@@ -1920,7 +1920,7 @@ async fn hermes_unavailable_dynamic_schema_with_supplied_settings_is_agent_error
 }
 
 #[tokio::test]
-async fn hermes_unavailable_dynamic_schema_with_tier_settings_is_agent_error() {
+async fn hermes_unavailable_dynamic_schema_rejects_tier_configuration() {
     init_tracing();
 
     let mut fixture = Fixture::new().await;
@@ -1956,88 +1956,21 @@ async fn hermes_unavailable_dynamic_schema_with_tier_settings_is_agent_error() {
         })
         .await
         .expect("set Hermes tier config");
-    loop {
-        let env = expect_fixture_event(&mut fixture.client, "Hermes tier HostSettings").await;
-        if env.kind == FrameKind::HostSettings {
-            break;
-        }
-    }
-
-    fixture
-        .client
-        .spawn_agent(SpawnAgentPayload {
-            name: Some("Hermes unavailable tier schema".to_string()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: Vec::new(),
-                prompt: "hello".to_string(),
-                images: None,
-                backend_kind: BackendKind::Hermes,
-                launch_profile_id: None,
-                cost_hint: Some(SpawnCostHint::Low),
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await
-        .expect("send Hermes spawn with tier settings and unavailable schema");
-
-    let new_agent = loop {
-        let env = expect_fixture_event(
-            &mut fixture.client,
-            "Hermes unavailable tier schema NewAgent",
-        )
-        .await;
-        match env.kind {
-            FrameKind::NewAgent => {
-                let payload: NewAgentPayload = env
-                    .parse_payload()
-                    .expect("parse Hermes unavailable tier schema NewAgent");
-                if payload.backend_kind == BackendKind::Hermes {
-                    break payload;
-                }
-            }
-            FrameKind::CommandError => {
-                let error = env
-                    .parse_payload::<CommandErrorPayload>()
-                    .expect("parse unexpected Hermes unavailable tier schema CommandError");
-                panic!(
-                    "Hermes unavailable tier schema should become agent startup failure, not CommandError: {error:?}"
-                );
-            }
-            _ => {}
-        }
-    };
-
-    let bootstrap: AgentBootstrapPayload = loop {
-        let env = expect_fixture_event(
-            &mut fixture.client,
-            "Hermes unavailable tier schema AgentBootstrap",
-        )
-        .await;
-        if env.kind == FrameKind::AgentBootstrap && env.stream == new_agent.instance_stream {
+    let error = loop {
+        let env = expect_fixture_event(&mut fixture.client, "Hermes tier CommandError").await;
+        if env.kind == FrameKind::CommandError {
             break env
-                .parse_payload()
-                .expect("parse Hermes unavailable tier schema AgentBootstrap");
+                .parse_payload::<CommandErrorPayload>()
+                .expect("parse Hermes tier CommandError");
         }
     };
-    let error = bootstrap
-        .events
-        .iter()
-        .find_map(|event| match event {
-            AgentBootstrapEvent::AgentError(error) => Some(error),
-            _ => None,
-        })
-        .expect("Hermes unavailable tier schema bootstrap must include AgentError");
-    assert_eq!(error.code, AgentErrorCode::BackendFailed);
-    assert!(error.fatal);
+    assert_eq!(error.code, protocol::CommandErrorCode::InvalidInput);
+    assert!(!error.fatal);
     assert!(
         error
             .message
             .contains("session settings schema unavailable"),
-        "unexpected Hermes unavailable tier schema error: {error:?}"
+        "unexpected Hermes tier configuration error: {error:?}"
     );
 }
 

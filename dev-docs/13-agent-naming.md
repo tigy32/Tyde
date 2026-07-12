@@ -38,7 +38,9 @@ The design must preserve the existing architectural rules:
 - No backend-specific naming semantics visible to the client.
 
 If automatic naming fails, `spawn_agent` fails visibly. The caller can retry
-with an explicit name.
+with an explicit name. The host returns a typed `CommandError` for
+`spawn_agent`, does not register the real agent, and emits no `NewAgent` or
+`AgentStart` carrying a provisional name.
 
 ---
 
@@ -280,6 +282,24 @@ The server then sanitizes the returned text:
 - validate the final result is 2-4 words
 
 If the result is invalid, the whole spawn fails.
+
+Backends may emit a completed reasoning-only display segment before the final
+assistant answer. An empty-content `StreamEnd` for such a segment is not a name
+generation result; the collector must continue until a completed assistant
+answer contains usable text. If the turn completes or the backend event stream
+ends first, name generation fails visibly and must not report a prompt-derived
+fallback as a successful generated name.
+
+This is intentionally different from retaining a prompt-derived provisional
+name with a warning: a warning would still make the failed helper look like a
+successful unnamed spawn. Tyde instead preserves the existing spawn UX while
+the helper is running, then either reveals the fully named agent or returns the
+typed spawn failure.
+
+The synchronous helper is bounded by a server-owned timeout. If backend startup,
+tool activity, or answer collection exceeds that bound, the host treats the
+timeout as generation failure and returns the same typed `spawn_agent`
+`CommandError`; it still registers and exposes no real agent.
 
 ### 7.4 Backend Interface
 

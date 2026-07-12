@@ -3180,6 +3180,45 @@ pub struct SessionSettingField {
     /// Options are treated as ordered positions (low→high). Defaults to false.
     #[serde(default)]
     pub use_slider: bool,
+    /// Select-option overrides keyed by another setting's selected value.
+    /// The options in `field_type` apply while that setting is unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub select_options_by_setting: Option<SelectOptionsBySetting>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectOptionsBySetting {
+    pub setting_key: String,
+    pub values: Vec<SelectOptionsForValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectOptionsForValue {
+    pub setting_value: String,
+    pub options: Vec<SelectOption>,
+}
+
+impl SessionSettingField {
+    pub fn select_options<'a>(
+        &'a self,
+        values: &'a SessionSettingsValues,
+    ) -> Option<&'a [SelectOption]> {
+        let SessionSettingFieldType::Select { options, .. } = &self.field_type else {
+            return None;
+        };
+        let Some(options_by_setting) = self.select_options_by_setting.as_ref() else {
+            return Some(options);
+        };
+        match values.0.get(&options_by_setting.setting_key) {
+            Some(SessionSettingValue::String(setting_value)) => options_by_setting
+                .values
+                .iter()
+                .find(|entry| entry.setting_value == *setting_value)
+                .map(|entry| entry.options.as_slice()),
+            Some(SessionSettingValue::Null) | None => Some(options),
+            Some(SessionSettingValue::Bool(_) | SessionSettingValue::Integer(_)) => None,
+        }
+    }
 }
 
 /// The type of a session setting field. Determines how the frontend renders it.

@@ -280,6 +280,7 @@ const ACTIVITY_SUMMARY_DEBOUNCE: Duration = Duration::from_secs(5);
 const ACTIVITY_SUMMARY_MAX_FREQUENCY: Duration = Duration::from_secs(60);
 const ACTIVITY_SUMMARY_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const ACTIVITY_SUMMARY_GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const AGENT_NAME_GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActivitySummarySettingsSignal {
@@ -2017,7 +2018,6 @@ impl HostHandle {
             Some(Err(err)) => (None, Some(err)),
             None => (None, None),
         };
-        let mut deferred_generated_name: Option<GenerateAgentNameRequest> = None;
         let host_settings = settings_store
             .lock()
             .await
@@ -2149,24 +2149,36 @@ impl HostHandle {
                         }),
                     ),
                     None => {
-                        let provisional = derive_agent_name(&prompt);
-                        if startup_failure.is_none()
+                        let generated = if startup_failure.is_none()
                             && host_settings
                                 .background_agent_features
                                 .auto_generate_agent_names
                         {
-                            deferred_generated_name = Some(GenerateAgentNameRequest {
-                                backend_kind,
-                                workspace_roots: workspace_roots.clone(),
-                                prompt: prompt.clone(),
-                                startup_mcp_servers: startup_mcp_servers.clone(),
-                                use_mock_backend,
-                            });
-                        }
+                            await_agent_name_generation(
+                                generate_agent_name(GenerateAgentNameRequest {
+                                    backend_kind,
+                                    workspace_roots: workspace_roots.clone(),
+                                    prompt: prompt.clone(),
+                                    startup_mcp_servers: startup_mcp_servers.clone(),
+                                    use_mock_backend,
+                                }),
+                                AGENT_NAME_GENERATION_TIMEOUT,
+                            )
+                            .await
+                            .map_err(|error| {
+                                AppError::internal_message(
+                                    "spawn_agent",
+                                    format!("automatic agent name generation failed: {error}"),
+                                    anyhow!(error),
+                                )
+                            })?
+                        } else {
+                            derive_agent_name(&prompt)
+                        };
                         (
-                            provisional.clone(),
+                            generated.clone(),
                             Some(InitialAgentAlias {
-                                name: provisional,
+                                name: generated,
                                 persistence: InitialAgentAliasPersistence::GeneratedIfNoUserAlias,
                             }),
                         )
@@ -2953,10 +2965,6 @@ impl HostHandle {
             "host spawn_agent completed"
         );
 
-        if let Some(request) = deferred_generated_name {
-            self.schedule_generated_agent_name(agent_id.clone(), request);
-        }
-
         Ok(agent_id)
     }
 
@@ -3030,6 +3038,34 @@ impl HostHandle {
                 request.cost_hint = None;
                 return request;
             }
+            (_, None) if request.backend_kind == protocol::BackendKind::Codex => {
+                let Some(schema) = request.session_settings_schema.as_ref() else {
+                    request.startup_failure = request.startup_failure.or_else(|| {
+                        Some(AgentStartupFailure::backend_failed(
+                            "Codex session settings schema unavailable; cannot resolve complexity tier",
+                        ))
+                    });
+                    request.cost_hint = None;
+                    return request;
+                };
+                let selected_values = request.session_settings.clone().unwrap_or_default();
+                let config = match crate::backend::codex::codex_tier_config_from_schema(
+                    schema,
+                    &selected_values,
+                ) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        request.startup_failure = request.startup_failure.or_else(|| {
+                            Some(AgentStartupFailure::backend_failed(format!(
+                                "failed to resolve Codex complexity tier from model metadata: {error}"
+                            )))
+                        });
+                        request.cost_hint = None;
+                        return request;
+                    }
+                };
+                tier_values_for_hint(hint, &config)
+            }
             // No user config for this backend: the backend's built-in
             // tier mapping applies via the cost hint as before.
             (_, None) => {
@@ -3077,12 +3113,19 @@ impl HostHandle {
             request.cost_hint = None;
             return request;
         }
-        let mut merged = match request.session_settings_schema.as_ref() {
-            Some(schema) => sanitize_session_settings_values(schema, &tier_values),
-            None => tier_values,
-        };
+        let mut merged = tier_values;
         if let Some(explicit) = request.session_settings.take() {
             apply_session_settings_update(&mut merged, &explicit);
+        }
+        if let Some(schema) = request.session_settings_schema.as_ref()
+            && let Err(error) = validate_session_settings_values(schema, &merged)
+        {
+            request.startup_failure = request.startup_failure.or_else(|| {
+                Some(AgentStartupFailure::internal(format!(
+                    "invalid complexity-tier session settings for backend {:?}: {error}",
+                    request.backend_kind
+                )))
+            });
         }
         request.session_settings = (!merged.0.is_empty()).then_some(merged);
         request.cost_hint = None;
@@ -5001,6 +5044,27 @@ impl HostHandle {
         if let protocol::HostSettingValue::MobileBrokerUrl { broker_url } = &payload.setting {
             crate::store::settings::validate_mobile_broker_url_for_write(broker_url.as_ref())
                 .map_err(|error| AppError::invalid(OPERATION, error))?;
+        }
+
+        if let protocol::HostSettingValue::BackendTiers { backend, config } = &payload.setting
+            && (!config.low.0.is_empty() || !config.high.0.is_empty())
+        {
+            let schema = {
+                let state = self.state.lock().await;
+                session_schema_for_backend(&state, *backend)
+            }
+            .ok_or_else(|| {
+                AppError::invalid(
+                    OPERATION,
+                    format!("{backend:?} session settings schema unavailable"),
+                )
+            })?;
+            validate_session_settings_values(&schema, &config.low).map_err(|error| {
+                AppError::invalid(OPERATION, format!("invalid Low tier: {error}"))
+            })?;
+            validate_session_settings_values(&schema, &config.high).map_err(|error| {
+                AppError::invalid(OPERATION, format!("invalid High tier: {error}"))
+            })?;
         }
 
         let mut state = self.state.lock().await;
@@ -7132,30 +7196,6 @@ impl HostHandle {
                         "agent startup channel dropped before session registration"
                     );
                 }
-            }
-        });
-    }
-
-    fn schedule_generated_agent_name(&self, agent_id: AgentId, request: GenerateAgentNameRequest) {
-        let host = self.clone();
-        tokio::spawn(async move {
-            let generated = match generate_agent_name(request).await {
-                Ok(name) => name,
-                Err(err) => {
-                    tracing::warn!(
-                        "background agent name generation failed for {}: {}",
-                        agent_id,
-                        err
-                    );
-                    return;
-                }
-            };
-
-            let Some(agent) = host.agent_handle(&agent_id).await else {
-                return;
-            };
-            if agent.set_generated_name(generated).await == Some(true) {
-                host.fan_out_session_lists().await;
             }
         });
     }
@@ -10424,12 +10464,25 @@ where
         Ok(result) => result,
         Err(_) => Err(format!(
             "activity summary generation timed out after {}",
-            activity_summary_timeout_label(timeout)
+            generation_timeout_label(timeout)
         )),
     }
 }
 
-fn activity_summary_timeout_label(timeout: Duration) -> String {
+async fn await_agent_name_generation<F>(generation: F, timeout: Duration) -> Result<String, String>
+where
+    F: Future<Output = Result<String, String>>,
+{
+    match tokio::time::timeout(timeout, generation).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "agent name generation timed out after {}",
+            generation_timeout_label(timeout)
+        )),
+    }
+}
+
+fn generation_timeout_label(timeout: Duration) -> String {
     if timeout.subsec_nanos() == 0 && timeout.as_secs() == 1 {
         return "1 second".to_owned();
     }
@@ -13996,6 +14049,18 @@ mod tests {
         .expect_err("pending summary generation should time out");
 
         assert_eq!(error, "activity summary generation timed out after 10 ms");
+    }
+
+    #[tokio::test]
+    async fn agent_name_generation_timeout_returns_error() {
+        let error = await_agent_name_generation(
+            std::future::pending::<Result<String, String>>(),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("pending agent name generation should time out");
+
+        assert_eq!(error, "agent name generation timed out after 10 ms");
     }
 
     #[tokio::test]

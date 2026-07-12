@@ -350,6 +350,7 @@ fn hermes_base_session_fields() -> Vec<SessionSettingField> {
                     .to_string(),
             ),
             use_slider: false,
+            select_options_by_setting: None,
             field_type: SessionSettingFieldType::Select {
                 options: vec![
                     SelectOption {
@@ -386,6 +387,7 @@ fn hermes_base_session_fields() -> Vec<SessionSettingField> {
             label: "Fast Mode".to_string(),
             description: Some("Request Hermes fast service tier when available.".to_string()),
             use_slider: false,
+            select_options_by_setting: None,
             field_type: SessionSettingFieldType::Toggle { default: false },
         },
     ]
@@ -2197,6 +2199,7 @@ fn session_settings_schema_from_model_options(
             "Hermes model from authenticated providers reported by model.options.".to_string(),
         ),
         use_slider: false,
+        select_options_by_setting: None,
         field_type: SessionSettingFieldType::Select {
             options: model_options,
             default: model_default,

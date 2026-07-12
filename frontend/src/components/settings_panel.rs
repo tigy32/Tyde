@@ -16,7 +16,7 @@ use protocol::{
     HostLaunchProfileConfig, HostSettingValue, LaunchProfileId, McpServerConfig, McpServerId,
     McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceState,
     MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState, ProjectId,
-    RunBackendSetupPayload, SelectOption, SessionSchemaEntry, SessionSettingFieldType,
+    RunBackendSetupPayload, SessionSchemaEntry, SessionSettingField, SessionSettingFieldType,
     SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, SetSettingPayload, Skill,
     SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
 };
@@ -24,7 +24,9 @@ use protocol::{
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
-use crate::components::session_settings::SessionSettingsControls;
+use crate::components::session_settings::{
+    SessionSettingsControls, clear_invalid_dependent_select_values,
+};
 use crate::send::{
     custom_agent_delete, custom_agent_upsert, mcp_server_delete, mcp_server_upsert,
     mobile_device_revoke, mobile_pairing_cancel, mobile_pairing_start, skill_refresh,
@@ -2541,9 +2543,7 @@ fn complexity_tier_rows(state: &AppState) -> Option<AnyView> {
                 .fields
                 .iter()
                 .filter_map(|field| match &field.field_type {
-                    SessionSettingFieldType::Select { options, .. } => {
-                        Some((field.key.clone(), field.label.clone(), options.clone()))
-                    }
+                    SessionSettingFieldType::Select { .. } => Some(field.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -2582,33 +2582,43 @@ fn tier_row(
     kind: BackendKind,
     is_high: bool,
     values: &SessionSettingsValues,
-    fields: &[(String, String, Vec<SelectOption>)],
+    fields: &[SessionSettingField],
 ) -> AnyView {
     let selects = fields
         .iter()
-        .map(|(key, label, options)| {
-            let current = match values.0.get(key) {
+        .map(|field| {
+            let current = match values.0.get(&field.key) {
                 Some(SessionSettingValue::String(value)) => value.clone(),
                 _ => String::new(),
             };
-            let option_views = options
+            let option_views = field
+                .select_options(values)
+                .unwrap_or_default()
                 .iter()
                 .map(|option| {
                     view! { <option value=option.value.clone()>{option.label.clone()}</option> }
                 })
                 .collect::<Vec<_>>();
             let state = state.clone();
-            let key = key.clone();
+            let key = field.key.clone();
+            let fields = fields.to_vec();
             view! {
                 <label class="settings-tier-select">
-                    <span class="settings-tier-select-label">{label.clone()}</span>
+                    <span class="settings-tier-select-label">{field.label.clone()}</span>
                     <select
                         class="settings-select"
                         prop:value=current
                         on:change=move |ev: web_sys::Event| {
                             let target = ev.target().unwrap();
                             let el: web_sys::HtmlSelectElement = target.unchecked_into();
-                            update_tier_setting(&state, kind, is_high, &key, el.value());
+                            update_tier_setting(
+                                &state,
+                                kind,
+                                is_high,
+                                &key,
+                                el.value(),
+                                &fields,
+                            );
                         }
                     >
                         <option value="">"Backend default"</option>
@@ -2633,6 +2643,7 @@ fn update_tier_setting(
     is_high: bool,
     key: &str,
     value: String,
+    fields: &[SessionSettingField],
 ) {
     let Some(mut settings) = state.selected_host_settings_untracked() else {
         return;
@@ -2653,6 +2664,7 @@ fn update_tier_setting(
             .0
             .insert(key.to_owned(), SessionSettingValue::String(value));
     }
+    clear_invalid_dependent_select_values(fields, tier_values);
     send_host_setting(
         state,
         HostSettingValue::BackendTiers {
@@ -6563,6 +6575,7 @@ mod wasm_tests {
     use super::*;
     use crate::state::AppState;
     use leptos::mount::mount_to;
+    use protocol::SelectOption;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::{HtmlElement, HtmlInputElement, HtmlOptionElement, HtmlSelectElement};
@@ -9384,6 +9397,7 @@ mod wasm_tests {
                                 nullable: false,
                             },
                             use_slider: false,
+                            select_options_by_setting: None,
                         }],
                     },
                 },

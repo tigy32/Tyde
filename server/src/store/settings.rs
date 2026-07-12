@@ -318,6 +318,9 @@ fn apply_setting(settings: &mut HostSettings, setting: HostSettingValue) -> Resu
             // the settings UI always shows the actual Low/High behavior.
             if enabled {
                 for kind in CANONICAL_BACKENDS {
+                    if kind == BackendKind::Codex {
+                        continue;
+                    }
                     settings
                         .backend_tier_configs
                         .entry(kind)
@@ -986,6 +989,12 @@ mod tests {
         assert_eq!(
             claude.high.0.get("effort"),
             Some(&SessionSettingValue::String("max".to_string()))
+        );
+        assert!(
+            !settings
+                .backend_tier_configs
+                .contains_key(&BackendKind::Codex),
+            "Codex built-in tiers must resolve from live model metadata"
         );
 
         // User edits survive a disable/enable cycle (no re-seeding over them).

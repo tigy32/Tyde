@@ -83,6 +83,19 @@ pub struct SessionSettingField {
     pub description: Option<String>,
     /// The type and constraints of this field.
     pub field_type: SessionSettingFieldType,
+    /// Optional select options keyed by another setting's selected value.
+    /// The field_type options apply while the controlling setting is unset.
+    pub select_options_by_setting: Option<SelectOptionsBySetting>,
+}
+
+pub struct SelectOptionsBySetting {
+    pub setting_key: String,
+    pub values: Vec<SelectOptionsForValue>,
+}
+
+pub struct SelectOptionsForValue {
+    pub setting_value: String,
+    pub options: Vec<SelectOption>,
 }
 
 /// The type of a session setting field. Determines how the frontend renders it.
@@ -151,7 +164,9 @@ keys are backend-defined, but the value side is fully typed.
 **Validation invariant:** The server validates every value against the field's
 `SessionSettingFieldType` before accepting it:
 - `Select` fields accept only `String(v)` where `v` matches an option value
-  (or `Null` if nullable).
+  (or `Null` if nullable). When `select_options_by_setting` is present, both
+  validation and the generic frontend use the options advertised for the
+  controlling setting's current value.
 - `Toggle` fields accept only `Bool(b)` (or `Null` to reset to default).
 - `Integer` fields accept only `Integer(n)` where `min <= n <= max`
   (or `Null` to reset to default).
@@ -240,9 +255,13 @@ pub struct BackendSpawnConfig {
 When complexity tiers are disabled, the host drops `cost_hint`; backend
 defaults apply. When tiers are enabled, the host validates and merges the
 configured tier values against the backend schema before spawning, or leaves
-the hint for the backend built-in tier fallback when no user tier config
-exists. Dynamic schema backends fail visibly if non-empty tier/default values
-would apply while their schema is unavailable.
+the hint for a static backend built-in tier fallback when no user tier config
+exists. Codex derives its built-in Low/High reasoning values from the ordered
+efforts advertised by its default model metadata. Dynamic schema backends fail
+visibly if non-empty tier/default values would apply while their schema is
+unavailable.
+Tier configuration writes are validated against the current schema and fail
+with a typed command error instead of persisting unsupported values.
 
 **`AgentInput`** — add variant for mid-session setting changes:
 
@@ -277,7 +296,11 @@ Each backend implements this to declare its supported settings. Examples:
 - `effort`: Select — low, medium, high, max (nullable: true)
 
 **Codex:**
-- `reasoning_effort`: Select — low, medium, high, xhigh (nullable: true)
+- `model`: Dynamic Select from Codex `model/list` metadata.
+- `reasoning_effort`: Dynamic Select from the selected model's ordered
+  `supportedReasoningEfforts` metadata (nullable: true). Values such as `max`
+  remain distinct from `xhigh`; Tyde does not invent or normalize effort
+  levels that the selected model did not advertise.
 
 **Antigravity:**
 - `model`: Select — exact `agy models` labels such as
@@ -394,8 +417,13 @@ The server:
 1. Validates the new values against the backend's schema.
 2. Merges with current settings (partial update).
 3. Forwards to the agent actor as `AgentInput::UpdateSessionSettings`.
-4. The agent actor forwards to the backend (via existing `SessionCommand::UpdateSettings` path).
-5. Emits the full effective settings back as `SessionSettings`.
+4. The agent actor waits for the backend to acknowledge the update; Codex does
+   not acknowledge until `thread/update` succeeds. This applies to fresh,
+   resumed, and forked Codex sessions; each session updates the live values
+   used by later `turn/start` calls only after that provider acknowledgement.
+5. Only after acknowledgement does it persist and emit the full effective
+   settings as `SessionSettings`. A provider rejection emits `AgentError` and
+   leaves the prior settings unchanged.
 
 If validation fails (unknown key, invalid value for a Select field), the server
 emits `AgentError { fatal: false, code: internal, message: "..." }` — the
@@ -445,9 +473,10 @@ fn collect_session_schemas(enabled: &[BackendKind]) -> Vec<SessionSchemaEntry> {
 The host validates all explicit, stored, and host-tier-derived session settings
 against the server-owned schema before spawning. When complexity tiers are
 disabled, `cost_hint` is dropped and backend defaults apply. When tiers are
-enabled, the host resolves configured tier values first; if no user tier config
-exists, the backend can apply its built-in tier fallback from the preserved
-hint.
+enabled, the host resolves configured tier values first. Static backends may
+apply a built-in fallback from the preserved hint; Codex resolves its fallback
+from the current dynamic model schema instead of hardcoding model or effort
+names.
 
 In the host/agent spawn path, before calling `Backend::spawn()`:
 

@@ -301,13 +301,28 @@ for line in sys.stdin:
             send({{
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {{"data": [{{"model": "gpt-5.5"}}]}}
+                "result": {{"data": [{{
+                    "model": "gpt-5.5",
+                    "isDefault": True,
+                    "supportedReasoningEfforts": [
+                        {{"reasoningEffort": "low"}},
+                        {{"reasoningEffort": "high"}}
+                    ]
+                }}]}}
             }})
         elif count == 1:
             send({{
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {{"data": [{{"model": "gpt-5.6"}}]}}
+                "result": {{"data": [{{
+                    "model": "gpt-5.6",
+                    "isDefault": True,
+                    "supportedReasoningEfforts": [
+                        {{"reasoningEffort": "low"}},
+                        {{"reasoningEffort": "xhigh"}},
+                        {{"reasoningEffort": "max"}}
+                    ]
+                }}]}}
             }})
         else:
             send({{
@@ -1002,6 +1017,20 @@ async fn codex_session_schema_refresh_replaces_models_and_surfaces_errors() {
     );
     assert_eq!(default, &None, "Auto must remain the model default");
     assert!(*nullable, "Auto must remain representable as null");
+    let first_reasoning_field = first_schema
+        .fields
+        .iter()
+        .find(|field| field.key == "reasoning_effort")
+        .expect("initial Codex reasoning field");
+    assert_eq!(
+        first_reasoning_field
+            .select_options(&SessionSettingsValues::default())
+            .expect("initial default-model reasoning options")
+            .iter()
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["low", "high"]
+    );
 
     let first_catalog_env = next_kind(
         &mut client,
@@ -1016,6 +1045,36 @@ async fn codex_session_schema_refresh_replaces_models_and_surfaces_errors() {
         launch_profile_entry(&first_catalog.catalog, "codex:gpt-5.6"),
         LaunchProfileEntry::Unavailable { message, .. } if message.contains("invalid session setting 'model' value 'gpt-5.6'")
     ));
+
+    let mut invalid_low = SessionSettingsValues::default();
+    invalid_low.0.insert(
+        "reasoning_effort".to_owned(),
+        SessionSettingValue::String("max".to_owned()),
+    );
+    client
+        .set_setting(SetSettingPayload {
+            setting: HostSettingValue::BackendTiers {
+                backend: BackendKind::Codex,
+                config: protocol::BackendTierConfig {
+                    low: invalid_low,
+                    high: SessionSettingsValues::default(),
+                },
+            },
+        })
+        .await
+        .expect("write invalid Codex tier config");
+    let tier_error = next_kind(
+        &mut client,
+        FrameKind::CommandError,
+        "invalid Codex tier CommandError",
+    )
+    .await
+    .parse_payload::<CommandErrorPayload>()
+    .expect("parse invalid Codex tier CommandError");
+    assert_eq!(tier_error.code, CommandErrorCode::InvalidInput);
+    assert!(tier_error.message.contains("invalid Low tier"));
+    assert!(tier_error.message.contains("reasoning_effort"));
+    assert!(tier_error.message.contains("max"));
 
     client
         .set_setting(SetSettingPayload {
@@ -1058,6 +1117,21 @@ async fn codex_session_schema_refresh_replaces_models_and_surfaces_errors() {
             .collect::<Vec<_>>(),
         vec!["gpt-5.6"],
         "refreshed metadata must replace the old process-lifetime model list"
+    );
+    let refreshed_reasoning_field = refreshed_schema
+        .fields
+        .iter()
+        .find(|field| field.key == "reasoning_effort")
+        .expect("refreshed Codex reasoning field");
+    assert_eq!(
+        refreshed_reasoning_field
+            .select_options(&SessionSettingsValues::default())
+            .expect("refreshed default-model reasoning options")
+            .iter()
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["low", "xhigh", "max"],
+        "Codex reasoning options must preserve model metadata order and max"
     );
 
     let refreshed_catalog_env = next_kind(

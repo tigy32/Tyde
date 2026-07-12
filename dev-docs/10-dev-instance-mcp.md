@@ -647,6 +647,26 @@ goal is to keep the instance stable until explicitly restarted.
 
 Do not spread launcher assumptions across the shell, frontend, and driver.
 
+### Shell Navigation Guard
+
+`tauri-shell` opens `http`/`https` navigations in the system browser instead of
+the webview, except for the app's own origins. The dev frontend origin is one of
+those app origins, and it must be derived from the build config
+(`build.devUrl`), not hardcoded.
+
+Both launchers override `build.devUrl` with a freshly reserved loopback port and
+pass the generated config through `tauri dev --config`, which the Tauri CLI
+forwards to the shell build as `TAURI_CONFIG`. The shell therefore reads its own
+configured dev URL at runtime and treats only that origin (plus the standard
+`tauri.localhost`/`asset.localhost` origins) as internal. A shell that assumed
+port 1420 sent every MCP-launched instance's first navigation to the system
+browser, so the webview never loaded and UI-debug readiness never arrived.
+
+The whitelist stays narrow: scheme, host, and port must all match the configured
+dev URL, loopback aliases (`127.0.0.1`, `localhost`, `::1`) are interchangeable
+only when the configured dev host is itself loopback, and the dev origin is
+recognized only in debug builds.
+
 ---
 
 ## What We Should Not Rebuild

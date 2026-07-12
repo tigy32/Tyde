@@ -143,6 +143,7 @@ impl Backend for AntigravityBackend {
                 label: "Model".to_string(),
                 description: None,
                 use_slider: false,
+                select_options_by_setting: None,
                 field_type: SessionSettingFieldType::Select {
                     options: antigravity_known_models(),
                     default: Some(ANTIGRAVITY_DEFAULT_MODEL.to_string()),

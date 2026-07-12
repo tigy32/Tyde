@@ -11,6 +11,34 @@ use crate::components::agents_panel::backend_label;
 use crate::components::chat_message::{format_compact, token_badge_data};
 use crate::state::AppState;
 
+pub(crate) fn clear_invalid_dependent_select_values(
+    fields: &[protocol::SessionSettingField],
+    values: &mut SessionSettingsValues,
+) {
+    for field in fields {
+        if field.select_options_by_setting.is_none() {
+            continue;
+        }
+        let Some(SessionSettingValue::String(selected)) = values.0.get(&field.key) else {
+            continue;
+        };
+        let selected = selected.clone();
+        let valid = field
+            .select_options(values)
+            .is_some_and(|options| options.iter().any(|option| option.value == selected));
+        if !valid
+            && matches!(
+                &field.field_type,
+                SessionSettingFieldType::Select { nullable: true, .. }
+            )
+        {
+            values
+                .0
+                .insert(field.key.clone(), SessionSettingValue::Null);
+        }
+    }
+}
+
 #[component]
 pub fn SessionSettingsControls(
     schema: SessionSettingsSchema,
@@ -18,6 +46,7 @@ pub fn SessionSettingsControls(
     on_change: Callback<SessionSettingsValues>,
 ) -> impl IntoView {
     let fields = schema.fields.clone();
+    let all_fields = schema.fields;
 
     view! {
         <div class="session-settings">
@@ -27,7 +56,16 @@ pub fn SessionSettingsControls(
                 let description = field.description.clone();
                 let field_type = field.field_type.clone();
                 let use_slider = field.use_slider;
+                let field_for_options = field.clone();
+                let available_options = Memo::new(move |_| {
+                    let current = values.get();
+                    field_for_options
+                        .select_options(&current)
+                        .unwrap_or_default()
+                        .to_vec()
+                });
                 let on_change_cb = on_change;
+                let all_fields = all_fields.clone();
 
                 view! {
                     <div
@@ -36,26 +74,21 @@ pub fn SessionSettingsControls(
                     >
                         <span class="session-setting-label">{label}</span>
                         {match field_type {
-                            SessionSettingFieldType::Select { options, default, nullable } if use_slider => {
-                                // Build ordered entries: optional "Auto" at index 0, then each option.
-                                let entries: Vec<(String, String)> = {
+                            SessionSettingFieldType::Select { options: _, default, nullable } if use_slider => {
+                                let entries = Memo::new(move |_| {
                                     let mut v = Vec::new();
                                     if nullable {
                                         v.push((String::new(), "Auto".to_string()));
                                     }
-                                    for opt in &options {
+                                    for opt in available_options.get() {
                                         v.push((opt.value.clone(), opt.label.clone()));
                                     }
                                     v
-                                };
-                                let entries_for_read = entries.clone();
-                                let entries_for_change = entries.clone();
-                                let max_idx = (entries.len().saturating_sub(1)) as i64;
+                                });
 
                                 let current_idx = {
                                     let key = key.clone();
                                     let default = default.clone();
-                                    let entries = entries_for_read.clone();
                                     Signal::derive(move || {
                                         let vals = values.get();
                                         let current_val = match vals.0.get(&key) {
@@ -69,31 +102,42 @@ pub fn SessionSettingsControls(
                                             }
                                             _ => String::new(),
                                         };
+                                        let entries = entries.get();
                                         entries.iter().position(|(v, _)| v == &current_val)
                                             .unwrap_or(0) as i64
                                     })
                                 };
 
-                                let current_label = {
-                                    let entries = entries_for_read.clone();
-                                    move || {
-                                        let idx = current_idx.get() as usize;
-                                        entries.get(idx).map(|(_, l)| l.clone()).unwrap_or_default()
-                                    }
+                                let current_label = move || {
+                                    let idx = current_idx.get() as usize;
+                                    entries
+                                        .get()
+                                        .get(idx)
+                                        .map(|(_, label)| label.clone())
+                                        .unwrap_or_default()
                                 };
 
                                 let on_slider_change = {
                                     let key = key.clone();
+                                    let all_fields = all_fields.clone();
                                     move |ev: leptos::ev::Event| {
                                         let text = event_target_value(&ev);
                                         if let Ok(idx) = text.parse::<usize>() {
                                             let mut current = values.get_untracked();
-                                            if let Some((val, _)) = entries_for_change.get(idx) {
+                                            if let Some((val, _)) = entries
+                                                .get_untracked()
+                                                .get(idx)
+                                                .cloned()
+                                            {
                                                 if val.is_empty() {
                                                     current.0.insert(key.clone(), SessionSettingValue::Null);
                                                 } else {
-                                                    current.0.insert(key.clone(), SessionSettingValue::String(val.clone()));
+                                                    current.0.insert(key.clone(), SessionSettingValue::String(val));
                                                 }
+                                                clear_invalid_dependent_select_values(
+                                                    &all_fields,
+                                                    &mut current,
+                                                );
                                                 on_change_cb.run(current);
                                             }
                                         }
@@ -106,7 +150,7 @@ pub fn SessionSettingsControls(
                                             type="range"
                                             class="session-setting-slider"
                                             min="0"
-                                            max=max_idx.to_string()
+                                            max=move || entries.get().len().saturating_sub(1).to_string()
                                             step="1"
                                             prop:value=move || current_idx.get().to_string()
                                             on:input=on_slider_change
@@ -115,9 +159,8 @@ pub fn SessionSettingsControls(
                                     </div>
                                 }.into_any()
                             }
-                            SessionSettingFieldType::Select { options, default, nullable } => {
+                            SessionSettingFieldType::Select { options: _, default, nullable } => {
                                 let key = key.clone();
-                                let options_for_view = options.clone();
                                 let default_for_view = default.clone();
 
                                 let current_value = {
@@ -141,6 +184,7 @@ pub fn SessionSettingsControls(
 
                                 let on_select_change = {
                                     let key = key.clone();
+                                    let all_fields = all_fields.clone();
                                     move |ev: leptos::ev::Event| {
                                         let selected = event_target_value(&ev);
                                         let mut current = values.get_untracked();
@@ -149,6 +193,10 @@ pub fn SessionSettingsControls(
                                         } else {
                                             current.0.insert(key.clone(), SessionSettingValue::String(selected));
                                         }
+                                        clear_invalid_dependent_select_values(
+                                            &all_fields,
+                                            &mut current,
+                                        );
                                         on_change_cb.run(current);
                                     }
                                 };
@@ -162,11 +210,11 @@ pub fn SessionSettingsControls(
                                         {nullable.then(|| view! {
                                             <option value="">"Auto"</option>
                                         })}
-                                        {options_for_view.into_iter().map(|opt| {
-                                            view! {
-                                                <option value={opt.value.clone()}>{opt.label}</option>
-                                            }
-                                        }).collect_view()}
+                                        {move || available_options.get().into_iter().map(|opt| {
+                                                view! {
+                                                    <option value={opt.value.clone()}>{opt.label}</option>
+                                                }
+                                            }).collect_view()}
                                     </select>
                                 }.into_any()
                             }
@@ -786,13 +834,87 @@ mod wasm_tests {
     use leptos::mount::mount_to;
     use protocol::{
         AgentActivitySummaryPayload, AgentActivitySummaryState, AgentId, AgentOrigin, Envelope,
-        FrameKind, SessionSettingField, StreamPath, TaskTokenUsageAggregate, TaskTokenUsageEntry,
+        FrameKind, SelectOption, SelectOptionsBySetting, SelectOptionsForValue,
+        SessionSettingField, StreamPath, TaskTokenUsageAggregate, TaskTokenUsageEntry,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn model_change_clears_unsupported_dependent_select_value() {
+        let fields = vec![
+            SessionSettingField {
+                key: "model".to_owned(),
+                label: "Model".to_owned(),
+                description: None,
+                field_type: SessionSettingFieldType::Select {
+                    options: vec![
+                        SelectOption {
+                            value: "model-a".to_owned(),
+                            label: "Model A".to_owned(),
+                        },
+                        SelectOption {
+                            value: "model-b".to_owned(),
+                            label: "Model B".to_owned(),
+                        },
+                    ],
+                    default: None,
+                    nullable: true,
+                },
+                use_slider: false,
+                select_options_by_setting: None,
+            },
+            SessionSettingField {
+                key: "effort".to_owned(),
+                label: "Effort".to_owned(),
+                description: None,
+                field_type: SessionSettingFieldType::Select {
+                    options: vec![SelectOption {
+                        value: "max".to_owned(),
+                        label: "Max".to_owned(),
+                    }],
+                    default: None,
+                    nullable: true,
+                },
+                use_slider: true,
+                select_options_by_setting: Some(SelectOptionsBySetting {
+                    setting_key: "model".to_owned(),
+                    values: vec![
+                        SelectOptionsForValue {
+                            setting_value: "model-a".to_owned(),
+                            options: vec![SelectOption {
+                                value: "max".to_owned(),
+                                label: "Max".to_owned(),
+                            }],
+                        },
+                        SelectOptionsForValue {
+                            setting_value: "model-b".to_owned(),
+                            options: vec![SelectOption {
+                                value: "high".to_owned(),
+                                label: "High".to_owned(),
+                            }],
+                        },
+                    ],
+                }),
+            },
+        ];
+        let mut values = SessionSettingsValues::default();
+        values.0.insert(
+            "model".to_owned(),
+            SessionSettingValue::String("model-b".to_owned()),
+        );
+        values.0.insert(
+            "effort".to_owned(),
+            SessionSettingValue::String("max".to_owned()),
+        );
+
+        clear_invalid_dependent_select_values(&fields, &mut values);
+
+        assert_eq!(values.0.get("effort"), Some(&SessionSettingValue::Null));
+    }
 
     fn make_container() -> HtmlElement {
         let document = web_sys::window().unwrap().document().unwrap();
@@ -882,6 +1004,7 @@ mod wasm_tests {
                 description: None,
                 field_type: SessionSettingFieldType::Toggle { default: false },
                 use_slider: false,
+                select_options_by_setting: None,
             }]
         } else {
             Vec::new()

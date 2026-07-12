@@ -45,7 +45,16 @@ for line in sys.stdin:
         send({
             "jsonrpc": "2.0",
             "id": request_id,
-            "result": {"data": [{"model": "gpt-5.4-mini"}]}
+            "result": {"data": [{
+                "model": "gpt-5.4-mini",
+                "isDefault": True,
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "low"},
+                    {"reasoningEffort": "medium"},
+                    {"reasoningEffort": "high"},
+                    {"reasoningEffort": "max"}
+                ]
+            }]}
         })
 "#;
     std::fs::write(&binary, script).expect("write fake Codex model probe");

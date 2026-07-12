@@ -17,8 +17,8 @@ use protocol::{
     AgentErrorCode, AgentInput, BackendAccessMode, BackendConfigFieldType, BackendConfigSchema,
     BackendConfigSnapshot, BackendConfigSnapshotStatus, BackendConfigValues, BackendKind,
     BackendTierConfig, ChatEvent, CustomAgentId, ImageData, ModelRequestTokenUsage,
-    SendMessagePayload, SessionId, SessionSettingFieldType, SessionSettingValue,
-    SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
+    SendMessagePayload, SessionId, SessionSettingField, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -345,6 +345,18 @@ pub trait Backend: Send + 'static {
     /// Returns false if the backend has terminated and can't accept input.
     fn send(&self, input: AgentInput) -> impl std::future::Future<Output = bool> + Send;
 
+    fn update_session_settings(
+        &mut self,
+        payload: protocol::SetSessionSettingsPayload,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async move {
+            self.send(AgentInput::UpdateSessionSettings(payload))
+                .await
+                .then_some(())
+                .ok_or_else(|| "backend terminated before applying session settings".to_owned())
+        }
+    }
+
     /// Request interruption of the currently active turn, if any.
     /// The returned future may resolve after the backend accepts or dispatches
     /// the interrupt request, before the interrupted turn has fully quiesced.
@@ -582,17 +594,17 @@ pub(crate) fn validate_session_settings_values(
     let fields_by_key = schema
         .fields
         .iter()
-        .map(|field| (field.key.as_str(), &field.field_type))
+        .map(|field| (field.key.as_str(), field))
         .collect::<HashMap<_, _>>();
 
     for (key, value) in &values.0 {
-        let Some(field_type) = fields_by_key.get(key.as_str()) else {
+        let Some(field) = fields_by_key.get(key.as_str()) else {
             return Err(format!(
                 "unknown session setting '{}' for backend {:?}",
                 key, schema.backend_kind
             ));
         };
-        validate_session_setting_value(key, value, field_type)?;
+        validate_session_setting_value(key, value, field, values)?;
     }
 
     Ok(())
@@ -621,7 +633,7 @@ pub(crate) fn sanitize_session_settings_values(
         let Some(field) = schema.fields.iter().find(|field| field.key == *key) else {
             continue;
         };
-        if validate_session_setting_value(key, value, &field.field_type).is_ok() {
+        if validate_session_setting_value(key, value, field, values).is_ok() {
             sanitized.0.insert(key.clone(), value.clone());
         }
     }
@@ -644,16 +656,16 @@ pub(crate) fn apply_session_settings_update(
     }
 }
 
-/// The built-in Low/High tier mapping for a backend, used to seed the
-/// user-editable per-backend tier config when complexity tiers are first
-/// enabled (and as the spawn-time fallback for backends with no config).
+/// Static Low/High tier mappings. Dynamic Codex tiers are resolved from its
+/// live session schema by the host.
 pub(crate) fn builtin_tier_config(kind: BackendKind) -> BackendTierConfig {
     let defaults: fn(SpawnCostHint) -> SessionSettingsValues = match kind {
         BackendKind::Claude => claude::claude_cost_hint_defaults,
-        BackendKind::Codex => codex::codex_cost_hint_defaults,
+        BackendKind::Codex | BackendKind::Tycode | BackendKind::Hermes => {
+            |_| SessionSettingsValues::default()
+        }
         BackendKind::Antigravity => antigravity::antigravity_cost_hint_defaults,
         BackendKind::Kiro => kiro::kiro_cost_hint_defaults,
-        BackendKind::Tycode | BackendKind::Hermes => |_| SessionSettingsValues::default(),
     };
     BackendTierConfig {
         low: defaults(SpawnCostHint::Low),
@@ -750,8 +762,10 @@ pub(crate) fn schema_field_default(
 fn validate_session_setting_value(
     key: &str,
     value: &SessionSettingValue,
-    field_type: &SessionSettingFieldType,
+    field: &SessionSettingField,
+    values: &SessionSettingsValues,
 ) -> Result<(), String> {
+    let field_type = &field.field_type;
     if matches!(value, SessionSettingValue::Null) {
         if let SessionSettingFieldType::Select {
             nullable: false, ..
@@ -763,8 +777,11 @@ fn validate_session_setting_value(
     }
 
     match (value, field_type) {
-        (SessionSettingValue::String(actual), SessionSettingFieldType::Select { options, .. }) => {
-            if options.iter().any(|option| option.value == *actual) {
+        (SessionSettingValue::String(actual), SessionSettingFieldType::Select { .. }) => {
+            if field
+                .select_options(values)
+                .is_some_and(|options| options.iter().any(|option| option.value == *actual))
+            {
                 Ok(())
             } else {
                 Err(format!(

@@ -221,12 +221,13 @@ fn request_quit_confirmation(app: tauri::AppHandle, confirmation: Arc<QuitConfir
 
 fn external_link_guard<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::new("external-link-guard")
-        .on_navigation(|_webview, url| {
-            if !should_open_externally(url) {
+        .on_navigation(|webview, url| {
+            let dev_url = dev_server_url(webview.config());
+            if !should_open_externally(url, dev_url) {
                 return true;
             }
 
-            if let Err(err) = open_url_with_system_handler(url) {
+            if let Err(err) = open_url_with_system_handler(url, dev_url) {
                 tracing::warn!("failed to open external navigation {url}: {err}");
             }
             false
@@ -234,34 +235,60 @@ fn external_link_guard<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
         .build()
 }
 
-fn should_open_externally(url: &Url) -> bool {
-    if is_app_url(url) {
+/// Dev instances launched by the debug MCP rewrite `build.devUrl` to a random
+/// loopback port, so the guard reads the configured dev URL rather than
+/// assuming 1420. Release builds still carry a `devUrl`, hence the profile gate.
+fn dev_server_url(config: &tauri::Config) -> Option<&Url> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+
+    config.build.dev_url.as_ref()
+}
+
+fn should_open_externally(url: &Url, dev_url: Option<&Url>) -> bool {
+    if is_app_url(url, dev_url) {
         return false;
     }
 
     matches!(url.scheme(), "http" | "https" | "mailto")
 }
 
-fn is_app_url(url: &Url) -> bool {
+fn is_app_url(url: &Url, dev_url: Option<&Url>) -> bool {
     match url.scheme() {
         "tauri" | "asset" | "ipc" => return true,
         "http" | "https" => {}
         _ => return false,
     }
 
-    let host = url.host_str();
-    if matches!(host, Some("tauri.localhost") | Some("asset.localhost")) {
+    if matches!(
+        url.host_str(),
+        Some("tauri.localhost") | Some("asset.localhost")
+    ) {
         return true;
     }
 
-    cfg!(debug_assertions)
-        && matches!(host, Some("127.0.0.1" | "localhost" | "::1"))
-        && url.port_or_known_default() == Some(1420)
+    dev_url.is_some_and(|dev_url| is_dev_server_origin(url, dev_url))
 }
 
-fn parse_external_url(value: &str) -> Result<Url, String> {
+fn is_dev_server_origin(url: &Url, dev_url: &Url) -> bool {
+    url.scheme() == dev_url.scheme()
+        && url.port_or_known_default() == dev_url.port_or_known_default()
+        && match (url.host_str(), dev_url.host_str()) {
+            (Some(host), Some(dev_host)) => {
+                host == dev_host || (is_loopback_host(host) && is_loopback_host(dev_host))
+            }
+            _ => false,
+        }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+fn parse_external_url(value: &str, dev_url: Option<&Url>) -> Result<Url, String> {
     let url = Url::parse(value).map_err(|err| format!("invalid URL: {err}"))?;
-    if is_app_url(&url) {
+    if is_app_url(&url, dev_url) {
         return Err("refusing to open Tyde's own app URL externally".to_owned());
     }
 
@@ -274,8 +301,8 @@ fn parse_external_url(value: &str) -> Result<Url, String> {
     }
 }
 
-fn open_url_with_system_handler(url: &Url) -> Result<(), String> {
-    let url = parse_external_url(url.as_str())?;
+fn open_url_with_system_handler(url: &Url, dev_url: Option<&Url>) -> Result<(), String> {
+    let url = parse_external_url(url.as_str(), dev_url)?;
     spawn_system_url_handler(url.as_str())
 }
 
@@ -322,8 +349,8 @@ fn system_url_handler_command(url: &str) -> Command {
 }
 
 #[tauri::command]
-fn open_external_url(url: String) -> Result<(), String> {
-    let url = parse_external_url(&url)?;
+fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let url = parse_external_url(&url, dev_server_url(app.config()))?;
     spawn_system_url_handler(url.as_str())
 }
 
@@ -331,32 +358,94 @@ fn open_external_url(url: String) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn dev_url(port: u16) -> Url {
+        Url::parse(&format!("http://127.0.0.1:{port}")).expect("dev url should parse")
+    }
+
     #[test]
     fn external_url_validation_allows_web_and_mail_links() {
-        assert!(parse_external_url("https://example.com/path?q=1").is_ok());
-        assert!(parse_external_url("http://example.com").is_ok());
-        assert!(parse_external_url("mailto:help@example.com").is_ok());
+        let dev = dev_url(1420);
+        let dev = Some(&dev);
+        assert!(parse_external_url("https://example.com/path?q=1", dev).is_ok());
+        assert!(parse_external_url("http://example.com", dev).is_ok());
+        assert!(parse_external_url("mailto:help@example.com", dev).is_ok());
     }
 
     #[test]
     fn external_url_validation_rejects_unsafe_or_internal_targets() {
-        assert!(parse_external_url("javascript:alert(1)").is_err());
-        assert!(parse_external_url("file:///etc/passwd").is_err());
-        assert!(parse_external_url("https://").is_err());
-        assert!(parse_external_url("tauri://localhost").is_err());
-        assert!(parse_external_url("http://tauri.localhost/").is_err());
+        let dev = dev_url(1420);
+        let dev = Some(&dev);
+        assert!(parse_external_url("javascript:alert(1)", dev).is_err());
+        assert!(parse_external_url("file:///etc/passwd", dev).is_err());
+        assert!(parse_external_url("https://", dev).is_err());
+        assert!(parse_external_url("tauri://localhost", dev).is_err());
+        assert!(parse_external_url("http://tauri.localhost/", dev).is_err());
+        assert!(parse_external_url("http://127.0.0.1:1420/", dev).is_err());
     }
 
     #[test]
     fn navigation_guard_opens_only_external_urls() {
+        let dev = dev_url(1420);
+        let dev = Some(&dev);
         assert!(!should_open_externally(
-            &Url::parse("tauri://localhost").unwrap()
+            &Url::parse("tauri://localhost").unwrap(),
+            dev
         ));
         assert!(!should_open_externally(
-            &Url::parse("http://tauri.localhost/").unwrap()
+            &Url::parse("http://tauri.localhost/").unwrap(),
+            dev
         ));
         assert!(should_open_externally(
-            &Url::parse("https://example.com").unwrap()
+            &Url::parse("https://example.com").unwrap(),
+            dev
+        ));
+    }
+
+    #[test]
+    fn navigation_guard_keeps_configured_dev_server_in_the_webview() {
+        let dev = dev_url(51763);
+        let dev = Some(&dev);
+        assert!(!should_open_externally(
+            &Url::parse("http://127.0.0.1:51763/").unwrap(),
+            dev
+        ));
+        assert!(!should_open_externally(
+            &Url::parse("http://localhost:51763/index.html#/agents").unwrap(),
+            dev
+        ));
+    }
+
+    #[test]
+    fn navigation_guard_does_not_whitelist_other_origins() {
+        let dev = dev_url(51763);
+        let dev = Some(&dev);
+        assert!(should_open_externally(
+            &Url::parse("http://127.0.0.1:1420/").unwrap(),
+            dev
+        ));
+        assert!(should_open_externally(
+            &Url::parse("http://127.0.0.1:51764/").unwrap(),
+            dev
+        ));
+        assert!(should_open_externally(
+            &Url::parse("http://evil.example.com:51763/").unwrap(),
+            dev
+        ));
+        assert!(should_open_externally(
+            &Url::parse("https://127.0.0.1:51763/").unwrap(),
+            dev
+        ));
+    }
+
+    #[test]
+    fn navigation_guard_without_dev_server_treats_loopback_as_external() {
+        assert!(should_open_externally(
+            &Url::parse("http://127.0.0.1:1420/").unwrap(),
+            None
+        ));
+        assert!(!should_open_externally(
+            &Url::parse("http://tauri.localhost/").unwrap(),
+            None
         ));
     }
 }

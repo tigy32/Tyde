@@ -8171,6 +8171,7 @@ impl Backend for ClaudeBackend {
                     label: "Model".to_string(),
                     description: None,
                     use_slider: false,
+                    select_options_by_setting: None,
                     field_type: SessionSettingFieldType::Select {
                         options: vec![
                             SelectOption {
@@ -8199,6 +8200,7 @@ impl Backend for ClaudeBackend {
                     label: "Effort".to_string(),
                     description: None,
                     use_slider: true,
+                    select_options_by_setting: None,
                     field_type: SessionSettingFieldType::Select {
                         options: vec![
                             SelectOption {

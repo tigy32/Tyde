@@ -87,6 +87,10 @@ impl CodexCommandHandle {
     pub async fn execute(&self, command: SessionCommand) -> Result<(), String> {
         self.inner.execute(command).await
     }
+
+    async fn update_runtime_settings(&self, settings: Value) -> Result<(), String> {
+        self.inner.update_runtime_settings(settings).await
+    }
 }
 
 pub struct CodexSession {
@@ -381,7 +385,10 @@ impl CodexSession {
             state: Mutex::new(CodexState {
                 thread_id,
                 model,
-                reasoning_effort: Some("xhigh".to_string()),
+                reasoning_effort: thread_response
+                    .get("reasoningEffort")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 approval_policy: None,
                 access_mode,
                 turn_network_access: codex_has_http_mcp_servers(startup_mcp_servers),
@@ -566,7 +573,7 @@ pub(crate) async fn probe_session_settings_schema(
             format!("Codex model discovery model/list response missing data array: {response}")
         })?;
 
-    let models = codex_model_options_from_raw(raw_models);
+    let models = codex_model_metadata_from_raw(raw_models);
 
     if models.is_empty() {
         return Err("Codex model discovery model/list returned no usable models".to_string());
@@ -591,18 +598,25 @@ fn codex_probe_result_with_cleanup<T>(
     }
 }
 
-fn codex_model_options_from_raw(raw_models: &[Value]) -> Vec<protocol::SelectOption> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexModelMetadata {
+    option: protocol::SelectOption,
+    reasoning_options: Vec<protocol::SelectOption>,
+    is_default: bool,
+}
+
+fn codex_model_metadata_from_raw(raw_models: &[Value]) -> Vec<CodexModelMetadata> {
     let mut models = raw_models
         .iter()
-        .filter_map(codex_model_option_from_raw)
+        .filter_map(codex_model_metadata_entry_from_raw)
         .collect::<Vec<_>>();
 
-    models.sort_by(|a, b| compare_codex_model_ids_for_display(&a.value, &b.value));
-    models.dedup_by(|a, b| a.value.eq_ignore_ascii_case(&b.value));
+    models.sort_by(|a, b| compare_codex_model_ids_for_display(&a.option.value, &b.option.value));
+    models.dedup_by(|a, b| a.option.value.eq_ignore_ascii_case(&b.option.value));
     models
 }
 
-fn codex_model_option_from_raw(model: &Value) -> Option<protocol::SelectOption> {
+fn codex_model_metadata_entry_from_raw(model: &Value) -> Option<CodexModelMetadata> {
     let id = model
         .get("model")
         .or_else(|| model.get("id"))
@@ -612,13 +626,54 @@ fn codex_model_option_from_raw(model: &Value) -> Option<protocol::SelectOption> 
         return None;
     }
 
+    let mut reasoning_options = model
+        .get("supportedReasoningEfforts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(codex_reasoning_option_from_raw)
+        .collect::<Vec<_>>();
+    reasoning_options.dedup_by(|a, b| a.value == b.value);
+
+    Some(CodexModelMetadata {
+        option: protocol::SelectOption {
+            value: id.to_string(),
+            // Codex's displayName casing is not currently normalized across entries
+            // (for example, `gpt-...` and `GPT-...` can appear in one response).
+            // The model id is the canonical value we send back to Codex, so use it as
+            // the label too and normalize only display casing.
+            label: codex_model_label_from_id(id),
+        },
+        reasoning_options,
+        is_default: model
+            .get("isDefault")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn codex_reasoning_option_from_raw(value: &Value) -> Option<protocol::SelectOption> {
+    let effort = value.get("reasoningEffort").and_then(Value::as_str)?.trim();
+    if effort.is_empty() {
+        return None;
+    }
     Some(protocol::SelectOption {
-        value: id.to_string(),
-        // Codex's displayName casing is not currently normalized across entries
-        // (for example, `gpt-...` and `GPT-...` can appear in one response).
-        // The model id is the canonical value we send back to Codex, so use it as
-        // the label too and normalize only display casing.
-        label: codex_model_label_from_id(id),
+        value: effort.to_string(),
+        label: match effort {
+            "xhigh" => "XHigh".to_string(),
+            _ => effort
+                .split(['-', '_'])
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    let mut chars = part.chars();
+                    chars.next().map_or_else(String::new, |first| {
+                        first.to_uppercase().collect::<String>()
+                            + &chars.as_str().to_ascii_lowercase()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        },
     })
 }
 
@@ -808,6 +863,56 @@ struct CodexInner {
 }
 
 impl CodexInner {
+    async fn apply_local_settings(&self, settings: &Value) {
+        let Some(obj) = settings.as_object() else {
+            return;
+        };
+        let mut state = self.state.lock().await;
+
+        if let Some(model_value) = obj.get("model") {
+            if model_value.is_null() {
+                state.model = None;
+            } else if let Some(model) = model_value.as_str() {
+                let normalized = model.trim();
+                state.model = if normalized.is_empty() {
+                    None
+                } else {
+                    Some(normalized.to_string())
+                };
+            }
+        }
+
+        if let Some(effort_value) = obj
+            .get("reasoning_effort")
+            .or_else(|| obj.get("reasoningEffort"))
+        {
+            if effort_value.is_null() {
+                state.reasoning_effort = None;
+            } else if let Some(raw) = effort_value.as_str() {
+                state.reasoning_effort = normalize_reasoning_effort(raw);
+            }
+        }
+
+        if obj.contains_key("approval_policy") || obj.contains_key("approvalPolicy") {
+            state.approval_policy = Some(CODEX_FORCED_APPROVAL_POLICY.to_string());
+        }
+    }
+
+    async fn update_runtime_settings(&self, settings: Value) -> Result<(), String> {
+        let thread_id = self.state.lock().await.thread_id.clone();
+        self.rpc
+            .request(
+                "thread/update",
+                json!({
+                    "threadId": thread_id,
+                    "settings": settings,
+                }),
+            )
+            .await?;
+        self.apply_local_settings(&settings).await;
+        Ok(())
+    }
+
     async fn ensure_active_stream_for_message(&self, message_id: &str) -> Option<(String, String)> {
         let mut state = self.state.lock().await;
         if state.active_stream.is_none() {
@@ -990,37 +1095,7 @@ impl CodexInner {
                 settings,
                 persist: _,
             } => {
-                if let Some(obj) = settings.as_object() {
-                    let mut state = self.state.lock().await;
-
-                    if let Some(model_value) = obj.get("model") {
-                        if model_value.is_null() {
-                            state.model = None;
-                        } else if let Some(model) = model_value.as_str() {
-                            let normalized = model.trim();
-                            state.model = if normalized.is_empty() {
-                                None
-                            } else {
-                                Some(normalized.to_string())
-                            };
-                        }
-                    }
-
-                    if let Some(effort_value) = obj
-                        .get("reasoning_effort")
-                        .or_else(|| obj.get("reasoningEffort"))
-                    {
-                        if effort_value.is_null() {
-                            state.reasoning_effort = None;
-                        } else if let Some(raw) = effort_value.as_str() {
-                            state.reasoning_effort = normalize_reasoning_effort(raw);
-                        }
-                    }
-
-                    if obj.contains_key("approval_policy") || obj.contains_key("approvalPolicy") {
-                        state.approval_policy = Some(CODEX_FORCED_APPROVAL_POLICY.to_string());
-                    }
-                }
+                self.apply_local_settings(&settings).await;
                 Ok(())
             }
         }
@@ -5147,14 +5222,14 @@ fn codex_app_server_args(
 
 fn normalize_reasoning_effort(raw: &str) -> Option<String> {
     let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
     let value = match normalized.as_str() {
-        "off" | "none" => "none",
-        "minimal" | "min" => "minimal",
-        "low" => "low",
-        "medium" | "med" => "medium",
-        "high" => "high",
-        "max" | "xhigh" => "xhigh",
-        _ => return None,
+        "off" => "none",
+        "min" => "minimal",
+        "med" => "medium",
+        _ => normalized.as_str(),
     };
     Some(value.to_string())
 }
@@ -5687,9 +5762,8 @@ impl Drop for CodexRpc {
 // ---------------------------------------------------------------------------
 
 use protocol::{
-    AgentInput, ChatEvent, ChatMessage, MessageSender, SelectOption, SessionId,
-    SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
-    SpawnCostHint,
+    AgentInput, ChatEvent, ChatMessage, MessageSender, SessionId, SessionSettingField,
+    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SpawnCostHint,
 };
 
 use super::{
@@ -5700,9 +5774,15 @@ use super::{
 
 pub struct CodexBackend {
     input_tx: mpsc::UnboundedSender<AgentInput>,
+    settings_tx: mpsc::UnboundedSender<CodexSettingsUpdate>,
     interrupt_tx: mpsc::UnboundedSender<()>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
+}
+
+struct CodexSettingsUpdate {
+    payload: protocol::SetSessionSettingsPayload,
+    reply: oneshot::Sender<Result<(), String>>,
 }
 
 impl CodexBackend {
@@ -5711,7 +5791,23 @@ impl CodexBackend {
     }
 }
 
-fn codex_session_settings_schema(model_options: Vec<SelectOption>) -> SessionSettingsSchema {
+fn codex_session_settings_schema(models: Vec<CodexModelMetadata>) -> SessionSettingsSchema {
+    let default_reasoning_options = models
+        .iter()
+        .find(|model| model.is_default)
+        .map(|model| model.reasoning_options.clone())
+        .unwrap_or_default();
+    let model_options = models.iter().map(|model| model.option.clone()).collect();
+    let reasoning_options_by_model = protocol::SelectOptionsBySetting {
+        setting_key: "model".to_string(),
+        values: models
+            .into_iter()
+            .map(|model| protocol::SelectOptionsForValue {
+                setting_value: model.option.value,
+                options: model.reasoning_options,
+            })
+            .collect(),
+    };
     SessionSettingsSchema {
         backend_kind: protocol::BackendKind::Codex,
         fields: vec![
@@ -5720,6 +5816,7 @@ fn codex_session_settings_schema(model_options: Vec<SelectOption>) -> SessionSet
                 label: "Model".to_string(),
                 description: None,
                 use_slider: false,
+                select_options_by_setting: None,
                 field_type: SessionSettingFieldType::Select {
                     options: model_options,
                     default: None,
@@ -5731,26 +5828,10 @@ fn codex_session_settings_schema(model_options: Vec<SelectOption>) -> SessionSet
                 label: "Reasoning Effort".to_string(),
                 description: None,
                 use_slider: true,
+                select_options_by_setting: Some(reasoning_options_by_model),
                 field_type: SessionSettingFieldType::Select {
-                    options: vec![
-                        SelectOption {
-                            value: "low".to_string(),
-                            label: "Low".to_string(),
-                        },
-                        SelectOption {
-                            value: "medium".to_string(),
-                            label: "Medium".to_string(),
-                        },
-                        SelectOption {
-                            value: "high".to_string(),
-                            label: "High".to_string(),
-                        },
-                        SelectOption {
-                            value: "xhigh".to_string(),
-                            label: "XHigh".to_string(),
-                        },
-                    ],
-                    default: Some("xhigh".to_string()),
+                    options: default_reasoning_options,
+                    default: None,
                     nullable: true,
                 },
             },
@@ -5758,36 +5839,58 @@ fn codex_session_settings_schema(model_options: Vec<SelectOption>) -> SessionSet
     }
 }
 
-fn codex_backend_defaults(cost_hint: Option<SpawnCostHint>) -> (Option<String>, Option<String>) {
-    match cost_hint {
-        // Low is usually reserved for small UI-facing helpers like agent
-        // naming and activity summaries, so keep it on the cheapest capable
-        // model.
-        Some(SpawnCostHint::Low) => (Some("gpt-5.4-mini".to_string()), Some("low".to_string())),
-        // Medium is a legacy no-op: spawn on the backend's own defaults.
-        Some(SpawnCostHint::Medium) => (None, None),
-        Some(SpawnCostHint::High) => (None, Some("xhigh".to_string())),
-        None => (None, None),
-    }
-}
-
 pub(crate) fn codex_cost_hint_defaults(
     cost_hint: SpawnCostHint,
 ) -> protocol::SessionSettingsValues {
-    let (model, effort) = codex_backend_defaults(Some(cost_hint));
-    let mut values = protocol::SessionSettingsValues::default();
-    if let Some(model) = model {
-        values
-            .0
-            .insert("model".to_string(), SessionSettingValue::String(model));
+    match cost_hint {
+        SpawnCostHint::Low | SpawnCostHint::Medium | SpawnCostHint::High => {
+            protocol::SessionSettingsValues::default()
+        }
     }
-    if let Some(effort) = effort {
-        values.0.insert(
-            "reasoning_effort".to_string(),
-            SessionSettingValue::String(effort),
-        );
+}
+
+pub(crate) fn codex_tier_config_from_schema(
+    schema: &SessionSettingsSchema,
+    selected_values: &protocol::SessionSettingsValues,
+) -> Result<protocol::BackendTierConfig, String> {
+    if schema.backend_kind != protocol::BackendKind::Codex {
+        return Err("Codex tier resolution received a non-Codex schema".to_owned());
     }
-    values
+    let reasoning_field = schema
+        .fields
+        .iter()
+        .find(|field| field.key == "reasoning_effort")
+        .ok_or_else(|| "Codex model metadata omitted reasoning_effort".to_owned())?;
+    let options = reasoning_field
+        .select_options(selected_values)
+        .filter(|options| !options.is_empty())
+        .ok_or_else(|| {
+            "selected Codex model metadata advertised no reasoning efforts".to_owned()
+        })?;
+    let low = options
+        .first()
+        .ok_or_else(|| "selected Codex model metadata has no lowest reasoning effort".to_owned())?
+        .value
+        .clone();
+    let high = options
+        .last()
+        .ok_or_else(|| "selected Codex model metadata has no highest reasoning effort".to_owned())?
+        .value
+        .clone();
+    let mut low_values = protocol::SessionSettingsValues::default();
+    low_values.0.insert(
+        "reasoning_effort".to_owned(),
+        SessionSettingValue::String(low),
+    );
+    let mut high_values = protocol::SessionSettingsValues::default();
+    high_values.0.insert(
+        "reasoning_effort".to_owned(),
+        SessionSettingValue::String(high),
+    );
+    Ok(protocol::BackendTierConfig {
+        low: low_values,
+        high: high_values,
+    })
 }
 
 pub(crate) fn resolve_session_settings(
@@ -5798,6 +5901,27 @@ pub(crate) fn resolve_session_settings(
         &CodexBackend::session_settings_schema(),
         codex_cost_hint_defaults,
     )
+}
+
+fn apply_codex_runtime_settings(
+    values: &protocol::SessionSettingsValues,
+    model: &mut Option<String>,
+    effort: &mut Option<String>,
+) {
+    if let Some(value) = values.0.get("model") {
+        *model = match value {
+            SessionSettingValue::String(value) => Some(value.clone()),
+            SessionSettingValue::Null => None,
+            SessionSettingValue::Bool(_) | SessionSettingValue::Integer(_) => return,
+        };
+    }
+    if let Some(value) = values.0.get("reasoning_effort") {
+        *effort = match value {
+            SessionSettingValue::String(value) => Some(value.clone()),
+            SessionSettingValue::Null => None,
+            SessionSettingValue::Bool(_) | SessionSettingValue::Integer(_) => return,
+        };
+    }
 }
 
 fn backend_user_image_values(images: Option<Vec<protocol::ImageData>>) -> Vec<Value> {
@@ -6283,6 +6407,7 @@ impl Backend for CodexBackend {
         let initial_images = initial_input.images;
         let cwd = pick_workspace_root(&workspace_roots)?;
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (raw_event_tx, raw_event_rx) = mpsc::unbounded_channel();
@@ -6513,10 +6638,10 @@ impl Backend for CodexBackend {
                 .map(|s| s.to_string());
 
             // --- event loop: translate notifications -> ChatEvent ----------------
-            let model_name = model_override
+            let backend_default_model_name = model.unwrap_or_else(|| "codex".to_string());
+            let mut model_name = model_override
                 .clone()
-                .or(model)
-                .unwrap_or_else(|| "codex".to_string());
+                .unwrap_or_else(|| backend_default_model_name.clone());
             let mut accumulated_text = String::new();
             let mut accumulated_reasoning = String::new();
             let mut current_message_id: Option<String> = None;
@@ -6546,8 +6671,8 @@ impl Backend for CodexBackend {
             let pending_for_input = Arc::clone(&pending);
             let next_id_for_input = Arc::clone(&next_id);
             let thread_id_for_input = thread_id.clone();
-            let model_for_input = model_override.clone();
-            let effort_for_input = effort_override.clone();
+            let mut model_for_input = model_override.clone();
+            let mut effort_for_input = effort_override.clone();
             let access_mode_for_input = access_mode;
 
             emitter.user_message(
@@ -7431,19 +7556,7 @@ impl Backend for CodexBackend {
                                 )
                                 .await;
                             }
-                            AgentInput::UpdateSessionSettings(payload) => {
-                                let _ = rpc_request(
-                                    &stdin_for_input,
-                                    &pending_for_input,
-                                    &next_id_for_input,
-                                    "thread/update",
-                                    json!({
-                                        "threadId": thread_id_for_input,
-                                        "settings": session_settings_to_json(&payload.values),
-                                    }),
-                                )
-                                .await;
-                            }
+                            AgentInput::UpdateSessionSettings(_) => {}
                             AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
                             | AgentInput::SendQueuedMessageNow(_) => {
@@ -7452,6 +7565,32 @@ impl Backend for CodexBackend {
                                 );
                             }
                         }
+                    }
+                    update = settings_rx.recv() => {
+                        let Some(update) = update else { break };
+                        let result = rpc_request(
+                            &stdin_for_input,
+                            &pending_for_input,
+                            &next_id_for_input,
+                            "thread/update",
+                            json!({
+                                "threadId": thread_id_for_input,
+                                "settings": session_settings_to_json(&update.payload.values),
+                            }),
+                        )
+                        .await
+                        .map(|_| ());
+                        if result.is_ok() {
+                            apply_codex_runtime_settings(
+                                &update.payload.values,
+                                &mut model_for_input,
+                                &mut effort_for_input,
+                            );
+                            model_name = model_for_input
+                                .clone()
+                                .unwrap_or_else(|| backend_default_model_name.clone());
+                        }
+                        let _ = update.reply.send(result);
                     }
                     interrupt = interrupt_rx.recv() => {
                         let Some(()) = interrupt else { break };
@@ -7481,6 +7620,7 @@ impl Backend for CodexBackend {
         Ok((
             Self {
                 input_tx,
+                settings_tx,
                 interrupt_tx,
                 session_id,
                 subagent_emitter_tx,
@@ -7495,6 +7635,7 @@ impl Backend for CodexBackend {
         session_id: protocol::SessionId,
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (resume_replay_complete_tx, resume_replay_complete_rx) =
@@ -7603,18 +7744,7 @@ impl Backend for CodexBackend {
                                     break;
                                 }
                             }
-                            AgentInput::UpdateSessionSettings(payload) => {
-                                if let Err(err) = handle
-                                    .execute(SessionCommand::UpdateSettings {
-                                        settings: session_settings_to_json(&payload.values),
-                                        persist: false,
-                                    })
-                                    .await
-                                {
-                                    tracing::error!("Failed to update resumed Codex session settings: {err}");
-                                    break;
-                                }
-                            }
+                            AgentInput::UpdateSessionSettings(_) => {}
                             AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
                             | AgentInput::SendQueuedMessageNow(_) => {
@@ -7623,6 +7753,13 @@ impl Backend for CodexBackend {
                                 );
                             }
                         }
+                    }
+                    update = settings_rx.recv() => {
+                        let Some(update) = update else { break };
+                        let result = handle
+                            .update_runtime_settings(session_settings_to_json(&update.payload.values))
+                            .await;
+                        let _ = update.reply.send(result);
                     }
                     interrupt = interrupt_rx.recv() => {
                         let Some(()) = interrupt else { break };
@@ -7649,6 +7786,7 @@ impl Backend for CodexBackend {
         Ok((
             Self {
                 input_tx,
+                settings_tx,
                 interrupt_tx,
                 session_id: backend_session_id,
                 subagent_emitter_tx,
@@ -7671,6 +7809,7 @@ impl Backend for CodexBackend {
         }
 
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (subagent_emitter_tx, mut subagent_emitter_rx) =
@@ -7796,20 +7935,7 @@ impl Backend for CodexBackend {
                                     break;
                                 }
                             }
-                            AgentInput::UpdateSessionSettings(payload) => {
-                                if let Err(err) = handle
-                                    .execute(SessionCommand::UpdateSettings {
-                                        settings: session_settings_to_json(&payload.values),
-                                        persist: false,
-                                    })
-                                    .await
-                                {
-                                    tracing::error!(
-                                        "Failed to update forked Codex session settings: {err}"
-                                    );
-                                    break;
-                                }
-                            }
+                            AgentInput::UpdateSessionSettings(_) => {}
                             AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
                             | AgentInput::SendQueuedMessageNow(_) => {
@@ -7818,6 +7944,13 @@ impl Backend for CodexBackend {
                                 );
                             }
                         }
+                    }
+                    update = settings_rx.recv() => {
+                        let Some(update) = update else { break };
+                        let result = handle
+                            .update_runtime_settings(session_settings_to_json(&update.payload.values))
+                            .await;
+                        let _ = update.reply.send(result);
                     }
                     interrupt = interrupt_rx.recv() => {
                         let Some(()) = interrupt else { break };
@@ -7855,6 +7988,7 @@ impl Backend for CodexBackend {
         Ok((
             Self {
                 input_tx,
+                settings_tx,
                 interrupt_tx,
                 session_id: backend_session_id,
                 subagent_emitter_tx,
@@ -7876,7 +8010,23 @@ impl Backend for CodexBackend {
     }
 
     async fn send(&self, input: AgentInput) -> bool {
-        self.input_tx.send(input).is_ok()
+        match input {
+            AgentInput::UpdateSessionSettings(_) => false,
+            other => self.input_tx.send(other).is_ok(),
+        }
+    }
+
+    async fn update_session_settings(
+        &mut self,
+        payload: protocol::SetSessionSettingsPayload,
+    ) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.settings_tx
+            .send(CodexSettingsUpdate { payload, reply })
+            .map_err(|_| "Codex backend terminated before applying session settings".to_owned())?;
+        result
+            .await
+            .map_err(|_| "Codex settings update response channel closed".to_owned())?
     }
 
     async fn interrupt(&self) -> bool {
@@ -7976,19 +8126,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_low_cost_hint_defaults_use_gpt_54_mini_for_ui_helpers() {
+    fn codex_cost_hints_do_not_guess_model_metadata_values() {
         let values = codex_cost_hint_defaults(protocol::SpawnCostHint::Low);
 
-        assert_eq!(
-            values.0.get("model"),
-            Some(&protocol::SessionSettingValue::String(
-                "gpt-5.4-mini".to_owned()
-            ))
-        );
-        assert_eq!(
-            values.0.get("reasoning_effort"),
-            Some(&protocol::SessionSettingValue::String("low".to_owned()))
-        );
+        assert!(!values.0.contains_key("model"));
+        assert!(!values.0.contains_key("reasoning_effort"));
     }
 
     impl CodexFakeAppServer {
@@ -8026,6 +8168,7 @@ def send(value):
 with open(ARGV_CAPTURE, "a", encoding="utf-8") as argv_capture:
     argv_capture.write(json.dumps({"pid": os.getpid(), "argv": sys.argv[1:]}, separators=(",", ":")) + "\n")
 
+turn_count = 0
 for line in sys.stdin:
     try:
         request = json.loads(line)
@@ -8085,6 +8228,7 @@ for line in sys.stdin:
                 }
             })
     elif method == "turn/start":
+        turn_count += 1
         if MODE == "fresh_agent_control_progress":
             send({
                 "jsonrpc": "2.0",
@@ -8214,6 +8358,30 @@ for line in sys.stdin:
                     }
                 }
             })
+        elif MODE in ("runtime_settings", "reject_runtime_settings"):
+            turn_id = "turn-settings-" + str(turn_count)
+            message_id = "message-settings-" + str(turn_count)
+            send({
+                "jsonrpc": "2.0",
+                "method": "turn/started",
+                "params": {"turn": {"id": turn_id}}
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": message_id,
+                        "type": "agentMessage",
+                        "text": "settings turn " + str(turn_count)
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "turn/completed",
+                "params": {"turn": {"id": turn_id, "status": "completed"}}
+            })
         send({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -8222,7 +8390,14 @@ for line in sys.stdin:
     elif method == "turn/interrupt":
         send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "thread/update":
-        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+        if MODE == "reject_runtime_settings":
+            send({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32000, "message": "settings rejected"}
+            })
+        else:
+            send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     else:
         send({
             "jsonrpc": "2.0",
@@ -8542,7 +8717,10 @@ for line in sys.stdin:
             }),
         ];
 
-        let options = codex_model_options_from_raw(&raw_models);
+        let options = codex_model_metadata_from_raw(&raw_models)
+            .into_iter()
+            .map(|model| model.option)
+            .collect::<Vec<_>>();
 
         assert_eq!(
             options,
@@ -8584,9 +8762,9 @@ for line in sys.stdin:
             json!({ "model": "gpt-5" }),
         ];
 
-        let values = codex_model_options_from_raw(&raw_models)
+        let values = codex_model_metadata_from_raw(&raw_models)
             .into_iter()
-            .map(|option| option.value)
+            .map(|model| model.option.value)
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -8597,10 +8775,14 @@ for line in sys.stdin:
 
     #[test]
     fn codex_auto_model_remains_unset_in_dynamic_schema_and_spawn_settings() {
-        let schema = codex_session_settings_schema(vec![protocol::SelectOption {
-            value: "gpt-5.6".to_string(),
-            label: "gpt-5.6".to_string(),
-        }]);
+        let schema = codex_session_settings_schema(codex_model_metadata_from_raw(&[json!({
+            "model": "gpt-5.6",
+            "isDefault": true,
+            "supportedReasoningEfforts": [
+                { "reasoningEffort": "low" },
+                { "reasoningEffort": "max" }
+            ]
+        })]));
         let model_field = schema
             .fields
             .iter()
@@ -8619,6 +8801,102 @@ for line in sys.stdin:
         assert!(
             !resolved.0.contains_key("model"),
             "Auto must omit the model override so Codex selects its effective model"
+        );
+        assert!(
+            !resolved.0.contains_key("reasoning_effort"),
+            "Auto must not force a reasoning level over Codex's model default"
+        );
+    }
+
+    #[test]
+    fn codex_reasoning_options_follow_each_models_metadata() {
+        let schema = codex_session_settings_schema(codex_model_metadata_from_raw(&[
+            json!({
+                "model": "gpt-5.6",
+                "isDefault": true,
+                "supportedReasoningEfforts": [
+                    { "reasoningEffort": "low" },
+                    { "reasoningEffort": "xhigh" },
+                    { "reasoningEffort": "max" },
+                    { "reasoningEffort": "ultra" }
+                ]
+            }),
+            json!({
+                "model": "gpt-5.5",
+                "supportedReasoningEfforts": [
+                    { "reasoningEffort": "low" },
+                    { "reasoningEffort": "high" }
+                ]
+            }),
+        ]));
+        let reasoning_field = schema
+            .fields
+            .iter()
+            .find(|field| field.key == "reasoning_effort")
+            .expect("Codex reasoning field");
+
+        let mut values = protocol::SessionSettingsValues::default();
+        assert_eq!(
+            reasoning_field
+                .select_options(&values)
+                .expect("default model reasoning options")
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "xhigh", "max", "ultra"]
+        );
+
+        values.0.insert(
+            "model".to_string(),
+            SessionSettingValue::String("gpt-5.5".to_string()),
+        );
+        assert_eq!(
+            reasoning_field
+                .select_options(&values)
+                .expect("selected model reasoning options")
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "high"]
+        );
+
+        let tiers =
+            codex_tier_config_from_schema(&schema, &protocol::SessionSettingsValues::default())
+                .expect("Codex tiers should resolve from default model metadata");
+        assert_eq!(
+            tiers.low.0.get("reasoning_effort"),
+            Some(&SessionSettingValue::String("low".to_owned()))
+        );
+        assert_eq!(
+            tiers.high.0.get("reasoning_effort"),
+            Some(&SessionSettingValue::String("ultra".to_owned()))
+        );
+        assert!(!tiers.low.0.contains_key("model"));
+        assert!(!tiers.high.0.contains_key("model"));
+
+        let selected_model_tiers = codex_tier_config_from_schema(&schema, &values)
+            .expect("Codex tiers should follow the selected model metadata");
+        assert_eq!(
+            selected_model_tiers.high.0.get("reasoning_effort"),
+            Some(&SessionSettingValue::String("high".to_owned()))
+        );
+
+        values.0.insert(
+            "reasoning_effort".to_string(),
+            SessionSettingValue::String("max".to_string()),
+        );
+        let error = crate::backend::validate_session_settings_values(&schema, &values)
+            .expect_err("unsupported model/effort pair must be rejected");
+        assert!(error.contains("reasoning_effort"));
+        assert!(error.contains("max"));
+    }
+
+    #[test]
+    fn codex_reasoning_normalization_preserves_max() {
+        assert_eq!(normalize_reasoning_effort("max").as_deref(), Some("max"));
+        assert_eq!(
+            normalize_reasoning_effort("xhigh").as_deref(),
+            Some("xhigh")
         );
     }
 
@@ -8661,6 +8939,300 @@ for line in sys.stdin:
 
         assert!(result.contains("timed out after 0.01s"));
         assert!(result.contains("reaping Codex app-server process group"));
+    }
+
+    async fn wait_for_codex_test_stream_end(events: &mut EventStream) -> protocol::StreamEndData {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.recv().await {
+                if let ChatEvent::StreamEnd(data) = event {
+                    return data;
+                }
+            }
+            panic!("fake Codex event stream ended before StreamEnd");
+        })
+        .await
+        .expect("fake Codex StreamEnd timeout")
+    }
+
+    #[tokio::test]
+    async fn codex_session_runtime_settings_acknowledge_provider_before_followup() {
+        let fake = CodexFakeAppServer::new("runtime_settings", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_roots = vec![workspace.path().to_string_lossy().to_string()];
+        let (session, _events) = CodexSession::spawn(
+            &workspace_roots,
+            None,
+            &[],
+            None,
+            BackendAccessMode::ReadOnly,
+        )
+        .await
+        .expect("spawn fake Codex session");
+        let handle = session.command_handle();
+
+        handle
+            .update_runtime_settings(json!({
+                "model": "gpt-updated",
+                "reasoning_effort": "max",
+            }))
+            .await
+            .expect("provider should accept settings update");
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "followup".to_owned(),
+                images: None,
+            })
+            .await
+            .expect("send followup after settings acknowledgement");
+        session.shutdown().await;
+
+        let requests = fake.requests();
+        let update_index = requests
+            .iter()
+            .position(|request| {
+                request.get("method").and_then(Value::as_str) == Some("thread/update")
+            })
+            .expect("thread/update request");
+        let turn_index = requests
+            .iter()
+            .position(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .expect("turn/start request");
+        assert!(update_index < turn_index);
+        assert_eq!(
+            requests[update_index]
+                .pointer("/params/settings/reasoning_effort")
+                .and_then(Value::as_str),
+            Some("max")
+        );
+        assert_eq!(
+            requests[turn_index]
+                .pointer("/params/model")
+                .and_then(Value::as_str),
+            Some("gpt-updated")
+        );
+        assert_eq!(
+            requests[turn_index]
+                .pointer("/params/effort")
+                .and_then(Value::as_str),
+            Some("max")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_session_rejected_runtime_settings_preserve_live_state() {
+        let fake = CodexFakeAppServer::new("reject_runtime_settings", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_roots = vec![workspace.path().to_string_lossy().to_string()];
+        let (session, _events) = CodexSession::spawn(
+            &workspace_roots,
+            None,
+            &[],
+            None,
+            BackendAccessMode::ReadOnly,
+        )
+        .await
+        .expect("spawn fake Codex session");
+        let handle = session.command_handle();
+        handle
+            .execute(SessionCommand::UpdateSettings {
+                settings: json!({
+                    "model": "gpt-initial",
+                    "reasoning_effort": "low",
+                }),
+                persist: false,
+            })
+            .await
+            .expect("configure initial live settings");
+
+        let error = handle
+            .update_runtime_settings(json!({
+                "model": "gpt-rejected",
+                "reasoning_effort": "max",
+            }))
+            .await
+            .expect_err("provider rejection must reach the caller");
+        assert!(error.contains("settings rejected"));
+        handle
+            .execute(SessionCommand::SendMessage {
+                message: "followup".to_owned(),
+                images: None,
+            })
+            .await
+            .expect("send followup after rejected settings");
+        session.shutdown().await;
+
+        let turn = fake
+            .requests()
+            .into_iter()
+            .find(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .expect("turn/start request");
+        assert_eq!(
+            turn.pointer("/params/model").and_then(Value::as_str),
+            Some("gpt-initial")
+        );
+        assert_eq!(
+            turn.pointer("/params/effort").and_then(Value::as_str),
+            Some("low")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_runtime_settings_update_changes_followup_turn_overrides() {
+        let fake = CodexFakeAppServer::new("runtime_settings", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (mut backend, mut events) = <CodexBackend as Backend>::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig::default(),
+            protocol::SendMessagePayload {
+                message: "initial".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn fake Codex backend");
+        let _ = wait_for_codex_test_stream_end(&mut events).await;
+
+        let mut values = protocol::SessionSettingsValues::default();
+        values.0.insert(
+            "model".to_owned(),
+            SessionSettingValue::String("gpt-updated".to_owned()),
+        );
+        values.0.insert(
+            "reasoning_effort".to_owned(),
+            SessionSettingValue::String("max".to_owned()),
+        );
+        Backend::update_session_settings(
+            &mut backend,
+            protocol::SetSessionSettingsPayload { values },
+        )
+        .await
+        .expect("provider should accept settings update");
+        assert!(
+            Backend::send(
+                &backend,
+                AgentInput::SendMessage(protocol::SendMessagePayload {
+                    message: "followup".to_owned(),
+                    images: None,
+                    origin: None,
+                    tool_response: None,
+                }),
+            )
+            .await
+        );
+        let followup_end = wait_for_codex_test_stream_end(&mut events).await;
+        assert_eq!(
+            followup_end
+                .message
+                .model_info
+                .as_ref()
+                .map(|model| model.model.as_str()),
+            Some("gpt-updated")
+        );
+
+        let turn_requests = fake
+            .requests()
+            .into_iter()
+            .filter(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .collect::<Vec<_>>();
+        let followup = turn_requests.last().expect("followup turn/start request");
+        assert_eq!(
+            followup.pointer("/params/model").and_then(Value::as_str),
+            Some("gpt-updated")
+        );
+        assert_eq!(
+            followup.pointer("/params/effort").and_then(Value::as_str),
+            Some("max")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_rejected_runtime_settings_do_not_change_followup_turn() {
+        let fake = CodexFakeAppServer::new("reject_runtime_settings", "unused");
+        let _guard = CodexTestAppServerBinaryGuard::set(fake.binary.clone());
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut initial_values = protocol::SessionSettingsValues::default();
+        initial_values.0.insert(
+            "model".to_owned(),
+            SessionSettingValue::String("gpt-initial".to_owned()),
+        );
+        initial_values.0.insert(
+            "reasoning_effort".to_owned(),
+            SessionSettingValue::String("low".to_owned()),
+        );
+        let (mut backend, mut events) = <CodexBackend as Backend>::spawn(
+            vec![workspace.path().to_string_lossy().to_string()],
+            BackendSpawnConfig {
+                session_settings: Some(initial_values),
+                ..BackendSpawnConfig::default()
+            },
+            protocol::SendMessagePayload {
+                message: "initial".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("spawn fake Codex backend");
+        let _ = wait_for_codex_test_stream_end(&mut events).await;
+
+        let mut values = protocol::SessionSettingsValues::default();
+        values.0.insert(
+            "model".to_owned(),
+            SessionSettingValue::String("gpt-rejected".to_owned()),
+        );
+        values.0.insert(
+            "reasoning_effort".to_owned(),
+            SessionSettingValue::String("max".to_owned()),
+        );
+        let error = Backend::update_session_settings(
+            &mut backend,
+            protocol::SetSessionSettingsPayload { values },
+        )
+        .await
+        .expect_err("provider rejection must reach the caller");
+        assert!(error.contains("settings rejected"));
+
+        assert!(
+            Backend::send(
+                &backend,
+                AgentInput::SendMessage(protocol::SendMessagePayload {
+                    message: "followup".to_owned(),
+                    images: None,
+                    origin: None,
+                    tool_response: None,
+                }),
+            )
+            .await
+        );
+        let followup_end = wait_for_codex_test_stream_end(&mut events).await;
+        assert_eq!(
+            followup_end
+                .message
+                .model_info
+                .as_ref()
+                .map(|model| model.model.as_str()),
+            Some("gpt-initial")
+        );
+        let turn_requests = fake
+            .requests()
+            .into_iter()
+            .filter(|request| request.get("method").and_then(Value::as_str) == Some("turn/start"))
+            .collect::<Vec<_>>();
+        let followup = turn_requests.last().expect("followup turn/start request");
+        assert_eq!(
+            followup.pointer("/params/model").and_then(Value::as_str),
+            Some("gpt-initial")
+        );
+        assert_eq!(
+            followup.pointer("/params/effort").and_then(Value::as_str),
+            Some("low")
+        );
     }
 
     #[tokio::test]

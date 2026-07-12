@@ -20,7 +20,7 @@ Goals:
 
 - Show a short, human-readable "what is this agent doing?" summary for active
   agents.
-- Reuse the existing background-agent pattern used for generated agent names.
+- Reuse the server-owned helper-generation pattern used for agent names.
 - Keep the feature behind a user setting because it spends money.
 - Use typed protocol state and events end-to-end.
 - Make model calls mockable in tests and disabled by default unless the user
@@ -33,23 +33,24 @@ Non-goals:
 - Summarize every streaming token. The summary is a sampled progress signal, not
   a live transcript mirror.
 
-## 2. Existing background agent-name mechanism
+## 2. Existing internal agent-name mechanism
 
-Tyde already has a background model call for generated agent names. This is the
-mechanism to reuse for lifecycle shape, cheap-model selection, mock behavior,
-and server-owned emission.
+Tyde already has an internal model call for generated agent names. Activity
+summaries reuse its cheap-model selection and mock behavior, but not its spawn
+ordering: name generation is part of spawn resolution, while summaries remain
+background work for an already-visible agent.
 
 ### 2.1 Trigger and gating
 
 When spawning `SpawnAgentParams::New`, the host resolves the displayed name from
 `payload.name`. If the user supplied a name, Tyde treats it as a user alias. If
-no name was supplied, Tyde immediately derives a provisional deterministic name
-from the initial prompt and records it as `GeneratedIfNoUserAlias`
-(`server/src/host.rs:1832-1858`).
+no name was supplied and automatic names are enabled, Tyde completes the
+internal generation call before registering or announcing the real agent. A
+generation failure therefore fails the spawn command without exposing a
+provisional agent.
 
-Only the no-explicit-name path schedules a background generated-name request,
-and only if startup has not already failed (`server/src/host.rs:1840-1850`). The
-request captures:
+Only the no-explicit-name path runs a generated-name request, and only if startup
+resolution has not already failed. The request captures:
 
 - target backend kind,
 - workspace roots,
@@ -57,16 +58,12 @@ request captures:
 - startup MCP servers,
 - whether this host is using the mock backend (`server/src/host.rs:1843-1849`).
 
-After the agent is spawned and announced, the host schedules the background name
-generation task (`server/src/host.rs:2600-2611`). Resume/fork paths use stored or
-explicit session names and do not schedule this background call
-(`server/src/host.rs:1893-1941`, `server/src/host.rs:2188-2208`).
+Resume/fork paths use stored or explicit session names and do not run this
+generation call.
 
-There is no current `HostSettings` toggle for this behavior. The existing
-`HostSettings` fields cover enabled/default backends, mobile connections, Tyde
-MCP toggles, complexity tiers, and tier configs (`protocol/src/types.rs:1530-1551`),
-and the settings store default contains no generated-name flag
-(`server/src/store/settings.rs:384-394`).
+`HostSettings.background_agent_features.auto_generate_agent_names` controls
+whether the internal generation call runs. When disabled, Tyde uses the
+deterministic prompt-derived name without making a model call.
 
 ### 2.2 What backend/model it uses
 
@@ -94,16 +91,19 @@ The backend-level cheap mappings are already backend-owned:
 
 - Claude Low maps to `model = haiku`, `effort = low`
   (`server/src/backend/claude.rs:7737-7758`).
-- Codex Low maps to low reasoning effort (`server/src/backend/codex.rs:5058-5080`).
+- Codex does not guess a Low model or reasoning value in its backend resolver.
+  Normal complexity tiers are resolved by the host from current Codex model
+  metadata; direct helper spawns use the provider default rather than risking
+  an unsupported hardcoded effort.
 - Kiro Low maps to `claude-haiku-4.5` (`server/src/backend/kiro.rs:3105-3123`).
 - Antigravity Low maps to `ANTIGRAVITY_LOW_MODEL`
   (`server/src/backend/antigravity.rs:1221-1232`).
 - The generic resolver applies cost-hint defaults before explicit settings and
   schema defaults (`server/src/backend/mod.rs:378-398`).
 
-Normal user spawns may have cost hints stripped when complexity tiers are off
-(`server/src/host.rs:2616-2670`), but generated-name background calls bypass that
-host-spawn path and pass `SpawnCostHint::Low` directly to the backend.
+Normal user spawns may have cost hints stripped when complexity tiers are off,
+but generated-name helper calls bypass that host-spawn path and pass
+`SpawnCostHint::Low` directly to the backend.
 
 ### 2.3 What history it feeds
 
@@ -131,29 +131,15 @@ If tests run with `use_mock_backend`, it returns a deterministic generated name
 without spawning a real backend (`server/src/agent/mod.rs:350-352`,
 `server/src/agent/mod.rs:3457-3467`).
 
-The generated output is sanitized to a 2-4 word title; invalid output falls back
-to a prompt-derived name (`server/src/agent/mod.rs:3469-3506`). This fallback is
-acceptable for generated names because a provisional name already exists. The
-summary feature should **not** silently synthesize fallback summary text; it
-should emit an explicit error state.
-
-Once the background task returns a name, the host fetches the live agent handle
-and calls `set_generated_name` (`server/src/host.rs:6005-6026`). The actor then:
-
-1. Persists the generated alias only if the session has no user alias
-   (`server/src/agent/mod.rs:2749-2759`,
-   `server/src/store/session.rs:194-211`).
-2. Rejects generated aliases after a manual rename by returning `false`
-   (`server/src/store/session.rs:203-205`).
-3. Updates the actor's current `AgentStartPayload`, overwrites the first replay
-   `AgentStart` payload, updates the handle snapshot, and broadcasts
-   `AgentRenamed` (`server/src/agent/mod.rs:2807-2822`).
-4. Fans out session lists if the generated name applied, so session cards show
-   the updated alias (`server/src/host.rs:6020-6025`).
-
-The frontend receives `AgentRenamed`, updates `AgentInfo.name`, updates active
-streaming state, and retitles chat tabs (`frontend/src/dispatch.rs:991-999`,
-`frontend/src/dispatch.rs:3307-3335`).
+The generated output is sanitized to a 2-4 word title. A reasoning-only or
+otherwise empty `StreamEnd` is not a final name: collection continues until an
+assistant answer segment completes. If the turn or backend ends without usable
+answer text, or the completed answer is invalid, generation fails explicitly
+instead of treating the prompt-derived deterministic name as a successful model
+result. The resolved generated name is included in the initial registry spawn
+and persisted as the session alias, so the first `NewAgent` and `AgentStart`
+already agree. The summary feature likewise must not silently synthesize
+fallback summary text; it should emit an explicit error state.
 
 ### 2.5 Tests already cover this pattern
 
@@ -513,14 +499,14 @@ Mirror the existing settings pattern:
 
 ### 5.3 Existing generated names under the same group
 
-The generated-name path should consult
-`settings.background_agent_features.auto_generate_agent_names` before scheduling
-`deferred_generated_name`.
+The generated-name path consults
+`settings.background_agent_features.auto_generate_agent_names` before invoking
+the internal generator.
 
 When disabled:
 
-- keep the current deterministic provisional name from `derive_agent_name`;
-- do not schedule `GenerateAgentNameRequest`;
+- resolve the deterministic name from `derive_agent_name`;
+- do not invoke `GenerateAgentNameRequest`;
 - do not call a model;
 - do not emit a synthetic error, because the user explicitly disabled the
   background enhancement.
