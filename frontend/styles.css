@@ -6185,6 +6185,11 @@ kbd {
 .fe-row .fe-item {
     flex: 1 1 auto;
     min-width: 0;
+    /* Reset the base `.fe-item` `width: 100%`: inside the wrapping row it would
+       resolve as a 100% flex-basis, leaving no room for `.fe-open-side` beside
+       it, so the 44px action wrapped to its own line and doubled every file
+       row's height. Content-sized basis lets the item share the line. */
+    width: auto;
 }
 
 /* The inline action is a pointer convenience. Its hit target is 44px wide and

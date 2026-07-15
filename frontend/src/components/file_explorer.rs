@@ -1717,6 +1717,57 @@ mod wasm_tests {
         }
     }
 
+    /// A file row is a single dense line, exactly like a directory row. Its
+    /// trailing side-open action shares that line with the name and must never
+    /// wrap onto its own line, which would double the row's height.
+    ///
+    /// Regression guard: the base `.fe-item` rule carries `width: 100%`, which
+    /// inside the wrapping `.fe-row` resolved as a full-width flex-basis and
+    /// pushed the 44px `.fe-open-side` beneath the name — every file row
+    /// rendered at ~2x height while directory rows stayed dense.
+    #[wasm_bindgen_test]
+    async fn file_rows_are_single_line_and_match_directory_density() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let _state = mount_explorer_with_files(container.clone(), &["main.rs"]);
+        next_tick().await;
+
+        let row = container
+            .query_selector(".fe-row")
+            .unwrap()
+            .expect("the file renders as a row")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let name = file_rows(&container).remove(0);
+        let action = side_action(&container);
+        let dir = container
+            .query_selector("button.fe-dir")
+            .unwrap()
+            .expect("the fixture directory renders a directory row")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+
+        // The action shares the name's line rather than wrapping beneath it. Its
+        // resting opacity is 0 but it still occupies its layout box, so its top
+        // reports where it wrapped to — the wrap doubled the row height.
+        let name_top = name.get_bounding_client_rect().top();
+        let action_top = action.get_bounding_client_rect().top();
+        assert!(
+            (action_top - name_top).abs() < 3.0,
+            "the side-open action must share the name's line, not wrap below it: \
+             name top {name_top}, action top {action_top}"
+        );
+
+        // And so a file row is no taller than a directory row — one dense line.
+        let row_h = row.get_bounding_client_rect().height();
+        let dir_h = dir.get_bounding_client_rect().height();
+        assert!(
+            row_h <= dir_h + 1.0,
+            "a file row must be a single dense line like a directory row: \
+             file row {row_h}px vs directory row {dir_h}px"
+        );
+    }
+
     /// The context menus animate via `menu-in` on `.context-menu`. Under
     /// reduced motion that animation must be off — and the rule that turns it
     /// off must actually win, which an earlier block in the file does not.
