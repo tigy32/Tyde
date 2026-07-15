@@ -366,7 +366,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             before + [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG, "wasm-prepare"],
         )
 
-    def test_fingerprint_tracks_content_without_commit_state(self) -> None:
+    def test_fingerprint_tracks_commit_and_worktree_content(self) -> None:
         base_key = self._explain_key()
         base_index = self._index_digest()
         self.assertEqual(self._index_digest(), base_index)
@@ -397,15 +397,16 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         staged_key = self._explain_key()
         self.assertEqual(staged_key, unstaged_key)
         self._git("commit", "-qm", "Update tracked content")
-        self.assertEqual(self._explain_key(), unstaged_key)
+        committed_key = self._explain_key()
+        self.assertNotEqual(committed_key, unstaged_key)
 
         index_after_commit = self._index_digest()
         tracked.unlink()
         deleted_key = self._explain_key()
-        self.assertNotEqual(deleted_key, staged_key)
+        self.assertNotEqual(deleted_key, committed_key)
         self.assertEqual(self._index_digest(), index_after_commit)
 
-    def test_fingerprint_covers_browser_wasm_and_sccache_identities(self) -> None:
+    def test_fingerprint_ignores_environment_and_tool_identities(self) -> None:
         base_key = self._explain_key()
 
         chrome = self.bin / "google-chrome"
@@ -414,7 +415,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             encoding="utf-8",
         )
         chrome.chmod(0o755)
-        self.assertNotEqual(self._explain_key(), base_key)
+        self.assertEqual(self._explain_key(), base_key)
 
         chrome.write_text(
             "#!/usr/bin/env bash\necho 'Google Chrome 150.0.7871.102'\n",
@@ -427,7 +428,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             encoding="utf-8",
         )
         runner.chmod(0o755)
-        self.assertNotEqual(self._explain_key(), base_key)
+        self.assertEqual(self._explain_key(), base_key)
 
         runner.write_text(
             "#!/usr/bin/env bash\necho 'wasm-bindgen-test-runner 0.2.118'\n",
@@ -442,7 +443,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
 
         changed_python = self.env.copy()
         changed_python["DEV_CHECK_FAKE_PYTHON_VERSION"] = "3.changed"
-        self.assertNotEqual(self._explain_key(changed_python), base_key)
+        self.assertEqual(self._explain_key(changed_python), base_key)
 
     def test_environment_and_failures_obey_cache_contract(self) -> None:
         self._run()
@@ -462,7 +463,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         env_one["TYDE_RUN_REAL_LSP_TESTS"] = "one"
         env_two = self.env.copy()
         env_two["TYDE_RUN_REAL_LSP_TESTS"] = "two"
-        self.assertNotEqual(self._explain_key(env_one), self._explain_key(env_two))
+        self.assertEqual(self._explain_key(env_one), self._explain_key(env_two))
 
         without_real_ai = self.env.copy()
         without_real_ai.pop("TYDE_RUN_REAL_AI_TESTS")
@@ -564,7 +565,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             self._log_lines(), [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG]
         )
 
-    def test_ci_and_release_guards_use_canonical_cache(self) -> None:
+    def test_ci_checks_run_only_for_pull_requests(self) -> None:
         ci_env = self.env.copy()
         ci_env["CI"] = "true"
         result = self._run(env=ci_env)
@@ -574,18 +575,23 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         release_check = (REPO_ROOT / "tools" / "release_check.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("./dev.sh check\n", release_check)
-        self.assertNotIn("./dev.sh check --", release_check)
+        self.assertNotIn("./dev.sh check", release_check)
         release_workflow = (
             REPO_ROOT / ".github" / "workflows" / "release.yml"
         ).read_text(encoding="utf-8")
-        self.assertIn("run: ./dev.sh check", release_workflow)
-        self.assertNotIn("run: ./dev.sh check --", release_workflow)
+        self.assertNotIn("run: ./dev.sh check", release_workflow)
+        check_workflow = (
+            REPO_ROOT / ".github" / "workflows" / "check.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pull_request:", check_workflow)
+        self.assertNotIn("push:", check_workflow)
+        self.assertIn("runs-on: ubuntu-latest", check_workflow)
+        self.assertIn("run: ./dev.sh check", check_workflow)
         install = "cargo install sccache --version 0.16.0 --locked --force"
-        self.assertIn(install, release_workflow)
+        self.assertIn(install, check_workflow)
         self.assertLess(
-            release_workflow.index(install),
-            release_workflow.index("run: ./dev.sh check"),
+            check_workflow.index(install),
+            check_workflow.index("run: ./dev.sh check"),
         )
 
     def test_contract_stage_is_reachable_without_recursive_checks(self) -> None:

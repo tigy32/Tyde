@@ -59,64 +59,8 @@ jobs:
             gh release create "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$GITHUB_SHA" "${create_prerelease_flag[@]}"
           fi
 
-  test:
-    needs: create-release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # The workspace compiles the Tauri GUI crate (tauri-shell), so the native
-      # test build needs the same system libs the release build installs.
-      - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential \
-            curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev \
-            librsvg2-dev patchelf musl-tools time
-
-      - name: Install repository Rust toolchain
-        run: ./dev.sh rust-toolchain
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-          cache: npm
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
-      - name: Install pinned sccache
-        run: |
-          cargo install sccache --version 0.16.0 --locked --force
-          test "$(sccache --version)" = "sccache 0.16.0"
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: . -> target
-
-      - name: Install trunk
-        uses: taiki-e/install-action@v2
-        with:
-          tool: trunk@0.21.14
-
-      - name: Build frontend prerequisites
-        run: |
-          (cd frontend && trunk build --release)
-          (cd mobile-frontend && trunk build --release)
-
-      # Run the canonical cached check before any expensive matrix build or code
-      # signing. The fingerprint makes restored successes reusable only for the
-      # exact validated inputs.
-      - name: Run canonical checks
-        run: ./dev.sh check
-
   build:
-    needs: [create-release, test]
+    needs: create-release
     env:
       RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}
       TYDE_RELEASE_TAG: ${{ github.event.inputs.version || github.ref_name }}

@@ -331,7 +331,6 @@ command_prepare() {
 
     if [[ "$commit" == true ]]; then
         [[ -s "$changed_file" ]] || die "release version files already match $tag; nothing to commit"
-        "$REPO_ROOT/dev.sh" check
         while IFS= read -r path; do
             [[ -n "$path" ]] && git add -- "$path"
         done < "$changed_file"

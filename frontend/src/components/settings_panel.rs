@@ -2853,7 +2853,7 @@ fn BackendSettingsPage(kind: BackendKind) -> impl IntoView {
                     // here. Nothing is sent in that case: the user's consent named a
                     // host and a projection, and if either has moved, that consent
                     // no longer describes anything that exists.
-                    if !reset_arming_is_live(&confirm_state, kind, &armed) {
+                    if !untrack(|| reset_arming_is_live(&confirm_state, kind, &armed)) {
                         pending_reset.set(None);
                         return;
                     }
@@ -13050,14 +13050,14 @@ mod wasm_tests {
             state_hash: TycodeProjectionStateHash("sha256:state-a".to_owned()),
         };
         assert!(
-            reset_arming_is_live(&state, BackendKind::Tycode, &armed),
+            untrack(|| reset_arming_is_live(&state, BackendKind::Tycode, &armed)),
             "the arming matches the card on screen"
         );
 
         // The user switches hosts.
         state.selected_host_id.set(Some("host-other".to_owned()));
         assert!(
-            !reset_arming_is_live(&state, BackendKind::Tycode, &armed),
+            !untrack(|| reset_arming_is_live(&state, BackendKind::Tycode, &armed)),
             "an arming for one host must not stay live while another host is selected"
         );
 
@@ -13073,7 +13073,7 @@ mod wasm_tests {
             )),
         );
         assert!(
-            !reset_arming_is_live(&state, BackendKind::Tycode, &armed),
+            !untrack(|| reset_arming_is_live(&state, BackendKind::Tycode, &armed)),
             "consent to reset proj-A is not consent to reset whatever replaced it"
         );
 
@@ -13083,7 +13083,7 @@ mod wasm_tests {
             tycode_managed_snapshot(tycode_provenance("proj-C", false), Vec::new()),
         );
         assert!(
-            !reset_arming_is_live(&state, BackendKind::Tycode, &armed),
+            !untrack(|| reset_arming_is_live(&state, BackendKind::Tycode, &armed)),
             "a snapshot with no recovery state leaves nothing to reset"
         );
     }

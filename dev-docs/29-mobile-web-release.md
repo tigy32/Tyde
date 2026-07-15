@@ -89,7 +89,7 @@ The deterministic human release entry points are:
 ```
 
 `cut` requires the explicit `--confirm` mutation gate before it runs the
-authoritative release check, pushes `main` before the annotated tag, and waits
+release-coherence guard, pushes `main` before the annotated tag, and waits
 by polling GitHub unless `--no-wait` is given. Beta workflows leave a verified
 draft; `publish` is the separate beta-only publication step and also requires
 `--confirm`. Neither command prompts for terminal input, and neither bypasses
@@ -100,7 +100,8 @@ was seen and `4` after a matching run reached a nonterminal state. A deadline
 hit while normalizing status or verifying a completed run exits `5` as a
 network/tool error.
 
-Use the canonical local guard before release builds:
+Use the release-coherence guard before release builds. Repository tests run
+only for pull requests and are not repeated here:
 
 ```sh
 tools/release_check.sh [v<release>]

@@ -25,7 +25,6 @@ STAGE_NUMBER=0
 CLEANUP_RECLAIMED_BYTES=0
 SCCACHE_STATS_BEFORE=""
 SCCACHE_CONFIGURED=false
-WASM_CACHE_IDENTITY=""
 TIME_FLAVOR=""
 
 die() {
@@ -449,31 +448,13 @@ SCRIPT
     printf 'cargo.incremental=%s\n' "$CARGO_INCREMENTAL" >>"$RUN_METADATA"
 }
 
-hash_command() {
-    local label="$1"
-    shift
-    local output status
-
-    if output="$("$@" 2>&1)"; then
-        status=0
-    else
-        status=$?
-    fi
-    if ((status != 0)); then
-        printf 'ERROR: could not read %s identity (exit %s)\n' "$label" "$status" >&2
-        printf '%s\n' "$output" >&2
-        exit "$status"
-    fi
-    printf 'tool.%s.version=%s\n' "$label" "$(printf '%s\n' "$output" | head -n 1)"
-    printf 'tool.%s.identity=%s\n' "$label" "$(printf '%s' "$output" | hash_text)"
-}
-
 worktree_identity() {
-    local temp_dir temp_index head_tree worktree_tree
+    local temp_dir temp_index head_commit head_tree worktree_tree
     temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/tyde-dev-check-index.XXXXXX")"
     temp_index="$temp_dir/index"
 
-    if ! head_tree="$(git rev-parse --verify 'HEAD^{tree}')" ||
+    if ! head_commit="$(git rev-parse --verify HEAD)" ||
+        ! head_tree="$(git rev-parse --verify 'HEAD^{tree}')" ||
         ! GIT_INDEX_FILE="$temp_index" git read-tree "$head_tree" ||
         ! GIT_INDEX_FILE="$temp_index" git add -A -- . ||
         ! worktree_tree="$(GIT_INDEX_FILE="$temp_index" git write-tree)"; then
@@ -482,94 +463,13 @@ worktree_identity() {
     fi
 
     rm -rf "$temp_dir"
+    printf 'git.head_commit=%s\n' "$head_commit"
     printf 'git.worktree_tree=%s\n' "$worktree_tree"
 }
 
-environment_identity() {
-    local name value_hash
-    local -a names=()
-
-    while IFS= read -r name; do
-        case "$name" in
-            TYDE_DEV_CHECK_LOCK_HELD | TYDE_WASM_*) continue ;;
-        esac
-        case "$name" in
-            CI | HOME | PATH | PATHEXT | SHELL | USERPROFILE | LANG | LC_* | TZ | \
-                CLAUDE_CONFIG_DIR | HERMES_PYTHON | NO_COLOR | NODE_OPTIONS | \
-                RUST* | CARGO* | NEXTEST* | SCCACHE* | \
-                TYDE* | CC | CXX | AR | CFLAGS | CPPFLAGS | CXXFLAGS | LDFLAGS | \
-                MACOSX_DEPLOYMENT_TARGET | SDKROOT | LD_LIBRARY_PATH | DYLD_* | \
-                ASAN_OPTIONS | LSAN_OPTIONS | MSAN_OPTIONS | TSAN_OPTIONS | \
-                UBSAN_OPTIONS | HTTP_PROXY | HTTPS_PROXY | NO_PROXY | \
-                http_proxy | https_proxy | no_proxy)
-                names+=("$name")
-                ;;
-        esac
-    done < <(compgen -e | LC_ALL=C sort)
-
-    printf 'env.names='
-    if [[ ${#names[@]} -gt 0 ]]; then
-        (IFS=,; printf '%s' "${names[*]}")
-    fi
-    printf '\n'
-
-    for name in "${names[@]}"; do
-        value_hash="$(printf '%s=%s' "$name" "${!name}" | hash_text)"
-        printf 'env.%s=%s\n' "$name" "$value_hash"
-    done
-
-    for name in \
-        TYDE_RUN_REAL_AI_TESTS \
-        TYDE_LIVE_CODEX_TEST \
-        TYDE_RUN_CLAUDE_INTEGRATION; do
-        printf 'env.%s=unset\n' "$name"
-    done
-}
-
 cache_inputs() {
-    local path
-    local -a relevant_files=(
-        dev.sh
-        rust-toolchain.toml
-        .config/nextest.toml
-        tools/run-nextest-binary.sh
-        tools/run-wasm-tests.sh
-        tools/test_dev_check.py
-    )
-
     printf 'cache.schema=%s\n' "$DEV_CHECK_CACHE_SCHEMA"
     worktree_identity
-
-    for path in "${relevant_files[@]}"; do
-        [[ -f "$path" ]] || die "cache input is missing: $path"
-        printf 'script.%s=%s\n' "$path" "$(git hash-object "$path")"
-    done
-
-    printf 'shell.bash.version=%s\n' "$BASH_VERSION"
-    printf 'platform.os=%s\n' "$(uname -s)"
-    printf 'platform.release=%s\n' "$(uname -r)"
-    printf 'platform.arch=%s\n' "$(uname -m)"
-    hash_command git git --version
-    hash_command rustc rustc -Vv
-    hash_command cargo cargo -Vv
-    hash_command nextest cargo nextest --version
-    hash_command node node --version
-    hash_command python3 python3 --version
-    hash_command sccache sccache --version
-    printf '%s\n' "$WASM_CACHE_IDENTITY"
-    if command -v rustup >/dev/null 2>&1; then
-        hash_command rustup rustup show active-toolchain
-        hash_command rust-targets rustup target list --installed
-    else
-        printf 'tool.rustup.version=unavailable\n'
-        printf 'tool.rustup.identity=unavailable\n'
-    fi
-    printf 'sccache.directory=%s\n' "$SCCACHE_DIR"
-    printf 'sccache.cache_size=%s\n' "$SCCACHE_CACHE_SIZE"
-    printf 'sccache.idle_timeout=%s\n' "$SCCACHE_IDLE_TIMEOUT"
-    printf 'sccache.server_port=%s\n' "$SCCACHE_SERVER_PORT"
-    printf 'cargo.incremental=%s\n' "$CARGO_INCREMENTAL"
-    environment_identity
 }
 
 cache_key_for_inputs() {
@@ -723,7 +623,7 @@ check_usage() {
     cat <<'USAGE'
 Usage: ./dev.sh check [--explain-cache]
 
-  --explain-cache Print current canonical inputs/key without cleanup, network, or daemons
+  --explain-cache Print current Git state/key without cleanup, network, or daemons
 USAGE
 }
 
@@ -732,7 +632,7 @@ check() {
     local repetitions=3
     local cache_state="miss"
     local inputs key record_path refreshed_inputs refreshed_key
-    local channel name wasm_environment
+    local name wasm_environment
 
     if [[ $# -gt 1 ]]; then
         check_usage >&2
@@ -763,14 +663,6 @@ check() {
     done < <(compgen -e)
 
     if [[ "$mode" == "explain" ]]; then
-        channel="$(rust_toolchain_channel)"
-        command -v rustup >/dev/null 2>&1 || die "rustup is required"
-        export RUSTUP_TOOLCHAIN="$channel"
-        verify_active_rust_toolchain "$channel"
-        set_sccache_environment
-        [[ "$(sccache --version)" == "sccache $DEV_CHECK_SCCACHE_VERSION" ]] ||
-            die "sccache $DEV_CHECK_SCCACHE_VERSION is required for cache identity. Install it with: cargo install sccache --version $DEV_CHECK_SCCACHE_VERSION --locked"
-        WASM_CACHE_IDENTITY="$(tools/run-wasm-tests.sh --identity)"
         inputs="$(cache_inputs)"
         key="$(cache_key_for_inputs "$inputs")"
         record_path="$DEV_CHECK_CACHE_DIR/$key.success"
@@ -796,7 +688,6 @@ check() {
     source "$wasm_environment"
     [[ -f "$TYDE_WASM_IDENTITY_FILE" ]] ||
         die "wasm tool provisioning did not write $TYDE_WASM_IDENTITY_FILE"
-    WASM_CACHE_IDENTITY="$(cat "$TYDE_WASM_IDENTITY_FILE")"
 
     command -v cargo-nextest >/dev/null 2>&1 ||
         die "cargo-nextest is required. Install it with: cargo install cargo-nextest --locked"

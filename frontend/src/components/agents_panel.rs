@@ -1448,7 +1448,7 @@ pub(crate) fn activate_agent_side_open(
     width: Option<f64>,
     agent: &AgentInfo,
 ) -> Result<AgentOpenToSideResult, &'static str> {
-    if let Some(block) = agent_side_open_block(state, width, agent) {
+    if let Some(block) = untrack(|| agent_side_open_block(state, width, agent)) {
         return Err(block.reason());
     }
     Ok(state.open_agent_chat_to_side(
@@ -5120,7 +5120,7 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(
-            agent_side_open_eligibility(&state, &agent),
+            untrack(|| agent_side_open_eligibility(&state, &agent)),
             None,
             "the authoritative query reports this agent as eligible"
         );
@@ -5192,7 +5192,7 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(
-            agent_side_open_eligibility(&state, &agent),
+            untrack(|| agent_side_open_eligibility(&state, &agent)),
             None,
             "a chat beside other tabs in the focused pane is eligible to move"
         );
@@ -5247,7 +5247,7 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(
-            agent_side_open_eligibility(&state, &agent),
+            untrack(|| agent_side_open_eligibility(&state, &agent)),
             None,
             "an occurrence already in the other pane is eligible to reveal"
         );
@@ -5284,7 +5284,7 @@ mod wasm_tests {
 
         // The state layer classifies this, and the control must render exactly
         // what it says — no locally derived policy or reason text.
-        let eligibility = agent_side_open_eligibility(&state, &agent);
+        let eligibility = untrack(|| agent_side_open_eligibility(&state, &agent));
         assert_eq!(
             eligibility,
             Some(AgentOpenToSideResult::CrossProject),
@@ -5383,7 +5383,7 @@ mod wasm_tests {
         let _handle = mount_panel(&container, state.clone());
         next_tick().await;
 
-        let eligibility = agent_side_open_eligibility(&state, &agent);
+        let eligibility = untrack(|| agent_side_open_eligibility(&state, &agent));
         assert_eq!(
             eligibility,
             Some(AgentOpenToSideResult::NothingWouldRemain),
@@ -5544,7 +5544,7 @@ mod wasm_tests {
         // The state layer alone would allow this — it is the UI-owned width gate
         // that refuses, and the two compose.
         assert_eq!(
-            agent_side_open_eligibility(&state, &agent),
+            untrack(|| agent_side_open_eligibility(&state, &agent)),
             None,
             "state eligibility does not refuse here; the width gate does"
         );
@@ -5672,7 +5672,7 @@ mod wasm_tests {
         next_tick().await;
 
         // Both authorities refuse — that is what makes this a combination.
-        let state_reason = agent_side_open_eligibility(&state, &agent)
+        let state_reason = untrack(|| agent_side_open_eligibility(&state, &agent))
             .expect("the state layer refuses a cross-project agent")
             .disabled_reason()
             .expect("a refusal carries a reason");
@@ -5747,7 +5747,7 @@ mod wasm_tests {
         let _handle = mount_panel_at_width(&container, state.clone(), Some(500.0));
         next_tick().await;
 
-        let state_reason = agent_side_open_eligibility(&state, &agent)
+        let state_reason = untrack(|| agent_side_open_eligibility(&state, &agent))
             .expect("the state layer refuses when tabs are disabled")
             .disabled_reason()
             .expect("a refusal carries a reason");

@@ -3022,7 +3022,7 @@ mod wasm_tests {
         assert!(
             state
                 .compaction_in_progress
-                .with(|map| map.contains_key(&bound_agent_id)),
+                .with_untracked(|map| map.contains_key(&bound_agent_id)),
             "bound agent should be marked in-flight while the server processes"
         );
 
@@ -5291,13 +5291,13 @@ mod wasm_tests {
         assert!(
             state
                 .compaction_in_progress
-                .with(|map| map.contains_key(&mgr_agent_id)),
+                .with_untracked(|map| map.contains_key(&mgr_agent_id)),
             "manager agent should be marked in-flight after team compact"
         );
         assert!(
             state
                 .compaction_in_progress
-                .with(|map| map.contains_key(&rep_agent_id)),
+                .with_untracked(|map| map.contains_key(&rep_agent_id)),
             "reporter agent should be marked in-flight after team compact"
         );
         // With both agents now in compaction_in_progress, gating must

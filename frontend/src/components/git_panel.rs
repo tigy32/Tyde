@@ -484,7 +484,7 @@ fn diff_side_open_block(
     if let Some(result) = state.diff_open_to_side_eligibility(key) {
         return Some(DiffSideOpenBlock::State(result));
     }
-    split_creation_availability(state, width)
+    untrack(|| split_creation_availability(state, width))
         .reason()
         .map(DiffSideOpenBlock::Width)
 }
@@ -1167,6 +1167,7 @@ fn send_commit(root: ProjectRootPath, message: String) {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use crate::wasm_test_support::Mounted;
     use crate::components::center_zone::CenterWorkspaceWidth;
     use crate::state::{
         ActiveProjectRef, CenterLayout, CenterZoneState, PaneId, PaneState, Tab, TabContent, TabId,
@@ -1275,7 +1276,10 @@ mod wasm_tests {
         }
     }
 
-    fn mount_git_panel(container: HtmlElement, with_draft: bool) -> Rc<RefCell<Option<AppState>>> {
+    fn mount_git_panel(
+        container: HtmlElement,
+        with_draft: bool,
+    ) -> Mounted<Rc<RefCell<Option<AppState>>>> {
         let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
         let holder_for_mount = holder.clone();
         let handle = mount_to(container, move || {
@@ -1301,8 +1305,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <GitPanel /> }
         });
-        std::mem::forget(handle);
-        holder
+        Mounted::new(handle, holder)
     }
 
     fn diff_key() -> DiffKey {
@@ -1325,7 +1328,10 @@ mod wasm_tests {
         }
     }
 
-    fn mount_side_open_panel(container: HtmlElement, width: f64) -> Rc<RefCell<Option<AppState>>> {
+    fn mount_side_open_panel(
+        container: HtmlElement,
+        width: f64,
+    ) -> Mounted<Rc<RefCell<Option<AppState>>>> {
         stub_recording_bridge();
         let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
         let holder_for_mount = holder.clone();
@@ -1345,8 +1351,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <GitPanel /> }
         });
-        std::mem::forget(handle);
-        holder
+        Mounted::new(handle, holder)
     }
 
     fn diff_occurrences(state: &AppState, key: &DiffKey) -> Vec<(PaneId, TabId)> {
@@ -1613,7 +1618,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn no_draft_shows_review_changes_control() {
         let container = make_container();
-        let _ = mount_git_panel(container.clone(), false);
+        let _mounted = mount_git_panel(container.clone(), false);
         next_tick().await;
 
         assert!(
@@ -1631,7 +1636,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn draft_shows_review_hub_with_counts() {
         let container = make_container();
-        let _ = mount_git_panel(container.clone(), true);
+        let _mounted = mount_git_panel(container.clone(), true);
         next_tick().await;
 
         // Exactly one workspace hub for the project.
@@ -1669,7 +1674,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn file_row_shows_comment_count_badge() {
         let container = make_container();
-        let _ = mount_git_panel(container.clone(), true);
+        let _mounted = mount_git_panel(container.clone(), true);
         next_tick().await;
         next_tick().await;
 
@@ -1688,7 +1693,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn file_row_has_no_badge_without_review() {
         let container = make_container();
-        let _ = mount_git_panel(container.clone(), false);
+        let _mounted = mount_git_panel(container.clone(), false);
         next_tick().await;
         next_tick().await;
 
@@ -1735,7 +1740,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <GitPanel /> }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
 
         // Exactly one workspace hub even with two roots.
@@ -1823,7 +1828,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <GitPanel /> }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
         next_tick().await;
 
@@ -1914,7 +1919,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <GitPanel /> }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
         next_tick().await;
 
@@ -1971,7 +1976,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <div></div> }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
 
         let state = holder.borrow().clone().unwrap();
@@ -2052,7 +2057,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <div></div> }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
 
         let state = holder.borrow().clone().unwrap();
@@ -2191,7 +2196,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <div></div> }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
 
         assert_eq!(
@@ -2259,7 +2264,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <div></div> }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
 
         next_tick().await;
         next_tick().await;
@@ -2299,7 +2304,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <div></div> }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
         assert_eq!(invoke_count(), 1, "initial subscribe");
 
@@ -2351,7 +2356,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <div></div> }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
         assert_eq!(invoke_count(), 1, "initial subscribe");
 

@@ -3608,6 +3608,7 @@ mod tests {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use crate::wasm_test_support::Mounted;
     use crate::state::DiffViewState;
     use crate::syntax_highlight::{compute_hunk_tokens, syntax_for_path};
     use leptos::mount::mount_to;
@@ -4249,8 +4250,8 @@ mod wasm_tests {
         container: HtmlElement,
         diff: DiffViewState,
         review: Option<protocol::Review>,
-    ) {
-        mount_reviewable_with_mode(container, diff, review, DiffViewMode::Unified);
+    ) -> Mounted<()> {
+        mount_reviewable_with_mode(container, diff, review, DiffViewMode::Unified)
     }
 
     fn mount_reviewable_with_mode(
@@ -4258,7 +4259,7 @@ mod wasm_tests {
         diff: DiffViewState,
         review: Option<protocol::Review>,
         view_mode: DiffViewMode,
-    ) {
+    ) -> Mounted<()> {
         let scope = diff.scope;
         let path = diff.path.clone().unwrap_or_default();
         let root = diff.root.clone();
@@ -4317,7 +4318,7 @@ mod wasm_tests {
                 />
             }
         });
-        std::mem::forget(handle);
+        Mounted::new(handle, ())
     }
 
     /// A normal diff tab whose project has a Draft review renders that
@@ -4328,7 +4329,7 @@ mod wasm_tests {
     async fn reviewable_diff_renders_draft_comment_without_review_view() {
         ensure_styles_loaded();
         let container = make_container();
-        mount_reviewable(
+        let _mounted = mount_reviewable(
             container.clone(),
             small_foo_diff(),
             Some(draft_review("src/foo.rs", 2, "please fix this")),
@@ -4368,7 +4369,7 @@ mod wasm_tests {
     async fn reviewable_diff_clicking_added_line_opens_composer() {
         ensure_styles_loaded();
         let container = make_container();
-        mount_reviewable(
+        let _mounted = mount_reviewable(
             container.clone(),
             small_foo_diff(),
             Some(draft_review("src/foo.rs", 2, "please fix this")),
@@ -4405,7 +4406,7 @@ mod wasm_tests {
         let mut diff = small_foo_diff();
         diff.files[0].hunks[0].lines = diff.files[0].hunks[0].lines[1..].to_vec();
         diff.files[0].hunks[0].old_count = 0;
-        mount_reviewable_with_mode(
+        let _mounted = mount_reviewable_with_mode(
             container.clone(),
             diff,
             Some(draft_review("src/foo.rs", 2, "please fix this")),
@@ -4444,7 +4445,7 @@ mod wasm_tests {
     async fn reviewable_diff_no_banner_without_draft() {
         ensure_styles_loaded();
         let container = make_container();
-        mount_reviewable(container.clone(), small_foo_diff(), None);
+        let _mounted = mount_reviewable(container.clone(), small_foo_diff(), None);
         next_tick().await;
         next_tick().await;
 
@@ -4474,7 +4475,7 @@ mod wasm_tests {
         let container = make_container();
         let mut diff = small_foo_diff();
         diff.scope = ProjectDiffScope::Unstaged;
-        mount_reviewable(
+        let _mounted = mount_reviewable(
             container.clone(),
             diff,
             Some(draft_review("src/foo.rs", 2, "please fix this")),
@@ -4517,7 +4518,7 @@ mod wasm_tests {
         let container = make_container();
         let mut diff = small_foo_diff();
         diff.scope = ProjectDiffScope::Staged;
-        mount_reviewable(
+        let _mounted = mount_reviewable(
             container.clone(),
             diff,
             Some(draft_review("src/foo.rs", 2, "please fix this")),
@@ -4563,7 +4564,7 @@ mod wasm_tests {
         let container = make_container();
         let mut diff = small_foo_diff();
         diff.scope = ProjectDiffScope::Uncommitted;
-        mount_reviewable(
+        let _mounted = mount_reviewable(
             container.clone(),
             diff,
             Some(draft_review("src/foo.rs", 2, "please fix this")),
@@ -4661,7 +4662,7 @@ mod wasm_tests {
                 />
             }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
         next_tick().await;
 
@@ -4734,7 +4735,7 @@ mod wasm_tests {
                 />
             }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
         next_tick().await;
 
@@ -4756,7 +4757,7 @@ mod wasm_tests {
     async fn all_files_surface_shows_comment_on_non_first_file() {
         ensure_styles_loaded();
         let container = make_container();
-        mount_reviewable(
+        let _mounted = mount_reviewable(
             container.clone(),
             all_files_diff(),
             // Comment anchored to the SECOND file (src/bar.rs), new line 2.
@@ -4841,7 +4842,7 @@ mod wasm_tests {
                 />
             }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
         next_tick().await;
 
@@ -4874,7 +4875,7 @@ mod wasm_tests {
     async fn binary_file_renders_placeholder_with_file_comment_affordance() {
         ensure_styles_loaded();
         let container = make_container();
-        mount_reviewable(
+        let _mounted = mount_reviewable(
             container.clone(),
             binary_diff("assets/logo.png"),
             Some(draft_review("assets/logo.png", 1, "file note")),
@@ -4970,7 +4971,7 @@ mod wasm_tests {
                 </div>
             }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
         next_tick().await;
 
@@ -5055,7 +5056,7 @@ mod wasm_tests {
                 />
             }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
 
         // Toggle the context mode ⇒ refetch.

@@ -683,9 +683,9 @@ fn split_target(state: &AppState, tab: TabId) -> Option<PaneId> {
 /// Every Split Right path — shortcut, palette, tab menu, strip button — runs
 /// through here, so they cannot succeed or refuse differently.
 pub fn split_right(state: &AppState, tab: TabId, workspace_width: Option<f64>) {
-    if let CommandAvailability::Disabled(reason) =
-        split_right_availability_for(state, Some(tab), workspace_width)
-    {
+    let availability =
+        untrack(|| split_right_availability_for(state, Some(tab), workspace_width));
+    if let CommandAvailability::Disabled(reason) = availability {
         announce(reason);
         return;
     }
@@ -765,8 +765,8 @@ fn toggle_dock(signal: RwSignal<DockVisibility>) {
 /// menu row, a shortcut pressed in the wrong context, and a palette selection
 /// all fail the same way — visibly disabled, never a surprise mutation.
 pub fn execute_command(state: &AppState, id: CommandId, workspace_width: Option<f64>) {
-    if let CommandAvailability::Disabled(reason) = command_availability(state, id, workspace_width)
-    {
+    let availability = untrack(|| command_availability(state, id, workspace_width));
+    if let CommandAvailability::Disabled(reason) = availability {
         // Refusing silently is what makes a disabled control feel broken. Every
         // refusal — shortcut, menu item, palette row — says the same specific
         // thing through the one polite live region.
@@ -897,7 +897,7 @@ fn do_select(
                 // somewhere they did not ask for. Refuse, say exactly why, and
                 // leave the palette open so the row is still there to retry.
                 if let CommandAvailability::Disabled(reason) =
-                    open_to_side_availability(&state, workspace_width)
+                    untrack(|| open_to_side_availability(&state, workspace_width))
                 {
                     notice.set(Some(reason));
                     announce(reason);
@@ -911,7 +911,7 @@ fn do_select(
         PaletteResult::Command { entry_index } => {
             let id = COMMANDS[*entry_index].id;
             if let CommandAvailability::Disabled(reason) =
-                command_availability(&state, id, workspace_width)
+                untrack(|| command_availability(&state, id, workspace_width))
             {
                 notice.set(Some(reason));
                 announce(reason);

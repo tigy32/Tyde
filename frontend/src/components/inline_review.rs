@@ -1080,6 +1080,7 @@ pub(crate) fn Composer(
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use crate::wasm_test_support::Mounted;
     use leptos::mount::mount_to;
     use protocol::{
         AgentId, ProjectId, Review, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewComment,
@@ -1160,7 +1161,7 @@ mod wasm_tests {
         container: HtmlElement,
         seed_comments: Vec<ReviewComment>,
         baseline: Vec<ReviewCommentId>,
-    ) -> RwSignal<Option<ComposerState>> {
+    ) -> Mounted<RwSignal<Option<ComposerState>>> {
         let review = review_with(seed_comments);
         let rid = review.id.clone();
         let composer: RwSignal<Option<ComposerState>> = RwSignal::new(None);
@@ -1187,8 +1188,7 @@ mod wasm_tests {
                 />
             }
         });
-        std::mem::forget(handle);
-        composer
+        Mounted::new(handle, composer)
     }
 
     /// Regression: the close is level-triggered, not edge-triggered. When the

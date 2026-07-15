@@ -3333,7 +3333,7 @@ mod wasm_tests {
         // User filters to idle rows → overlay installed.
         button_with_text(&container, "Idle").click();
         next_tick().await;
-        assert!(state.agents_view_overlay_pending());
+        assert!(untrack(|| state.agents_view_overlay_pending()));
         assert_eq!(rendered_names(&container), vec!["live"]);
         assert_eq!(last_pref_update_kind(), "set_filters");
 
@@ -3350,7 +3350,7 @@ mod wasm_tests {
 
         // Overlay dropped (server is now the sole input) and the view still
         // reflects the server state.
-        assert!(!state.agents_view_overlay_pending());
+        assert!(!untrack(|| state.agents_view_overlay_pending()));
         assert!(
             state
                 .agents_view_preferences
@@ -3400,7 +3400,7 @@ mod wasm_tests {
             .unwrap();
         move_c_down.click();
         next_tick().await;
-        assert!(state.agents_view_overlay_pending());
+        assert!(untrack(|| state.agents_view_overlay_pending()));
         assert_eq!(rendered_names(&container), vec!["b", "c", "a"]);
         assert_eq!(last_pref_update_kind(), "set_manual_order");
 
@@ -3416,7 +3416,7 @@ mod wasm_tests {
 
         // Overlay cleared and the view shows the server order, not the stuck
         // optimistic [b, c, a].
-        assert!(!state.agents_view_overlay_pending());
+        assert!(!untrack(|| state.agents_view_overlay_pending()));
         assert_eq!(rendered_names(&container), vec!["a", "b", "c"]);
     }
 
@@ -3741,7 +3741,7 @@ mod wasm_tests {
         user_tab.click();
         next_tick().await;
 
-        assert!(state.agents_view_overlay_pending());
+        assert!(untrack(|| state.agents_view_overlay_pending()));
         // The view's query is applied (NameAsc → a, z) and the view is active.
         assert_eq!(rendered_names(&container), vec!["a", "z"]);
         assert_eq!(active_tab_names(&container), vec!["Alpha order"]);
@@ -3768,7 +3768,7 @@ mod wasm_tests {
         next_tick().await;
 
         // Overlay dropped; view stays active and ordered from the server snapshot.
-        assert!(!state.agents_view_overlay_pending());
+        assert!(!untrack(|| state.agents_view_overlay_pending()));
         assert_eq!(active_tab_names(&container), vec!["Alpha order"]);
         assert_eq!(rendered_names(&container), vec!["a", "z"]);
     }
@@ -3801,7 +3801,7 @@ mod wasm_tests {
 
         // "All" stays highlighted purely from the optimistic overlay (default
         // query still matches the active view), before any server notify.
-        assert!(state.agents_view_overlay_pending());
+        assert!(untrack(|| state.agents_view_overlay_pending()));
         assert_eq!(active_tab_names(&container), vec!["All"]);
     }
 
@@ -3826,7 +3826,7 @@ mod wasm_tests {
         next_tick().await;
 
         // Query now diverges from "All" → no tab highlighted.
-        assert!(state.agents_view_overlay_pending());
+        assert!(untrack(|| state.agents_view_overlay_pending()));
         assert!(active_tab_names(&container).is_empty());
     }
 
@@ -4378,7 +4378,7 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(
-            agent_side_open_eligibility(&state, &agent),
+            untrack(|| agent_side_open_eligibility(&state, &agent)),
             None,
             "the authoritative query reports this agent as eligible"
         );
@@ -4432,7 +4432,7 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(
-            agent_side_open_eligibility(&state, &agent),
+            untrack(|| agent_side_open_eligibility(&state, &agent)),
             None,
             "a chat beside other tabs in the focused pane is eligible to move"
         );
@@ -4461,7 +4461,7 @@ mod wasm_tests {
 
         // Same authoritative source as the Agents panel — the monitor renders
         // what the state layer says, and derives no policy of its own.
-        let eligibility = agent_side_open_eligibility(&state, &agent);
+        let eligibility = untrack(|| agent_side_open_eligibility(&state, &agent));
         assert_eq!(
             eligibility,
             Some(AgentOpenToSideResult::CrossProject),
@@ -4615,7 +4615,7 @@ mod wasm_tests {
         next_tick().await;
 
         assert_eq!(
-            agent_side_open_eligibility(&state, &agent),
+            untrack(|| agent_side_open_eligibility(&state, &agent)),
             None,
             "state eligibility does not refuse here; the width gate does"
         );
@@ -4718,7 +4718,7 @@ mod wasm_tests {
         let _h = mount_monitor_at_width(&container, state.clone(), Some(500.0));
         next_tick().await;
 
-        let state_reason = agent_side_open_eligibility(&state, &agent)
+        let state_reason = untrack(|| agent_side_open_eligibility(&state, &agent))
             .expect("the state layer refuses a cross-project agent")
             .disabled_reason()
             .expect("a refusal carries a reason");
@@ -4789,7 +4789,7 @@ mod wasm_tests {
         let _h = mount_monitor_at_width(&container, state.clone(), Some(500.0));
         next_tick().await;
 
-        let state_reason = agent_side_open_eligibility(&state, &agent)
+        let state_reason = untrack(|| agent_side_open_eligibility(&state, &agent))
             .expect("the state layer refuses when tabs are disabled")
             .disabled_reason()
             .expect("a refusal carries a reason");

@@ -901,6 +901,7 @@ fn node_matches_filter(node: &TreeNode, filter: &str, show_hidden: bool) -> bool
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use crate::wasm_test_support::Mounted;
     use crate::state::ActiveProjectRef;
     use leptos::mount::mount_to;
     use protocol::{
@@ -1016,7 +1017,7 @@ mod wasm_tests {
     fn mount_footer(
         container: HtmlElement,
         overview: Option<CodeIntelOverviewPayload>,
-    ) -> Rc<RefCell<Option<AppState>>> {
+    ) -> Mounted<Rc<RefCell<Option<AppState>>>> {
         let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
         let holder_for_mount = holder.clone();
         let handle = mount_to(container, move || {
@@ -1040,8 +1041,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <FileExplorer /> }
         });
-        std::mem::forget(handle);
-        holder
+        Mounted::new(handle, holder)
     }
 
     // ── Open / Open to the Side ─────────────────────────────────────────
@@ -1076,7 +1076,10 @@ mod wasm_tests {
     /// Pre-loading matters: it is the state in which "Open to the Side"
     /// duplicates synchronously, so the test observes the destination pane
     /// directly instead of an unresolvable cold-open round trip.
-    fn mount_explorer_with_files(container: HtmlElement, files: &[&str]) -> AppState {
+    fn mount_explorer_with_files(
+        container: HtmlElement,
+        files: &[&str],
+    ) -> Mounted<AppState> {
         // The shape the server actually emits: one entry per path, `Add` for a
         // path present in the listing (server/src/project_stream.rs). The
         // directory rides along so the tree is exercised against the protocol's
@@ -1135,9 +1138,8 @@ mod wasm_tests {
             provide_context(state);
             view! { <FileExplorer /> }
         });
-        std::mem::forget(handle);
         let state = holder.borrow().clone().expect("state provided");
-        state
+        Mounted::new(handle, state)
     }
 
     fn file_rows(container: &HtmlElement) -> Vec<HtmlElement> {
@@ -1798,7 +1800,7 @@ mod wasm_tests {
     #[wasm_bindgen_test]
     async fn footer_shows_loading_without_overview() {
         let container = make_container();
-        let _ = mount_footer(container.clone(), None);
+        let _mounted = mount_footer(container.clone(), None);
         next_tick().await;
         assert_eq!(label_text(&container), "Code Intel: Loading…");
     }
@@ -1816,7 +1818,7 @@ mod wasm_tests {
                 Some("No language server running — open a file to index"),
             ),
         };
-        let _ = mount_footer(container.clone(), Some(overview));
+        let _mounted = mount_footer(container.clone(), Some(overview));
         next_tick().await;
 
         assert_eq!(label_text(&container), "Code Intel: Not started");
@@ -1868,7 +1870,7 @@ mod wasm_tests {
                 Some("Indexing code intelligence"),
             ),
         };
-        let _ = mount_footer(container.clone(), Some(overview));
+        let _mounted = mount_footer(container.clone(), Some(overview));
         next_tick().await;
 
         assert_eq!(
@@ -1909,7 +1911,7 @@ mod wasm_tests {
             ],
             summary: summary(CodeIntelOverviewHeadline::Indexing, [1, 1, 0, 0, 0], None),
         };
-        let _ = mount_footer(container.clone(), Some(overview));
+        let _mounted = mount_footer(container.clone(), Some(overview));
         next_tick().await;
 
         let toggle = container

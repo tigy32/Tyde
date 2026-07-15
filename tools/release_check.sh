@@ -57,7 +57,6 @@ esac
 
 require_command python3 "Install Python 3 and rerun release-check."
 require_command cargo "Install Rust/Cargo and rerun release-check."
-require_command cargo-nextest "Install it with: cargo install cargo-nextest --locked"
 require_command rustup "Install rustup or add the wasm32-unknown-unknown target in this Rust toolchain."
 require_command node "Install Node.js and rerun release-check."
 require_command trunk "Install it with: cargo install trunk"
@@ -89,18 +88,6 @@ for raw_path in sys.argv[1:]:
     path = pathlib.Path(raw_path)
     compile(path.read_text(encoding="utf-8"), str(path), "exec")
 PY
-
-log "Running release tooling Python tests"
-python3 -B -m unittest \
-    tools/test_dev_check.py \
-    tools/test_release_tooling.py \
-    tools/test_check_mobile_web_manifest.py
-
-log "Running canonical dev checks"
-./dev.sh check
-
-log "Running web deploy manifest tests"
-node --test web/deploy/*.test.mjs
 
 log "Checking web deploy shell syntax"
 bash -n web/deploy/deploy.sh

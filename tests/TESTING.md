@@ -79,12 +79,11 @@ deletion notification. Every other error or event remains a failure.
 
 ## Repository Validation
 
-`./dev.sh check` is the only ordinary repository validation command. Do not
-run Cargo tests, nextest, filtered tests, wasm scripts, web tests, or any
-underlying stage directly. The wrapper owns caching, repetition and flaky-test
-handling, current-stable toolchain setup, the release-safe environment, and
-token/time optimization. Run it once after the final tree is ready; if it
-fails, fix only from its diagnostics and rerun the same command.
+Full repository validation runs only for pull requests through
+`.github/workflows/check.yml`. Do not run it during local implementation or
+release cutting. If the user explicitly requests a local diagnostic run,
+`./dev.sh check` is the only allowed command; never invoke an underlying stage
+directly.
 
 Normal output is deliberately compact: each stage reports START and PASS/FAIL
 with wall time, repetition counts, and peak RSS. Full lossless output is kept in
@@ -116,14 +115,13 @@ clones are preserved between checks. Shared `target/debug`,
 wasm build output, user files, and sibling-worktree targets are never cleaned.
 
 The normal wrapper provisions browser and wasm-bindgen tools once before cache
-evaluation, fingerprints the resolved tools, and reuses those exact paths for
-all repetitions. Explicit browser overrides never fall back. Chrome-major and
-Cargo.lock wasm-bindgen changes are resolved in the same invocation without
-post-run cache drift. `--explain-cache` only reads current identities: it does
-not acquire the check lock, clean artifacts, access the network, or start
-sccache, and it never signs a driver. Explicit wasm runner overrides must use
-the Cargo runner basename so the fingerprinted executable is the one Cargo
-runs. Nextest lock acquisition and lease creation use exclusive filesystem
+evaluation and reuses those exact paths for all repetitions. Cache identity is
+only the schema, `HEAD` commit, and tracked plus unignored worktree content.
+Explicit browser overrides never fall back. `--explain-cache` reads only that
+Git state: it does not acquire the check lock, clean artifacts, access the
+network, or start sccache, and it never signs a driver. Explicit wasm runner
+overrides must use the Cargo runner basename so that exact executable is the one
+Cargo runs. Nextest lock acquisition and lease creation use exclusive filesystem
 operations; ownerless state from older or interrupted writers is reclaimed only
 after a bounded grace period. Release CI installs the pinned sccache version
 before its canonical cached check.

@@ -2168,6 +2168,7 @@ fn subscribe_backoff_ms(failures: u32) -> i32 {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
+    use crate::wasm_test_support::Mounted;
     use crate::state::AgentInfo;
     use leptos::mount::mount_to;
     use protocol::{
@@ -2406,7 +2407,7 @@ mod wasm_tests {
     fn mount_sidebar(
         container: HtmlElement,
         review: Review,
-    ) -> std::rc::Rc<std::cell::RefCell<Option<AppState>>> {
+    ) -> Mounted<std::rc::Rc<std::cell::RefCell<Option<AppState>>>> {
         let state_holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let state_holder_for_mount = state_holder.clone();
@@ -2436,8 +2437,7 @@ mod wasm_tests {
                 />
             }
         });
-        std::mem::forget(handle);
-        state_holder
+        Mounted::new(handle, state_holder)
     }
 
     /// Submit gating: disabled with zero comments, stays disabled with a
@@ -2768,7 +2768,7 @@ mod wasm_tests {
             provide_context(state);
             view! { <crate::components::git_panel::GitPanel /> }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
 
         next_tick().await;
         next_tick().await;
@@ -2949,7 +2949,7 @@ mod wasm_tests {
                 </div>
             }
         });
-        std::mem::forget(handle);
+        let _mounted = Mounted::new(handle, ());
         next_tick().await;
 
         let read = || {
@@ -3034,7 +3034,7 @@ mod wasm_tests {
         container: HtmlElement,
         review: Review,
         seed_diff: bool,
-    ) -> std::rc::Rc<std::cell::RefCell<Option<AppState>>> {
+    ) -> Mounted<std::rc::Rc<std::cell::RefCell<Option<AppState>>>> {
         let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let holder_for_mount = holder.clone();
@@ -3096,8 +3096,7 @@ mod wasm_tests {
                 />
             }
         });
-        std::mem::forget(handle);
-        holder
+        Mounted::new(handle, holder)
     }
 
     fn rejected_suggestion_at_line(line: u32, body: &str) -> ReviewSuggestedComment {
@@ -3113,7 +3112,7 @@ mod wasm_tests {
     async fn comments_surface_shows_empty_state() {
         ensure_styles_loaded();
         let container = make_container();
-        let _ = mount_comments_surface(container.clone(), make_review(), true);
+        let _mounted = mount_comments_surface(container.clone(), make_review(), true);
 
         next_tick().await;
         next_tick().await;
@@ -3155,7 +3154,7 @@ mod wasm_tests {
         review
             .suggestions
             .push(rejected_suggestion_at_line(5, "rejected"));
-        let _ = mount_comments_surface(container.clone(), review, true);
+        let _mounted = mount_comments_surface(container.clone(), review, true);
 
         next_tick().await;
         next_tick().await;
@@ -3199,7 +3198,7 @@ mod wasm_tests {
         other.location.root = ProjectRootPath("/other".to_owned());
         other.location.relative_path = "src/other.rs".to_owned();
         review.comments.push(other);
-        let _ = mount_comments_surface(container.clone(), review, true);
+        let _mounted = mount_comments_surface(container.clone(), review, true);
 
         next_tick().await;
         next_tick().await;
@@ -3342,7 +3341,7 @@ mod wasm_tests {
         let mut review = make_review();
         review.comments.push(comment_at_line(2, "a"));
         // seed_diff = false ⇒ no cached project diff, so a fetch must fire.
-        let _ = mount_comments_surface(container.clone(), review, false);
+        let _mounted = mount_comments_surface(container.clone(), review, false);
 
         next_tick().await;
         next_tick().await;
