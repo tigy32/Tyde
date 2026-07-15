@@ -42,11 +42,11 @@ usage() {
     cat <<'USAGE'
 Usage:
   ./dev.sh release prepare vX.Y.Z [--commit]
-  ./dev.sh release cut vX.Y.Z [--no-wait]
+  ./dev.sh release cut vX.Y.Z --confirm [--no-wait]
   ./dev.sh release status vX.Y.Z
   ./dev.sh release wait vX.Y.Z [--timeout 90m] [--interval 30]
   ./dev.sh release verify vX.Y.Z
-  ./dev.sh release publish vX.Y.Z
+  ./dev.sh release publish vX.Y.Z --confirm
 
 wait/status exit codes: 0 success, 1 failed, 3 not found, 4 still running,
 5 network/tool error. Usage errors exit 2.
@@ -298,16 +298,6 @@ cheap_cut_gates() {
     require_tag_absent "$tag"
 }
 
-confirm_exact_tag() {
-    local action="$1"
-    local tag="$2"
-    local response
-    [[ -t 0 && -t 1 ]] || die "$action requires an interactive TTY; no bypass is available"
-    printf '%s %s by typing the exact tag: ' "$action" "$tag"
-    IFS= read -r response || die "$action confirmation was not provided"
-    [[ "$response" == "$tag" ]] || die "$action confirmation did not match $tag"
-}
-
 command_prepare() {
     local tag="${1:-}"
     local commit=false
@@ -354,16 +344,24 @@ command_prepare() {
 
 command_cut() {
     local tag="${1:-}"
+    local confirmed=false
     local no_wait=false
     local release_sha subject remote_sha
     [[ -n "$tag" ]] || { usage >&2; exit "$EXIT_USAGE"; }
     shift
-    if [[ $# -gt 0 ]]; then
-        [[ $# -eq 1 && "$1" == "--no-wait" ]] || { usage >&2; exit "$EXIT_USAGE"; }
-        no_wait=true
-    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --confirm) confirmed=true ;;
+            --no-wait) no_wait=true ;;
+            *) usage >&2; exit "$EXIT_USAGE" ;;
+        esac
+        shift
+    done
 
     require_strict_tag "$tag"
+    [[ "$confirmed" == true ]] || die \
+        "release cut requires --confirm before any release checks or mutation" \
+        "$EXIT_USAGE"
     require_tools_and_auth
     python3 "$PYTHON_HELPER" validate-tag "$tag" >/dev/null || exit "$EXIT_USAGE"
     require_repo_root
@@ -379,8 +377,6 @@ command_cut() {
     printf 'Release candidate: %s %s %s\n' "$tag" "$release_sha" "$subject"
 
     "$RELEASE_CHECK" "$tag" || die "canonical release check failed"
-    cheap_cut_gates "$tag" "$release_sha"
-    confirm_exact_tag "Cut release" "$tag"
     cheap_cut_gates "$tag" "$release_sha"
 
     git tag -a "$tag" -m "Release $tag" || die "failed to create local annotated tag $tag"
@@ -793,12 +789,14 @@ command_wait_bounded() {
 command_publish() {
     local tag="${1:-}"
     local status draft
-    [[ -n "$tag" && $# -eq 1 ]] || { usage >&2; exit "$EXIT_USAGE"; }
+    [[ -n "$tag" && $# -eq 2 && "$2" == "--confirm" ]] || {
+        usage >&2
+        exit "$EXIT_USAGE"
+    }
     require_strict_tag "$tag"
     [[ "$tag" == *-* ]] || die "$tag is stable; release publish is beta-only" "$EXIT_USAGE"
     command_verify "$tag"
     require_remote_tag_on_origin_main "$tag"
-    confirm_exact_tag "Publish beta release" "$tag"
 
     if read_release_json "$tag"; then
         :

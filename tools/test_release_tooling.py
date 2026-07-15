@@ -7,8 +7,6 @@ import io
 import json
 import os
 import pathlib
-import pty
-import select
 import shutil
 import subprocess
 import sys
@@ -524,50 +522,12 @@ esac
             check=False,
         )
 
-    def run_tty(
-        self, response: str, *args: str, env: dict[str, str] | None = None
-    ) -> tuple[int, str, str]:
-        merged = self.env | (env or {})
-        master, slave = pty.openpty()
-        process = subprocess.Popen(
-            [str(self.tools / "release.sh"), *args],
-            cwd=self.root,
-            env=merged,
-            stdin=slave,
-            stdout=slave,
-            stderr=subprocess.PIPE,
-        )
-        os.close(slave)
-        os.write(master, response.encode("utf-8"))
-        output = bytearray()
-        while process.poll() is None:
-            ready, _, _ = select.select([master], [], [], 0.1)
-            if ready:
-                try:
-                    output.extend(os.read(master, 4096))
-                except OSError:
-                    break
-        deadline = time.time() + 1
-        while time.time() < deadline:
-            ready, _, _ = select.select([master], [], [], 0.05)
-            if not ready:
-                break
-            try:
-                output.extend(os.read(master, 4096))
-            except OSError:
-                break
-        os.close(master)
-        stderr = process.stderr.read().decode("utf-8") if process.stderr else ""
-        if process.stderr:
-            process.stderr.close()
-        return process.wait(), output.decode("utf-8", errors="replace"), stderr
-
     def commands(self) -> list[str]:
         return self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
 
     def test_gate_failure_does_not_mutate(self) -> None:
         result = self.run_shell(
-            "cut", TAG, "--no-wait", env={"FAKE_DIRTY": "1"}
+            "cut", TAG, "--confirm", "--no-wait", env={"FAKE_DIRTY": "1"}
         )
 
         self.assertEqual(result.returncode, 1)
@@ -584,54 +544,49 @@ esac
 
     def test_hook_gate_failure_does_not_mutate(self) -> None:
         result = self.run_shell(
-            "cut", TAG, "--no-wait", env={"FAKE_HOOKS": ".git/hooks"}
+            "cut", TAG, "--confirm", "--no-wait", env={"FAKE_HOOKS": ".git/hooks"}
         )
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("core.hooksPath", result.stderr)
         self.assertFalse(any(line.startswith("git tag ") for line in self.commands()))
 
-    def test_non_tty_and_wrong_confirmation_do_not_mutate(self) -> None:
+    def test_missing_confirmation_does_not_run_checks_or_mutate(self) -> None:
         result = self.run_shell("cut", TAG, "--no-wait")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("interactive TTY", result.stderr)
-        self.assertFalse(any(line.startswith("git tag ") for line in self.commands()))
-
-        self.log.unlink()
-        code, _, stderr = self.run_tty("wrong\n", "cut", TAG, "--no-wait")
-        self.assertEqual(code, 1)
-        self.assertIn("did not match", stderr)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires --confirm", result.stderr)
+        self.assertFalse(any(line.startswith("release_check ") for line in self.commands()))
         self.assertFalse(any(line.startswith("git tag ") for line in self.commands()))
 
     def test_pushes_main_before_tag(self) -> None:
-        code, stdout, stderr = self.run_tty(f"{TAG}\n", "cut", TAG, "--no-wait")
+        result = self.run_shell("cut", TAG, "--confirm", "--no-wait")
 
-        self.assertEqual(code, 0, stdout + stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = self.commands()
         tag_index = commands.index(f"git tag -a {TAG} -m Release {TAG}")
         main_index = commands.index("git push origin main")
         remote_tag_index = commands.index(f"git push origin {TAG}")
         self.assertLess(tag_index, main_index)
         self.assertLess(main_index, remote_tag_index)
-        self.assertIn("verified both remote refs", stdout)
+        self.assertIn("verified both remote refs", result.stdout)
 
     def test_reports_partial_main_push_when_tag_push_fails(self) -> None:
-        code, _, stderr = self.run_tty(
-            f"{TAG}\n",
+        result = self.run_shell(
             "cut",
             TAG,
+            "--confirm",
             "--no-wait",
             env={"FAKE_TAG_PUSH_FAIL": "1"},
         )
 
-        self.assertEqual(code, 1)
-        self.assertIn("PARTIAL RELEASE", stderr)
-        self.assertIn("origin/main contains", stderr)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("PARTIAL RELEASE", result.stderr)
+        self.assertIn("origin/main contains", result.stderr)
         self.assertTrue((self.state / "main-pushed").exists())
         self.assertFalse((self.state / "remote-tag").exists())
 
     def test_stable_publish_is_refused_before_github_mutation(self) -> None:
-        result = self.run_shell("publish", "v1.2.3")
+        result = self.run_shell("publish", "v1.2.3", "--confirm")
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("beta-only", result.stderr)
@@ -652,7 +607,7 @@ esac
         (self.state / "remote-tag").touch()
 
         result = self.run_shell(
-            "publish", TAG, env={"FAKE_PUBLISH_OFF_MAIN": "1"}
+            "publish", TAG, "--confirm", env={"FAKE_PUBLISH_OFF_MAIN": "1"}
         )
 
         self.assertEqual(result.returncode, 1)
@@ -733,9 +688,9 @@ esac
     def test_beta_publish_uses_required_flags_and_rereads_release(self) -> None:
         (self.state / "remote-tag").touch()
 
-        code, stdout, stderr = self.run_tty(f"{TAG}\n", "publish", TAG)
+        result = self.run_shell("publish", TAG, "--confirm")
 
-        self.assertEqual(code, 0, stdout + stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = self.commands()
         edit = f"gh release edit {TAG} --draft=false --prerelease --latest=false"
         self.assertIn(edit, commands)

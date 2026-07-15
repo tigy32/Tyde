@@ -81,18 +81,19 @@ The deterministic human release entry points are:
 
 ```sh
 ./dev.sh release prepare v<release> [--commit]
-./dev.sh release cut v<release> [--no-wait]
+./dev.sh release cut v<release> --confirm [--no-wait]
 ./dev.sh release status v<release>
 ./dev.sh release wait v<release> [--timeout 90m] [--interval 30]
 ./dev.sh release verify v<release>
-./dev.sh release publish v<beta-release>
+./dev.sh release publish v<beta-release> --confirm
 ```
 
-`cut` requires an exact TTY confirmation, pushes `main` before the annotated
-tag, and waits by polling GitHub unless `--no-wait` is given. Beta workflows
-leave a verified draft; `publish` is the separate beta-only publication step
-and also requires exact TTY confirmation. None of these commands bypasses the
-release checks, hook, clean-tree, or `main` requirements in `AGENTS.md`.
+`cut` requires the explicit `--confirm` mutation gate before it runs the
+authoritative release check, pushes `main` before the annotated tag, and waits
+by polling GitHub unless `--no-wait` is given. Beta workflows leave a verified
+draft; `publish` is the separate beta-only publication step and also requires
+`--confirm`. Neither command prompts for terminal input, and neither bypasses
+the release checks, hook, clean-tree, or `main` requirements in `AGENTS.md`.
 The `wait --timeout` deadline bounds the complete wait subprocess, including
 GitHub, network, and helper calls; timeout exits remain `3` when no matching run
 was seen and `4` after a matching run reached a nonterminal state. A deadline
