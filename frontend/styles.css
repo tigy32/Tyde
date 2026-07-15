@@ -1249,32 +1249,6 @@ details summary:focus:not(:focus-visible) {
     flex: 0 0 auto;
 }
 
-/* Both strip controls carry a >=24x24 target (WCAG 2.5.8). A 44x44 control
-   cannot fit a 36px tab strip without redesigning the strip, so the full-size
-   (>=44px) targets for these same actions are the menu items below, which every
-   one of them can also be reached through. */
-.split-right-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 28px;
-    height: 28px;
-    padding: 0 4px;
-    color: var(--text-secondary);
-}
-
-.split-right-btn:hover:not(.disabled) {
-    color: var(--text-bright);
-    background: var(--surface-3);
-}
-
-/* Never hidden — a control that cannot run still says why it cannot. */
-.split-right-btn.disabled,
-.split-right-btn[aria-disabled="true"] {
-    opacity: 0.45;
-    cursor: default;
-}
-
 .pane-actions {
     position: relative;
     display: flex;
@@ -6169,9 +6143,8 @@ kbd {
     background: var(--surface-hover);
 }
 
-/* File row: the name opens in the focused pane, the trailing action opens to
-   the side. The action is always in the tab order — it is revealed on hover or
-   focus, never hidden from the keyboard. */
+/* File row: clicking the name opens the file in the focused pane. Splits are
+   created by dragging tabs, so the row hosts no trailing side-open action. */
 .fe-row {
     display: flex;
     align-items: center;
@@ -6185,125 +6158,10 @@ kbd {
 .fe-row .fe-item {
     flex: 1 1 auto;
     min-width: 0;
-    /* Reset the base `.fe-item` `width: 100%`: inside the wrapping row it would
-       resolve as a 100% flex-basis, leaving no room for `.fe-open-side` beside
-       it, so the 44px action wrapped to its own line and doubled every file
-       row's height. Content-sized basis lets the item share the line. */
+    /* Reset the base `.fe-item` `width: 100%` so a file row stays a single dense
+       line: as a 100% flex-basis it would previously push a trailing action onto
+       its own line and double the row height. Content-sized basis keeps it flat. */
     width: auto;
-}
-
-/* The inline action is a pointer convenience. Its hit target is 44px wide and
-   spans the full row height — a 44x44 box is not reachable inside a 26px tree
-   row without making every row 44px tall, so the full-size (>=44px) target for
-   this action is the row context menu's item below. */
-.fe-open-side {
-    flex: 0 0 auto;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    align-self: stretch;
-    width: 44px;
-    min-height: 26px;
-    padding: 0;
-    border: none;
-    background: none;
-    color: var(--text-secondary);
-    border-radius: 3px;
-    cursor: pointer;
-    /* Quiet until the row is engaged — revealed on hover, on keyboard focus
-       anywhere in the row, and on its own focus. Hover-only would hide the
-       affordance from every keyboard and touch user.
-
-       `pointer-events: none` while invisible is the load-bearing half: an
-       `opacity: 0` element still swallows clicks, so a reuse of this class in a
-       row that does not match the reveal selectors below (the git panel's
-       `.gp-file-row` was exactly that) left an *invisible but clickable* target
-       sitting in the row. It is now unclickable precisely when it is unseeable. */
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.1s;
-}
-
-.fe-open-side-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 22px;
-    height: 22px;
-}
-
-/* Every row that hosts this control lists itself here. The explorer, search and
-   references rows use `.fe-row`; the git panel's file rows are `.gp-file-row`
-   (whose `.gp-file-actions` group reveals itself the same way). A disabled
-   control is always shown: it carries the reason, and a reason nobody can see is
-   the failure this exists to prevent. */
-.fe-row:hover .fe-open-side,
-.fe-row:focus-within .fe-open-side,
-.gp-file-row:hover .fe-open-side,
-.gp-file-row:focus-within .fe-open-side,
-.fe-open-side:focus-visible,
-.fe-open-side.disabled,
-.fe-open-side[aria-disabled="true"] {
-    opacity: 1;
-    pointer-events: auto;
-}
-
-.fe-open-side:focus-visible {
-    outline: 2px solid var(--accent-primary);
-    outline-offset: -2px;
-}
-
-/* A refusal the user can see, not only hear. */
-.fe-refusal {
-    flex: 1 0 100%;
-    margin: 2px 0 4px 28px;
-    padding: 4px 8px;
-    border-left: 2px solid var(--accent-primary);
-    background: var(--surface-2);
-    color: var(--text-secondary);
-    font-size: 0.75rem;
-    white-space: normal;
-}
-
-.fe-row {
-    flex-wrap: wrap;
-}
-
-/* Row context menu: the full-size target for the same actions. */
-.fe-menu-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 1000;
-}
-
-.fe-menu {
-    min-width: 220px;
-}
-
-.fe-menu-item {
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    gap: 2px;
-    min-height: 44px;
-    padding: 8px 12px;
-}
-
-.fe-open-side:hover {
-    color: var(--text-bright);
-    background: var(--surface-3);
-}
-
-.fe-open-side.disabled,
-.fe-open-side[aria-disabled="true"] {
-    color: var(--text-secondary);
-    cursor: default;
-}
-
-.fe-open-side.disabled:hover,
-.fe-open-side[aria-disabled="true"]:hover {
-    background: none;
-    color: var(--text-secondary);
 }
 
 .fe-item:active {
@@ -12880,8 +12738,7 @@ pre.tool-error-pre {
         animation: none;
     }
 
-    /* Opacity reveals: the side-open control and the git panel's action group. */
-    .fe-open-side,
+    /* Opacity reveal: the git panel's action group. */
     .gp-file-actions {
         transition: none;
     }

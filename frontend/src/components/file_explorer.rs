@@ -4,10 +4,6 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::actions::{delete_project_root, open_project_path_at};
-use crate::components::center_zone::{announce, workspace_width};
-use crate::components::command_palette::{
-    ContextActionId, context_binding, open_to_side_availability,
-};
 use crate::components::host_browser::open_add_root_browser;
 use crate::send::send_frame;
 use crate::state::{AppState, OpenTarget, display_path_name, root_display_name};
@@ -655,18 +651,8 @@ fn render_nodes(
         .collect()
 }
 
-/// One file row: an ordinary open, plus an Open-to-the-Side action reachable
-/// by pointer and by keyboard.
-///
-/// The `Command/Ctrl+Enter` chord is bound *here*, on the focused row, and
-/// nowhere else. It is never a global binding: the chat composer needs that
-/// chord for send/steer (dev-docs/32 §12), so the handler also stops the event
-/// from travelling any further.
-///
-/// Both openers go through `open_project_path_at`, which resolves the
-/// destination pane at invocation time. A cold file therefore keeps the pane
-/// the user aimed at even though its tab is only created when the contents
-/// arrive, and a loaded file is duplicated into the other pane synchronously.
+/// One file row: clicking it opens the file in the focused pane. Splits are
+/// created by dragging tabs, so the row offers no open-to-the-side affordance.
 #[component]
 fn FileRow(
     root: ProjectRootPath,
@@ -674,214 +660,28 @@ fn FileRow(
     name: String,
     indent: usize,
 ) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let width = workspace_width();
-
     let path = ProjectPath {
         root,
         relative_path,
     };
 
-    // Explorer rows exist only for the active project, and opening beside is
-    // offered only there — there is no cross-project split affordance.
-    let availability = Memo::new(move |_| open_to_side_availability(&state, width.get()));
-    let side_disabled = move || !availability.get().is_enabled();
-    let side_reason = move || availability.get().reason().unwrap_or_default().to_owned();
-
     let open_state = expect_context::<AppState>();
-    let open_path = path.clone();
     let on_click = move |_| {
-        open_project_path_at(&open_state, open_path.clone(), OpenTarget::Focused);
-    };
-
-    // A refusal the user cannot perceive is the same as a dead control. Every
-    // refusal — inline button, keyboard chord, menu item — sets this, which is
-    // rendered as visible text on the row *and* announced politely.
-    let refusal: RwSignal<Option<&'static str>> = RwSignal::new(None);
-
-    let side_state = expect_context::<AppState>();
-    let side_path = path.clone();
-    let open_to_side = move || {
-        if let Some(reason) = availability.get_untracked().reason() {
-            refusal.set(Some(reason));
-            announce(reason);
-            return;
-        }
-        refusal.set(None);
-        open_project_path_at(&side_state, side_path.clone(), OpenTarget::Beside);
-    };
-
-    // Row context menu: the plan's specified explorer affordance (§4.1), and the
-    // one that can carry a full-size (>=44px) target and a visible reason
-    // without turning a 26px tree row into a 44px one.
-    let menu: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
-    let row_ref = NodeRef::<leptos::html::Button>::new();
-
-    // Open the menu from the row itself, so a keyboard user reaches it without
-    // a pointer: Shift+F10 and the Menu key are the platform conventions.
-    let open_menu_at_row = move || {
-        let Some(row) = row_ref.get_untracked() else {
-            return;
-        };
-        let rect = row.get_bounding_client_rect();
-        menu.set(Some((rect.left() + 16.0, rect.bottom())));
-    };
-
-    let on_keydown = {
-        let open_to_side = open_to_side.clone();
-        move |ev: web_sys::KeyboardEvent| {
-            let key = ev.key();
-            // The Open-to-the-Side chord stays element-scoped: it is handled on
-            // the focused row and stopped there, so it can never reach the
-            // window, where it would collide with the composer's send/steer.
-            if key == "Enter" && (ev.ctrl_key() || ev.meta_key()) {
-                ev.prevent_default();
-                ev.stop_propagation();
-                open_to_side();
-                return;
-            }
-            if key == "ContextMenu" || (key == "F10" && ev.shift_key()) {
-                ev.prevent_default();
-                ev.stop_propagation();
-                open_menu_at_row();
-            }
-        }
-    };
-    let on_contextmenu = move |ev: web_sys::MouseEvent| {
-        ev.prevent_default();
-        ev.stop_propagation();
-        menu.set(Some((ev.client_x() as f64, ev.client_y() as f64)));
-    };
-    let on_side_click = {
-        let open_to_side = open_to_side.clone();
-        move |ev: web_sys::MouseEvent| {
-            // The row itself would otherwise open the file in the focused pane.
-            ev.stop_propagation();
-            open_to_side();
-        }
-    };
-
-    // Menu actions. A disabled item still activates — and refuses out loud
-    // (dev-docs/32 §12): a control that does nothing and says nothing is the
-    // failure mode this exists to prevent.
-    let menu_open_state = expect_context::<AppState>();
-    let menu_open_path = path.clone();
-    let on_menu_open = move |_: web_sys::MouseEvent| {
-        menu.set(None);
-        open_project_path_at(
-            &menu_open_state,
-            menu_open_path.clone(),
-            OpenTarget::Focused,
-        );
-    };
-    let on_menu_side = {
-        let open_to_side = open_to_side.clone();
-        move |_: web_sys::MouseEvent| {
-            if availability.get_untracked().is_enabled() {
-                menu.set(None);
-            }
-            // `open_to_side` refuses, notifies, and announces on its own, so the
-            // menu path cannot diverge from the button and chord paths.
-            open_to_side();
-        }
+        open_project_path_at(&open_state, path.clone(), OpenTarget::Focused);
     };
 
     let icon = file_type_icon(&name);
-    let side_label = format!("Open {name} to the side");
-    // The hint comes from the chord that actually fires, so a macOS user is told
-    // ⌘Enter rather than a Ctrl chord that is not what they press.
-    let side_hint = context_binding(ContextActionId::OpenToSide).chord().hint();
-    let side_title = move || {
-        if side_disabled() {
-            side_reason()
-        } else {
-            format!("Open to the side ({side_hint})")
-        }
-    };
-    // The reason id is read from three closures, one of which is `<Show>`'s
-    // children — which Leptos re-runs, so it must be `Fn`. A captured `String`
-    // makes that impossible: any inner closure that takes it moves it out of the
-    // children's environment and collapses it to `FnOnce` (E0525). Storing it as
-    // a `Copy` handle removes the hazard at the root instead of scattering
-    // `.clone()`s that each have to be got right.
-    let reason_id: StoredValue<String> = StoredValue::new(format!(
-        "fe-side-reason-{}",
-        path.relative_path.replace(['/', '.'], "-")
-    ));
-    let described_by = move || side_disabled().then(|| reason_id.get_value());
 
     view! {
         <div class="fe-row">
             <button
                 class="fe-item fe-file"
-                node_ref=row_ref
                 style=format!("padding-left: {}px", indent + 4)
                 on:click=on_click
-                on:keydown=on_keydown
-                on:contextmenu=on_contextmenu
             >
                 <span class="fe-icon fe-file-icon">{icon}</span>
                 <span class="fe-name">{name}</span>
             </button>
-            <button
-                class="fe-open-side"
-                class:disabled=side_disabled
-                aria-label=side_label
-                aria-disabled=move || side_disabled().then_some("true")
-                aria-describedby=described_by
-                aria-keyshortcuts="Control+Enter Meta+Enter"
-                title=side_title
-                on:click=on_side_click
-            >
-                <span class="fe-open-side-icon" aria-hidden="true">"\u{29c9}"</span>
-            </button>
-            <Show when=move || refusal.get().is_some()>
-                <div class="fe-refusal" role="status" data-testid="fe-refusal">
-                    {move || refusal.get().unwrap_or_default()}
-                </div>
-            </Show>
-            <Show when=move || menu.get().is_some()>
-                <div class="fe-menu-backdrop" on:click=move |_| menu.set(None)></div>
-                <div
-                    class="context-menu fe-menu"
-                    role="menu"
-                    aria-label="File actions"
-                    style=move || {
-                        menu.get()
-                            .map(|(x, y)| format!("left: {x}px; top: {y}px;"))
-                            .unwrap_or_default()
-                    }
-                    on:keydown=move |ev: web_sys::KeyboardEvent| {
-                        if ev.key() == "Escape" {
-                            ev.prevent_default();
-                            menu.set(None);
-                        }
-                    }
-                >
-                    <button
-                        class="context-menu-item fe-menu-item"
-                        role="menuitem"
-                        on:click=on_menu_open.clone()
-                    >
-                        "Open"
-                    </button>
-                    <button
-                        class="context-menu-item fe-menu-item"
-                        role="menuitem"
-                        class:disabled=side_disabled
-                        aria-disabled=move || side_disabled().then_some("true")
-                        aria-describedby=described_by
-                        on:click=on_menu_side.clone()
-                    >
-                        <span class="context-menu-label">"Open to the Side"</span>
-                        <Show when=side_disabled>
-                            <span class="context-menu-reason" id=move || reason_id.get_value()>
-                                {side_reason}
-                            </span>
-                        </Show>
-                    </button>
-                </div>
-            </Show>
         </div>
     }
 }
@@ -937,31 +737,6 @@ mod wasm_tests {
         container.set_attribute("data-test-container", "1").unwrap();
         document.body().unwrap().append_child(&container).unwrap();
         container.dyn_into::<HtmlElement>().unwrap()
-    }
-
-    /// Longest transition in `styles.css` on anything asserted here
-    /// (`.fe-open-side` animates `opacity` for 100ms).
-    const LONGEST_TRANSITION_MS: i32 = 100;
-
-    /// Wait for CSS transitions to finish before reading a computed style.
-    ///
-    /// `getComputedStyle` mid-transition returns the *interpolated* value: an
-    /// action that has just been revealed still reports `opacity: 0` a
-    /// microtask later. The assertion is about the settled appearance, so the
-    /// fixture waits for it — the assertion itself still demands a full
-    /// `opacity: 1`.
-    async fn settle_styles() {
-        next_tick().await;
-        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-            web_sys::window()
-                .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(
-                    &resolve,
-                    LONGEST_TRANSITION_MS + 50,
-                )
-                .unwrap();
-        });
-        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
     async fn next_tick() {
@@ -1044,7 +819,7 @@ mod wasm_tests {
         Mounted::new(handle, holder)
     }
 
-    // ── Open / Open to the Side ─────────────────────────────────────────
+    // ── Open ────────────────────────────────────────────────────────────
 
     const HOST: &str = "h1";
     const PROJECT: &str = "proj-1";
@@ -1073,9 +848,9 @@ mod wasm_tests {
 
     /// An explorer whose active project lists `files`, each already loaded.
     ///
-    /// Pre-loading matters: it is the state in which "Open to the Side"
-    /// duplicates synchronously, so the test observes the destination pane
-    /// directly instead of an unresolvable cold-open round trip.
+    /// Pre-loading matters: it is the state in which opening a file resolves
+    /// synchronously, so the test observes the destination pane directly instead
+    /// of an unresolvable cold-open round trip.
     fn mount_explorer_with_files(
         container: HtmlElement,
         files: &[&str],
@@ -1167,36 +942,6 @@ mod wasm_tests {
         }
     }
 
-    fn is_visible(element: &HtmlElement) -> bool {
-        let rect = element.get_bounding_client_rect();
-        rect.width() > 0.0 && rect.height() > 0.0
-    }
-
-    fn query_all_in(root: &HtmlElement, selector: &str) -> Vec<HtmlElement> {
-        let nodes = root.query_selector_all(selector).unwrap();
-        (0..nodes.length())
-            .map(|i| nodes.item(i).unwrap().dyn_into::<HtmlElement>().unwrap())
-            .collect()
-    }
-
-    fn side_action(container: &HtmlElement) -> HtmlElement {
-        container
-            .query_selector("button.fe-open-side")
-            .unwrap()
-            .expect("file rows offer an Open to the Side action")
-            .dyn_into()
-            .unwrap()
-    }
-
-    fn ctrl_enter() -> web_sys::KeyboardEvent {
-        let init = web_sys::KeyboardEventInit::new();
-        init.set_key("Enter");
-        init.set_ctrl_key(true);
-        init.set_bubbles(true);
-        init.set_cancelable(true);
-        web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init).unwrap()
-    }
-
     /// Where a file ended up: which pane holds a tab for it.
     fn pane_of_file(state: &AppState, name: &str) -> Option<crate::state::PaneId> {
         let content = crate::state::TabContent::File {
@@ -1208,12 +953,6 @@ mod wasm_tests {
                 .first()
                 .map(|(pane, _)| *pane)
         })
-    }
-
-    fn tab_count(state: &AppState) -> usize {
-        state
-            .center_zone
-            .with_untracked(|center_zone| center_zone.all_tab_ids().len())
     }
 
     /// An ordinary click opens in the focused pane and never splits.
@@ -1255,476 +994,16 @@ mod wasm_tests {
         );
     }
 
-    /// The visible row action opens the file beside, creating the split, and
-    /// does not also trigger the row's ordinary open.
-    #[wasm_bindgen_test]
-    async fn the_row_action_opens_the_file_to_the_side() {
-        let container = make_container();
-        let state = mount_explorer_with_files(container.clone(), &["main.rs"]);
-        next_tick().await;
-
-        let action = side_action(&container);
-        assert_eq!(
-            action.get_attribute("aria-label").as_deref(),
-            Some("Open main.rs to the side"),
-            "the action names the file it acts on"
-        );
-        assert_eq!(
-            action.get_attribute("aria-disabled"),
-            None,
-            "with an active project and room to split, the action is enabled"
-        );
-
-        action.click();
-        next_tick().await;
-
-        assert!(
-            state
-                .center_zone
-                .with_untracked(|center_zone| center_zone.is_split()),
-            "opening to the side creates the second pane"
-        );
-        assert_eq!(
-            pane_of_file(&state, "main.rs"),
-            Some(crate::state::PaneId::Secondary),
-            "the file opens in the pane the user aimed at, resolved at invocation"
-        );
-        assert_eq!(
-            tab_count(&state),
-            2,
-            "the row action must not also fire the row's ordinary open — Home \
-             plus one file tab, not two file tabs"
-        );
-    }
-
-    /// The Command/Ctrl+Enter chord is bound to the focused row and stops
-    /// there. It must never reach a global handler, because the chat composer
-    /// owns that chord for send/steer.
-    #[wasm_bindgen_test]
-    async fn ctrl_enter_on_a_focused_row_opens_to_the_side_and_never_escapes_the_row() {
-        let container = make_container();
-        let state = mount_explorer_with_files(container.clone(), &["main.rs"]);
-        next_tick().await;
-
-        // Stand in for the app's global keydown listener, which lives on the
-        // window and must not see this chord.
-        let seen = Rc::new(RefCell::new(0usize));
-        let seen_for_cb = seen.clone();
-        let callback = wasm_bindgen::closure::Closure::<dyn Fn(web_sys::Event)>::new(
-            move |_: web_sys::Event| {
-                *seen_for_cb.borrow_mut() += 1;
-            },
-        );
-        let window = web_sys::window().unwrap();
-        window
-            .add_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref())
-            .unwrap();
-
-        let row = file_rows(&container).remove(0);
-        row.dispatch_event(&ctrl_enter()).unwrap();
-        next_tick().await;
-
-        assert_eq!(
-            pane_of_file(&state, "main.rs"),
-            Some(crate::state::PaneId::Secondary),
-            "Ctrl+Enter on the focused row opens the file to the side"
-        );
-        assert_eq!(
-            *seen.borrow(),
-            0,
-            "the chord is element-scoped: it must not propagate to a global \
-             window handler, where it would collide with the composer's \
-             send/steer binding"
-        );
-
-        window
-            .remove_event_listener_with_callback("keydown", callback.as_ref().unchecked_ref())
-            .unwrap();
-    }
-
-    /// A workspace that cannot host a second pane keeps the action visible and
-    /// says why, and the action refuses to act.
-    #[wasm_bindgen_test]
-    async fn open_to_side_is_disabled_with_a_reason_when_tabs_are_disabled() {
-        let container = make_container();
-        let state = mount_explorer_with_files(container.clone(), &["main.rs"]);
-        state.tabs_enabled.set(false);
-        next_tick().await;
-
-        let action = side_action(&container);
-        assert_eq!(
-            action.get_attribute("aria-disabled").as_deref(),
-            Some("true"),
-            "the action is disabled, not hidden"
-        );
-        assert_eq!(
-            action.get_attribute("title").as_deref(),
-            Some("Enable tabs to use split view."),
-            "the disabled action states the specific reason"
-        );
-
-        action.click();
-        next_tick().await;
-        assert!(
-            !state
-                .center_zone
-                .with_untracked(|center_zone| center_zone.is_split()),
-            "a disabled action performs no work"
-        );
-
-        file_rows(&container)
-            .remove(0)
-            .dispatch_event(&ctrl_enter())
-            .unwrap();
-        next_tick().await;
-        assert!(
-            !state
-                .center_zone
-                .with_untracked(|center_zone| center_zone.is_split()),
-            "the keyboard path honors the same availability as the visible action"
-        );
-    }
-
-    fn computed(element: &HtmlElement, property: &str) -> String {
-        web_sys::window()
-            .unwrap()
-            .get_computed_style(element)
-            .unwrap()
-            .unwrap()
-            .get_property_value(property)
-            .unwrap()
-    }
-
-    fn shift_f10() -> web_sys::KeyboardEvent {
-        let init = web_sys::KeyboardEventInit::new();
-        init.set_key("F10");
-        init.set_shift_key(true);
-        init.set_bubbles(true);
-        init.set_cancelable(true);
-        web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init).unwrap()
-    }
-
-    /// The side-open affordance must not be hover-only: a keyboard user who has
-    /// focused the row has to be able to *see* that the action exists, and a
-    /// pointer user needs a target big enough to hit.
-    #[wasm_bindgen_test]
-    async fn the_side_open_action_is_revealed_by_focus_and_has_a_real_target() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let _state = mount_explorer_with_files(container.clone(), &["main.rs"]);
-        next_tick().await;
-
-        settle_styles().await;
-        let action = side_action(&container);
-        assert_eq!(
-            computed(&action, "opacity"),
-            "0",
-            "precondition: the action is quiet until the row is engaged"
-        );
-
-        // Focusing the row — the keyboard path — reveals it. Nothing is hovered.
-        let row = file_rows(&container).remove(0);
-        row.focus().unwrap();
-        settle_styles().await;
-        assert_eq!(
-            computed(&action, "opacity"),
-            "1",
-            "focusing the row must reveal its action: a hover-only affordance is \
-             invisible to every keyboard and touch user"
-        );
-
-        let rect = action.get_bounding_client_rect();
-        assert!(
-            rect.width() >= 44.0,
-            "the action's hit target must be at least 44px wide, got {}px",
-            rect.width()
-        );
-        assert!(
-            rect.height() >= 24.0,
-            "and at least 24px tall, got {}px",
-            rect.height()
-        );
-    }
-
-    /// The full-size (>=44px) target for the same action is the row's context
-    /// menu, which a keyboard user opens with Shift+F10 — no pointer, no hover.
-    #[wasm_bindgen_test]
-    async fn the_row_context_menu_opens_from_the_keyboard_and_has_a_full_size_target() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let state = mount_explorer_with_files(container.clone(), &["main.rs"]);
-        next_tick().await;
-
-        assert!(
-            container.query_selector(".fe-menu").unwrap().is_none(),
-            "precondition: no menu is open"
-        );
-
-        file_rows(&container)
-            .remove(0)
-            .dispatch_event(&shift_f10())
-            .unwrap();
-        next_tick().await;
-
-        let menu = container
-            .query_selector(".fe-menu")
-            .unwrap()
-            .expect("Shift+F10 on the focused row opens its context menu")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        assert_eq!(menu.get_attribute("role").as_deref(), Some("menu"));
-
-        let side_item = query_all_in(&menu, "[role=\"menuitem\"]")
-            .into_iter()
-            .find(|item| {
-                item.text_content()
-                    .unwrap_or_default()
-                    .contains("to the Side")
-            })
-            .expect("the menu offers Open to the Side");
-        let rect = side_item.get_bounding_client_rect();
-        assert!(
-            rect.height() >= 44.0,
-            "the menu item is the full-size target for this action: expected >=44px \
-             tall, got {}px",
-            rect.height()
-        );
-        assert!(
-            rect.width() >= 44.0,
-            "and >=44px wide, got {}px",
-            rect.width()
-        );
-
-        side_item.click();
-        next_tick().await;
-        assert_eq!(
-            pane_of_file(&state, "main.rs"),
-            Some(crate::state::PaneId::Secondary),
-            "the menu item performs the same side-open as the inline action"
-        );
-    }
-
-    /// Unavailable is not invisible: the menu item stays, keeps its keyboard
-    /// reachability, describes its reason, and refuses out loud.
-    #[wasm_bindgen_test]
-    async fn an_unavailable_side_open_menu_item_keeps_its_reason() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let state = mount_explorer_with_files(container.clone(), &["main.rs"]);
-        state.tabs_enabled.set(false);
-        next_tick().await;
-
-        file_rows(&container)
-            .remove(0)
-            .dispatch_event(&shift_f10())
-            .unwrap();
-        next_tick().await;
-
-        let menu = container
-            .query_selector(".fe-menu")
-            .unwrap()
-            .expect("menu opened")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        let side_item = query_all_in(&menu, "[role=\"menuitem\"]")
-            .into_iter()
-            .find(|item| {
-                item.text_content()
-                    .unwrap_or_default()
-                    .contains("to the Side")
-            })
-            .expect("the item stays listed when unavailable");
-
-        assert_eq!(
-            side_item.get_attribute("aria-disabled").as_deref(),
-            Some("true"),
-            "unavailable items are aria-disabled, never removed"
-        );
-        assert!(
-            !side_item.has_attribute("disabled"),
-            "and never the bare disabled attribute, which would drop them out of \
-             the tab order and take the reason with them"
-        );
-        let described_by = side_item
-            .get_attribute("aria-describedby")
-            .expect("the item is described by its reason");
-        let description = container
-            .query_selector(&format!("#{described_by}"))
-            .unwrap()
-            .expect("the description element exists");
-        assert_eq!(
-            description.text_content().unwrap_or_default().trim(),
-            "Enable tabs to use split view.",
-            "the shared reason vocabulary, not a bespoke message"
-        );
-
-        side_item.click();
-        next_tick().await;
-        assert!(
-            !state
-                .center_zone
-                .with_untracked(|center_zone| center_zone.is_split()),
-            "an unavailable item performs no work"
-        );
-    }
-
-    /// A refusal the user cannot perceive is a dead control. Both the inline
-    /// button and the keyboard chord must say why they refused — visibly, and
-    /// to a screen reader.
-    #[wasm_bindgen_test]
-    async fn inline_and_chord_refusals_notify_visibly() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let state = mount_explorer_with_files(container.clone(), &["main.rs"]);
-        state.tabs_enabled.set(false);
-        next_tick().await;
-
-        assert!(
-            container
-                .query_selector("[data-testid=\"fe-refusal\"]")
-                .unwrap()
-                .is_none(),
-            "precondition: nothing has been refused yet"
-        );
-
-        // The inline button.
-        side_action(&container).click();
-        next_tick().await;
-        let notice = container
-            .query_selector("[data-testid=\"fe-refusal\"]")
-            .unwrap()
-            .expect("the inline refusal is shown, not swallowed")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        assert_eq!(
-            notice.text_content().unwrap_or_default().trim(),
-            "Enable tabs to use split view.",
-            "the visible text is the shared reason, not a generic failure"
-        );
-        assert_eq!(
-            notice.get_attribute("role").as_deref(),
-            Some("status"),
-            "and it is announced, not only drawn"
-        );
-        assert!(is_visible(&notice), "the refusal has a real box on screen");
-        assert!(
-            !state
-                .center_zone
-                .with_untracked(|center_zone| center_zone.is_split()),
-            "a refused action performs no work"
-        );
-
-        // The keyboard chord takes the same path.
-        let row = file_rows(&container).remove(0);
-        row.dispatch_event(&ctrl_enter()).unwrap();
-        next_tick().await;
-        let notice = container
-            .query_selector("[data-testid=\"fe-refusal\"]")
-            .unwrap()
-            .expect("the chord refusal is shown too");
-        assert_eq!(
-            notice.text_content().unwrap_or_default().trim(),
-            "Enable tabs to use split view.",
-            "the chord and the button cannot refuse differently"
-        );
-
-        // The row advertises the chord it answers to.
-        assert!(
-            side_action(&container)
-                .get_attribute("aria-keyshortcuts")
-                .is_some_and(|keys| keys.contains("Enter")),
-            "the action advertises its keyboard chord"
-        );
-    }
-
-    /// `.fe-open-side` is reused by the git, search and references panels. Any
-    /// row that hosts it must reveal it — and while it is invisible it must not
-    /// swallow clicks.
-    ///
-    /// The git panel's `.gp-file-row` matched none of the reveal selectors, so
-    /// its side-open button sat at `opacity: 0` **and still took clicks**: an
-    /// invisible hit target in the middle of a file row. This pins the CSS
-    /// contract for every host row. (The markup belongs to those panels; only
-    /// the stylesheet is ours.)
-    #[wasm_bindgen_test]
-    async fn the_reused_side_open_control_is_never_an_invisible_click_target() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let document = web_sys::window().unwrap().document().unwrap();
-
-        // Rebuild each host row's shape, exactly as its panel renders it.
-        for (row_class, wrapper) in [("fe-row", None), ("gp-file-row", Some("gp-file-actions"))] {
-            let row = document.create_element("div").unwrap();
-            row.set_class_name(row_class);
-            let action = document.create_element("button").unwrap();
-            action.set_class_name("fe-open-side");
-            match wrapper {
-                Some(wrapper_class) => {
-                    let group = document.create_element("div").unwrap();
-                    group.set_class_name(wrapper_class);
-                    group.append_child(&action).unwrap();
-                    row.append_child(&group).unwrap();
-                }
-                None => {
-                    row.append_child(&action).unwrap();
-                }
-            }
-            container.append_child(&row).unwrap();
-            next_tick().await;
-
-            let action: HtmlElement = action.dyn_into().unwrap();
-            // At rest it is quiet — and, crucially, not clickable. An opacity-0
-            // element still receives pointer events unless told otherwise.
-            assert_eq!(
-                computed(&action, "opacity"),
-                "0",
-                "{row_class}: the control is quiet until the row is engaged"
-            );
-            assert_eq!(
-                computed(&action, "pointer-events"),
-                "none",
-                "{row_class}: an invisible control must not be clickable — that is \
-                 an invisible hit target sitting in the row"
-            );
-
-            // Keyboard focus anywhere in the row reveals it, and makes it usable.
-            let row: HtmlElement = row.dyn_into().unwrap();
-            row.set_attribute("tabindex", "0").unwrap();
-            row.focus().unwrap();
-            settle_styles().await;
-            assert_eq!(
-                computed(&action, "opacity"),
-                "1",
-                "{row_class}: focus within the row reveals its action"
-            );
-            assert_eq!(
-                computed(&action, "pointer-events"),
-                "auto",
-                "{row_class}: and a revealed control is clickable"
-            );
-            row.blur().unwrap();
-            next_tick().await;
-
-            // Disabled stays visible: it carries the reason.
-            action.set_attribute("aria-disabled", "true").unwrap();
-            settle_styles().await;
-            assert_eq!(
-                computed(&action, "opacity"),
-                "1",
-                "{row_class}: a disabled control stays visible, because it is the \
-                 thing carrying the reason"
-            );
-        }
-    }
-
-    /// A file row is a single dense line, exactly like a directory row. Its
-    /// trailing side-open action shares that line with the name and must never
-    /// wrap onto its own line, which would double the row's height.
+    /// A file row is a single dense line, exactly like a directory row. It is a
+    /// plain open-on-click row: splits are created by dragging tabs, so the row
+    /// carries no side-open action, and it must not render any taller than a
+    /// directory row.
     ///
     /// Regression guard: the base `.fe-item` rule carries `width: 100%`, which
-    /// inside the wrapping `.fe-row` resolved as a full-width flex-basis and
-    /// pushed the 44px `.fe-open-side` beneath the name — every file row
-    /// rendered at ~2x height while directory rows stayed dense.
+    /// inside the wrapping `.fe-row` resolved as a full-width flex-basis. When
+    /// the row still carried a trailing action that pushed the action onto its
+    /// own line and doubled the row height; the row now has no such action, and
+    /// this keeps it a single dense line.
     #[wasm_bindgen_test]
     async fn file_rows_are_single_line_and_match_directory_density() {
         ensure_styles_loaded();
@@ -1738,8 +1017,6 @@ mod wasm_tests {
             .expect("the file renders as a row")
             .dyn_into::<HtmlElement>()
             .unwrap();
-        let name = file_rows(&container).remove(0);
-        let action = side_action(&container);
         let dir = container
             .query_selector("button.fe-dir")
             .unwrap()
@@ -1747,18 +1024,13 @@ mod wasm_tests {
             .dyn_into::<HtmlElement>()
             .unwrap();
 
-        // The action shares the name's line rather than wrapping beneath it. Its
-        // resting opacity is 0 but it still occupies its layout box, so its top
-        // reports where it wrapped to — the wrap doubled the row height.
-        let name_top = name.get_bounding_client_rect().top();
-        let action_top = action.get_bounding_client_rect().top();
+        // Splits are drag-only now: the row carries no side-open control.
         assert!(
-            (action_top - name_top).abs() < 3.0,
-            "the side-open action must share the name's line, not wrap below it: \
-             name top {name_top}, action top {action_top}"
+            container.query_selector("button.fe-open-side").unwrap().is_none(),
+            "the file row must not render an open-to-the-side action"
         );
 
-        // And so a file row is no taller than a directory row — one dense line.
+        // A file row is no taller than a directory row — one dense line.
         let row_h = row.get_bounding_client_rect().height();
         let dir_h = dir.get_bounding_client_rect().height();
         assert!(
@@ -1798,28 +1070,6 @@ mod wasm_tests {
         assert!(
             block.contains("animation: none"),
             "and it must actually turn the animation off"
-        );
-    }
-
-    /// The tooltip names the chord that actually fires — rendered from the
-    /// binding, not a hardcoded "Ctrl+Enter" that is wrong on macOS.
-    #[wasm_bindgen_test]
-    async fn the_side_open_tooltip_shows_the_platform_chord() {
-        let container = make_container();
-        let _state = mount_explorer_with_files(container.clone(), &["main.rs"]);
-        next_tick().await;
-
-        let expected = crate::components::command_palette::context_binding(
-            crate::components::command_palette::ContextActionId::OpenToSide,
-        )
-        .chord()
-        .hint();
-        let title = side_action(&container)
-            .get_attribute("title")
-            .expect("the enabled action has a tooltip");
-        assert!(
-            title.contains(&expected),
-            "the tooltip shows the chord that fires ({expected}), got {title:?}"
         );
     }
 

@@ -3,13 +3,9 @@ use std::collections::HashMap;
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::components::center_zone::{announce, workspace_width};
-use crate::components::command_palette::{
-    ContextActionId, context_binding, split_creation_availability,
-};
 use crate::components::review_view::ReviewSidebar;
 use crate::send::send_frame;
-use crate::state::{AppState, DiffKey, DiffOpenToSideResult, DiffViewState, root_display_name};
+use crate::state::{AppState, DiffKey, DiffViewState, root_display_name};
 
 use protocol::{
     FrameKind, ProjectDiffScope, ProjectDiscardFilePayload, ProjectGitChangeKind,
@@ -69,7 +65,7 @@ pub fn GitPanel() -> impl IntoView {
                 <WorkspaceReviewHub />
                 {move || {
                     match git_roots.get() {
-                        Some((project, roots)) => {
+                        Some((_project, roots)) => {
                             if roots.iter().all(|r| r.clean) {
                                 vec![view! {
                                     <div class="gp-clean">
@@ -79,11 +75,7 @@ pub fn GitPanel() -> impl IntoView {
                             } else {
                                 roots.into_iter().map(|root| {
                                     view! {
-                                        <GitRootSection
-                                            root=root
-                                            host_id=project.host_id.clone()
-                                            project_id=project.project_id.clone()
-                                        />
+                                        <GitRootSection root=root />
                                     }.into_any()
                                 }).collect()
                             }
@@ -267,11 +259,7 @@ fn WorkspaceReviewHubInner(host_id: String, review_id: ReviewId) -> impl IntoVie
 }
 
 #[component]
-fn GitRootSection(
-    root: ProjectRootGitStatus,
-    host_id: String,
-    project_id: protocol::ProjectId,
-) -> impl IntoView {
+fn GitRootSection(root: ProjectRootGitStatus) -> impl IntoView {
     let staged: Vec<_> = root
         .files
         .iter()
@@ -303,12 +291,6 @@ fn GitRootSection(
     let root_for_unstaged = root_path.clone();
     let root_for_untracked = root_path.clone();
     let root_for_commit = root_path.clone();
-    let host_for_staged = host_id.clone();
-    let host_for_unstaged = host_id.clone();
-    let host_for_untracked = host_id;
-    let project_for_staged = project_id.clone();
-    let project_for_unstaged = project_id.clone();
-    let project_for_untracked = project_id;
     let root_label = root_display_name(&root.root);
     let root_title = root.root.0.clone();
     let branch_label = root.branch.unwrap_or_else(|| "--".to_owned());
@@ -419,8 +401,6 @@ fn GitRootSection(
                     show_unstage_btn=true
                     show_discard_btn=false
                     file_counts=file_counts
-                    host_id=host_for_staged.clone()
-                    project_id=project_for_staged.clone()
                 />
             </Show>
             <Show when=move || has_unstaged>
@@ -435,8 +415,6 @@ fn GitRootSection(
                     show_unstage_btn=false
                     show_discard_btn=true
                     file_counts=file_counts
-                    host_id=host_for_unstaged.clone()
-                    project_id=project_for_unstaged.clone()
                 />
             </Show>
             <Show when=move || has_untracked>
@@ -451,65 +429,9 @@ fn GitRootSection(
                     show_unstage_btn=false
                     show_discard_btn=true
                     file_counts=file_counts
-                    host_id=host_for_untracked.clone()
-                    project_id=project_for_untracked.clone()
                 />
             </Show>
         </div>
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DiffSideOpenBlock {
-    State(DiffOpenToSideResult),
-    Width(&'static str),
-}
-
-impl DiffSideOpenBlock {
-    fn reason(self) -> &'static str {
-        match self {
-            Self::State(result) => result
-                .disabled_reason()
-                .unwrap_or("Open to the side is unavailable."),
-            Self::Width(reason) => reason,
-        }
-    }
-}
-
-fn diff_side_open_block(
-    state: &AppState,
-    width: Option<f64>,
-    key: &DiffKey,
-) -> Option<DiffSideOpenBlock> {
-    if let Some(result) = state.diff_open_to_side_eligibility(key) {
-        return Some(DiffSideOpenBlock::State(result));
-    }
-    untrack(|| split_creation_availability(state, width))
-        .reason()
-        .map(DiffSideOpenBlock::Width)
-}
-
-fn activate_diff_side_open(
-    state: &AppState,
-    width: Option<f64>,
-    key: DiffKey,
-    label: String,
-) -> Result<DiffOpenToSideResult, &'static str> {
-    match diff_side_open_block(state, width, &key) {
-        Some(DiffSideOpenBlock::State(_)) | None => Ok(state.open_diff_to_side(key, label)),
-        Some(DiffSideOpenBlock::Width(reason)) => Err(reason),
-    }
-}
-
-fn diff_side_open_announcement(path: &str, result: DiffOpenToSideResult) -> String {
-    match result {
-        DiffOpenToSideResult::Opened { .. } => format!("Opened {path} in the other pane"),
-        DiffOpenToSideResult::Moved { .. } => format!("Moved {path} to the other pane"),
-        DiffOpenToSideResult::Revealed { .. } => format!("Revealed {path} in the other pane"),
-        refused => refused
-            .disabled_reason()
-            .unwrap_or("Open to the side is unavailable.")
-            .to_owned(),
     }
 }
 
@@ -533,12 +455,8 @@ fn GitFileSection(
     show_unstage_btn: bool,
     show_discard_btn: bool,
     file_counts: Memo<HashMap<String, u32>>,
-    host_id: String,
-    project_id: protocol::ProjectId,
 ) -> impl IntoView {
     let toggle = move |_| expanded.update(|v| *v = !*v);
-    let state = expect_context::<AppState>();
-    let width = workspace_width();
 
     // Bulk action data
     let bulk_paths: Vec<String> = files.iter().map(|f| f.relative_path.clone()).collect();
@@ -630,151 +548,15 @@ fn GitFileSection(
                         let path_for_unstage = path.clone();
                         let root_for_discard = root_path.clone();
                         let path_for_discard = path.clone();
-                        let diff_key = DiffKey::new(
-                            host_id.clone(),
-                            project_id.clone(),
-                            root_path.clone(),
-                            scope,
-                            path.clone(),
-                        );
-                        let diff_label = diff_label(&root_path, &path);
-
-                        let side_block = {
-                            let state = state.clone();
-                            let key = diff_key.clone();
-                            Memo::new(move |_| diff_side_open_block(&state, width.get(), &key))
-                        };
-                        let side_disabled = move || side_block.get().is_some();
-                        let side_reason = move || {
-                            side_block
-                                .get()
-                                .map(DiffSideOpenBlock::reason)
-                                .unwrap_or_default()
-                                .to_owned()
-                        };
-                        let refusal: RwSignal<Option<&'static str>> = RwSignal::new(None);
-
-                        let side_state = state.clone();
-                        let side_key = diff_key.clone();
-                        let side_label_for_open = diff_label.clone();
-                        let side_path = path.clone();
-                        let open_to_side = move || {
-                            match activate_diff_side_open(
-                                &side_state,
-                                width.get_untracked(),
-                                side_key.clone(),
-                                side_label_for_open.clone(),
-                            ) {
-                                Ok(result) => {
-                                    refusal.set(result.disabled_reason());
-                                    announce(diff_side_open_announcement(&side_path, result));
-                                    if result.disabled_reason().is_none() {
-                                        request_diff(&side_state, side_key.clone());
-                                    }
-                                }
-                                Err(reason) => {
-                                    refusal.set(Some(reason));
-                                    announce(reason);
-                                }
-                            }
-                        };
-
-                        let menu: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
-                        let row_ref = NodeRef::<leptos::html::Button>::new();
-                        let open_menu_at_row = move || {
-                            let Some(row) = row_ref.get_untracked() else {
-                                return;
-                            };
-                            let rect = row.get_bounding_client_rect();
-                            menu.set(Some((rect.left() + 16.0, rect.bottom())));
-                        };
-                        let on_keydown = {
-                            let open_to_side = open_to_side.clone();
-                            move |ev: web_sys::KeyboardEvent| {
-                                let key = ev.key();
-                                if key == "Enter" && (ev.ctrl_key() || ev.meta_key()) {
-                                    ev.prevent_default();
-                                    ev.stop_propagation();
-                                    open_to_side();
-                                    return;
-                                }
-                                if key == "ContextMenu" || (key == "F10" && ev.shift_key()) {
-                                    ev.prevent_default();
-                                    ev.stop_propagation();
-                                    open_menu_at_row();
-                                }
-                            }
-                        };
-                        let on_contextmenu = move |ev: web_sys::MouseEvent| {
-                            ev.prevent_default();
-                            ev.stop_propagation();
-                            menu.set(Some((ev.client_x() as f64, ev.client_y() as f64)));
-                        };
-                        let on_side_click = {
-                            let open_to_side = open_to_side.clone();
-                            move |ev: web_sys::MouseEvent| {
-                                ev.stop_propagation();
-                                open_to_side();
-                            }
-                        };
-                        let on_menu_side = {
-                            let open_to_side = open_to_side.clone();
-                            move |_: web_sys::MouseEvent| {
-                                if side_block.get_untracked().is_none() {
-                                    menu.set(None);
-                                }
-                                open_to_side();
-                            }
-                        };
-
-                        let side_hint = context_binding(ContextActionId::OpenToSide).chord().hint();
-                        let side_title = move || match side_block.get() {
-                            Some(block) => block.reason().to_owned(),
-                            None => format!("Open to the side ({side_hint})"),
-                        };
-                        let scope_id = match scope {
-                            ProjectDiffScope::Staged => "staged",
-                            ProjectDiffScope::Unstaged => "unstaged",
-                            ProjectDiffScope::Uncommitted => "uncommitted",
-                        };
-                        let side_aria_label =
-                            format!("Open {scope_id} diff for {path} to the side");
-                        let reason_id: StoredValue<String> = StoredValue::new(format!(
-                            "gp-diff-side-reason-{scope_id}-{}",
-                            path.replace(['/', '.'], "-")
-                        ));
-                        let described_by = move || side_disabled().then(|| reason_id.get_value());
-
-                        let menu_open_root = root_for_click.clone();
-                        let menu_open_path = path_for_click.clone();
-                        let on_menu_open = move |_: web_sys::MouseEvent| {
-                            menu.set(None);
-                            refusal.set(None);
-                            view_diff(menu_open_root.clone(), scope, menu_open_path.clone());
-                        };
-
                         view! {
-                            <div
-                                class="gp-file-row"
-                                style=move || {
-                                    if side_disabled() || refusal.get().is_some() {
-                                        "flex-wrap: wrap;"
-                                    } else {
-                                        ""
-                                    }
-                                }
-                            >
+                            <div class="gp-file-row">
                                 <button
                                     class="gp-file-btn"
-                                    node_ref=row_ref
                                     title=path_for_title
-                                    aria-keyshortcuts="Enter Control+Enter Meta+Enter"
+                                    aria-keyshortcuts="Enter"
                                     on:click=move |_| {
-                                        refusal.set(None);
                                         view_diff(root_for_click.clone(), scope, path_for_click.clone());
                                     }
-                                    on:keydown=on_keydown
-                                    on:contextmenu=on_contextmenu
                                 >
                                     <span class=icon_class>{icon}</span>
                                     <span class="gp-file-path">
@@ -800,28 +582,7 @@ fn GitFileSection(
                                         })
                                     }}
                                 </button>
-                                <div
-                                    class="gp-file-actions"
-                                    style=move || {
-                                        if side_disabled() { "opacity: 1;" } else { "" }
-                                    }
-                                >
-                                    <button
-                                        class="fe-open-side gp-diff-open-side"
-                                        class:disabled=side_disabled
-                                        data-test="gp-diff-open-side"
-                                        aria-label=side_aria_label
-                                        aria-disabled=move || side_disabled().then_some("true")
-                                        aria-describedby=described_by
-                                        aria-keyshortcuts="Control+Enter Meta+Enter"
-                                        title=side_title
-                                        style=move || {
-                                            if side_disabled() { "opacity: 1;" } else { "" }
-                                        }
-                                        on:click=on_side_click
-                                    >
-                                        <span class="fe-open-side-icon" aria-hidden="true">"\u{29c9}"</span>
-                                    </button>
+                                <div class="gp-file-actions">
                                     {show_discard_btn.then(|| {
                                         let root = root_for_discard.clone();
                                         let path = path_for_discard.clone();
@@ -868,65 +629,6 @@ fn GitFileSection(
                                         }
                                     })}
                                 </div>
-                                <Show when=side_disabled>
-                                    <span
-                                        class="fe-refusal"
-                                        id=move || reason_id.get_value()
-                                        data-test="gp-diff-side-disabled-reason"
-                                    >
-                                        {side_reason}
-                                    </span>
-                                </Show>
-                                <Show when=move || refusal.get().is_some()>
-                                    <div
-                                        class="fe-refusal"
-                                        role="status"
-                                        data-test="gp-diff-side-refusal"
-                                    >
-                                        {move || refusal.get().unwrap_or_default()}
-                                    </div>
-                                </Show>
-                                <Show when=move || menu.get().is_some()>
-                                    <div class="fe-menu-backdrop" on:click=move |_| menu.set(None)></div>
-                                    <div
-                                        class="context-menu fe-menu"
-                                        role="menu"
-                                        aria-label="Git diff actions"
-                                        style=move || {
-                                            menu.get()
-                                                .map(|(x, y)| format!("left: {x}px; top: {y}px;"))
-                                                .unwrap_or_default()
-                                        }
-                                        on:keydown=move |ev: web_sys::KeyboardEvent| {
-                                            if ev.key() == "Escape" {
-                                                ev.prevent_default();
-                                                menu.set(None);
-                                            }
-                                        }
-                                    >
-                                        <button
-                                            class="context-menu-item fe-menu-item"
-                                            role="menuitem"
-                                            on:click=on_menu_open.clone()
-                                        >
-                                            "Open"
-                                        </button>
-                                        <button
-                                            class="context-menu-item fe-menu-item"
-                                            role="menuitem"
-                                            class:disabled=side_disabled
-                                            data-test="gp-diff-open-side-menu"
-                                            aria-disabled=move || side_disabled().then_some("true")
-                                            aria-describedby=described_by
-                                            on:click=on_menu_side.clone()
-                                        >
-                                            <span class="context-menu-label">"Open to the Side"</span>
-                                            <Show when=side_disabled>
-                                                <span class="context-menu-reason">{side_reason}</span>
-                                            </Show>
-                                        </button>
-                                    </div>
-                                </Show>
                             </div>
                         }
                     }).collect::<Vec<_>>()}
@@ -1169,9 +871,7 @@ mod wasm_tests {
     use super::*;
     use crate::wasm_test_support::Mounted;
     use crate::components::center_zone::CenterWorkspaceWidth;
-    use crate::state::{
-        ActiveProjectRef, CenterLayout, CenterZoneState, PaneId, PaneState, Tab, TabContent, TabId,
-    };
+    use crate::state::{ActiveProjectRef, CenterZoneState, PaneId, TabContent, TabId};
     use leptos::mount::mount_to;
     use protocol::{
         AgentId, Envelope, FrameKind, Project, ProjectBootstrapPayload, ProjectEventPayload,
@@ -1360,15 +1060,6 @@ mod wasm_tests {
             .with_untracked(|center_zone| center_zone.occurrences(&diff_content(key)))
     }
 
-    fn side_button(container: &HtmlElement) -> HtmlElement {
-        container
-            .query_selector("[data-test=\"gp-diff-open-side\"]")
-            .unwrap()
-            .expect("Git diff Open to the Side action")
-            .dyn_into()
-            .unwrap()
-    }
-
     fn row_button(container: &HtmlElement) -> HtmlElement {
         container
             .query_selector(".gp-file-btn")
@@ -1378,221 +1069,38 @@ mod wasm_tests {
             .unwrap()
     }
 
-    fn ctrl_enter(target: &HtmlElement) {
-        let init = web_sys::KeyboardEventInit::new();
-        init.set_key("Enter");
-        init.set_ctrl_key(true);
-        init.set_bubbles(true);
-        init.set_cancelable(true);
-        let event =
-            web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init).unwrap();
-        target.dispatch_event(&event).unwrap();
-    }
-
+    /// Splits are created by dragging tabs: a git diff row is a plain
+    /// open-on-click control with no side-open action, menu, or chord.
     #[wasm_bindgen_test]
-    async fn diff_side_action_opens_unopened_diff_in_opposite_pane() {
+    async fn git_diff_rows_have_no_side_open_control() {
         let container = make_container();
-        let holder = mount_side_open_panel(container.clone(), 900.0);
+        let _holder = mount_side_open_panel(container.clone(), 900.0);
         next_tick().await;
 
-        side_button(&container).click();
-        next_tick().await;
-
-        let state = holder.borrow().clone().unwrap();
-        let key = diff_key();
-        let occurrences = diff_occurrences(&state, &key);
-        assert_eq!(occurrences.len(), 1, "a diff must never be duplicated");
-        let (pane, tab) = occurrences[0];
-        assert_eq!(pane, PaneId::Secondary, "unopened diff opens opposite");
-        assert_eq!(
-            state
-                .center_zone
-                .with_untracked(|center_zone| center_zone.pane_active_tab_id(PaneId::Secondary)),
-            Some(tab),
-            "the exact new diff TabId must be active in the opposite pane"
-        );
         assert!(
-            state
-                .diff_contents
-                .with_untracked(|diffs| diffs.contains_key(&key)),
-            "the request must use the exact DiffKey"
+            container
+                .query_selector("[data-test=\"gp-diff-open-side\"]")
+                .unwrap()
+                .is_none(),
+            "no side-open action renders on a git diff row"
         );
-    }
-
-    #[wasm_bindgen_test]
-    async fn diff_side_context_chord_moves_focused_occurrence_with_same_tab_id() {
-        let container = make_container();
-        let holder = mount_side_open_panel(container.clone(), 900.0);
-        next_tick().await;
-        let state = holder.borrow().clone().unwrap();
-        let key = diff_key();
-        let tab = state
-            .open_tab_in(
-                PaneId::Primary,
-                diff_content(&key),
-                diff_label(&key.root, &key.path),
-                true,
-            )
-            .expect("focused diff tab");
-        next_tick().await;
-
-        ctrl_enter(&row_button(&container));
-        next_tick().await;
-
-        assert_eq!(
-            diff_occurrences(&state, &key),
-            vec![(PaneId::Secondary, tab)],
-            "the focused occurrence must move without changing its TabId"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    async fn diff_side_context_menu_reveals_other_pane_occurrence_while_narrow() {
-        let container = make_container();
-        let holder = mount_side_open_panel(container.clone(), 600.0);
-        next_tick().await;
-        let state = holder.borrow().clone().unwrap();
-        let key = diff_key();
-        let tab = state
-            .open_tab_in(
-                PaneId::Secondary,
-                diff_content(&key),
-                diff_label(&key.root, &key.path),
-                true,
-            )
-            .expect("other-pane diff tab");
-        let primary = state
-            .center_zone
-            .with_untracked(|center_zone| center_zone.pane_active_tab_id(PaneId::Primary))
-            .expect("primary Home tab");
-        assert!(state.reveal_tab(primary));
-        next_tick().await;
-
         let row = row_button(&container);
+        assert_eq!(
+            row.get_attribute("aria-keyshortcuts").as_deref(),
+            Some("Enter"),
+            "the row advertises only its ordinary Enter activation"
+        );
+
+        // Right-clicking must not surface a side-open context menu.
         row.dispatch_event(&web_sys::MouseEvent::new("contextmenu").unwrap())
             .unwrap();
         next_tick().await;
-        let menu_action: HtmlElement = container
-            .query_selector("[data-test=\"gp-diff-open-side-menu\"]")
-            .unwrap()
-            .expect("Git diff context action")
-            .dyn_into()
-            .unwrap();
         assert!(
-            !menu_action.has_attribute("aria-disabled"),
-            "an existing split stays actionable after narrowing"
-        );
-        menu_action.click();
-        next_tick().await;
-
-        assert_eq!(
-            diff_occurrences(&state, &key),
-            vec![(PaneId::Secondary, tab)],
-            "revealing must keep the exact existing DiffKey and TabId"
-        );
-        assert_eq!(
-            state
-                .center_zone
-                .with_untracked(|center_zone| center_zone.focused_id()),
-            PaneId::Secondary,
-            "the pane containing the existing occurrence must be revealed"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    async fn diff_side_typed_refusal_stays_visible_and_announces_on_activation() {
-        let container = make_container();
-        let holder = mount_side_open_panel(container.clone(), 900.0);
-        next_tick().await;
-        let state = holder.borrow().clone().unwrap();
-        let key = diff_key();
-        let tab = TabId(91_001);
-        state.center_zone.set(CenterZoneState {
-            layout: CenterLayout::Single(PaneState {
-                tabs: vec![Tab {
-                    id: tab,
-                    content: diff_content(&key),
-                    label: diff_label(&key.root, &key.path),
-                    closeable: true,
-                }],
-                active_tab_id: Some(tab),
-            }),
-        });
-        next_tick().await;
-
-        let expected = DiffOpenToSideResult::NothingWouldRemain
-            .disabled_reason()
-            .expect("typed refusal reason");
-        let button = side_button(&container);
-        assert_eq!(
-            button.get_attribute("aria-disabled").as_deref(),
-            Some("true")
-        );
-        let visible = container
-            .query_selector("[data-test=\"gp-diff-side-disabled-reason\"]")
-            .unwrap()
-            .expect("visible typed refusal reason")
-            .text_content()
-            .unwrap_or_default();
-        assert_eq!(visible, expected);
-        button.click();
-        next_tick().await;
-
-        let feedback = container
-            .query_selector("[data-test=\"gp-diff-side-refusal\"]")
-            .unwrap()
-            .expect("live refusal feedback")
-            .text_content()
-            .unwrap_or_default();
-        assert_eq!(feedback, expected);
-        assert_eq!(diff_occurrences(&state, &key), vec![(PaneId::Primary, tab)]);
-        assert!(
-            state
-                .diff_contents
-                .with_untracked(|diffs| !diffs.contains_key(&key))
-        );
-    }
-
-    #[wasm_bindgen_test]
-    async fn diff_side_width_refusal_does_not_fall_back_to_ordinary_open() {
-        let container = make_container();
-        let holder = mount_side_open_panel(container.clone(), 600.0);
-        next_tick().await;
-        let state = holder.borrow().clone().unwrap();
-        let key = diff_key();
-        let expected = split_creation_availability(&state, Some(600.0))
-            .reason()
-            .expect("narrow unsplit refusal");
-        let button = side_button(&container);
-        assert_eq!(
-            button.get_attribute("aria-disabled").as_deref(),
-            Some("true")
-        );
-        assert!(
-            button
-                .get_attribute("title")
-                .is_some_and(|title| title == expected)
-        );
-
-        button.click();
-        next_tick().await;
-
-        let feedback = container
-            .query_selector("[data-test=\"gp-diff-side-refusal\"]")
-            .unwrap()
-            .expect("visible width refusal feedback")
-            .text_content()
-            .unwrap_or_default();
-        assert_eq!(feedback, expected);
-        assert!(diff_occurrences(&state, &key).is_empty());
-        assert!(
-            !state.center_zone.with_untracked(CenterZoneState::is_split),
-            "width refusal must not create a split"
-        );
-        assert!(
-            state
-                .diff_contents
-                .with_untracked(|diffs| !diffs.contains_key(&key))
+            container
+                .query_selector("[data-test=\"gp-diff-open-side-menu\"]")
+                .unwrap()
+                .is_none(),
+            "no side-open context menu opens from a git diff row"
         );
     }
 

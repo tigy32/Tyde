@@ -11,7 +11,7 @@ use crate::components::agent_monitor_view::AgentMonitorView;
 use crate::components::chat_view::ChatView;
 use crate::components::command_palette::{
     ActionId, CommandId, binding_for, command_availability_for, conflicting_occurrence,
-    execute_command, move_tab, move_tab_availability, split_right, split_right_availability_for,
+    execute_command, move_tab, move_tab_availability,
 };
 use crate::components::diff_view::ReviewableDiffView;
 use crate::components::file_view::FileView;
@@ -438,25 +438,9 @@ fn CommandMenuItem(
             return;
         }
         context_menu.set(None);
-        match (on_run, target) {
-            (Some(callback), _) => callback.run(()),
-            // Tab-targeted commands run against the menu's tab. Activating the
-            // tab first and then running "the active tab's command" would move
-            // focus as a side effect of *reading* a menu, and would act on the
-            // wrong tab the moment activation failed.
-            (None, Some(tab)) => match id {
-                CommandId::SplitRight => split_right(&run_state, tab, width.get_untracked()),
-                CommandId::MoveTabToOtherPane => {
-                    if let Some(pane) = run_state
-                        .center_zone
-                        .with_untracked(|center_zone| center_zone.locate_tab(tab))
-                    {
-                        move_tab(&run_state, pane.other(), tab);
-                    }
-                }
-                other => execute_command(&run_state, other, width.get_untracked()),
-            },
-            (None, None) => execute_command(&run_state, id, width.get_untracked()),
+        match on_run {
+            Some(callback) => callback.run(()),
+            None => execute_command(&run_state, id, width.get_untracked()),
         }
     };
     let on_click = {
@@ -656,89 +640,13 @@ fn TabContextMenu(
             >
                 "Close All Tabs"
             </button>
-            <span class="context-menu-separator" role="separator"></span>
-            // Both act on the tab this menu was opened for — not on whatever
-            // tab happens to be active in the focused pane.
-            <CommandMenuItem
-                id=CommandId::SplitRight
-                label="Split Right"
-                target=tab_id
-                context_menu=context_menu
-            />
-            <CommandMenuItem
-                id=CommandId::MoveTabToOtherPane
-                label="Move Tab to Other Pane"
-                target=tab_id
-                context_menu=context_menu
-            />
         </div>
     }
 }
 
-/// The tab strip's split control: the one *visible* way to split, so the
-/// feature is discoverable without knowing a shortcut or opening a menu
-/// (dev-docs/32 §12 — "the tab-strip split control").
-///
-/// It is never hidden. When it cannot run it stays put, `aria-disabled`, and
-/// says why — the same reason text every other Split Right surface shows.
-#[component]
-fn SplitRightButton(pane: PaneId) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let width = workspace_width();
-
-    let target = Memo::new(move |_| {
-        state
-            .center_zone
-            .with(|center_zone| center_zone.pane_active_tab_id(pane))
-    });
-    let availability =
-        Memo::new(move |_| split_right_availability_for(&state, target.get(), width.get()));
-    let disabled = move || !availability.get().is_enabled();
-    let reason = move || availability.get().reason().unwrap_or_default().to_owned();
-    let hint = binding_for(ActionId::Command(CommandId::SplitRight))
-        .map(|binding| binding.chord().hint())
-        .unwrap_or_default();
-    let title = {
-        let hint = hint.clone();
-        move || {
-            if disabled() {
-                reason()
-            } else {
-                format!("Split Right ({hint})")
-            }
-        }
-    };
-
-    let run_state = expect_context::<AppState>();
-    let on_click = move |_: web_sys::MouseEvent| {
-        let Some(tab) = target.get_untracked() else {
-            return;
-        };
-        // `split_right` announces its own refusal, so a disabled press is never
-        // a dead click.
-        split_right(&run_state, tab, width.get_untracked());
-    };
-
-    view! {
-        <button
-            class="center-tool-btn split-right-btn"
-            class:disabled=disabled
-            aria-disabled=move || disabled().then_some("true")
-            aria-label="Split Right"
-            aria-keyshortcuts="Control+Backslash Meta+Backslash"
-            title=title
-            on:click=on_click
-        >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                <rect x="1" y="2" width="14" height="12" rx="1.5" stroke="currentColor" stroke-width="1.4"/>
-                <path d="M8 2V14" stroke="currentColor" stroke-width="1.4"/>
-            </svg>
-        </button>
-    }
-}
-
 /// The pane-level action menu, reachable from every pane's tab strip. Carries
-/// the split/join commands so they are discoverable without the palette.
+/// the pane close/join commands so they are discoverable without the palette.
+/// Splits and tab moves are created by dragging tabs, not from this menu.
 #[component]
 fn PaneActionsMenu(pane: PaneId, context_menu: RwSignal<Option<TabMenu>>) -> impl IntoView {
     let open = RwSignal::new(false);
@@ -775,16 +683,6 @@ fn PaneActionsMenu(pane: PaneId, context_menu: RwSignal<Option<TabMenu>>) -> imp
                     role="menu"
                     aria-label="Pane actions"
                 >
-                    <CommandMenuItem
-                        id=CommandId::SplitRight
-                        label="Split Right"
-                        context_menu=context_menu
-                    />
-                    <CommandMenuItem
-                        id=CommandId::MoveTabToOtherPane
-                        label="Move Tab to Other Pane"
-                        context_menu=context_menu
-                    />
                     <CommandMenuItem
                         id=CommandId::CloseEditorPane
                         label="Close Editor Pane"
@@ -1669,7 +1567,6 @@ fn EditorPane(
 
                 <div class="pinned-tab-actions">
                     <span class="tab-bar-divider" aria-hidden="true"></span>
-                    <SplitRightButton pane=pane />
                     <PaneActionsMenu pane=pane context_menu=context_menu />
                     <Show when=move || pane == PaneId::Primary>
                         <PaneToolActions />
@@ -2012,7 +1909,7 @@ pub fn CenterZone() -> impl IntoView {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
-    use crate::components::command_palette::{CommandId, command_availability};
+    use crate::components::command_palette::CommandId;
     use crate::state::{FileResourceKey, OpenFile, TAB_LRU_CAPACITY};
     use leptos::mount::mount_to;
     use protocol::{ProjectFileVersion, ProjectPath, ProjectRootPath};
@@ -3465,19 +3362,6 @@ mod wasm_tests {
              ({expected}), got {:?}",
             text_of(&notice)
         );
-
-        // The split control's own hint comes from the same place.
-        let button = query(&container, ".split-right-btn").expect("split control");
-        let split_hint = binding_for(ActionId::Command(CommandId::SplitRight))
-            .expect("Split Right is bound")
-            .chord()
-            .hint();
-        assert!(
-            button
-                .get_attribute("title")
-                .is_some_and(|title| title.contains(&split_hint)),
-            "the split control shows the chord that fires it ({split_hint})"
-        );
     }
 
     /// Two menus can be open at once (a pane menu and a tab menu), and both may
@@ -3495,8 +3379,8 @@ mod wasm_tests {
         });
         settle().await;
 
-        // A chat: Split Right is unavailable, so every menu that lists it also
-        // renders its reason element.
+        // A single pane: the pane menu's Close Editor Pane / Return to Single
+        // Pane commands are both unavailable, so each renders its reason element.
         state.open_tab(TabContent::empty_chat(), "Chat".to_owned(), true);
         settle().await;
 
@@ -3555,7 +3439,7 @@ mod wasm_tests {
         });
         settle().await;
 
-        for selector in [".split-right-btn", ".pane-actions-trigger"] {
+        for selector in [".pane-actions-trigger"] {
             let control = query(&container, selector).unwrap_or_else(|| panic!("{selector}"));
             let rect = control.get_bounding_client_rect();
             assert!(
@@ -3581,60 +3465,6 @@ mod wasm_tests {
                 rect.height()
             );
         }
-    }
-
-    /// The agent surfaces' "Open to the Side" control was `display: none` until
-    /// hover, which removes it from the accessibility tree — a screen reader in
-    /// *browse* mode never encounters it. This pins the CSS contract: present
-    /// and reachable, without costing the sighted UI any ink.
-    ///
-    /// (The markup lives in the agents panel; only the stylesheet is ours.)
-    #[wasm_bindgen_test]
-    async fn the_agent_card_side_open_control_stays_in_the_accessibility_tree() {
-        ensure_styles_loaded();
-        let container = make_container();
-        let document = web_sys::window().unwrap().document().unwrap();
-        let card = document.create_element("div").unwrap();
-        card.set_class_name("agent-card");
-        let action = document.create_element("button").unwrap();
-        action.set_class_name("agent-card-action agent-card-open-side");
-        action.set_text_content(Some("Open to the Side"));
-        card.append_child(&action).unwrap();
-        container.append_child(&card).unwrap();
-        next_tick().await;
-
-        let action: HtmlElement = action.dyn_into().unwrap();
-        assert_ne!(
-            computed(&action, "display"),
-            "none",
-            "a display:none control is absent from the accessibility tree, so a \
-             browse-mode screen reader can never find it"
-        );
-        assert_ne!(
-            computed(&action, "visibility"),
-            "hidden",
-            "and visibility:hidden would remove it just the same"
-        );
-
-        // It must also cost the sighted UI nothing until engaged.
-        let rect = action.get_bounding_client_rect();
-        assert!(
-            rect.width() <= 1.0 && rect.height() <= 1.0,
-            "the resting control is clipped away visually, got {}x{}",
-            rect.width(),
-            rect.height()
-        );
-
-        // Focus restores it to a real control.
-        action.focus().unwrap();
-        next_tick().await;
-        let rect = action.get_bounding_client_rect();
-        assert!(
-            rect.width() >= 24.0 && rect.height() >= 24.0,
-            "focusing it reveals a >=24x24 control, got {}x{}",
-            rect.width(),
-            rect.height()
-        );
     }
 
     /// Fixtures do not inherit the previous test's page or its presentation
@@ -3769,34 +3599,24 @@ mod wasm_tests {
             "the remounted workspace measures itself through the same handle"
         );
 
+        // Drive a split, then use narrow mode — the one width-reactive surface
+        // that remains — to prove the shared width signal is read live and its
+        // changes still propagate across the remount boundary.
         open_file_tab(&state, "alpha.rs", "fn alpha() {}");
         settle().await;
+        open_file_tab_in(&state, PaneId::Secondary, "bravo.rs", "fn bravo() {}");
+        settle().await;
         assert!(
-            command_availability(&state, CommandId::SplitRight, width.get_untracked()).is_enabled(),
-            "and the shared width gate reads it without touching a disposed signal"
+            query(&container, ".center-narrow-notice").is_none(),
+            "a 1200px workspace is wide enough for two panes, so no narrow notice"
         );
 
-        // The reactive path still works too: the strip's split control tracks it.
-        let button = query(&container, ".split-right-btn").expect("split control");
-        assert_eq!(
-            button.get_attribute("aria-disabled"),
-            None,
-            "a 1200px workspace is wide enough to split"
-        );
         width.set(Some(400.0));
         settle().await;
-        let button = query(&container, ".split-right-btn").expect("split control");
-        assert_eq!(
-            button.get_attribute("aria-disabled").as_deref(),
-            Some("true"),
-            "and a width change still propagates reactively — the signal is \
-             reference-counted, not dead"
-        );
         assert!(
-            button
-                .get_attribute("title")
-                .is_some_and(|title| title.contains("Not enough width")),
-            "with the shared 645px reason"
+            query(&container, ".center-narrow-notice").is_some(),
+            "a width change still propagates reactively — the signal is \
+             reference-counted, not dead"
         );
     }
 
@@ -4212,14 +4032,14 @@ mod wasm_tests {
         );
     }
 
-    /// Split Right is files-only and every disabled case says why
-    /// (dev-docs/32 §9). The reasons are user-facing text, so they are asserted
-    /// as such.
+    /// Splits and cross-pane moves are created by dragging tabs — never by a
+    /// button, menu item, or palette command. With a loaded file (which used to
+    /// enable Split Right), no split/move control renders anywhere: not on the
+    /// tab strip, not in the pane-actions menu, not in the tab context menu.
     #[wasm_bindgen_test]
-    async fn split_right_is_files_only_with_specific_disabled_reasons() {
+    async fn no_split_or_move_controls_are_rendered() {
         let container = make_container();
         let state = AppState::new();
-
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
@@ -4227,220 +4047,46 @@ mod wasm_tests {
             view! { <CenterZone /> }
         });
         settle().await;
-        // `None` = unmeasured, which must not disable a command by itself; the
-        // width-specific case is asserted explicitly with `Some(400.0)` below.
-        let width: Option<f64> = None;
 
-        // Home active.
-        assert_eq!(
-            command_availability(&state, CommandId::SplitRight, width).reason(),
-            Some("Open a file to split."),
-            "Home cannot be split"
-        );
-
-        // Chat active.
-        state.open_tab(TabContent::empty_chat(), "Chat".to_owned(), true);
-        settle().await;
-        let chat_reason = command_availability(&state, CommandId::SplitRight, width)
-            .reason()
-            .expect("a chat cannot be split");
-        assert!(
-            chat_reason.contains("Chats can't be split")
-                && chat_reason.contains("Move to Other Pane"),
-            "the chat reason points at the action that does work, got {chat_reason:?}"
-        );
-
-        // A file that has not loaded yet.
-        let unloaded = file_key("pending.rs");
-        state.open_tab(
-            TabContent::File {
-                key: unloaded.clone(),
-            },
-            "pending.rs".to_owned(),
-            true,
-        );
-        settle().await;
-        assert_eq!(
-            command_availability(&state, CommandId::SplitRight, width).reason(),
-            Some("Wait for the file to finish loading."),
-            "an unloaded file cannot be duplicated"
-        );
-
-        // A loaded file: enabled, and splitting is idempotent.
+        // A loaded file is the exact state that used to enable the split control.
         open_file_tab(&state, "alpha.rs", "fn alpha() {}");
         settle().await;
+
         assert!(
-            command_availability(&state, CommandId::SplitRight, width).is_enabled(),
-            "a loaded file can be split"
+            query(&container, ".split-right-btn").is_none(),
+            "the tab-strip split control is gone — splits are created by dragging"
         );
 
-        // Too narrow to hold two panes.
-        assert_eq!(
-            command_availability(&state, CommandId::SplitRight, Some(400.0)).reason(),
-            Some("Not enough width to split — widen the window or hide a side panel."),
-            "a workspace under 645px cannot host a split"
-        );
-
-        // Tabs disabled.
-        state.tabs_enabled.set(false);
+        // The pane-actions menu lists only pane focus/close commands now.
+        query(&container, ".pane-actions-trigger")
+            .expect("pane actions trigger")
+            .click();
         settle().await;
-        assert_eq!(
-            command_availability(&state, CommandId::SplitRight, width).reason(),
-            Some("Enable tabs to use split view."),
-            "split view requires tabs"
-        );
-    }
-
-    /// Split Right's refusals are the state layer's, not the UI's: the reasons
-    /// are `DuplicateFileEligibility`'s own strings, a refusal is announced
-    /// rather than silent, and the already-duplicated case stays *enabled*
-    /// because Split Right is idempotent.
-    #[wasm_bindgen_test]
-    async fn split_right_refusals_come_from_the_state_contract_and_are_announced() {
-        let container = make_container();
-        let state = AppState::new();
-        let state_for_mount = state.clone();
-        let _handle = mount_to(container.clone(), move || {
-            provide_context(state_for_mount.clone());
-            install_tab_lru_effect(&state_for_mount);
-            view! { <CenterZone /> }
-        });
-        settle().await;
-
-        // A file whose contents have not arrived: the reason is the state
-        // layer's constant, not a copy of its wording kept in the UI.
-        let unloaded = file_key("pending.rs");
-        state.open_tab(
-            TabContent::File { key: unloaded },
-            "pending.rs".to_owned(),
-            true,
-        );
-        settle().await;
-        assert_eq!(
-            command_availability(&state, CommandId::SplitRight, None).reason(),
-            Some(crate::state::DUPLICATE_FILE_NOT_LOADED_REASON),
-            "the not-loaded refusal is DuplicateFileEligibility's own reason"
-        );
-
-        // A chat: the state layer says NotAFile; §9 requires the wording that
-        // points at the gesture which does work.
-        state.open_tab(TabContent::empty_chat(), "Chat".to_owned(), true);
-        settle().await;
-        crate::components::command_palette::execute_command(&state, CommandId::SplitRight, None);
-        settle().await;
+        let pane_items = query_all(&container, ".pane-actions-menu [role=\"menuitem\"]");
         assert!(
-            !state
-                .center_zone
-                .with_untracked(|center_zone| center_zone.is_split()),
-            "a refused Split Right performs no work"
+            !pane_items.is_empty(),
+            "the pane menu still lists its close/join commands"
         );
-        let announced = live_region_text(&container);
-        assert!(
-            announced.contains("Chats can't be split") && announced.contains("Move to Other Pane"),
-            "the refusal is announced, and names the gesture that does work, got {announced:?}"
-        );
+        for item in &pane_items {
+            let label = text_of(item);
+            assert!(
+                !label.contains("Split Right") && !label.contains("Move Tab to Other Pane"),
+                "no split/move command remains in the pane menu, found {label:?}"
+            );
+        }
 
-        // A loaded file: enabled, and once duplicated it stays enabled, because
-        // the second invocation focuses the occurrence already there.
-        open_file_tab(&state, "alpha.rs", "fn alpha() {}");
-        settle().await;
-        assert!(
-            command_availability(&state, CommandId::SplitRight, None).is_enabled(),
-            "a loaded file can be split"
-        );
-        crate::components::command_palette::execute_command(&state, CommandId::SplitRight, None);
-        settle().await;
-        assert!(
-            state
-                .center_zone
-                .with_untracked(|center_zone| center_zone.is_split()),
-            "precondition: the file now has an occurrence in each pane"
-        );
-        assert!(
-            command_availability(&state, CommandId::SplitRight, None).is_enabled(),
-            "Split Right stays enabled once the file is already in the other pane: \
-             it is idempotent, so 'already there' is a success, not a refusal"
-        );
-    }
-
-    /// Split Right duplicates the focused file into the other pane, is
-    /// idempotent, and leaves the shared file loaded when one occurrence closes
-    /// (dev-docs/32 §2, §4, §9).
-    #[wasm_bindgen_test]
-    async fn split_right_duplicates_the_file_and_closing_one_occurrence_keeps_the_other() {
-        let container = make_container();
-        let state = AppState::new();
-
-        let state_for_mount = state.clone();
-        let _handle = mount_to(container.clone(), move || {
-            provide_context(state_for_mount.clone());
-            install_tab_lru_effect(&state_for_mount);
-            view! { <CenterZone /> }
-        });
-        settle().await;
-
-        let key = open_file_tab(&state, "alpha.rs", "fn alpha() {}");
-        settle().await;
-        // The 900px container is wide enough for two 320px panes; `None` states
-        // the command does not depend on a measurement here.
-        let width: Option<f64> = None;
-
-        crate::components::command_palette::execute_command(&state, CommandId::SplitRight, width);
-        settle().await;
-
-        assert_eq!(
-            panes(&container).len(),
-            2,
-            "Split Right on a loaded file creates the second pane"
-        );
-        let occurrences = visible_mounts(&container)
-            .iter()
-            .filter(|mount| text_of(mount).contains("fn alpha()"))
-            .count();
-        assert_eq!(
-            occurrences, 2,
-            "the same file renders in both panes at once"
-        );
-
-        // Idempotent: running it again focuses the existing occurrence rather
-        // than creating a third tab.
-        crate::components::command_palette::execute_command(&state, CommandId::SplitRight, width);
-        settle().await;
-        assert_eq!(
-            tab_mounts(&container)
-                .iter()
-                .filter(|mount| text_of(mount).contains("fn alpha()"))
-                .count(),
-            2,
-            "Split Right is idempotent — a file has at most one occurrence per pane"
-        );
-
-        // Closing one occurrence must not tear down the shared file.
-        let secondary = pane_element(&container, PaneId::Secondary);
-        let close = tab_button_named_in(&secondary, "alpha.rs")
-            .query_selector(".tab-close")
-            .unwrap()
-            .expect("file tabs are closeable")
-            .dyn_into::<HtmlElement>()
+        // The tab context menu carries no split/move item either.
+        tab_button_named(&container, "alpha.rs")
+            .dispatch_event(&web_sys::MouseEvent::new("contextmenu").unwrap())
             .unwrap();
-        close.click();
         settle().await;
-
-        assert_eq!(
-            panes(&container).len(),
-            1,
-            "closing the secondary pane's last tab collapses back to one pane"
-        );
-        assert!(
-            state
-                .open_files
-                .with_untracked(|files| files.contains_key(&key)),
-            "the surviving occurrence keeps the file's contents loaded"
-        );
-        assert!(
-            text_of(&visible_mount(&container)).contains("fn alpha()"),
-            "the surviving occurrence still renders the file"
-        );
+        for item in query_all(&container, ".context-menu [role=\"menuitem\"]") {
+            let label = text_of(&item);
+            assert!(
+                !label.contains("Split Right") && !label.contains("Move Tab to Other Pane"),
+                "no split/move command remains in the tab menu, found {label:?}"
+            );
+        }
     }
 
     /// Cross-pane drag is move-only, refuses its own pane, and collapses the
@@ -4791,19 +4437,19 @@ mod wasm_tests {
         });
         settle().await;
 
-        // A chat cannot be split — Split Right must say so rather than vanish.
+        // A single pane: "Return to Single Pane" cannot run and must say so
+        // rather than vanish from the pane-actions menu.
         state.open_tab(TabContent::empty_chat(), "Chat".to_owned(), true);
         settle().await;
-        let chat_tab = tab_button_named(&container, "Chat");
-        chat_tab
-            .dispatch_event(&web_sys::MouseEvent::new("contextmenu").unwrap())
-            .unwrap();
+        query(&container, ".pane-actions-trigger")
+            .expect("pane actions trigger")
+            .click();
         settle().await;
 
-        let item = query_all(&container, ".context-menu button[role=\"menuitem\"]")
+        let item = query_all(&container, ".pane-actions-menu button[role=\"menuitem\"]")
             .into_iter()
-            .find(|button| text_of(button).contains("Split Right"))
-            .expect("Split Right stays listed even when it cannot run");
+            .find(|button| text_of(button).contains("Return to Single Pane"))
+            .expect("the join command stays listed even when it cannot run");
 
         assert_eq!(
             item.get_attribute("aria-disabled").as_deref(),
@@ -4821,7 +4467,7 @@ mod wasm_tests {
         let description =
             query(&container, &format!("#{described_by}")).expect("the description element exists");
         assert!(
-            text_of(&description).contains("Chats can't be split"),
+            text_of(&description).contains("There is only one pane."),
             "the description is the specific reason, got {:?}",
             text_of(&description)
         );
@@ -4835,7 +4481,7 @@ mod wasm_tests {
             "activating an unavailable item performs no work"
         );
         assert!(
-            live_region_text(&container).contains("Chats can't be split"),
+            live_region_text(&container).contains("There is only one pane."),
             "the refusal is announced, got {:?}",
             live_region_text(&container)
         );
@@ -4857,9 +4503,16 @@ mod wasm_tests {
         settle().await;
 
         // The same file in both panes: the only resource allowed two occurrences.
+        // Placed via the state-layer duplicate primitive — the split creation UI
+        // is gone, but the underlying capability that tab-dragging builds on
+        // remains, and here it just sets up the precondition.
         open_file_tab(&state, "alpha.rs", "fn alpha() {}");
         settle().await;
-        crate::components::command_palette::execute_command(&state, CommandId::SplitRight, None);
+        let file_tab = state
+            .center_zone
+            .with_untracked(|center_zone| center_zone.active_tab_id())
+            .expect("the file tab is active");
+        state.duplicate_file_in_result(PaneId::Secondary, file_tab);
         settle().await;
         assert_eq!(panes(&container).len(), 2, "precondition: a split exists");
 
@@ -4916,86 +4569,6 @@ mod wasm_tests {
         assert!(
             query(&container, ".tab-drag-conflict").is_none(),
             "the conflict highlight is cleared when the drag ends"
-        );
-    }
-
-    /// A tab context menu acts on **the tab it was opened for**. Right-clicking
-    /// a background tab, or one in the other pane, must ask about *that* tab —
-    /// not about whatever happens to be active.
-    #[wasm_bindgen_test]
-    async fn the_tab_context_menu_targets_its_own_tab_not_the_active_one() {
-        let container = make_container();
-        let state = AppState::new();
-        let state_for_mount = state.clone();
-        let _handle = mount_to(container.clone(), move || {
-            provide_context(state_for_mount.clone());
-            install_tab_lru_effect(&state_for_mount);
-            view! { <CenterZone /> }
-        });
-        settle().await;
-
-        // A loaded file sits in the background; a chat is the active tab.
-        open_file_tab(&state, "alpha.rs", "fn alpha() {}");
-        settle().await;
-        state.open_tab(TabContent::empty_chat(), "Chat".to_owned(), true);
-        settle().await;
-        assert!(
-            command_availability(&state, CommandId::SplitRight, None)
-                .reason()
-                .is_some_and(|reason| reason.contains("Chats can't be split")),
-            "precondition: the *active* tab is a chat, which cannot be split"
-        );
-
-        // Right-click the background file tab.
-        tab_button_named(&container, "alpha.rs")
-            .dispatch_event(&web_sys::MouseEvent::new("contextmenu").unwrap())
-            .unwrap();
-        settle().await;
-
-        let item = query_all(&container, ".context-menu button[role=\"menuitem\"]")
-            .into_iter()
-            .find(|button| text_of(button).contains("Split Right"))
-            .expect("Split Right is listed");
-        assert_eq!(
-            item.get_attribute("aria-disabled"),
-            None,
-            "the menu asks about the file it was opened for — which *can* be \
-             split — not about the active chat"
-        );
-
-        item.click();
-        settle().await;
-        assert!(
-            state
-                .center_zone
-                .with_untracked(|center_zone| center_zone.is_split()),
-            "activating it splits the menu's tab"
-        );
-
-        // The file the menu was opened for — not the active chat — now has an
-        // occurrence in each pane. (Counting *mounted* views would be the wrong
-        // question: the primary pane's occurrence is a background tab there, and
-        // the LRU unmounts background tabs by design.)
-        let primary = pane_element(&container, PaneId::Primary);
-        let secondary = pane_element(&container, PaneId::Secondary);
-        assert!(
-            tab_labels_in(&primary).contains(&"alpha.rs".to_owned()),
-            "the original occurrence stays in the pane it came from, got {:?}",
-            tab_labels_in(&primary)
-        );
-        assert_eq!(
-            tab_labels_in(&secondary),
-            vec!["alpha.rs".to_owned()],
-            "and the duplicate is the file the menu was opened for — not the chat \
-             that happened to be active"
-        );
-        assert!(
-            text_of(&secondary).contains("fn alpha()"),
-            "the new pane renders that file"
-        );
-        assert!(
-            tab_labels_in(&primary).contains(&"Chat".to_owned()),
-            "the active chat is untouched: the menu acted on its own tab"
         );
     }
 
@@ -5074,76 +4647,6 @@ mod wasm_tests {
             revealed, "Focused Chat",
             "it reveals the chat in the visible pane, not the one whose composer \
              is hidden by narrow mode"
-        );
-    }
-
-    /// Split is discoverable without a shortcut or a menu: a visible control in
-    /// the strip that, when it cannot run, stays put and says why.
-    #[wasm_bindgen_test]
-    async fn the_strip_offers_a_visible_split_control_that_explains_itself() {
-        let container = make_container();
-        let state = AppState::new();
-        let state_for_mount = state.clone();
-        let _handle = mount_to(container.clone(), move || {
-            provide_context(state_for_mount.clone());
-            install_tab_lru_effect(&state_for_mount);
-            view! { <CenterZone /> }
-        });
-        settle().await;
-
-        state.open_tab(TabContent::empty_chat(), "Chat".to_owned(), true);
-        settle().await;
-
-        let button = query(&container, ".split-right-btn").expect("a visible split control");
-        assert!(
-            is_visible(&button),
-            "the control is on screen, not hover-only"
-        );
-        assert_eq!(
-            button.get_attribute("aria-disabled").as_deref(),
-            Some("true"),
-            "a chat cannot be split, so the control is disabled — not hidden"
-        );
-        assert!(
-            button
-                .get_attribute("title")
-                .is_some_and(|title| title.contains("Chats can't be split")),
-            "and it carries the same reason every other Split Right surface shows"
-        );
-        assert!(
-            button
-                .get_attribute("aria-keyshortcuts")
-                .is_some_and(|keys| keys.contains("Backslash")),
-            "it advertises its shortcut"
-        );
-
-        button.click();
-        settle().await;
-        assert!(
-            !state
-                .center_zone
-                .with_untracked(|center_zone| center_zone.is_split()),
-            "pressing a disabled control does no work"
-        );
-        assert!(
-            live_region_text(&container).contains("Chats can't be split"),
-            "and it is not a dead click: the refusal is announced"
-        );
-
-        open_file_tab(&state, "alpha.rs", "fn alpha() {}");
-        settle().await;
-        let button = query(&container, ".split-right-btn").expect("split control");
-        assert_eq!(
-            button.get_attribute("aria-disabled"),
-            None,
-            "with a loaded file active it becomes available"
-        );
-        button.click();
-        settle().await;
-        assert_eq!(
-            panes(&container).len(),
-            2,
-            "and the visible control splits the workspace"
         );
     }
 
