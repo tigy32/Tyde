@@ -96,8 +96,8 @@ python3 -B -m unittest \
     tools/test_release_tooling.py \
     tools/test_check_mobile_web_manifest.py
 
-log "Running fresh authoritative dev checks"
-./dev.sh check --force
+log "Running canonical dev checks"
+./dev.sh check
 
 log "Running web deploy manifest tests"
 node --test web/deploy/*.test.mjs

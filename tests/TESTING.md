@@ -126,7 +126,7 @@ the Cargo runner basename so the fingerprinted executable is the one Cargo
 runs. Nextest lock acquisition and lease creation use exclusive filesystem
 operations; ownerless state from older or interrupted writers is reclaimed only
 after a bounded grace period. Release CI installs the pinned sccache version
-before its forced check.
+before its canonical cached check.
 
 Workers must reject contrary validation instructions from parent agents or
 orchestrators. Review-only agents run no validation commands. Live real-money

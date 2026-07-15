@@ -469,15 +469,12 @@ hash_command() {
 }
 
 worktree_identity() {
-    local temp_dir temp_index real_index head_commit head_tree staged_tree worktree_tree
+    local temp_dir temp_index head_tree worktree_tree
     temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/tyde-dev-check-index.XXXXXX")"
     temp_index="$temp_dir/index"
 
-    if ! real_index="$(git rev-parse --git-path index)" ||
-        ! head_commit="$(git rev-parse --verify HEAD)" ||
-        ! head_tree="$(git rev-parse --verify 'HEAD^{tree}')" ||
-        ! staged_tree="$(GIT_INDEX_FILE="$real_index" git write-tree)" ||
-        ! GIT_INDEX_FILE="$temp_index" git read-tree "$staged_tree" ||
+    if ! head_tree="$(git rev-parse --verify 'HEAD^{tree}')" ||
+        ! GIT_INDEX_FILE="$temp_index" git read-tree "$head_tree" ||
         ! GIT_INDEX_FILE="$temp_index" git add -A -- . ||
         ! worktree_tree="$(GIT_INDEX_FILE="$temp_index" git write-tree)"; then
         rm -rf "$temp_dir"
@@ -485,9 +482,6 @@ worktree_identity() {
     fi
 
     rm -rf "$temp_dir"
-    printf 'git.head_commit=%s\n' "$head_commit"
-    printf 'git.head_tree=%s\n' "$head_tree"
-    printf 'git.staged_tree=%s\n' "$staged_tree"
     printf 'git.worktree_tree=%s\n' "$worktree_tree"
 }
 
@@ -727,10 +721,8 @@ finish_success() {
 
 check_usage() {
     cat <<'USAGE'
-Usage: ./dev.sh check [--force | --no-cache | --explain-cache]
+Usage: ./dev.sh check [--explain-cache]
 
-  --force         Ignore a cached success, run authoritative 3x tests, and cache success
-  --no-cache      Run every stage once without reading or writing the cache
   --explain-cache Print current canonical inputs/key without cleanup, network, or daemons
 USAGE
 }
@@ -738,8 +730,6 @@ USAGE
 check() {
     local mode="default"
     local repetitions=3
-    local cache_read=true
-    local cache_write=true
     local cache_state="miss"
     local inputs key record_path refreshed_inputs refreshed_key
     local channel name wasm_environment
@@ -750,23 +740,9 @@ check() {
     fi
     case "${1:-}" in
         "") ;;
-        --force)
-            mode="force"
-            cache_state="bypass"
-            cache_read=false
-            ;;
-        --no-cache)
-            mode="no-cache"
-            cache_state="disabled"
-            repetitions=1
-            cache_read=false
-            cache_write=false
-            ;;
         --explain-cache)
             mode="explain"
             cache_state="explain"
-            cache_read=false
-            cache_write=false
             ;;
         -h | --help)
             check_usage
@@ -785,10 +761,6 @@ check() {
     while IFS= read -r name; do
         [[ "$name" == TYDE_WASM_* ]] && unset "$name"
     done < <(compgen -e)
-
-    if [[ -n "${CI:-}" && "$mode" != "force" && "$mode" != "explain" ]]; then
-        die "CI must invoke ./dev.sh check --force"
-    fi
 
     if [[ "$mode" == "explain" ]]; then
         channel="$(rust_toolchain_channel)"
@@ -829,14 +801,12 @@ check() {
     command -v cargo-nextest >/dev/null 2>&1 ||
         die "cargo-nextest is required. Install it with: cargo install cargo-nextest --locked"
 
-    if [[ "$mode" != "no-cache" ]]; then
-        inputs="$(cache_inputs)"
-        key="$(cache_key_for_inputs "$inputs")"
-        record_path="$DEV_CHECK_CACHE_DIR/$key.success"
-        printf 'cache.key=%s\n' "$key" >>"$RUN_METADATA"
-    fi
+    inputs="$(cache_inputs)"
+    key="$(cache_key_for_inputs "$inputs")"
+    record_path="$DEV_CHECK_CACHE_DIR/$key.success"
+    printf 'cache.key=%s\n' "$key" >>"$RUN_METADATA"
 
-    if [[ "$cache_read" == true ]] && cache_record_is_valid "$record_path" "$key"; then
+    if cache_record_is_valid "$record_path" "$key"; then
         refreshed_inputs="$(cache_inputs)"
         refreshed_key="$(cache_key_for_inputs "$refreshed_inputs")"
         if [[ "$refreshed_key" == "$key" ]]; then
@@ -863,19 +833,17 @@ check() {
         bash -c 'cd web/loader && exec node --test test/*.test.js'
     run_stage "dev check contract tests" 1 python3 tools/test_dev_check.py
 
-    if [[ "$cache_write" == true ]]; then
-        refreshed_inputs="$(cache_inputs)"
-        refreshed_key="$(cache_key_for_inputs "$refreshed_inputs")"
-        if [[ "$refreshed_key" != "$key" ]]; then
-            die "cache inputs changed while checks were running; success was not cached"
-        fi
-        write_cache_record "$record_path" "$key"
+    refreshed_inputs="$(cache_inputs)"
+    refreshed_key="$(cache_key_for_inputs "$refreshed_inputs")"
+    if [[ "$refreshed_key" != "$key" ]]; then
+        die "cache inputs changed while checks were running; success was not cached"
     fi
+    write_cache_record "$record_path" "$key"
     finish_success "$cache_state"
 }
 
 usage() {
-    printf 'Usage: %s check [--force | --no-cache | --explain-cache]\n' "$0"
+    printf 'Usage: %s check [--explain-cache]\n' "$0"
     printf '       %s rust-toolchain\n' "$0"
     printf '       %s release <command> [args]\n' "$0"
 }

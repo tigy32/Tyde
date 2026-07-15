@@ -366,7 +366,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             before + [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG, "wasm-prepare"],
         )
 
-    def test_fingerprint_covers_git_states_without_mutating_real_index(self) -> None:
+    def test_fingerprint_tracks_content_without_commit_state(self) -> None:
         base_key = self._explain_key()
         base_index = self._index_digest()
         self.assertEqual(self._index_digest(), base_index)
@@ -395,12 +395,15 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
 
         self._git("add", "tracked.txt")
         staged_key = self._explain_key()
-        self.assertNotEqual(staged_key, unstaged_key)
-        index_before = self._index_digest()
+        self.assertEqual(staged_key, unstaged_key)
+        self._git("commit", "-qm", "Update tracked content")
+        self.assertEqual(self._explain_key(), unstaged_key)
+
+        index_after_commit = self._index_digest()
         tracked.unlink()
         deleted_key = self._explain_key()
         self.assertNotEqual(deleted_key, staged_key)
-        self.assertEqual(self._index_digest(), index_before)
+        self.assertEqual(self._index_digest(), index_after_commit)
 
     def test_fingerprint_covers_browser_wasm_and_sccache_identities(self) -> None:
         base_key = self._explain_key()
@@ -441,23 +444,15 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         changed_python["DEV_CHECK_FAKE_PYTHON_VERSION"] = "3.changed"
         self.assertNotEqual(self._explain_key(changed_python), base_key)
 
-    def test_modes_environment_and_failures_obey_cache_contract(self) -> None:
+    def test_environment_and_failures_obey_cache_contract(self) -> None:
         self._run()
         initial_records = list((self.root / "target" / "dev-check-cache").glob("*.success"))
         initial_log_count = len(self._log_lines())
 
-        forced = self._run("--force")
-        self.assertIn("CACHE BYPASS", forced.stdout)
-        self.assertEqual(len(self._log_lines()) - initial_log_count, 16)
-        self.assertEqual(
-            len(list((self.root / "target" / "dev-check-cache").glob("*.success"))),
-            len(initial_records),
-        )
-
-        before_no_cache = len(self._log_lines())
-        no_cache = self._run("--no-cache")
-        self.assertIn("CACHE DISABLED", no_cache.stdout)
-        self.assertEqual(len(self._log_lines()) - before_no_cache, 10)
+        for removed_option in ("--force", "--no-cache"):
+            rejected = self._run(removed_option, check=False)
+            self.assertEqual(rejected.returncode, 2)
+        self.assertEqual(len(self._log_lines()), initial_log_count)
         self.assertEqual(
             len(list((self.root / "target" / "dev-check-cache").glob("*.success"))),
             len(initial_records),
@@ -511,10 +506,10 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         env = self.env.copy()
         env["DEV_CHECK_NATIVE_MULTI_FAILURE"] = "1"
 
-        failed = self._run("--no-cache", env=env, check=False)
+        failed = self._run(env=env, check=False)
 
         self.assertEqual(failed.returncode, 9)
-        self.assertIn("FAIL  cargo nextest run (1/1", failed.stderr)
+        self.assertIn("FAIL  cargo nextest run (1/3", failed.stderr)
         for diagnostic in (
             "first_independent_failure",
             "first independent failure diagnostics",
@@ -569,35 +564,35 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             self._log_lines(), [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG]
         )
 
-    def test_ci_requires_force_and_release_guard_uses_force(self) -> None:
+    def test_ci_and_release_guards_use_canonical_cache(self) -> None:
         ci_env = self.env.copy()
         ci_env["CI"] = "true"
-        rejected = self._run("--no-cache", env=ci_env, check=False)
-        self.assertEqual(rejected.returncode, 1)
-        self.assertIn("CI must invoke ./dev.sh check --force", rejected.stderr)
-        self.assertEqual(self._log_lines(), [])
+        result = self._run(env=ci_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CACHE MISS", result.stdout)
 
         release_check = (REPO_ROOT / "tools" / "release_check.sh").read_text(
             encoding="utf-8"
         )
-        self.assertIn("./dev.sh check --force", release_check)
-        self.assertNotIn("./dev.sh check\n", release_check)
+        self.assertIn("./dev.sh check\n", release_check)
+        self.assertNotIn("./dev.sh check --", release_check)
         release_workflow = (
             REPO_ROOT / ".github" / "workflows" / "release.yml"
         ).read_text(encoding="utf-8")
-        self.assertIn("run: ./dev.sh check --force", release_workflow)
+        self.assertIn("run: ./dev.sh check", release_workflow)
+        self.assertNotIn("run: ./dev.sh check --", release_workflow)
         install = "cargo install sccache --version 0.16.0 --locked --force"
         self.assertIn(install, release_workflow)
         self.assertLess(
             release_workflow.index(install),
-            release_workflow.index("run: ./dev.sh check --force"),
+            release_workflow.index("run: ./dev.sh check"),
         )
 
     def test_contract_stage_is_reachable_without_recursive_checks(self) -> None:
         env = self.env.copy()
         env["DEV_CHECK_CONTRACT_CHILD"] = "1"
 
-        result = self._run("--no-cache", env=env)
+        result = self._run(env=env)
 
         self.assertIn("START dev check contract tests", result.stdout)
         self.assertIn("PASS  dev check contract tests (1/1", result.stdout)
@@ -725,7 +720,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         orphan = cache / ".success.interrupted"
         orphan.write_text("partial\n", encoding="utf-8")
 
-        self._run("--no-cache")
+        self._run()
 
         self.assertFalse(records[0].exists())
         self.assertFalse(records[1].exists())
@@ -737,7 +732,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         (target / "dev-check-logs").mkdir(parents=True)
         (target / "dev-check-cache").mkdir()
 
-        result = self._run("--no-cache")
+        result = self._run()
 
         self.assertIn("RESULT PASS", result.stdout)
 

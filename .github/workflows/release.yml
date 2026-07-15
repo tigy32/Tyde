@@ -109,11 +109,11 @@ jobs:
           (cd frontend && trunk build --release)
           (cd mobile-frontend && trunk build --release)
 
-      # Run the complete fresh check before any expensive matrix build or code
-      # signing. --force makes release CI authoritative even if the runner's
-      # restored target directory contains a local dev-check success record.
-      - name: Run authoritative checks
-        run: ./dev.sh check --force
+      # Run the canonical cached check before any expensive matrix build or code
+      # signing. The fingerprint makes restored successes reusable only for the
+      # exact validated inputs.
+      - name: Run canonical checks
+        run: ./dev.sh check
 
   build:
     needs: [create-release, test]

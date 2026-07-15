@@ -40,10 +40,9 @@ wall time, repetitions, and peak RSS. Complete stage output and metadata are
 retained in bounded `target/dev-check-logs/` runs; failures print the complete
 captured output for the failing repetition plus the complete stage-log path,
 without truncation. Repeated stages print a lightweight progress line before
-each run. Use
-`./dev.sh check --force` only where the release or CI workflow explicitly
-requires a cache-bypassing authoritative run. Do not use `--no-cache` unless the
-user explicitly asks for that diagnostic mode.
+each run. Validation always uses the cache when the exact canonical inputs have
+a successful record. There is no cache-bypass mode for local, release, or CI
+validation.
 
 Checks are single-instance per repository and fail immediately if the local
 check lock is held. The wrapper pins repository-local sccache configuration,
